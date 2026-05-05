@@ -4,4 +4,4 @@ mod pty;
 
 pub use connection::SshConnection;
 pub use error::SshError;
-pub use pty::PtyStream;
+pub use pty::{PtyStream, PtyWriter};
