@@ -6,9 +6,15 @@ license.workspace = true
 
 [dependencies]
 rift-protocol = { path = "../../crates/protocol" }
+rift-ssh = { path = "../../crates/ssh" }
 tauri = { version = "2", features = [] }
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
+base64 = "0.22"
+anyhow.workspace = true
+whoami = "1"
+dirs = "5"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
