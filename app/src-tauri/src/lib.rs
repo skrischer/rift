@@ -26,11 +26,7 @@ async fn pty_input(state: tauri::State<'_, AppState>, data: String) -> Result<()
 }
 
 #[tauri::command]
-async fn pty_resize(
-    state: tauri::State<'_, AppState>,
-    cols: u16,
-    rows: u16,
-) -> Result<(), String> {
+async fn pty_resize(state: tauri::State<'_, AppState>, cols: u16, rows: u16) -> Result<(), String> {
     state
         .cmd_tx
         .send(PtyCommand::Resize(cols, rows))
