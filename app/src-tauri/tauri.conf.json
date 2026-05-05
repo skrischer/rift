@@ -1,0 +1,20 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicedoc/tauri/dev/core/tauri-config-schema/schema.json",
+  "productName": "rift",
+  "version": "0.1.0",
+  "identifier": "dev.rift.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420"
+  },
+  "app": {
+    "title": "rift",
+    "windows": [
+      {
+        "title": "rift",
+        "width": 1280,
+        "height": 800
+      }
+    ]
+  }
+}
