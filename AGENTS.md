@@ -66,6 +66,14 @@ cd app && cargo tauri dev                                        # run Tauri app
 - **No feature flags for unimplemented features.**
 - **No large PRs.** Split at ~400 lines. Exception: initial scaffolding.
 
+## Branching
+
+- **`main`** — protected, production-ready. Only receives merges from `develop` via PR.
+- **`develop`** — protected, integration branch. All feature work merges here first via PR.
+- **Feature branches** — branch off `develop`, merge back into `develop`. Naming: `feat/<scope>`, `fix/<scope>`, `chore/<scope>`.
+
+Never push directly to `main` or `develop`. Always use pull requests. Delete feature branches after merge.
+
 ## Commits
 
 Conventional Commits. Scope matches crate name. Imperative mood, lowercase, no period.
