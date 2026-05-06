@@ -6,7 +6,7 @@ use russh_keys::key::PublicKey;
 use tracing::{debug, info};
 
 use crate::error::SshError;
-use crate::known_hosts::{verify_host_key, HostKeyVerification};
+use crate::known_hosts::verify_host_key;
 use crate::pty::PtyStream;
 
 pub struct SshConnection {
@@ -74,12 +74,7 @@ impl client::Handler for ClientHandler {
     type Error = SshError;
 
     async fn check_server_key(&mut self, key: &PublicKey) -> Result<bool, Self::Error> {
-        match verify_host_key(&self.host, self.port, key)? {
-            HostKeyVerification::Matched | HostKeyVerification::TrustedOnFirstUse => Ok(true),
-            HostKeyVerification::Mismatch { line } => Err(SshError::HostKeyMismatch {
-                host: self.host.clone(),
-                line,
-            }),
-        }
+        verify_host_key(&self.host, self.port, key)?;
+        Ok(true)
     }
 }

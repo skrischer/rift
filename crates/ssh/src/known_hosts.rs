@@ -5,15 +5,13 @@ use tracing::{debug, info, warn};
 
 use crate::error::SshError;
 
-/// Result of verifying a server key against a known_hosts file.
+/// Result of a successful server key verification.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum HostKeyVerification {
     /// The key matches a known entry.
     Matched,
     /// The host was not found — key was trusted on first use and appended.
     TrustedOnFirstUse,
-    /// The host is known but the key differs (potential MITM).
-    Mismatch { line: usize },
 }
 
 /// Path to the user's known_hosts file.
@@ -25,9 +23,8 @@ fn default_known_hosts_path() -> Result<PathBuf, SshError> {
 
 /// Verify the server key for `host:port` against the known_hosts file at `path`.
 ///
-/// - Returns `Ok(Matched)` if the key matches a known entry.
-/// - Returns `Ok(TrustedOnFirstUse)` if the host was unknown and the key was appended.
-/// - Returns `Ok(Mismatch { line })` if the host is known but the key differs.
+/// Returns `Ok(Matched)` or `Ok(TrustedOnFirstUse)` on success.
+/// Returns `Err(HostKeyMismatch)` if the host is known but the key differs.
 pub(crate) fn verify_host_key_at_path(
     host: &str,
     port: u16,
@@ -39,8 +36,8 @@ pub(crate) fn verify_host_key_at_path(
             debug!(%host, port, "server key matches known_hosts");
             Ok(HostKeyVerification::Matched)
         }
+        // No entry found for this host+key-algorithm combination — trust on first use.
         Ok(false) => {
-            // Host not found — trust on first use
             info!(%host, port, "unknown host, trusting key on first use");
             russh_keys::known_hosts::learn_known_hosts_path(host, port, key, path)
                 .map_err(|e| SshError::KnownHosts(e.to_string()))?;
@@ -48,7 +45,10 @@ pub(crate) fn verify_host_key_at_path(
         }
         Err(russh_keys::Error::KeyChanged { line }) => {
             warn!(%host, port, line, "server key mismatch detected");
-            Ok(HostKeyVerification::Mismatch { line })
+            Err(SshError::HostKeyMismatch {
+                host: host.to_owned(),
+                line,
+            })
         }
         Err(e) => Err(SshError::KnownHosts(e.to_string())),
     }
@@ -158,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_host_key_mismatch_returns_mismatch() {
+    fn test_verify_host_key_mismatch_returns_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let stored_key = generate_ed25519_key();
         let different_key = generate_ed25519_key();
@@ -169,8 +169,11 @@ mod tests {
 
         let result = verify_host_key_at_path("mismatch.example.com", 22, &different_key, &path);
         assert!(
-            matches!(result, Ok(HostKeyVerification::Mismatch { line: 1 })),
-            "expected Mismatch at line 1, got: {result:?}"
+            matches!(
+                result,
+                Err(SshError::HostKeyMismatch { ref host, line: 1 }) if host == "mismatch.example.com"
+            ),
+            "expected HostKeyMismatch error at line 1, got: {result:?}"
         );
     }
 
@@ -181,7 +184,6 @@ mod tests {
         let different_key = generate_ed25519_key();
 
         let base64 = stored_key.public_key_base64();
-        // Comment lines and blank lines before the actual entry
         let content = format!(
             "# this is a comment\n\
              other.host {} {}\n\
@@ -194,10 +196,12 @@ mod tests {
         let path = write_known_hosts(dir.path(), content.as_bytes());
 
         let result = verify_host_key_at_path("target.host", 22, &different_key, &path);
-        // russh-keys skips comment lines in its line counter, so "target.host" is at line 2
         assert!(
-            matches!(result, Ok(HostKeyVerification::Mismatch { line: 2 })),
-            "expected Mismatch at line 2, got: {result:?}"
+            matches!(
+                result,
+                Err(SshError::HostKeyMismatch { ref host, line: 2 }) if host == "target.host"
+            ),
+            "expected HostKeyMismatch error at line 2, got: {result:?}"
         );
     }
 
