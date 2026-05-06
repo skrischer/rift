@@ -5,6 +5,8 @@ use std::thread;
 use anyhow::{Context as _, Result};
 use gpui::*;
 use rift_terminal::{TermSize, TerminalView};
+use tracing::{debug, error, info};
+use tracing_subscriber::EnvFilter;
 
 struct SshConfig {
     host: String,
@@ -20,6 +22,17 @@ struct PtyChannels {
 }
 
 fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_target(true)
+        .init();
+
+    info!(
+        os = env::consts::OS,
+        arch = env::consts::ARCH,
+        "rift starting"
+    );
+
     Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
         let window = cx
@@ -54,12 +67,28 @@ fn main() {
                             size_changed_rx: handle.size_changed_rx,
                         };
 
+                        debug!(
+                            host = %ssh.host,
+                            port = ssh.port,
+                            user = %ssh.user,
+                            key = %ssh.key.display(),
+                            key_exists = ssh.key.exists(),
+                            "connecting via SSH"
+                        );
+
                         thread::spawn(move || {
                             let rt = tokio::runtime::Runtime::new()
                                 .expect("failed to create tokio runtime");
                             rt.block_on(async move {
                                 if let Err(e) = run_ssh_session(&ssh, channels).await {
-                                    eprintln!("SSH session error: {e:#}");
+                                    error!(
+                                        %e,
+                                        host = %ssh.host,
+                                        port = ssh.port,
+                                        key = %ssh.key.display(),
+                                        key_exists = ssh.key.exists(),
+                                        "SSH session failed"
+                                    );
                                 }
                             });
                         });

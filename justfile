@@ -46,6 +46,24 @@ dev:
     RIFT_SSH_KEY="{{RIFT_SSH_KEY}}" \
     cargo run -p rift-app
 
+# Build and run native Windows .exe (cross-compiled via cargo-xwin)
+dev-windows:
+    cargo xwin build -p rift-app --target x86_64-pc-windows-msvc
+    mkdir -p /mnt/c/temp/rift
+    cp target/x86_64-pc-windows-msvc/debug/rift.exe /mnt/c/temp/rift/rift.exe
+    cp "{{RIFT_SSH_KEY}}" /mnt/c/temp/rift/ssh_key
+    export WSLENV="RUST_LOG:RIFT_SSH_HOST:RIFT_SSH_USER:RIFT_SSH_PORT:RIFT_SSH_KEY/p" && \
+    export RUST_LOG=rift=debug,rift_ssh=debug && \
+    export RIFT_SSH_HOST="{{RIFT_SSH_HOST}}" && \
+    export RIFT_SSH_USER="{{RIFT_SSH_USER}}" && \
+    export RIFT_SSH_PORT="{{RIFT_SSH_PORT}}" && \
+    export RIFT_SSH_KEY="/mnt/c/temp/rift/ssh_key" && \
+    /mnt/c/temp/rift/rift.exe
+
+# Build Windows .exe without running
+build-windows:
+    cargo xwin build -p rift-app --target x86_64-pc-windows-msvc
+
 # Check licenses (requires cargo-deny)
 deny:
     cargo deny check licenses

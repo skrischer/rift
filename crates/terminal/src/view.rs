@@ -362,7 +362,10 @@ impl Render for TerminalView {
                         }
                     }
                     if let Some(text) = this.selected_text() {
+                        #[cfg(target_os = "linux")]
                         cx.write_to_primary(ClipboardItem::new_string(text));
+                        #[cfg(not(target_os = "linux"))]
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
                     }
                     cx.notify();
                 }),

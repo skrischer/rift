@@ -10,4 +10,5 @@ russh-keys = "0.46"
 tokio.workspace = true
 flume.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 async-trait = "0.1"
