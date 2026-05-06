@@ -1,5 +1,6 @@
 mod connection;
 mod error;
+mod known_hosts;
 mod pty;
 
 pub use connection::SshConnection;
