@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use russh::client::{self, Config, Handle};
 use russh_keys::key::PublicKey;
+use tracing::{debug, info};
 
 use crate::error::SshError;
 use crate::pty::PtyStream;
@@ -18,13 +19,20 @@ impl SshConnection {
         user: &str,
         key_path: &Path,
     ) -> Result<Self, SshError> {
+        debug!(
+            path = %key_path.display(),
+            exists = key_path.exists(),
+            "loading SSH key"
+        );
         let key_pair = russh_keys::load_secret_key(key_path, None)?;
 
         let config = Arc::new(Config::default());
         let handler = ClientHandler;
 
+        debug!(%host, port, "establishing SSH connection");
         let mut handle = client::connect(config, (host, port), handler).await?;
 
+        debug!(%user, "authenticating");
         let auth_result = handle
             .authenticate_publickey(user, Arc::new(key_pair))
             .await?;
@@ -35,6 +43,7 @@ impl SshConnection {
             )));
         }
 
+        info!(%host, port, %user, "SSH connection established");
         Ok(Self { handle })
     }
 
