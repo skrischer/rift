@@ -55,9 +55,16 @@ fn main() {
                             key: env::var("RIFT_SSH_KEY")
                                 .map(PathBuf::from)
                                 .unwrap_or_else(|_| {
-                                    let home = env::var("HOME")
-                                        .unwrap_or_else(|_| "/home/developer".into());
-                                    PathBuf::from(home).join(".ssh/id_ed25519")
+                                    let home = env::var("USERPROFILE")
+                                        .or_else(|_| env::var("HOME"))
+                                        .unwrap_or_else(|_| {
+                                            if cfg!(target_os = "windows") {
+                                                "C:\\Users\\Default".into()
+                                            } else {
+                                                "/home/developer".into()
+                                            }
+                                        });
+                                    PathBuf::from(home).join(".ssh").join("id_ed25519")
                                 }),
                         };
 
