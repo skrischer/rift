@@ -128,9 +128,7 @@ impl TerminalView {
                             p.advance(&mut *term, &more);
                         }
                     }
-                    let result = cx.update(|cx| {
-                        this.update(cx, |_view, cx| cx.notify())
-                    });
+                    let result = cx.update(|cx| this.update(cx, |_view, cx| cx.notify()));
                     if result.is_err() {
                         break;
                     }
@@ -142,26 +140,24 @@ impl TerminalView {
 
         // Cursor blink timer (termy pattern: only notify on actual state change)
         {
-            cx.spawn(async move |this, cx| {
-                loop {
-                    smol::Timer::after(Duration::from_millis(500)).await;
-                    let result = cx.update(|cx| {
-                        this.update(cx, |view, cx| {
-                            let term = view.terminal.lock().expect("term lock poisoned");
-                            let blinking = term.cursor_style().blinking;
-                            drop(term);
-                            if blinking {
-                                view.cursor_blink_visible = !view.cursor_blink_visible;
-                                cx.notify();
-                            } else if !view.cursor_blink_visible {
-                                view.cursor_blink_visible = true;
-                                cx.notify();
-                            }
-                        })
-                    });
-                    if result.is_err() {
-                        break;
-                    }
+            cx.spawn(async move |this, cx| loop {
+                smol::Timer::after(Duration::from_millis(500)).await;
+                let result = cx.update(|cx| {
+                    this.update(cx, |view, cx| {
+                        let term = view.terminal.lock().expect("term lock poisoned");
+                        let blinking = term.cursor_style().blinking;
+                        drop(term);
+                        if blinking {
+                            view.cursor_blink_visible = !view.cursor_blink_visible;
+                            cx.notify();
+                        } else if !view.cursor_blink_visible {
+                            view.cursor_blink_visible = true;
+                            cx.notify();
+                        }
+                    })
+                });
+                if result.is_err() {
+                    break;
                 }
             })
             .detach();
@@ -802,4 +798,3 @@ impl Element for TerminalElement {
         }
     }
 }
-
