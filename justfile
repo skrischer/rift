@@ -54,6 +54,7 @@ dev-windows:
     mkdir -p {{windows_staging_dir}}
     cp target/x86_64-pc-windows-msvc/debug/rift.exe {{windows_staging_dir}}/rift.exe
     cp "{{RIFT_SSH_KEY}}" {{windows_staging_dir}}/ssh_key
+    chmod 600 {{windows_staging_dir}}/ssh_key
     export WSLENV="RUST_LOG:RIFT_SSH_HOST:RIFT_SSH_USER:RIFT_SSH_PORT:RIFT_SSH_KEY/p" && \
     export RUST_LOG=rift=debug,rift_ssh=debug && \
     export RIFT_SSH_HOST="{{RIFT_SSH_HOST}}" && \
