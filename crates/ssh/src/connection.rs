@@ -6,6 +6,7 @@ use russh_keys::key::PublicKey;
 use tracing::{debug, info};
 
 use crate::error::SshError;
+use crate::known_hosts::{verify_host_key, HostKeyVerification};
 use crate::pty::PtyStream;
 
 pub struct SshConnection {
@@ -27,7 +28,10 @@ impl SshConnection {
         let key_pair = russh_keys::load_secret_key(key_path, None)?;
 
         let config = Arc::new(Config::default());
-        let handler = ClientHandler;
+        let handler = ClientHandler {
+            host: host.to_owned(),
+            port,
+        };
 
         debug!(%host, port, "establishing SSH connection");
         let mut handle = client::connect(config, (host, port), handler).await?;
@@ -60,14 +64,22 @@ impl SshConnection {
     }
 }
 
-struct ClientHandler;
+struct ClientHandler {
+    host: String,
+    port: u16,
+}
 
 #[async_trait::async_trait]
 impl client::Handler for ClientHandler {
     type Error = SshError;
 
-    async fn check_server_key(&mut self, _key: &PublicKey) -> Result<bool, Self::Error> {
-        // TODO(security): implement known_hosts verification before production use
-        Ok(true)
+    async fn check_server_key(&mut self, key: &PublicKey) -> Result<bool, Self::Error> {
+        match verify_host_key(&self.host, self.port, key)? {
+            HostKeyVerification::Matched | HostKeyVerification::TrustedOnFirstUse => Ok(true),
+            HostKeyVerification::Mismatch { line } => Err(SshError::HostKeyMismatch {
+                host: self.host.clone(),
+                line,
+            }),
+        }
     }
 }

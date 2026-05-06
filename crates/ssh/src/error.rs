@@ -12,6 +12,13 @@ pub enum SshError {
     Pty(String),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
+    #[error(
+        "host key mismatch for {host}: the server key has changed since it was last recorded \
+         (known_hosts line {line}). This could indicate a man-in-the-middle attack."
+    )]
+    HostKeyMismatch { host: String, line: usize },
+    #[error("known_hosts error: {0}")]
+    KnownHosts(String),
 }
 
 impl From<russh::Error> for SshError {
