@@ -124,7 +124,9 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
         }
     }
 
-    write_handle.abort();
-    resize_handle.abort();
+    drop(ch.pty_tx);
+    drop(ch.input_rx);
+    let _ = write_handle.await;
+    let _ = resize_handle.await;
     Ok(())
 }

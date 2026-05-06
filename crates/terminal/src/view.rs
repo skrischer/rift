@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::Duration;
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
@@ -89,8 +89,6 @@ impl RowCacheState {
 
 pub struct TerminalView {
     terminal: Arc<Mutex<Term<Listener>>>,
-    parser: Arc<Mutex<Processor>>,
-    pty_rx: flume::Receiver<Vec<u8>>,
     input_tx: flume::Sender<Vec<u8>>,
     size_changed_tx: flume::Sender<TermSize>,
     focus_handle: FocusHandle,
@@ -98,7 +96,7 @@ pub struct TerminalView {
     grid_size: TermSize,
     selection: Option<GridSelection>,
     selecting: bool,
-    blink_epoch: Instant,
+    cursor_blink_visible: bool,
     row_cache: Arc<Mutex<RowCacheState>>,
 }
 
@@ -106,16 +104,71 @@ impl TerminalView {
     pub fn new(cx: &mut Context<Self>) -> (Self, TerminalHandle) {
         let grid_size = TermSize { cols: 80, rows: 24 };
         let config = Config::default();
-        let terminal = Term::new(config, &grid_size, Listener);
+        let terminal = Arc::new(Mutex::new(Term::new(config, &grid_size, Listener)));
+        let parser: Arc<Mutex<Processor>> = Arc::new(Mutex::new(Processor::new()));
 
-        let (pty_tx, pty_rx) = flume::unbounded();
+        let (pty_tx, pty_rx) = flume::unbounded::<Vec<u8>>();
         let (input_tx, input_rx) = flume::unbounded();
         let (size_changed_tx, size_changed_rx) = flume::unbounded();
 
+        // PTY reader: wait for data, process, notify UI
+        {
+            let terminal = terminal.clone();
+            let parser = parser.clone();
+            cx.spawn(async move |this, cx| {
+                loop {
+                    let Ok(data) = pty_rx.recv_async().await else {
+                        break;
+                    };
+                    {
+                        let mut term = terminal.lock().expect("term lock poisoned");
+                        let mut p = parser.lock().expect("parser lock poisoned");
+                        p.advance(&mut *term, &data);
+                        while let Ok(more) = pty_rx.try_recv() {
+                            p.advance(&mut *term, &more);
+                        }
+                    }
+                    let result = cx.update(|cx| {
+                        this.update(cx, |_view, cx| cx.notify())
+                    });
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                let _ = cx.update(|cx| cx.quit());
+            })
+            .detach();
+        }
+
+        // Cursor blink timer (termy pattern: only notify on actual state change)
+        {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    smol::Timer::after(Duration::from_millis(500)).await;
+                    let result = cx.update(|cx| {
+                        this.update(cx, |view, cx| {
+                            let term = view.terminal.lock().expect("term lock poisoned");
+                            let blinking = term.cursor_style().blinking;
+                            drop(term);
+                            if blinking {
+                                view.cursor_blink_visible = !view.cursor_blink_visible;
+                                cx.notify();
+                            } else if !view.cursor_blink_visible {
+                                view.cursor_blink_visible = true;
+                                cx.notify();
+                            }
+                        })
+                    });
+                    if result.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+
         let view = Self {
-            terminal: Arc::new(Mutex::new(terminal)),
-            parser: Arc::new(Mutex::new(Processor::new())),
-            pty_rx,
+            terminal,
             input_tx,
             size_changed_tx,
             focus_handle: cx.focus_handle(),
@@ -123,7 +176,7 @@ impl TerminalView {
             grid_size,
             selection: None,
             selecting: false,
-            blink_epoch: Instant::now(),
+            cursor_blink_visible: true,
             row_cache: Arc::new(Mutex::new(RowCacheState::new())),
         };
 
@@ -134,20 +187,6 @@ impl TerminalView {
         };
 
         (view, handle)
-    }
-
-    fn process_incoming(&mut self) {
-        while let Ok(data) = self.pty_rx.try_recv() {
-            let mut term = self.terminal.lock().expect("term lock poisoned");
-            let mut parser = self.parser.lock().expect("parser lock poisoned");
-            let offset_before = term.grid().display_offset();
-            parser.advance(&mut *term, &data);
-            if offset_before > 0 && term.grid().display_offset() == 0 {
-                term.scroll_display(alacritty_terminal::grid::Scroll::Delta(
-                    offset_before as i32,
-                ));
-            }
-        }
     }
 
     fn pixel_to_grid(&self, pos: Point<Pixels>) -> (usize, usize) {
@@ -230,9 +269,7 @@ impl Focusable for TerminalView {
 }
 
 impl Render for TerminalView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.process_incoming();
-
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         {
             let cache = self.row_cache.lock().expect("cache lock poisoned");
             self.cell_size = cache.cell_size;
@@ -244,9 +281,7 @@ impl Render for TerminalView {
             }
         }
 
-        let cursor_visible = (self.blink_epoch.elapsed().as_millis() / 500).is_multiple_of(2);
-
-        window.request_animation_frame();
+        let cursor_visible = self.cursor_blink_visible;
 
         let terminal = self.terminal.clone();
         let cell_size = self.cell_size;
@@ -260,7 +295,7 @@ impl Render for TerminalView {
             .key_context("Terminal")
             .track_focus(&self.focus_handle(cx))
             .size_full()
-            .bg(RgbaExt::to_hsla(colors::BACKGROUND))
+            .bg(Hsla::from(colors::BACKGROUND))
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _window, cx| {
                 let ks = &event.keystroke;
 
@@ -293,7 +328,7 @@ impl Render for TerminalView {
                         }
                     }
                     this.selection = None;
-                    this.blink_epoch = Instant::now();
+                    this.cursor_blink_visible = true;
                     let _ = this.input_tx.try_send(bytes);
                 }
             }))
@@ -565,8 +600,8 @@ impl Element for TerminalElement {
                     (cell.fg, cell.bg)
                 };
 
-                let fg_hsla = RgbaExt::to_hsla(fg);
-                let bg_hsla = RgbaExt::to_hsla(bg);
+                let fg_hsla = Hsla::from(fg);
+                let bg_hsla = Hsla::from(bg);
 
                 let bg_is_default = !at_block_cursor && !cell.selected && bg == colors::BACKGROUND;
                 if !bg_is_default {
@@ -654,7 +689,7 @@ impl Element for TerminalElement {
                     &[TextRun {
                         len: 1,
                         font: font.clone(),
-                        color: RgbaExt::to_hsla(colors::FOREGROUND),
+                        color: Hsla::from(colors::FOREGROUND),
                         background_color: None,
                         underline: None,
                         strikethrough: None,
@@ -688,7 +723,7 @@ impl Element for TerminalElement {
         let (block_cursor, line_cursor) = if show_cursor && cursor_row < new_size.rows {
             let cx = bounds.origin.x + cell_width * cursor_col as f32;
             let cy = bounds.origin.y + line_height * cursor_row as f32;
-            let cursor_color = RgbaExt::to_hsla(colors::FOREGROUND);
+            let cursor_color = Hsla::from(colors::FOREGROUND);
 
             match cursor_shape {
                 CursorShape::Block => (
@@ -768,16 +803,3 @@ impl Element for TerminalElement {
     }
 }
 
-struct RgbaExt;
-
-impl RgbaExt {
-    fn to_hsla(rgba: gpui::Rgba) -> gpui::Hsla {
-        gpui::rgba(
-            ((rgba.r * 255.0) as u32) << 24
-                | ((rgba.g * 255.0) as u32) << 16
-                | ((rgba.b * 255.0) as u32) << 8
-                | ((rgba.a * 255.0) as u32),
-        )
-        .into()
-    }
-}
