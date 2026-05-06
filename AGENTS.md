@@ -73,7 +73,12 @@ cargo run -p daemon -- --port 9500                               # run daemon lo
 - **`develop`** — protected, integration branch. All feature work merges here first via PR.
 - **Feature branches** — branch off `develop`, merge back into `develop`. Naming: `feat/<scope>`, `fix/<scope>`, `chore/<scope>`.
 
-Never push directly to `main` or `develop`. Always use pull requests. Delete feature branches after merge.
+**Hard rules:**
+- Always `git checkout develop && git pull` before creating a feature branch.
+- Always target `develop` as base branch when creating a PR (`gh pr create --base develop`).
+- Never target `main` for feature PRs. `main` only receives merges from `develop`.
+- Never push directly to `main` or `develop`. Always use pull requests.
+- Delete feature branches after merge.
 
 ## Commits
 
