@@ -1,5 +1,6 @@
-mod error;
+mod colors;
+pub mod grid;
+pub mod keyboard;
+mod view;
 
-pub use error::TerminalError;
-
-pub type Result<T> = std::result::Result<T, TerminalError>;
+pub use view::{TermSize, TerminalHandle, TerminalView};
