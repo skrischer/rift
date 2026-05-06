@@ -107,7 +107,7 @@ fn main() {
             .unwrap();
         window
             .update(cx, |view, window, cx| {
-                window.focus(&view.focus_handle(cx));
+                window.focus(&view.focus_handle(cx), cx);
             })
             .unwrap();
         cx.activate(true);
