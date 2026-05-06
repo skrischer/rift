@@ -97,14 +97,17 @@ pub fn take_damage<T: EventListener>(term: &mut Term<T>) -> DamageSnapshot {
 pub fn extract_row_cells<T: EventListener>(
     term: &Term<T>,
     row: usize,
+    display_offset: usize,
     selection: Option<&GridSelection>,
 ) -> Vec<CellRenderInfo> {
     let grid = term.grid();
     let columns = grid.columns();
     let mut cells = Vec::with_capacity(columns);
 
+    let line = Line(row as i32 - display_offset as i32);
+
     for col in 0..columns {
-        let cell = &grid[Line(row as i32)][Column(col)];
+        let cell = &grid[line][Column(col)];
 
         let flags = cell.flags;
         let inverse = flags.contains(Flags::INVERSE);
@@ -268,7 +271,7 @@ mod tests {
     #[test]
     fn test_extract_row_cells_default_grid() {
         let term = make_term(80, 24);
-        let cells = extract_row_cells(&term, 0, None);
+        let cells = extract_row_cells(&term, 0, 0, None);
 
         assert_eq!(cells.len(), 80);
         assert_eq!(cells[0].col, 0);
@@ -287,7 +290,7 @@ mod tests {
             end_row: 0,
             end_col: 10,
         };
-        let cells = extract_row_cells(&term, 0, Some(&sel));
+        let cells = extract_row_cells(&term, 0, 0, Some(&sel));
 
         assert!(!cells[4].selected);
         assert!(cells[5].selected);

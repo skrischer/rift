@@ -4822,6 +4822,7 @@ name = "rift-ssh"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "flume 0.12.0",
  "russh",
  "russh-keys",
  "thiserror 2.0.18",

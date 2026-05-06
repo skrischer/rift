@@ -15,7 +15,6 @@ struct SshConfig {
 
 struct PtyChannels {
     pty_tx: flume::Sender<Vec<u8>>,
-    notify_tx: flume::Sender<()>,
     input_rx: flume::Receiver<Vec<u8>>,
     size_changed_rx: flume::Receiver<TermSize>,
 }
@@ -51,7 +50,6 @@ fn main() {
 
                         let channels = PtyChannels {
                             pty_tx: handle.pty_tx,
-                            notify_tx: handle.notify_tx,
                             input_rx: handle.input_rx,
                             size_changed_rx: handle.size_changed_rx,
                         };
@@ -89,11 +87,12 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
 
     let pty = conn.open_pty(80, 24).await.context("failed to open PTY")?;
 
-    pty.write(b"tmux new-session -A -s rift\n")
+    let pty_writer = pty.clone_writer();
+
+    pty_writer
+        .write(b"tmux new-session -A -s rift\n")
         .await
         .context("failed to start tmux")?;
-
-    let pty_writer = pty.clone_writer();
 
     let write_handle = tokio::spawn({
         let input_rx = ch.input_rx.clone();
@@ -123,7 +122,6 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
         if ch.pty_tx.send(data).is_err() {
             break;
         }
-        let _ = ch.notify_tx.send(());
     }
 
     write_handle.abort();

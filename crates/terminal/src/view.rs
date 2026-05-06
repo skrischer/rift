@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::Instant;
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
@@ -41,7 +41,6 @@ impl EventListener for Listener {
 
 pub struct TerminalHandle {
     pub pty_tx: flume::Sender<Vec<u8>>,
-    pub notify_tx: flume::Sender<()>,
     pub input_rx: flume::Receiver<Vec<u8>>,
     pub size_changed_rx: flume::Receiver<TermSize>,
 }
@@ -64,6 +63,8 @@ struct RowCacheState {
     entries: Vec<Option<CachedRow>>,
     grid_cols: usize,
     grid_rows: usize,
+    cell_size: Size<Pixels>,
+    grid_origin: Point<Pixels>,
     prev_cursor_visible: bool,
     prev_cursor_row: usize,
     prev_selection: Option<GridSelection>,
@@ -76,6 +77,8 @@ impl RowCacheState {
             entries: Vec::new(),
             grid_cols: 0,
             grid_rows: 0,
+            cell_size: size(px(0.0), px(0.0)),
+            grid_origin: point(px(0.0), px(0.0)),
             prev_cursor_visible: true,
             prev_cursor_row: 0,
             prev_selection: None,
@@ -95,7 +98,7 @@ pub struct TerminalView {
     grid_size: TermSize,
     selection: Option<GridSelection>,
     selecting: bool,
-    cursor_visible: bool,
+    blink_epoch: Instant,
     row_cache: Arc<Mutex<RowCacheState>>,
 }
 
@@ -106,43 +109,8 @@ impl TerminalView {
         let terminal = Term::new(config, &grid_size, Listener);
 
         let (pty_tx, pty_rx) = flume::unbounded();
-        let (notify_tx, notify_rx) = flume::unbounded::<()>();
         let (input_tx, input_rx) = flume::unbounded();
         let (size_changed_tx, size_changed_rx) = flume::unbounded();
-
-        cx.spawn(async move |this, cx| {
-            while notify_rx.recv_async().await.is_ok() {
-                let _ = cx.update(|cx| {
-                    this.update(cx, |_, cx| cx.notify()).ok();
-                });
-            }
-        })
-        .detach();
-
-        let (blink_tx, blink_rx) = flume::unbounded::<()>();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(500));
-            if blink_tx.send(()).is_err() {
-                break;
-            }
-        });
-        cx.spawn(async move |this, cx| {
-            while blink_rx.recv_async().await.is_ok() {
-                let ok = cx
-                    .update(|cx| {
-                        this.update(cx, |view, cx| {
-                            view.cursor_visible = !view.cursor_visible;
-                            cx.notify();
-                        })
-                        .is_ok()
-                    })
-                    .is_ok();
-                if !ok {
-                    break;
-                }
-            }
-        })
-        .detach();
 
         let view = Self {
             terminal: Arc::new(Mutex::new(terminal)),
@@ -155,13 +123,12 @@ impl TerminalView {
             grid_size,
             selection: None,
             selecting: false,
-            cursor_visible: true,
+            blink_epoch: Instant::now(),
             row_cache: Arc::new(Mutex::new(RowCacheState::new())),
         };
 
         let handle = TerminalHandle {
             pty_tx,
-            notify_tx,
             input_rx,
             size_changed_rx,
         };
@@ -173,16 +140,35 @@ impl TerminalView {
         while let Ok(data) = self.pty_rx.try_recv() {
             let mut term = self.terminal.lock().expect("term lock poisoned");
             let mut parser = self.parser.lock().expect("parser lock poisoned");
+            let offset_before = term.grid().display_offset();
             parser.advance(&mut *term, &data);
+            if offset_before > 0 && term.grid().display_offset() == 0 {
+                term.scroll_display(alacritty_terminal::grid::Scroll::Delta(
+                    offset_before as i32,
+                ));
+            }
         }
     }
 
     fn pixel_to_grid(&self, pos: Point<Pixels>) -> (usize, usize) {
-        let col = (pos.x / self.cell_size.width).floor().max(0.0) as usize;
-        let row = (pos.y / self.cell_size.height).floor().max(0.0) as usize;
+        let cache = self.row_cache.lock().expect("cache lock poisoned");
+        let cell_size = cache.cell_size;
+        let origin = cache.grid_origin;
+        let grid_cols = cache.grid_cols;
+        let grid_rows = cache.grid_rows;
+        drop(cache);
+
+        if cell_size.width <= px(0.0) || cell_size.height <= px(0.0) {
+            return (0, 0);
+        }
+
+        let local_x = pos.x - origin.x;
+        let local_y = pos.y - origin.y;
+        let col = (local_x / cell_size.width).floor().max(0.0) as usize;
+        let row = (local_y / cell_size.height).floor().max(0.0) as usize;
         (
-            col.min(self.grid_size.cols.saturating_sub(1)),
-            row.min(self.grid_size.rows.saturating_sub(1)),
+            col.min(grid_cols.saturating_sub(1)),
+            row.min(grid_rows.saturating_sub(1)),
         )
     }
 
@@ -192,6 +178,7 @@ impl TerminalView {
         let term = self.terminal.lock().expect("term lock poisoned");
         let grid = term.grid();
         let columns = grid.columns();
+        let display_offset = grid.display_offset();
         let mut result = String::new();
 
         for row in sr..=er {
@@ -204,12 +191,13 @@ impl TerminalView {
             } else {
                 columns.saturating_sub(1)
             };
+            let line_idx = Line(row as i32 - display_offset as i32);
             let mut line = String::new();
             for col in c0..=c1 {
                 if col >= columns {
                     break;
                 }
-                let cell = &grid[Line(row as i32)][Column(col)];
+                let cell = &grid[line_idx][Column(col)];
                 if cell
                     .flags
                     .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER)
@@ -242,14 +230,28 @@ impl Focusable for TerminalView {
 }
 
 impl Render for TerminalView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.process_incoming();
+
+        {
+            let cache = self.row_cache.lock().expect("cache lock poisoned");
+            self.cell_size = cache.cell_size;
+            if cache.grid_cols > 0 && cache.grid_rows > 0 {
+                self.grid_size = TermSize {
+                    cols: cache.grid_cols,
+                    rows: cache.grid_rows,
+                };
+            }
+        }
+
+        let cursor_visible = (self.blink_epoch.elapsed().as_millis() / 500).is_multiple_of(2);
+
+        window.request_animation_frame();
 
         let terminal = self.terminal.clone();
         let cell_size = self.cell_size;
         let grid_size = self.grid_size;
         let selection = self.selection.clone();
-        let cursor_visible = self.cursor_visible;
         let size_changed_tx = self.size_changed_tx.clone();
         let row_cache = self.row_cache.clone();
 
@@ -291,6 +293,7 @@ impl Render for TerminalView {
                         }
                     }
                     this.selection = None;
+                    this.blink_epoch = Instant::now();
                     let _ = this.input_tx.try_send(bytes);
                 }
             }))
@@ -337,7 +340,10 @@ impl Render for TerminalView {
                 let delta = match event.delta {
                     ScrollDelta::Lines(lines) => lines.y.round() as i32,
                     ScrollDelta::Pixels(pixels) => {
-                        let lh: f32 = this.cell_size.height.into();
+                        let lh: f32 = {
+                            let cache = this.row_cache.lock().expect("cache lock poisoned");
+                            cache.cell_size.height.into()
+                        };
                         if lh > 0.0 {
                             (pixels.y / px(lh)).round() as i32
                         } else {
@@ -475,6 +481,9 @@ impl Element for TerminalElement {
             cache.grid_rows = new_size.rows;
         }
 
+        cache.cell_size = self.cell_size;
+        cache.grid_origin = bounds.origin;
+
         let mut dirty_rows: Vec<usize> = match &damage {
             DamageSnapshot::Full => (0..new_size.rows).collect(),
             DamageSnapshot::Partial(spans) => {
@@ -523,7 +532,8 @@ impl Element for TerminalElement {
                 continue;
             }
 
-            let cells = grid::extract_row_cells(&*term, row_idx, self.selection.as_ref());
+            let cells =
+                grid::extract_row_cells(&*term, row_idx, display_offset, self.selection.as_ref());
             let y = bounds.origin.y + line_height * row_idx as f32;
             let mut bg_spans = Vec::new();
             let mut line_text = String::with_capacity(new_size.cols);
