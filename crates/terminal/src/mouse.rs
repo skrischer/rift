@@ -1,8 +1,4 @@
-/// Mouse protocol encoding for terminal applications.
-///
-/// Implements the three standard mouse encoding formats (Normal/X10, UTF-8, SGR)
-/// and four reporting modes (X10, Normal/VT200, ButtonEvent, AnyEvent) as defined
-/// in the xterm control sequences specification.
+// Copyright (C) rift contributors. Licensed under MIT OR Apache-2.0.
 
 // ---------------------------------------------------------------------------
 // Button types
@@ -13,7 +9,6 @@ pub enum MouseButton {
     Left,
     Middle,
     Right,
-    Release,
     WheelUp,
     WheelDown,
     WheelLeft,
@@ -129,10 +124,6 @@ fn is_reportable(event: MouseEventKind, mode: MouseReportingMode) -> bool {
             MouseEventKind::Press(MouseButton::Left)
                 | MouseEventKind::Press(MouseButton::Middle)
                 | MouseEventKind::Press(MouseButton::Right)
-                | MouseEventKind::Press(MouseButton::WheelUp)
-                | MouseEventKind::Press(MouseButton::WheelDown)
-                | MouseEventKind::Press(MouseButton::WheelLeft)
-                | MouseEventKind::Press(MouseButton::WheelRight)
         ),
         MouseReportingMode::Normal => {
             matches!(event, MouseEventKind::Press(_) | MouseEventKind::Release(_))
@@ -149,33 +140,25 @@ fn is_reportable(event: MouseEventKind, mode: MouseReportingMode) -> bool {
 // Button code computation
 // ---------------------------------------------------------------------------
 
-fn base_button_code(event: MouseEventKind) -> u8 {
+const MOTION_FLAG: u8 = 32;
+
+fn button_code(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+        MouseButton::WheelUp => 64,
+        MouseButton::WheelDown => 65,
+        MouseButton::WheelLeft => 66,
+        MouseButton::WheelRight => 67,
+    }
+}
+
+fn event_button_code(event: MouseEventKind) -> u8 {
     match event {
-        MouseEventKind::Press(button) | MouseEventKind::Release(button) => match button {
-            MouseButton::Left => 0,
-            MouseButton::Middle => 1,
-            MouseButton::Right => 2,
-            MouseButton::Release => 3,
-            MouseButton::WheelUp => 64,
-            MouseButton::WheelDown => 65,
-            MouseButton::WheelLeft => 66,
-            MouseButton::WheelRight => 67,
-        },
-        MouseEventKind::Drag(button) => {
-            let base = match button {
-                MouseButton::Left => 0,
-                MouseButton::Middle => 1,
-                MouseButton::Right => 2,
-                // Drag with these is unusual but encode defensively.
-                MouseButton::Release => 3,
-                MouseButton::WheelUp => 64,
-                MouseButton::WheelDown => 65,
-                MouseButton::WheelLeft => 66,
-                MouseButton::WheelRight => 67,
-            };
-            base + 32
-        }
-        MouseEventKind::Move => 35, // 3 (no button) + 32 (motion flag)
+        MouseEventKind::Press(button) | MouseEventKind::Release(button) => button_code(button),
+        MouseEventKind::Drag(button) => button_code(button) + MOTION_FLAG,
+        MouseEventKind::Move => 3 + MOTION_FLAG,
     }
 }
 
@@ -208,11 +191,11 @@ fn encode_normal(
         return None;
     }
 
-    let button_byte = compute_legacy_button(event, modifiers);
-    let col_byte = (position.col as u8) + 32 + 1;
-    let row_byte = (position.row as u8) + 32 + 1;
+    let button_byte = 32 + compute_legacy_button(event, modifiers);
+    let col_byte = (position.col + 33) as u8;
+    let row_byte = (position.row + 33) as u8;
 
-    Some(vec![0x1b, b'[', b'M', 32 + button_byte, col_byte, row_byte])
+    Some(vec![0x1b, b'[', b'M', button_byte, col_byte, row_byte])
 }
 
 // ---------------------------------------------------------------------------
@@ -230,8 +213,8 @@ fn encode_utf8(
         return None;
     }
 
-    let button_byte = compute_legacy_button(event, modifiers);
-    let mut buf = vec![0x1b, b'[', b'M', 32 + button_byte];
+    let button_byte = 32 + compute_legacy_button(event, modifiers);
+    let mut buf = vec![0x1b, b'[', b'M', button_byte];
     push_utf8_coord(&mut buf, position.col);
     push_utf8_coord(&mut buf, position.row);
 
@@ -239,7 +222,11 @@ fn encode_utf8(
 }
 
 fn push_utf8_coord(buf: &mut Vec<u8>, coord: usize) {
-    let value = coord + 32 + 1;
+    debug_assert!(
+        coord < 2015,
+        "coord {coord} exceeds UTF-8 mouse encoding limit"
+    );
+    let value = coord + 33;
     if value < 128 {
         buf.push(value as u8);
     } else {
@@ -260,7 +247,7 @@ fn encode_sgr(
     position: MousePosition,
     modifiers: MouseModifiers,
 ) -> Vec<u8> {
-    let button = base_button_code(event) + modifier_bits(modifiers);
+    let button = event_button_code(event) + modifier_bits(modifiers);
     let suffix = match event {
         MouseEventKind::Release(_) => 'm',
         _ => 'M',
@@ -281,11 +268,12 @@ fn encode_sgr(
 // ---------------------------------------------------------------------------
 
 /// In legacy encodings, release always uses button code 3 (regardless of which
-/// button was released).
+/// button was released), because the protocol cannot distinguish which button
+/// was released.
 fn compute_legacy_button(event: MouseEventKind, modifiers: MouseModifiers) -> u8 {
     let base = match event {
         MouseEventKind::Release(_) => 3,
-        _ => base_button_code(event),
+        _ => event_button_code(event),
     };
     base + modifier_bits(modifiers)
 }
@@ -774,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn test_x10_reports_wheel() {
+    fn test_x10_rejects_wheel() {
         let wheel = encode_mouse_event(
             MouseEventKind::Press(MouseButton::WheelUp),
             pos(0, 0),
@@ -782,7 +770,7 @@ mod tests {
             MouseEncoding::Sgr,
             MouseReportingMode::X10,
         );
-        assert!(wheel.is_some());
+        assert!(wheel.is_none());
     }
 
     #[test]
