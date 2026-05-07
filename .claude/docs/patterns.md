@@ -76,9 +76,11 @@ GPUI owns the main event loop (`Application::new().run()`). Tokio lives in a sep
 - `Arc<Mutex<T>>` only where channel-based snapshots are not feasible (e.g. `alacritty_terminal::Term` shared between PTY loop and UI render)
 
 ```rust
-// GPUI side: offload CPU-bound parsing
+// GPUI side: offload CPU-bound VTE parsing
 let result = smol::unblock(move || {
-    parser.process_bytes(&raw_output)
+    let mut term = terminal.lock().map_err(|_| TerminalError::LockPoisoned)?;
+    parser.advance(&mut *term, &filtered);
+    Ok(parser)
 }).await;
 
 // Tokio side: offload blocking file I/O
