@@ -495,11 +495,15 @@ fn extract_row_cells(
         let raw_fg = Hsla::from(colors::to_gpui_color(cell.fg));
         let raw_bg = Hsla::from(colors::to_gpui_color(cell.bg));
 
-        let (fg, bg) = if inverse {
+        let (mut fg, bg) = if inverse {
             (raw_bg, raw_fg)
         } else {
             (raw_fg, raw_bg)
         };
+
+        if flags.contains(Flags::DIM) {
+            fg.a *= 0.5;
+        }
 
         let ch = if cell.c == '\0' { ' ' } else { cell.c };
         let selected = selection.is_some_and(|sel| sel.contains(row, col));
@@ -591,15 +595,19 @@ impl Render for TerminalView {
             self.prev_selection = self.selection.clone();
         }
 
+        let mode = *term.mode();
+
         let cursor_point = term.grid().cursor.point;
         let cursor_row = cursor_point.line.0 as usize;
         let cursor_col = cursor_point.column.0;
         let cursor_style = term.cursor_style();
-        let cursor_shape = cursor_style.shape;
+        let cursor_shape = if mode.contains(TermMode::SHOW_CURSOR) {
+            cursor_style.shape
+        } else {
+            CursorShape::Hidden
+        };
         let show_cursor = cursor_shape != CursorShape::Hidden
             && (self.cursor_blink_visible || !cursor_style.blinking);
-
-        let mode = *term.mode();
         let mouse_now = mode.intersects(
             TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION,
         );
@@ -766,20 +774,35 @@ impl Render for TerminalView {
                 };
                 let mouse_mode = Self::mouse_mode_from_term(mode);
 
-                if mouse_mode.enabled && event.pressed_button == Some(MouseButton::Left) {
-                    let (col, row) = this.pixel_to_grid(event.position);
-                    let modifiers = TerminalMouseModifiers {
-                        shift: event.modifiers.shift,
-                        alt: event.modifiers.alt,
-                        control: event.modifiers.control,
+                if mouse_mode.enabled {
+                    let button = match event.pressed_button {
+                        Some(MouseButton::Left) => {
+                            Some(TerminalMouseEventKind::Drag(TerminalMouseButton::Left))
+                        }
+                        Some(MouseButton::Right) => {
+                            Some(TerminalMouseEventKind::Drag(TerminalMouseButton::Right))
+                        }
+                        Some(MouseButton::Middle) => {
+                            Some(TerminalMouseEventKind::Drag(TerminalMouseButton::Middle))
+                        }
+                        None if mouse_mode.report_motion => Some(TerminalMouseEventKind::Move),
+                        _ => None,
                     };
-                    if let Some(bytes) = encode_mouse_report(
-                        mouse_mode,
-                        TerminalMouseEventKind::Drag(TerminalMouseButton::Left),
-                        TerminalMousePosition { col, row },
-                        modifiers,
-                    ) {
-                        let _ = this.input_tx.try_send(bytes);
+                    if let Some(event_kind) = button {
+                        let (col, row) = this.pixel_to_grid(event.position);
+                        let modifiers = TerminalMouseModifiers {
+                            shift: event.modifiers.shift,
+                            alt: event.modifiers.alt,
+                            control: event.modifiers.control,
+                        };
+                        if let Some(bytes) = encode_mouse_report(
+                            mouse_mode,
+                            event_kind,
+                            TerminalMousePosition { col, row },
+                            modifiers,
+                        ) {
+                            let _ = this.input_tx.try_send(bytes);
+                        }
                     }
                 } else if this.selecting && event.pressed_button == Some(MouseButton::Left) {
                     let (col, row) = this.pixel_to_grid(event.position);
@@ -854,6 +877,64 @@ impl Render for TerminalView {
                             cx.write_to_clipboard(ClipboardItem::new_string(text));
                         }
                         cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                    let mode = {
+                        let term = this.terminal.lock().expect("term lock poisoned");
+                        *term.mode()
+                    };
+                    let mouse_mode = Self::mouse_mode_from_term(mode);
+
+                    if mouse_mode.enabled {
+                        let (col, row) = this.pixel_to_grid(event.position);
+                        let modifiers = TerminalMouseModifiers {
+                            shift: event.modifiers.shift,
+                            alt: event.modifiers.alt,
+                            control: event.modifiers.control,
+                        };
+                        if let Some(bytes) = encode_mouse_report(
+                            mouse_mode,
+                            TerminalMouseEventKind::Press(TerminalMouseButton::Right),
+                            TerminalMousePosition { col, row },
+                            modifiers,
+                        ) {
+                            let _ = this.input_tx.try_send(bytes);
+                        }
+                    } else if let Some(item) = cx.read_from_clipboard() {
+                        if let Some(text) = item.text() {
+                            let _ = this.input_tx.try_send(text.as_bytes().to_vec());
+                        }
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
+                    let mode = {
+                        let term = this.terminal.lock().expect("term lock poisoned");
+                        *term.mode()
+                    };
+                    let mouse_mode = Self::mouse_mode_from_term(mode);
+
+                    if mouse_mode.enabled {
+                        let (col, row) = this.pixel_to_grid(event.position);
+                        let modifiers = TerminalMouseModifiers {
+                            shift: event.modifiers.shift,
+                            alt: event.modifiers.alt,
+                            control: event.modifiers.control,
+                        };
+                        if let Some(bytes) = encode_mouse_report(
+                            mouse_mode,
+                            TerminalMouseEventKind::Release(TerminalMouseButton::Right),
+                            TerminalMousePosition { col, row },
+                            modifiers,
+                        ) {
+                            let _ = this.input_tx.try_send(bytes);
+                        }
                     }
                 }),
             )
