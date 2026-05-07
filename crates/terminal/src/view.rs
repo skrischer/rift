@@ -9,10 +9,10 @@ use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape, Processor};
 use gpui::*;
 use termy_terminal_ui::{
-    encode_mouse_report, CellRenderInfo, CommandLifecycle, OscEvent, OscInterceptor,
-    TerminalCursorStyle, TerminalGrid, TerminalGridPaintCacheHandle, TerminalGridPaintDamage,
-    TerminalMouseButton, TerminalMouseEventKind, TerminalMouseMode, TerminalMouseModifiers,
-    TerminalMousePosition,
+    encode_mouse_report, find_link_in_line, CellRenderInfo, CommandLifecycle, OscEvent,
+    OscInterceptor, TerminalCursorStyle, TerminalGrid, TerminalGridPaintCacheHandle,
+    TerminalGridPaintDamage, TerminalMouseButton, TerminalMouseEventKind, TerminalMouseMode,
+    TerminalMouseModifiers, TerminalMousePosition,
 };
 
 use tracing::{debug, info};
@@ -109,6 +109,14 @@ pub struct TerminalView {
     working_directory: Option<String>,
     command_lifecycle: CommandLifecycle,
     mouse_mode_active: bool,
+    hovered_link: Option<HoveredLink>,
+}
+
+struct HoveredLink {
+    row: usize,
+    start_col: usize,
+    end_col: usize,
+    target: String,
 }
 
 impl TerminalView {
@@ -210,6 +218,7 @@ impl TerminalView {
             working_directory: None,
             command_lifecycle: CommandLifecycle::default(),
             mouse_mode_active: false,
+            hovered_link: None,
         };
 
         let handle = TerminalHandle {
@@ -312,6 +321,84 @@ impl TerminalView {
                 self.command_lifecycle.command_finished(code);
             }
             _ => {}
+        }
+    }
+
+    fn detect_link_at(&self, row: usize, col: usize) -> Option<HoveredLink> {
+        let term = self.terminal.lock().expect("term lock poisoned");
+        let grid = term.grid();
+        let display_offset = grid.display_offset();
+        let line = Line(row as i32 - display_offset as i32);
+        let columns = grid.columns();
+
+        // OSC 8: check if cell has an explicit hyperlink
+        if col < columns {
+            if let Some(hyperlink) = grid[line][Column(col)].hyperlink() {
+                let uri = hyperlink.uri().to_owned();
+                let mut start = col;
+                let mut end = col;
+                while start > 0 {
+                    if let Some(h) = grid[line][Column(start - 1)].hyperlink() {
+                        if h.uri() == hyperlink.uri() {
+                            start -= 1;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                while end + 1 < columns {
+                    if let Some(h) = grid[line][Column(end + 1)].hyperlink() {
+                        if h.uri() == hyperlink.uri() {
+                            end += 1;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                return Some(HoveredLink {
+                    row,
+                    start_col: start,
+                    end_col: end,
+                    target: uri,
+                });
+            }
+        }
+
+        // Regex fallback: extract row text and use find_link_in_line
+        let chars: Vec<char> = (0..columns)
+            .map(|c| {
+                let cell = &grid[line][Column(c)];
+                if cell.c == '\0' {
+                    ' '
+                } else {
+                    cell.c
+                }
+            })
+            .collect();
+
+        find_link_in_line(&chars, col).map(|detected| HoveredLink {
+            row,
+            start_col: detected.start_col,
+            end_col: detected.end_col,
+            target: detected.target,
+        })
+    }
+
+    fn open_link(url: &str) {
+        debug!(%url, "opening link");
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("cmd")
+                .args(["/C", "start", "", url])
+                .spawn();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open").arg(url).spawn();
         }
     }
 
@@ -517,7 +604,10 @@ impl Render for TerminalView {
             selection_fg: fg_hsla,
             search_match_bg: selection_bg,
             search_current_bg: selection_bg,
-            hovered_link_range: None,
+            hovered_link_range: self
+                .hovered_link
+                .as_ref()
+                .map(|l| (l.row, l.start_col, l.end_col)),
             cursor_cell,
             cursor_visible: show_cursor,
             font_family: "JetBrainsMono Nerd Font Mono".into(),
@@ -525,12 +615,18 @@ impl Render for TerminalView {
             cursor_style: termy_cursor_style,
         };
 
-        div()
+        let mut container = div()
             .id("terminal")
             .key_context("Terminal")
             .track_focus(&self.focus_handle(cx))
             .size_full()
-            .bg(bg_hsla)
+            .bg(bg_hsla);
+
+        if self.hovered_link.is_some() {
+            container = container.cursor(gpui::CursorStyle::PointingHand);
+        }
+
+        container
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _window, cx| {
                 let ks = &event.keystroke;
 
@@ -570,6 +666,16 @@ impl Render for TerminalView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                    // Ctrl+Click opens hovered link
+                    if event.modifiers.control {
+                        if let Some(ref link) = this.hovered_link {
+                            Self::open_link(&link.target);
+                            this.hovered_link = None;
+                            cx.notify();
+                            return;
+                        }
+                    }
+
                     let mode = {
                         let term = this.terminal.lock().expect("term lock poisoned");
                         *term.mode()
@@ -632,6 +738,32 @@ impl Render for TerminalView {
                         sel.end_row = row;
                         sel.end_col = col;
                     }
+                    cx.notify();
+                }
+
+                // Link detection on Ctrl+hover
+                if event.modifiers.control && event.pressed_button.is_none() {
+                    let (col, row) = this.pixel_to_grid(event.position);
+                    let new_link = this.detect_link_at(row, col);
+                    if this
+                        .hovered_link
+                        .as_ref()
+                        .map(|l| (&l.target, l.row, l.start_col))
+                        != new_link.as_ref().map(|l| (&l.target, l.row, l.start_col))
+                    {
+                        if let Some(ref link) = new_link {
+                            debug!(
+                                url = %link.target,
+                                row = link.row,
+                                cols = ?(link.start_col..=link.end_col),
+                                "link detected"
+                            );
+                        }
+                        this.hovered_link = new_link;
+                        cx.notify();
+                    }
+                } else if this.hovered_link.is_some() {
+                    this.hovered_link = None;
                     cx.notify();
                 }
             }))
