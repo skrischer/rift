@@ -9,8 +9,8 @@ use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape, Processor};
 use gpui::*;
 use termy_terminal_ui::{
-    encode_mouse_report, CellRenderInfo, TerminalCursorStyle, TerminalGrid,
-    TerminalGridPaintCacheHandle, TerminalGridPaintDamage, TerminalMouseButton,
+    encode_mouse_report, CellRenderInfo, OscEvent, OscInterceptor, TerminalCursorStyle,
+    TerminalGrid, TerminalGridPaintCacheHandle, TerminalGridPaintDamage, TerminalMouseButton,
     TerminalMouseEventKind, TerminalMouseMode, TerminalMouseModifiers, TerminalMousePosition,
 };
 
@@ -103,6 +103,7 @@ pub struct TerminalView {
     selecting: bool,
     cursor_blink_visible: bool,
     paint_cache: TerminalGridPaintCacheHandle,
+    working_directory: Option<String>,
 }
 
 impl TerminalView {
@@ -120,19 +121,36 @@ impl TerminalView {
             let terminal = terminal.clone();
             let parser = parser.clone();
             cx.spawn(async move |this, cx| {
+                let mut osc = OscInterceptor::new();
                 loop {
                     let Ok(data) = pty_rx.recv_async().await else {
                         break;
                     };
+                    let mut all_events: Vec<OscEvent> = Vec::new();
                     {
                         let mut term = terminal.lock().expect("term lock poisoned");
                         let mut p = parser.lock().expect("parser lock poisoned");
-                        p.advance(&mut *term, &data);
+                        let (filtered, events) = osc.process(&data);
+                        all_events.extend(events);
+                        if !filtered.is_empty() {
+                            p.advance(&mut *term, &filtered);
+                        }
                         while let Ok(more) = pty_rx.try_recv() {
-                            p.advance(&mut *term, &more);
+                            let (filtered, events) = osc.process(&more);
+                            all_events.extend(events);
+                            if !filtered.is_empty() {
+                                p.advance(&mut *term, &filtered);
+                            }
                         }
                     }
-                    let result = cx.update(|cx| this.update(cx, |_view, cx| cx.notify()));
+                    let result = cx.update(|cx| {
+                        this.update(cx, |view, cx| {
+                            for event in all_events {
+                                view.handle_osc_event(event);
+                            }
+                            cx.notify();
+                        })
+                    });
                     if result.is_err() {
                         break;
                     }
@@ -177,6 +195,7 @@ impl TerminalView {
             selecting: false,
             cursor_blink_visible: true,
             paint_cache: TerminalGridPaintCacheHandle::default(),
+            working_directory: None,
         };
 
         let handle = TerminalHandle {
@@ -245,6 +264,20 @@ impl TerminalView {
             None
         } else {
             Some(trimmed)
+        }
+    }
+
+    pub fn working_directory(&self) -> Option<&str> {
+        self.working_directory.as_deref()
+    }
+
+    #[allow(clippy::single_match)] // will grow as we wire shell integration, notifications, etc.
+    fn handle_osc_event(&mut self, event: OscEvent) {
+        match event {
+            OscEvent::WorkingDirectory(path) => {
+                self.working_directory = Some(path);
+            }
+            _ => {}
         }
     }
 
