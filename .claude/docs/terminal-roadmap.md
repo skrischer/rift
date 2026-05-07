@@ -14,13 +14,13 @@ Step-by-step plan to replace our custom terminal rendering with termy's `termina
 | Module | Lines | Replaces our... |
 |--------|------:|-----------------|
 | `grid.rs` (TerminalGrid, CellRenderInfo, paint cache, box-drawing geometry) | 3,665 | `view.rs` TerminalElement + `grid.rs` CellRenderInfo |
-| `keyboard.rs` (keystroke_to_input, Kitty protocol) | 1,372 | `keyboard.rs` (563L) |
-| `mouse_protocol.rs` (encode_mouse_report) | 305 | `mouse.rs` (943L) |
+| `keyboard.rs` (keystroke_to_input, Kitty protocol) | 1,372 | -- (termy's is `pub(crate)`, we keep ours) |
+| `mouse_protocol.rs` (encode_mouse_report) | 305 | `mouse.rs` (deleted) |
 | `osc_intercept.rs` (OSC 7/8/9/133/777) | 432 | nothing (new feature) |
 | `shell_integration.rs` (command lifecycle) | 252 | nothing (new feature) |
 | `links.rs` (URL/path detection) | 527 | nothing (new feature) |
 | `render_metrics.rs` | 220 | nothing (new feature) |
-| `tmux/` (control mode client, parser, sessions) | 4,313 | nothing (was Phase 3+ roadmap item) |
+| `tmux/` (control mode client, parser, sessions) | 4,313 | nothing (future) |
 
 ## What we DON'T take
 
@@ -38,121 +38,45 @@ Step-by-step plan to replace our custom terminal rendering with termy's `termina
 
 ---
 
-## Phase 1: GPUI Upgrade
+## Phase 1: GPUI Upgrade -- DONE
 
-**Goal:** Pin GPUI to termy's rev so we can depend on `terminal_ui`.
+Pinned GPUI to termy's Zed git rev. Fixed API changes in app + terminal crates.
 
-Current: `gpui = "0.2.2"` (crates.io)
-Target: `gpui = { git = "https://github.com/zed-industries/zed", rev = "83de8a25..." }`
+## Phase 2: Add terminal_ui dependency -- DONE
 
-Steps:
-1. Update workspace `Cargo.toml` to use termy's GPUI git rev
-2. `cargo build --workspace` -- fix compile errors from API changes
-3. Our GPUI surface is ~2,700 lines across 3 crates (app, terminal, ssh). SSH doesn't use GPUI, so only app + terminal need fixes.
-4. `cargo clippy --workspace -- -D warnings` + `cargo test --workspace`
+Added `termy_terminal_ui` to workspace and terminal crate.
 
-Risk: GPUI API changes between 0.2.2 and the Zed commit. Likely affected:
-- Element trait signature (request_layout, prepaint, paint)
-- Window/App context API
-- Text shaping API
+## Phase 3: Replace rendering -- DONE
 
-Mitigation: termy's `grid.rs` shows exactly what the new API looks like.
+Replaced `TerminalElement` with `TerminalGrid`. Deleted `grid.rs`. Adapter function converts `alacritty_terminal::Term` cells to `CellRenderInfo`.
 
-## Phase 2: Add terminal_ui dependency
+## Phase 4: Replace input handling -- DONE
 
-**Goal:** Add the crate without changing any existing code yet.
+Replaced `mouse.rs` with `encode_mouse_report()`. Kept `keyboard.rs` (termy's keyboard API is `pub(crate)`). Added AltGr support for German keyboard layouts.
 
-Steps:
-1. Add to workspace `Cargo.toml`:
-   ```toml
-   termy_terminal_ui = { git = "<termy-repo>", path = "crates/terminal_ui" }
-   ```
-2. Add to `crates/terminal/Cargo.toml` as dependency
-3. `cargo build --workspace` -- confirm it compiles alongside our existing code
-4. No code changes. Both implementations coexist.
+## Phase 5: Wire new features -- DONE
 
-## Phase 3: Replace rendering
+- OSC interception: `OscInterceptor` filters bytes before VTE parser, extracts OSC 7/133 events
+- Shell integration: `CommandLifecycle` tracks command phase (idle/prompt/input/executing)
+- Link detection: Ctrl+hover detects URLs (regex + OSC 8 hyperlinks), Ctrl+click opens them
+- Render metrics: Damage computation timed, grid paint/shaping/cache metrics tracked automatically
+- Structured logging: debug-level tracing for OSC events, resize, PTY lifecycle, mouse mode, links
 
-**Goal:** Swap our `TerminalElement` for termy's `TerminalGrid`.
+## Phase 6: Cleanup -- DONE
 
-This is the core migration step. Our `view.rs` goes from ~800 lines to ~200.
-
-### What gets deleted from our code:
-- `TerminalElement` struct + `impl Element` + `impl IntoElement` (~370 lines)
-- `TerminalPrepaintState` struct
-- `CachedBgSpan`, `CachedRow`, `RowCacheState` structs + impl (~90 lines)
-- `grid.rs`: `CellRenderInfo`, `DamageSnapshot`, `DirtySpan`, `extract_row_cells` (replaced by termy types)
-
-### What gets written:
-- Adapter function: read `alacritty_terminal::Term` grid -> produce `termy_terminal_ui::CellRenderInfo` rows + damage info -> build `TerminalGrid`
-- Updated `TerminalView::render()`: build a `TerminalGrid` instead of a `TerminalElement`
-
-### Key mapping:
-
-| Ours | termy |
-|------|-------|
-| `grid::CellRenderInfo` | `termy_terminal_ui::CellRenderInfo` |
-| `grid::DamageSnapshot` | `termy_terminal_ui::TerminalGridPaintDamage` |
-| `RowCacheState` | `termy_terminal_ui::TerminalGridPaintCacheHandle` |
-| `TerminalElement` | `termy_terminal_ui::TerminalGrid` |
-
-Verify: `cargo test --workspace`, run app, check rendering visually (htop, lazygit for box-drawing).
-
-## Phase 4: Replace input handling
-
-**Goal:** Use termy's keyboard + mouse encoding.
-
-### Keyboard:
-- Replace `keyboard::encode_keystroke()` calls with `termy_terminal_ui::keystroke_to_input()`
-- Delete `crates/terminal/src/keyboard.rs`
-- Gains: Kitty keyboard protocol support
-
-### Mouse:
-- Replace `mouse::encode_mouse_event()` with `termy_terminal_ui::encode_mouse_report()`
-- Delete `crates/terminal/src/mouse.rs`
-- Wire mouse events in `TerminalView::render()`: check terminal mouse mode, route to PTY or local selection
-- Gains: Mouse events actually reach the PTY (vim mouse, tmux mouse, etc.)
-
-Verify: `cargo test --workspace`, test keyboard in vim/tmux, test mouse in tmux.
-
-## Phase 5: Wire new features
-
-**Goal:** Enable features that come free with terminal_ui.
-
-These are independent and can be done in any order:
-
-### OSC interception
-- Instantiate `OscInterceptor` in the VTE processing loop
-- Handle OSC 7 (working directory tracking)
-- Handle OSC 133 (shell integration / prompt markers)
-
-### Link detection
-- Use `find_link_in_line()` on hover
-- Add click handler for detected URLs
-
-### Shell integration
-- Expose `CommandLifecycle` events (prompt start, command start, command end + exit code)
-- Foundation for future UI (command duration, exit status indicators)
-
-### Render metrics
-- Wire up in debug builds for performance profiling
-
-## Phase 6: Cleanup
-
-**Goal:** Remove dead code, update docs.
-
-- Delete remaining unused files from `crates/terminal/src/`
-- Update `crates/terminal/src/lib.rs` exports
-- Update ARCHITECTURE.md if crate responsibilities changed
-- Remove `crates/tmux-core/` from roadmap -- covered by `terminal_ui::tmux`
-- `colors.rs`: evaluate if still needed or if termy's color handling covers it
+- No dead files remaining (grid.rs, mouse.rs already deleted in Phase 3-4)
+- `colors.rs` still needed (termy expects Hsla input, we map from alacritty's Color enum)
+- `keyboard.rs` still needed (termy's is pub(crate))
+- ARCHITECTURE.md updated with termy_terminal_ui references
+- lib.rs exports updated with TerminalUiRenderMetricsSnapshot
 
 ### Final file structure of `crates/terminal/`:
 ```
 src/
-  lib.rs          -- public exports
-  view.rs         -- TerminalView (Render impl, event handlers, ~200 lines)
-  colors.rs       -- theme mapping (if still needed)
+  lib.rs          -- public exports (TermSize, TerminalHandle, TerminalView, RenderMetrics)
+  view.rs         -- TerminalView (~830 lines: render, OSC, links, shell integration, mouse, selection)
+  keyboard.rs     -- keystroke encoding (termy's is pub(crate), so we keep ours)
+  colors.rs       -- Catppuccin Mocha theme, alacritty Color -> Rgba mapping
 ```
 
 Everything else comes from `termy_terminal_ui`.
@@ -162,7 +86,13 @@ Everything else comes from `termy_terminal_ui`.
 ## Decision log
 
 - 2026-05-06: Decided to adopt `terminal_ui` instead of building rendering from scratch. Rationale: 14,900 lines of production-grade rendering, keyboard, mouse, tmux, and shell integration. MIT licensed, zero coupling to termy app. Only blocker is GPUI version alignment.
-- SSH architecture is unaffected: `terminal_ui` operates on `alacritty_terminal::Term` state and byte streams, not on PTY implementation details. We skip `runtime.rs` (local PTY) entirely.
+- 2026-05-06: SSH architecture is unaffected: `terminal_ui` operates on `alacritty_terminal::Term` state and byte streams, not on PTY implementation details. We skip `runtime.rs` (local PTY) entirely.
+- 2026-05-07: Migration complete. Phases 1-6 done. File-path link detection limited over SSH (canonicalize runs locally). termy's keyboard API is pub(crate) so we keep our own keyboard.rs.
+
+## Known limitations
+
+- File-path link detection doesn't work over SSH (termy's `find_link_in_line` uses `fs::canonicalize` which checks the local filesystem, not the remote host)
+- termy's `keystroke_to_input` is `pub(crate)`, so we maintain our own keyboard encoding in `keyboard.rs`
 
 ## Not in scope
 

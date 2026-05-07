@@ -39,10 +39,12 @@ This is a deliberate architectural constraint. There is no agent detection, no a
 ### Rendering pipeline
 
 1. SSH PTY stream delivers raw bytes from the remote shell.
-2. Bytes are fed into `alacritty_terminal::Term` via a VTE parser — this handles all ANSI escape sequence processing, cursor movement, color attributes, and scrollback.
-3. On each render frame, the GPUI terminal widget reads the cell grid from `Term` and paints characters with correct foreground/background colors, font weight, and underline/strikethrough styles.
-4. Keyboard input is captured by GPUI, encoded as terminal escape sequences, and written back to the PTY stream.
-5. Window resize triggers grid recalculation and PTY resize notification.
+2. An `OscInterceptor` (from `termy_terminal_ui`) extracts custom OSC sequences (working directory, shell integration, notifications) before passing filtered bytes to the VTE parser.
+3. Filtered bytes are fed into `alacritty_terminal::Term` via a VTE parser — this handles all ANSI escape sequence processing, cursor movement, color attributes, and scrollback.
+4. On each render frame, the terminal widget reads the cell grid from `Term`, converts cells to `termy_terminal_ui::CellRenderInfo`, and hands them to `TerminalGrid` for GPU-accelerated rendering with box-drawing geometry, shaped-line caching, and paint-damage optimization.
+5. Keyboard input is captured by GPUI, encoded as terminal escape sequences, and written back to the PTY stream.
+6. Mouse events are routed to the PTY (when terminal mouse mode is active) or handled locally (text selection, Ctrl+click link opening).
+7. Window resize triggers grid recalculation and PTY resize notification.
 
 ### Async bridge
 
@@ -86,7 +88,8 @@ When the daemon is introduced, VTE parsing may move server-side (daemon sends pr
 
 | Component | Crate / Technology |
 |---|---|
-| GUI framework | `gpui` (GPUI 0.2.2, Apache-2.0) |
+| GUI framework | `gpui` (from Zed git, Apache-2.0) |
+| Terminal rendering | `termy_terminal_ui` (MIT) — grid painting, link detection, OSC interception, shell integration |
 | Terminal emulation | `alacritty_terminal` 0.26 |
 | VTE parsing | `vte` (via alacritty_terminal) |
 | SSH connection | `russh` |
@@ -102,7 +105,7 @@ rift/
 ├── crates/
 │   ├── app/                # GPUI application binary
 │   ├── ssh/                # SSH connection + PTY stream
-│   ├── terminal/           # GPUI terminal widget + alacritty_terminal
+│   ├── terminal/           # Terminal widget wrapping alacritty_terminal + termy_terminal_ui
 │   ├── daemon/             # Remote daemon binary (Phase 3+)
 │   ├── tmux-core/          # tmux control mode parser + state (Phase 3+)
 │   ├── explorer/           # File watcher, git status, file sync (Phase 3+)
