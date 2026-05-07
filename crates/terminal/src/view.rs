@@ -42,10 +42,16 @@ impl Dimensions for TermSize {
 }
 
 #[derive(Clone)]
-struct Listener;
+struct Listener {
+    event_tx: flume::Sender<Event>,
+}
 
 impl EventListener for Listener {
-    fn send_event(&self, _event: Event) {}
+    fn send_event(&self, event: Event) {
+        if matches!(event, Event::ClipboardStore(..)) {
+            let _ = self.event_tx.try_send(event);
+        }
+    }
 }
 
 pub struct TerminalHandle {
@@ -130,7 +136,11 @@ impl TerminalView {
             "terminal view created"
         );
         let config = Config::default();
-        let terminal = Arc::new(Mutex::new(Term::new(config, &grid_size, Listener)));
+        let (term_event_tx, term_event_rx) = flume::unbounded();
+        let listener = Listener {
+            event_tx: term_event_tx,
+        };
+        let terminal = Arc::new(Mutex::new(Term::new(config, &grid_size, listener)));
         let parser: Arc<Mutex<Processor>> = Arc::new(Mutex::new(Processor::new()));
 
         let (pty_tx, pty_rx) = flume::unbounded::<Vec<u8>>();
@@ -148,27 +158,34 @@ impl TerminalView {
                         debug!("PTY stream closed");
                         break;
                     };
-                    let mut all_events: Vec<OscEvent> = Vec::new();
+                    let mut all_osc_events: Vec<OscEvent> = Vec::new();
                     {
                         let mut term = terminal.lock().expect("term lock poisoned");
                         let mut p = parser.lock().expect("parser lock poisoned");
                         let (filtered, events) = osc.process(&data);
-                        all_events.extend(events);
+                        all_osc_events.extend(events);
                         if !filtered.is_empty() {
                             p.advance(&mut *term, &filtered);
                         }
                         while let Ok(more) = pty_rx.try_recv() {
                             let (filtered, events) = osc.process(&more);
-                            all_events.extend(events);
+                            all_osc_events.extend(events);
                             if !filtered.is_empty() {
                                 p.advance(&mut *term, &filtered);
                             }
                         }
                     }
+                    let mut term_events: Vec<Event> = Vec::new();
+                    while let Ok(event) = term_event_rx.try_recv() {
+                        term_events.push(event);
+                    }
                     let result = cx.update(|cx| {
                         this.update(cx, |view, cx| {
-                            for event in all_events {
+                            for event in all_osc_events {
                                 view.handle_osc_event(event);
+                            }
+                            for event in term_events {
+                                view.handle_term_event(event, cx);
                             }
                             cx.notify();
                         })
@@ -328,6 +345,13 @@ impl TerminalView {
                 self.command_lifecycle.command_finished(code);
             }
             _ => {}
+        }
+    }
+
+    fn handle_term_event(&mut self, event: Event, cx: &mut Context<Self>) {
+        if let Event::ClipboardStore(_, text) = event {
+            debug!(len = text.len(), "OSC 52: clipboard store");
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
 
