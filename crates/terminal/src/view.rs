@@ -111,6 +111,7 @@ pub struct TerminalView {
     command_lifecycle: CommandLifecycle,
     mouse_mode_active: bool,
     hovered_link: Option<HoveredLink>,
+    prev_selection: Option<GridSelection>,
 }
 
 struct HoveredLink {
@@ -220,6 +221,7 @@ impl TerminalView {
             command_lifecycle: CommandLifecycle::default(),
             mouse_mode_active: false,
             hovered_link: None,
+            prev_selection: None,
         };
 
         let handle = TerminalHandle {
@@ -546,8 +548,13 @@ impl Render for TerminalView {
         }
 
         let damage_start = std::time::Instant::now();
-        let paint_damage = map_damage(&mut term);
+        let mut paint_damage = map_damage(&mut term);
         add_span_damage_compute_us(damage_start.elapsed().as_micros() as u64);
+
+        if self.selection != self.prev_selection {
+            paint_damage = TerminalGridPaintDamage::Full;
+            self.prev_selection = self.selection.clone();
+        }
 
         let cursor_point = term.grid().cursor.point;
         let cursor_row = cursor_point.line.0 as usize;
