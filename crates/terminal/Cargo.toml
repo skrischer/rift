@@ -11,3 +11,4 @@ flume.workspace = true
 thiserror.workspace = true
 smol.workspace = true
 termy_terminal_ui.workspace = true
+tracing.workspace = true

@@ -4681,6 +4681,7 @@ dependencies = [
  "smol",
  "termy_terminal_ui",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

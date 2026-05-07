@@ -9,10 +9,13 @@ use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape, Processor};
 use gpui::*;
 use termy_terminal_ui::{
-    encode_mouse_report, CellRenderInfo, OscEvent, OscInterceptor, TerminalCursorStyle,
-    TerminalGrid, TerminalGridPaintCacheHandle, TerminalGridPaintDamage, TerminalMouseButton,
-    TerminalMouseEventKind, TerminalMouseMode, TerminalMouseModifiers, TerminalMousePosition,
+    encode_mouse_report, CellRenderInfo, CommandLifecycle, OscEvent, OscInterceptor,
+    TerminalCursorStyle, TerminalGrid, TerminalGridPaintCacheHandle, TerminalGridPaintDamage,
+    TerminalMouseButton, TerminalMouseEventKind, TerminalMouseMode, TerminalMouseModifiers,
+    TerminalMousePosition,
 };
+
+use tracing::{debug, info};
 
 use crate::colors;
 use crate::keyboard;
@@ -104,11 +107,18 @@ pub struct TerminalView {
     cursor_blink_visible: bool,
     paint_cache: TerminalGridPaintCacheHandle,
     working_directory: Option<String>,
+    command_lifecycle: CommandLifecycle,
+    mouse_mode_active: bool,
 }
 
 impl TerminalView {
     pub fn new(cx: &mut Context<Self>) -> (Self, TerminalHandle) {
         let grid_size = TermSize { cols: 80, rows: 24 };
+        info!(
+            cols = grid_size.cols,
+            rows = grid_size.rows,
+            "terminal view created"
+        );
         let config = Config::default();
         let terminal = Arc::new(Mutex::new(Term::new(config, &grid_size, Listener)));
         let parser: Arc<Mutex<Processor>> = Arc::new(Mutex::new(Processor::new()));
@@ -122,8 +132,10 @@ impl TerminalView {
             let parser = parser.clone();
             cx.spawn(async move |this, cx| {
                 let mut osc = OscInterceptor::new();
+                debug!("PTY read loop started");
                 loop {
                     let Ok(data) = pty_rx.recv_async().await else {
+                        debug!("PTY stream closed");
                         break;
                     };
                     let mut all_events: Vec<OscEvent> = Vec::new();
@@ -196,6 +208,8 @@ impl TerminalView {
             cursor_blink_visible: true,
             paint_cache: TerminalGridPaintCacheHandle::default(),
             working_directory: None,
+            command_lifecycle: CommandLifecycle::default(),
+            mouse_mode_active: false,
         };
 
         let handle = TerminalHandle {
@@ -271,11 +285,31 @@ impl TerminalView {
         self.working_directory.as_deref()
     }
 
-    #[allow(clippy::single_match)] // will grow as we wire shell integration, notifications, etc.
+    pub fn command_lifecycle(&self) -> &CommandLifecycle {
+        &self.command_lifecycle
+    }
+
     fn handle_osc_event(&mut self, event: OscEvent) {
         match event {
             OscEvent::WorkingDirectory(path) => {
+                debug!(%path, "OSC 7: working directory changed");
                 self.working_directory = Some(path);
+            }
+            OscEvent::ShellPromptStart => {
+                debug!("OSC 133;A: shell prompt start");
+                self.command_lifecycle.prompt_start();
+            }
+            OscEvent::ShellCommandStart => {
+                debug!("OSC 133;B: command input start");
+                self.command_lifecycle.command_start();
+            }
+            OscEvent::ShellCommandExecuting => {
+                debug!("OSC 133;C: command executing");
+                self.command_lifecycle.command_executing();
+            }
+            OscEvent::ShellCommandFinished(code) => {
+                debug!(?code, "OSC 133;D: command finished");
+                self.command_lifecycle.command_finished(code);
             }
             _ => {}
         }
@@ -408,6 +442,11 @@ impl Render for TerminalView {
         let mut term = self.terminal.lock().expect("term lock poisoned");
 
         if new_size != self.grid_size {
+            debug!(
+                cols = new_size.cols,
+                rows = new_size.rows,
+                "terminal resized"
+            );
             self.grid_size = new_size;
             term.resize(new_size);
             let _ = self.size_changed_tx.try_send(new_size);
@@ -423,6 +462,15 @@ impl Render for TerminalView {
         let cursor_shape = cursor_style.shape;
         let show_cursor = cursor_shape != CursorShape::Hidden
             && (self.cursor_blink_visible || !cursor_style.blinking);
+
+        let mode = *term.mode();
+        let mouse_now = mode.intersects(
+            TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION,
+        );
+        if mouse_now != self.mouse_mode_active {
+            debug!(enabled = mouse_now, "mouse mode changed");
+            self.mouse_mode_active = mouse_now;
+        }
 
         let display_offset = term.grid().display_offset();
 
