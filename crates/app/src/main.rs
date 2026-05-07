@@ -74,12 +74,13 @@ fn main() {
                             size_changed_rx: handle.size_changed_rx,
                         };
 
+                        let key_exists = ssh.key.exists();
                         debug!(
                             host = %ssh.host,
                             port = ssh.port,
                             user = %ssh.user,
                             key = %ssh.key.display(),
-                            key_exists = ssh.key.exists(),
+                            key_exists,
                             "connecting via SSH"
                         );
 
@@ -93,7 +94,7 @@ fn main() {
                                         host = %ssh.host,
                                         port = ssh.port,
                                         key = %ssh.key.display(),
-                                        key_exists = ssh.key.exists(),
+                                        key_exists,
                                         "SSH session failed"
                                     );
                                 }

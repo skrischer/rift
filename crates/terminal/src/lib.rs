@@ -1,4 +1,5 @@
 mod colors;
+pub mod error;
 pub mod keyboard;
 mod view;
 
