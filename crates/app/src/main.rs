@@ -38,7 +38,7 @@ fn main() {
         let window = cx
             .open_window(
                 WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_bounds: Some(WindowBounds::Maximized(bounds)),
                     ..Default::default()
                 },
                 |_window, cx| {
@@ -46,7 +46,7 @@ fn main() {
                         let (view, handle) = TerminalView::new(cx);
 
                         let ssh = SshConfig {
-                            host: env::var("RIFT_SSH_HOST").unwrap_or_else(|_| "localhost".into()),
+                            host: env::var("RIFT_SSH_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
                             user: env::var("RIFT_SSH_USER").unwrap_or_else(|_| "developer".into()),
                             port: env::var("RIFT_SSH_PORT")
                                 .ok()
