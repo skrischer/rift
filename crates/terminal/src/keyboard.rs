@@ -12,6 +12,16 @@ pub fn encode_keystroke(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>
         return None;
     }
 
+    // AltGr on Windows/Linux is reported as Ctrl+Alt. When a key_char is present,
+    // it's a composed character (e.g. AltGr+ß → \) — pass it through directly.
+    if ctrl && alt {
+        if let Some(ch) = &keystroke.key_char {
+            if !ch.is_empty() {
+                return Some(ch.as_bytes().to_vec());
+            }
+        }
+    }
+
     // Nav/cursor/function keys encode all modifiers (including alt) internally
     if let Some(bytes) = encode_nav_key(key, ctrl, alt, shift, mode) {
         return Some(bytes);
@@ -545,6 +555,22 @@ mod tests {
         // ctrl+home: mod_param = 5
         let ks = ctrl_key("home");
         assert_eq!(encode_keystroke(&ks, normal()), Some(b"\x1b[1;5H".to_vec()));
+    }
+
+    // --- AltGr (Ctrl+Alt) produces composed character ---
+
+    #[test]
+    fn test_encode_altgr_passthrough() {
+        let ks = Keystroke {
+            modifiers: Modifiers {
+                control: true,
+                alt: true,
+                ..Modifiers::none()
+            },
+            key: "ß".into(),
+            key_char: Some("\\".into()),
+        };
+        assert_eq!(encode_keystroke(&ks, normal()), Some(vec![b'\\']));
     }
 
     // --- Alt on basic keys gets ESC prefix ---
