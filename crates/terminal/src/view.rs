@@ -9,10 +9,11 @@ use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape, Processor};
 use gpui::*;
 use termy_terminal_ui::{
-    encode_mouse_report, find_link_in_line, CellRenderInfo, CommandLifecycle, OscEvent,
+    add_span_damage_compute_us, encode_mouse_report, find_link_in_line,
+    terminal_ui_render_metrics_snapshot, CellRenderInfo, CommandLifecycle, OscEvent,
     OscInterceptor, TerminalCursorStyle, TerminalGrid, TerminalGridPaintCacheHandle,
     TerminalGridPaintDamage, TerminalMouseButton, TerminalMouseEventKind, TerminalMouseMode,
-    TerminalMouseModifiers, TerminalMousePosition,
+    TerminalMouseModifiers, TerminalMousePosition, TerminalUiRenderMetricsSnapshot,
 };
 
 use tracing::{debug, info};
@@ -298,6 +299,10 @@ impl TerminalView {
         &self.command_lifecycle
     }
 
+    pub fn render_metrics(&self) -> TerminalUiRenderMetricsSnapshot {
+        terminal_ui_render_metrics_snapshot()
+    }
+
     fn handle_osc_event(&mut self, event: OscEvent) {
         match event {
             OscEvent::WorkingDirectory(path) => {
@@ -540,7 +545,9 @@ impl Render for TerminalView {
             self.paint_cache.clear();
         }
 
+        let damage_start = std::time::Instant::now();
         let paint_damage = map_damage(&mut term);
+        add_span_damage_compute_us(damage_start.elapsed().as_micros() as u64);
 
         let cursor_point = term.grid().cursor.point;
         let cursor_row = cursor_point.line.0 as usize;
