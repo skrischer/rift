@@ -63,6 +63,7 @@ dev-watch:
 dev-windows:
     cargo xwin build -p rift-app --target x86_64-pc-windows-msvc
     mkdir -p {{windows_staging_dir}}
+    -taskkill.exe /F /IM rift.exe 2>/dev/null
     cp target/x86_64-pc-windows-msvc/debug/rift.exe {{windows_staging_dir}}/rift.exe
     export WSLENV="RUST_LOG:RIFT_SSH_HOST:RIFT_SSH_USER:RIFT_SSH_PORT:RIFT_SSH_KEY" && \
     export RUST_LOG=rift=debug,rift_ssh=debug && \
