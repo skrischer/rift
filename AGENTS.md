@@ -59,7 +59,7 @@ cargo run -p daemon -- --port 9500                               # run daemon lo
 ## What to avoid
 
 - **No agent-specific code.** No detection of which CLI agent runs. No parsing of agent output formats.
-- **No proprietary dependencies.** MIT, Apache-2.0, ISC, BSD compatible only. Run `cargo deny check licenses` in CI.
+- **No proprietary dependencies.** MIT, Apache-2.0, ISC, BSD, GPL-3.0 compatible only. Run `cargo deny check licenses` in CI.
 - **No `.unwrap()` in library code.** Use `thiserror` in libs, `anyhow` in binaries. `.expect("reason")` only for true invariants.
 - **No `clone()` to satisfy the borrow checker.** Restructure ownership instead.
 - **No `String` where `&str` suffices.** Be intentional about ownership at API boundaries.
