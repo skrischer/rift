@@ -33,7 +33,7 @@ run-daemon *ARGS:
     cargo run -p rift-daemon -- {{ARGS}}
 
 # SSH config (overridable via env)
-export RIFT_SSH_HOST := env("RIFT_SSH_HOST", "localhost")
+export RIFT_SSH_HOST := env("RIFT_SSH_HOST", "127.0.0.1")
 export RIFT_SSH_USER := env("RIFT_SSH_USER", "developer")
 export RIFT_SSH_PORT := env("RIFT_SSH_PORT", "22")
 export RIFT_SSH_KEY := env("RIFT_SSH_KEY", home_directory() / ".ssh" / "id_rsa")
