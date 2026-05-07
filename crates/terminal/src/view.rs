@@ -499,12 +499,23 @@ fn extract_row_cells(
 }
 
 fn map_damage(term: &mut Term<Listener>) -> TerminalGridPaintDamage {
+    let display_offset = term.grid().display_offset();
     let damage = match term.damage() {
         TermDamage::Full => {
             term.reset_damage();
             return TerminalGridPaintDamage::Full;
         }
         TermDamage::Partial(iter) => {
+            let mut iter = iter.peekable();
+            if display_offset != 0 {
+                let has_damage = iter.peek().is_some();
+                term.reset_damage();
+                return if has_damage {
+                    TerminalGridPaintDamage::Full
+                } else {
+                    TerminalGridPaintDamage::None
+                };
+            }
             let ranges: Vec<(usize, usize, usize)> = iter
                 .map(|bounds| (bounds.line, bounds.left, bounds.right))
                 .collect();
