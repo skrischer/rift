@@ -118,6 +118,7 @@ pub struct TerminalView {
     mouse_mode_active: bool,
     hovered_link: Option<HoveredLink>,
     prev_selection: Option<GridSelection>,
+    ssh_label: SharedString,
 }
 
 struct HoveredLink {
@@ -223,6 +224,14 @@ impl TerminalView {
             .detach();
         }
 
+        let ssh_user = std::env::var("RIFT_SSH_USER").unwrap_or_default();
+        let ssh_host = std::env::var("RIFT_SSH_HOST").unwrap_or_else(|_| "localhost".into());
+        let ssh_label: SharedString = if ssh_user.is_empty() {
+            ssh_host.into()
+        } else {
+            format!("{}@{}", ssh_user, ssh_host).into()
+        };
+
         let view = Self {
             terminal,
             input_tx,
@@ -239,6 +248,7 @@ impl TerminalView {
             mouse_mode_active: false,
             hovered_link: None,
             prev_selection: None,
+            ssh_label,
         };
 
         let handle = TerminalHandle {
@@ -595,9 +605,10 @@ impl Render for TerminalView {
         let cell_size = measure_cell_size(window, font_size);
         self.cell_size = cell_size;
 
+        let statusbar_h = px(28.0);
         let viewport = window.viewport_size();
         let cols = (viewport.width / cell_size.width).floor() as usize;
-        let rows = (viewport.height / cell_size.height).floor() as usize;
+        let rows = ((viewport.height - statusbar_h) / cell_size.height).floor() as usize;
         let new_size = TermSize {
             cols: cols.max(1),
             rows: rows.max(1),
@@ -703,18 +714,18 @@ impl Render for TerminalView {
             cursor_style: termy_cursor_style,
         };
 
-        let mut container = div()
+        let mut terminal_area = div()
             .id("terminal")
             .key_context("Terminal")
             .track_focus(&self.focus_handle(cx))
-            .size_full()
+            .flex_1()
             .bg(bg_hsla);
 
         if self.hovered_link.is_some() {
-            container = container.cursor(gpui::CursorStyle::PointingHand);
+            terminal_area = terminal_area.cursor(gpui::CursorStyle::PointingHand);
         }
 
-        container
+        let terminal_area = terminal_area
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _window, cx| {
                 let ks = &event.keystroke;
 
@@ -987,7 +998,47 @@ impl Render for TerminalView {
                     }
                 }
             }))
-            .child(grid)
+            .child(grid);
+
+        let cwd = self.working_directory.clone().unwrap_or_default();
+        let size_label = format!("{}x{}", new_size.cols, new_size.rows);
+        let statusbar_bg = Hsla::from(colors::SURFACE0);
+        let statusbar_border = Hsla::from(colors::SURFACE1);
+        let statusbar_fg = Hsla::from(colors::SUBTEXT0);
+
+        let statusbar = div()
+            .id("statusbar")
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .w_full()
+            .h(statusbar_h)
+            .bg(statusbar_bg)
+            .border_t_1()
+            .border_color(statusbar_border)
+            .text_size(font_size)
+            .text_color(statusbar_fg)
+            .font_family("JetBrainsMono Nerd Font Mono")
+            .px(px(12.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(16.0))
+                    .child(self.ssh_label.clone())
+                    .children((!cwd.is_empty()).then(|| SharedString::from(cwd.clone()))),
+            )
+            .child(div().child(SharedString::from(size_label)));
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(bg_hsla)
+            .child(terminal_area)
+            .child(statusbar)
     }
 }
 
