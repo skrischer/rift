@@ -13,7 +13,7 @@ use termy_terminal_ui::{
     terminal_ui_render_metrics_snapshot, CellRenderInfo, CommandLifecycle, OscEvent,
     OscInterceptor, TerminalCursorStyle, TerminalGrid, TerminalGridPaintCacheHandle,
     TerminalGridPaintDamage, TerminalMouseButton, TerminalMouseEventKind, TerminalMouseMode,
-    TerminalMouseModifiers, TerminalMousePosition, TerminalUiRenderMetricsSnapshot,
+    TerminalMouseModifiers, TerminalMousePosition, TerminalUiRenderMetricsSnapshot, TmuxSnapshot,
 };
 
 use tracing::{debug, error, info};
@@ -60,6 +60,7 @@ pub struct TerminalHandle {
     pub pty_tx: flume::Sender<Vec<u8>>,
     pub input_rx: flume::Receiver<Vec<u8>>,
     pub size_changed_rx: flume::Receiver<TermSize>,
+    pub snapshot_tx: flume::Sender<TmuxSnapshot>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -148,6 +149,7 @@ impl TerminalView {
         let (pty_tx, pty_rx) = flume::unbounded::<Vec<u8>>();
         let (input_tx, input_rx) = flume::unbounded();
         let (size_changed_tx, size_changed_rx) = flume::unbounded();
+        let (snapshot_tx, snapshot_rx) = flume::unbounded::<TmuxSnapshot>();
 
         {
             let terminal = terminal.clone();
@@ -237,6 +239,34 @@ impl TerminalView {
             .detach();
         }
 
+        {
+            cx.spawn(async move |this, cx| loop {
+                let Ok(snapshot) = snapshot_rx.recv_async().await else {
+                    break;
+                };
+                let active_pane = snapshot
+                    .windows
+                    .iter()
+                    .find(|w| w.is_active)
+                    .and_then(|w| w.panes.iter().find(|p| p.is_active));
+                let cwd = active_pane.map(|p| p.current_path.clone());
+                let result = cx.update(|cx| {
+                    this.update(cx, |view, cx| {
+                        if let Some(path) = cwd {
+                            if !path.is_empty() {
+                                view.working_directory = Some(path);
+                            }
+                        }
+                        cx.notify();
+                    })
+                });
+                if result.is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
+
         let ssh_user = std::env::var("RIFT_SSH_USER").unwrap_or_default();
         let ssh_host = std::env::var("RIFT_SSH_HOST").unwrap_or_else(|_| "localhost".into());
         let ssh_label: SharedString = if ssh_user.is_empty() {
@@ -268,6 +298,7 @@ impl TerminalView {
             pty_tx,
             input_rx,
             size_changed_rx,
+            snapshot_tx,
         };
 
         (view, handle)

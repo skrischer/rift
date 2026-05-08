@@ -19,6 +19,7 @@ struct PtyChannels {
     pty_tx: flume::Sender<Vec<u8>>,
     input_rx: flume::Receiver<Vec<u8>>,
     size_changed_rx: flume::Receiver<TermSize>,
+    snapshot_tx: flume::Sender<termy_terminal_ui::TmuxSnapshot>,
 }
 
 fn main() {
@@ -72,6 +73,7 @@ fn main() {
                             pty_tx: handle.pty_tx,
                             input_rx: handle.input_rx,
                             size_changed_rx: handle.size_changed_rx,
+                            snapshot_tx: handle.snapshot_tx,
                         };
 
                         let key_exists = ssh.key.exists();
@@ -117,53 +119,130 @@ fn main() {
 
 async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
     use rift_ssh::SshConnection;
+    use termy_terminal_ui::{TmuxClient, TmuxNotification, TmuxSocketTarget};
 
     let mut conn = SshConnection::connect(&ssh.host, ssh.port, &ssh.user, &ssh.key)
         .await
         .context("SSH connection failed")?;
 
-    let pty = conn.open_pty(80, 24).await.context("failed to open PTY")?;
-
-    let pty_writer = pty.clone_writer();
-
-    pty_writer
-        .write(b"tmux new-session -A -s rift\n")
+    let pty = conn
+        .open_pty_exec(80, 24, "tmux -CC new-session -A -s rift")
         .await
-        .context("failed to start tmux")?;
+        .context("failed to start tmux control mode")?;
 
-    let write_handle = tokio::spawn({
-        let input_rx = ch.input_rx.clone();
-        let pty_writer = pty_writer.clone();
-        async move {
-            while let Ok(data) = input_rx.recv_async().await {
-                if pty_writer.write(&data).await.is_err() {
+    let reader = pty.sync_reader();
+    let writer = pty.sync_writer();
+
+    let (wakeup_tx, wakeup_rx) = flume::bounded::<()>(1);
+
+    let tmux_client = TmuxClient::from_streams(
+        writer,
+        reader,
+        "rift".to_string(),
+        "tmux".to_string(),
+        TmuxSocketTarget::Default,
+        Some(wakeup_tx),
+    )
+    .context("failed to create tmux control client")?;
+
+    tmux_client
+        .set_client_size(80, 24)
+        .context("failed to set initial tmux client size")?;
+
+    tmux_client
+        .send_command_async("refresh-client -f pause-after=5")
+        .context("failed to activate flow control")?;
+
+    info!("tmux control mode connected");
+
+    let pty_tx = ch.pty_tx;
+    let input_rx = ch.input_rx;
+    let size_changed_rx = ch.size_changed_rx;
+    let snapshot_tx = ch.snapshot_tx;
+
+    let initial_snapshot = tmux_client
+        .refresh_snapshot()
+        .context("failed to get initial tmux snapshot")?;
+    let active_pane_id = initial_snapshot
+        .windows
+        .iter()
+        .find(|w| w.is_active)
+        .and_then(|w| w.active_pane_id.clone())
+        .unwrap_or_else(|| "%0".to_string());
+    let _ = snapshot_tx.send(initial_snapshot);
+
+    let active_pane = std::sync::Arc::new(std::sync::Mutex::new(active_pane_id));
+
+    let tmux_for_input = std::sync::Arc::new(tmux_client);
+    let tmux_for_resize = tmux_for_input.clone();
+    let tmux_for_poll = tmux_for_input.clone();
+    let active_pane_for_input = active_pane.clone();
+    let active_pane_for_poll = active_pane.clone();
+
+    let input_handle = std::thread::spawn(move || {
+        while let Ok(data) = input_rx.recv() {
+            let pane_id = active_pane_for_input.lock().expect("pane lock").clone();
+            if tmux_for_input.send_input(&pane_id, &data).is_err() {
+                break;
+            }
+        }
+    });
+
+    let resize_handle = std::thread::spawn(move || {
+        while let Ok(new_size) = size_changed_rx.recv() {
+            if tmux_for_resize
+                .set_client_size(new_size.cols as u16, new_size.rows as u16)
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let poll_handle = std::thread::spawn(move || loop {
+        if wakeup_rx.recv().is_err() {
+            break;
+        }
+        let notifications = tmux_for_poll.poll_notifications();
+        let mut should_exit = false;
+        for notification in notifications {
+            match notification {
+                TmuxNotification::Output { bytes, .. } => {
+                    if pty_tx.send(bytes).is_err() {
+                        should_exit = true;
+                        break;
+                    }
+                }
+                TmuxNotification::NeedsRefresh => {
+                    if let Ok(snapshot) = tmux_for_poll.refresh_snapshot() {
+                        if let Some(pane_id) = snapshot
+                            .windows
+                            .iter()
+                            .find(|w| w.is_active)
+                            .and_then(|w| w.active_pane_id.clone())
+                        {
+                            *active_pane_for_poll.lock().expect("pane lock") = pane_id;
+                        }
+                        let _ = snapshot_tx.send(snapshot);
+                    }
+                }
+                TmuxNotification::Exit(reason) => {
+                    info!(?reason, "tmux control mode exited");
+                    should_exit = true;
                     break;
+                }
+                TmuxNotification::Warning(msg) => {
+                    tracing::warn!(%msg, "tmux control warning");
                 }
             }
         }
-    });
-
-    let resize_handle = tokio::spawn({
-        let pty_writer = pty_writer.clone();
-        let size_changed_rx = ch.size_changed_rx;
-        async move {
-            while let Ok(new_size) = size_changed_rx.recv_async().await {
-                let _ = pty_writer
-                    .resize(new_size.cols as u16, new_size.rows as u16)
-                    .await;
-            }
-        }
-    });
-
-    while let Ok(data) = pty.read().await {
-        if ch.pty_tx.send(data).is_err() {
+        if should_exit {
             break;
         }
-    }
+    });
 
-    drop(ch.pty_tx);
-    drop(ch.input_rx);
-    let _ = write_handle.await;
-    let _ = resize_handle.await;
+    let _ = poll_handle.join();
+    drop(input_handle);
+    drop(resize_handle);
     Ok(())
 }

@@ -17,6 +17,7 @@ flume.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+termy_terminal_ui.workspace = true
 
 [build-dependencies]
 embed-resource = "3"
