@@ -168,7 +168,7 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
         .iter()
         .find(|w| w.is_active)
         .and_then(|w| w.active_pane_id.clone())
-        .unwrap_or_else(|| "%0".to_string());
+        .context("no active pane in initial tmux snapshot")?;
     let _ = snapshot_tx.send(initial_snapshot);
 
     let active_pane = std::sync::Arc::new(std::sync::Mutex::new(active_pane_id));
@@ -242,7 +242,7 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
     });
 
     let _ = poll_handle.join();
-    drop(input_handle);
-    drop(resize_handle);
+    let _ = input_handle.join();
+    let _ = resize_handle.join();
     Ok(())
 }
