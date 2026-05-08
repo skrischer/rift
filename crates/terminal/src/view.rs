@@ -16,7 +16,9 @@ use termy_terminal_ui::{
     TerminalMouseModifiers, TerminalMousePosition, TerminalUiRenderMetricsSnapshot,
 };
 
-use tracing::{debug, info};
+use tracing::{debug, error, info};
+
+use crate::error::TerminalError;
 
 use crate::colors;
 use crate::keyboard;
@@ -142,7 +144,6 @@ impl TerminalView {
             event_tx: term_event_tx,
         };
         let terminal = Arc::new(Mutex::new(Term::new(config, &grid_size, listener)));
-        let parser: Arc<Mutex<Processor>> = Arc::new(Mutex::new(Processor::new()));
 
         let (pty_tx, pty_rx) = flume::unbounded::<Vec<u8>>();
         let (input_tx, input_rx) = flume::unbounded();
@@ -150,32 +151,44 @@ impl TerminalView {
 
         {
             let terminal = terminal.clone();
-            let parser = parser.clone();
             cx.spawn(async move |this, cx| {
                 let mut osc = OscInterceptor::new();
+                let mut parser: Processor = Processor::new();
                 debug!("PTY read loop started");
                 loop {
                     let Ok(data) = pty_rx.recv_async().await else {
                         debug!("PTY stream closed");
                         break;
                     };
-                    let mut all_osc_events: Vec<OscEvent> = Vec::new();
-                    {
-                        let mut term = terminal.lock().expect("term lock poisoned");
-                        let mut p = parser.lock().expect("parser lock poisoned");
-                        let (filtered, events) = osc.process(&data);
-                        all_osc_events.extend(events);
-                        if !filtered.is_empty() {
-                            p.advance(&mut *term, &filtered);
-                        }
-                        while let Ok(more) = pty_rx.try_recv() {
-                            let (filtered, events) = osc.process(&more);
-                            all_osc_events.extend(events);
+                    let mut chunks = vec![data];
+                    while let Ok(more) = pty_rx.try_recv() {
+                        chunks.push(more);
+                    }
+                    let term_ref = terminal.clone();
+                    let mut p = parser;
+                    let mut o = osc;
+                    let parse_result = smol::unblock(move || {
+                        let mut term = term_ref.lock().map_err(|_| TerminalError::LockPoisoned)?;
+                        let mut events = Vec::new();
+                        for chunk in &chunks {
+                            let (filtered, chunk_events) = o.process(chunk);
+                            events.extend(chunk_events);
                             if !filtered.is_empty() {
                                 p.advance(&mut *term, &filtered);
                             }
                         }
-                    }
+                        Ok::<_, TerminalError>((p, o, events))
+                    })
+                    .await;
+                    let (p_ret, o_ret, all_osc_events) = match parse_result {
+                        Ok(val) => val,
+                        Err(e) => {
+                            error!(%e, "PTY parse loop aborting");
+                            break;
+                        }
+                    };
+                    parser = p_ret;
+                    osc = o_ret;
                     let mut term_events: Vec<Event> = Vec::new();
                     while let Ok(event) = term_event_rx.try_recv() {
                         term_events.push(event);

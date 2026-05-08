@@ -20,12 +20,17 @@ impl SshConnection {
         user: &str,
         key_path: &Path,
     ) -> Result<Self, SshError> {
+        let key_exists = key_path.exists();
         debug!(
             path = %key_path.display(),
-            exists = key_path.exists(),
+            exists = key_exists,
             "loading SSH key"
         );
-        let key_pair = russh_keys::load_secret_key(key_path, None)?;
+        let path = key_path.to_path_buf();
+        let key_pair =
+            tokio::task::spawn_blocking(move || russh_keys::load_secret_key(&path, None))
+                .await
+                .map_err(|e| SshError::Key(e.to_string()))??;
 
         let config = Arc::new(Config::default());
         let handler = ClientHandler {
