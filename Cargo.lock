@@ -5852,7 +5852,7 @@ dependencies = [
 [[package]]
 name = "termy_terminal_ui"
 version = "0.1.0"
-source = "git+https://github.com/termy-org/termy?rev=19367eb8c6d6909c37923ae6493112fde0366457#19367eb8c6d6909c37923ae6493112fde0366457"
+source = "git+https://github.com/termy-org/termy?rev=297bf90#297bf906aedb0baf6002ceea4b1a3a0c1603e9e1"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
