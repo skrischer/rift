@@ -9,38 +9,20 @@ use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape, Processor};
 use gpui::*;
 use termy_terminal_ui::{
-    add_span_damage_compute_us, encode_mouse_report, find_link_in_line,
-    terminal_ui_render_metrics_snapshot, CellRenderInfo, CommandLifecycle, OscEvent,
-    OscInterceptor, TerminalCursorStyle, TerminalGrid, TerminalGridPaintCacheHandle,
-    TerminalGridPaintDamage, TerminalMouseButton, TerminalMouseEventKind, TerminalMouseMode,
-    TerminalMouseModifiers, TerminalMousePosition, TerminalUiRenderMetricsSnapshot, TmuxSnapshot,
+    add_span_damage_compute_us, encode_mouse_report, find_link_in_line, CellRenderInfo,
+    CommandLifecycle, OscEvent, OscInterceptor, TerminalCursorStyle, TerminalGrid,
+    TerminalGridPaintCacheHandle, TerminalGridPaintDamage, TerminalMouseButton,
+    TerminalMouseEventKind, TerminalMouseMode, TerminalMouseModifiers, TerminalMousePosition,
 };
-
-use tracing::{debug, error, info};
-
-use crate::error::TerminalError;
+use tracing::{debug, error};
 
 use crate::colors;
+use crate::error::TerminalError;
 use crate::keyboard;
+use crate::{PaneInput, TermSize};
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct TermSize {
-    pub cols: usize,
-    pub rows: usize,
-}
-
-impl Dimensions for TermSize {
-    fn total_lines(&self) -> usize {
-        self.rows
-    }
-
-    fn screen_lines(&self) -> usize {
-        self.rows
-    }
-
-    fn columns(&self) -> usize {
-        self.cols
-    }
+pub fn statusbar_height() -> Pixels {
+    px(28.0)
 }
 
 #[derive(Clone)]
@@ -54,13 +36,6 @@ impl EventListener for Listener {
             let _ = self.event_tx.try_send(event);
         }
     }
-}
-
-pub struct TerminalHandle {
-    pub pty_tx: flume::Sender<Vec<u8>>,
-    pub input_rx: flume::Receiver<Vec<u8>>,
-    pub size_changed_rx: flume::Receiver<TermSize>,
-    pub snapshot_tx: flume::Sender<TmuxSnapshot>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -105,9 +80,17 @@ impl GridSelection {
     }
 }
 
-pub struct TerminalView {
+struct HoveredLink {
+    row: usize,
+    start_col: usize,
+    end_col: usize,
+    target: String,
+}
+
+pub struct PaneView {
+    pane_id: String,
     terminal: Arc<Mutex<Term<Listener>>>,
-    input_tx: flume::Sender<Vec<u8>>,
+    input_tx: flume::Sender<PaneInput>,
     size_changed_tx: flume::Sender<TermSize>,
     focus_handle: FocusHandle,
     cell_size: Size<Pixels>,
@@ -121,35 +104,22 @@ pub struct TerminalView {
     mouse_mode_active: bool,
     hovered_link: Option<HoveredLink>,
     prev_selection: Option<GridSelection>,
-    ssh_label: SharedString,
 }
 
-struct HoveredLink {
-    row: usize,
-    start_col: usize,
-    end_col: usize,
-    target: String,
-}
-
-impl TerminalView {
-    pub fn new(cx: &mut Context<Self>) -> (Self, TerminalHandle) {
+impl PaneView {
+    pub fn new(
+        cx: &mut Context<Self>,
+        pty_rx: flume::Receiver<Vec<u8>>,
+        input_tx: flume::Sender<PaneInput>,
+        size_changed_tx: flume::Sender<TermSize>,
+    ) -> Self {
         let grid_size = TermSize { cols: 80, rows: 24 };
-        info!(
-            cols = grid_size.cols,
-            rows = grid_size.rows,
-            "terminal view created"
-        );
         let config = Config::default();
         let (term_event_tx, term_event_rx) = flume::unbounded();
         let listener = Listener {
             event_tx: term_event_tx,
         };
         let terminal = Arc::new(Mutex::new(Term::new(config, &grid_size, listener)));
-
-        let (pty_tx, pty_rx) = flume::unbounded::<Vec<u8>>();
-        let (input_tx, input_rx) = flume::unbounded();
-        let (size_changed_tx, size_changed_rx) = flume::unbounded();
-        let (snapshot_tx, snapshot_rx) = flume::unbounded::<TmuxSnapshot>();
 
         {
             let terminal = terminal.clone();
@@ -239,43 +209,8 @@ impl TerminalView {
             .detach();
         }
 
-        {
-            cx.spawn(async move |this, cx| loop {
-                let Ok(snapshot) = snapshot_rx.recv_async().await else {
-                    break;
-                };
-                let active_pane = snapshot
-                    .windows
-                    .iter()
-                    .find(|w| w.is_active)
-                    .and_then(|w| w.panes.iter().find(|p| p.is_active));
-                let cwd = active_pane.map(|p| p.current_path.clone());
-                let result = cx.update(|cx| {
-                    this.update(cx, |view, cx| {
-                        if let Some(path) = cwd {
-                            if !path.is_empty() {
-                                view.working_directory = Some(path);
-                            }
-                        }
-                        cx.notify();
-                    })
-                });
-                if result.is_err() {
-                    break;
-                }
-            })
-            .detach();
-        }
-
-        let ssh_user = std::env::var("RIFT_SSH_USER").unwrap_or_default();
-        let ssh_host = std::env::var("RIFT_SSH_HOST").unwrap_or_else(|_| "localhost".into());
-        let ssh_label: SharedString = if ssh_user.is_empty() {
-            ssh_host.into()
-        } else {
-            format!("{}@{}", ssh_user, ssh_host).into()
-        };
-
-        let view = Self {
+        Self {
+            pane_id: String::new(),
             terminal,
             input_tx,
             size_changed_tx,
@@ -291,17 +226,34 @@ impl TerminalView {
             mouse_mode_active: false,
             hovered_link: None,
             prev_selection: None,
-            ssh_label,
-        };
+        }
+    }
 
-        let handle = TerminalHandle {
-            pty_tx,
-            input_rx,
-            size_changed_rx,
-            snapshot_tx,
-        };
+    pub fn grid_size(&self) -> TermSize {
+        self.grid_size
+    }
 
-        (view, handle)
+    pub fn working_directory(&self) -> Option<&str> {
+        self.working_directory.as_deref()
+    }
+
+    pub fn set_pane_id(&mut self, id: String) {
+        self.pane_id = id;
+    }
+
+    pub fn set_working_directory(&mut self, path: String) {
+        self.working_directory = Some(path);
+    }
+
+    fn send_input(&self, bytes: Vec<u8>) {
+        let _ = self.input_tx.try_send(PaneInput {
+            pane_id: self.pane_id.clone(),
+            bytes,
+        });
+    }
+
+    pub fn command_lifecycle(&self) -> &CommandLifecycle {
+        &self.command_lifecycle
     }
 
     fn pixel_to_grid(&self, pos: Point<Pixels>) -> (usize, usize) {
@@ -364,18 +316,6 @@ impl TerminalView {
         }
     }
 
-    pub fn working_directory(&self) -> Option<&str> {
-        self.working_directory.as_deref()
-    }
-
-    pub fn command_lifecycle(&self) -> &CommandLifecycle {
-        &self.command_lifecycle
-    }
-
-    pub fn render_metrics(&self) -> TerminalUiRenderMetricsSnapshot {
-        terminal_ui_render_metrics_snapshot()
-    }
-
     fn handle_osc_event(&mut self, event: OscEvent) {
         match event {
             OscEvent::WorkingDirectory(path) => {
@@ -416,7 +356,6 @@ impl TerminalView {
         let line = Line(row as i32 - display_offset as i32);
         let columns = grid.columns();
 
-        // OSC 8: check if cell has an explicit hyperlink
         if col < columns {
             if let Some(hyperlink) = grid[line][Column(col)].hyperlink() {
                 let uri = hyperlink.uri().to_owned();
@@ -449,7 +388,6 @@ impl TerminalView {
             }
         }
 
-        // Regex fallback: extract row text and use find_link_in_line
         let chars: Vec<char> = (0..columns)
             .map(|c| {
                 let cell = &grid[line][Column(c)];
@@ -526,13 +464,13 @@ impl TerminalView {
             TerminalMousePosition { col, row },
             mods,
         ) {
-            let _ = self.input_tx.try_send(bytes);
+            self.send_input(bytes);
         }
         true
     }
 }
 
-impl Focusable for TerminalView {
+impl Focusable for PaneView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
@@ -643,16 +581,15 @@ fn map_damage(term: &mut Term<Listener>) -> TerminalGridPaintDamage {
     damage
 }
 
-impl Render for TerminalView {
+impl Render for PaneView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let font_size = px(14.0);
         let cell_size = measure_cell_size(window, font_size);
         self.cell_size = cell_size;
 
-        let statusbar_h = px(28.0);
         let viewport = window.viewport_size();
         let cols = (viewport.width / cell_size.width).floor() as usize;
-        let rows = ((viewport.height - statusbar_h) / cell_size.height).floor() as usize;
+        let rows = ((viewport.height - statusbar_height()) / cell_size.height).floor() as usize;
         let new_size = TermSize {
             cols: cols.max(1),
             rows: rows.max(1),
@@ -769,7 +706,7 @@ impl Render for TerminalView {
             terminal_area = terminal_area.cursor(gpui::CursorStyle::PointingHand);
         }
 
-        let terminal_area = terminal_area
+        terminal_area
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _window, cx| {
                 let ks = &event.keystroke;
 
@@ -783,7 +720,7 @@ impl Render for TerminalView {
                 if ks.modifiers.control && ks.modifiers.shift && ks.key.as_str() == "v" {
                     if let Some(item) = cx.read_from_clipboard() {
                         if let Some(text) = item.text() {
-                            let _ = this.input_tx.try_send(text.as_bytes().to_vec());
+                            this.send_input(text.as_bytes().to_vec());
                         }
                     }
                     return;
@@ -803,7 +740,7 @@ impl Render for TerminalView {
                     }
                     this.selection = None;
                     this.cursor_blink_visible = true;
-                    let _ = this.input_tx.try_send(bytes);
+                    this.send_input(bytes);
                 }
             }))
             .on_mouse_down(
@@ -869,7 +806,7 @@ impl Render for TerminalView {
                             TerminalMousePosition { col, row },
                             modifiers,
                         ) {
-                            let _ = this.input_tx.try_send(bytes);
+                            this.send_input(bytes);
                         }
                     }
                 } else if this.selecting && event.pressed_button == Some(MouseButton::Left) {
@@ -881,7 +818,6 @@ impl Render for TerminalView {
                     cx.notify();
                 }
 
-                // Link detection on Ctrl+hover
                 if event.modifiers.control && event.pressed_button.is_none() {
                     let (col, row) = this.pixel_to_grid(event.position);
                     let new_link = this.detect_link_at(row, col);
@@ -941,7 +877,7 @@ impl Render for TerminalView {
                     ) {
                         if let Some(item) = cx.read_from_clipboard() {
                             if let Some(text) = item.text() {
-                                let _ = this.input_tx.try_send(text.as_bytes().to_vec());
+                                this.send_input(text.as_bytes().to_vec());
                             }
                         }
                     }
@@ -967,7 +903,7 @@ impl Render for TerminalView {
                     ) {
                         if let Some(item) = cx.read_from_clipboard() {
                             if let Some(text) = item.text() {
-                                let _ = this.input_tx.try_send(text.as_bytes().to_vec());
+                                this.send_input(text.as_bytes().to_vec());
                             }
                         }
                     }
@@ -1020,7 +956,7 @@ impl Render for TerminalView {
                             TerminalMousePosition { col, row },
                             modifiers,
                         ) {
-                            let _ = this.input_tx.try_send(bytes);
+                            this.send_input(bytes);
                         }
                     }
                 } else {
@@ -1042,47 +978,7 @@ impl Render for TerminalView {
                     }
                 }
             }))
-            .child(grid);
-
-        let cwd = self.working_directory.clone().unwrap_or_default();
-        let size_label = format!("{}x{}", new_size.cols, new_size.rows);
-        let statusbar_bg = Hsla::from(colors::SURFACE0);
-        let statusbar_border = Hsla::from(colors::SURFACE1);
-        let statusbar_fg = Hsla::from(colors::SUBTEXT0);
-
-        let statusbar = div()
-            .id("statusbar")
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .w_full()
-            .h(statusbar_h)
-            .bg(statusbar_bg)
-            .border_t_1()
-            .border_color(statusbar_border)
-            .text_size(font_size)
-            .text_color(statusbar_fg)
-            .font_family("JetBrainsMono Nerd Font Mono")
-            .px(px(12.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(16.0))
-                    .child(self.ssh_label.clone())
-                    .children((!cwd.is_empty()).then(|| SharedString::from(cwd.clone()))),
-            )
-            .child(div().child(SharedString::from(size_label)));
-
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .bg(bg_hsla)
-            .child(terminal_area)
-            .child(statusbar)
+            .child(grid)
     }
 }
 

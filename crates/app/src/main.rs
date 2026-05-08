@@ -4,7 +4,7 @@ use std::thread;
 
 use anyhow::{Context as _, Result};
 use gpui::*;
-use rift_terminal::{TermSize, TerminalView};
+use rift_terminal::{PaneInput, PaneOutput, SessionView, TermSize};
 use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -16,8 +16,8 @@ struct SshConfig {
 }
 
 struct PtyChannels {
-    pty_tx: flume::Sender<Vec<u8>>,
-    input_rx: flume::Receiver<Vec<u8>>,
+    pane_output_tx: flume::Sender<PaneOutput>,
+    input_rx: flume::Receiver<PaneInput>,
     size_changed_rx: flume::Receiver<TermSize>,
     snapshot_tx: flume::Sender<termy_terminal_ui::TmuxSnapshot>,
 }
@@ -44,7 +44,7 @@ fn main() {
                 },
                 |_window, cx| {
                     cx.new(|cx| {
-                        let (view, handle) = TerminalView::new(cx);
+                        let (view, handle) = SessionView::new(cx);
 
                         let ssh = SshConfig {
                             host: env::var("RIFT_SSH_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
@@ -70,7 +70,7 @@ fn main() {
                         };
 
                         let channels = PtyChannels {
-                            pty_tx: handle.pty_tx,
+                            pane_output_tx: handle.pane_output_tx,
                             input_rx: handle.input_rx,
                             size_changed_rx: handle.size_changed_rx,
                             snapshot_tx: handle.snapshot_tx,
@@ -155,7 +155,7 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
 
     info!("tmux control mode connected");
 
-    let pty_tx = ch.pty_tx;
+    let pane_output_tx = ch.pane_output_tx;
     let input_rx = ch.input_rx;
     let size_changed_rx = ch.size_changed_rx;
     let snapshot_tx = ch.snapshot_tx;
@@ -163,26 +163,18 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
     let initial_snapshot = tmux_client
         .refresh_snapshot()
         .context("failed to get initial tmux snapshot")?;
-    let active_pane_id = initial_snapshot
-        .windows
-        .iter()
-        .find(|w| w.is_active)
-        .and_then(|w| w.active_pane_id.clone())
-        .context("no active pane in initial tmux snapshot")?;
     let _ = snapshot_tx.send(initial_snapshot);
-
-    let active_pane = std::sync::Arc::new(std::sync::Mutex::new(active_pane_id));
 
     let tmux_for_input = std::sync::Arc::new(tmux_client);
     let tmux_for_resize = tmux_for_input.clone();
     let tmux_for_poll = tmux_for_input.clone();
-    let active_pane_for_input = active_pane.clone();
-    let active_pane_for_poll = active_pane.clone();
 
     let input_handle = std::thread::spawn(move || {
-        while let Ok(data) = input_rx.recv() {
-            let pane_id = active_pane_for_input.lock().expect("pane lock").clone();
-            if tmux_for_input.send_input(&pane_id, &data).is_err() {
+        while let Ok(input) = input_rx.recv() {
+            if tmux_for_input
+                .send_input(&input.pane_id, &input.bytes)
+                .is_err()
+            {
                 break;
             }
         }
@@ -207,22 +199,14 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
         let mut should_exit = false;
         for notification in notifications {
             match notification {
-                TmuxNotification::Output { bytes, .. } => {
-                    if pty_tx.send(bytes).is_err() {
+                TmuxNotification::Output { pane_id, bytes } => {
+                    if pane_output_tx.send(PaneOutput { pane_id, bytes }).is_err() {
                         should_exit = true;
                         break;
                     }
                 }
                 TmuxNotification::NeedsRefresh => {
                     if let Ok(snapshot) = tmux_for_poll.refresh_snapshot() {
-                        if let Some(pane_id) = snapshot
-                            .windows
-                            .iter()
-                            .find(|w| w.is_active)
-                            .and_then(|w| w.active_pane_id.clone())
-                        {
-                            *active_pane_for_poll.lock().expect("pane lock") = pane_id;
-                        }
                         let _ = snapshot_tx.send(snapshot);
                     }
                 }
