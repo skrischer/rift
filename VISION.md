@@ -1,6 +1,6 @@
-# Vision — rift
+# rift
 
-> An agent-centric IDE for terminal-based coding agents.
+> Reactive IDE awareness for terminal coding agents. Open source. Remote-native.
 
 ## The problem
 
@@ -16,21 +16,21 @@ The problem isn't that IDEs lack AI features. Every editor has bolted on copilot
 
 The result is a mismatch. You're running Claude Code in a terminal pane that the IDE barely acknowledges. The file explorer doesn't react to what the agent is doing. Diagnostics don't update in real-time as the agent edits. Git changes aren't surfaced until you manually refresh. The IDE and the agent exist in parallel universes.
 
-On the other side, pure terminal setups (tmux + Neovim) give the agent a first-class home but lack the visual feedback that makes complex work manageable. You can build tmux layouts, configure status bars, write scripts — but a TUI will never match a native GUI for information density, mouse interaction, and spatial awareness.
+On the other side, a new wave of agent orchestrators has emerged — tools like Arbor, Superconductor, Claude Squad, and Nimbalyst that put terminal agents at the center. They solve the management problem: running multiple agents in parallel, isolating worktrees, reviewing diffs after the fact. But they stop at the terminal boundary. **None of them give you live IDE awareness while agents are working** — no reactive file explorer, no real-time diagnostics, no LSP integration, no ctrl+click navigation. They show you what agents did. They don't show you what agents are doing to your codebase right now.
 
-Recent tools have started to address pieces of this. Nimbalyst wraps CLI agents in a visual workspace with session management and diff review — but it's Electron-based, local-only, and doesn't render terminals natively. Claude Squad manages multiple agents via tmux and git worktrees — but it's a TUI with no visual feedback beyond the terminal. Claude Code's own VS Code extension adds plan review and inline diffs — but it lives inside an editor-first IDE that treats the agent as a sidebar feature.
-
-No tool combines native GUI performance, remote-first SSH architecture, tmux as the multiplexing engine, and unmodified CLI agents — while being open source and free.
+The missing tool is not another terminal manager or another agent orchestrator. It's an IDE that wraps around terminal agents and provides **reactive code intelligence while they work** — diagnostics updating as files change, errors surfacing before the agent finishes, file structure reflecting reality in real-time.
 
 ## The solution
 
-This project is an **agent-centric IDE** — a native GUI shell that treats terminal-based coding agents as the primary interface and provides reactive IDE features around them.
+rift is an **agent-centric IDE** — a native GUI shell that wraps terminal-based coding agents with **reactive code intelligence**.
 
-The core idea: **tmux is the engine, the GUI is the cockpit.**
+The core differentiator is not session management or worktree isolation — other tools do that. It's that rift gives you **live IDE awareness while agents work**: diagnostics updating as files change, type errors surfacing before the agent finishes its turn, the file explorer reflecting every modification in real-time, and full code navigation (go-to-definition, find references, hover) without leaving the terminal workflow.
+
+The architecture: **tmux is the engine, the GUI is the cockpit.**
 
 tmux handles what it's already great at — session management, pane multiplexing, persistent processes. The GUI adds what tmux can't — real-time file explorer updates, live LSP diagnostics, visual git diffs, structured agent output, and native mouse interaction including context menus and ctrl+click navigation.
 
-When a coding agent edits a file, the file explorer lights up. When it introduces a type error, the diagnostics panel shows it immediately. When it commits, the git diff view surfaces what changed. When multiple agents run in parallel across worktrees, you see all of them at a glance.
+When a coding agent edits a file, the file explorer lights up. When it introduces a type error, the diagnostics panel shows it immediately — not after the agent is done, not after you run the compiler, but as it happens. When it commits, the git diff view surfaces what changed. When multiple agents run in parallel across worktrees, you see all of them at a glance.
 
 The IDE doesn't compete with the agent — it amplifies it.
 
@@ -40,21 +40,28 @@ The IDE doesn't compete with the agent — it amplifies it.
 - **Not another text editor.** Neovim runs inside the terminal panes and handles editing. This project doesn't reimplement text editing.
 - **Not another tmux replacement.** Zellij and others rewrite multiplexing from scratch. This project uses tmux as its engine and adds a visual layer on top.
 - **Not another AI IDE.** Cursor, Windsurf, and Zed build custom agent harnesses around raw LLMs. This project runs vanilla CLI agents unmodified — their harness is the product, not ours to reinvent.
-- **Not another agent GUI wrapper.** Nimbalyst and Claude Code Desktop wrap agents in Electron. This project renders terminals natively in Rust with GPU acceleration, connects to remote hosts via SSH, and treats the terminal as the primary surface — not a chat panel.
+- **Not another agent orchestrator.** Arbor, Superconductor, Claude Squad, and Nimbalyst manage agent sessions, worktrees, and diffs. This project does that too — but the core value is the reactive IDE layer on top: live diagnostics, file awareness, and code navigation while agents work. Without that layer, it's just another orchestrator.
 
 ## Why not existing tools?
 
-| Tool | What it gets right | Where it falls short |
-|---|---|---|
-| **Nimbalyst** | Visual workspace around CLI agents, multi-session kanban, diff review | Electron, local-only (no SSH/remote), no terminal rendering, no tmux integration |
-| **Claude Squad** | tmux-native, git worktree isolation, multi-agent TUI | Pure TUI — no visual feedback, no IDE features, no GUI |
-| **Cursor / Windsurf** | Deep AI integration, parallel agents | Editor-first, builds own agent harness around raw LLMs — agents are not vanilla |
-| **Zed** | Fast, native, Rust | Reinterprets the entire agent harness, no remote-first, terminal is secondary |
-| **VS Code + Claude Code** | Official extension, plan review, inline diffs | Electron, editor-centric, agent is a sidebar panel |
-| **Warp** | Modern terminal UX | No remote tmux support, no IDE features, no agent awareness |
-| **tmux + Neovim** | Agent-native, lightweight, remote-ready | Blind — no visual feedback, TUI limits on information density |
+**Agent orchestrators** — closest to rift's space, but missing the IDE layer:
 
-The unique intersection: **vanilla CLI agents + native GUI + remote-first SSH + tmux engine + open source.**
+| Tool | What it gets right | What's missing |
+|---|---|---|
+| **Arbor** | Native Rust + GPUI, remote SSH/mosh, agent-agnostic, open source (MIT), daemon architecture | No IDE features (no LSP, no diagnostics, no file explorer). No Windows support (GPUI = macOS/Linux). Replaces tmux with own session management. Hardcoded agent detection. |
+| **Superconductor** | 100% Rust, GPU-rendered, unlimited parallel agents, agent-agnostic, polished UX | Closed source. macOS only. No remote-first architecture. No IDE awareness (no LSP, no diagnostics). |
+| **Nimbalyst** | Visual workspace, multi-session kanban, diff review, open source | Electron-based. Local-only (no SSH/remote). No terminal rendering. No LSP integration. |
+| **Claude Squad** | tmux-native, git worktree isolation, multi-agent TUI | Pure TUI — no visual feedback, no IDE features, no GUI. |
+
+**Traditional IDEs** — have IDE features, but wrong architecture:
+
+| Tool | What it gets right | What's missing |
+|---|---|---|
+| **Cursor / Windsurf** | Deep AI integration, parallel agents, LSP | Editor-first. Builds own agent harness — agents are not vanilla. Electron. |
+| **Zed** | Fast, native, Rust, GPU-rendered | Reinterprets agent harness. No remote-first SSH. Terminal is secondary. |
+| **VS Code + Claude Code** | Official extension, plan review, inline diffs | Electron. Editor-centric. Agent is a sidebar panel. |
+
+**rift's unique position:** the only tool that combines reactive IDE awareness (LSP, diagnostics, file explorer) with vanilla terminal agents, remote-first SSH, tmux as engine, and open source — on Windows.
 
 ## Core principles
 
@@ -83,4 +90,4 @@ You've been using Claude Code for a feature. Mid-sprint, you want to try Codex o
 
 ## Current status
 
-Early concept phase. Architecture defined, technology validated (Rust, Tauri, tmux control mode, alacritty_terminal, LSP). No code yet.
+Phase 0 (scaffolding) complete. Cargo workspace compiling, CI green. Phase 1 (SSH + terminal rendering MVP) in progress. Reference projects studied: Arbor (Rust + GPUI, closest in scope, no IDE layer), Superconductor (native Rust, macOS only, closed source), tauri-terminal (Tauri + xterm.js proof of concept).

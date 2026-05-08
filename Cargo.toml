@@ -1,20 +1,21 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/app",
     "crates/daemon",
     "crates/tmux-core",
     "crates/terminal",
     "crates/explorer",
     "crates/protocol",
     "crates/plugin-api",
-    "app/src-tauri",
+    "crates/ssh",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
-repository = "https://github.com/pulsecraft/rift"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/skrischer/rift"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -22,3 +23,10 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "83de8a25e0ef71a8d762a148459bc863adaeb7e3", package = "gpui" }
+termy_terminal_ui = { git = "https://github.com/termy-org/termy", rev = "297bf90" }
+flume = "0.12"
+alacritty_terminal = "0.26.0"
+smol = "2.0"

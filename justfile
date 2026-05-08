@@ -1,7 +1,7 @@
 default:
     @just --list
 
-# Build all crates (excluding Tauri app which needs system libs)
+# Build all crates (excluding GPUI app which needs platform libs)
 build:
     cargo build --workspace --exclude rift-app
 
@@ -31,6 +31,53 @@ release-daemon:
 # Run daemon locally
 run-daemon *ARGS:
     cargo run -p rift-daemon -- {{ARGS}}
+
+# SSH config (overridable via env)
+export RIFT_SSH_HOST := env("RIFT_SSH_HOST", "127.0.0.1")
+export RIFT_SSH_USER := env("RIFT_SSH_USER", "developer")
+export RIFT_SSH_PORT := env("RIFT_SSH_PORT", "22")
+export RIFT_SSH_KEY := env("RIFT_SSH_KEY", home_directory() / ".ssh" / "id_rsa")
+windows_ssh_key := env("RIFT_WINDOWS_SSH_KEY", "C:\\Users\\skrischer\\.ssh\\id_rsa")
+windows_exe := "target/x86_64-pc-windows-msvc/debug/rift.exe"
+
+dev:
+    WAYLAND_DISPLAY="" \
+    RUST_LOG=rift=debug,rift_ssh=debug \
+    RIFT_SSH_HOST="{{RIFT_SSH_HOST}}" \
+    RIFT_SSH_USER="{{RIFT_SSH_USER}}" \
+    RIFT_SSH_PORT="{{RIFT_SSH_PORT}}" \
+    RIFT_SSH_KEY="{{RIFT_SSH_KEY}}" \
+    cargo run -p rift-app
+
+# Watch for changes: lint then rebuild (requires cargo-watch)
+dev-watch:
+    WAYLAND_DISPLAY="" \
+    RUST_LOG=rift=debug,rift_ssh=debug \
+    RIFT_SSH_HOST="{{RIFT_SSH_HOST}}" \
+    RIFT_SSH_USER="{{RIFT_SSH_USER}}" \
+    RIFT_SSH_PORT="{{RIFT_SSH_PORT}}" \
+    RIFT_SSH_KEY="{{RIFT_SSH_KEY}}" \
+    cargo watch -x 'clippy --workspace -- -D warnings' -x 'run -p rift-app'
+
+# Build and run native Windows .exe (cross-compiled via cargo-xwin)
+dev-windows:
+    cargo xwin build -p rift-app --target x86_64-pc-windows-msvc
+    -taskkill.exe /F /IM rift.exe 2>/dev/null
+    export WSLENV="RUST_LOG:RIFT_SSH_HOST:RIFT_SSH_USER:RIFT_SSH_PORT:RIFT_SSH_KEY" && \
+    export RUST_LOG=rift=debug,rift_ssh=debug && \
+    export RIFT_SSH_HOST="{{RIFT_SSH_HOST}}" && \
+    export RIFT_SSH_USER="{{RIFT_SSH_USER}}" && \
+    export RIFT_SSH_PORT="{{RIFT_SSH_PORT}}" && \
+    export RIFT_SSH_KEY="{{windows_ssh_key}}" && \
+    {{windows_exe}}
+
+# Watch for changes and rebuild+run Windows .exe (requires cargo-watch)
+dev-windows-watch:
+    cargo watch -s 'just dev-windows'
+
+# Build Windows .exe without running
+build-windows:
+    cargo xwin build -p rift-app --target x86_64-pc-windows-msvc
 
 # Check licenses (requires cargo-deny)
 deny:

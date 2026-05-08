@@ -1,6 +1,0 @@
-{
-  "identifier": "default",
-  "description": "Default capabilities for rift",
-  "windows": ["main"],
-  "permissions": ["core:default"]
-}

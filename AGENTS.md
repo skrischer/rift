@@ -2,7 +2,7 @@
 
 ## Project context
 
-Open-source, agent-centric IDE built in Rust. Wraps tmux with a native GUI (Tauri) to provide visual feedback for terminal-based coding agents. Split architecture: Tauri frontend on Windows, daemon on remote Linux hosts, connected via SSH.
+Open-source, agent-centric IDE built in Rust. Wraps tmux with a native GPU-accelerated GUI (GPUI) to provide visual feedback for terminal-based coding agents. Current state: single-window terminal connected via SSH. Target architecture (Phase 3+): GPUI frontend with a remote daemon on Linux hosts, connected via SSH.
 
 Coding agents (Claude Code, Codex, OpenCode, Gemini CLI) run completely unmodified. The IDE reacts to their side effects — file changes, terminal output, git state — never to agent internals. Agents are interchangeable black boxes. If you're writing code that detects or special-cases a specific agent, stop.
 
@@ -10,24 +10,25 @@ Read `VISION.md` for the why. Read `ARCHITECTURE.md` for the how.
 
 ## Tech stack
 
-- **Language:** Rust (2021 edition), TypeScript (Tauri webview)
+- **Language:** Rust (2021 edition)
 - **Async runtime:** Tokio
-- **GUI framework:** Tauri v2
+- **GUI framework:** GPUI 0.2.2
 - **Build target (daemon):** `x86_64-unknown-linux-musl`
-- **Build target (app):** `x86_64-pc-windows-msvc`
+- **Build target (app):** Linux/X11 (GPUI native), macOS and Windows deferred
 
 ## Repository layout
 
 Cargo workspace. Each crate has a single responsibility:
 
-- `crates/daemon/` — Remote daemon binary. Depends on all other crates.
-- `crates/tmux-core/` — tmux control mode parser and session state tree. Pure logic, no I/O.
-- `crates/terminal/` — VTE parsing and cell grid. Wraps `alacritty_terminal`.
-- `crates/explorer/` — File watching, git status, file sync.
-- `crates/protocol/` — Shared message types. Serializable with serde. Both sides depend on this, never on each other.
-- `crates/plugin-api/` — Plugin trait for pane awareness. Daemon depends on this, never on plugin implementations.
-- `plugins/` — Optional pane awareness plugins (e.g. claude-code, codex, devserver). Compiled as cargo features.
-- `app/` — Tauri frontend (src-tauri/ for Rust backend, src/ for TypeScript).
+- `crates/app/` — GPUI application binary.
+- `crates/ssh/` — SSH connection and PTY stream.
+- `crates/terminal/` — GPUI terminal widget. Wraps `alacritty_terminal`.
+- `crates/daemon/` — Remote daemon binary (Phase 3+).
+- `crates/tmux-core/` — tmux control mode parser and session state tree (Phase 3+).
+- `crates/explorer/` — File watching, git status, file sync (Phase 3+).
+- `crates/protocol/` — Shared message types. Serializable with serde (Phase 3+).
+- `crates/plugin-api/` — Plugin trait for pane awareness (Phase 3+).
+- `plugins/` — Optional pane awareness plugins (Phase 3+).
 
 ## Commands
 
@@ -37,8 +38,8 @@ cargo clippy --workspace -- -D warnings                          # lint (zero wa
 cargo fmt --all                                                  # format
 cargo test --workspace                                           # test all
 cargo build --release -p daemon --target x86_64-unknown-linux-musl  # daemon release build
+cargo run -p rift-app                                            # run GPUI app in dev mode
 cargo run -p daemon -- --port 9500                               # run daemon locally
-cd app && cargo tauri dev                                        # run Tauri app in dev mode
 ```
 
 ## Architectural rules
@@ -58,13 +59,26 @@ cd app && cargo tauri dev                                        # run Tauri app
 ## What to avoid
 
 - **No agent-specific code.** No detection of which CLI agent runs. No parsing of agent output formats.
-- **No proprietary dependencies.** MIT, Apache-2.0, ISC, BSD compatible only. Run `cargo deny check licenses` in CI.
+- **No proprietary dependencies.** MIT, Apache-2.0, ISC, BSD, GPL-3.0 compatible only. Run `cargo deny check licenses` in CI.
 - **No `.unwrap()` in library code.** Use `thiserror` in libs, `anyhow` in binaries. `.expect("reason")` only for true invariants.
 - **No `clone()` to satisfy the borrow checker.** Restructure ownership instead.
 - **No `String` where `&str` suffices.** Be intentional about ownership at API boundaries.
 - **No `todo!()` or `unimplemented!()` in merged code.**
 - **No feature flags for unimplemented features.**
 - **No large PRs.** Split at ~400 lines. Exception: initial scaffolding.
+
+## Branching
+
+- **`main`** — protected, production-ready. Only receives merges from `develop` via PR.
+- **`develop`** — protected, integration branch. All feature work merges here first via PR.
+- **Feature branches** — branch off `develop`, merge back into `develop`. Naming: `feat/<scope>`, `fix/<scope>`, `chore/<scope>`.
+
+**Hard rules:**
+- Always `git checkout develop && git pull` before creating a feature branch.
+- Always target `develop` as base branch when creating a PR (`gh pr create --base develop`).
+- Never target `main` for feature PRs. `main` only receives merges from `develop`.
+- Never push directly to `main` or `develop`. Always use pull requests.
+- Delete feature branches after merge.
 
 ## Commits
 

@@ -1,5 +1,7 @@
-mod error;
+mod colors;
+pub mod error;
+pub mod keyboard;
+mod view;
 
-pub use error::TerminalError;
-
-pub type Result<T> = std::result::Result<T, TerminalError>;
+pub use termy_terminal_ui::TerminalUiRenderMetricsSnapshot;
+pub use view::{TermSize, TerminalHandle, TerminalView};

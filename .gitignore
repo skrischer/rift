@@ -3,3 +3,4 @@ node_modules
 dist
 *.exe
 *.pdb
+app/src-tauri/gen/

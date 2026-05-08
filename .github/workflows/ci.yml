@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,6 +20,13 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-x11-dev libxkbcommon-dev \
+            libxcb1-dev libfreetype-dev libfontconfig-dev libwayland-dev \
+            libvulkan-dev
 
       - name: Format
         run: cargo fmt --all -- --check

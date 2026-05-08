@@ -46,13 +46,47 @@ tmux control mode and VTE streams are parsed with explicit state machines or `no
 
 ## Async discipline
 
-All I/O is async via Tokio. CPU-bound work on `spawn_blocking`:
+This project runs **two independent async runtimes** — this is forced by dependencies, not a design choice:
+
+| | GPUI (UI thread) | SSH (dedicated OS thread) |
+|---|---|---|
+| **Runtime** | smol (via GPUI internals) | Tokio |
+| **Spawn** | `cx.spawn()` | `tokio::spawn()` |
+| **Timer/sleep** | `smol::Timer::after()` | `tokio::time::sleep()` |
+| **CPU offload** | `smol::unblock()` | `tokio::task::spawn_blocking()` |
+| **Bridge** | flume channels | flume channels |
+
+GPUI owns the main event loop (`Application::new().run()`). Tokio lives in a separate OS thread created via `std::thread::spawn` + `Runtime::new()`.
+
+### Rules per runtime
+
+**GPUI/smol side** (anything in `cx.spawn`, render, event handlers):
+- Use `smol::Timer` for delays — `tokio::time::sleep` will not fire here
+- Use `smol::unblock` to offload CPU-bound work (VTE parsing, grid snapshots)
+- `tokio::task::spawn_blocking` is **not available** in this context
+- Never hold `Mutex` locks across `.await` points
+
+**Tokio side** (SSH connection, PTY I/O, daemon):
+- Use `tokio::task::spawn_blocking` for blocking I/O (`std::fs`, `russh_keys::load_secret_key`)
+- Use `tokio::fs` instead of `std::fs` in async functions
+- Never call `std::thread::sleep` — use `tokio::time::sleep`
+
+**Cross-runtime bridge:**
+- `flume` channels connect the two runtimes (PTY data, input, resize signals)
+- `Arc<Mutex<T>>` only where channel-based snapshots are not feasible (e.g. `alacritty_terminal::Term` shared between PTY loop and UI render)
 
 ```rust
-// VTE parsing is CPU-bound
-let grid = tokio::task::spawn_blocking(move || {
-    parser.process_bytes(&raw_output)
-}).await?;
+// GPUI side: offload CPU-bound VTE parsing
+let result = smol::unblock(move || {
+    let mut term = terminal.lock().map_err(|_| TerminalError::LockPoisoned)?;
+    parser.advance(&mut *term, &filtered);
+    Ok(parser)
+}).await;
+
+// Tokio side: offload blocking file I/O
+let key = tokio::task::spawn_blocking(move || {
+    russh_keys::load_secret_key(&path, None)
+}).await??;
 ```
 
-Never call blocking functions (std::fs, std::net) inside async contexts.
+Never call blocking functions (`std::fs`, `std::net`, `Path::exists()`) inside async contexts on either runtime. Evaluate them before the first `.await` point or offload to a blocking thread.

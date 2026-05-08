@@ -1,0 +1,22 @@
+[package]
+name = "rift-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rift"
+path = "src/main.rs"
+
+[dependencies]
+rift-terminal = { path = "../terminal" }
+rift-ssh = { path = "../ssh" }
+gpui.workspace = true
+tokio.workspace = true
+flume.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[build-dependencies]
+embed-resource = "3"
