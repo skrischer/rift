@@ -104,6 +104,7 @@ pub struct PaneView {
     mouse_mode_active: bool,
     hovered_link: Option<HoveredLink>,
     prev_selection: Option<GridSelection>,
+    tmux_size: Option<TermSize>,
 }
 
 impl PaneView {
@@ -226,6 +227,7 @@ impl PaneView {
             mouse_mode_active: false,
             hovered_link: None,
             prev_selection: None,
+            tmux_size: None,
         }
     }
 
@@ -243,6 +245,20 @@ impl PaneView {
 
     pub fn set_working_directory(&mut self, path: String) {
         self.working_directory = Some(path);
+    }
+
+    pub fn set_tmux_size(&mut self, cols: u16, rows: u16) {
+        let new_size = TermSize {
+            cols: cols as usize,
+            rows: rows as usize,
+        };
+        self.tmux_size = Some(new_size);
+        if new_size != self.grid_size {
+            self.grid_size = new_size;
+            let mut term = self.terminal.lock().expect("term lock poisoned");
+            term.resize(new_size);
+            self.paint_cache.clear();
+        }
     }
 
     fn send_input(&self, bytes: Vec<u8>) {
@@ -476,7 +492,7 @@ impl Focusable for PaneView {
     }
 }
 
-fn measure_cell_size(window: &mut Window, font_size: Pixels) -> Size<Pixels> {
+pub fn measure_cell_size(window: &mut Window, font_size: Pixels) -> Size<Pixels> {
     let text_system = window.text_system();
     let font = Font {
         family: "JetBrainsMono Nerd Font Mono".into(),
@@ -587,12 +603,16 @@ impl Render for PaneView {
         let cell_size = measure_cell_size(window, font_size);
         self.cell_size = cell_size;
 
-        let viewport = window.viewport_size();
-        let cols = (viewport.width / cell_size.width).floor() as usize;
-        let rows = ((viewport.height - statusbar_height()) / cell_size.height).floor() as usize;
-        let new_size = TermSize {
-            cols: cols.max(1),
-            rows: rows.max(1),
+        let new_size = if let Some(ts) = self.tmux_size {
+            ts
+        } else {
+            let viewport = window.viewport_size();
+            let cols = (viewport.width / cell_size.width).floor() as usize;
+            let rows = ((viewport.height - statusbar_height()) / cell_size.height).floor() as usize;
+            TermSize {
+                cols: cols.max(1),
+                rows: rows.max(1),
+            }
         };
 
         let mut term = self.terminal.lock().expect("term lock poisoned");
@@ -605,7 +625,9 @@ impl Render for PaneView {
             );
             self.grid_size = new_size;
             term.resize(new_size);
-            let _ = self.size_changed_tx.try_send(new_size);
+            if self.tmux_size.is_none() {
+                let _ = self.size_changed_tx.try_send(new_size);
+            }
             self.paint_cache.clear();
         }
 

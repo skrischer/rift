@@ -5,7 +5,8 @@ use termy_terminal_ui::TmuxSnapshot;
 use tracing::debug;
 
 use crate::colors;
-use crate::pane_view::{statusbar_height, PaneView};
+use crate::layout::{self, LayoutNode};
+use crate::pane_view::{measure_cell_size, statusbar_height, PaneView};
 use crate::{PaneInput, PaneOutput, TermSize};
 
 pub struct TerminalHandle {
@@ -33,11 +34,13 @@ pub struct SessionView {
     panes: HashMap<String, PaneEntry>,
     early_output_buffer: HashMap<String, Vec<Vec<u8>>>,
     windows: Vec<WindowState>,
+    layout: Option<LayoutNode>,
     active_pane_id: Option<String>,
     input_tx: flume::Sender<PaneInput>,
     size_changed_tx: flume::Sender<TermSize>,
     focus_handle: FocusHandle,
     needs_focus: bool,
+    window_grid_size: TermSize,
     ssh_label: SharedString,
     working_directory: Option<String>,
 }
@@ -102,11 +105,13 @@ impl SessionView {
             panes: HashMap::new(),
             early_output_buffer: HashMap::new(),
             windows: Vec::new(),
+            layout: None,
             active_pane_id: None,
             input_tx: input_tx.clone(),
             size_changed_tx: size_changed_tx.clone(),
             focus_handle: cx.focus_handle(),
             needs_focus: true,
+            window_grid_size: TermSize { cols: 80, rows: 24 },
             ssh_label,
             working_directory: None,
         };
@@ -153,6 +158,7 @@ impl SessionView {
                 if self.panes.contains_key(&pane_state.id) {
                     if let Some(entry) = self.panes.get(&pane_state.id) {
                         entry.entity.update(cx, |pv, cx| {
+                            pv.set_tmux_size(pane_state.width, pane_state.height);
                             if !pane_state.current_path.is_empty() {
                                 pv.set_working_directory(pane_state.current_path.clone());
                             }
@@ -168,6 +174,7 @@ impl SessionView {
                     let entity = cx.new(|pane_cx| {
                         let mut pv = PaneView::new(pane_cx, pty_rx, input_tx, size_changed_tx);
                         pv.set_pane_id(pane_id.clone());
+                        pv.set_tmux_size(pane_state.width, pane_state.height);
                         if !pane_state.current_path.is_empty() {
                             pv.set_working_directory(pane_state.current_path.clone());
                         }
@@ -201,7 +208,56 @@ impl SessionView {
             self.working_directory = Some(cwd);
         }
 
+        self.layout = snapshot
+            .windows
+            .iter()
+            .find(|w| w.is_active)
+            .map(|w| layout::build_layout(&w.panes));
+
         cx.notify();
+    }
+
+    fn render_layout(&self, node: &LayoutNode) -> AnyElement {
+        let border_color = Hsla::from(colors::SURFACE1);
+
+        match node {
+            LayoutNode::Pane(id) => {
+                if let Some(entry) = self.panes.get(id) {
+                    entry.entity.clone().into_any_element()
+                } else {
+                    div().flex_grow().into_any_element()
+                }
+            }
+            LayoutNode::Split {
+                horizontal,
+                children,
+            } => {
+                let mut container = div().flex().size_full();
+                container = if *horizontal {
+                    container.flex_row()
+                } else {
+                    container.flex_col()
+                };
+                let last = children.len().saturating_sub(1);
+                for (i, (proportion, child)) in children.iter().enumerate() {
+                    let inner = self.render_layout(child);
+                    let mut wrapper = div()
+                        .flex_1()
+                        .flex_basis(relative(*proportion))
+                        .size_full()
+                        .child(inner);
+                    if i < last {
+                        wrapper = if *horizontal {
+                            wrapper.border_r_1().border_color(border_color)
+                        } else {
+                            wrapper.border_b_1().border_color(border_color)
+                        };
+                    }
+                    container = container.child(wrapper);
+                }
+                container.into_any_element()
+            }
+        }
     }
 }
 
@@ -233,6 +289,20 @@ impl Render for SessionView {
         }
 
         let font_size = px(14.0);
+        let cell_size = measure_cell_size(window, font_size);
+
+        let viewport = window.viewport_size();
+        let total_cols = (viewport.width / cell_size.width).floor() as usize;
+        let total_rows =
+            ((viewport.height - statusbar_height()) / cell_size.height).floor() as usize;
+        let window_size = TermSize {
+            cols: total_cols.max(1),
+            rows: total_rows.max(1),
+        };
+        if window_size != self.window_grid_size {
+            self.window_grid_size = window_size;
+            let _ = self.size_changed_tx.try_send(window_size);
+        }
 
         let (grid_size, pane_cwd) = self
             .active_pane_id
@@ -254,17 +324,11 @@ impl Render for SessionView {
         let statusbar_border = Hsla::from(colors::SURFACE1);
         let statusbar_fg = Hsla::from(colors::SUBTEXT0);
 
-        let active_window = self.windows.iter().find(|w| w.is_active);
-        let pane_entities: Vec<Entity<PaneView>> = active_window
-            .map(|w| {
-                w.pane_ids
-                    .iter()
-                    .filter_map(|id| self.panes.get(id).map(|e| e.entity.clone()))
-                    .collect()
-            })
-            .unwrap_or_else(|| self.panes.values().map(|e| e.entity.clone()).collect());
-
-        let pane_area = div().flex().flex_col().flex_grow().children(pane_entities);
+        let pane_area = if let Some(ref layout) = self.layout {
+            self.render_layout(layout)
+        } else {
+            div().flex_grow().into_any_element()
+        };
 
         let statusbar = div()
             .id("statusbar")

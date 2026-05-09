@@ -1,6 +1,7 @@
 mod colors;
 pub mod error;
 pub mod keyboard;
+pub mod layout;
 pub mod pane_view;
 mod session_view;
 
