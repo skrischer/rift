@@ -67,6 +67,23 @@ impl SshConnection {
 
         Ok(PtyStream::new(channel))
     }
+
+    pub async fn open_pty_exec(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        command: &str,
+    ) -> Result<PtyStream, SshError> {
+        let channel = self.handle.channel_open_session().await?;
+
+        channel
+            .request_pty(false, "xterm-256color", cols.into(), rows.into(), 0, 0, &[])
+            .await?;
+
+        channel.exec(true, command).await?;
+
+        Ok(PtyStream::new(channel))
+    }
 }
 
 struct ClientHandler {
