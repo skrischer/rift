@@ -1,4 +1,6 @@
-# Phase 2c: Multi-Pane Awareness — Implementation Plan
+# Phase 2c: Multi-Pane Awareness — Implementation Plan (COMPLETED)
+
+> Completed 2026-05-20. All steps implemented. SessionView + PaneView architecture, pane-scoped channels, snapshot-driven lifecycle, split-tree layout, focus routing.
 
 Phase 2c replaces the current single-pane terminal view with a multi-pane architecture that renders all visible tmux panes in their tmux-native layout. Each pane is an independent GPUI view with its own VTE parser, arranged via GPUI's flex layout system.
 

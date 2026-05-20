@@ -105,6 +105,7 @@ pub struct PaneView {
     hovered_link: Option<HoveredLink>,
     prev_selection: Option<GridSelection>,
     tmux_size: Option<TermSize>,
+    content_origin: Point<Pixels>,
 }
 
 impl PaneView {
@@ -228,6 +229,7 @@ impl PaneView {
             hovered_link: None,
             prev_selection: None,
             tmux_size: None,
+            content_origin: Point::default(),
         }
     }
 
@@ -277,8 +279,10 @@ impl PaneView {
             return (0, 0);
         }
 
-        let col = (pos.x / self.cell_size.width).floor().max(0.0) as usize;
-        let row = (pos.y / self.cell_size.height).floor().max(0.0) as usize;
+        let local_x = pos.x - self.content_origin.x;
+        let local_y = pos.y - self.content_origin.y;
+        let col = (local_x / self.cell_size.width).floor().max(0.0) as usize;
+        let row = (local_y / self.cell_size.height).floor().max(0.0) as usize;
         (
             col.min(self.grid_size.cols.saturating_sub(1)),
             row.min(self.grid_size.rows.saturating_sub(1)),
@@ -642,6 +646,8 @@ impl Render for PaneView {
 
         let mode = *term.mode();
 
+        let is_focused = self.focus_handle.is_focused(window);
+
         let cursor_point = term.grid().cursor.point;
         let cursor_row = cursor_point.line.0 as usize;
         let cursor_col = cursor_point.column.0;
@@ -651,7 +657,8 @@ impl Render for PaneView {
         } else {
             CursorShape::Hidden
         };
-        let show_cursor = cursor_shape != CursorShape::Hidden
+        let show_cursor = is_focused
+            && cursor_shape != CursorShape::Hidden
             && (self.cursor_blink_visible || !cursor_style.blinking);
         let mouse_now = mode.intersects(
             TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION,
@@ -716,6 +723,18 @@ impl Render for PaneView {
             font_size,
             cursor_style: termy_cursor_style,
         };
+
+        let entity = cx.entity().clone();
+        let bounds_observer = canvas(
+            move |bounds: Bounds<Pixels>, _window: &mut Window, cx: &mut App| {
+                entity.update(cx, |view: &mut Self, _cx| {
+                    view.content_origin = bounds.origin;
+                });
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
 
         let mut terminal_area = div()
             .id("terminal")
@@ -1000,6 +1019,7 @@ impl Render for PaneView {
                     }
                 }
             }))
+            .child(bounds_observer)
             .child(grid)
     }
 }

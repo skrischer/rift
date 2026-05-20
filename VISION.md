@@ -90,4 +90,4 @@ You've been using Claude Code for a feature. Mid-sprint, you want to try Codex o
 
 ## Current status
 
-Phase 2 (tmux control mode integration) complete. SSH connection to remote tmux via control mode (`-CC`), event-driven notification processing, flow control, active pane tracking, working directory from tmux snapshots, terminal rendering through GPUI with `alacritty_terminal` and `termy_terminal_ui`. Phase 2c (multi-pane awareness) in progress.
+Phase 2 (tmux control mode integration) complete. SSH connection to remote tmux via control mode (`-CC`), event-driven notification processing, flow control, active pane tracking, working directory from tmux snapshots, terminal rendering through GPUI with `alacritty_terminal` and `termy_terminal_ui`. Multi-pane awareness (Phase 2c) complete: per-pane VTE parsers, snapshot-driven pane lifecycle, split-tree layout from tmux pane coordinates. Next: tab bar for tmux window switching, then daemon with file tree, git status, and LSP diagnostics on the remote host.

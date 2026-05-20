@@ -8,8 +8,8 @@ Current state (Phase 2): single-window terminal connected via SSH using tmux con
 
 Target architecture (Phase 3+): split into two processes connected by an SSH tunnel:
 
-- **GPUI frontend** — a native application that handles all rendering, user interaction, and local compute (language servers).
-- **Daemon** — a statically linked Linux binary that runs on the remote host, manages tmux, parses terminal output, and watches the filesystem.
+- **GPUI frontend** — a native application that handles all rendering and user interaction.
+- **Daemon** — a statically linked Linux binary that runs on the remote host, manages tmux, watches the filesystem, runs language servers, and parses terminal output.
 
 ## Agent-agnostic design
 
@@ -18,7 +18,7 @@ The system has no concept of "which coding agent is running." It sees tmux panes
 All IDE features derive from two universal signals:
 
 - **PTY byte streams** — terminal output, parsed by the VTE layer into cell grids. Any process that writes to a terminal works.
-- **Filesystem events** — file creation, modification, deletion. Any process that writes files triggers the file watcher, the file sync, the explorer update, and the LSP re-index.
+- **Filesystem events** — file creation, modification, deletion. Any process that writes files triggers the file watcher, the explorer update, and LSP diagnostics.
 
 This is a deliberate architectural constraint. There is no agent detection, no agent-specific event parsing, no protocol integration with any agent's internals. The agents are black boxes.
 
@@ -69,13 +69,20 @@ The two runtimes never share state beyond the channels. The `Term` instance is b
 │  GPUI frontend               │  SSH  │  Daemon (static musl binary)  │
 │  ├─ Terminal renderer        │◄─────►│  ├─ tmux control mode client  │
 │  ├─ File explorer            │  WS   │  ├─ VTE parser                │
-│  ├─ Context menus            │       │  ├─ File watcher              │
-│  ├─ Session bar              │       │  └─ File sync                 │
-│  ├─ Local project files      │       │                               │
-│  └─ Language servers         │       │  tmux server                  │
+│  ├─ Context menus            │       │  ├─ File watcher (inotify)    │
+│  └─ Session bar              │       │  ├─ Git status                │
+│                              │       │  └─ Language servers (LSP)    │
+│                              │       │                               │
+│                              │       │  tmux server                  │
 │                              │       │  Neovim (in panes)            │
 └─────────────────────────────┘       └──────────────────────────────┘
 ```
+
+### Why LSP runs on the remote
+
+Language servers need access to the full project environment — `node_modules`, `target/`, `venv/`, `$GOPATH` — to resolve types and dependencies. These directories are not in git, platform-specific, and often gigabytes in size. Syncing them to the local host would require either mirroring the entire dependency tree (hundreds of MB, platform mismatches) or running a parallel package install locally. Every other remote-capable IDE (VS Code Remote, JetBrains Gateway, Zed) runs LSP on the remote for this reason.
+
+The daemon starts language servers on demand and forwards diagnostics as lightweight JSON over the WebSocket connection. No file sync, no local project copies, no path translation.
 
 When the daemon is introduced, VTE parsing may move server-side (daemon sends pre-parsed cell diffs) or remain client-side (daemon forwards raw PTY streams). That decision is deferred.
 
@@ -113,10 +120,10 @@ rift/
 │   ├── app/                # GPUI application binary
 │   ├── ssh/                # SSH connection + PTY stream
 │   ├── terminal/           # Terminal widget wrapping alacritty_terminal + termy_terminal_ui
-│   ├── daemon/             # Remote daemon binary (Phase 3+)
-│   ├── tmux-core/          # tmux control mode parser + state (Phase 3+)
-│   ├── explorer/           # File watcher, git status, file sync (Phase 3+)
-│   ├── protocol/           # Shared message types (Phase 3+)
+│   ├── daemon/             # Remote daemon binary
+│   ├── tmux-core/          # tmux control mode parser + state (currently using termy's TmuxClient directly)
+│   ├── explorer/           # File watcher, git status — library used by daemon
+│   ├── protocol/           # Shared message types. Serializable with serde
 │   └── plugin-api/         # Plugin trait for pane awareness (Phase 3+)
 ├── AGENTS.md
 ├── VISION.md

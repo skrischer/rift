@@ -209,6 +209,9 @@ impl SessionView {
         }
 
         self.windows = new_windows;
+        if active_pane_id != self.active_pane_id {
+            self.needs_focus = true;
+        }
         self.active_pane_id = active_pane_id;
         if let Some(cwd) = active_cwd {
             self.working_directory = Some(cwd);
@@ -291,6 +294,20 @@ impl Render for SessionView {
             if let Some(entity) = entity_to_focus {
                 cx.focus_view(&entity, window);
                 self.needs_focus = false;
+            }
+        }
+
+        let focused_pane_id = self.panes.iter().find_map(|(id, entry)| {
+            let fh = entry.entity.read(cx).focus_handle(cx);
+            fh.is_focused(window).then_some(id.as_str())
+        });
+        if let Some(id) = focused_pane_id {
+            if self.active_pane_id.as_deref() != Some(id) {
+                debug!(pane_id = %id, "focus changed");
+                let _ = self
+                    .tmux_command_tx
+                    .try_send(format!("select-pane -t {}", id));
+                self.active_pane_id = Some(id.to_string());
             }
         }
 

@@ -23,10 +23,10 @@ Cargo workspace. Each crate has a single responsibility:
 - `crates/app/` — GPUI application binary.
 - `crates/ssh/` — SSH connection and PTY stream.
 - `crates/terminal/` — GPUI terminal widget. Wraps `alacritty_terminal` + `termy_terminal_ui`.
-- `crates/daemon/` — Remote daemon binary (Phase 3+).
-- `crates/tmux-core/` — tmux control mode state (Phase 3+, currently using termy's `TmuxClient` directly).
-- `crates/explorer/` — File watching, git status, file sync (Phase 3+).
-- `crates/protocol/` — Shared message types. Serializable with serde (Phase 3+).
+- `crates/daemon/` — Remote daemon binary. Runs on the remote host, manages file watching, git status, and language servers.
+- `crates/tmux-core/` — tmux control mode state (currently using termy's `TmuxClient` directly).
+- `crates/explorer/` — File watching, git status — library used by daemon (Phase 3+).
+- `crates/protocol/` — Shared message types. Serializable with serde.
 - `crates/plugin-api/` — Plugin trait for pane awareness (Phase 3+).
 - `plugins/` — Optional pane awareness plugins (Phase 3+).
 

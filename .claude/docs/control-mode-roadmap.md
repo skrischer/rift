@@ -93,30 +93,40 @@ Completed 2026-05-08. PR: `feat/tmux-control-mode`.
 - CWD from snapshot refresh, not subscriptions (polling on `NeedsRefresh` events)
 - No `%pause`/`%continue` handling on our side (termy handles flow control internally)
 
-### Phase 2c: Multi-pane awareness (NEXT)
+### Phase 2c: Multi-pane awareness (COMPLETED)
 
+Completed 2026-05-20. PR: `feat/tmux-control-mode`.
+
+**What was delivered:**
 - Per-pane `alacritty_terminal::Term` instances fed by pane-specific `%output`
-- Track all panes in session, render active pane
-- Statusbar shows window list, active window/pane indicator
-- Pane switching via UI (tab bar or keyboard shortcut)
-- Layout-aware pane sizing (parse tmux layout strings)
+- `SessionView` + `PaneView` split (replaced monolithic `TerminalView`)
+- Snapshot-driven pane lifecycle: create/remove PaneViews from `TmuxSnapshot` diffs
+- Early output buffering for `%output` arriving before pane creation
+- Split-tree layout reconstruction from tmux pane coordinates (GPUI flex layout)
+- Focus routing: click pane to focus, keyboard input tagged with pane_id
+- Per-pane working directory from snapshot
 
 **Validation:** create split in tmux, both panes render and update independently.
 
-### Phase 2d: Statusbar enrichment
+### Phase 2d: Tab bar + statusbar enrichment (NEXT)
 
+- Tab bar for tmux window switching (click or Ctrl+Shift+1..9)
 - CWD from tmux subscriptions (`refresh-client -B`) instead of snapshot polling
 - Git branch from subscription or metadata sync
 - Pane command name (what's running in the pane)
 - Session/window name in titlebar or statusbar
 - Connection status indicator
 
-### Phase 3: Daemon extraction
+### Phase 3: Daemon
 
-- Move tmux management + file watcher into daemon binary on remote host
+- Remote daemon binary on the host, connected to frontend via WebSocket over SSH port-forward
+- File tree API (`readdir` + `inotify`/`fswatch`) for file explorer
+- Git status (`git status --porcelain`) for file tree annotations
+- Language servers (LSP) run on the remote — daemon starts them on demand, forwards diagnostics as JSON
 - Frontend connects to daemon via protocol (see protocol.md)
-- Daemon manages tmux control mode connection locally (no SSH latency for parsing)
 - VTE parsing stays client-side or moves to daemon (deferred decision)
+
+**Why LSP on the remote:** Language servers need `node_modules`, `target/`, `venv/` etc. to resolve types. These are not in git, platform-specific, and often gigabytes. Syncing them to the client is impractical. All remote-capable IDEs (VS Code Remote, JetBrains Gateway, Zed) run LSP on the remote for this reason.
 
 ## Known pitfalls
 
@@ -135,7 +145,7 @@ Completed 2026-05-08. PR: `feat/tmux-control-mode`.
 - [x] **Upstream strategy:** PR #306 merged into termy. No fork needed.
 - [x] **Minimum tmux version:** 3.4+ (hard requirement for subscriptions).
 - [ ] **VTE parsing location in Phase 3:** Client-side (current, simpler) vs. daemon-side (less data over SSH). Deferred per ARCHITECTURE.md.
-- [ ] **Per-pane VTE ownership:** Does `crates/terminal` own per-pane `Term` instances, or does a new module in `crates/app` manage the pane-to-Term mapping?
+- [x] **Per-pane VTE ownership:** `crates/terminal` owns per-pane `Term` instances. `PaneView` each has their own `Arc<Mutex<Term>>`, managed by `SessionView` via snapshot diffs.
 
 ## Decision log
 
