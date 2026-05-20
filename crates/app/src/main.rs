@@ -20,6 +20,7 @@ struct PtyChannels {
     input_rx: flume::Receiver<PaneInput>,
     size_changed_rx: flume::Receiver<TermSize>,
     snapshot_tx: flume::Sender<termy_terminal_ui::TmuxSnapshot>,
+    tmux_command_rx: flume::Receiver<String>,
 }
 
 fn main() {
@@ -74,6 +75,7 @@ fn main() {
                             input_rx: handle.input_rx,
                             size_changed_rx: handle.size_changed_rx,
                             snapshot_tx: handle.snapshot_tx,
+                            tmux_command_rx: handle.tmux_command_rx,
                         };
 
                         let key_exists = ssh.key.exists();
@@ -159,6 +161,7 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
     let input_rx = ch.input_rx;
     let size_changed_rx = ch.size_changed_rx;
     let snapshot_tx = ch.snapshot_tx;
+    let tmux_command_rx = ch.tmux_command_rx;
 
     let initial_snapshot = tmux_client
         .refresh_snapshot()
@@ -168,6 +171,7 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
     let tmux_for_input = std::sync::Arc::new(tmux_client);
     let tmux_for_resize = tmux_for_input.clone();
     let tmux_for_poll = tmux_for_input.clone();
+    let tmux_for_cmd = tmux_for_input.clone();
 
     let input_handle = std::thread::spawn(move || {
         while let Ok(input) = input_rx.recv() {
@@ -186,6 +190,15 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
                 .set_client_size(new_size.cols as u16, new_size.rows as u16)
                 .is_err()
             {
+                break;
+            }
+        }
+    });
+
+    let cmd_handle = std::thread::spawn(move || {
+        while let Ok(cmd) = tmux_command_rx.recv() {
+            debug!(cmd = %cmd, "sending tmux command");
+            if tmux_for_cmd.send_command_async(&cmd).is_err() {
                 break;
             }
         }
@@ -228,5 +241,6 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
     let _ = poll_handle.join();
     let _ = input_handle.join();
     let _ = resize_handle.join();
+    let _ = cmd_handle.join();
     Ok(())
 }

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use termy_terminal_ui::TmuxSnapshot;
 use tracing::debug;
@@ -14,6 +15,7 @@ pub struct TerminalHandle {
     pub input_rx: flume::Receiver<PaneInput>,
     pub size_changed_rx: flume::Receiver<TermSize>,
     pub snapshot_tx: flume::Sender<TmuxSnapshot>,
+    pub tmux_command_rx: flume::Receiver<String>,
 }
 
 struct PaneEntry {
@@ -21,12 +23,12 @@ struct PaneEntry {
     pty_tx: flume::Sender<Vec<u8>>,
 }
 
-#[allow(dead_code)]
 struct WindowState {
     id: String,
     name: String,
     index: i32,
     is_active: bool,
+    #[allow(dead_code)]
     pane_ids: Vec<String>,
 }
 
@@ -38,6 +40,7 @@ pub struct SessionView {
     active_pane_id: Option<String>,
     input_tx: flume::Sender<PaneInput>,
     size_changed_tx: flume::Sender<TermSize>,
+    tmux_command_tx: flume::Sender<String>,
     focus_handle: FocusHandle,
     needs_focus: bool,
     window_grid_size: TermSize,
@@ -51,6 +54,7 @@ impl SessionView {
         let (input_tx, input_rx) = flume::unbounded::<PaneInput>();
         let (size_changed_tx, size_changed_rx) = flume::unbounded();
         let (snapshot_tx, snapshot_rx) = flume::unbounded::<TmuxSnapshot>();
+        let (tmux_command_tx, tmux_command_rx) = flume::unbounded::<String>();
 
         {
             cx.spawn(async move |this, cx| loop {
@@ -109,6 +113,7 @@ impl SessionView {
             active_pane_id: None,
             input_tx: input_tx.clone(),
             size_changed_tx: size_changed_tx.clone(),
+            tmux_command_tx,
             focus_handle: cx.focus_handle(),
             needs_focus: true,
             window_grid_size: TermSize { cols: 80, rows: 24 },
@@ -121,6 +126,7 @@ impl SessionView {
             input_rx,
             size_changed_rx,
             snapshot_tx,
+            tmux_command_rx,
         };
 
         (view, handle)
@@ -291,10 +297,17 @@ impl Render for SessionView {
         let font_size = px(14.0);
         let cell_size = measure_cell_size(window, font_size);
 
+        let has_tabs = self.windows.len() > 1;
+        let tab_bar_h = if has_tabs {
+            statusbar_height()
+        } else {
+            px(0.0)
+        };
+
         let viewport = window.viewport_size();
         let total_cols = (viewport.width / cell_size.width).floor() as usize;
-        let total_rows =
-            ((viewport.height - statusbar_height()) / cell_size.height).floor() as usize;
+        let total_rows = ((viewport.height - statusbar_height() - tab_bar_h) / cell_size.height)
+            .floor() as usize;
         let window_size = TermSize {
             cols: total_cols.max(1),
             rows: total_rows.max(1),
@@ -320,9 +333,52 @@ impl Render for SessionView {
 
         let size_label = format!("{}x{}", grid_size.cols, grid_size.rows);
         let bg_hsla = Hsla::from(colors::BACKGROUND);
-        let statusbar_bg = Hsla::from(colors::SURFACE0);
-        let statusbar_border = Hsla::from(colors::SURFACE1);
-        let statusbar_fg = Hsla::from(colors::SUBTEXT0);
+        let surface0 = Hsla::from(colors::SURFACE0);
+        let surface1 = Hsla::from(colors::SURFACE1);
+        let subtext0 = Hsla::from(colors::SUBTEXT0);
+        let foreground = Hsla::from(colors::FOREGROUND);
+
+        let tab_bar = has_tabs.then(|| {
+            let windows_data: Vec<_> = self
+                .windows
+                .iter()
+                .map(|w| (w.id.clone(), w.index, w.name.clone(), w.is_active))
+                .collect();
+
+            div()
+                .id("tab-bar")
+                .flex()
+                .flex_row()
+                .items_center()
+                .w_full()
+                .h(statusbar_height())
+                .bg(surface0)
+                .border_b_1()
+                .border_color(surface1)
+                .text_size(font_size)
+                .font_family("JetBrainsMono Nerd Font Mono")
+                .children(windows_data.into_iter().map(|(id, index, name, active)| {
+                    let click_id = id.clone();
+                    div()
+                        .id(SharedString::from(format!("tab-{}", id)))
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .cursor_pointer()
+                        .when(active, |d| d.bg(surface1).text_color(foreground))
+                        .when(!active, |d| {
+                            d.text_color(subtext0).hover(|d| d.bg(surface1))
+                        })
+                        .on_click(cx.listener(move |this, _, _, _cx| {
+                            if let Err(e) = this
+                                .tmux_command_tx
+                                .try_send(format!("select-window -t {}", click_id))
+                            {
+                                debug!(error = %e, "failed to send window switch command");
+                            }
+                        }))
+                        .child(SharedString::from(format!("{}: {}", index, name)))
+                }))
+        });
 
         let pane_area = if let Some(ref layout) = self.layout {
             self.render_layout(layout)
@@ -338,11 +394,11 @@ impl Render for SessionView {
             .justify_between()
             .w_full()
             .h(statusbar_height())
-            .bg(statusbar_bg)
+            .bg(surface0)
             .border_t_1()
-            .border_color(statusbar_border)
+            .border_color(surface1)
             .text_size(font_size)
-            .text_color(statusbar_fg)
+            .text_color(subtext0)
             .font_family("JetBrainsMono Nerd Font Mono")
             .px(px(12.0))
             .child(
@@ -361,6 +417,7 @@ impl Render for SessionView {
             .flex_col()
             .size_full()
             .bg(bg_hsla)
+            .children(tab_bar)
             .child(pane_area)
             .child(statusbar)
     }
