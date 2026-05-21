@@ -51,7 +51,7 @@ rift/
 |   +-- explorer/     # File watcher, git status, file sync (Phase 3+)
 |   +-- protocol/     # Shared message types (Phase 3+)
 |   +-- plugin-api/   # Plugin trait for pane awareness (Phase 3+)
-+-- .claude/docs/     # Architecture docs and roadmaps
++-- docs/             # Architecture docs, specs, and roadmap
 ```
 
 ## Development
@@ -84,7 +84,7 @@ SSH connection is configured via environment variables: `RIFT_SSH_HOST`, `RIFT_S
 
 ## Status
 
-Phase 2 (tmux control mode integration) complete. SSH connection to remote tmux via control mode (`-CC`), event-driven notification processing, flow control, active pane tracking, terminal rendering through GPUI. Phase 2c (multi-pane awareness) in progress.
+Phase 2c (multi-pane awareness) complete. SSH connection to remote tmux via control mode (`-CC`), event-driven notification processing, flow control, per-pane VTE parsing, split-tree layout from tmux coordinates, focus routing. Next: Phase 2d (tab bar + statusbar enrichment).
 
 ## License
 
