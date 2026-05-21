@@ -6,7 +6,7 @@ Open-source, agent-centric IDE built in Rust. Wraps tmux with a native GPU-accel
 
 Coding agents (Claude Code, Codex, OpenCode, Gemini CLI) run completely unmodified. The IDE reacts to their side effects — file changes, terminal output, git state — never to agent internals. Agents are interchangeable black boxes. If you're writing code that detects or special-cases a specific agent, stop.
 
-Read `VISION.md` for the why. Read `ARCHITECTURE.md` for the how.
+Read `docs/vision.md` for the why. Read `docs/architecture.md` for the how.
 
 ## Tech stack
 
@@ -89,6 +89,39 @@ fix(terminal): handle malformed UTF-8 in cell output
 refactor(explorer): extract git status into dedicated module
 chore: update alacritty_terminal to 0.24
 ```
+
+## Planning handover
+
+Planning lives in `docs/`. Implementation specs follow the SDD (Spec-Driven Development) format defined in `spec-template.md`.
+
+**Before starting work on a spec:**
+1. Read `docs/handover-conventions.md` for the exchange rules
+2. Read the relevant `docs/spec-*.md` file for scope, constraints, and prior decisions
+3. Do not start work on specs with status `DRAFT` — only `READY` specs are cleared for implementation
+
+**After completing work on a spec:**
+1. Update the spec status to `COMPLETED` with date
+2. Mark completed steps with checkboxes in the task breakdown
+3. Add entries to the decision log for decisions made during implementation
+4. Update `docs/roadmap.md` with the current phase status
+
+**If blocked:**
+1. Set spec status to `BLOCKED` with reason
+2. Add a note at the blocked step in the task breakdown
+
+## Claude Code
+
+When compacting, always preserve: the list of modified files, active crate context, and any failing test output.
+
+For detailed patterns (error handling, state management, async discipline), read `docs/patterns.md` before implementing — don't guess from memory.
+
+For protocol message types, read `docs/protocol.md` before adding or modifying messages.
+
+1. Check architecture docs before adding dependencies or new crates.
+2. Run `cargo clippy --workspace -- -D warnings` and `cargo test --workspace` before considering a task done.
+3. Don't refactor code you weren't asked to touch. Note opportunities in a comment if significant.
+4. When in doubt about a design decision, state your reasoning — don't silently pick an approach.
+5. Respect crate boundaries. Adding to `protocol` is a deliberate API change.
 
 ## Testing
 

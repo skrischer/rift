@@ -126,9 +126,8 @@ rift/
 │   ├── protocol/           # Shared message types. Serializable with serde
 │   └── plugin-api/         # Plugin trait for pane awareness (Phase 3+)
 ├── AGENTS.md
-├── VISION.md
-├── ARCHITECTURE.md
-└── CLAUDE.md
+├── CLAUDE.md               # Symlink → AGENTS.md
+└── docs/                   # Architecture, specs, roadmap, reference docs
 ```
 
 ## Commands
