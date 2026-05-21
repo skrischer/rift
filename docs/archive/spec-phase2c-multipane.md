@@ -37,4 +37,4 @@ Replaced monolithic `TerminalView` with `SessionView` + `PaneView` architecture.
 - 2026-05-08: Chose snapshot-diff lifecycle over event-driven pane creation (simpler, avoids races).
 - 2026-05-10: Implemented early output buffer to handle `%output` before pane materialization.
 - 2026-05-12: Split-tree reconstruction working for H/V splits; complex layouts fall back gracefully.
-- 2026-05-20: Phase 2c completed. All 6 steps implemented and validated.
+- 2026-05-20: Phase 2c completed. All outcomes implemented and validated.

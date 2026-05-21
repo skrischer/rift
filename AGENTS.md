@@ -92,7 +92,7 @@ chore: update alacritty_terminal to 0.24
 
 ## Planning handover
 
-Planning lives in `docs/`. Implementation specs follow the SDD (Spec-Driven Development) format defined in `spec-template.md`.
+Planning lives in `docs/`. Implementation specs follow the SDD (Spec-Driven Development) format defined in `docs/spec-template.md`.
 
 **Before starting work on a spec:**
 1. Read `docs/handover-conventions.md` for the exchange rules

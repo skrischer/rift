@@ -7,10 +7,10 @@ Living document tracking project phases, current status, and planned work.
 | Phase | Name | Status | Spec |
 |---|---|---|---|
 | 1 | SSH terminal + GPUI rendering | COMPLETED | (predates spec system) |
+| 2 (migration) | termy_terminal_ui adoption | COMPLETED 2026-05-07 | [archive/spec-terminal-migration.md](archive/spec-terminal-migration.md) |
 | 2a+2b | tmux control mode integration | COMPLETED 2026-05-08 | [archive/spec-phase2ab-control-mode.md](archive/spec-phase2ab-control-mode.md) |
 | 2c | Multi-pane awareness | COMPLETED 2026-05-20 | [archive/spec-phase2c-multipane.md](archive/spec-phase2c-multipane.md) |
-| 2d | Tab bar + statusbar enrichment | NEXT | [spec-phase2d-tabbar.md](spec-phase2d-tabbar.md) |
-| 2 (migration) | termy_terminal_ui adoption | COMPLETED 2026-05-07 | [archive/spec-terminal-migration.md](archive/spec-terminal-migration.md) |
+| 2d | Tab bar + statusbar enrichment | IN PROGRESS | [spec-phase2d-tabbar.md](spec-phase2d-tabbar.md) |
 | 3 | Remote daemon | PLANNED | — |
 
 ## Current focus

@@ -1,6 +1,6 @@
 # Spec: Phase 2d — Tab bar + statusbar enrichment
 
-> Status: READY
+> Status: IN PROGRESS
 > Created: 2026-05-21
 > Completed: —
 
@@ -8,8 +8,8 @@ Tab bar for tmux window switching and enriched statusbar with live metadata from
 
 ## Outcome
 
-- [ ] Tab bar renders one tab per tmux window, showing `index: name`, with the active window highlighted
-- [ ] Clicking a tab switches to that window (pane layout rebuilds from snapshot)
+- [x] Tab bar renders one tab per tmux window, showing `index: name`, with the active window highlighted
+- [x] Clicking a tab switches to that window (pane layout rebuilds from snapshot)
 - [ ] Keyboard shortcut Ctrl+Shift+1..9 switches windows 1..9
 - [ ] CWD updates via tmux subscriptions (`refresh-client -B`) instead of snapshot polling
 - [ ] Git branch displayed in statusbar (from subscription or metadata sync)
@@ -110,7 +110,7 @@ Tab bar for tmux window switching and enriched statusbar with live metadata from
 - Session/window name: from snapshot (already available)
 - Connection status: track SSH connection state, show indicator
 
-**Validation:** Statusbar shows all four pieces of information. Git branch updates when switching to a different repo directory. Command name shows `claude` when Claude Code is running, `bash` otherwise.
+**Validation:** Statusbar shows all four pieces of information. Git branch updates when switching to a different repo directory. Command name reflects the actual running process (e.g. `bash`, `python`, `cargo`).
 
 ## Verification
 
@@ -139,3 +139,4 @@ Tab bar for tmux window switching and enriched statusbar with live metadata from
 Decisions made during implementation:
 
 - 2026-05-21: Spec created from Phase 2d section of control-mode-roadmap.md. tmux protocol reference extracted to tmux-reference.md.
+- 2026-05-21: Steps 2 (tab bar rendering) and 3 (click-to-switch) already implemented in prior commits (33fea26, 8ca4b0b). Status updated to IN PROGRESS.
