@@ -71,7 +71,7 @@ The IDE doesn't compete with the agent — it amplifies it.
 4. **Reactive, not manual.** The IDE reacts to what's happening in the terminal. File changes, diagnostics, git state — all update automatically without user action.
 5. **tmux-native.** Don't reinvent multiplexing. tmux is battle-tested and universally available. Use it as the engine, not as a dependency to hide.
 6. **Remote-first.** SSH is not an afterthought. The architecture assumes the code lives on a remote host. Local development is a special case of remote where the host is localhost.
-7. **Native performance.** Rust + Tauri. No Electron, no web runtime overhead. Terminal rendering must be as fast as Alacritty. GUI must feel native on Windows.
+7. **Native performance.** Rust + GPUI. No Electron, no web runtime overhead. Terminal rendering must be as fast as Alacritty. GPU-accelerated native rendering.
 8. **Personal tool.** This is built for a specific workflow — terminal-based agentic coding on remote hosts. Generality is a non-goal. Solving this one workflow exceptionally well is the goal.
 
 ## North star scenarios
@@ -90,4 +90,4 @@ You've been using Claude Code for a feature. Mid-sprint, you want to try Codex o
 
 ## Current status
 
-Phase 0 (scaffolding) complete. Cargo workspace compiling, CI green. Phase 1 (SSH + terminal rendering MVP) in progress. Reference projects studied: Arbor (Rust + GPUI, closest in scope, no IDE layer), Superconductor (native Rust, macOS only, closed source), tauri-terminal (Tauri + xterm.js proof of concept).
+Phase 2 (tmux control mode integration) complete. SSH connection to remote tmux via control mode (`-CC`), event-driven notification processing, flow control, active pane tracking, working directory from tmux snapshots, terminal rendering through GPUI with `alacritty_terminal` and `termy_terminal_ui`. Multi-pane awareness (Phase 2c) complete: per-pane VTE parsers, snapshot-driven pane lifecycle, split-tree layout from tmux pane coordinates. Next: tab bar for tmux window switching, then daemon with file tree, git status, and LSP diagnostics on the remote host.

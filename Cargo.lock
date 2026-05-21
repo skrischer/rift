@@ -1892,9 +1892,6 @@ name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
-dependencies = [
- "getrandom 0.3.4",
-]
 
 [[package]]
 name = "fax"
@@ -1992,18 +1989,6 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "nanorand",
- "spin 0.9.8",
-]
-
-[[package]]
-name = "flume"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e139bc46ca777eb5efaf62df0ab8cc5fd400866427e56c68b22e414e53bd3be"
-dependencies = [
- "fastrand 2.4.1",
- "futures-core",
- "futures-sink",
  "spin 0.9.8",
 ]
 
@@ -2259,11 +2244,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -4612,10 +4595,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "embed-resource",
- "flume 0.12.0",
+ "flume",
  "gpui",
  "rift-ssh",
  "rift-terminal",
+ "termy_terminal_ui",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -4661,7 +4645,7 @@ name = "rift-ssh"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "flume 0.12.0",
+ "flume",
  "home",
  "russh",
  "russh-keys",
@@ -4676,7 +4660,7 @@ name = "rift-terminal"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
- "flume 0.12.0",
+ "flume",
  "gpui",
  "smol",
  "termy_terminal_ui",
@@ -5012,7 +4996,7 @@ dependencies = [
  "async-task",
  "backtrace",
  "chrono",
- "flume 0.11.1",
+ "flume",
  "futures",
  "parking_lot",
  "rand 0.9.4",
@@ -5857,7 +5841,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "dirs 6.0.0",
- "flume 0.11.1",
+ "flume",
  "gpui",
  "polling",
  "rustix-openpty",

@@ -2,7 +2,7 @@
 
 ## Project context
 
-Open-source, agent-centric IDE built in Rust. Wraps tmux with a native GPU-accelerated GUI (GPUI) to provide visual feedback for terminal-based coding agents. Current state: single-window terminal connected via SSH. Target architecture (Phase 3+): GPUI frontend with a remote daemon on Linux hosts, connected via SSH.
+Open-source, agent-centric IDE built in Rust. Wraps tmux with a native GPU-accelerated GUI (GPUI) to provide visual feedback for terminal-based coding agents. Current state: single-window terminal connected via SSH using tmux control mode (`-CC`) with event-driven notification processing. Target architecture (Phase 3+): GPUI frontend with a remote daemon on Linux hosts, connected via SSH.
 
 Coding agents (Claude Code, Codex, OpenCode, Gemini CLI) run completely unmodified. The IDE reacts to their side effects — file changes, terminal output, git state — never to agent internals. Agents are interchangeable black boxes. If you're writing code that detects or special-cases a specific agent, stop.
 
@@ -22,11 +22,11 @@ Cargo workspace. Each crate has a single responsibility:
 
 - `crates/app/` — GPUI application binary.
 - `crates/ssh/` — SSH connection and PTY stream.
-- `crates/terminal/` — GPUI terminal widget. Wraps `alacritty_terminal`.
-- `crates/daemon/` — Remote daemon binary (Phase 3+).
-- `crates/tmux-core/` — tmux control mode parser and session state tree (Phase 3+).
-- `crates/explorer/` — File watching, git status, file sync (Phase 3+).
-- `crates/protocol/` — Shared message types. Serializable with serde (Phase 3+).
+- `crates/terminal/` — GPUI terminal widget. Wraps `alacritty_terminal` + `termy_terminal_ui`.
+- `crates/daemon/` — Remote daemon binary. Runs on the remote host, manages file watching, git status, and language servers.
+- `crates/tmux-core/` — tmux control mode state (currently using termy's `TmuxClient` directly).
+- `crates/explorer/` — File watching, git status — library used by daemon (Phase 3+).
+- `crates/protocol/` — Shared message types. Serializable with serde.
 - `crates/plugin-api/` — Plugin trait for pane awareness (Phase 3+).
 - `plugins/` — Optional pane awareness plugins (Phase 3+).
 
@@ -37,9 +37,8 @@ cargo build --workspace                                          # compile all
 cargo clippy --workspace -- -D warnings                          # lint (zero warnings policy)
 cargo fmt --all                                                  # format
 cargo test --workspace                                           # test all
-cargo build --release -p daemon --target x86_64-unknown-linux-musl  # daemon release build
 cargo run -p rift-app                                            # run GPUI app in dev mode
-cargo run -p daemon -- --port 9500                               # run daemon locally
+cargo build --release -p daemon --target x86_64-unknown-linux-musl  # daemon release build (Phase 3+)
 ```
 
 ## Architectural rules
