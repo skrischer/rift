@@ -41,4 +41,4 @@ See [roadmap.md](roadmap.md) for the full phase overview.
 | [protocol.md](protocol.md) | WebSocket protocol spec (Phase 3) |
 | [tmux-reference.md](tmux-reference.md) | tmux control mode protocol and pitfalls |
 | [spec-template.md](spec-template.md) | SDD spec template for new implementation plans |
-| [handover-conventions.md](handover-conventions.md) | Rules for Cowork <-> Claude Code exchange |
+| [handover-conventions.md](handover-conventions.md) | Planning conventions: the design-doc -> issue -> PR chain |

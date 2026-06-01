@@ -51,66 +51,13 @@ Tab bar for tmux window switching and enriched statusbar with live metadata from
 | Per-pane VTE in `crates/terminal` | PaneView each has own `Arc<Mutex<Term>>`, managed by SessionView | 2026-05-20 |
 | Snapshot-driven pane lifecycle | Create/remove PaneViews from TmuxSnapshot diffs | 2026-05-20 |
 
-## Task breakdown
+## Tracking
 
-### Step 1: Subscription infrastructure
+The step decomposition lives as GitHub issues under the milestone — not in this file. This spec owns the design; the issues own progress.
 
-**Goal:** Register tmux subscriptions on connect and process `%subscription-changed` notifications.
-
-**Changes:**
-- Add subscription registration after flow control activation in the connect sequence
-- Register subscriptions for: `pane_current_path`, `pane_current_command`, `window_name`
-- Route `%subscription-changed` notifications to SessionView via a new channel or existing snapshot channel
-- Parse subscription payload: `<name> $<session> @<window> %<pane> <value>`
-
-**Validation:** Subscription values arrive in SessionView when CWD or command changes in a pane. Log output confirms values update within ~1 second of change.
-
-### Step 2: Tab bar rendering
-
-**Goal:** SessionView renders a tab bar above the pane layout showing all tmux windows.
-
-**Changes:**
-- `crates/terminal/src/session_view.rs` — add tab bar to render output, above the flex layout
-- Tab bar shows `window.index: window.name` for each window from TmuxSnapshot
-- Active window tab is visually highlighted
-- Tab bar height subtracted from available terminal grid space
-
-**Validation:** Create multiple tmux windows (`tmux new-window`). Tab bar shows them. Active window is highlighted. Terminal grid size adjusts correctly.
-
-### Step 3: Window switching
-
-**Goal:** Click a tab or press Ctrl+Shift+N to switch tmux windows.
-
-**Changes:**
-- Click handler on tab sends `select-window -t @<window_id>` via TmuxClient
-- Keyboard handler intercepts Ctrl+Shift+1..9 before PTY input routing
-- tmux notifications -> NeedsRefresh -> snapshot refresh -> pane layout rebuilds for new window
-- Panes of previous window stop rendering but keep VTE state
-
-**Validation:** Click tab -> window switches, panes rebuild. Ctrl+Shift+2 -> switches to window 2. Switch back -> pane content preserved.
-
-### Step 4: CWD from subscriptions
-
-**Goal:** Replace snapshot-polling CWD with subscription-driven updates.
-
-**Changes:**
-- SessionView updates per-pane CWD from `%subscription-changed` for `pane_current_path`
-- Statusbar CWD display updates reactively
-- Remove or reduce snapshot-based CWD refresh (keep snapshot as fallback for initial state)
-
-**Validation:** `cd /tmp` in a pane -> statusbar CWD updates within ~1 second. No snapshot refresh needed for CWD changes.
-
-### Step 5: Statusbar enrichment
-
-**Goal:** Statusbar shows git branch, pane command, session/window name, connection status.
-
-**Changes:**
-- Git branch: from subscription `pane_current_path` -> run `git rev-parse --abbrev-ref HEAD` via tmux `send-keys` or a separate mechanism. Alternative: use a subscription format like `#(cd #{pane_current_path} && git rev-parse --abbrev-ref HEAD 2>/dev/null)`
-- Pane command: from `pane_current_command` subscription
-- Session/window name: from snapshot (already available)
-- Connection status: track SSH connection state, show indicator
-
-**Validation:** Statusbar shows all four pieces of information. Git branch updates when switching to a different repo directory. Command name reflects the actual running process (e.g. `bash`, `python`, `cargo`).
+- Milestone: [Phase 2d — Tab bar + statusbar enrichment](https://github.com/skrischer/rift/milestone/1)
+- Open steps (issues): subscription infrastructure (#15), keyboard window switching (#16), CWD from subscriptions (#17), git branch (#18), pane command name (#19), session/window name (#20), connection status (#21)
+- Done before issue tracking existed: tab bar rendering, click-to-switch (commits 33fea26, 8ca4b0b)
 
 ## Verification
 

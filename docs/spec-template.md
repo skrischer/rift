@@ -38,22 +38,14 @@ Decisions already made that the implementor must respect. Include rationale so e
 |---|---|---|
 | Example: Use termy's PaneTerminal | MIT licensed, 14k LOC production-grade, upstream maintained | 2026-05-06 |
 
-## Task breakdown
+## Tracking
 
-Discrete, implementable steps. Each step should be independently verifiable. Mark status as work progresses.
+The decomposition into steps lives as GitHub issues, not in this file — one issue per step, grouped under a milestone. This spec owns the design; the issues own progress. Do not duplicate the step list here.
 
-### Step 1: [Name]
+- Milestone: [Phase/Feature name](<milestone-url>)
+- Issues: created from this spec once it is `READY` (one per implementable step)
 
-**Goal:** What this step achieves.
-
-**Changes:**
-- File/module changes needed
-
-**Validation:** How to verify this step is done (specific commands, observable behavior).
-
-### Step 2: [Name]
-
-...
+Each issue references this spec path in its body. A PR may only merge if it closes an issue that traces back here (enforced by the planning gate).
 
 ## Verification
 
