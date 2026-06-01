@@ -40,5 +40,6 @@ See [roadmap.md](roadmap.md) for the full phase overview.
 | [patterns.md](patterns.md) | Coding patterns reference (for Claude Code) |
 | [protocol.md](protocol.md) | WebSocket protocol spec (Phase 3) |
 | [tmux-reference.md](tmux-reference.md) | tmux control mode protocol and pitfalls |
+| [prior-art.md](prior-art.md) | Open-source reference projects and candidate dependencies |
 | [spec-template.md](spec-template.md) | SDD spec template for new implementation plans |
 | [handover-conventions.md](handover-conventions.md) | Planning conventions: the design-doc -> issue -> PR chain |
