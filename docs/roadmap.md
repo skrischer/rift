@@ -11,6 +11,7 @@ Living document tracking project phases, current status, and planned work.
 | 2a+2b | tmux control mode integration | COMPLETED 2026-05-08 | [archive/spec-phase2ab-control-mode.md](archive/spec-phase2ab-control-mode.md) |
 | 2c | Multi-pane awareness | COMPLETED 2026-05-20 | [archive/spec-phase2c-multipane.md](archive/spec-phase2c-multipane.md) |
 | 2d | Tab bar + statusbar enrichment | IN PROGRESS | [spec-phase2d-tabbar.md](spec-phase2d-tabbar.md) |
+| 2e | gpui-component UI foundation | READY | [spec-gpui-component-adoption.md](spec-gpui-component-adoption.md) |
 | 3 | Remote daemon | PLANNED | — |
 
 ## Current focus
