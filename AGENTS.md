@@ -92,22 +92,25 @@ chore: update alacritty_terminal to 0.24
 
 ## Planning handover
 
-Planning lives in `docs/`. Implementation specs follow the SDD (Spec-Driven Development) format defined in `docs/spec-template.md`.
+Planning lives in `docs/` as SDD specs (`docs/spec-template.md`). The chain is **design-doc -> issue -> PR**, mechanically enforced — see `docs/handover-conventions.md` for the full rules.
 
-**Before starting work on a spec:**
-1. Read `docs/handover-conventions.md` for the exchange rules
-2. Read the relevant `docs/spec-*.md` file for scope, constraints, and prior decisions
-3. Do not start work on specs with status `DRAFT` — only `READY` specs are cleared for implementation
+- Spec (`docs/spec-*.md`) owns the **design**: outcome, scope, constraints, prior decisions, verification.
+- A GitHub **milestone** groups a phase; **issues** own the step decomposition and progress. The step list lives only as issues, never as a task breakdown inside the spec.
+- A `feat:`/`fix:` PR may only merge if it closes an issue that references an existing spec (`planning-gate` required check on `develop`). `chore:/docs:/refactor:/test:/ci:/build:/perf:` are exempt.
 
-**After completing work on a spec:**
-1. Update the spec status to `COMPLETED` with date
-2. Mark completed steps with checkboxes in the task breakdown
-3. Add entries to the decision log for decisions made during implementation
+**Before starting work:**
+1. Read `docs/handover-conventions.md` and the relevant `READY` `docs/spec-*.md` (never a `DRAFT`)
+2. Pick the issue for the step; branch `feat/<scope>` or `fix/<scope>` off `develop`
+
+**After completing work:**
+1. Open a PR that closes the issue (`Closes #N`); the milestone closes when its issues do
+2. When the spec's verification is fully met, set status to `COMPLETED` with date and move it to `archive/`
+3. Add decisions made during implementation to the spec's decision log
 4. Update `docs/roadmap.md` with the current phase status
 
 **If blocked:**
-1. Set spec status to `BLOCKED` with reason
-2. Add a note at the blocked step in the task breakdown
+1. Set spec status to `BLOCKED` with reason in the spec header
+2. Comment the blocker on the affected issue
 
 ## Claude Code
 
