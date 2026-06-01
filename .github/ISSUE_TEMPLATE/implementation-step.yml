@@ -1,0 +1,51 @@
+name: Implementation step
+description: A single, verifiable step that implements part of a READY spec.
+title: "[<scope>] "
+labels: ["implementation"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Every implementation step traces back to a design spec. No spec, no issue.
+        The spec owns the design (why/what/done-criteria); this issue owns one step
+        of the decomposition and its progress.
+
+  - type: input
+    id: spec
+    attributes:
+      label: Spec
+      description: >
+        Path to the design spec this step implements, relative to repo root.
+        Must point at an existing file matching `docs/spec-*.md`.
+      placeholder: docs/spec-phase2d-tabbar.md
+    validations:
+      required: true
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What this step achieves. One or two sentences. Pull this from the spec's intent.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: >
+        Observable, verifiable outcomes that mean this step is done.
+        Use a checklist. Mirror the spec's Verification where applicable.
+      placeholder: |
+        - [ ] cargo clippy --workspace -- -D warnings passes
+        - [ ] Behavioral check: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Optional implementation notes, links, or constraints specific to this step.
+    validations:
+      required: false
