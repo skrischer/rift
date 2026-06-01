@@ -32,6 +32,8 @@ Key open decisions for Phase 3:
 
 These decisions need specs before implementation starts. Phase 3 is the biggest architectural change since the project began and will likely need multiple sub-specs (daemon scaffolding, file tree, git status, LSP integration, protocol migration).
 
+See [prior-art.md](prior-art.md) for reference implementations (Zed `remote_server`, Lapce proxy, Arbor, `async-lsp`) and candidate dependencies to draw from when writing these specs.
+
 ## North star
 
 The goal is Scenario 1 from [vision.md](vision.md): connect to a VPS, run Claude Code in a pane, see the file explorer highlight every file it touches, diagnostics update in real-time, git panel shows clean diffs. Review visually, approve, move on.
