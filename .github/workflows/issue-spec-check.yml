@@ -24,6 +24,13 @@ jobs:
             const label = 'needs-spec';
             const specPattern = /docs\/spec-[A-Za-z0-9._-]+\.md/;
 
+            // Only implementation issues trace to a spec. Leave other issue types alone.
+            const isImpl = (issue.labels || []).some(l => (l.name || l) === 'implementation');
+            if (!isImpl) {
+              core.info('Not an implementation issue; skipping spec check.');
+              return;
+            }
+
             const has = (issue.labels || []).some(l => (l.name || l) === label);
             const match = (issue.body || '').match(specPattern);
 
