@@ -33,10 +33,10 @@ Adopt `longbridge/gpui-component` as rift's UI primitive layer and migrate the P
 
 ## Constraints
 
-- `gpui` is a git dependency: `zed-industries/zed` rev `83de8a25e0ef71a8d762a148459bc863adaeb7e3` (v0.2.2)
-- `termy_terminal_ui` is a git dependency: `termy-org/termy` rev `297bf90`, which transitively depends on a GPUI rev
-- Cargo cannot link two incompatible `gpui` versions — all three crates MUST resolve to one GPUI rev, or the project will not compile (GPUI types do not unify across versions)
-- GPUI is pre-1.0 and ships from git; expect breaking-change churn. Pin exact revs everywhere.
+- `gpui` and `gpui_platform` are git dependencies from `zed-industries/zed`, **bare-tracked** (no `rev` in any `Cargo.toml`); the committed `Cargo.lock` pins the exact commit. zed extracted `gpui_platform` out of `gpui` on 2026-02-19, so the app constructs the platform via `gpui_platform::current_platform(false)` and `Application::with_platform(...)` (post-split API).
+- `termy_terminal_ui` is a git dependency from the rift-owned fork `skrischer/termy`, with its `gpui` dependency bare-tracked too. terminal_ui is self-contained (only `gpui`, `alacritty_terminal`, `flume`, `anyhow`, `dirs`, `polling`) and compiles unchanged against current post-split gpui — the fork delta is a one-line "bare-ize the gpui pin".
+- `gpui-component` floats its `gpui` dependency (it dropped its rev lock on 2025-12-18) and is consumed **natively — no fork**. It commits a `Cargo.lock` pinning the zed rev it was validated against; that rev is the convergence target.
+- Cargo cannot link two incompatible `gpui` versions — all three crates MUST resolve to one GPUI rev. Convergence is achieved by everyone sharing the **same bare git reference** to zed (so cargo unifies to one source) with the committed `Cargo.lock` pinning the commit. Bump deliberately via `cargo update -p gpui --precise <rev>`; never float to `HEAD`.
 - License: gpui-component is Apache-2.0 (compatible with rift's GPL-3.0). Must pass `cargo deny check licenses`.
 - Minimal-dependency policy: adopting gpui-component is justified because it replaces hand-rolled tab/dock/list/theme primitives rift would otherwise maintain (see prior-art.md).
 
@@ -57,7 +57,7 @@ Step decomposition lives as GitHub issues under the milestone.
 - Issues: created from the task outline below
 
 Provisional step outline (becomes issues, not kept here once created):
-1. GPUI-rev compatibility spike — prove `gpui` + `termy_terminal_ui` + `gpui-component` build on one shared rev. **Gate: if no shared rev exists, spec becomes BLOCKED pending an upstream bump.**
+1. GPUI-rev compatibility spike — prove `gpui` + `termy_terminal_ui` + `gpui-component` build on one shared rev. **Gate PASSED (2026-06-02):** full `cargo build --workspace`, one `gpui` entry, 0 errors. See decision log.
 2. Add gpui-component dependency + wire `Root`/`Theme` at app root
 3. Migrate window tab bar to gpui-component, preserving click-to-switch
 4. Rebuild statusbar container on gpui-component primitives
@@ -76,7 +76,7 @@ Provisional step outline (becomes issues, not kept here once created):
 
 | Risk | Mitigation |
 |---|---|
-| gpui-component pins a GPUI rev incompatible with rift's `83de8a25e0` and/or termy's rev | Compatibility spike is step 1. Options if mismatched: (a) bump rift+termy to gpui-component's rev and re-verify termy builds; (b) pin gpui-component to rift's rev via a fork; (c) BLOCK and raise upstream. Do not proceed to migration until one GPUI rev builds everywhere. |
+| gpui-component pins a GPUI rev incompatible with rift's `83de8a25e0` and/or termy's rev | RESOLVED (2026-06-02): gpui-component does not pin gpui (floats since 2025-12-18). Convergence achieved by bare-tracking zed everywhere + `Cargo.lock` pinning gpui-component's own validated rev (`4bee412`). No gpui-component fork needed; termy fork delta is one line. |
 | GPUI pre-1.0 churn breaks the build later | Pin exact git revs; bump deliberately, never floating |
 | Scope creep into Dock splits / file explorer | Explicitly out of scope; those are Phase 3 with their own specs |
 | Tab bar migration regresses window switching | Verification requires click-to-switch parity before close |
@@ -84,3 +84,12 @@ Provisional step outline (becomes issues, not kept here once created):
 ## Decision log
 
 - 2026-06-01: Spec created. GPUI-rev convergence identified as the make-or-break constraint; compatibility spike mandated as step 1.
+- 2026-06-02: Compatibility spike PASSED. Full `cargo build --workspace` green — `gpui` + `gpui_platform` + `termy_terminal_ui` + `gpui-component` + all rift crates on one zed rev, exactly one `gpui` entry in `Cargo.lock`, 0 errors / 0 warnings.
+  - **Chosen rev:** zed `4bee412118dafea3bbd491cd044d354f16b3d665` — sourced from gpui-component HEAD's committed `Cargo.lock` (the rev they validated against). gpui-component consumed at `9ad30e6` (HEAD).
+  - **Convergence architecture:** all consumers bare-track `zed-industries/zed` (no `rev` in `Cargo.toml`); the committed `Cargo.lock` pins the commit. Same bare git reference -> cargo unifies to one source. Bump via `cargo update -p gpui --precise <rev>`.
+  - **No gpui-component fork:** gpui-component floats gpui by design (rev lock removed upstream 2025-12-18). Earlier spike attempts to pin it (path-patch / re-add rev lock in a fork) were workarounds and were discarded.
+  - **termy fork delta is one line:** terminal_ui is self-contained and compiles unchanged against post-split gpui; the only change is bare-izing its `gpui` pin. termy stays otherwise upstream-clean.
+  - **rift's own post-split adaptation is one line:** `Application::new()` -> `Application::with_platform(gpui_platform::current_platform(false))`, plus a `gpui_platform` dependency. The terminal UI (`rift-terminal`: pane_view, session_view) compiled unchanged.
+  - **R-discovery is deterministic:** read gpui-component's committed `Cargo.lock` for the zed rev to target on every future bump.
+  - **Ergonomics caveat:** adding a new dependency from the zed source re-floats the bare resolution to `HEAD`; re-apply `cargo update -p gpui --precise <rev>` after such changes. Rare once `Cargo.lock` is committed.
+  - **Strategic reframe:** the real future constraint is termy lagging gpui, not "finding a shared rev". rift owns the termy fork and brings it current on rift's cadence; gpui-component then floats in cleanly.
