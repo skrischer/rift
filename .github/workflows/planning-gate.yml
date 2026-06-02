@@ -86,7 +86,16 @@ jobs:
                 continue;
               }
 
-              // 3. Issue should belong to a milestone (warn, do not block).
+              // 3. Spec must not still be a DRAFT — no code merges against an unreviewed design.
+              const specBody = fs.readFileSync(specPath, 'utf8');
+              const statusMatch = specBody.match(/^>\s*Status:\s*(.+?)\s*$/m);
+              const status = statusMatch ? statusMatch[1].trim().toUpperCase() : '';
+              if (status === 'DRAFT') {
+                problems.push(`#${number}: spec "${specPath}" is still DRAFT — promote it to READY before merging code against it.`);
+                continue;
+              }
+
+              // 4. Issue should belong to a milestone (warn, do not block).
               if (!issue.milestone) {
                 core.warning(`#${number}: not assigned to a milestone.`);
               }
