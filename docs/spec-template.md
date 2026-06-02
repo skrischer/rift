@@ -9,6 +9,8 @@ One-sentence summary of what this spec delivers.
 ## Outcome
 
 What is true when this work is done? Write observable, verifiable outcomes — not activities.
+These are the spec's done-criteria, not a progress tracker: check a box only when the outcome
+holds end-to-end. Step-by-step progress lives in the issues, never here.
 
 - [ ] Outcome 1
 - [ ] Outcome 2

@@ -14,6 +14,8 @@ Every piece of implementation progress traces through three layers, each owning 
 
 The step decomposition lives **only** as issues — never as a task list inside the spec. The spec stops at design; issues carry the steps. A PR closes an issue (`Closes #N`); the issue references the spec.
 
+The spec's `Outcome` list is **done-criteria, not a progress mirror**: a box is checked only when that outcome holds end-to-end (typically at `COMPLETED`). Live step progress is the issues' job — do not tick Outcome boxes to track work underway.
+
 This chain is **mechanically enforced**, not just documented here:
 - `blank_issues_enabled: false` + a required Spec field on the issue form — every issue must name a spec.
 - `issue-spec-check.yml` flags any issue whose spec reference does not resolve to an existing file (`needs-spec` label).
@@ -77,7 +79,7 @@ A good spec answers: what is true when this is done? What must NOT be touched? W
 ## When work completes
 
 1. PRs close their issues automatically (`Closes #N`); the milestone closes when its issues do
-2. Set the spec status to `COMPLETED` with date and move it to `archive/`
+2. Set the spec status to `COMPLETED` with date and move it to `archive/`. Repoint any links to the spec — the milestone description and the project README — at the new `docs/archive/` path, so they do not 404 after the move
 3. Add entries to the spec's decision log for any decisions made during implementation
 4. If scope changed, note what changed and why
 5. Update `roadmap.md`
