@@ -10,7 +10,7 @@ See [vision.md](vision.md) for the full problem statement and positioning.
 
 ## Tech stack
 
-Rust (2021 edition), Tokio, GPUI (from Zed), alacritty_terminal, termy_terminal_ui, russh. Build target: Linux/X11 (GPUI native). Daemon: x86_64-unknown-linux-musl (static).
+Rust (2021 edition), Tokio, GPUI (from Zed), alacritty_terminal, termy_terminal_ui, russh. App build target: Windows (x86_64-pc-windows-gnu, cross-compiled via MinGW) and Linux/X11 (GPUI native). Daemon: x86_64-unknown-linux-musl (static).
 
 ## Repository
 
