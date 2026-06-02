@@ -143,4 +143,4 @@ cargo build --release -p daemon --target x86_64-unknown-linux-musl  # daemon rel
 
 ## Cross-compilation and deployment
 
-The daemon is compiled for `x86_64-unknown-linux-musl` (static linking). The GPUI app targets all platforms supported by GPUI: Linux (Vulkan/X11), macOS, and Windows natively.
+The daemon is compiled for `x86_64-unknown-linux-musl` (static linking). The GPUI app currently targets Windows (`x86_64-pc-windows-gnu`, cross-compiled from WSL via MinGW) and Linux (Vulkan/X11); macOS is supported by GPUI but deferred for rift. The primary dev loop builds the app in WSL and runs the resulting `.exe` on the Windows host.

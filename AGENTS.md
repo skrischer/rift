@@ -14,7 +14,7 @@ Read `docs/vision.md` for the why. Read `docs/architecture.md` for the how.
 - **Async runtime:** Tokio
 - **GUI framework:** GPUI 0.2.2
 - **Build target (daemon):** `x86_64-unknown-linux-musl`
-- **Build target (app):** Linux/X11 (GPUI native), macOS and Windows deferred
+- **Build target (app):** Windows (`x86_64-pc-windows-gnu`, cross-compiled from WSL via MinGW) and Linux/X11 (GPUI native); macOS deferred. Primary dev loop runs the GPU app on the Windows host (`just dev-windows`).
 
 ## Repository layout
 

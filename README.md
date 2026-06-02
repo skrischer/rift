@@ -36,7 +36,7 @@ The app connects via SSH, launches `tmux -CC` (control mode), and processes the 
 - **Terminal emulation:** alacritty_terminal
 - **tmux integration:** termy_terminal_ui (control mode client)
 - **SSH:** russh
-- **Build target:** Linux/X11 (GPUI native)
+- **Build target:** Windows (`x86_64-pc-windows-gnu`, cross-compiled via MinGW) and Linux/X11 (GPUI native)
 
 ## Repository layout
 

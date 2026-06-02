@@ -38,7 +38,7 @@ export RIFT_SSH_USER := env("RIFT_SSH_USER", "developer")
 export RIFT_SSH_PORT := env("RIFT_SSH_PORT", "22")
 export RIFT_SSH_KEY := env("RIFT_SSH_KEY", home_directory() / ".ssh" / "id_rsa")
 windows_ssh_key := env("RIFT_WINDOWS_SSH_KEY", "C:\\Users\\skrischer\\.ssh\\id_rsa")
-windows_exe := "target/x86_64-pc-windows-msvc/debug/rift.exe"
+windows_exe := "target/x86_64-pc-windows-gnu/debug/rift.exe"
 
 dev:
     WAYLAND_DISPLAY="" \
@@ -59,9 +59,9 @@ dev-watch:
     RIFT_SSH_KEY="{{RIFT_SSH_KEY}}" \
     cargo watch -x 'clippy --workspace -- -D warnings' -x 'run -p rift-app'
 
-# Build and run native Windows .exe (cross-compiled via cargo-xwin)
+# Build and run native Windows .exe (cross-compiled via MinGW)
 dev-windows:
-    cargo xwin build -p rift-app --target x86_64-pc-windows-msvc
+    cargo build -p rift-app --target x86_64-pc-windows-gnu
     -taskkill.exe /F /IM rift.exe 2>/dev/null
     export WSLENV="RUST_LOG:RIFT_SSH_HOST:RIFT_SSH_USER:RIFT_SSH_PORT:RIFT_SSH_KEY" && \
     export RUST_LOG=rift=debug,rift_ssh=debug && \
@@ -77,7 +77,7 @@ dev-windows-watch:
 
 # Build Windows .exe without running
 build-windows:
-    cargo xwin build -p rift-app --target x86_64-pc-windows-msvc
+    cargo build -p rift-app --target x86_64-pc-windows-gnu
 
 # Check licenses (requires cargo-deny)
 deny:

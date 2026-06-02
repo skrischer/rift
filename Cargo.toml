@@ -25,8 +25,10 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-gpui = { git = "https://github.com/zed-industries/zed", rev = "83de8a25e0ef71a8d762a148459bc863adaeb7e3", package = "gpui" }
-termy_terminal_ui = { git = "https://github.com/termy-org/termy", rev = "297bf90" }
+gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+termy_terminal_ui = { git = "https://github.com/skrischer/termy", rev = "1c882224c9f46c7961d5f7b54582f18bf9123b28" }
 flume = "0.11"
 alacritty_terminal = "0.26.0"
 smol = "2.0"

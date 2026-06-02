@@ -4,6 +4,7 @@ use std::thread;
 
 use anyhow::{Context as _, Result};
 use gpui::*;
+use gpui_component::Root;
 use rift_terminal::{PaneInput, PaneOutput, SessionView, TermSize};
 use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
@@ -35,86 +36,88 @@ fn main() {
         "rift starting"
     );
 
-    Application::new().run(|cx: &mut App| {
+    Application::with_platform(gpui_platform::current_platform(false)).run(|cx: &mut App| {
+        gpui_component::init(cx);
         let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
-        let window = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Maximized(bounds)),
-                    ..Default::default()
-                },
-                |_window, cx| {
-                    cx.new(|cx| {
-                        let (view, handle) = SessionView::new(cx);
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Maximized(bounds)),
+                ..Default::default()
+            },
+            |window, cx| {
+                let session_view = cx.new(|cx| {
+                    let (view, handle) = SessionView::new(cx);
 
-                        let ssh = SshConfig {
-                            host: env::var("RIFT_SSH_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-                            user: env::var("RIFT_SSH_USER").unwrap_or_else(|_| "developer".into()),
-                            port: env::var("RIFT_SSH_PORT")
-                                .ok()
-                                .and_then(|p| p.parse().ok())
-                                .unwrap_or(22),
-                            key: env::var("RIFT_SSH_KEY")
-                                .map(PathBuf::from)
-                                .unwrap_or_else(|_| {
-                                    let home = env::var("USERPROFILE")
-                                        .or_else(|_| env::var("HOME"))
-                                        .unwrap_or_else(|_| {
-                                            if cfg!(target_os = "windows") {
-                                                "C:\\Users\\Default".into()
-                                            } else {
-                                                "/home/developer".into()
-                                            }
-                                        });
-                                    PathBuf::from(home).join(".ssh").join("id_ed25519")
-                                }),
-                        };
+                    let ssh = SshConfig {
+                        host: env::var("RIFT_SSH_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+                        user: env::var("RIFT_SSH_USER").unwrap_or_else(|_| "developer".into()),
+                        port: env::var("RIFT_SSH_PORT")
+                            .ok()
+                            .and_then(|p| p.parse().ok())
+                            .unwrap_or(22),
+                        key: env::var("RIFT_SSH_KEY")
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|_| {
+                                let home = env::var("USERPROFILE")
+                                    .or_else(|_| env::var("HOME"))
+                                    .unwrap_or_else(|_| {
+                                        if cfg!(target_os = "windows") {
+                                            "C:\\Users\\Default".into()
+                                        } else {
+                                            "/home/developer".into()
+                                        }
+                                    });
+                                PathBuf::from(home).join(".ssh").join("id_ed25519")
+                            }),
+                    };
 
-                        let channels = PtyChannels {
-                            pane_output_tx: handle.pane_output_tx,
-                            input_rx: handle.input_rx,
-                            size_changed_rx: handle.size_changed_rx,
-                            snapshot_tx: handle.snapshot_tx,
-                            tmux_command_rx: handle.tmux_command_rx,
-                        };
+                    let channels = PtyChannels {
+                        pane_output_tx: handle.pane_output_tx,
+                        input_rx: handle.input_rx,
+                        size_changed_rx: handle.size_changed_rx,
+                        snapshot_tx: handle.snapshot_tx,
+                        tmux_command_rx: handle.tmux_command_rx,
+                    };
 
-                        let key_exists = ssh.key.exists();
-                        debug!(
-                            host = %ssh.host,
-                            port = ssh.port,
-                            user = %ssh.user,
-                            key = %ssh.key.display(),
-                            key_exists,
-                            "connecting via SSH"
-                        );
+                    let key_exists = ssh.key.exists();
+                    debug!(
+                        host = %ssh.host,
+                        port = ssh.port,
+                        user = %ssh.user,
+                        key = %ssh.key.display(),
+                        key_exists,
+                        "connecting via SSH"
+                    );
 
-                        thread::spawn(move || {
-                            let rt = tokio::runtime::Runtime::new()
-                                .expect("failed to create tokio runtime");
-                            rt.block_on(async move {
-                                if let Err(e) = run_ssh_session(&ssh, channels).await {
-                                    error!(
-                                        %e,
-                                        host = %ssh.host,
-                                        port = ssh.port,
-                                        key = %ssh.key.display(),
-                                        key_exists,
-                                        "SSH session failed"
-                                    );
-                                }
-                            });
+                    thread::spawn(move || {
+                        let rt =
+                            tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+                        rt.block_on(async move {
+                            if let Err(e) = run_ssh_session(&ssh, channels).await {
+                                error!(
+                                    %e,
+                                    host = %ssh.host,
+                                    port = ssh.port,
+                                    key = %ssh.key.display(),
+                                    key_exists,
+                                    "SSH session failed"
+                                );
+                            }
                         });
+                    });
 
-                        view
-                    })
-                },
-            )
-            .unwrap();
-        window
-            .update(cx, |view, window, cx| {
-                window.focus(&view.focus_handle(cx), cx);
-            })
-            .unwrap();
+                    view
+                });
+
+                let focus_handle = session_view.focus_handle(cx);
+                window.defer(cx, move |window, cx| {
+                    focus_handle.focus(window, cx);
+                });
+
+                cx.new(|cx| Root::new(session_view, window, cx))
+            },
+        )
+        .unwrap();
         cx.activate(true);
     });
 }
