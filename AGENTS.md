@@ -85,7 +85,7 @@ The GPU app (`rift-app`) is the only expensive, non-parallelizable build (pulls 
 
 - **Main checkout = the one GPU station.** Stays on `develop`, runs `just dev-watch`. The only place `rift-app` is built and visually previewed.
 - **Agents work headless in worktrees.** They verify with `just lint` / `just test` / `cargo build --workspace --exclude rift-app` — no GPU build, so their `target/` stays small.
-- **Visual review is a gate *before* merge**, not after: to eyeball an agent's branch, `git checkout <branch>` in the main checkout, let `dev-watch` rebuild incrementally, then switch back to `develop`. Never blind-merge GPU changes into `develop`.
+- **Visual review is a gate *before* merge**, not after: the agent first commits its work in the worktree (worktrees share only committed objects, not the working tree, so uncommitted changes are invisible to the main checkout). Then, on the GPU station, `git checkout --detach <branch>` — a plain `git checkout <branch>` fails because the branch is already checked out in the worktree, so use `--detach` to ride the commit while reusing the station's heavy `target/`. Let `dev-watch` rebuild incrementally, then `git checkout develop` to return. Never blind-merge GPU changes into `develop`.
 
 Worktrees live in a sibling container `../rift-worktrees/<branch-with-slashes-as-dashes>` (outside the repo tree, so `rg`/`cargo`/watchers don't traverse them; own `target/` per worktree). Use `just agent-worktree <branch>` to create and `just agent-worktree-rm <branch>` to remove.
 
