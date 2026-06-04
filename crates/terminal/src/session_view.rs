@@ -6,7 +6,6 @@ use gpui_component::{h_flex, ActiveTheme};
 use termy_terminal_ui::TmuxSnapshot;
 use tracing::debug;
 
-use crate::colors;
 use crate::layout::{self, LayoutNode};
 use crate::pane_view::{measure_cell_size, statusbar_height, PaneView};
 use crate::{PaneInput, PaneOutput, TermSize};
@@ -227,9 +226,7 @@ impl SessionView {
         cx.notify();
     }
 
-    fn render_layout(&self, node: &LayoutNode) -> AnyElement {
-        let border_color = Hsla::from(colors::SURFACE1);
-
+    fn render_layout(&self, node: &LayoutNode, border_color: Hsla) -> AnyElement {
         match node {
             LayoutNode::Pane(id) => {
                 if let Some(entry) = self.panes.get(id) {
@@ -250,7 +247,7 @@ impl SessionView {
                 };
                 let last = children.len().saturating_sub(1);
                 for (i, (proportion, child)) in children.iter().enumerate() {
-                    let inner = self.render_layout(child);
+                    let inner = self.render_layout(child, border_color);
                     let mut wrapper = div()
                         .flex_1()
                         .flex_basis(relative(*proportion))
@@ -369,7 +366,7 @@ impl Render for SessionView {
             }));
 
         let pane_area = if let Some(ref layout) = self.layout {
-            self.render_layout(layout)
+            self.render_layout(layout, cx.theme().border)
         } else {
             div().flex_grow().into_any_element()
         };

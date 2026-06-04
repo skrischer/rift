@@ -12,7 +12,6 @@ const fn c(r: u8, g: u8, b: u8) -> Rgba {
 
 pub const FOREGROUND: Rgba = c(205, 214, 244);
 pub const BACKGROUND: Rgba = c(30, 30, 46);
-pub const SURFACE1: Rgba = c(69, 71, 90);
 
 const PALETTE: [Rgba; 16] = [
     c(69, 71, 90),    // black
