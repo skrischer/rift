@@ -8,11 +8,11 @@ Adopt `longbridge/gpui-component` as rift's UI primitive layer and migrate the P
 
 ## Outcome
 
-- [ ] `gpui-component` is a workspace dependency, building cleanly alongside `gpui` and `termy_terminal_ui` on a single shared GPUI git revision
-- [ ] The app renders inside gpui-component's `Root`/theme context; a theme is applied app-wide
-- [ ] The window tab bar is rendered with gpui-component's tab/dock component, replacing the hand-rolled tab bar in `session_view.rs`, with no regression in window switching (click) behavior
+- [x] `gpui-component` is a workspace dependency, building cleanly alongside `gpui` and `termy_terminal_ui` on a single shared GPUI git revision
+- [x] The app renders inside gpui-component's `Root`/theme context; a theme is applied app-wide (#33 / PR #34)
+- [x] The window tab bar is rendered with gpui-component's tab/dock component, replacing the hand-rolled tab bar in `session_view.rs`, with no regression in window switching (click) behavior (#27 / PR #35)
 - [ ] The statusbar is rebuilt on gpui-component primitives, ready to host the Phase 2d data displays (git branch, command, session/window name, connection status)
-- [ ] `cargo deny check licenses` passes (gpui-component is Apache-2.0)
+- [x] `cargo deny check licenses` passes (gpui-component is Apache-2.0)
 
 ## Scope
 
@@ -64,13 +64,13 @@ Provisional step outline (becomes issues, not kept here once created):
 
 ## Verification
 
-- [ ] `cargo build --workspace` succeeds with exactly one `gpui` entry in `Cargo.lock`
-- [ ] `cargo clippy --workspace -- -D warnings` passes
-- [ ] `cargo test --workspace` passes
-- [ ] `cargo deny check licenses` passes
-- [ ] Tab bar renders via gpui-component; clicking a tab switches windows (no regression vs current behavior)
-- [ ] App renders inside gpui-component theme context; statusbar visible and themed
-- [ ] No second `gpui` version pulled in transitively (verified in `Cargo.lock`)
+- [x] `cargo build --workspace` succeeds with exactly one `gpui` entry in `Cargo.lock`
+- [x] `cargo clippy --workspace -- -D warnings` passes
+- [x] `cargo test --workspace` passes
+- [x] `cargo deny check licenses` passes
+- [x] Tab bar renders via gpui-component; clicking a tab switches windows (no regression vs current behavior)
+- [ ] App renders inside gpui-component theme context; statusbar visible and themed (theme context met via #34; statusbar rebuild pending #28)
+- [x] No second `gpui` version pulled in transitively (verified in `Cargo.lock`)
 
 ## Risks and mitigations
 
@@ -93,3 +93,11 @@ Provisional step outline (becomes issues, not kept here once created):
   - **R-discovery is deterministic:** read gpui-component's committed `Cargo.lock` for the zed rev to target on every future bump.
   - **Ergonomics caveat:** adding a new dependency from the zed source re-floats the bare resolution to `HEAD`; re-apply `cargo update -p gpui --precise <rev>` after such changes. Rare once `Cargo.lock` is committed.
   - **Strategic reframe:** the real future constraint is termy lagging gpui, not "finding a shared rev". rift owns the termy fork and brings it current on rift's cadence; gpui-component then floats in cleanly.
+- 2026-06-04: Step 3 (window tab bar) implemented (#27 / PR #35).
+  - **Tab variant:** gpui-component `TabBar` Default variant — closest to the prior hand-rolled look, lowest regression risk.
+  - **Tab bar visibility:** always rendered, even with a single window (was: shown only with >1 window). Gives a constant layout with no height jump when a second window opens.
+  - **Click-to-switch:** preserved via index -> window-id mapping; `TabBar::on_click` sends `select-window -t {id}` over `tmux_command_tx`, unchanged from before.
+- 2026-06-04: Outcome "a theme is applied app-wide" completed (#33 / PR #34). #26 wired `Root`/`init` structurally but never applied a palette, so gpui-component widgets defaulted to the built-in light theme (surfaced as black-on-white tabs in #27).
+  - **Fix:** register a Catppuccin Mocha theme in gpui-component's native `ThemeRegistry` (JSON asset, `crates/app/assets/themes/catppuccin-mocha.json`) alongside the built-in Light/Dark, then activate it at startup via `Theme::change`.
+  - **Single theme by design:** a selectable multi-theme system + runtime switcher is explicitly out of scope here and deferred to its own future spec. The registry/JSON approach keeps that extension rework-free (the switcher only needs to enumerate `ThemeRegistry::themes()`).
+  - **Source-of-truth note:** `crates/terminal/src/colors.rs` stays the terminal ANSI palette (cell colors); the JSON defines the UI-chrome `ThemeColor` tokens. They overlap only on a few base colors.
