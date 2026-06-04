@@ -5338,6 +5338,7 @@ dependencies = [
  "alacritty_terminal",
  "flume",
  "gpui",
+ "gpui-component",
  "smol",
  "termy_terminal_ui",
  "thiserror 2.0.18",
