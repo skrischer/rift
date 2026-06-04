@@ -2,10 +2,10 @@ use std::collections::HashMap;
 
 use gpui::*;
 use gpui_component::tab::TabBar;
+use gpui_component::{h_flex, ActiveTheme};
 use termy_terminal_ui::TmuxSnapshot;
 use tracing::debug;
 
-use crate::colors;
 use crate::layout::{self, LayoutNode};
 use crate::pane_view::{measure_cell_size, statusbar_height, PaneView};
 use crate::{PaneInput, PaneOutput, TermSize};
@@ -226,9 +226,7 @@ impl SessionView {
         cx.notify();
     }
 
-    fn render_layout(&self, node: &LayoutNode) -> AnyElement {
-        let border_color = Hsla::from(colors::SURFACE1);
-
+    fn render_layout(&self, node: &LayoutNode, border_color: Hsla) -> AnyElement {
         match node {
             LayoutNode::Pane(id) => {
                 if let Some(entry) = self.panes.get(id) {
@@ -249,7 +247,7 @@ impl SessionView {
                 };
                 let last = children.len().saturating_sub(1);
                 for (i, (proportion, child)) in children.iter().enumerate() {
-                    let inner = self.render_layout(child);
+                    let inner = self.render_layout(child, border_color);
                     let mut wrapper = div()
                         .flex_1()
                         .flex_basis(relative(*proportion))
@@ -344,10 +342,6 @@ impl Render for SessionView {
             .unwrap_or_default();
 
         let size_label = format!("{}x{}", grid_size.cols, grid_size.rows);
-        let bg_hsla = Hsla::from(colors::BACKGROUND);
-        let surface0 = Hsla::from(colors::SURFACE0);
-        let surface1 = Hsla::from(colors::SURFACE1);
-        let subtext0 = Hsla::from(colors::SUBTEXT0);
 
         let selected_index = self.windows.iter().position(|w| w.is_active).unwrap_or(0);
         let window_ids: Vec<String> = self.windows.iter().map(|w| w.id.clone()).collect();
@@ -372,42 +366,38 @@ impl Render for SessionView {
             }));
 
         let pane_area = if let Some(ref layout) = self.layout {
-            self.render_layout(layout)
+            self.render_layout(layout, cx.theme().border)
         } else {
             div().flex_grow().into_any_element()
         };
 
-        let statusbar = div()
+        let statusbar = h_flex()
             .id("statusbar")
-            .flex()
-            .flex_row()
-            .items_center()
             .justify_between()
             .w_full()
             .h(statusbar_height())
-            .bg(surface0)
+            .bg(cx.theme().tab_bar)
             .border_t_1()
-            .border_color(surface1)
+            .border_color(cx.theme().border)
             .text_size(font_size)
-            .text_color(subtext0)
+            .text_color(cx.theme().muted_foreground)
             .font_family("JetBrainsMono Nerd Font Mono")
             .px(px(12.0))
+            // Left slot: connection / session / window info (Phase 2d fields land here).
             .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
+                h_flex()
                     .gap(px(16.0))
                     .child(self.ssh_label.clone())
                     .children((!cwd.is_empty()).then(|| SharedString::from(cwd.clone()))),
             )
-            .child(div().child(SharedString::from(size_label)));
+            // Right slot: command / git status (Phase 2d fields land here).
+            .child(h_flex().child(SharedString::from(size_label)));
 
         div()
             .flex()
             .flex_col()
             .size_full()
-            .bg(bg_hsla)
+            .bg(cx.theme().background)
             .child(tab_bar)
             .child(pane_area)
             .child(statusbar)
