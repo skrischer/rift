@@ -24,6 +24,16 @@ test:
 # Full CI check (format + lint + test)
 ci: fmt-check lint test
 
+# Create an isolated headless worktree for an agent (off develop, own target, no GPU build)
+agent-worktree branch:
+    git worktree add ../rift-worktrees/{{replace(branch, "/", "-")}} -b {{branch}} develop
+    @echo "Worktree ready: ../rift-worktrees/{{replace(branch, "/", "-")}} (branch {{branch}})"
+    @echo "Verify there headless: just lint && just test"
+
+# Remove an agent worktree after merge
+agent-worktree-rm branch:
+    git worktree remove ../rift-worktrees/{{replace(branch, "/", "-")}}
+
 # Build daemon release binary for Linux (musl)
 release-daemon:
     cargo build --release -p rift-daemon --target x86_64-unknown-linux-musl

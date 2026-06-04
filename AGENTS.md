@@ -79,6 +79,16 @@ cargo build --release -p daemon --target x86_64-unknown-linux-musl  # daemon rel
 - Never push directly to `main` or `develop`. Always use pull requests.
 - Delete feature branches after merge.
 
+## Parallel development (worktrees)
+
+The GPU app (`rift-app`) is the only expensive, non-parallelizable build (pulls skia/wgpu — ~20 GB of debug artifacts). Topology that keeps a single heavy `target/`:
+
+- **Main checkout = the one GPU station.** Stays on `develop`, runs `just dev-watch`. The only place `rift-app` is built and visually previewed.
+- **Agents work headless in worktrees.** They verify with `just lint` / `just test` / `cargo build --workspace --exclude rift-app` — no GPU build, so their `target/` stays small.
+- **Visual review is a gate *before* merge**, not after: to eyeball an agent's branch, `git checkout <branch>` in the main checkout, let `dev-watch` rebuild incrementally, then switch back to `develop`. Never blind-merge GPU changes into `develop`.
+
+Worktrees live in a sibling container `../rift-worktrees/<branch-with-slashes-as-dashes>` (outside the repo tree, so `rg`/`cargo`/watchers don't traverse them; own `target/` per worktree). Use `just agent-worktree <branch>` to create and `just agent-worktree-rm <branch>` to remove.
+
 ## Commits
 
 Conventional Commits. Scope matches crate name. Imperative mood, lowercase, no period.
