@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui_component::tab::TabBar;
 use termy_terminal_ui::TmuxSnapshot;
 use tracing::debug;
 
@@ -314,12 +314,7 @@ impl Render for SessionView {
         let font_size = px(14.0);
         let cell_size = measure_cell_size(window, font_size);
 
-        let has_tabs = self.windows.len() > 1;
-        let tab_bar_h = if has_tabs {
-            statusbar_height()
-        } else {
-            px(0.0)
-        };
+        let tab_bar_h = statusbar_height();
 
         let viewport = window.viewport_size();
         let total_cols = (viewport.width / cell_size.width).floor() as usize;
@@ -353,49 +348,28 @@ impl Render for SessionView {
         let surface0 = Hsla::from(colors::SURFACE0);
         let surface1 = Hsla::from(colors::SURFACE1);
         let subtext0 = Hsla::from(colors::SUBTEXT0);
-        let foreground = Hsla::from(colors::FOREGROUND);
 
-        let tab_bar = has_tabs.then(|| {
-            let windows_data: Vec<_> = self
-                .windows
-                .iter()
-                .map(|w| (w.id.clone(), w.index, w.name.clone(), w.is_active))
-                .collect();
+        let selected_index = self.windows.iter().position(|w| w.is_active).unwrap_or(0);
+        let window_ids: Vec<String> = self.windows.iter().map(|w| w.id.clone()).collect();
+        let tab_labels: Vec<SharedString> = self
+            .windows
+            .iter()
+            .map(|w| SharedString::from(format!("{}: {}", w.index, w.name)))
+            .collect();
 
-            div()
-                .id("tab-bar")
-                .flex()
-                .flex_row()
-                .items_center()
-                .w_full()
-                .h(statusbar_height())
-                .bg(surface0)
-                .border_b_1()
-                .border_color(surface1)
-                .text_size(font_size)
-                .font_family("JetBrainsMono Nerd Font Mono")
-                .children(windows_data.into_iter().map(|(id, index, name, active)| {
-                    let click_id = id.clone();
-                    div()
-                        .id(SharedString::from(format!("tab-{}", id)))
-                        .px(px(12.0))
-                        .py(px(4.0))
-                        .cursor_pointer()
-                        .when(active, |d| d.bg(surface1).text_color(foreground))
-                        .when(!active, |d| {
-                            d.text_color(subtext0).hover(|d| d.bg(surface1))
-                        })
-                        .on_click(cx.listener(move |this, _, _, _cx| {
-                            if let Err(e) = this
-                                .tmux_command_tx
-                                .try_send(format!("select-window -t {}", click_id))
-                            {
-                                debug!(error = %e, "failed to send window switch command");
-                            }
-                        }))
-                        .child(SharedString::from(format!("{}: {}", index, name)))
-                }))
-        });
+        let tab_bar = TabBar::new("tab-bar")
+            .selected_index(selected_index)
+            .children(tab_labels)
+            .on_click(cx.listener(move |this, index: &usize, _, _| {
+                if let Some(id) = window_ids.get(*index) {
+                    if let Err(e) = this
+                        .tmux_command_tx
+                        .try_send(format!("select-window -t {}", id))
+                    {
+                        debug!(error = %e, "failed to send window switch command");
+                    }
+                }
+            }));
 
         let pane_area = if let Some(ref layout) = self.layout {
             self.render_layout(layout)
@@ -434,7 +408,7 @@ impl Render for SessionView {
             .flex_col()
             .size_full()
             .bg(bg_hsla)
-            .children(tab_bar)
+            .child(tab_bar)
             .child(pane_area)
             .child(statusbar)
     }
