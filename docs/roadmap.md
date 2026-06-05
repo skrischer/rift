@@ -30,6 +30,8 @@ A batch of pre-SDD terminal/tmux interaction defects surfaced while dogfooding: 
 
 **Planned: tmux key-table mirroring** — make configured tmux keybindings work in a rift pane (today `send-keys -H` bypasses them). Larger effort, split into its own DRAFT spec: [spec-tmux-keytable-mirroring.md](spec-tmux-keytable-mirroring.md). Not scheduled until the interaction fixes land.
 
+**Planned: tmux status-line mirroring** — under `tmux -CC` the user's `status-left/right/style` config is queryable but never rendered, so it is currently ignored. An opt-in mode would mirror it in the native statusbar via a tmux format-string interpreter. Own DRAFT spec: [spec-tmux-statusline-mirroring.md](spec-tmux-statusline-mirroring.md). Sibling to key-table mirroring (both surface a hidden tmux config primitive); the Phase 2d native statusbar stays the default.
+
 ## What comes after Phase 2d
 
 **Phase 3: Remote daemon** — the major architectural shift. Splits the monolithic app into GPUI frontend + remote daemon connected via WebSocket over SSH port-forward. The daemon handles file watching (inotify), git status, and language servers (LSP) on the remote host. The frontend becomes a thin rendering client.
