@@ -12,7 +12,7 @@ Living document tracking project phases, current status, and planned work.
 | 2c | Multi-pane awareness | COMPLETED 2026-05-20 | [archive/spec-phase2c-multipane.md](archive/spec-phase2c-multipane.md) |
 | 2d | Tab bar + statusbar enrichment | IN PROGRESS | [spec-phase2d-tabbar.md](spec-phase2d-tabbar.md) |
 | 2e | gpui-component UI foundation | COMPLETED 2026-06-05 | [archive/spec-gpui-component-adoption.md](archive/spec-gpui-component-adoption.md) |
-| 3 | Remote daemon | PLANNED | — |
+| 3 | Remote daemon | READY (scaffolding) | [spec-daemon-scaffolding.md](spec-daemon-scaffolding.md) |
 
 ## Current focus
 
@@ -34,14 +34,11 @@ A batch of pre-SDD terminal/tmux interaction defects surfaced while dogfooding: 
 
 ## What comes after Phase 2d
 
-**Phase 3: Remote daemon** — the major architectural shift. Splits the monolithic app into GPUI frontend + remote daemon connected via WebSocket over SSH port-forward. The daemon handles file watching (inotify), git status, and language servers (LSP) on the remote host. The frontend becomes a thin rendering client.
+**Phase 3: Remote daemon** — the major architectural shift. Splits the monolithic app into a GPUI frontend + a remote daemon connected over a dedicated `russh` channel (no WebSocket — `russh` already multiplexes channels). The daemon handles file watching (inotify), git status, and language servers (LSP) on the remote host. The frontend becomes a thin rendering client.
 
-Key open decisions for Phase 3:
-- VTE parsing location: client-side (current, simpler) vs. daemon-side (less data over SSH)
-- File sync strategy: daemon serves file tree on demand vs. full directory sync
-- LSP lifecycle: daemon starts/stops language servers, or always-on per project
+The foundational decisions are resolved (see [spec-daemon-scaffolding.md](spec-daemon-scaffolding.md)): daemon form is Lapce-flat dispatch (not Zed `HeadlessProject`), transport lifts Zed's connection-reuse + auto-deploy, the client↔daemon channel is a dedicated `russh` channel. File-sync (Zed worktree `Snapshot` + incremental updates) and LSP lifecycle (daemon-side, lazy per `DocumentSelector`, `async-lsp`) are pre-decided for their own sub-specs. The one genuinely open item is the VTE parsing location (client-side vs. daemon-side), deferred to a spike before the terminal-streaming sub-spec.
 
-These decisions need specs before implementation starts. Phase 3 is the biggest architectural change since the project began and will likely need multiple sub-specs (daemon scaffolding, file tree, git status, LSP integration, protocol migration).
+Phase 3 is the biggest architectural change since the project began and needs multiple sub-specs (daemon scaffolding, file tree, git status, LSP integration, terminal streaming). The first — daemon scaffolding + transport — is `READY`, with milestone [Phase 3 — Remote daemon](https://github.com/skrischer/rift/milestone/4) and issues #57–#62.
 
 See [prior-art.md](prior-art.md) for reference implementations (Zed `remote_server`, Lapce proxy, Arbor, `async-lsp`) and candidate dependencies to draw from when writing these specs.
 
