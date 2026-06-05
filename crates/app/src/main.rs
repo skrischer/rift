@@ -5,8 +5,8 @@ use std::thread;
 use anyhow::{Context as _, Result};
 use gpui::*;
 use gpui_component::{Root, Theme, ThemeMode, ThemeRegistry};
-use rift_terminal::{PaneInput, PaneOutput, SessionView, TermSize};
-use tracing::{debug, error, info};
+use rift_terminal::{PaneInput, PaneOutput, SessionView, SubscriptionUpdate, TermSize};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Catppuccin Mocha theme in gpui-component's native theme format. Registered in
@@ -46,6 +46,7 @@ struct PtyChannels {
     size_changed_rx: flume::Receiver<TermSize>,
     snapshot_tx: flume::Sender<termy_terminal_ui::TmuxSnapshot>,
     tmux_command_rx: flume::Receiver<String>,
+    subscription_tx: flume::Sender<SubscriptionUpdate>,
 }
 
 fn main() {
@@ -102,6 +103,7 @@ fn main() {
                         size_changed_rx: handle.size_changed_rx,
                         snapshot_tx: handle.snapshot_tx,
                         tmux_command_rx: handle.tmux_command_rx,
+                        subscription_tx: handle.subscription_tx,
                     };
 
                     let key_exists = ssh.key.exists();
@@ -183,6 +185,20 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
         .send_command_async("refresh-client -f pause-after=5")
         .context("failed to activate flow control")?;
 
+    // Register format subscriptions so pane/window state changes (cd, command,
+    // window rename) stream in within ~1s instead of waiting for a structural
+    // refresh. Requires tmux 3.4+; on older servers each call returns an error
+    // and we degrade to snapshot-only rather than failing the session.
+    for (name, scope, format) in [
+        ("rift_pane_path", "%*", "#{pane_current_path}"),
+        ("rift_pane_command", "%*", "#{pane_current_command}"),
+        ("rift_window_name", "@*", "#{window_name}"),
+    ] {
+        if let Err(e) = tmux_client.subscribe(name, scope, format) {
+            warn!(%e, name, "failed to register tmux subscription; continuing snapshot-only");
+        }
+    }
+
     info!("tmux control mode connected");
 
     let pane_output_tx = ch.pane_output_tx;
@@ -190,6 +206,7 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
     let size_changed_rx = ch.size_changed_rx;
     let snapshot_tx = ch.snapshot_tx;
     let tmux_command_rx = ch.tmux_command_rx;
+    let subscription_tx = ch.subscription_tx;
 
     let initial_snapshot = tmux_client
         .refresh_snapshot()
@@ -249,6 +266,27 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
                 TmuxNotification::NeedsRefresh => {
                     if let Ok(snapshot) = tmux_for_poll.refresh_snapshot() {
                         let _ = snapshot_tx.send(snapshot);
+                    }
+                }
+                TmuxNotification::SubscriptionChanged {
+                    name,
+                    session,
+                    window,
+                    pane,
+                    value,
+                } => {
+                    if subscription_tx
+                        .send(SubscriptionUpdate {
+                            name,
+                            session,
+                            window,
+                            pane,
+                            value,
+                        })
+                        .is_err()
+                    {
+                        should_exit = true;
+                        break;
                     }
                 }
                 TmuxNotification::Exit(reason) => {

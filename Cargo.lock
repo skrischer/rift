@@ -3027,7 +3027,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -6736,7 +6736,7 @@ dependencies = [
 [[package]]
 name = "termy_terminal_ui"
 version = "0.1.0"
-source = "git+https://github.com/skrischer/termy?rev=1c882224c9f46c7961d5f7b54582f18bf9123b28#1c882224c9f46c7961d5f7b54582f18bf9123b28"
+source = "git+https://github.com/skrischer/termy?rev=790e104fc110051fa84b6e84202bf3699e37058b#790e104fc110051fa84b6e84202bf3699e37058b"
 dependencies = [
  "alacritty_terminal",
  "anyhow",

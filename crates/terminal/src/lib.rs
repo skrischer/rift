@@ -21,6 +21,17 @@ pub struct PaneInput {
     pub bytes: Vec<u8>,
 }
 
+/// A tmux format-subscription update (`%subscription-changed`). `name` is the
+/// subscription registered via [`termy_terminal_ui::TmuxClient::subscribe`];
+/// `pane` is `-` for window- or session-scoped subscriptions.
+pub struct SubscriptionUpdate {
+    pub name: String,
+    pub session: String,
+    pub window: String,
+    pub pane: String,
+    pub value: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TermSize {
     pub cols: usize,
