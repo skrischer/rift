@@ -56,6 +56,7 @@ pub struct SessionView {
     needs_focus: bool,
     window_grid_size: TermSize,
     ssh_label: SharedString,
+    session_name: SharedString,
     working_directory: Option<String>,
 }
 
@@ -193,6 +194,7 @@ impl SessionView {
             needs_focus: true,
             window_grid_size: TermSize { cols: 80, rows: 24 },
             ssh_label,
+            session_name: SharedString::default(),
             working_directory: None,
         };
 
@@ -319,6 +321,10 @@ impl SessionView {
             });
         }
 
+        if !snapshot.session_name.is_empty() {
+            self.session_name = SharedString::from(snapshot.session_name.clone());
+        }
+
         self.windows = new_windows;
         if active_pane_id != self.active_pane_id {
             self.needs_focus = true;
@@ -361,6 +367,17 @@ impl SessionView {
                         cx.notify();
                     });
                     cx.notify();
+                }
+            }
+            // `rift_window_name` (`#{window_name}`, scope `@*`): live window
+            // title per window. Updates the tab label within ~1s of
+            // `rename-window`; the snapshot seeds it otherwise.
+            "rift_window_name" => {
+                if let Some(win) = self.windows.iter_mut().find(|w| w.id == update.window) {
+                    if win.name != update.value {
+                        win.name = update.value;
+                        cx.notify();
+                    }
                 }
             }
             other => {
@@ -537,6 +554,7 @@ impl Render for SessionView {
             .child(
                 h_flex()
                     .gap(px(16.0))
+                    .children((!self.session_name.is_empty()).then(|| self.session_name.clone()))
                     .child(self.ssh_label.clone())
                     .children((!cwd.is_empty()).then(|| SharedString::from(cwd.clone()))),
             )
