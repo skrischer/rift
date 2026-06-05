@@ -28,7 +28,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform" }
 gpui-component = { git = "https://github.com/longbridge/gpui-component" }
-termy_terminal_ui = { git = "https://github.com/skrischer/termy", rev = "790e104fc110051fa84b6e84202bf3699e37058b" }
+termy_terminal_ui = { git = "https://github.com/skrischer/termy", rev = "49d3928570c8b50fabb4f7d3d5f6322d3296fafa" }
 flume = "0.11"
 alacritty_terminal = "0.26.0"
 smol = "2.0"

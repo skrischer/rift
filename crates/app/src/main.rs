@@ -5,7 +5,9 @@ use std::thread;
 use anyhow::{Context as _, Result};
 use gpui::*;
 use gpui_component::{Root, Theme, ThemeMode, ThemeRegistry};
-use rift_terminal::{PaneInput, PaneOutput, SessionView, SubscriptionUpdate, TermSize};
+use rift_terminal::{
+    CaptureRequest, CaptureResult, PaneInput, PaneOutput, SessionView, SubscriptionUpdate, TermSize,
+};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -47,6 +49,8 @@ struct PtyChannels {
     snapshot_tx: flume::Sender<termy_terminal_ui::TmuxSnapshot>,
     tmux_command_rx: flume::Receiver<String>,
     subscription_tx: flume::Sender<SubscriptionUpdate>,
+    capture_request_rx: flume::Receiver<CaptureRequest>,
+    capture_result_tx: flume::Sender<CaptureResult>,
 }
 
 fn main() {
@@ -104,6 +108,8 @@ fn main() {
                         snapshot_tx: handle.snapshot_tx,
                         tmux_command_rx: handle.tmux_command_rx,
                         subscription_tx: handle.subscription_tx,
+                        capture_request_rx: handle.capture_request_rx,
+                        capture_result_tx: handle.capture_result_tx,
                     };
 
                     let key_exists = ssh.key.exists();
@@ -207,6 +213,8 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
     let snapshot_tx = ch.snapshot_tx;
     let tmux_command_rx = ch.tmux_command_rx;
     let subscription_tx = ch.subscription_tx;
+    let capture_request_rx = ch.capture_request_rx;
+    let capture_result_tx = ch.capture_result_tx;
 
     let initial_snapshot = tmux_client
         .refresh_snapshot()
@@ -217,6 +225,7 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
     let tmux_for_resize = tmux_for_input.clone();
     let tmux_for_poll = tmux_for_input.clone();
     let tmux_for_cmd = tmux_for_input.clone();
+    let tmux_for_capture = tmux_for_input.clone();
 
     let input_handle = std::thread::spawn(move || {
         while let Ok(input) = input_rx.recv() {
@@ -244,6 +253,27 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
         while let Ok(cmd) = tmux_command_rx.recv() {
             debug!(cmd = %cmd, "sending tmux command");
             if tmux_for_cmd.send_command_async(&cmd).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Pre-attach scrollback capture. `capture_pane_range` goes through termy's
+    // internal control-channel worker (10s timeout), so a blocking capture here
+    // is demultiplexed against the poll loop's `%output` stream. An empty payload
+    // on error lets the pane clear its in-flight flag and retry.
+    let capture_handle = std::thread::spawn(move || {
+        while let Ok(req) = capture_request_rx.recv() {
+            let bytes = tmux_for_capture
+                .capture_pane_range(&req.pane_id, &req.start_row, &req.end_row, req.join_wraps)
+                .unwrap_or_default();
+            if capture_result_tx
+                .send(CaptureResult {
+                    pane_id: req.pane_id,
+                    bytes,
+                })
+                .is_err()
+            {
                 break;
             }
         }
@@ -308,5 +338,6 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
     let _ = input_handle.join();
     let _ = resize_handle.join();
     let _ = cmd_handle.join();
+    let _ = capture_handle.join();
     Ok(())
 }

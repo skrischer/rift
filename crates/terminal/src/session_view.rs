@@ -8,7 +8,7 @@ use tracing::debug;
 
 use crate::layout::{self, LayoutNode};
 use crate::pane_view::{measure_cell_size, statusbar_height, PaneView};
-use crate::{PaneInput, PaneOutput, SubscriptionUpdate, TermSize};
+use crate::{CaptureRequest, CaptureResult, PaneInput, PaneOutput, SubscriptionUpdate, TermSize};
 
 pub struct TerminalHandle {
     pub pane_output_tx: flume::Sender<PaneOutput>,
@@ -17,6 +17,8 @@ pub struct TerminalHandle {
     pub snapshot_tx: flume::Sender<TmuxSnapshot>,
     pub tmux_command_rx: flume::Receiver<String>,
     pub subscription_tx: flume::Sender<SubscriptionUpdate>,
+    pub capture_request_rx: flume::Receiver<CaptureRequest>,
+    pub capture_result_tx: flume::Sender<CaptureResult>,
 }
 
 struct PaneEntry {
@@ -42,6 +44,7 @@ pub struct SessionView {
     input_tx: flume::Sender<PaneInput>,
     size_changed_tx: flume::Sender<TermSize>,
     tmux_command_tx: flume::Sender<String>,
+    capture_request_tx: flume::Sender<CaptureRequest>,
     focus_handle: FocusHandle,
     needs_focus: bool,
     window_grid_size: TermSize,
@@ -57,6 +60,8 @@ impl SessionView {
         let (snapshot_tx, snapshot_rx) = flume::unbounded::<TmuxSnapshot>();
         let (tmux_command_tx, tmux_command_rx) = flume::unbounded::<String>();
         let (subscription_tx, subscription_rx) = flume::unbounded::<SubscriptionUpdate>();
+        let (capture_request_tx, capture_request_rx) = flume::unbounded::<CaptureRequest>();
+        let (capture_result_tx, capture_result_rx) = flume::unbounded::<CaptureResult>();
 
         {
             cx.spawn(async move |this, cx| loop {
@@ -119,6 +124,27 @@ impl SessionView {
             .detach();
         }
 
+        {
+            cx.spawn(async move |this, cx| loop {
+                let Ok(result) = capture_result_rx.recv_async().await else {
+                    break;
+                };
+                let update = cx.update(|cx| {
+                    this.update(cx, |view, cx| {
+                        if let Some(entry) = view.panes.get(&result.pane_id) {
+                            entry.entity.update(cx, |pane, cx| {
+                                pane.apply_history(result.bytes, cx);
+                            });
+                        }
+                    })
+                });
+                if update.is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
+
         let ssh_user = std::env::var("RIFT_SSH_USER").unwrap_or_default();
         let ssh_host = std::env::var("RIFT_SSH_HOST").unwrap_or_else(|_| "localhost".into());
         let ssh_label: SharedString = if ssh_user.is_empty() {
@@ -136,6 +162,7 @@ impl SessionView {
             input_tx: input_tx.clone(),
             size_changed_tx: size_changed_tx.clone(),
             tmux_command_tx,
+            capture_request_tx,
             focus_handle: cx.focus_handle(),
             needs_focus: true,
             window_grid_size: TermSize { cols: 80, rows: 24 },
@@ -150,6 +177,8 @@ impl SessionView {
             snapshot_tx,
             tmux_command_rx,
             subscription_tx,
+            capture_request_rx,
+            capture_result_tx,
         };
 
         (view, handle)
@@ -198,10 +227,17 @@ impl SessionView {
                     let (pty_tx, pty_rx) = flume::unbounded::<Vec<u8>>();
                     let input_tx = self.input_tx.clone();
                     let size_changed_tx = self.size_changed_tx.clone();
+                    let capture_request_tx = self.capture_request_tx.clone();
                     let pane_id = pane_state.id.clone();
 
                     let entity = cx.new(|pane_cx| {
-                        let mut pv = PaneView::new(pane_cx, pty_rx, input_tx, size_changed_tx);
+                        let mut pv = PaneView::new(
+                            pane_cx,
+                            pty_rx,
+                            input_tx,
+                            size_changed_tx,
+                            capture_request_tx,
+                        );
                         pv.set_pane_id(pane_id.clone());
                         pv.set_tmux_size(pane_state.width, pane_state.height);
                         if !pane_state.current_path.is_empty() {
