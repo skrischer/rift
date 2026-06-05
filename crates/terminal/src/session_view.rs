@@ -10,6 +10,11 @@ use crate::layout::{self, LayoutNode};
 use crate::pane_view::{measure_cell_size, statusbar_height, PaneView};
 use crate::{CaptureRequest, CaptureResult, PaneInput, PaneOutput, SubscriptionUpdate, TermSize};
 
+const DEFAULT_FONT_SIZE: f32 = 14.0;
+const MIN_FONT_SIZE: f32 = 8.0;
+const MAX_FONT_SIZE: f32 = 40.0;
+const FONT_SIZE_STEP: f32 = 1.0;
+
 pub struct TerminalHandle {
     pub pane_output_tx: flume::Sender<PaneOutput>,
     pub input_rx: flume::Receiver<PaneInput>,
@@ -45,6 +50,8 @@ pub struct SessionView {
     size_changed_tx: flume::Sender<TermSize>,
     tmux_command_tx: flume::Sender<String>,
     capture_request_tx: flume::Sender<CaptureRequest>,
+    font_zoom_tx: flume::Sender<i32>,
+    font_size: Pixels,
     focus_handle: FocusHandle,
     needs_focus: bool,
     window_grid_size: TermSize,
@@ -62,6 +69,7 @@ impl SessionView {
         let (subscription_tx, subscription_rx) = flume::unbounded::<SubscriptionUpdate>();
         let (capture_request_tx, capture_request_rx) = flume::unbounded::<CaptureRequest>();
         let (capture_result_tx, capture_result_rx) = flume::unbounded::<CaptureResult>();
+        let (font_zoom_tx, font_zoom_rx) = flume::unbounded::<i32>();
 
         {
             cx.spawn(async move |this, cx| loop {
@@ -144,6 +152,23 @@ impl SessionView {
             .detach();
         }
 
+        {
+            cx.spawn(async move |this, cx| loop {
+                let Ok(delta) = font_zoom_rx.recv_async().await else {
+                    break;
+                };
+                let result = cx.update(|cx| {
+                    this.update(cx, |view, cx| {
+                        view.apply_font_zoom(delta, cx);
+                    })
+                });
+                if result.is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
+
         let ssh_user = std::env::var("RIFT_SSH_USER").unwrap_or_default();
         let ssh_host = std::env::var("RIFT_SSH_HOST").unwrap_or_else(|_| "localhost".into());
         let ssh_label: SharedString = if ssh_user.is_empty() {
@@ -162,6 +187,8 @@ impl SessionView {
             size_changed_tx: size_changed_tx.clone(),
             tmux_command_tx,
             capture_request_tx,
+            font_zoom_tx,
+            font_size: px(DEFAULT_FONT_SIZE),
             focus_handle: cx.focus_handle(),
             needs_focus: true,
             window_grid_size: TermSize { cols: 80, rows: 24 },
@@ -181,6 +208,26 @@ impl SessionView {
         };
 
         (view, handle)
+    }
+
+    /// Apply a font-zoom delta to the whole client. Font size is a single
+    /// client render property: changing it shifts the cell metrics, so the next
+    /// `render` recomputes cols/rows and pushes the new client size to tmux,
+    /// which reflows every pane.
+    fn apply_font_zoom(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let new_size = px((f32::from(self.font_size) + delta as f32 * FONT_SIZE_STEP)
+            .clamp(MIN_FONT_SIZE, MAX_FONT_SIZE));
+        if new_size == self.font_size {
+            return;
+        }
+        self.font_size = new_size;
+        for entry in self.panes.values() {
+            entry.entity.update(cx, |pane, cx| {
+                pane.set_font_size(new_size);
+                cx.notify();
+            });
+        }
+        cx.notify();
     }
 
     fn apply_snapshot(&mut self, snapshot: TmuxSnapshot, cx: &mut Context<Self>) {
@@ -226,7 +273,9 @@ impl SessionView {
                     let input_tx = self.input_tx.clone();
                     let size_changed_tx = self.size_changed_tx.clone();
                     let capture_request_tx = self.capture_request_tx.clone();
+                    let font_zoom_tx = self.font_zoom_tx.clone();
                     let pane_id = pane_state.id.clone();
+                    let font_size = self.font_size;
 
                     let entity = cx.new(|pane_cx| {
                         let mut pv = PaneView::new(
@@ -235,8 +284,10 @@ impl SessionView {
                             input_tx,
                             size_changed_tx,
                             capture_request_tx,
+                            font_zoom_tx,
                         );
                         pv.set_pane_id(pane_id.clone());
+                        pv.set_font_size(font_size);
                         pv.set_tmux_size(pane_state.width, pane_state.height);
                         if !pane_state.current_path.is_empty() {
                             pv.set_working_directory(pane_state.current_path.clone());
@@ -401,7 +452,7 @@ impl Render for SessionView {
             }
         }
 
-        let font_size = px(14.0);
+        let font_size = self.font_size;
         let cell_size = measure_cell_size(window, font_size);
 
         let tab_bar_h = statusbar_height();
@@ -476,7 +527,9 @@ impl Render for SessionView {
             .bg(cx.theme().tab_bar)
             .border_t_1()
             .border_color(cx.theme().border)
-            .text_size(font_size)
+            // Statusbar stays fixed-size; font zoom only scales terminal content,
+            // and the bar has a fixed height that larger text would overflow.
+            .text_size(px(DEFAULT_FONT_SIZE))
             .text_color(cx.theme().muted_foreground)
             .font_family("JetBrainsMono Nerd Font Mono")
             .px(px(12.0))
