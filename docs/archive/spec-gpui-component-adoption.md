@@ -1,8 +1,8 @@
 # Spec: gpui-component adoption
 
-> Status: READY
+> Status: COMPLETED
 > Created: 2026-06-01
-> Completed: —
+> Completed: 2026-06-05
 
 Adopt `longbridge/gpui-component` as rift's UI primitive layer and migrate the Phase 2d chrome (tab bar, statusbar, theme) onto it, instead of hand-rolling further UI.
 
@@ -11,7 +11,7 @@ Adopt `longbridge/gpui-component` as rift's UI primitive layer and migrate the P
 - [x] `gpui-component` is a workspace dependency, building cleanly alongside `gpui` and `termy_terminal_ui` on a single shared GPUI git revision
 - [x] The app renders inside gpui-component's `Root`/theme context; a theme is applied app-wide (#33 / PR #34)
 - [x] The window tab bar is rendered with gpui-component's tab/dock component, replacing the hand-rolled tab bar in `session_view.rs`, with no regression in window switching (click) behavior (#27 / PR #35)
-- [ ] The statusbar is rebuilt on gpui-component primitives, ready to host the Phase 2d data displays (git branch, command, session/window name, connection status)
+- [x] The statusbar is rebuilt on gpui-component primitives, ready to host the Phase 2d data displays (git branch, command, session/window name, connection status) (#28 / PR #37)
 - [x] `cargo deny check licenses` passes (gpui-component is Apache-2.0)
 
 ## Scope
@@ -69,7 +69,7 @@ Provisional step outline (becomes issues, not kept here once created):
 - [x] `cargo test --workspace` passes
 - [x] `cargo deny check licenses` passes
 - [x] Tab bar renders via gpui-component; clicking a tab switches windows (no regression vs current behavior)
-- [ ] App renders inside gpui-component theme context; statusbar visible and themed (theme context met via #34; statusbar rebuild pending #28)
+- [x] App renders inside gpui-component theme context; statusbar visible and themed (theme context via #34; statusbar rebuilt on gpui-component primitives via #28)
 - [x] No second `gpui` version pulled in transitively (verified in `Cargo.lock`)
 
 ## Risks and mitigations
@@ -101,3 +101,9 @@ Provisional step outline (becomes issues, not kept here once created):
   - **Fix:** register a Catppuccin Mocha theme in gpui-component's native `ThemeRegistry` (JSON asset, `crates/app/assets/themes/catppuccin-mocha.json`) alongside the built-in Light/Dark, then activate it at startup via `Theme::change`.
   - **Single theme by design:** a selectable multi-theme system + runtime switcher is explicitly out of scope here and deferred to its own future spec. The registry/JSON approach keeps that extension rework-free (the switcher only needs to enumerate `ThemeRegistry::themes()`).
   - **Source-of-truth note:** `crates/terminal/src/colors.rs` stays the terminal ANSI palette (cell colors); the JSON defines the UI-chrome `ThemeColor` tokens. They overlap only on a few base colors.
+- 2026-06-05: Step 4 (statusbar container) implemented (#28 / PR #37) — completes the spec.
+  - **Rebuild on `h_flex()` + `cx.theme()`:** the hand-rolled `div()` statusbar with hardcoded Catppuccin `Hsla` locals is replaced by a `gpui_component::h_flex().justify_between()` container reading the active theme via the `ActiveTheme` trait — same shape as `TitleBar`, no dedicated `StatusBar` component exists.
+  - **1:1 token mapping (no visual regression):** `colors::SURFACE0` -> `cx.theme().tab_bar` (bg, #313244), `colors::SUBTEXT0` -> `cx.theme().muted_foreground` (text, #a6adc8), `colors::SURFACE1` -> `cx.theme().border` (top border, #45475a). Visually confirmed identical on the GPU station.
+  - **Slots established, data deferred:** left group (connection/session/window) and right group (command/git) are marked as the homes for the Phase 2d fields (#18-#21); only the container is built here, the field wiring stays in each 2d issue.
+  - **Root frame + pane-split border themed too:** root container bg `colors::BACKGROUND` -> `cx.theme().background`; the `render_layout` pane-split border (also `colors::SURFACE1`) was switched to `cx.theme().border` in the same PR — `render_layout` now threads `border_color: Hsla` from `cx.theme().border` at the call site.
+  - **`colors.rs` reduced to the ANSI palette:** `SURFACE0`, `SUBTEXT0`, `SURFACE1` removed (dead after migration); the `use crate::colors;` import dropped from `session_view.rs`. `colors.rs` now holds only `FOREGROUND`/`BACKGROUND` + the ANSI `PALETTE`/`to_gpui_color` (still used by `pane_view.rs`).

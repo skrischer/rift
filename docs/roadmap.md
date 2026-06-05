@@ -11,7 +11,7 @@ Living document tracking project phases, current status, and planned work.
 | 2a+2b | tmux control mode integration | COMPLETED 2026-05-08 | [archive/spec-phase2ab-control-mode.md](archive/spec-phase2ab-control-mode.md) |
 | 2c | Multi-pane awareness | COMPLETED 2026-05-20 | [archive/spec-phase2c-multipane.md](archive/spec-phase2c-multipane.md) |
 | 2d | Tab bar + statusbar enrichment | IN PROGRESS | [spec-phase2d-tabbar.md](spec-phase2d-tabbar.md) |
-| 2e | gpui-component UI foundation | IN PROGRESS | [spec-gpui-component-adoption.md](spec-gpui-component-adoption.md) |
+| 2e | gpui-component UI foundation | COMPLETED 2026-06-05 | [archive/spec-gpui-component-adoption.md](archive/spec-gpui-component-adoption.md) |
 | 3 | Remote daemon | PLANNED | — |
 
 ## Current focus
@@ -22,7 +22,13 @@ Tab bar for tmux window switching, CWD from subscriptions instead of snapshot po
 
 Spec: [spec-phase2d-tabbar.md](spec-phase2d-tabbar.md)
 
-Phase 2e (gpui-component UI foundation) is being built first as the substrate for the 2d displays: `Root`/theme wiring (#26), an app-wide Catppuccin theme (#33), and the window tab bar (#27) have merged; the statusbar container rebuild (#28) is the remaining step before the 2d data fields land on it. Spec: [spec-gpui-component-adoption.md](spec-gpui-component-adoption.md)
+Phase 2e (gpui-component UI foundation) is COMPLETE — it built the substrate for the 2d displays: `Root`/theme wiring (#26), an app-wide Catppuccin theme (#33), the window tab bar (#27), and the statusbar container rebuilt on gpui-component primitives with themed slots (#28). The 2d data fields now land on that statusbar. Spec: [archive/spec-gpui-component-adoption.md](archive/spec-gpui-component-adoption.md)
+
+**Parallel track: terminal interaction fixes (dogfooding)**
+
+A batch of pre-SDD terminal/tmux interaction defects surfaced while dogfooding: `capture-pane`-backed scrollback, `Ctrl+=`/`Ctrl+-` font zoom, drag-to-resize pane borders, and a pane-zoom shortcut. These are GUI affordances replacing tmux's rendered interactive layer, not a phase. Spec: [spec-terminal-interaction-fixes.md](spec-terminal-interaction-fixes.md). The spec also adds the missing "tmux control-mode interaction model" decision to [architecture.md](architecture.md).
+
+**Planned: tmux key-table mirroring** — make configured tmux keybindings work in a rift pane (today `send-keys -H` bypasses them). Larger effort, split into its own DRAFT spec: [spec-tmux-keytable-mirroring.md](spec-tmux-keytable-mirroring.md). Not scheduled until the interaction fixes land.
 
 ## What comes after Phase 2d
 
