@@ -460,9 +460,10 @@ impl SessionView {
         }
     }
 
-    /// A draggable seam between two split children. The 5px hit area carries the
-    /// resize cursor and a centered 1px line; mouse-down records the drag so the
-    /// root element's move handler can emit incremental `resize-pane` commands.
+    /// A draggable seam between two split children. The 7px hit area wraps a
+    /// centered 1px line; mouse-down records the drag so the root element's move
+    /// handler can emit incremental `resize-pane` commands. The cursor stays the
+    /// default arrow (no resize cursor).
     fn resize_handle(
         &self,
         horizontal: bool,
@@ -477,12 +478,9 @@ impl SessionView {
         };
         let mut handle = div().flex().items_center().justify_center().flex_none();
         handle = if horizontal {
-            handle
-                .w(px(7.0))
-                .h_full()
-                .cursor(CursorStyle::ResizeLeftRight)
+            handle.w(px(7.0)).h_full()
         } else {
-            handle.h(px(7.0)).w_full().cursor(CursorStyle::ResizeUpDown)
+            handle.h(px(7.0)).w_full()
         };
         handle = handle.child(line);
 
@@ -663,14 +661,9 @@ impl Render for SessionView {
         // While dragging a border, a full-window overlay captures all mouse
         // events (`occlude`) so the underlying pane does not start a text
         // selection, and translates the drag into incremental `resize-pane`.
-        if let Some(drag) = self.border_drag.as_ref() {
+        if self.border_drag.is_some() {
             let cell_width = cell_size.width;
             let cell_height = cell_size.height;
-            let cursor = if drag.horizontal {
-                CursorStyle::ResizeLeftRight
-            } else {
-                CursorStyle::ResizeUpDown
-            };
             root = root.child(
                 div()
                     .absolute()
@@ -678,7 +671,6 @@ impl Render for SessionView {
                     .left_0()
                     .size_full()
                     .occlude()
-                    .cursor(cursor)
                     .on_mouse_move(cx.listener(
                         move |this, event: &MouseMoveEvent, _window, _cx| {
                             let Some(drag) = this.border_drag.as_mut() else {
