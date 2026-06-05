@@ -60,6 +60,24 @@ GPUI has its own async executor. SSH I/O uses Tokio. termy's `TmuxClient` uses b
 
 The two runtimes never share state beyond the channels. The `Term` instance is behind `Arc<Mutex<>>` — locked briefly by the PTY data receiver and by the render loop.
 
+## tmux control-mode interaction model
+
+The decision to drive tmux through control mode (`-CC`) rather than as a normal rendered terminal shapes every terminal interaction feature. It was previously only implicit ("tmux-native" in `vision.md`, "the only documented programmatic interface" in `prior-art.md`); this section records it as a deliberate architecture decision with its alternative and exit.
+
+**The decision and why.** `-CC` delivers *structure as a protocol*: per-pane `%output` byte streams, `%layout-change` geometry, window/pane lifecycle notifications, and flow control. On top of that rift gets native tmux session persistence, multi-client, and remote-over-SSH semantics for free. This structure is the foundation for everything rift is: each pane drives its own `alacritty_terminal::Term`, the split tree is built from tmux coordinates, and per-pane awareness becomes possible. Without a structured stream none of that exists.
+
+**The rejected alternative.** Running real tmux in a single PTY and rendering its TUI natively would inherit copy-mode, configured key bindings, and the status line for free — but rift would see a *single character grid* with no pane structure. It would have to recover pane boundaries by screen-scraping rendered box-drawing characters and parsing the status line: fragile, theme-dependent, and the exact anti-pattern rift forbids for agents, turned on tmux itself. It deletes rift's reason to exist. The tension is fundamental *per tmux attach mode* — one attach gives you the control stream **or** the rendered TUI, never both — which is why rift takes the control stream and re-provides the interactive features as GUI affordances (see `spec-terminal-interaction-fixes.md`).
+
+**The durable contract (consequences for features).**
+
+- `send-keys -t <pane> -H <hex>` injects bytes straight into the pane PTY, bypassing tmux's key tables — so configured keybindings need an explicit mirror (see `spec-tmux-keytable-mirroring.md`).
+- copy-mode/choose-mode are not rendered to control clients — so scrollback is fetched via `capture-pane`, not forwarded.
+- `-CC` exposes a single client size (`refresh-client -C`) — so font zoom is a whole-client resize, not per-pane.
+- pane geometry is tmux-owned — so resize/zoom go through `resize-pane` / `resize-pane -Z`.
+- all input and command emission flows through one narrow seam (today `TmuxClient` via flume channels) so the Phase 3 transport swap (`TmuxClient` → daemon protocol) is a single-seam change.
+
+**Exit criteria.** The single-seam interface keeps the choice reversible. If `-CC` parsing/state ever becomes a maintenance burden (the trigger already named in `prior-art.md`), evaluate the WezTerm-mux RPC protocol as a structured substrate that drops tmux while keeping a protocol — *before* any raw-PTY-from-scratch multiplexer, which would make rift "another tmux replacement" (the thing `vision.md` defines rift against). Do not pre-spend on this.
+
 ## Target architecture (Phase 3+)
 
 ```

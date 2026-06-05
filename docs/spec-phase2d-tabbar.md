@@ -29,7 +29,7 @@ Tab bar for tmux window switching and enriched statusbar with live metadata from
 
 ### Out of scope
 
-- Pane zoom handling (`resize-pane -Z`) — deferred
+- Pane zoom handling (`resize-pane -Z`) — now owned by [spec-terminal-interaction-fixes.md](spec-terminal-interaction-fixes.md)
 - Drag-reorder tabs — tmux owns window order
 - Session switching — single session for now
 - Tab close/create from GUI — use tmux commands in terminal
