@@ -241,6 +241,9 @@ impl SessionView {
                         if !pane_state.current_path.is_empty() {
                             pv.set_working_directory(pane_state.current_path.clone());
                         }
+                        if !pane_state.current_command.is_empty() {
+                            pv.set_current_command(pane_state.current_command.clone());
+                        }
                         pv
                     });
 
@@ -292,6 +295,18 @@ impl SessionView {
                 if let Some(entry) = self.panes.get(&update.pane) {
                     entry.entity.update(cx, |pv, cx| {
                         pv.set_working_directory(update.value);
+                        cx.notify();
+                    });
+                    cx.notify();
+                }
+            }
+            // `rift_pane_command` (`#{pane_current_command}`, scope `%*`): the
+            // foreground command per pane. Same live-driver pattern as the CWD;
+            // the snapshot only seeds it at pane creation.
+            "rift_pane_command" => {
+                if let Some(entry) = self.panes.get(&update.pane) {
+                    entry.entity.update(cx, |pv, cx| {
+                        pv.set_current_command(update.value);
                         cx.notify();
                     });
                     cx.notify();
@@ -404,19 +419,24 @@ impl Render for SessionView {
             let _ = self.size_changed_tx.try_send(window_size);
         }
 
-        let (grid_size, pane_cwd) = self
+        let (grid_size, pane_cwd, pane_command) = self
             .active_pane_id
             .as_ref()
             .and_then(|id| self.panes.get(id))
             .map(|entry| {
                 let pane = entry.entity.read(cx);
-                (pane.grid_size(), pane.working_directory().map(String::from))
+                (
+                    pane.grid_size(),
+                    pane.working_directory().map(String::from),
+                    pane.current_command().map(String::from),
+                )
             })
-            .unwrap_or((TermSize { cols: 0, rows: 0 }, None));
+            .unwrap_or((TermSize { cols: 0, rows: 0 }, None, None));
 
         let cwd = pane_cwd
             .or_else(|| self.working_directory.clone())
             .unwrap_or_default();
+        let command = pane_command.unwrap_or_default();
 
         let size_label = format!("{}x{}", grid_size.cols, grid_size.rows);
 
@@ -468,7 +488,12 @@ impl Render for SessionView {
                     .children((!cwd.is_empty()).then(|| SharedString::from(cwd.clone()))),
             )
             // Right slot: command / git status (Phase 2d fields land here).
-            .child(h_flex().child(SharedString::from(size_label)));
+            .child(
+                h_flex()
+                    .gap(px(16.0))
+                    .children((!command.is_empty()).then(|| SharedString::from(command.clone())))
+                    .child(SharedString::from(size_label)),
+            );
 
         div()
             .flex()
