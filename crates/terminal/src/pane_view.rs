@@ -123,6 +123,12 @@ pub struct PaneView {
     prev_selection: Option<GridSelection>,
     tmux_size: Option<TermSize>,
     content_origin: Point<Pixels>,
+    /// Whole-client render font size, pushed down by `SessionView`. Drives cell
+    /// metrics; the grid auto-detects the change via its paint style key.
+    font_size: Pixels,
+    /// Reports a font-zoom delta (`+1`/`-1`) to `SessionView` when the focused
+    /// pane intercepts a zoom shortcut.
+    font_zoom_tx: flume::Sender<i32>,
 }
 
 impl PaneView {
@@ -132,6 +138,7 @@ impl PaneView {
         input_tx: flume::Sender<PaneInput>,
         size_changed_tx: flume::Sender<TermSize>,
         capture_request_tx: flume::Sender<CaptureRequest>,
+        font_zoom_tx: flume::Sender<i32>,
     ) -> Self {
         let grid_size = TermSize { cols: 80, rows: 24 };
         let config = Config::default();
@@ -255,6 +262,8 @@ impl PaneView {
             prev_selection: None,
             tmux_size: None,
             content_origin: Point::default(),
+            font_size: px(14.0),
+            font_zoom_tx,
         }
     }
 
@@ -280,6 +289,17 @@ impl PaneView {
 
     pub fn set_current_command(&mut self, command: String) {
         self.current_command = Some(command);
+    }
+
+    /// Apply a new whole-client font size. The caller is responsible for
+    /// `cx.notify()`. Cell metrics recompute on the next render; the grid
+    /// repaints fully because its paint style key embeds the font size.
+    pub fn set_font_size(&mut self, size: Pixels) {
+        if size == self.font_size {
+            return;
+        }
+        self.font_size = size;
+        self.paint_cache.clear();
     }
 
     pub fn set_tmux_size(&mut self, cols: u16, rows: u16) {
@@ -793,7 +813,7 @@ fn map_damage(term: &mut Term<Listener>) -> TerminalGridPaintDamage {
 
 impl Render for PaneView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let font_size = px(14.0);
+        let font_size = self.font_size;
         let cell_size = measure_cell_size(window, font_size);
         self.cell_size = cell_size;
 
@@ -993,6 +1013,21 @@ impl Render for PaneView {
                         }
                     }
                     return;
+                }
+
+                // Whole-client font zoom. Ctrl++ (key "+", or "=" on QWERTY where
+                // Ctrl+Shift+= yields "+") zooms in; Ctrl+- zooms out. The delta
+                // goes to `SessionView`, the source of truth for font size.
+                if ks.modifiers.control {
+                    let delta = match ks.key.as_str() {
+                        "+" | "=" => 1,
+                        "-" => -1,
+                        _ => 0,
+                    };
+                    if delta != 0 {
+                        let _ = this.font_zoom_tx.try_send(delta);
+                        return;
+                    }
                 }
 
                 let mode = {

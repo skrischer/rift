@@ -86,7 +86,7 @@ The decision to drive tmux through control mode (`-CC`) rather than as a normal 
 │                              │       │                               │
 │  GPUI frontend               │  SSH  │  Daemon (static musl binary)  │
 │  ├─ Terminal renderer        │◄─────►│  ├─ tmux control mode client  │
-│  ├─ File explorer            │  WS   │  ├─ VTE parser                │
+│  ├─ File explorer            │ russh │  ├─ VTE parser                │
 │  ├─ Context menus            │       │  ├─ File watcher (inotify)    │
 │  └─ Session bar              │       │  ├─ Git status                │
 │                              │       │  └─ Language servers (LSP)    │
@@ -100,7 +100,7 @@ The decision to drive tmux through control mode (`-CC`) rather than as a normal 
 
 Language servers need access to the full project environment — `node_modules`, `target/`, `venv/`, `$GOPATH` — to resolve types and dependencies. These directories are not in git, platform-specific, and often gigabytes in size. Syncing them to the local host would require either mirroring the entire dependency tree (hundreds of MB, platform mismatches) or running a parallel package install locally. Every other remote-capable IDE (VS Code Remote, JetBrains Gateway, Zed) runs LSP on the remote for this reason.
 
-The daemon starts language servers on demand and forwards diagnostics as lightweight JSON over the WebSocket connection. No file sync, no local project copies, no path translation.
+The daemon starts language servers on demand and forwards diagnostics as lightweight JSON over a dedicated `russh` channel (russh already multiplexes channels, so no extra framing layer is needed). No file sync, no local project copies, no path translation.
 
 When the daemon is introduced, VTE parsing may move server-side (daemon sends pre-parsed cell diffs) or remain client-side (daemon forwards raw PTY streams). That decision is deferred.
 
