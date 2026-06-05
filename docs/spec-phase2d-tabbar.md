@@ -34,6 +34,7 @@ Tab bar for tmux window switching and enriched statusbar with live metadata from
 - Session switching — single session for now
 - Tab close/create from GUI — use tmux commands in terminal
 - Adaptive throttling (tmuxy pattern) — add only if performance requires it
+- Mirroring the user's tmux status-line config (`status-left/right/style`) — the native statusbar is the source of truth and deliberately does **not** render the `.tmux.conf` status line. Honoring that config is its own opt-in mode: [spec-tmux-statusline-mirroring.md](spec-tmux-statusline-mirroring.md). The fields here are rift-native, fed from tmux *data* (subscriptions), not from tmux's status format strings.
 
 ## Constraints
 
