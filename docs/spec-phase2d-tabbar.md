@@ -88,3 +88,5 @@ Decisions made during implementation:
 
 - 2026-05-21: Spec created from Phase 2d section of control-mode-roadmap.md. tmux protocol reference extracted to tmux-reference.md.
 - 2026-05-21: Steps 2 (tab bar rendering) and 3 (click-to-switch) already implemented in prior commits (33fea26, 8ca4b0b). Status updated to IN PROGRESS.
+- 2026-06-05: Step 1 (subscription infrastructure, #15) landed: `refresh-client -B` registrations in `main.rs` route `%subscription-changed` through a `flume` channel into `SessionView` (infra + logging only; display deferred to later steps).
+- 2026-06-05: Step 4 (CWD from subscriptions, #17) landed: `rift_pane_path` (`#{pane_current_path}`, scope `%*`) drives per-pane CWD live via `apply_subscription`. Snapshot reduced to seeding initial CWD at pane creation only; the tmux 3.4+ hard requirement makes the snapshot live-fallback redundant.
