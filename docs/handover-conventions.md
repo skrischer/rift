@@ -2,6 +2,8 @@
 
 Rules for the exchange between **planning** and **implementation**. Both happen in Claude Code — the split is by *session intent*, not by tool. A planning session writes specs and decomposes work into issues; an implementation session writes code against a `READY` spec. The discipline below is what keeps the two honest.
 
+> This file is the rulebook (the *why* and *what*). For the concrete step sequence of one cycle — commands, merge loop, cleanup, and known pitfalls — see the operational runbook: [planning-workflow.md](planning-workflow.md).
+
 ## The chain: design-doc -> issue -> PR
 
 Every piece of implementation progress traces through three layers, each owning exactly one thing. No layer duplicates another.
