@@ -6,7 +6,8 @@ use anyhow::{Context as _, Result};
 use gpui::*;
 use gpui_component::{Root, Theme, ThemeMode, ThemeRegistry};
 use rift_terminal::{
-    CaptureRequest, CaptureResult, PaneInput, PaneOutput, SessionView, SubscriptionUpdate, TermSize,
+    CaptureRequest, CaptureResult, ConnectionStatus, PaneInput, PaneOutput, SessionView,
+    SubscriptionUpdate, TermSize,
 };
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -51,6 +52,7 @@ struct PtyChannels {
     subscription_tx: flume::Sender<SubscriptionUpdate>,
     capture_request_rx: flume::Receiver<CaptureRequest>,
     capture_result_tx: flume::Sender<CaptureResult>,
+    connection_status_tx: flume::Sender<ConnectionStatus>,
 }
 
 fn main() {
@@ -101,6 +103,11 @@ fn main() {
                             }),
                     };
 
+                    // Kept outside `channels` so the session thread can flip the
+                    // indicator to Disconnected once `run_ssh_session` returns
+                    // (the in-session clone reports Connected).
+                    let status_tx = handle.connection_status_tx.clone();
+
                     let channels = PtyChannels {
                         pane_output_tx: handle.pane_output_tx,
                         input_rx: handle.input_rx,
@@ -110,6 +117,7 @@ fn main() {
                         subscription_tx: handle.subscription_tx,
                         capture_request_rx: handle.capture_request_rx,
                         capture_result_tx: handle.capture_result_tx,
+                        connection_status_tx: handle.connection_status_tx,
                     };
 
                     let key_exists = ssh.key.exists();
@@ -136,6 +144,7 @@ fn main() {
                                     "SSH session failed"
                                 );
                             }
+                            let _ = status_tx.send(ConnectionStatus::Disconnected);
                         });
                     });
 
@@ -206,6 +215,7 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
     }
 
     info!("tmux control mode connected");
+    let _ = ch.connection_status_tx.send(ConnectionStatus::Connected);
 
     let pane_output_tx = ch.pane_output_tx;
     let input_rx = ch.input_rx;
