@@ -19,7 +19,7 @@ use tracing::{debug, error};
 use crate::colors;
 use crate::error::TerminalError;
 use crate::keyboard;
-use crate::{PaneInput, TermSize};
+use crate::{CaptureRequest, PaneInput, TermSize};
 
 pub fn statusbar_height() -> Pixels {
     px(28.0)
@@ -92,6 +92,22 @@ pub struct PaneView {
     terminal: Arc<Mutex<Term<Listener>>>,
     input_tx: flume::Sender<PaneInput>,
     size_changed_tx: flume::Sender<TermSize>,
+    capture_request_tx: flume::Sender<CaptureRequest>,
+    /// Parsed pre-attach history rendered as a static block above the live
+    /// `Term`'s own scrollback. Captured once on the first scroll past the top
+    /// of the live scrollback; invalidated (and re-fetched) only on resize.
+    history_block: Option<Vec<Vec<CellRenderInfo>>>,
+    /// How many rows of the pre-attach block are scrolled into view above the
+    /// live region. `> 0` implies the live `Term` is pinned fully scrolled up.
+    history_scroll: usize,
+    /// A capture is in flight; suppress duplicate requests.
+    history_pending: bool,
+    /// The scroll-up remainder that triggered the in-flight capture, applied to
+    /// `history_scroll` once the block arrives so the gesture is not lost.
+    history_pending_scroll: usize,
+    /// `cols` at capture time; the block is sized to this width and goes stale
+    /// when the grid width changes.
+    history_capture_cols: usize,
     focus_handle: FocusHandle,
     cell_size: Size<Pixels>,
     grid_size: TermSize,
@@ -114,6 +130,7 @@ impl PaneView {
         pty_rx: flume::Receiver<Vec<u8>>,
         input_tx: flume::Sender<PaneInput>,
         size_changed_tx: flume::Sender<TermSize>,
+        capture_request_tx: flume::Sender<CaptureRequest>,
     ) -> Self {
         let grid_size = TermSize { cols: 80, rows: 24 };
         let config = Config::default();
@@ -216,6 +233,12 @@ impl PaneView {
             terminal,
             input_tx,
             size_changed_tx,
+            capture_request_tx,
+            history_block: None,
+            history_scroll: 0,
+            history_pending: false,
+            history_pending_scroll: 0,
+            history_capture_cols: 0,
             focus_handle: cx.focus_handle(),
             cell_size: size(px(0.0), px(0.0)),
             grid_size,
@@ -257,10 +280,128 @@ impl PaneView {
         self.tmux_size = Some(new_size);
         if new_size != self.grid_size {
             self.grid_size = new_size;
-            let mut term = self.terminal.lock().expect("term lock poisoned");
-            term.resize(new_size);
+            {
+                let mut term = self.terminal.lock().expect("term lock poisoned");
+                term.resize(new_size);
+            }
             self.paint_cache.clear();
+            self.invalidate_history();
         }
+    }
+
+    /// Drop the parsed pre-attach block and reset scroll into it. The block was
+    /// sized to the previous `cols`/history boundary; a resize reflows tmux's
+    /// history, so it must be re-captured on the next scroll past the top.
+    fn invalidate_history(&mut self) {
+        self.history_block = None;
+        self.history_scroll = 0;
+        self.history_pending = false;
+        self.history_pending_scroll = 0;
+    }
+
+    /// Composite scroll across the live `Term`'s own scrollback (post-attach) and
+    /// the static pre-attach block above it. Positive `delta` scrolls up.
+    fn handle_scroll(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if delta == 0 {
+            return;
+        }
+        let (history_size, display_offset, alt_screen) = {
+            let term = self.terminal.lock().expect("term lock poisoned");
+            (
+                term.grid().history_size(),
+                term.grid().display_offset(),
+                term.mode().contains(TermMode::ALT_SCREEN),
+            )
+        };
+
+        if delta > 0 {
+            let delta = delta as usize;
+            let room_in_live = history_size.saturating_sub(display_offset);
+            let live_step = room_in_live.min(delta);
+            if live_step > 0 {
+                let mut term = self.terminal.lock().expect("term lock poisoned");
+                term.scroll_display(alacritty_terminal::grid::Scroll::Delta(live_step as i32));
+            }
+            let remainder = delta - live_step;
+            // No pre-attach history while the live `Term` is on the alternate
+            // screen (vim/less/htop): capture would return alt-screen content,
+            // not history. This matches native terminals.
+            if remainder > 0 && !alt_screen {
+                match self.history_block.as_ref().map(Vec::len) {
+                    Some(block_rows) => {
+                        self.history_scroll = (self.history_scroll + remainder).min(block_rows);
+                    }
+                    None => self.request_history(history_size, remainder),
+                }
+            }
+        } else {
+            let down = (-delta) as usize;
+            let from_history = down.min(self.history_scroll);
+            self.history_scroll -= from_history;
+            let live_down = down - from_history;
+            if live_down > 0 {
+                let mut term = self.terminal.lock().expect("term lock poisoned");
+                term.scroll_display(alacritty_terminal::grid::Scroll::Delta(-(live_down as i32)));
+            }
+        }
+
+        // The history composite repaints the whole viewport; drop the cached row
+        // ops so a stale frame is never reused across a scroll.
+        self.paint_cache.clear();
+        cx.notify();
+    }
+
+    /// Ask the SSH thread for the pre-attach history: everything above the lines
+    /// the live `Term` already holds. tmux line `-(history_size + 1)` is the
+    /// newest pre-attach line; `-` is the oldest. `-J` is off so captured lines
+    /// map 1:1 to grid rows.
+    fn request_history(&mut self, history_size: usize, remainder: usize) {
+        if self.history_pending || self.pane_id.is_empty() {
+            return;
+        }
+        let end_row = format!("-{}", history_size + 1);
+        if self
+            .capture_request_tx
+            .try_send(CaptureRequest {
+                pane_id: self.pane_id.clone(),
+                start_row: "-".to_string(),
+                end_row,
+                join_wraps: false,
+            })
+            .is_ok()
+        {
+            self.history_pending = true;
+            self.history_pending_scroll = remainder;
+            self.history_capture_cols = self.grid_size.cols;
+        }
+    }
+
+    /// Receive a captured pre-attach payload. An empty payload (capture error or
+    /// no pre-attach history) just clears the in-flight flag so scrolling never
+    /// wedges and a later attempt can retry. The VTE replay is CPU-bound, so it
+    /// runs off the UI thread (`smol::unblock`) like the live PTY parse loop.
+    pub fn apply_history(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        self.history_pending = false;
+        if bytes.is_empty() {
+            return;
+        }
+        let cols = self.history_capture_cols.max(1);
+        let pending_scroll = self.history_pending_scroll;
+        cx.spawn(async move |this, cx| {
+            let rows = smol::unblock(move || parse_capture_to_rows(&bytes, cols)).await;
+            if rows.is_empty() {
+                return;
+            }
+            let _ = cx.update(|cx| {
+                this.update(cx, |view, cx| {
+                    view.history_scroll = pending_scroll.min(rows.len());
+                    view.history_block = Some(rows);
+                    view.paint_cache.clear();
+                    cx.notify();
+                })
+            });
+        })
+        .detach();
     }
 
     fn send_input(&self, bytes: Vec<u8>) {
@@ -569,6 +710,45 @@ fn extract_row_cells(
     cells
 }
 
+/// Parse a `capture-pane` payload (`-J` off, `-e` on) into styled rows by
+/// replaying it through a scratch `Term`. The scratch screen is sized to the
+/// logical line count with generous scrollback, so any line that still wraps
+/// (e.g. a capture taken at a wider width before a resize invalidates it) lands
+/// in the scratch history rather than being lost — the real produced row count
+/// is then read back from the grid, not assumed from the requested range or the
+/// `\n` count (which would silently drop wrapped history).
+fn parse_capture_to_rows(payload: &[u8], cols: usize) -> Vec<Vec<CellRenderInfo>> {
+    if payload.is_empty() || cols == 0 {
+        return Vec::new();
+    }
+
+    let line_count = payload.iter().filter(|byte| **byte == b'\n').count() + 1;
+    let size = TermSize {
+        cols,
+        rows: line_count.max(1),
+    };
+    let config = Config {
+        scrolling_history: line_count + cols,
+        ..Config::default()
+    };
+    let (event_tx, _event_rx) = flume::unbounded();
+    let listener = Listener { event_tx };
+    let mut term = Term::new(config, &size, listener);
+    let mut parser: Processor = Processor::new();
+    parser.advance(&mut term, payload);
+
+    let grid = term.grid();
+    let hist = grid.history_size();
+    let last_line = grid.cursor.point.line.0.max(0) as usize;
+    // Render row `r` maps to grid line `r - hist`, so row 0 is the oldest
+    // scrollback line and the final content line is at `hist + last_line`.
+    let total = hist + last_line + 1;
+
+    (0..total)
+        .map(|row| extract_row_cells(&term, row, hist, None))
+        .collect()
+}
+
 fn map_damage(term: &mut Term<Listener>) -> TerminalGridPaintDamage {
     let display_offset = term.grid().display_offset();
     let damage = match term.damage() {
@@ -633,6 +813,13 @@ impl Render for PaneView {
                 let _ = self.size_changed_tx.try_send(new_size);
             }
             self.paint_cache.clear();
+            // Reflow stales the pre-attach block (sized to the old width); drop it
+            // so the next top-scroll re-captures. Inlined rather than calling
+            // `invalidate_history` because the `term` lock guard is still alive.
+            self.history_block = None;
+            self.history_scroll = 0;
+            self.history_pending = false;
+            self.history_pending_scroll = 0;
         }
 
         let damage_start = std::time::Instant::now();
@@ -659,6 +846,7 @@ impl Render for PaneView {
         };
         let show_cursor = is_focused
             && cursor_shape != CursorShape::Hidden
+            && self.history_scroll == 0
             && (self.cursor_blink_visible || !cursor_style.blinking);
         let mouse_now = mode.intersects(
             TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION,
@@ -670,10 +858,40 @@ impl Render for PaneView {
 
         let display_offset = term.grid().display_offset();
 
+        // When scrolled into the pre-attach block, its bottom `history_rows` rows
+        // occupy the top of the viewport and the live `Term` (pinned fully
+        // scrolled up) fills the rest. `history_scroll == 0` is the unchanged
+        // pure-live path.
+        let history_rows = self
+            .history_block
+            .as_ref()
+            .map_or(0, |block| self.history_scroll.min(block.len()))
+            .min(new_size.rows);
+
         let mut grid_rows: Vec<Arc<Vec<CellRenderInfo>>> = Vec::with_capacity(new_size.rows);
-        for row_idx in 0..new_size.rows {
-            let row_cells =
-                extract_row_cells(&term, row_idx, display_offset, self.selection.as_ref());
+        if let (true, Some(block)) = (history_rows > 0, self.history_block.as_ref()) {
+            let first = block.len() - self.history_scroll.min(block.len());
+            for (row_idx, block_row) in block[first..first + history_rows].iter().enumerate() {
+                let mut cells = block_row.clone();
+                for cell in &mut cells {
+                    cell.row = row_idx;
+                }
+                grid_rows.push(Arc::new(cells));
+            }
+        }
+        for row_idx in history_rows..new_size.rows {
+            let mut row_cells = extract_row_cells(
+                &term,
+                row_idx - history_rows,
+                display_offset,
+                self.selection.as_ref(),
+            );
+            // Live rows render after the history block, so shift their grid-relative
+            // index to the viewport row they actually occupy (a no-op when
+            // `history_rows == 0`).
+            for cell in &mut row_cells {
+                cell.row = row_idx;
+            }
             grid_rows.push(Arc::new(row_cells));
         }
 
@@ -779,6 +997,9 @@ impl Render for PaneView {
                             term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
                         }
                     }
+                    // Typing snaps back to the live bottom, leaving the pre-attach
+                    // block too.
+                    this.history_scroll = 0;
                     this.selection = None;
                     this.cursor_blink_visible = true;
                     this.send_input(bytes);
@@ -1013,9 +1234,7 @@ impl Render for PaneView {
                         }
                     };
                     if delta != 0 {
-                        let mut term = this.terminal.lock().expect("term lock poisoned");
-                        term.scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
-                        cx.notify();
+                        this.handle_scroll(delta, cx);
                     }
                 }
             }))
@@ -1027,6 +1246,39 @@ impl Render for PaneView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row_text(row: &[CellRenderInfo]) -> String {
+        row.iter().map(|cell| cell.char).collect::<String>()
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_parse_capture_empty_payload_yields_no_rows() {
+        assert!(parse_capture_to_rows(b"", 80).is_empty());
+        assert!(parse_capture_to_rows(b"abc", 0).is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_parse_capture_maps_each_line_to_one_row() {
+        let rows = parse_capture_to_rows(b"ab\r\ncd", 4);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_text(&rows[0]).trim_end(), "ab");
+        assert_eq!(row_text(&rows[1]).trim_end(), "cd");
+        // Each row is padded to the capture width.
+        assert_eq!(rows[0].len(), 4);
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_parse_capture_wrapped_line_expands_to_multiple_rows() {
+        // A line longer than `cols` wraps into several grid rows. Sizing by the
+        // real (wrapped) row count rather than the `\n` count is what keeps the
+        // upper history from being silently dropped (the discarded first seam's
+        // latent bug).
+        let rows = parse_capture_to_rows(b"abcde\r\nfg", 3);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(row_text(&rows[0]).trim_end(), "abc");
+        assert_eq!(row_text(&rows[1]).trim_end(), "de");
+        assert_eq!(row_text(&rows[2]).trim_end(), "fg");
+    }
 
     #[::core::prelude::v1::test]
     fn test_grid_selection_contains_single_row() {
