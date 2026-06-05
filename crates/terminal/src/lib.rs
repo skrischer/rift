@@ -52,6 +52,18 @@ pub struct SubscriptionUpdate {
     pub value: String,
 }
 
+/// The SSH/tmux session lifecycle state, surfaced by the statusbar connection
+/// indicator. Driven by the SSH session thread (not polled): `Connected` once
+/// tmux control mode is up, `Disconnected` when the session ends. `Reconnecting`
+/// is reserved for a future auto-retry driver and is not yet emitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionStatus {
+    Connecting,
+    Connected,
+    Reconnecting,
+    Disconnected,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TermSize {
     pub cols: usize,
