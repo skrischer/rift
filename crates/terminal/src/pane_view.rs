@@ -116,6 +116,7 @@ pub struct PaneView {
     cursor_blink_visible: bool,
     paint_cache: TerminalGridPaintCacheHandle,
     working_directory: Option<String>,
+    current_command: Option<String>,
     command_lifecycle: CommandLifecycle,
     mouse_mode_active: bool,
     hovered_link: Option<HoveredLink>,
@@ -247,6 +248,7 @@ impl PaneView {
             cursor_blink_visible: true,
             paint_cache: TerminalGridPaintCacheHandle::default(),
             working_directory: None,
+            current_command: None,
             command_lifecycle: CommandLifecycle::default(),
             mouse_mode_active: false,
             hovered_link: None,
@@ -270,6 +272,14 @@ impl PaneView {
 
     pub fn set_working_directory(&mut self, path: String) {
         self.working_directory = Some(path);
+    }
+
+    pub fn current_command(&self) -> Option<&str> {
+        self.current_command.as_deref()
+    }
+
+    pub fn set_current_command(&mut self, command: String) {
+        self.current_command = Some(command);
     }
 
     pub fn set_tmux_size(&mut self, cols: u16, rows: u16) {
