@@ -100,21 +100,20 @@ impl SessionView {
         }
 
         {
-            // Phase 2d infra: format-subscription updates stream pane/window
-            // state changes (cd, command, rename) end-to-end into the view layer.
-            // This step only logs them; live display wiring lands in #17/#18/#19.
-            cx.spawn(async move |_this, _cx| loop {
+            // Phase 2d: format-subscription updates stream pane/window state
+            // changes (cd, command, rename) end-to-end into the view layer.
+            cx.spawn(async move |this, cx| loop {
                 let Ok(update) = subscription_rx.recv_async().await else {
                     break;
                 };
-                debug!(
-                    name = %update.name,
-                    session = %update.session,
-                    window = %update.window,
-                    pane = %update.pane,
-                    value = %update.value,
-                    "tmux subscription update"
-                );
+                let result = cx.update(|cx| {
+                    this.update(cx, |view, cx| {
+                        view.apply_subscription(update, cx);
+                    })
+                });
+                if result.is_err() {
+                    break;
+                }
             })
             .detach();
         }
@@ -188,9 +187,8 @@ impl SessionView {
                     if let Some(entry) = self.panes.get(&pane_state.id) {
                         entry.entity.update(cx, |pv, cx| {
                             pv.set_tmux_size(pane_state.width, pane_state.height);
-                            if !pane_state.current_path.is_empty() {
-                                pv.set_working_directory(pane_state.current_path.clone());
-                            }
+                            // CWD is subscription-driven (rift_pane_path); the
+                            // snapshot seeds it only at pane creation below.
                             cx.notify();
                         });
                     }
@@ -247,6 +245,26 @@ impl SessionView {
             .map(|w| layout::build_layout(&w.panes));
 
         cx.notify();
+    }
+
+    fn apply_subscription(&mut self, update: SubscriptionUpdate, cx: &mut Context<Self>) {
+        match update.name.as_str() {
+            // `rift_pane_path` (`#{pane_current_path}`, scope `%*`): live CWD per
+            // pane. Drives the statusbar within ~1s of `cd`; the snapshot only
+            // seeds initial state at pane creation.
+            "rift_pane_path" => {
+                if let Some(entry) = self.panes.get(&update.pane) {
+                    entry.entity.update(cx, |pv, cx| {
+                        pv.set_working_directory(update.value);
+                        cx.notify();
+                    });
+                    cx.notify();
+                }
+            }
+            other => {
+                debug!(name = %other, "unhandled tmux subscription");
+            }
+        }
     }
 
     fn render_layout(&self, node: &LayoutNode, border_color: Hsla) -> AnyElement {
