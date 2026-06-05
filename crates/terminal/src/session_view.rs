@@ -8,7 +8,7 @@ use tracing::debug;
 
 use crate::layout::{self, LayoutNode};
 use crate::pane_view::{measure_cell_size, statusbar_height, PaneView};
-use crate::{PaneInput, PaneOutput, TermSize};
+use crate::{PaneInput, PaneOutput, SubscriptionUpdate, TermSize};
 
 pub struct TerminalHandle {
     pub pane_output_tx: flume::Sender<PaneOutput>,
@@ -16,6 +16,7 @@ pub struct TerminalHandle {
     pub size_changed_rx: flume::Receiver<TermSize>,
     pub snapshot_tx: flume::Sender<TmuxSnapshot>,
     pub tmux_command_rx: flume::Receiver<String>,
+    pub subscription_tx: flume::Sender<SubscriptionUpdate>,
 }
 
 struct PaneEntry {
@@ -55,6 +56,7 @@ impl SessionView {
         let (size_changed_tx, size_changed_rx) = flume::unbounded();
         let (snapshot_tx, snapshot_rx) = flume::unbounded::<TmuxSnapshot>();
         let (tmux_command_tx, tmux_command_rx) = flume::unbounded::<String>();
+        let (subscription_tx, subscription_rx) = flume::unbounded::<SubscriptionUpdate>();
 
         {
             cx.spawn(async move |this, cx| loop {
@@ -97,6 +99,26 @@ impl SessionView {
             .detach();
         }
 
+        {
+            // Phase 2d infra: format-subscription updates stream pane/window
+            // state changes (cd, command, rename) end-to-end into the view layer.
+            // This step only logs them; live display wiring lands in #17/#18/#19.
+            cx.spawn(async move |_this, _cx| loop {
+                let Ok(update) = subscription_rx.recv_async().await else {
+                    break;
+                };
+                debug!(
+                    name = %update.name,
+                    session = %update.session,
+                    window = %update.window,
+                    pane = %update.pane,
+                    value = %update.value,
+                    "tmux subscription update"
+                );
+            })
+            .detach();
+        }
+
         let ssh_user = std::env::var("RIFT_SSH_USER").unwrap_or_default();
         let ssh_host = std::env::var("RIFT_SSH_HOST").unwrap_or_else(|_| "localhost".into());
         let ssh_label: SharedString = if ssh_user.is_empty() {
@@ -127,6 +149,7 @@ impl SessionView {
             size_changed_rx,
             snapshot_tx,
             tmux_command_rx,
+            subscription_tx,
         };
 
         (view, handle)
