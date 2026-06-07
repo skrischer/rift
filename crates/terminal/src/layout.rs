@@ -44,6 +44,17 @@ pub fn build_layout(panes: &[TmuxPaneState]) -> LayoutNode {
     LayoutNode::Pane(panes[0].id.clone())
 }
 
+/// First non-empty pane id in a subtree, used as the resize target for the
+/// border on that side of a split.
+pub fn first_pane_id(node: &LayoutNode) -> Option<&str> {
+    match node {
+        LayoutNode::Pane(id) => (!id.is_empty()).then_some(id.as_str()),
+        LayoutNode::Split { children, .. } => {
+            children.iter().find_map(|(_, child)| first_pane_id(child))
+        }
+    }
+}
+
 fn partition_by_left(panes: &[TmuxPaneState]) -> Option<Vec<Vec<TmuxPaneState>>> {
     let mut sorted: Vec<_> = panes.to_vec();
     sorted.sort_by_key(|p| p.left);
@@ -214,5 +225,25 @@ mod tests {
     #[test]
     fn test_build_layout_empty() {
         assert_eq!(build_layout(&[]), LayoutNode::Pane(String::new()));
+    }
+
+    #[test]
+    fn test_first_pane_id_single() {
+        assert_eq!(first_pane_id(&LayoutNode::Pane("%3".into())), Some("%3"));
+    }
+
+    #[test]
+    fn test_first_pane_id_empty_pane_is_none() {
+        assert_eq!(first_pane_id(&LayoutNode::Pane(String::new())), None);
+    }
+
+    #[test]
+    fn test_first_pane_id_nested_returns_leftmost() {
+        let panes = vec![
+            pane("%0", 0, 0, 65, 20),
+            pane("%1", 66, 0, 64, 20),
+            pane("%2", 0, 21, 130, 19),
+        ];
+        assert_eq!(first_pane_id(&build_layout(&panes)), Some("%0"));
     }
 }
