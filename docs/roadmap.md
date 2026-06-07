@@ -24,9 +24,13 @@ Spec: [spec-phase2d-tabbar.md](spec-phase2d-tabbar.md)
 
 Phase 2e (gpui-component UI foundation) is COMPLETE — it built the substrate for the 2d displays: `Root`/theme wiring (#26), an app-wide Catppuccin theme (#33), the window tab bar (#27), and the statusbar container rebuilt on gpui-component primitives with themed slots (#28). The 2d data fields now land on that statusbar. Spec: [archive/spec-gpui-component-adoption.md](archive/spec-gpui-component-adoption.md)
 
-**Parallel track: terminal interaction fixes (dogfooding)**
+**Completed track: terminal interaction fixes (dogfooding)**
 
-A batch of pre-SDD terminal/tmux interaction defects surfaced while dogfooding: `capture-pane`-backed scrollback, `Ctrl+=`/`Ctrl+-` font zoom, drag-to-resize pane borders, and a pane-zoom shortcut. These are GUI affordances replacing tmux's rendered interactive layer, not a phase. Spec: [spec-terminal-interaction-fixes.md](spec-terminal-interaction-fixes.md). The spec also adds the missing "tmux control-mode interaction model" decision to [architecture.md](architecture.md).
+A batch of pre-SDD terminal/tmux interaction defects surfaced while dogfooding: `capture-pane`-backed scrollback (#39), `Ctrl+=`/`Ctrl+-` font zoom (#40), and drag-to-resize pane borders (#41) — GUI affordances replacing tmux's rendered interactive layer. COMPLETED 2026-06-07; the fourth outcome (pane zoom, #42) was dropped before implementation and the work moved to the pane/window-management track below. Spec: [archive/spec-terminal-interaction-fixes.md](archive/spec-terminal-interaction-fixes.md). It also added the "tmux control-mode interaction model" decision to [architecture.md](architecture.md).
+
+**Active track: pane & window management (dogfooding)**
+
+Mouse-driven tmux pane/window lifecycle in the GPU UI: closing a pane via `exit` no longer quits the app (#68), the tab bar gains `+`/`x` to create and close windows (#69), a left sidebar lists and manages the active window's panes — focus, close, split (#70), and double-clicking a tab renames the window (#71). Spec: [spec-pane-window-management.md](spec-pane-window-management.md). Milestone: [Pane & window management](https://github.com/skrischer/rift/milestone/5).
 
 **Planned: tmux key-table mirroring** — make configured tmux keybindings work in a rift pane (today `send-keys -H` bypasses them). Larger effort, split into its own DRAFT spec: [spec-tmux-keytable-mirroring.md](spec-tmux-keytable-mirroring.md). Not scheduled until the interaction fixes land.
 
