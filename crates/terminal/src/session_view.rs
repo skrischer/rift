@@ -8,7 +8,10 @@ use tracing::debug;
 
 use crate::layout::{self, LayoutNode};
 use crate::pane_view::{measure_cell_size, statusbar_height, PaneView};
-use crate::{CaptureRequest, CaptureResult, PaneInput, PaneOutput, SubscriptionUpdate, TermSize};
+use crate::{
+    CaptureRequest, CaptureResult, ConnectionStatus, PaneInput, PaneOutput, SubscriptionUpdate,
+    TermSize,
+};
 
 const DEFAULT_FONT_SIZE: f32 = 14.0;
 const MIN_FONT_SIZE: f32 = 8.0;
@@ -24,6 +27,7 @@ pub struct TerminalHandle {
     pub subscription_tx: flume::Sender<SubscriptionUpdate>,
     pub capture_request_rx: flume::Receiver<CaptureRequest>,
     pub capture_result_tx: flume::Sender<CaptureResult>,
+    pub connection_status_tx: flume::Sender<ConnectionStatus>,
 }
 
 struct PaneEntry {
@@ -80,6 +84,7 @@ pub struct SessionView {
     ssh_label: SharedString,
     session_name: SharedString,
     working_directory: Option<String>,
+    connection_status: ConnectionStatus,
 }
 
 impl SessionView {
@@ -92,6 +97,7 @@ impl SessionView {
         let (subscription_tx, subscription_rx) = flume::unbounded::<SubscriptionUpdate>();
         let (capture_request_tx, capture_request_rx) = flume::unbounded::<CaptureRequest>();
         let (capture_result_tx, capture_result_rx) = flume::unbounded::<CaptureResult>();
+        let (connection_status_tx, connection_status_rx) = flume::unbounded::<ConnectionStatus>();
         let (font_zoom_tx, font_zoom_rx) = flume::unbounded::<i32>();
 
         {
@@ -176,6 +182,28 @@ impl SessionView {
         }
 
         {
+            // SSH/tmux lifecycle drives the statusbar connection indicator
+            // (event-driven, never polled).
+            cx.spawn(async move |this, cx| loop {
+                let Ok(status) = connection_status_rx.recv_async().await else {
+                    break;
+                };
+                let result = cx.update(|cx| {
+                    this.update(cx, |view, cx| {
+                        if view.connection_status != status {
+                            view.connection_status = status;
+                            cx.notify();
+                        }
+                    })
+                });
+                if result.is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
+
+        {
             cx.spawn(async move |this, cx| loop {
                 let Ok(delta) = font_zoom_rx.recv_async().await else {
                     break;
@@ -219,6 +247,7 @@ impl SessionView {
             ssh_label,
             session_name: SharedString::default(),
             working_directory: None,
+            connection_status: ConnectionStatus::Connecting,
         };
 
         let handle = TerminalHandle {
@@ -230,6 +259,7 @@ impl SessionView {
             subscription_tx,
             capture_request_rx,
             capture_result_tx,
+            connection_status_tx,
         };
 
         (view, handle)
@@ -589,6 +619,15 @@ impl Render for SessionView {
 
         let size_label = format!("{}x{}", grid_size.cols, grid_size.rows);
 
+        // Connection indicator: Catppuccin Mocha semantic colors (not in the
+        // gpui-component theme tokens), driven by the SSH lifecycle channel.
+        let (status_label, status_color) = match self.connection_status {
+            ConnectionStatus::Connecting => ("connecting", rgb(0xf9e2af)),
+            ConnectionStatus::Connected => ("connected", rgb(0xa6e3a1)),
+            ConnectionStatus::Reconnecting => ("reconnecting", rgb(0xfab387)),
+            ConnectionStatus::Disconnected => ("disconnected", rgb(0xf38ba8)),
+        };
+
         let selected_index = self.windows.iter().position(|w| w.is_active).unwrap_or(0);
         let window_ids: Vec<String> = self.windows.iter().map(|w| w.id.clone()).collect();
         let tab_labels: Vec<SharedString> = self
@@ -636,6 +675,12 @@ impl Render for SessionView {
             .child(
                 h_flex()
                     .gap(px(16.0))
+                    .child(
+                        h_flex()
+                            .gap(px(6.0))
+                            .child(div().size(px(8.0)).rounded_full().bg(status_color))
+                            .child(SharedString::from(status_label)),
+                    )
                     .children((!self.session_name.is_empty()).then(|| self.session_name.clone()))
                     .child(self.ssh_label.clone())
                     .children((!cwd.is_empty()).then(|| SharedString::from(cwd.clone()))),
