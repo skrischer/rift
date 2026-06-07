@@ -32,6 +32,8 @@ A batch of pre-SDD terminal/tmux interaction defects surfaced while dogfooding: 
 
 **Planned: tmux status-line mirroring** — under `tmux -CC` the user's `status-left/right/style` config is queryable but never rendered, so it is currently ignored. An opt-in mode would mirror it in the native statusbar via a tmux format-string interpreter. Own DRAFT spec: [spec-tmux-statusline-mirroring.md](spec-tmux-statusline-mirroring.md). Sibling to key-table mirroring (both surface a hidden tmux config primitive); the Phase 2d native statusbar stays the default.
 
+**Meta track: implementation workflow automation** — automate the issue → merged cycle that emerged across the Phase 2d work: a `just pr-merge` recipe (remote-only merge + cleanup), a CI job that finally compiles `rift-app`, board status transitions baked into the worktree/merge recipes, an interactive tmux reviewer pane, and a `/implement` skill tying it together. Tooling/DX, not a product phase. Spec: [spec-workflow-automation.md](spec-workflow-automation.md).
+
 ## What comes after Phase 2d
 
 **Phase 3: Remote daemon** — the major architectural shift. Splits the monolithic app into a GPUI frontend + a remote daemon connected over a dedicated `russh` channel (no WebSocket — `russh` already multiplexes channels). The daemon handles file watching (inotify), git status, and language servers (LSP) on the remote host. The frontend becomes a thin rendering client.
