@@ -1,8 +1,8 @@
 # Spec: Terminal interaction fixes (dogfooding)
 
-> Status: READY
+> Status: COMPLETED
 > Created: 2026-06-04
-> Completed: —
+> Completed: 2026-06-07
 
 Closes a batch of terminal/tmux interaction defects found during dogfooding: scrollback that desyncs from a native client, no font zoom, no inter-pane resize, no pane zoom. These predate the SDD process; this spec gives them a design anchor. The largest related concern — mirroring tmux's full key-table so configured keybindings work — is intentionally split into its own spec (see Pending document updates).
 
@@ -21,10 +21,10 @@ All four Outcomes below fall into category 1.
 
 What is true when this work is done:
 
-- [ ] Scrolling a pane shows the pane's real tmux scrollback history (fetched via `capture-pane`), not only the lines streamed since attach
-- [ ] `Ctrl+=` / `Ctrl+-` change the rendered font size; the resulting cols/rows are forwarded to tmux via `set_client_size`, and tmux reflows all panes (whole-client zoom)
-- [ ] Dragging the border between two panes resizes them in tmux (`resize-pane`); the layout updates from the next snapshot
-- [ ] A rift-native shortcut toggles pane zoom (`resize-pane -Z`); the zoomed pane fills the window and the snapshot-driven layout follows
+- [x] Scrolling a pane shows the pane's real tmux scrollback history (fetched via `capture-pane`), not only the lines streamed since attach
+- [x] `Ctrl+=` / `Ctrl+-` change the rendered font size; the resulting cols/rows are forwarded to tmux via `set_client_size`, and tmux reflows all panes (whole-client zoom)
+- [x] Dragging the border between two panes resizes them in tmux (`resize-pane`); the layout updates from the next snapshot
+- Pane zoom (`resize-pane -Z`) — **SUPERSEDED 2026-06-07**: dropped before implementation; no value for the current workflow, the screen space goes to direct pane manipulation instead. Moved to `spec-pane-window-management.md`. (was Outcome 4; issue #42 closed as replaced)
 
 ## Scope
 
@@ -105,12 +105,12 @@ Each issue references this spec path in its body. A PR may only merge if it clos
 
 ## Verification
 
-- [ ] `cargo clippy --workspace -- -D warnings` passes
-- [ ] `cargo test --workspace` passes
-- [ ] Scrolling up in a pane reveals pre-attach history identical to `tmux capture-pane` output for that pane
-- [ ] `Ctrl+=` / `Ctrl+-` visibly rescale the font and the statusbar cols×rows changes; a parallel native client attached to the same session reflows to the new size
-- [ ] Dragging a pane border changes the split ratio and persists in the tmux layout (visible to a native client)
-- [ ] The pane-zoom shortcut toggles a pane to fill the window and back, matching `resize-pane -Z`
+- [x] `cargo clippy --workspace -- -D warnings` passes
+- [x] `cargo test --workspace` passes
+- [x] Scrolling up in a pane reveals pre-attach history identical to `tmux capture-pane` output for that pane
+- [x] `Ctrl+=` / `Ctrl+-` visibly rescale the font and the statusbar cols×rows changes; a parallel native client attached to the same session reflows to the new size
+- [x] Dragging a pane border changes the split ratio and persists in the tmux layout (visible to a native client)
+- Pane-zoom shortcut — **SUPERSEDED 2026-06-07** (Outcome dropped; see `spec-pane-window-management.md`)
 
 ## Risks and mitigations
 
@@ -131,6 +131,7 @@ Decisions made during implementation are appended here.
 - 2026-06-04: Spec drafted from dogfooding triage. Copy-mode scroll forwarding rejected as technically impossible in `-CC` (see Prior decisions); key-table mirroring split out.
 - 2026-06-05: Challenged the scrollback implementation design (dedicated challenger session over code + termy source + tmux semantics). The "pager" model (capture-pane as single source above a screen-only live `Term`, re-fetched per scroll) was **rejected**: (S1, critical) termy hardcodes `-J … -E -`, so the overlap-free `-E -1` range it relies on is unreachable without a termy change — the "no termy bump" premise was factually wrong; (S2, critical) the available `-E -` range double-renders the screen and `-J` defeats a line-count trim; (S3) the first seam draft (`parse_capture_to_rows`) had a latent bug sizing the scratch `Term` by `\n` count, silently dropping upper history on wrapped lines; (S4–S6) per-tick re-capture is O(n) on a blocking thread and the frozen-history/live-screen seam tears under streaming. Adopted the revised model (live `scroll_display` for post-attach + one-time static pre-attach block above), which needs a termy capture-signature change (`-E` parametrizable, `-J` optional). The first seam (request/response plumbing) is discarded and rebuilt from scratch under the revised model. Open: termy-change ownership (parallel termy track vs. own branch).
 - 2026-06-05: Resolved the termy capture-signature ownership left open above. Added `capture_pane_range` (parametrizable `-E`, optional `-J`) to the skrischer/termy fork (`feat/capture-signature`, rev `49d3928`, layered on the subscriptions superset) and pinned rift to it; upstreamed as a separate single-responsibility PR (lassejlv/termy#322) rather than folding into the open subscriptions PR, since the two changes are orthogonal.
+- 2026-06-07: Completed on three of four outcomes (#39 scrollback, #40 font zoom, #41 drag-to-resize). Outcome 4 (pane zoom, #42) was **dropped before implementation** — no value for the current workflow; the screen space and effort moved to direct mouse-driven pane/window lifecycle management (`spec-pane-window-management.md`). #42 closed as replaced. Spec set to COMPLETED and archived.
 - 2026-06-04: Challenged the `-CC` choice (3-agent fan-out over docs/code/architecture). Outcome: `-CC` confirmed — the rejected alternative (tmux-in-one-PTY, native rendering) gives free interactive features but zero pane structure, deleting rift's reason to exist. Reframed the "lost features" into two categories (replaced-with-a-better-GUI-affordance vs. genuinely-forgone) so the fixes read as GUI design, not workarounds. Surfaced that the `-CC` decision is undocumented; expanded Pending update #1 to record it in `architecture.md` with the rejected alternative and the WezTerm-mux exit criteria.
 
 ---

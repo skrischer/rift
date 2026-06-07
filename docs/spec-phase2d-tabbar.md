@@ -29,10 +29,10 @@ Tab bar for tmux window switching and enriched statusbar with live metadata from
 
 ### Out of scope
 
-- Pane zoom handling (`resize-pane -Z`) — now owned by [spec-terminal-interaction-fixes.md](spec-terminal-interaction-fixes.md)
+- Pane zoom handling (`resize-pane -Z`) — was owned by [spec-terminal-interaction-fixes.md](archive/spec-terminal-interaction-fixes.md); dropped before implementation (see [spec-pane-window-management.md](spec-pane-window-management.md))
 - Drag-reorder tabs — tmux owns window order
 - Session switching — single session for now
-- Tab close/create from GUI — use tmux commands in terminal
+- Tab close/create from GUI — now owned by [spec-pane-window-management.md](spec-pane-window-management.md)
 - Adaptive throttling (tmuxy pattern) — add only if performance requires it
 - Mirroring the user's tmux status-line config (`status-left/right/style`) — the native statusbar is the source of truth and deliberately does **not** render the `.tmux.conf` status line. Honoring that config is its own opt-in mode: [spec-tmux-statusline-mirroring.md](spec-tmux-statusline-mirroring.md). The fields here are rift-native, fed from tmux *data* (subscriptions), not from tmux's status format strings.
 
