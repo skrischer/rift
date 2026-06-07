@@ -44,6 +44,27 @@ struct WindowState {
     pane_ids: Vec<String>,
 }
 
+/// An in-progress border drag. `start` is the mouse position along the drag
+/// axis at mouse-down; `emitted_cells` is the whole-cell offset already sent to
+/// tmux, so each move only emits the incremental `resize-pane`.
+struct BorderDrag {
+    target_pane: String,
+    horizontal: bool,
+    start: Pixels,
+    emitted_cells: i32,
+}
+
+/// tmux `resize-pane` direction flag for a cell delta. Positive grows the
+/// leading pane (right for a column split, down for a row split).
+fn resize_direction(horizontal: bool, delta_positive: bool) -> &'static str {
+    match (horizontal, delta_positive) {
+        (true, true) => "R",
+        (true, false) => "L",
+        (false, true) => "D",
+        (false, false) => "U",
+    }
+}
+
 pub struct SessionView {
     panes: HashMap<String, PaneEntry>,
     early_output_buffer: HashMap<String, Vec<Vec<u8>>>,
@@ -56,6 +77,7 @@ pub struct SessionView {
     capture_request_tx: flume::Sender<CaptureRequest>,
     font_zoom_tx: flume::Sender<i32>,
     font_size: Pixels,
+    border_drag: Option<BorderDrag>,
     focus_handle: FocusHandle,
     needs_focus: bool,
     window_grid_size: TermSize,
@@ -218,6 +240,7 @@ impl SessionView {
             capture_request_tx,
             font_zoom_tx,
             font_size: px(DEFAULT_FONT_SIZE),
+            border_drag: None,
             focus_handle: cx.focus_handle(),
             needs_focus: true,
             window_grid_size: TermSize { cols: 80, rows: 24 },
@@ -416,7 +439,12 @@ impl SessionView {
         }
     }
 
-    fn render_layout(&self, node: &LayoutNode, border_color: Hsla) -> AnyElement {
+    fn render_layout(
+        &self,
+        node: &LayoutNode,
+        border_color: Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         match node {
             LayoutNode::Pane(id) => {
                 if let Some(entry) = self.panes.get(id) {
@@ -429,32 +457,85 @@ impl SessionView {
                 horizontal,
                 children,
             } => {
+                let horizontal = *horizontal;
                 let mut container = div().flex().size_full();
-                container = if *horizontal {
+                container = if horizontal {
                     container.flex_row()
                 } else {
                     container.flex_col()
                 };
                 let last = children.len().saturating_sub(1);
                 for (i, (proportion, child)) in children.iter().enumerate() {
-                    let inner = self.render_layout(child, border_color);
-                    let mut wrapper = div()
+                    let inner = self.render_layout(child, border_color, cx);
+                    let wrapper = div()
                         .flex_1()
                         .flex_basis(relative(*proportion))
                         .size_full()
                         .child(inner);
-                    if i < last {
-                        wrapper = if *horizontal {
-                            wrapper.border_r_1().border_color(border_color)
-                        } else {
-                            wrapper.border_b_1().border_color(border_color)
-                        };
-                    }
                     container = container.child(wrapper);
+                    if i < last {
+                        // The seam before this border resizes the leading child;
+                        // target a representative pane inside it.
+                        let target = layout::first_pane_id(child).map(str::to_string);
+                        container = container.child(self.resize_handle(
+                            horizontal,
+                            border_color,
+                            target,
+                            cx,
+                        ));
+                    }
                 }
                 container.into_any_element()
             }
         }
+    }
+
+    /// A draggable seam between two split children. The 7px hit area wraps a
+    /// centered 1px line; mouse-down records the drag so the root element's move
+    /// handler can emit incremental `resize-pane` commands. The cursor stays the
+    /// default arrow (no resize cursor).
+    fn resize_handle(
+        &self,
+        horizontal: bool,
+        border_color: Hsla,
+        target: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let line = if horizontal {
+            div().w(px(1.0)).h_full().bg(border_color)
+        } else {
+            div().h(px(1.0)).w_full().bg(border_color)
+        };
+        let mut handle = div().flex().items_center().justify_center().flex_none();
+        handle = if horizontal {
+            handle.w(px(7.0)).h_full()
+        } else {
+            handle.h(px(7.0)).w_full()
+        };
+        handle = handle.child(line);
+
+        if let Some(target) = target {
+            handle = handle.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                    let start = if horizontal {
+                        event.position.x
+                    } else {
+                        event.position.y
+                    };
+                    this.border_drag = Some(BorderDrag {
+                        target_pane: target.clone(),
+                        horizontal,
+                        start,
+                        emitted_cells: 0,
+                    });
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            );
+        }
+
+        handle.into_any_element()
     }
 }
 
@@ -569,8 +650,9 @@ impl Render for SessionView {
                 }
             }));
 
+        let border_color = cx.theme().border;
         let pane_area = if let Some(ref layout) = self.layout {
-            self.render_layout(layout, cx.theme().border)
+            self.render_layout(layout, border_color, cx)
         } else {
             div().flex_grow().into_any_element()
         };
@@ -611,13 +693,80 @@ impl Render for SessionView {
                     .child(SharedString::from(size_label)),
             );
 
-        div()
+        let mut root = div()
+            .relative()
             .flex()
             .flex_col()
             .size_full()
             .bg(cx.theme().background)
             .child(tab_bar)
             .child(pane_area)
-            .child(statusbar)
+            .child(statusbar);
+
+        // While dragging a border, a full-window overlay captures all mouse
+        // events (`occlude`) so the underlying pane does not start a text
+        // selection, and translates the drag into incremental `resize-pane`.
+        if self.border_drag.is_some() {
+            let cell_width = cell_size.width;
+            let cell_height = cell_size.height;
+            root = root.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .occlude()
+                    .on_mouse_move(cx.listener(
+                        move |this, event: &MouseMoveEvent, _window, _cx| {
+                            let Some(drag) = this.border_drag.as_mut() else {
+                                return;
+                            };
+                            let (pos, extent) = if drag.horizontal {
+                                (event.position.x, cell_width)
+                            } else {
+                                (event.position.y, cell_height)
+                            };
+                            let total = ((pos - drag.start) / extent).round() as i32;
+                            let delta = total - drag.emitted_cells;
+                            if delta != 0 {
+                                let dir = resize_direction(drag.horizontal, delta > 0);
+                                let _ = this.tmux_command_tx.try_send(format!(
+                                    "resize-pane -t {} -{} {}",
+                                    drag.target_pane,
+                                    dir,
+                                    delta.unsigned_abs()
+                                ));
+                                drag.emitted_cells = total;
+                            }
+                        },
+                    ))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                            this.border_drag = None;
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+
+        root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resize_direction;
+
+    #[test]
+    fn test_resize_direction_horizontal() {
+        assert_eq!(resize_direction(true, true), "R");
+        assert_eq!(resize_direction(true, false), "L");
+    }
+
+    #[test]
+    fn test_resize_direction_vertical() {
+        assert_eq!(resize_direction(false, true), "D");
+        assert_eq!(resize_direction(false, false), "U");
     }
 }
