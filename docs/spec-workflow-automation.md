@@ -1,6 +1,6 @@
 # Spec: Implementation workflow automation
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-06-07
 > Completed: —
 
@@ -60,8 +60,15 @@ with GitHub board status transitions baked into every phase.
   reviewer pane depends on this; agent-teams split-pane mode is NOT used.
 - Board: project `PVT_kwHOBLauTs4BZeLy`, Status field `PVTSSF_…maE`, options
   `Todo / In Progress / Done`.
-- Push-guard hook blocks pushes when cwd resolves to the main checkout → recipes
-  operate via `git -C <worktree>`.
+- The push-guard hook fires only on Bash commands matching the `Bash(git push*)`
+  prefix; it then blocks when the current branch (in the hook's cwd) is
+  `main`/`develop` or the command targets them. A push via `git -C <worktree> push`
+  or inside a `just` recipe does not start with `git push`, so it bypasses the hook
+  entirely — `pr-merge`'s internal pushes are unaffected. (Never push a protected
+  branch directly regardless.)
+- `just agent-worktree`'s new issue argument must default to empty (`issue=""`) so
+  existing single-arg callers (`just agent-worktree feat/x`) keep working and skip
+  the board flip.
 - No new dependencies. Recipes use only `just`, `gh`, `git`, `tmux`, `cargo`.
 - The hard visual-review gate before merge stays — never blind-merge GPU/main.rs.
 
@@ -74,7 +81,11 @@ with GitHub board status transitions baked into every phase.
 | Reviewer verdict via `.claude/review-<branch>.md` file; `send-keys` only to drive the pane | Avoids the send-keys newline-submit/quoting fragility recorded in the runbook when reading results back | 2026-06-07 |
 | Merge is remote-only (`gh pr merge`, never the local checkout) | Eliminates the 4×-observed local-state failure class and preserves the visual-review gate | 2026-06-07 |
 | `rift-app` CI job runs always, not path-filtered on `crates/app/**` | Breakage often originates in non-app crates (the 6-site channel pattern), so a path filter would be leaky | 2026-06-07 |
+| `rift-app` is checked in a separate `app-check` CI job with its own `Swatinem/rust-cache` key | Keeps the fast `check` job lean, isolates the heavy skia/wgpu build, gives a distinct app-compiles signal | 2026-06-07 |
 | Mechanics in `just`/`scripts`, orchestration in the skill | Recipes stay testable and reusable outside the skill; matches the existing justfile + push-guard-script precedent | 2026-06-07 |
+| `pr-wait` reports green only when `statusCheckRollup` is non-empty AND every entry is `SUCCESS`/`NEUTRAL`; an empty rollup keeps waiting under a bounded timeout | Avoids the `gh pr checks` exit-0 trap (recorded in `implementation-workflow.md`) that merges before CI registers | 2026-06-07 |
+| `set-issue-status.sh` resolves issue# → board item id via `gh api graphql` over the project's paged `items` (match on `content.number`); field/option ids queried at runtime, not hardcoded | Issue numbers are not board item ids; runtime lookup avoids brittle hardcoded `PVTI_…`/option ids | 2026-06-07 |
+| Reviewer pane launches via `command claude`, not the `claude` alias | The alias starts with `-r` (resume) and would reuse a prior session instead of a fresh review context | 2026-06-07 |
 
 ## Tracking
 
@@ -86,11 +97,16 @@ with GitHub board status transitions baked into every phase.
 
 - [ ] `cargo clippy --workspace --exclude rift-app -- -D warnings` and
       `cargo test --workspace --exclude rift-app` still pass.
-- [ ] A deliberately broken `main.rs` produces a red CI check; a correct one is green.
+- [ ] A PR with an app-affecting compile break shows the `app-check` CI job red;
+      a correct one is green.
 - [ ] A test issue driven through the cycle shows `Todo → In Progress → Done` on the
       board, driven only by the recipes.
+- [ ] `just agent-worktree feat/x` with no issue arg still succeeds and skips the
+      board flip (existing callers unbroken).
 - [ ] `just pr-merge <n>` performs the full loop on a real PR, including a `BEHIND`
       rebase, leaving no junk merge commit or diverged `develop`.
+- [ ] `pr-wait` keeps waiting while `statusCheckRollup` is empty (checks not yet
+      registered) and only reports green once every entry is `SUCCESS`/`NEUTRAL`.
 - [ ] `just review-pane <branch>` opens a pane, the reviewer writes a verdict file,
       and the pane remains interactive afterward.
 - [ ] `/implement <issue#>` completes one real issue end-to-end.
