@@ -142,3 +142,16 @@ with GitHub board status transitions baked into every phase.
   seeing the reviewer verdict. Chosen over a fully-gated or fully-autonomous flow:
   cuts friction on the routine steps while keeping the one irreversible step
   (merge) under human control. — 2026-06-08
+- `review-pane` passes the prompt inline as claude's first argument
+  (single-quote-escaped so it survives tmux's `sh -c` as one token) so it submits
+  on launch, replacing the `send-keys` approach above, which raced the TUI and
+  left the prompt unsubmitted on a real run. The pane splits below (`-v`) instead
+  of to the right. The two sidecar files are gone: the pane is tagged with a tmux
+  user option (`@rift-review=<branch>`, immune to the TUI overwriting the title)
+  so `review-pane-rm` rediscovers it without a `.pane` file, and the prompt is no
+  longer written to a `.prompt` file — only the `.md` verdict remains. The
+  file-based verdict was kept as the approved channel after re-evaluating an
+  agent-teams reviewer and a fully file-free pane-option verdict and rejecting
+  both: the human must keep an interactive reviewer pane to follow up, which a
+  teammate (goes idle, experimental on WSL) does not provide. Found and fixed by
+  driving the issue through `/implement` itself. — 2026-06-08
