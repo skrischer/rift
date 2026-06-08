@@ -1,8 +1,8 @@
 # Spec: Pane and window lifecycle management
 
-> Status: READY
+> Status: COMPLETED
 > Created: 2026-06-07
-> Completed: —
+> Completed: 2026-06-08
 
 Make the tmux pane and window lifecycle directly manipulable from the GPU UI — create, close, focus, rename, split, all with the mouse — and stop `exit` from tearing down the whole application.
 
@@ -18,10 +18,10 @@ All mutations follow the established discipline (drag-to-resize, #41): the UI em
 
 What is true when this work is done:
 
-- [ ] Closing a pane (e.g. typing `exit`) closes only that pane/window; rift quits only when the tmux session itself ends (last pane gone / control mode exits)
-- [ ] The window tab bar creates a window via a `+` control (`new-window`) and closes a window via a per-tab `x` control and middle-click (`kill-window`)
-- [ ] A per-window pane sidebar lists the active window's panes; clicking a row focuses it (`select-pane`), a per-row `x` closes it (`kill-pane`), and header controls split the active pane side-by-side (`|`) or stacked (`-`); focus follows the newly created pane
-- [ ] Double-clicking a window tab renames the window (`rename-window`); the tab label reflects the new name
+- [x] Closing a pane (e.g. typing `exit`) closes only that pane/window; rift quits only when the tmux session itself ends (last pane gone / control mode exits)
+- [x] The window tab bar creates a window via a `+` control (`new-window`) and closes a window via a per-tab `x` control and middle-click (`kill-window`)
+- [x] A per-window pane sidebar lists the active window's panes; clicking a row focuses it (`select-pane`), a per-row `x` closes it (`kill-pane`), and header controls split the active pane side-by-side (`|`) or stacked (`-`); focus follows the newly created pane
+- [x] Double-clicking a window tab renames the window (`rename-window`); the tab label reflects the new name
 
 ## Scope
 
@@ -85,13 +85,13 @@ Each issue references this spec path in its body. A PR may only merge if it clos
 
 ## Verification
 
-- [ ] `cargo clippy --workspace -- -D warnings` passes
-- [ ] `cargo test --workspace` passes
-- [ ] In a multi-pane session, `exit` in a pane closes only that pane and the app stays open; closing the last pane (session end) quits rift
-- [ ] `+` in the tab bar creates a window; `x` and middle-click on a tab close that window; a parallel native client attached to the session sees the window set change
-- [ ] Clicking a pane row focuses it (`select-pane`); the row `x` closes it (`kill-pane`); `|` / `-` split the active pane into side-by-side / stacked panes; focus lands in the new pane
-- [ ] Double-clicking a tab renames the window (`rename-window`); the label updates
-- [ ] All changes persist in the tmux layout / window set (visible to a native client), driven by the snapshot
+- [x] `cargo clippy --workspace -- -D warnings` passes
+- [x] `cargo test --workspace` passes
+- [x] In a multi-pane session, `exit` in a pane closes only that pane and the app stays open; closing the last pane (session end) quits rift
+- [x] `+` in the tab bar creates a window; `x` and middle-click on a tab close that window; a parallel native client attached to the session sees the window set change
+- [x] Clicking a pane row focuses it (`select-pane`); the row `x` closes it (`kill-pane`); `|` / `-` split the active pane into side-by-side / stacked panes; focus lands in the new pane
+- [x] Double-clicking a tab renames the window (`rename-window`); the label updates
+- [x] All changes persist in the tmux layout / window set (visible to a native client), driven by the snapshot
 
 ## Risks and mitigations
 
@@ -107,3 +107,8 @@ Each issue references this spec path in its body. A PR may only merge if it clos
 ## Decision log
 
 - 2026-06-07: Spec created. Scope set to mouse-driven lifecycle (exit fix, tab `+`/`x`, pane sidebar, window rename). Pane zoom (#42) dropped; keyboard bindings, close-guard, and reorder/move deferred with reasons above.
+- 2026-06-08: Exit fix (#68, PR #87). `cx.quit()` removed from the PTY read loop (`pane_view.rs`); a loop ending now just means that pane was dropped from the snapshot. Quit moved to `ConnectionStatus::Disconnected` in the connection-status loop (`session_view.rs`). `cx.update` returns the closure value directly (not `Result`), so the loop returns the inner `this.update(...)` Result for its existing `is_err()` break check.
+- 2026-06-08: Tab bar (#69, PR #88). `+` as a bar-level `TabBar::suffix` → `new-window`; per-tab `x` as `Tab::suffix` with its own `on_mouse_down` + `stop_propagation`, plus middle-click, both → `kill-window -t <id>`. Confirmed a bar-level `TabBar::on_click` is wired onto every tab and overrides per-`Tab` `on_click`.
+- 2026-06-08: Pane sidebar (#70, PR #89). Left, fixed-width (`PANE_SIDEBAR_WIDTH = 160.0`) vertical list; root restructured to `flex_col[tab_bar, flex_row[sidebar, pane_area], statusbar]`. Lifecycle commands extracted as pure helpers (`split_command`/`select_pane_command`/`kill_pane_command`) with unit tests. **H1 fix:** the sidebar width is subtracted before the tmux column count — `total_cols = ((viewport.width - PANE_SIDEBAR_WIDTH) / cell_size.width).floor()` — so the terminal grid matches the space it actually occupies.
+- 2026-06-08: Window rename (#71, PR #90). Double-click a tab → inline gpui-component `Input` seeded with the name; Enter → `rename-window -t <id>` with `quote_tmux_name` quoting and a trimmed-empty guard; Escape/blur cancels; `needs_focus` hands focus to the input. **Integration with #69:** select-window dispatch moved onto the per-`Tab` `on_click` (which exposes `click_count()` for double-click) instead of a bar-level `on_click`, so rename coexists with the `x` close suffix, middle-click kill, and the `+` suffix on the same `TabBar`.
+- 2026-06-08: Review follow-ups noted for later specs (none blocking; all out of this spec's scope): quit-on-`Disconnected` could become an auto-reconnect prompt once a reconnect UI exists; the 1px sidebar border is not yet subtracted in the column math (sub-cell, harmless); the existing `select-pane`-on-focus call site could reuse the new `select_pane_command` helper; the sidebar could hide at ≤1 pane and the pane list could scroll for many panes; closing the last pane / a pane running an agent still has no confirmation (owned by a future close-guard spec).
