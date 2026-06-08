@@ -137,3 +137,8 @@ with GitHub board status transitions baked into every phase.
   best-effort from `pr-merge`) can close it. Caveat: a fresh worktree may trigger
   claude's one-time folder-trust prompt, which intercepts the first send — accept
   it and re-run `review-pane`. — 2026-06-08
+- `/implement` runs the git mechanics autonomously through PR creation (commit,
+  push, open PR) and stops only at the merge gate, where the human confirms after
+  seeing the reviewer verdict. Chosen over a fully-gated or fully-autonomous flow:
+  cuts friction on the routine steps while keeping the one irreversible step
+  (merge) under human control. — 2026-06-08
