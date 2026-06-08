@@ -207,7 +207,11 @@ impl PaneView {
                         break;
                     }
                 }
-                cx.update(|cx| cx.quit());
+                // The loop ending means this pane's PTY channel closed (the pane
+                // was dropped from the snapshot, e.g. via `exit`). That is a
+                // single-pane teardown, not an app shutdown. The app quits only
+                // when the whole tmux session ends — handled by the session's
+                // connection-status loop on `ConnectionStatus::Disconnected`.
             })
             .detach();
         }
