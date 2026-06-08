@@ -11,8 +11,10 @@ Orchestrates the rift issue -> merged cycle using the project's own recipes
 `/implement 76`. (`just pr-merge` waits on the checks via `pr-wait` internally.)
 
 **Git autonomy:** implement, verify, commit, push and open the PR without
-pausing. **Stop and ask only at the merge gate** — and on any error or blocker.
-Never merge until the human confirms after seeing the reviewer's verdict.
+pausing. **Stop and hand off at the visual review gate (app-affecting changes)
+and the merge gate** — and on any error or blocker. Never merge until the human
+confirms after seeing the reviewer's verdict and, for visual changes, testing it
+on the GPU station.
 
 ## Preconditions
 
@@ -77,14 +79,36 @@ Never merge until the human confirms after seeing the reviewer's verdict.
   fix before proceeding. Only an `APPROVE` (or an explicit human override) clears
   the gate. If `$TMUX` is unset, ask the human to review manually instead.
 
-## 8. Merge gate (STOP)
+## 8. Visual review gate (GPU station)
+
+- **Only for app-affecting changes** — anything that can alter what `rift-app`
+  renders (the `app`/`terminal` crates, GPUI surface, layout, input handling).
+  Pure daemon/protocol/tooling/docs changes have no visual surface; skip to step
+  9. CI's `app-check` only compiles the app, it never renders it, so a human has
+  to watch it run before merge.
+- Hand the human the exact commands with the **real branch substituted**. The
+  branch is checked out in its worktree `../rift-worktrees/<branch-dashes>`, so a
+  plain `git checkout <branch>` fails — `--detach` rides the same commit while
+  reusing the station's heavy `target/`:
+  ```
+  git checkout --detach <branch>   # dev-watch (running on the station) rebuilds incrementally; exercise the app
+  git checkout develop             # return when done
+  ```
+- Don't say "test it." Derive concrete scenarios from the issue's acceptance
+  checklist and the diff, and present them as a numbered list of what to do and
+  what to look for. Fold in any behavior change the reviewer flagged as worth
+  eyeballing.
+- Wait for the human's observations. On a regression go back to step 4;
+  otherwise proceed to the merge gate.
+
+## 9. Merge gate (STOP)
 
 - Ask the human to confirm the merge. On confirmation: `just pr-merge <n>` — it
   waits for green (refreshing the branch server-side when behind), squash-merges,
   closes the review pane, removes the worktree and both branch refs, and ff-syncs
   local develop.
 
-## 9. Close out
+## 10. Close out
 
 - `scripts/set-issue-status.sh <n> Done` — the merge auto-closes the issue; this
   flips the board column.
