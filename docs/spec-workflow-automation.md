@@ -130,3 +130,10 @@ with GitHub board status transitions baked into every phase.
   it drops the project-id hardcode entirely — portable to any repo/project,
   overridable with `RIFT_PROJECT_NUMBER` when an issue sits on several boards. —
   2026-06-08
+- `review-pane` seeds the reviewer with a single-line prompt via `send-keys -l`
+  (literal) after polling `#{pane_current_command}` until claude has replaced the
+  launching shell, rather than a blind sleep or a fragile multi-line send. The
+  pane id is stored in `.claude/review-<branch>.pane` so `review-pane-rm` (called
+  best-effort from `pr-merge`) can close it. Caveat: a fresh worktree may trigger
+  claude's one-time folder-trust prompt, which intercepts the first send — accept
+  it and re-run `review-pane`. — 2026-06-08
