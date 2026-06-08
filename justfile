@@ -66,7 +66,11 @@ review-pane branch:
     # no send-keys, no Enter race. Single-quote-escape it so the whole string
     # survives tmux's `sh -c` as one argument. The pane opens below (-v).
     esc=${prompt//\'/\'\\\'\'}
-    pane=$(tmux split-window -v -P -F '#{pane_id}' -c "$wt_abs" "command claude '$esc'")
+    # Target the invoking pane explicitly. tmux ignores $TMUX_PANE for a default
+    # target and splits the client's *active* window instead -- so without -t the
+    # reviewer lands in whatever window is on screen, not the caller's. Pin it.
+    target="${TMUX_PANE:?review-pane: TMUX_PANE unset, cannot target invoking pane}"
+    pane=$(tmux split-window -v -t "$target" -P -F '#{pane_id}' -c "$wt_abs" "command claude '$esc'")
     # Tag the pane with a tmux user option (immune to the TUI overwriting the
     # title) so review-pane-rm can rediscover it without a sidecar file.
     tmux set -p -t "$pane" @rift-review "$branch"
