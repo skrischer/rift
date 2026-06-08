@@ -59,19 +59,14 @@ review-pane branch:
     mkdir -p .claude
     verdict="$(pwd)/.claude/review-$dashed.md"
     panefile="$(pwd)/.claude/review-$dashed.pane"
-    prompt="Review the git branch '$branch' for the rift project; you are in its worktree. Inspect the diff with 'git diff develop...HEAD' and judge correctness, architecture-rule compliance (see CLAUDE.md: agent-agnostic core, no .unwrap() in libs, crate boundaries, no clone() to satisfy the borrow checker) and test coverage. Write your verdict to $verdict as markdown whose first line is 'VERDICT: APPROVE' or 'VERDICT: REQUEST_CHANGES', followed by the findings. Then summarize for me and stay available for follow-up."
-    pane=$(tmux split-window -h -P -F '#{pane_id}' -c "$wt_abs" "command claude")
+    promptfile="$(pwd)/.claude/review-$dashed.prompt"
+    printf '%s' "Review the git branch '$branch' for the rift project; you are in its worktree. Inspect the diff with 'git diff develop...HEAD' and judge correctness, architecture-rule compliance (see CLAUDE.md: agent-agnostic core, no .unwrap() in libs, crate boundaries, no clone() to satisfy the borrow checker) and test coverage. Write your verdict to $verdict as markdown whose first line is 'VERDICT: APPROVE' or 'VERDICT: REQUEST_CHANGES', followed by the findings. Then summarize for me and stay available for follow-up." > "$promptfile"
+    # Seed the prompt as claude's first argument so it is submitted automatically
+    # on launch -- no send-keys, no Enter race. "$(cat ...)" passes the whole file
+    # as a single argument regardless of its quoting. The pane opens below (-v).
+    pane=$(tmux split-window -v -P -F '#{pane_id}' -c "$wt_abs" "command claude \"\$(cat '$promptfile')\"")
     tmux select-pane -t "$pane" -T "review:$branch"
     echo "$pane" > "$panefile"
-    # Wait for claude to replace the launching shell before sending the prompt.
-    for _ in $(seq 1 30); do
-      cur=$(tmux display -p -t "$pane" '#{pane_current_command}')
-      if [ "$cur" != "bash" ] && [ "$cur" != "sh" ]; then break; fi
-      sleep 0.5
-    done
-    sleep 1
-    tmux send-keys -t "$pane" -l "$prompt"
-    tmux send-keys -t "$pane" Enter
     echo "review-pane: launched $pane reviewing $branch; verdict -> $verdict"
 
 # Tear down a branch's review pane and verdict/sidecar files (best-effort).
@@ -84,7 +79,7 @@ review-pane-rm branch:
     if [ -n "${TMUX:-}" ] && [ -f "$panefile" ]; then
       tmux kill-pane -t "$(cat "$panefile")" 2>/dev/null || true
     fi
-    rm -f "$panefile" ".claude/review-$dashed.md"
+    rm -f "$panefile" ".claude/review-$dashed.md" ".claude/review-$dashed.prompt"
 
 # Wait for a PR's checks to finish. Green only when every check is COMPLETED and
 # passing; an empty or still-running rollup keeps waiting (bounded). Exit 0=green,

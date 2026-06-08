@@ -142,3 +142,8 @@ with GitHub board status transitions baked into every phase.
   seeing the reviewer verdict. Chosen over a fully-gated or fully-autonomous flow:
   cuts friction on the routine steps while keeping the one irreversible step
   (merge) under human control. — 2026-06-08
+- `review-pane` now seeds the prompt as claude's first argument
+  (`command claude "$(cat <promptfile>)"`) so it submits on launch, replacing the
+  `send-keys` approach above, which raced the TUI and left the prompt unsubmitted
+  on a real run. The pane also splits below (`-v`) instead of to the right. Found
+  and fixed by driving the issue through `/implement` itself. — 2026-06-08
