@@ -24,11 +24,17 @@ test:
 # Full CI check (format + lint + test)
 ci: fmt-check lint test
 
-# Create an isolated headless worktree for an agent (off develop, own target, no GPU build)
-agent-worktree branch:
+# Create an isolated headless worktree for an agent (off develop, own target, no
+# GPU build). Pass an issue number to flip it to In Progress on the board.
+agent-worktree branch issue="":
+    #!/usr/bin/env bash
+    set -euo pipefail
     git worktree add ../rift-worktrees/{{replace(branch, "/", "-")}} -b {{branch}} develop
-    @echo "Worktree ready: ../rift-worktrees/{{replace(branch, "/", "-")}} (branch {{branch}})"
-    @echo "Verify there headless: just lint && just test"
+    echo "Worktree ready: ../rift-worktrees/{{replace(branch, "/", "-")}} (branch {{branch}})"
+    if [ -n "{{issue}}" ]; then
+      scripts/set-issue-status.sh "{{issue}}" "In Progress"
+    fi
+    echo "Verify there headless: just lint && just test"
 
 # Remove an agent worktree after merge
 agent-worktree-rm branch:

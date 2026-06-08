@@ -37,7 +37,9 @@ with GitHub board status transitions baked into every phase.
   `In Progress` on creation.
 - A CI job compiling `rift-app` (`cargo check -p rift-app`, cached), run always.
 - `just review-pane <branch>` — interactive `claude` reviewer in a tmux pane,
-  verdict via file.
+  verdict via file, plus a `just review-pane-rm <branch>` teardown (kill pane +
+  drop the verdict file) invoked best-effort from `pr-merge` cleanup so a merge
+  also closes its review pane.
 - `.claude/skills/implement/SKILL.md` — the `/implement` orchestration skill.
 
 ### Out of scope
@@ -122,4 +124,9 @@ with GitHub board status transitions baked into every phase.
 
 ## Decision log
 
-- (entries added during implementation)
+- `set-issue-status.sh` resolves the board item + project id from the issue's own
+  `projectItems` (one GraphQL hop) instead of paging the project's `items` and
+  matching `content.number`. Same runtime-resolution outcome with fewer calls, and
+  it drops the project-id hardcode entirely — portable to any repo/project,
+  overridable with `RIFT_PROJECT_NUMBER` when an issue sits on several boards. —
+  2026-06-08
