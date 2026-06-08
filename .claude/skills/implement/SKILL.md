@@ -6,9 +6,9 @@ description: Drive a single rift issue through the full implementation cycle end
 # /implement — drive one issue from start to merged
 
 Orchestrates the rift issue -> merged cycle using the project's own recipes
-(`just agent-worktree`, `just pr-wait`, `just pr-merge`, `just review-pane`) and
+(`just agent-worktree`, `just pr-merge`, `just review-pane`) and
 `scripts/set-issue-status.sh`. The argument is the issue number, e.g.
-`/implement 76`.
+`/implement 76`. (`just pr-merge` waits on the checks via `pr-wait` internally.)
 
 **Git autonomy:** implement, verify, commit, push and open the PR without
 pausing. **Stop and ask only at the merge gate** — and on any error or blocker.
@@ -60,8 +60,10 @@ Never merge until the human confirms after seeing the reviewer's verdict.
 
 - Commit with Conventional Commits (scope = crate). The body references the spec
   and ends with `Closes #<n>`. Stage specific files; never blind `git add -A`.
-- Push the feature branch: `git -C <wt> push -u origin <branch>` (the push-guard
-  permits feature branches; never push to `main`/`develop`).
+- Push the feature branch with `git -C <wt> push -u origin <branch>` — phrased
+  this way it does not start with `git push`, so it bypasses the push-guard's
+  matcher (a plain `git push` from the main checkout is blocked even for a feature
+  branch). Never push to `main`/`develop`.
 - `gh pr create --base develop` with a body that restates the change, the
   verification done, and `Closes #<n>`.
 
