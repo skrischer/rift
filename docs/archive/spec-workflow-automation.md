@@ -1,8 +1,8 @@
 # Spec: Implementation workflow automation
 
-> Status: READY
+> Status: COMPLETED
 > Created: 2026-06-07
-> Completed: —
+> Completed: 2026-06-08
 
 Automate the implementation cycle (issue → merged) via `just` recipes, a CI
 correctness gate, an interactive tmux reviewer pane, and a `/implement` skill —
@@ -155,3 +155,14 @@ with GitHub board status transitions baked into every phase.
   both: the human must keep an interactive reviewer pane to follow up, which a
   teammate (goes idle, experimental on WSL) does not provide. Found and fixed by
   driving the issue through `/implement` itself. — 2026-06-08
+- Deviation from the Outcome wording "`just pr-merge` leaves it `Done`": the
+  board flip to `Done` lives in the `/implement` skill's close-out
+  (`set-issue-status.sh <n> Done`), not in `pr-merge`. `pr-merge` operates on the
+  PR number and does not resolve the closing issue, so the status transition is
+  split — `agent-worktree` owns `In Progress`, the skill owns `Done` — rather than
+  bundled into the merge recipe. Still fully tooling-driven, just not in the one
+  recipe the Outcome named. — 2026-06-08
+- Verification "an app-affecting compile break shows the `app-check` CI job red"
+  was met by inspection, not by a deliberate negative test: the `app-check` job
+  runs `cargo check -p rift-app` on every PR (exercised green on real PRs incl.
+  #84). A synthetic break to observe the red was not run separately. — 2026-06-08
