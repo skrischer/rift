@@ -58,6 +58,9 @@ review-pane branch:
     wt_abs=$(cd "$wt" && pwd)
     mkdir -p .claude
     verdict="$(pwd)/.claude/review-$dashed.md"
+    # Clear any stale verdict from a prior review of this branch so a poll for the
+    # result reads only this run's verdict, never a leftover one.
+    rm -f "$verdict"
     prompt="Review the git branch '$branch' for the rift project; you are in its worktree. Inspect the diff with 'git diff develop...HEAD' and judge correctness, architecture-rule compliance (see CLAUDE.md: agent-agnostic core, no .unwrap() in libs, crate boundaries, no clone() to satisfy the borrow checker) and test coverage. Write your verdict to $verdict as markdown whose first line is 'VERDICT: APPROVE' or 'VERDICT: REQUEST_CHANGES', followed by the findings. Then summarize for me and stay available for follow-up."
     # Pass the prompt inline as claude's first argument so it submits on launch --
     # no send-keys, no Enter race. Single-quote-escape it so the whole string
