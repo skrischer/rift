@@ -189,12 +189,19 @@ impl SessionView {
                     break;
                 };
                 let result = cx.update(|cx| {
-                    this.update(cx, |view, cx| {
+                    let updated = this.update(cx, |view, cx| {
                         if view.connection_status != status {
                             view.connection_status = status;
                             cx.notify();
                         }
-                    })
+                    });
+                    // `Disconnected` arrives only after `run_ssh_session`
+                    // returns, i.e. the tmux session itself ended. That is the
+                    // single genuine app-shutdown signal; a closing pane is not.
+                    if status == ConnectionStatus::Disconnected {
+                        cx.quit();
+                    }
+                    updated
                 });
                 if result.is_err() {
                     break;
