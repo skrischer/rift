@@ -37,6 +37,26 @@ jobs:
       - name: Test
         run: cargo test --workspace --exclude rift-app
 
+  app-check:
+    name: App Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: app-check
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-x11-dev libxkbcommon-dev \
+            libxcb1-dev libfreetype-dev libfontconfig-dev libwayland-dev \
+            libvulkan-dev
+
+      - name: Check rift-app
+        run: cargo check -p rift-app
+
   deny:
     name: Licenses
     runs-on: ubuntu-latest
