@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use gpui::*;
 use gpui_component::tab::TabBar;
-use gpui_component::{h_flex, ActiveTheme};
+use gpui_component::{h_flex, v_flex, ActiveTheme};
 use termy_terminal_ui::TmuxSnapshot;
 use tracing::debug;
 
@@ -40,7 +40,6 @@ struct WindowState {
     name: String,
     index: i32,
     is_active: bool,
-    #[allow(dead_code)]
     pane_ids: Vec<String>,
 }
 
@@ -544,6 +543,152 @@ impl SessionView {
 
         handle.into_any_element()
     }
+
+    /// The per-window pane sidebar: a fixed-width column listing the active
+    /// window's panes. A row click focuses its pane (`select-pane`), the row
+    /// `x` closes it (`kill-pane`), and the header splits the active pane
+    /// side-by-side (`|` -> `split-window -h`) or stacked (`-` ->
+    /// `split-window -v`). Every control only emits a tmux command; the next
+    /// snapshot redraws the result.
+    fn render_pane_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let bg = cx.theme().tab_bar;
+        let border = cx.theme().border;
+        let active_bg = cx.theme().list_active;
+        let fg = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+
+        let active_pane = self.active_pane_id.clone();
+        let rows: Vec<(String, String, bool)> = self
+            .windows
+            .iter()
+            .find(|w| w.is_active)
+            .map(|w| w.pane_ids.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .map(|id| {
+                let label = self
+                    .panes
+                    .get(id)
+                    .and_then(|entry| entry.entity.read(cx).current_command().map(str::to_string))
+                    .filter(|cmd| !cmd.is_empty())
+                    .unwrap_or_else(|| id.clone());
+                let is_active = active_pane.as_deref() == Some(id.as_str());
+                (id.clone(), label, is_active)
+            })
+            .collect();
+
+        // Visual "|" splits side-by-side (tmux `-h`); visual "-" stacks (tmux
+        // `-v`) -- the naming is inverted vs. the divider orientation.
+        let split_side = active_pane
+            .as_ref()
+            .map(|id| format!("split-window -h -t {}", id));
+        let split_stack = active_pane
+            .as_ref()
+            .map(|id| format!("split-window -v -t {}", id));
+
+        let header = h_flex()
+            .flex_none()
+            .w_full()
+            .gap(px(4.0))
+            .px(px(8.0))
+            .py(px(6.0))
+            .border_b_1()
+            .border_color(border)
+            .child(self.sidebar_button("|", split_side, fg, muted, active_bg, cx))
+            .child(self.sidebar_button("-", split_stack, fg, muted, active_bg, cx));
+
+        let mut list = v_flex().w_full().flex_1().min_h_0();
+        for (id, label, is_active) in rows {
+            let select_id = id.clone();
+            let row_bg = if is_active { active_bg } else { bg };
+            let row_fg = if is_active { fg } else { muted };
+            let row = h_flex()
+                .w_full()
+                .gap(px(6.0))
+                .px(px(8.0))
+                .py(px(4.0))
+                .bg(row_bg)
+                .text_color(row_fg)
+                .hover(|s| s.bg(active_bg).text_color(fg))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event: &MouseDownEvent, _window, _cx| {
+                        if let Err(e) = this
+                            .tmux_command_tx
+                            .try_send(format!("select-pane -t {}", select_id))
+                        {
+                            debug!(error = %e, "failed to send select-pane command");
+                        }
+                    }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(SharedString::from(label)),
+                )
+                .child(self.sidebar_button(
+                    "x",
+                    Some(format!("kill-pane -t {}", id)),
+                    fg,
+                    muted,
+                    active_bg,
+                    cx,
+                ));
+            list = list.child(row);
+        }
+
+        v_flex()
+            .flex_none()
+            .w(px(160.0))
+            .h_full()
+            .bg(bg)
+            .border_r_1()
+            .border_color(border)
+            .text_size(px(DEFAULT_FONT_SIZE))
+            .font_family("JetBrainsMono Nerd Font Mono")
+            .child(header)
+            .child(list)
+            .into_any_element()
+    }
+
+    /// A square glyph button for the pane sidebar. With a command it emits that
+    /// command on click and stops propagation so a parent row does not also act;
+    /// without one it renders dimmed and inert (no active pane to target).
+    fn sidebar_button(
+        &self,
+        glyph: &'static str,
+        command: Option<String>,
+        fg: Hsla,
+        muted: Hsla,
+        hover_bg: Hsla,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let button = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(20.0))
+            .rounded(px(4.0))
+            .child(glyph);
+        match command {
+            Some(command) => button
+                .text_color(muted)
+                .hover(|s| s.bg(hover_bg).text_color(fg))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
+                        if let Err(e) = this.tmux_command_tx.try_send(command.clone()) {
+                            debug!(error = %e, command = %command, "failed to send sidebar command");
+                        }
+                        cx.stop_propagation();
+                    }),
+                ),
+            None => button.text_color(muted.opacity(0.4)),
+        }
+    }
 }
 
 impl Focusable for SessionView {
@@ -721,7 +866,16 @@ impl Render for SessionView {
                 }
             }))
             .child(tab_bar)
-            .child(pane_area)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(self.render_pane_sidebar(cx))
+                    .child(div().flex().flex_1().min_w_0().h_full().child(pane_area)),
+            )
             .child(statusbar);
 
         // While dragging a border, a full-window overlay captures all mouse
