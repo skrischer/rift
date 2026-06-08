@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::tab::{Tab, TabBar};
-use gpui_component::{h_flex, ActiveTheme, Sizable};
+use gpui_component::{h_flex, v_flex, ActiveTheme, Sizable};
 use termy_terminal_ui::TmuxSnapshot;
 use tracing::debug;
 
@@ -18,6 +18,10 @@ const DEFAULT_FONT_SIZE: f32 = 14.0;
 const MIN_FONT_SIZE: f32 = 8.0;
 const MAX_FONT_SIZE: f32 = 40.0;
 const FONT_SIZE_STEP: f32 = 1.0;
+/// Width of the always-visible pane sidebar. Shared between the sidebar render
+/// and the tmux client-width compute so the reported column count never
+/// includes the space the sidebar occupies.
+const PANE_SIDEBAR_WIDTH: f32 = 160.0;
 
 pub struct TerminalHandle {
     pub pane_output_tx: flume::Sender<PaneOutput>,
@@ -41,7 +45,6 @@ struct WindowState {
     name: String,
     index: i32,
     is_active: bool,
-    #[allow(dead_code)]
     pane_ids: Vec<String>,
 }
 
@@ -82,6 +85,24 @@ fn resize_direction(horizontal: bool, delta_positive: bool) -> &'static str {
         (false, true) => "D",
         (false, false) => "U",
     }
+}
+
+/// tmux `split-window` command for the sidebar's split controls. The visual
+/// divider is inverted vs. tmux's naming: a side-by-side split (vertical `|`
+/// divider) is tmux `-h`; a stacked split (horizontal `-` divider) is `-v`.
+fn split_command(side_by_side: bool, pane: &str) -> String {
+    let direction = if side_by_side { "h" } else { "v" };
+    format!("split-window -{} -t {}", direction, pane)
+}
+
+/// tmux `select-pane` command focusing the given pane.
+fn select_pane_command(pane: &str) -> String {
+    format!("select-pane -t {}", pane)
+}
+
+/// tmux `kill-pane` command closing the given pane.
+fn kill_pane_command(pane: &str) -> String {
+    format!("kill-pane -t {}", pane)
 }
 
 pub struct SessionView {
@@ -492,11 +513,12 @@ impl SessionView {
                 InputEvent::PressEnter { .. } => {
                     if let Some(rename) = this.renaming_window.take() {
                         let value = input.read(cx).value();
-                        if !value.trim().is_empty() {
+                        let trimmed = value.trim();
+                        if !trimmed.is_empty() {
                             if let Err(e) = this.tmux_command_tx.try_send(format!(
                                 "rename-window -t {} {}",
                                 rename.window_id,
-                                quote_tmux_name(&value)
+                                quote_tmux_name(trimmed)
                             )) {
                                 debug!(error = %e, "failed to send window rename command");
                             }
@@ -626,6 +648,148 @@ impl SessionView {
 
         handle.into_any_element()
     }
+
+    /// The per-window pane sidebar: a fixed-width column listing the active
+    /// window's panes. A row click focuses its pane (`select-pane`), the row
+    /// `x` closes it (`kill-pane`), and the header splits the active pane
+    /// side-by-side (`|` -> `split-window -h`) or stacked (`-` ->
+    /// `split-window -v`). Every control only emits a tmux command; the next
+    /// snapshot redraws the result.
+    fn render_pane_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let bg = cx.theme().tab_bar;
+        let border = cx.theme().border;
+        let active_bg = cx.theme().list_active;
+        let fg = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+
+        let active_pane = self.active_pane_id.as_deref();
+        let rows: Vec<(String, String, bool)> = self
+            .windows
+            .iter()
+            .find(|w| w.is_active)
+            .map(|w| w.pane_ids.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .map(|id| {
+                let label = self
+                    .panes
+                    .get(id)
+                    .and_then(|entry| entry.entity.read(cx).current_command().map(str::to_string))
+                    .filter(|cmd| !cmd.is_empty())
+                    .unwrap_or_else(|| id.clone());
+                let is_active = active_pane == Some(id.as_str());
+                (id.clone(), label, is_active)
+            })
+            .collect();
+
+        // Visual "|" splits side-by-side (tmux `-h`); visual "-" stacks (tmux
+        // `-v`) -- the naming is inverted vs. the divider orientation.
+        let split_side = active_pane.map(|id| split_command(true, id));
+        let split_stack = active_pane.map(|id| split_command(false, id));
+
+        let header = h_flex()
+            .flex_none()
+            .w_full()
+            .gap(px(4.0))
+            .px(px(8.0))
+            .py(px(6.0))
+            .border_b_1()
+            .border_color(border)
+            .child(self.sidebar_button("|", split_side, fg, muted, active_bg, cx))
+            .child(self.sidebar_button("-", split_stack, fg, muted, active_bg, cx));
+
+        let mut list = v_flex().w_full().flex_1().min_h_0();
+        for (id, label, is_active) in rows {
+            let select_id = id.clone();
+            let row_bg = if is_active { active_bg } else { bg };
+            let row_fg = if is_active { fg } else { muted };
+            let row = h_flex()
+                .w_full()
+                .gap(px(6.0))
+                .px(px(8.0))
+                .py(px(4.0))
+                .bg(row_bg)
+                .text_color(row_fg)
+                .hover(|s| s.bg(active_bg).text_color(fg))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event: &MouseDownEvent, _window, _cx| {
+                        if let Err(e) = this
+                            .tmux_command_tx
+                            .try_send(select_pane_command(&select_id))
+                        {
+                            debug!(error = %e, "failed to send select-pane command");
+                        }
+                    }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(SharedString::from(label)),
+                )
+                .child(self.sidebar_button(
+                    "x",
+                    Some(kill_pane_command(&id)),
+                    fg,
+                    muted,
+                    active_bg,
+                    cx,
+                ));
+            list = list.child(row);
+        }
+
+        v_flex()
+            .flex_none()
+            .w(px(PANE_SIDEBAR_WIDTH))
+            .h_full()
+            .bg(bg)
+            .border_r_1()
+            .border_color(border)
+            .text_size(px(DEFAULT_FONT_SIZE))
+            .font_family("JetBrainsMono Nerd Font Mono")
+            .child(header)
+            .child(list)
+            .into_any_element()
+    }
+
+    /// A square glyph button for the pane sidebar. With a command it emits that
+    /// command on click and stops propagation so a parent row does not also act;
+    /// without one it renders dimmed and inert (no active pane to target).
+    fn sidebar_button(
+        &self,
+        glyph: &'static str,
+        command: Option<String>,
+        fg: Hsla,
+        muted: Hsla,
+        hover_bg: Hsla,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let button = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(20.0))
+            .rounded(px(4.0))
+            .child(glyph);
+        match command {
+            Some(command) => button
+                .text_color(muted)
+                .hover(|s| s.bg(hover_bg).text_color(fg))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
+                        if let Err(e) = this.tmux_command_tx.try_send(command.clone()) {
+                            debug!(error = %e, command = %command, "failed to send sidebar command");
+                        }
+                        cx.stop_propagation();
+                    }),
+                ),
+            None => button.text_color(muted.opacity(0.4)),
+        }
+    }
 }
 
 impl Focusable for SessionView {
@@ -677,7 +841,11 @@ impl Render for SessionView {
         let tab_bar_h = statusbar_height();
 
         let viewport = window.viewport_size();
-        let total_cols = (viewport.width / cell_size.width).floor() as usize;
+        // The pane sidebar occupies a fixed slice of the viewport width, so the
+        // panes only get what remains; reporting the full width to tmux would
+        // clip every pane's right edge.
+        let total_cols =
+            ((viewport.width - px(PANE_SIDEBAR_WIDTH)) / cell_size.width).floor() as usize;
         let total_rows = ((viewport.height - statusbar_height() - tab_bar_h) / cell_size.height)
             .floor() as usize;
         let window_size = TermSize {
@@ -720,37 +888,78 @@ impl Render for SessionView {
         };
 
         let selected_index = self.windows.iter().position(|w| w.is_active).unwrap_or(0);
-        // Single click selects the window; double click opens an inline rename
-        // input in place of the label. The handler lives per-`Tab` (not on the
-        // bar) so it sees the click count needed to tell the two apart.
-        let tabs: Vec<Tab> = self
-            .windows
-            .iter()
-            .map(|w| {
-                let window_id = w.id.clone();
-                let editing = self
-                    .renaming_window
-                    .as_ref()
-                    .filter(|rename| rename.window_id == w.id)
-                    .map(|rename| rename.input.clone());
+        // Tab affordances reuse the theme tokens; the close glyph idles muted and
+        // reddens on hover, the new-window glyph idles muted and brightens.
+        let close_idle = cx.theme().muted_foreground;
+        let close_hover = cx.theme().danger;
+        let new_idle = cx.theme().muted_foreground;
+        let new_hover = cx.theme().foreground;
 
-                let tab = match editing {
-                    Some(input) => Tab::new().child(
-                        div()
-                            .w(px(160.0))
-                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                                if event.keystroke.key.as_str() == "escape" {
-                                    this.cancel_window_rename(cx);
-                                    cx.stop_propagation();
+        // One Tab per window. Single click selects the window, double click opens
+        // an inline rename input in place of the label; this dispatch lives on the
+        // per-`Tab` `on_click` (not the bar) because it needs the click count to
+        // tell the two apart. The per-tab "x" suffix and middle-click both kill
+        // the window (own mouse-down + stop_propagation so they do not also
+        // select); the editing tab shows the input instead and omits the "x".
+        let mut tabs: Vec<Tab> = Vec::with_capacity(self.windows.len());
+        for (ix, w) in self.windows.iter().enumerate() {
+            let window_id = w.id.clone();
+            let editing = self
+                .renaming_window
+                .as_ref()
+                .filter(|rename| rename.window_id == w.id)
+                .map(|rename| rename.input.clone());
+
+            let tab = match editing {
+                Some(input) => Tab::new().child(
+                    div()
+                        .w(px(160.0))
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                            if event.keystroke.key.as_str() == "escape" {
+                                this.cancel_window_rename(cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .child(Input::new(&input).xsmall()),
+                ),
+                None => {
+                    let label = SharedString::from(format!("{}: {}", w.index, w.name));
+                    let close_target = w.id.clone();
+                    let middle_target = w.id.clone();
+                    let close = div()
+                        .id(("tab-close", ix))
+                        .px(px(4.0))
+                        .text_color(close_idle)
+                        .hover(move |this| this.text_color(close_hover))
+                        .child("x")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
+                                if let Err(e) = this
+                                    .tmux_command_tx
+                                    .try_send(format!("kill-window -t {}", close_target))
+                                {
+                                    debug!(error = %e, "failed to send kill-window command");
                                 }
-                            }))
-                            .child(Input::new(&input).xsmall()),
-                    ),
-                    None => {
-                        Tab::new().label(SharedString::from(format!("{}: {}", w.index, w.name)))
-                    }
-                };
+                                cx.stop_propagation();
+                            }),
+                        );
+                    Tab::new().label(label).suffix(close).on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
+                            if let Err(e) = this
+                                .tmux_command_tx
+                                .try_send(format!("kill-window -t {}", middle_target))
+                            {
+                                debug!(error = %e, "failed to send kill-window command");
+                            }
+                            cx.stop_propagation();
+                        }),
+                    )
+                }
+            };
 
+            tabs.push(
                 tab.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                     if event.click_count() >= 2 {
                         this.start_window_rename(&window_id, window, cx);
@@ -760,13 +969,30 @@ impl Render for SessionView {
                     {
                         debug!(error = %e, "failed to send window switch command");
                     }
-                }))
-            })
-            .collect();
+                })),
+            );
+        }
+
+        let new_window = div()
+            .id("tab-new-window")
+            .px(px(8.0))
+            .text_color(new_idle)
+            .hover(move |this| this.text_color(new_hover))
+            .child("+")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
+                    if let Err(e) = this.tmux_command_tx.try_send("new-window".into()) {
+                        debug!(error = %e, "failed to send new-window command");
+                    }
+                    cx.stop_propagation();
+                }),
+            );
 
         let tab_bar = TabBar::new("tab-bar")
             .selected_index(selected_index)
-            .children(tabs);
+            .children(tabs)
+            .suffix(new_window);
 
         let border_color = cx.theme().border;
         let pane_area = if let Some(ref layout) = self.layout {
@@ -832,7 +1058,16 @@ impl Render for SessionView {
                 }
             }))
             .child(tab_bar)
-            .child(pane_area)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(self.render_pane_sidebar(cx))
+                    .child(div().flex().flex_1().min_w_0().h_full().child(pane_area)),
+            )
             .child(statusbar);
 
         // While dragging a border, a full-window overlay captures all mouse
@@ -888,7 +1123,9 @@ impl Render for SessionView {
 
 #[cfg(test)]
 mod tests {
-    use super::{quote_tmux_name, resize_direction};
+    use super::{
+        kill_pane_command, quote_tmux_name, resize_direction, select_pane_command, split_command,
+    };
 
     #[test]
     fn test_quote_tmux_name_plain_wraps_in_single_quotes() {
@@ -915,5 +1152,25 @@ mod tests {
     fn test_resize_direction_vertical() {
         assert_eq!(resize_direction(false, true), "D");
         assert_eq!(resize_direction(false, false), "U");
+    }
+
+    #[test]
+    fn test_split_command_side_by_side_uses_h() {
+        assert_eq!(split_command(true, "%3"), "split-window -h -t %3");
+    }
+
+    #[test]
+    fn test_split_command_stacked_uses_v() {
+        assert_eq!(split_command(false, "%3"), "split-window -v -t %3");
+    }
+
+    #[test]
+    fn test_select_pane_command_targets_pane() {
+        assert_eq!(select_pane_command("%7"), "select-pane -t %7");
+    }
+
+    #[test]
+    fn test_kill_pane_command_targets_pane() {
+        assert_eq!(kill_pane_command("%7"), "kill-pane -t %7");
     }
 }
