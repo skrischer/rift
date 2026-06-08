@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use gpui::*;
-use gpui_component::tab::TabBar;
+use gpui_component::tab::{Tab, TabBar};
 use gpui_component::{h_flex, v_flex, ActiveTheme};
 use termy_terminal_ui::TmuxSnapshot;
 use tracing::debug;
@@ -804,15 +804,74 @@ impl Render for SessionView {
 
         let selected_index = self.windows.iter().position(|w| w.is_active).unwrap_or(0);
         let window_ids: Vec<String> = self.windows.iter().map(|w| w.id.clone()).collect();
-        let tab_labels: Vec<SharedString> = self
-            .windows
-            .iter()
-            .map(|w| SharedString::from(format!("{}: {}", w.index, w.name)))
-            .collect();
+
+        // Tab affordances reuse the theme tokens; the close glyph idles muted and
+        // reddens on hover, the new-window glyph idles muted and brightens.
+        let close_idle = cx.theme().muted_foreground;
+        let close_hover = cx.theme().danger;
+        let new_idle = cx.theme().muted_foreground;
+        let new_hover = cx.theme().foreground;
+
+        // One Tab per window. The per-tab "x" is a suffix element with its own
+        // mouse-down + stop_propagation so it does not also trigger the bar-level
+        // select-window; middle-click anywhere on the tab kills the window too.
+        let mut tabs: Vec<Tab> = Vec::with_capacity(self.windows.len());
+        for (ix, w) in self.windows.iter().enumerate() {
+            let label = SharedString::from(format!("{}: {}", w.index, w.name));
+            let close_target = w.id.clone();
+            let middle_target = w.id.clone();
+            let close = div()
+                .id(("tab-close", ix))
+                .px(px(4.0))
+                .text_color(close_idle)
+                .hover(move |this| this.text_color(close_hover))
+                .child("x")
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
+                        if let Err(e) = this
+                            .tmux_command_tx
+                            .try_send(format!("kill-window -t {}", close_target))
+                        {
+                            debug!(error = %e, "failed to send kill-window command");
+                        }
+                        cx.stop_propagation();
+                    }),
+                );
+            tabs.push(Tab::new().label(label).suffix(close).on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
+                    if let Err(e) = this
+                        .tmux_command_tx
+                        .try_send(format!("kill-window -t {}", middle_target))
+                    {
+                        debug!(error = %e, "failed to send kill-window command");
+                    }
+                    cx.stop_propagation();
+                }),
+            ));
+        }
+
+        let new_window = div()
+            .id("tab-new-window")
+            .px(px(8.0))
+            .text_color(new_idle)
+            .hover(move |this| this.text_color(new_hover))
+            .child("+")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
+                    if let Err(e) = this.tmux_command_tx.try_send("new-window".into()) {
+                        debug!(error = %e, "failed to send new-window command");
+                    }
+                    cx.stop_propagation();
+                }),
+            );
 
         let tab_bar = TabBar::new("tab-bar")
             .selected_index(selected_index)
-            .children(tab_labels)
+            .children(tabs)
+            .suffix(new_window)
             .on_click(cx.listener(move |this, index: &usize, _, _| {
                 if let Some(id) = window_ids.get(*index) {
                     if let Err(e) = this
