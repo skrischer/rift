@@ -17,6 +17,10 @@ const DEFAULT_FONT_SIZE: f32 = 14.0;
 const MIN_FONT_SIZE: f32 = 8.0;
 const MAX_FONT_SIZE: f32 = 40.0;
 const FONT_SIZE_STEP: f32 = 1.0;
+/// Width of the always-visible pane sidebar. Shared between the sidebar render
+/// and the tmux client-width compute so the reported column count never
+/// includes the space the sidebar occupies.
+const PANE_SIDEBAR_WIDTH: f32 = 160.0;
 
 pub struct TerminalHandle {
     pub pane_output_tx: flume::Sender<PaneOutput>,
@@ -62,6 +66,24 @@ fn resize_direction(horizontal: bool, delta_positive: bool) -> &'static str {
         (false, true) => "D",
         (false, false) => "U",
     }
+}
+
+/// tmux `split-window` command for the sidebar's split controls. The visual
+/// divider is inverted vs. tmux's naming: a side-by-side split (vertical `|`
+/// divider) is tmux `-h`; a stacked split (horizontal `-` divider) is `-v`.
+fn split_command(side_by_side: bool, pane: &str) -> String {
+    let direction = if side_by_side { "h" } else { "v" };
+    format!("split-window -{} -t {}", direction, pane)
+}
+
+/// tmux `select-pane` command focusing the given pane.
+fn select_pane_command(pane: &str) -> String {
+    format!("select-pane -t {}", pane)
+}
+
+/// tmux `kill-pane` command closing the given pane.
+fn kill_pane_command(pane: &str) -> String {
+    format!("kill-pane -t {}", pane)
 }
 
 pub struct SessionView {
@@ -557,7 +579,7 @@ impl SessionView {
         let fg = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
 
-        let active_pane = self.active_pane_id.clone();
+        let active_pane = self.active_pane_id.as_deref();
         let rows: Vec<(String, String, bool)> = self
             .windows
             .iter()
@@ -572,19 +594,15 @@ impl SessionView {
                     .and_then(|entry| entry.entity.read(cx).current_command().map(str::to_string))
                     .filter(|cmd| !cmd.is_empty())
                     .unwrap_or_else(|| id.clone());
-                let is_active = active_pane.as_deref() == Some(id.as_str());
+                let is_active = active_pane == Some(id.as_str());
                 (id.clone(), label, is_active)
             })
             .collect();
 
         // Visual "|" splits side-by-side (tmux `-h`); visual "-" stacks (tmux
         // `-v`) -- the naming is inverted vs. the divider orientation.
-        let split_side = active_pane
-            .as_ref()
-            .map(|id| format!("split-window -h -t {}", id));
-        let split_stack = active_pane
-            .as_ref()
-            .map(|id| format!("split-window -v -t {}", id));
+        let split_side = active_pane.map(|id| split_command(true, id));
+        let split_stack = active_pane.map(|id| split_command(false, id));
 
         let header = h_flex()
             .flex_none()
@@ -615,7 +633,7 @@ impl SessionView {
                     cx.listener(move |this, _event: &MouseDownEvent, _window, _cx| {
                         if let Err(e) = this
                             .tmux_command_tx
-                            .try_send(format!("select-pane -t {}", select_id))
+                            .try_send(select_pane_command(&select_id))
                         {
                             debug!(error = %e, "failed to send select-pane command");
                         }
@@ -630,7 +648,7 @@ impl SessionView {
                 )
                 .child(self.sidebar_button(
                     "x",
-                    Some(format!("kill-pane -t {}", id)),
+                    Some(kill_pane_command(&id)),
                     fg,
                     muted,
                     active_bg,
@@ -641,7 +659,7 @@ impl SessionView {
 
         v_flex()
             .flex_none()
-            .w(px(160.0))
+            .w(px(PANE_SIDEBAR_WIDTH))
             .h_full()
             .bg(bg)
             .border_r_1()
@@ -738,7 +756,11 @@ impl Render for SessionView {
         let tab_bar_h = statusbar_height();
 
         let viewport = window.viewport_size();
-        let total_cols = (viewport.width / cell_size.width).floor() as usize;
+        // The pane sidebar occupies a fixed slice of the viewport width, so the
+        // panes only get what remains; reporting the full width to tmux would
+        // clip every pane's right edge.
+        let total_cols =
+            ((viewport.width - px(PANE_SIDEBAR_WIDTH)) / cell_size.width).floor() as usize;
         let total_rows = ((viewport.height - statusbar_height() - tab_bar_h) / cell_size.height)
             .floor() as usize;
         let window_size = TermSize {
@@ -931,7 +953,7 @@ impl Render for SessionView {
 
 #[cfg(test)]
 mod tests {
-    use super::resize_direction;
+    use super::{kill_pane_command, resize_direction, select_pane_command, split_command};
 
     #[test]
     fn test_resize_direction_horizontal() {
@@ -943,5 +965,25 @@ mod tests {
     fn test_resize_direction_vertical() {
         assert_eq!(resize_direction(false, true), "D");
         assert_eq!(resize_direction(false, false), "U");
+    }
+
+    #[test]
+    fn test_split_command_side_by_side_uses_h() {
+        assert_eq!(split_command(true, "%3"), "split-window -h -t %3");
+    }
+
+    #[test]
+    fn test_split_command_stacked_uses_v() {
+        assert_eq!(split_command(false, "%3"), "split-window -v -t %3");
+    }
+
+    #[test]
+    fn test_select_pane_command_targets_pane() {
+        assert_eq!(select_pane_command("%7"), "select-pane -t %7");
+    }
+
+    #[test]
+    fn test_kill_pane_command_targets_pane() {
+        assert_eq!(kill_pane_command("%7"), "kill-pane -t %7");
     }
 }
