@@ -6,8 +6,8 @@ use anyhow::{Context as _, Result};
 use gpui::*;
 use gpui_component::{Root, Theme, ThemeMode, ThemeRegistry};
 use rift_terminal::{
-    CaptureRequest, CaptureResult, ConnectionStatus, PaneInput, PaneOutput, SessionView,
-    SubscriptionUpdate, TermSize,
+    CaptureRequest, CaptureResult, ConnectionStatus, PaneInput, PaneOutput, SelectWindow,
+    SessionView, SubscriptionUpdate, TermSize,
 };
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -70,6 +70,12 @@ fn main() {
     Application::with_platform(gpui_platform::current_platform(false)).run(|cx: &mut App| {
         gpui_component::init(cx);
         apply_theme(cx);
+        // Alt+1..9 -> switch to window N. Unshifted modifier+digit needs no
+        // keyboard-layout mapping, so it matches identically on Windows and
+        // Linux/X11 (where GPUI's keyboard mapper is a no-op).
+        cx.bind_keys(
+            (1..=9usize).map(|n| KeyBinding::new(&format!("alt-{n}"), SelectWindow(n), None)),
+        );
         let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
         cx.open_window(
             WindowOptions {

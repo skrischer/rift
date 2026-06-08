@@ -9,8 +9,8 @@ use tracing::debug;
 use crate::layout::{self, LayoutNode};
 use crate::pane_view::{measure_cell_size, statusbar_height, PaneView};
 use crate::{
-    CaptureRequest, CaptureResult, ConnectionStatus, PaneInput, PaneOutput, SubscriptionUpdate,
-    TermSize,
+    CaptureRequest, CaptureResult, ConnectionStatus, PaneInput, PaneOutput, SelectWindow,
+    SubscriptionUpdate, TermSize,
 };
 
 const DEFAULT_FONT_SIZE: f32 = 14.0;
@@ -699,6 +699,20 @@ impl Render for SessionView {
             .flex_col()
             .size_full()
             .bg(cx.theme().background)
+            // Alt+1..9 window switch. The action is dispatched here (an ancestor
+            // of the focused pane) before the keystroke reaches the PTY; the
+            // 1-based number selects the Nth window in tab order, mirroring the
+            // tab-bar click handler.
+            .on_action(cx.listener(|this, action: &SelectWindow, _window, _cx| {
+                if let Some(win) = this.windows.get(action.0.saturating_sub(1)) {
+                    if let Err(e) = this
+                        .tmux_command_tx
+                        .try_send(format!("select-window -t {}", win.id))
+                    {
+                        debug!(error = %e, "failed to send window switch command");
+                    }
+                }
+            }))
             .child(tab_bar)
             .child(pane_area)
             .child(statusbar);

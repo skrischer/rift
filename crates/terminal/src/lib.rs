@@ -64,6 +64,18 @@ pub enum ConnectionStatus {
     Disconnected,
 }
 
+/// Switches to the Nth window (1-based, by statusbar tab order) of the active
+/// tmux session. Bound to `Alt+1..9` in the app and dispatched to [`SessionView`]
+/// through the GPUI action system, so the chord is intercepted before the
+/// keystroke reaches the PTY. `Alt+digit` (rather than `Ctrl+Shift+digit`) is
+/// deliberate: GPUI normalizes shifted digits to their layout symbol and strips
+/// the shift modifier, and on Linux/X11 the keyboard mapper is a no-op, so a
+/// `ctrl-shift-1` binding cannot match there. An unshifted modifier+digit needs
+/// no layout mapping and matches identically on Windows and Linux.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct SelectWindow(pub usize);
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TermSize {
     pub cols: usize,
