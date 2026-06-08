@@ -36,7 +36,7 @@ Mouse-driven tmux pane/window lifecycle in the GPU UI: closing a pane via `exit`
 
 **Planned: tmux status-line mirroring** — under `tmux -CC` the user's `status-left/right/style` config is queryable but never rendered, so it is currently ignored. An opt-in mode would mirror it in the native statusbar via a tmux format-string interpreter. Own DRAFT spec: [spec-tmux-statusline-mirroring.md](spec-tmux-statusline-mirroring.md). Sibling to key-table mirroring (both surface a hidden tmux config primitive); the Phase 2d native statusbar stays the default.
 
-**Meta track: implementation workflow automation** — automate the issue → merged cycle that emerged across the Phase 2d work: a `just pr-merge` recipe (remote-only merge + cleanup), a CI job that finally compiles `rift-app`, board status transitions baked into the worktree/merge recipes, an interactive tmux reviewer pane, and a `/implement` skill tying it together. Tooling/DX, not a product phase. Spec: [spec-workflow-automation.md](spec-workflow-automation.md).
+**Meta track: implementation workflow automation** — COMPLETED 2026-06-08. Automated the issue → merged cycle that emerged across the Phase 2d work: a `just pr-merge` recipe (remote-only merge + cleanup), a CI `app-check` job that finally compiles `rift-app`, board status transitions baked into the worktree recipe (`In Progress`) and the skill close-out (`Done`), an interactive tmux reviewer pane, and a `/implement` skill tying it together. Tooling/DX, not a product phase. Spec: [archive/spec-workflow-automation.md](archive/spec-workflow-automation.md). Milestone: [Workflow automation](https://github.com/skrischer/rift/milestone/6).
 
 ## What comes after Phase 2d
 
