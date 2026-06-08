@@ -1,6 +1,6 @@
 # Spec: Planning workflow automation
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-06-08
 > Completed: —
 
@@ -30,11 +30,12 @@ completed implementation-workflow automation, filling the slot it reserved.
 
 ### In scope
 
-- `just plan-issues <spec> <step-list>` — milestone create (idempotent on title) +
-  one issue per step (Spec / Goal / Acceptance, matching the issue form fields) +
-  board add as `Todo`, reusing `set-issue-status.sh` and the gh-2.45 workarounds.
-  The step-list **input format is the one genuinely-open decision** (see Prior
-  decisions), resolved at the review gate before `READY`.
+- `just plan-issues <spec> <milestone-title> <step-file>` — milestone create
+  (idempotent on title) + one issue per step (Spec / Goal / Acceptance, matching the
+  issue form fields) + board add as `Todo`, reusing `set-issue-status.sh` and the
+  gh-2.45 workarounds. The `<step-file>` is a markdown file: one `## [scope] Title`
+  heading per step, with a `Goal:` line and an `Acceptance:` checklist beneath; the
+  recipe splits on the headings and injects the spec path into each issue body.
 - `.claude/skills/plan/SKILL.md` — the `/plan` orchestration skill, mirroring
   `/implement`'s shape: preconditions, numbered phases, hard gates, if-blocked. It
   inlines the happy-path commands and references `docs/planning-workflow.md` for the
@@ -85,7 +86,7 @@ completed implementation-workflow automation, filling the slot it reserved.
 | Milestone + issues are created after the spec merges, never in the spec PR | `issue-spec-check` resolves the spec path against the default branch; an unmerged spec would flag every issue `needs-spec`. | 2026-06-08 |
 | The roadmap update is its own `docs:` PR after the milestone/issues exist | Folding it into the spec PR would force omitting the concrete `#NN` milestone/issue links (they do not exist pre-merge); a separate PR keeps the links live. Runbook optimization #4 trade-off. | 2026-06-08 |
 | `/plan` runs readiness → spec → PR → review autonomously and stops only at the genuinely-open-decision gate and the merge gate | Mirrors `/implement`'s autonomy split: the routine steps flow, the two judgment/irreversible points (an unsettled design decision; the merge) stay human. | 2026-06-08 |
-| **OPEN — resolved at the review gate:** the `plan-issues` step-list input format | No precedent or constraint settles how the planner hands N multi-field steps (title / goal / acceptance) to the recipe — a markdown file, a TSV, or a heredoc DSL. The one genuinely-open decision; surfaced via `AskUserQuestion` at Phase 4 before the `READY` flip. | 2026-06-08 |
+| `plan-issues` step-list = a markdown file, one `## [scope] Title` per step with a `Goal:` line and an `Acceptance:` checklist | Resolved at the review gate (`AskUserQuestion`) over a TSV and a heredoc DSL: markdown is human-readable, diff-friendly, carries multi-line acceptance checklists natively, and needs no parser dependency (section split + field read). | 2026-06-08 |
 
 ## Tracking
 
@@ -104,13 +105,15 @@ completed implementation-workflow automation, filling the slot it reserved.
 - [ ] Every generated issue passes `issue-spec-check` (its spec ref resolves) — no
       `needs-spec` label.
 - [ ] `/plan <scope>` drives the readiness → merged-`READY`-spec → milestone+issues →
-      roadmap cycle, pausing only at the two gates.
-- [ ] The review gate yields a structured `APPROVE` / `REQUEST_CHANGES` verdict from
-      a fresh context; `REQUEST_CHANGES` blocks the `READY` flip.
+      roadmap cycle, pausing only at the two gates (observed on a trial spec, since
+      this spec's own issues are hand-rolled per the bootstrap).
+- [ ] The review gate yields a structured `READY` / `NEEDS CHANGES` verdict from a
+      fresh context; `NEEDS CHANGES` blocks the `READY` flip.
 - [ ] A genuinely-open decision in the trial spec is surfaced via `AskUserQuestion`,
       not guessed.
-- [ ] This spec itself was produced by the cycle it specifies (dogfooded), and the
-      friction observed is folded into the skill.
+- [ ] The spec-authoring half of the cycle (readiness → spec → PR → review) was
+      dogfooded to produce this spec; `plan-issues` is first exercised on the next
+      spec, and the friction observed feeds the skill.
 
 ## Risks and mitigations
 
@@ -126,4 +129,8 @@ completed implementation-workflow automation, filling the slot it reserved.
 Decisions made during implementation. Claude Code adds entries here as work
 progresses.
 
-- (none yet)
+- The `plan-issues` step-list input format was the spec's one genuinely-open
+  decision, resolved at the review gate via `AskUserQuestion`: a markdown file (one
+  `## [scope] Title` per step, `Goal:` + `Acceptance:` beneath) over a TSV
+  (multi-line acceptance does not fit one line) and a heredoc DSL (needs a field
+  parser). Markdown is diff-friendly and dependency-free. — 2026-06-08
