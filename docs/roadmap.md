@@ -14,6 +14,7 @@ Living document tracking project phases, current status, and planned work.
 | 2e | gpui-component UI foundation | COMPLETED 2026-06-05 | [archive/spec-gpui-component-adoption.md](archive/spec-gpui-component-adoption.md) |
 | 3 | Remote daemon — scaffolding + transport | READY | [spec-daemon-scaffolding.md](spec-daemon-scaffolding.md) |
 | 3 | Remote daemon — worktree file-tree sync | READY | [spec-daemon-filetree.md](spec-daemon-filetree.md) |
+| 3 | Remote daemon — git status | READY | [spec-daemon-git-status.md](spec-daemon-git-status.md) |
 
 ## Current focus
 
@@ -56,6 +57,10 @@ The foundational decisions are resolved (see [spec-daemon-scaffolding.md](spec-d
 Phase 3 is the biggest architectural change since the project began and needs multiple sub-specs (daemon scaffolding, file tree, git status, LSP integration, terminal streaming). The first — daemon scaffolding + transport — is `READY`, with milestone [Phase 3 — Remote daemon](https://github.com/skrischer/rift/milestone/4) and issues #57–#62.
 
 The second sub-spec — **worktree file-tree sync** — is now `READY`: the daemon scans/watches a project root, maintains a Zed-style worktree `Snapshot`, and streams it to the client as an initial snapshot plus incremental `UpdateWorktree` updates. The file-sync strategy was pre-decided in the scaffolding spec (Zed `Snapshot` + incremental updates, `notify` + `jwalk`, honor VCS ignore rules); the one open decision — whether to also ship the GPUI explorer panel — was resolved at the review gate to **data-layer-only**, leaving the rendered panel (and its git-status decoration) to its own later sub-spec. It redesigns the placeholder `rift-protocol` file messages and fleshes out the empty `crates/explorer`. Spec: [spec-daemon-filetree.md](spec-daemon-filetree.md). Milestone: [Phase 3 — Worktree file-tree sync](https://github.com/skrischer/rift/milestone/9) (issues #107–#111). Its implementation sequences after the scaffolding transport lands.
+
+The third sub-spec — **git status** — is now `READY`: the daemon computes per-file git status (staged + unstaged) for the watched worktree plus repo-level branch + ahead/behind via `gix` (pure-Rust, musl-clean; `git2`/`libgit2` ruled out by the static-musl constraint), and streams it as incremental decoration on the worktree-snapshot entries — re-introducing the status slot the file-tree spec reserved. Because the worktree watcher ignores `.git/`, it observes a minimal `.git/` whitelist (`HEAD`, `index`, `refs/`, `packed-refs`) as a second watched set so commits, staging, and branch switches are reflected. The one open decision — git-state granularity — was resolved at the review gate to **full porcelain** (per-file index/worktree pair plus repo-level branch state, the eventual successor to the tmux-sourced statusbar branch but not wired into it here); the cut stays **data-layer-only**, read-only, single-root. Spec: [spec-daemon-git-status.md](spec-daemon-git-status.md). Milestone: [Phase 3 — Git status](https://github.com/skrischer/rift/milestone/11) (issues #131–#135). Its implementation sequences after the file-tree sync lands.
+
+That leaves **LSP integration** and **terminal streaming** as the remaining Phase 3 sub-specs to plan; terminal streaming first needs the VTE-parsing-location spike (see above).
 
 See [prior-art.md](prior-art.md) for reference implementations (Zed `remote_server`, Lapce proxy, Arbor, `async-lsp`) and candidate dependencies to draw from when writing these specs.
 
