@@ -67,6 +67,7 @@ Used in spec headers and `roadmap.md`:
 - `COMPLETED` — all verification met, with date; spec moved to `archive/`
 - `BLOCKED` — cannot proceed, reason documented
 - `DEFERRED` — consciously postponed, reason documented
+- `LIVING` — a rolling backlog spec with no terminal done-state; never `COMPLETED`, never archived (see "Living specs" below). Example: `spec-dogfooding-fixes.md`
 
 ## When a spec is ready for implementation
 
@@ -87,6 +88,10 @@ A good spec answers: what is true when this is done? What must NOT be touched? W
 5. Update `roadmap.md`
 
 When blocked: set status to `BLOCKED` with the reason in the spec header, and comment on the affected issue.
+
+## Living specs
+
+A `LIVING` spec is a rolling backlog — a single design anchor (the *admission policy*) for many small, self-contained fixes that each do not warrant their own spec. It is **exempt from "When work completes"**: it never reaches `COMPLETED` and is never moved to `archive/`, because there is no terminal done-state — the backlog refills. The spec body stays generic (policy, not a per-entry list); the individual fixes live and close as issues, exactly like any other spec. Entries are grouped by a label rather than a milestone, since an open-ended backlog never closes. A fix that turns out to carry a real design surface graduates to its own spec. Example: `spec-dogfooding-fixes.md`.
 
 ## Language
 
