@@ -200,7 +200,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // Import only `registry`, not `super::*`: the module glob-imports `gpui::*`,
+    // which brings gpui's `test` attribute macro into scope and shadows the
+    // built-in `#[test]`, blowing the macro recursion limit.
+    use super::registry;
     use std::collections::HashSet;
 
     #[test]
