@@ -161,4 +161,4 @@ cargo build --release -p daemon --target x86_64-unknown-linux-musl  # daemon rel
 
 ## Cross-compilation and deployment
 
-The daemon is compiled for `x86_64-unknown-linux-musl` (static linking). The GPUI app currently targets Windows (`x86_64-pc-windows-gnu`, cross-compiled from WSL via MinGW) and Linux (Vulkan/X11); macOS is supported by GPUI but deferred for rift. The primary dev loop builds the app in WSL and runs the resulting `.exe` on the Windows host.
+The daemon is compiled for `x86_64-unknown-linux-musl` (static linking). The target is declared in `rust-toolchain.toml`, so `rustup` installs it automatically; the daemon is a pure-Rust binary that links self-contained via Rust's bundled linker, so no `musl-gcc`/`musl-tools` is required locally. Build it with `just release-daemon`. The CI `daemon-musl` job builds the same artifact on each PR to keep the cross-compile reproducible. The GPUI app currently targets Windows (`x86_64-pc-windows-gnu`, cross-compiled from WSL via MinGW) and Linux (Vulkan/X11); macOS is supported by GPUI but deferred for rift. The primary dev loop builds the app in WSL and runs the resulting `.exe` on the Windows host.

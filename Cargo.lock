@@ -5286,11 +5286,7 @@ name = "rift-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "rift-explorer",
- "rift-plugin-api",
  "rift-protocol",
- "rift-terminal",
- "rift-tmux-core",
  "tokio",
 ]
 
