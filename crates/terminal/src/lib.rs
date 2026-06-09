@@ -11,6 +11,13 @@ pub use termy_terminal_ui::TerminalUiRenderMetricsSnapshot;
 
 use alacritty_terminal::grid::Dimensions;
 
+/// GPUI key context set on the terminal pane's focusable div. The app binds
+/// `tab`/`shift-tab` to `NoAction` in this context to shadow gpui-component's
+/// `Root` focus-navigation and forward Tab to the PTY. Exported so the binding
+/// and the `key_context(...)` call reference one string instead of two literals
+/// that must stay in sync.
+pub const TERMINAL_KEY_CONTEXT: &str = "Terminal";
+
 pub struct PaneOutput {
     pub pane_id: String,
     pub bytes: Vec<u8>,

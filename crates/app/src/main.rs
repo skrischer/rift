@@ -7,7 +7,7 @@ use gpui::*;
 use gpui_component::{Root, Theme, ThemeMode, ThemeRegistry};
 use rift_terminal::{
     CaptureRequest, CaptureResult, ConnectionStatus, PaneInput, PaneOutput, SelectWindow,
-    SessionView, SubscriptionUpdate, TermSize,
+    SessionView, SubscriptionUpdate, TermSize, TERMINAL_KEY_CONTEXT,
 };
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -85,8 +85,8 @@ fn main() {
         // existing `encode_keystroke` path (`\t` / `\x1b[Z`). Scoped to "Terminal", so
         // Tab still navigates focus in dialogs and forms.
         cx.bind_keys([
-            KeyBinding::new("tab", NoAction, Some("Terminal")),
-            KeyBinding::new("shift-tab", NoAction, Some("Terminal")),
+            KeyBinding::new("tab", NoAction, Some(TERMINAL_KEY_CONTEXT)),
+            KeyBinding::new("shift-tab", NoAction, Some(TERMINAL_KEY_CONTEXT)),
         ]);
         let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
         cx.open_window(

@@ -990,7 +990,7 @@ impl Render for PaneView {
 
         let mut terminal_area = div()
             .id("terminal")
-            .key_context("Terminal")
+            .key_context(crate::TERMINAL_KEY_CONTEXT)
             .track_focus(&self.focus_handle(cx))
             .flex_1()
             .bg(bg_hsla);
