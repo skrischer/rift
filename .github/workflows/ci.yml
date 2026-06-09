@@ -43,6 +43,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: app-check
@@ -56,6 +58,14 @@ jobs:
 
       - name: Check rift-app
         run: cargo check -p rift-app
+
+      # The gallery is a feature-gated second binary headless agents never build;
+      # this is its only automated gate (clippy compiles the test module too).
+      - name: Clippy rift-app (gallery feature)
+        run: cargo clippy -p rift-app --features gallery --all-targets -- -D warnings
+
+      - name: Test rift-app (gallery feature)
+        run: cargo test -p rift-app --features gallery
 
   daemon-musl:
     name: Daemon musl build

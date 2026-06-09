@@ -283,6 +283,7 @@ export RIFT_SSH_PORT := env("RIFT_SSH_PORT", "22")
 export RIFT_SSH_KEY := env("RIFT_SSH_KEY", home_directory() / ".ssh" / "id_rsa")
 windows_ssh_key := env("RIFT_WINDOWS_SSH_KEY", "C:\\Users\\skrischer\\.ssh\\id_rsa")
 windows_exe := "target/x86_64-pc-windows-gnu/debug/rift.exe"
+windows_gallery_exe := "target/x86_64-pc-windows-gnu/debug/gallery.exe"
 
 dev:
     WAYLAND_DISPLAY="" \
@@ -322,6 +323,15 @@ dev-windows-watch:
 # Build Windows .exe without running
 build-windows:
     cargo build -p rift-app --target x86_64-pc-windows-gnu
+
+# Build and run the component gallery (Windows .exe, cross-compiled via MinGW).
+# Mirrors dev-windows; the gallery is a standalone dev window with no SSH wiring.
+gallery:
+    cargo build -p rift-app --features gallery --bin gallery --target x86_64-pc-windows-gnu
+    -taskkill.exe /F /IM gallery.exe 2>/dev/null
+    export WSLENV="RUST_LOG" && \
+    export RUST_LOG=rift_app=debug && \
+    {{windows_gallery_exe}}
 
 # Check licenses (requires cargo-deny)
 deny:
