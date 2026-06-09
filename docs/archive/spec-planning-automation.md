@@ -1,8 +1,8 @@
 # Spec: Planning workflow automation
 
-> Status: READY
+> Status: COMPLETED
 > Created: 2026-06-08
-> Completed: —
+> Completed: 2026-06-09
 
 Automate the planning cycle (readiness → `READY` spec + milestone + issues) via a
 `just plan-issues` recipe and a `/plan` skill — the planning-side sibling to the
@@ -134,3 +134,27 @@ progresses.
   `## [scope] Title` per step, `Goal:` + `Acceptance:` beneath) over a TSV
   (multi-line acceptance does not fit one line) and a heredoc DSL (needs a field
   parser). Markdown is diff-friendly and dependency-free. — 2026-06-08
+- `plan-issues` gained a `PLAN_ISSUES_PREVIEW=1` mode that prints the milestone and
+  each issue body with no GitHub writes. Added so the recipe could be verified
+  non-destructively (the new parsing/idempotency glue) while the `gh` write
+  primitives were already proven by the hand-rolled bootstrap of #93/#94; it doubles
+  as a planner preview before a real run. — 2026-06-09
+- `plan-issues` validates every step (title / `Goal:` / `Acceptance:`) in a pre-pass
+  before any GitHub write, and tolerates a `set-issue-status.sh` failure (the board's
+  built-in `Todo` default covers it) instead of aborting. Both folded in from the
+  review of #96 so a malformed late step or a transient board lag cannot leave a
+  partial run. — 2026-06-09
+- The review gate runs through the in-session Agent tool, confirmed clean while
+  dogfooding (structured `READY`/`NEEDS CHANGES` verdict, no tmux/`send-keys`
+  fragility). `/implement`'s tmux review-pane stays reserved for code diffs that need
+  a lingering interactive pane. — 2026-06-09
+- A transient `mergeStateStatus=UNKNOWN` abort in `pr-merge` (GitHub computes
+  mergeability asynchronously) surfaced repeatedly while dogfooding this cycle. Since
+  it blocks both `/implement` and `/plan`, it was fixed as a sibling `chore(pr-merge)`
+  (#97, re-poll the transient state) on the already-COMPLETED implementation-side
+  tooling rather than smuggled into this spec's scope. — 2026-06-09
+- The `/plan` skill was verified end-to-end on a throwaway trial spec (Agent-tool
+  review -> `READY` -> real `plan-issues` creation of milestone + issue on the board,
+  idempotent re-run), then fully torn down — leaving no trace on `develop`. This
+  closes the "drives one real cycle" verification beyond the spec-authoring dogfood.
+  — 2026-06-09
