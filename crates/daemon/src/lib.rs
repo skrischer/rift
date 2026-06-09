@@ -1,4 +1,5 @@
-use rift_protocol::{ClientMessage, DaemonMessage, PROTOCOL_VERSION};
+use rift_protocol::{encode_frame, ClientMessage, DaemonMessage, FrameDecoder, PROTOCOL_VERSION};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, watch};
 
 /// Single source of truth for the daemon's observable state.
@@ -61,6 +62,87 @@ pub fn channels(event_capacity: usize, inbound_capacity: usize) -> (Daemon, Hand
         state: state_rx,
     };
     (daemon, handles)
+}
+
+/// Capacities for the channels backing a [`serve`] session.
+///
+/// Sized for a single client connection: the inbound queue absorbs bursts of
+/// `ClientMessage`s while the dispatch loop drains them, and the broadcast
+/// backlog bounds how far an outbound writer may lag before lagged events are
+/// dropped.
+const SERVE_INBOUND_CAPACITY: usize = 256;
+const SERVE_EVENT_CAPACITY: usize = 256;
+
+/// Read buffer for a single transport read. The transport delivers arbitrary
+/// chunk sizes; the [`FrameDecoder`] reassembles frames regardless of this size.
+const SERVE_READ_BUFFER: usize = 8 * 1024;
+
+/// Run a daemon over a byte-stream transport until either side closes.
+///
+/// Decodes [`ClientMessage`] frames from `reader` into the dispatch loop and
+/// writes [`DaemonMessage`] frames from the event bus to `writer`. This is the
+/// single transport seam: the daemon binary feeds it stdio, an integration test
+/// feeds it a `tokio::io::duplex` pipe, and a future SSH-channel host feeds it
+/// the channel's read/write halves — all without touching the dispatch loop.
+///
+/// Returns once the reader reaches EOF or the writer/event bus closes.
+pub async fn serve<R, W>(reader: R, mut writer: W) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let (daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
+    let mut events = handles.subscribe();
+    let inbound = handles.inbound.clone();
+    // Drop the remaining handles so the dispatch loop ends once `inbound` (held
+    // by the reader task) is dropped at EOF; keep only the subscription and the
+    // inbound sender that this session drives.
+    drop(handles);
+
+    let dispatch = tokio::spawn(daemon.run());
+
+    let mut reader = reader;
+    let mut decoder = FrameDecoder::new();
+    let mut buf = vec![0u8; SERVE_READ_BUFFER];
+
+    'serve: loop {
+        tokio::select! {
+            read = reader.read(&mut buf) => {
+                let n = read?;
+                if n == 0 {
+                    // Reader EOF: stop accepting input. Dropping `inbound` lets
+                    // the dispatch loop drain and exit.
+                    break 'serve;
+                }
+                decoder.push(&buf[..n]);
+                while let Some(msg) = decoder.next_frame::<ClientMessage>()? {
+                    if inbound.send(msg).await.is_err() {
+                        // Dispatch loop gone; stop serving entirely rather than
+                        // reading and discarding further frames.
+                        break 'serve;
+                    }
+                }
+            }
+            event = events.recv() => {
+                match event {
+                    Ok(msg) => {
+                        let frame = encode_frame(&msg)?;
+                        writer.write_all(&frame).await?;
+                        writer.flush().await?;
+                    }
+                    // Lagged: the writer fell behind the broadcast backlog. Skip
+                    // the dropped events and keep serving rather than tearing the
+                    // session down.
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break 'serve,
+                }
+            }
+        }
+    }
+
+    drop(inbound);
+    dispatch.await?;
+    Ok(())
 }
 
 impl Daemon {
