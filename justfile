@@ -178,6 +178,76 @@ pr-merge n:
 
     echo "pr-merge: merged #$pr"
 
+# Create a milestone (idempotent on title) and one issue per step from a markdown
+# step-file, adding each to the board as Todo -- the planning-side sibling to
+# pr-merge. The step-file holds one `## [scope] Title` heading per step, each with a
+# `Goal:` line and an `Acceptance:` checklist beneath; the spec path is injected into
+# every issue body. Set PLAN_ISSUES_PREVIEW=1 to preview without writing to GitHub.
+plan-issues spec milestone step_file:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    spec="{{spec}}"
+    milestone="{{milestone}}"
+    stepfile="{{step_file}}"
+    preview="${PLAN_ISSUES_PREVIEW:-}"
+
+    [ -f "$spec" ] || { echo "plan-issues: spec not found: $spec" >&2; exit 1; }
+    case "$spec" in
+      docs/spec-*.md) ;;
+      *) echo "plan-issues: spec must match docs/spec-*.md, got: $spec" >&2; exit 1 ;;
+    esac
+    [ -f "$stepfile" ] || { echo "plan-issues: step-file not found: $stepfile" >&2; exit 1; }
+
+    repo=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
+    owner="${repo%%/*}"
+    proj="${RIFT_PROJECT_NUMBER:-1}"
+
+    # 1. Milestone: reuse an existing one with this title, else create it.
+    num=$(gh api "repos/$repo/milestones?state=all" --paginate --jq '.[] | [.number, .title] | @tsv' \
+      | awk -F'\t' -v t="$milestone" '$2 == t { print $1; exit }')
+    if [ -n "$num" ]; then
+      echo "plan-issues: reusing milestone #$num \"$milestone\""
+    elif [ -n "$preview" ]; then
+      echo "plan-issues: [preview] would create milestone \"$milestone\""
+    else
+      desc="Design: [$(basename "$spec")](https://github.com/$repo/blob/develop/$spec)"
+      num=$(gh api "repos/$repo/milestones" -X POST -f title="$milestone" -f description="$desc" --jq '.number')
+      echo "plan-issues: created milestone #$num \"$milestone\""
+    fi
+
+    # 2. Split the step-file into one file per `## ` heading.
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    awk -v dir="$tmp" '
+      /^## / { n++; f = sprintf("%s/step-%03d", dir, n) }
+      n > 0 { print > f }
+    ' "$stepfile"
+
+    shopt -s nullglob
+    steps=("$tmp"/step-*)
+    [ ${#steps[@]} -gt 0 ] || { echo "plan-issues: no '## ' step headings found in $stepfile" >&2; exit 1; }
+
+    # 3. One issue per step: <goal> + spec link + `### Acceptance` checklist.
+    for f in "${steps[@]}"; do
+      title=$(sed -n '1s/^## //p' "$f")
+      grep -q '^Goal:' "$f"       || { echo "plan-issues: step \"$title\" has no 'Goal:' line" >&2; exit 1; }
+      grep -q '^Acceptance:' "$f" || { echo "plan-issues: step \"$title\" has no 'Acceptance:' line" >&2; exit 1; }
+      goal=$(sed -n '/^Goal:/,/^Acceptance:/p' "$f" | sed '1s/^Goal:[[:space:]]*//; /^Acceptance:/d')
+      accept=$(sed -n '/^Acceptance:/,$p' "$f" | sed '1d')
+      body=$(printf '%s\n\nSpec: `%s`\n\n### Acceptance\n%s\n' "$goal" "$spec" "$accept")
+
+      if [ -n "$preview" ]; then
+        printf -- '----- [preview] issue: %s -----\n%s\n' "$title" "$body"
+        continue
+      fi
+
+      url=$(gh issue create --title "$title" --label implementation --milestone "$milestone" --body "$body")
+      n=$(basename "$url")
+      gh project item-add "$proj" --owner "$owner" --url "$url" >/dev/null
+      scripts/set-issue-status.sh "$n" Todo >/dev/null
+      echo "plan-issues: created $url (#$n, board Todo)"
+    done
+
 # Build daemon release binary for Linux (musl)
 release-daemon:
     cargo build --release -p rift-daemon --target x86_64-unknown-linux-musl
