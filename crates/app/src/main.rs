@@ -4,37 +4,14 @@ use std::thread;
 
 use anyhow::{Context as _, Result};
 use gpui::*;
-use gpui_component::{Root, Theme, ThemeMode, ThemeRegistry};
+use gpui_component::Root;
+use rift_app::apply_theme;
 use rift_terminal::{
     CaptureRequest, CaptureResult, ConnectionStatus, PaneInput, PaneOutput, SelectWindow,
     SessionView, SubscriptionUpdate, TermSize,
 };
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
-
-/// Catppuccin Mocha theme in gpui-component's native theme format. Registered in
-/// the `ThemeRegistry` alongside the built-in Light/Dark themes, leaving room to
-/// add more selectable themes later.
-const CATPPUCCIN_MOCHA: &str = include_str!("../assets/themes/catppuccin-mocha.json");
-
-/// Register the Catppuccin theme and make it the active app-wide theme so all
-/// gpui-component widgets render in rift's palette instead of the default light theme.
-fn apply_theme(cx: &mut App) {
-    if let Err(e) = ThemeRegistry::global_mut(cx).load_themes_from_str(CATPPUCCIN_MOCHA) {
-        error!(%e, "failed to load catppuccin theme");
-        return;
-    }
-    let Some(theme) = ThemeRegistry::global(cx)
-        .themes()
-        .get(&SharedString::from("Catppuccin Mocha"))
-        .cloned()
-    else {
-        error!("catppuccin theme not found after load");
-        return;
-    };
-    Theme::global_mut(cx).dark_theme = theme;
-    Theme::change(ThemeMode::Dark, None, cx);
-}
 
 struct SshConfig {
     host: String,
