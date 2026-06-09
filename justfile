@@ -126,6 +126,7 @@ pr-merge n:
 
     # 1. Wait for green, refreshing the branch while it is behind develop.
     updates=0
+    unknowns=0
     while :; do
       if ! just pr-wait "$pr"; then
         echo "pr-merge: checks not green, aborting" >&2; exit 1
@@ -134,6 +135,7 @@ pr-merge n:
       echo "pr-merge: mergeStateStatus=$state" >&2
       case "$state" in
         BEHIND)
+          unknowns=0
           updates=$((updates + 1))
           if [ "$updates" -gt 5 ]; then
             echo "pr-merge: still behind after $updates updates, aborting" >&2; exit 1
@@ -153,6 +155,16 @@ pr-merge n:
           echo "pr-merge: BLOCKED — required checks or protection not satisfied" >&2; exit 1 ;;
         DIRTY)
           echo "pr-merge: DIRTY — merge conflicts, resolve manually" >&2; exit 1 ;;
+        UNKNOWN|"")
+          # GitHub computes mergeability asynchronously and reports UNKNOWN (or an
+          # empty state) for a few seconds after the checks settle. Re-poll instead
+          # of treating the transient state as fatal.
+          unknowns=$((unknowns + 1))
+          if [ "$unknowns" -gt 10 ]; then
+            echo "pr-merge: mergeStateStatus still UNKNOWN after $unknowns polls, aborting" >&2; exit 1
+          fi
+          echo "pr-merge: mergeStateStatus UNKNOWN (GitHub still computing), re-polling ($unknowns)" >&2
+          sleep 3 ;;
         *)
           echo "pr-merge: unexpected mergeStateStatus $state, aborting" >&2; exit 1 ;;
       esac
