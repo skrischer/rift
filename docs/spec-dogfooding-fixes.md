@@ -1,6 +1,6 @@
 # Spec: Dogfooding fixes (living)
 
-> Status: DRAFT
+> Status: LIVING
 > Created: 2026-06-09
 > Completed: — (never; this spec is LIVING, see "Why this spec is LIVING")
 
@@ -118,11 +118,13 @@ policy; the issues own the individual fixes and their progress.
 - Grouping: [`papercut` label](https://github.com/skrischer/rift/labels/papercut)
 - First entry: **Tab keypress not forwarded to the PTY** — pressing Tab in a pane does
   not reach the shell/agent, so shell completion (`cd /path/<Tab>`) and Claude Code's
-  slash/prompt suggestions are dead. `encode_keystroke` already maps Tab correctly
-  (`crates/terminal/src/keyboard.rs`: `"tab" => \t`, `Shift+Tab -> \x1b[Z`), so the
-  defect is upstream of it: the `KeyDownEvent` for Tab never reaches the pane's
-  `on_key_down` (`crates/terminal/src/pane_view.rs`) because GPUI's focus/keymap layer
-  consumes Tab for focus traversal first. Category 2 (defect in an existing path).
+  slash/prompt suggestions are dead. Observable: `encode_keystroke` already maps Tab
+  correctly (`crates/terminal/src/keyboard.rs`: `"tab" => \t`, `Shift+Tab -> \x1b[Z`)
+  and the pane's `on_key_down` (`crates/terminal/src/pane_view.rs`) has no Tab
+  early-return, yet the byte never reaches `send_input` — so the listener does not fire
+  for Tab. Root cause is **to be confirmed during the fix** (candidate: a focus-layer /
+  tab-stop interaction in GPUI; rift registers no Tab key-binding itself). Category 2
+  (defect in an existing path); the fix forwards Tab and `Shift+Tab` like any other key.
 
 Each issue references this spec path in its body. A `fix:` PR may only merge if it closes
 an issue that traces back here (planning gate).
