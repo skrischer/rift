@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use gpui::*;
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::tab::{Tab, TabBar};
-use gpui_component::{h_flex, v_flex, ActiveTheme};
+use gpui_component::{h_flex, v_flex, ActiveTheme, Sizable};
 use termy_terminal_ui::TmuxSnapshot;
 use tracing::debug;
 
@@ -47,6 +48,17 @@ struct WindowState {
     pane_ids: Vec<String>,
 }
 
+/// An in-progress inline window rename. `window_id` targets the tmux window;
+/// `input` holds the edit state and `_subscription` keeps the submit handler
+/// alive for as long as the rename is active. The rename only emits
+/// `rename-window`; the new name arrives via the next snapshot /
+/// `rift_window_name` subscription, never an optimistic local mutation.
+struct WindowRename {
+    window_id: String,
+    input: Entity<InputState>,
+    _subscription: Subscription,
+}
+
 /// An in-progress border drag. `start` is the mouse position along the drag
 /// axis at mouse-down; `emitted_cells` is the whole-cell offset already sent to
 /// tmux, so each move only emits the incremental `resize-pane`.
@@ -55,6 +67,13 @@ struct BorderDrag {
     horizontal: bool,
     start: Pixels,
     emitted_cells: i32,
+}
+
+/// Quote a window name for a tmux command line. tmux parses the command with
+/// its own lexer, so a name containing spaces or metacharacters must be wrapped
+/// in single quotes, with any embedded single quote escaped as `'\''`.
+fn quote_tmux_name(name: &str) -> String {
+    format!("'{}'", name.replace('\'', "'\\''"))
 }
 
 /// tmux `resize-pane` direction flag for a cell delta. Positive grows the
@@ -99,6 +118,7 @@ pub struct SessionView {
     font_zoom_tx: flume::Sender<i32>,
     font_size: Pixels,
     border_drag: Option<BorderDrag>,
+    renaming_window: Option<WindowRename>,
     focus_handle: FocusHandle,
     needs_focus: bool,
     window_grid_size: TermSize,
@@ -269,6 +289,7 @@ impl SessionView {
             font_zoom_tx,
             font_size: px(DEFAULT_FONT_SIZE),
             border_drag: None,
+            renaming_window: None,
             focus_handle: cx.focus_handle(),
             needs_focus: true,
             window_grid_size: TermSize { cols: 80, rows: 24 },
@@ -464,6 +485,68 @@ impl SessionView {
             other => {
                 debug!(name = %other, "unhandled tmux subscription");
             }
+        }
+    }
+
+    /// Begin an inline rename of `window_id`: seed a text input with the current
+    /// window name, focus it, and subscribe for submit/blur. Enter emits
+    /// `rename-window`; blur cancels. The snapshot remains the source of truth
+    /// for the resulting name.
+    fn start_window_rename(
+        &mut self,
+        window_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = self
+            .windows
+            .iter()
+            .find(|w| w.id == window_id)
+            .map(|w| w.name.clone())
+            .unwrap_or_default();
+
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            move |this, input, event: &InputEvent, _window, cx| match event {
+                InputEvent::PressEnter { .. } => {
+                    if let Some(rename) = this.renaming_window.take() {
+                        let value = input.read(cx).value();
+                        let trimmed = value.trim();
+                        if !trimmed.is_empty() {
+                            if let Err(e) = this.tmux_command_tx.try_send(format!(
+                                "rename-window -t {} {}",
+                                rename.window_id,
+                                quote_tmux_name(trimmed)
+                            )) {
+                                debug!(error = %e, "failed to send window rename command");
+                            }
+                        }
+                        this.needs_focus = true;
+                        cx.notify();
+                    }
+                }
+                InputEvent::Blur => this.cancel_window_rename(cx),
+                _ => {}
+            },
+        );
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.renaming_window = Some(WindowRename {
+            window_id: window_id.to_string(),
+            input,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    /// Cancel an in-progress rename without emitting a command, restoring pane
+    /// focus on the next render.
+    fn cancel_window_rename(&mut self, cx: &mut Context<Self>) {
+        if self.renaming_window.is_some() {
+            self.renaming_window = None;
+            self.needs_focus = true;
+            cx.notify();
         }
     }
 
@@ -722,7 +805,9 @@ impl Focusable for SessionView {
 
 impl Render for SessionView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.needs_focus {
+        // Skip pane auto-focus while an inline rename owns focus, so a snapshot
+        // arriving mid-rename does not steal the keystroke stream from the input.
+        if self.needs_focus && self.renaming_window.is_none() {
             let entity_to_focus = self
                 .active_pane_id
                 .as_ref()
@@ -803,8 +888,6 @@ impl Render for SessionView {
         };
 
         let selected_index = self.windows.iter().position(|w| w.is_active).unwrap_or(0);
-        let window_ids: Vec<String> = self.windows.iter().map(|w| w.id.clone()).collect();
-
         // Tab affordances reuse the theme tokens; the close glyph idles muted and
         // reddens on hover, the new-window glyph idles muted and brightens.
         let close_idle = cx.theme().muted_foreground;
@@ -812,44 +895,82 @@ impl Render for SessionView {
         let new_idle = cx.theme().muted_foreground;
         let new_hover = cx.theme().foreground;
 
-        // One Tab per window. The per-tab "x" is a suffix element with its own
-        // mouse-down + stop_propagation so it does not also trigger the bar-level
-        // select-window; middle-click anywhere on the tab kills the window too.
+        // One Tab per window. Single click selects the window, double click opens
+        // an inline rename input in place of the label; this dispatch lives on the
+        // per-`Tab` `on_click` (not the bar) because it needs the click count to
+        // tell the two apart. The per-tab "x" suffix and middle-click both kill
+        // the window (own mouse-down + stop_propagation so they do not also
+        // select); the editing tab shows the input instead and omits the "x".
         let mut tabs: Vec<Tab> = Vec::with_capacity(self.windows.len());
         for (ix, w) in self.windows.iter().enumerate() {
-            let label = SharedString::from(format!("{}: {}", w.index, w.name));
-            let close_target = w.id.clone();
-            let middle_target = w.id.clone();
-            let close = div()
-                .id(("tab-close", ix))
-                .px(px(4.0))
-                .text_color(close_idle)
-                .hover(move |this| this.text_color(close_hover))
-                .child("x")
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
-                        if let Err(e) = this
-                            .tmux_command_tx
-                            .try_send(format!("kill-window -t {}", close_target))
-                        {
-                            debug!(error = %e, "failed to send kill-window command");
-                        }
-                        cx.stop_propagation();
-                    }),
-                );
-            tabs.push(Tab::new().label(label).suffix(close).on_mouse_down(
-                MouseButton::Middle,
-                cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
-                    if let Err(e) = this
+            let window_id = w.id.clone();
+            let editing = self
+                .renaming_window
+                .as_ref()
+                .filter(|rename| rename.window_id == w.id)
+                .map(|rename| rename.input.clone());
+
+            let tab = match editing {
+                Some(input) => Tab::new().child(
+                    div()
+                        .w(px(160.0))
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                            if event.keystroke.key.as_str() == "escape" {
+                                this.cancel_window_rename(cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .child(Input::new(&input).xsmall()),
+                ),
+                None => {
+                    let label = SharedString::from(format!("{}: {}", w.index, w.name));
+                    let close_target = w.id.clone();
+                    let middle_target = w.id.clone();
+                    let close = div()
+                        .id(("tab-close", ix))
+                        .px(px(4.0))
+                        .text_color(close_idle)
+                        .hover(move |this| this.text_color(close_hover))
+                        .child("x")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
+                                if let Err(e) = this
+                                    .tmux_command_tx
+                                    .try_send(format!("kill-window -t {}", close_target))
+                                {
+                                    debug!(error = %e, "failed to send kill-window command");
+                                }
+                                cx.stop_propagation();
+                            }),
+                        );
+                    Tab::new().label(label).suffix(close).on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
+                            if let Err(e) = this
+                                .tmux_command_tx
+                                .try_send(format!("kill-window -t {}", middle_target))
+                            {
+                                debug!(error = %e, "failed to send kill-window command");
+                            }
+                            cx.stop_propagation();
+                        }),
+                    )
+                }
+            };
+
+            tabs.push(
+                tab.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    if event.click_count() >= 2 {
+                        this.start_window_rename(&window_id, window, cx);
+                    } else if let Err(e) = this
                         .tmux_command_tx
-                        .try_send(format!("kill-window -t {}", middle_target))
+                        .try_send(format!("select-window -t {}", window_id))
                     {
-                        debug!(error = %e, "failed to send kill-window command");
+                        debug!(error = %e, "failed to send window switch command");
                     }
-                    cx.stop_propagation();
-                }),
-            ));
+                })),
+            );
         }
 
         let new_window = div()
@@ -871,17 +992,7 @@ impl Render for SessionView {
         let tab_bar = TabBar::new("tab-bar")
             .selected_index(selected_index)
             .children(tabs)
-            .suffix(new_window)
-            .on_click(cx.listener(move |this, index: &usize, _, _| {
-                if let Some(id) = window_ids.get(*index) {
-                    if let Err(e) = this
-                        .tmux_command_tx
-                        .try_send(format!("select-window -t {}", id))
-                    {
-                        debug!(error = %e, "failed to send window switch command");
-                    }
-                }
-            }));
+            .suffix(new_window);
 
         let border_color = cx.theme().border;
         let pane_area = if let Some(ref layout) = self.layout {
@@ -1012,7 +1123,24 @@ impl Render for SessionView {
 
 #[cfg(test)]
 mod tests {
-    use super::{kill_pane_command, resize_direction, select_pane_command, split_command};
+    use super::{
+        kill_pane_command, quote_tmux_name, resize_direction, select_pane_command, split_command,
+    };
+
+    #[test]
+    fn test_quote_tmux_name_plain_wraps_in_single_quotes() {
+        assert_eq!(quote_tmux_name("build"), "'build'");
+    }
+
+    #[test]
+    fn test_quote_tmux_name_with_space_stays_single_argument() {
+        assert_eq!(quote_tmux_name("my window"), "'my window'");
+    }
+
+    #[test]
+    fn test_quote_tmux_name_with_single_quote_is_escaped() {
+        assert_eq!(quote_tmux_name("it's"), "'it'\\''s'");
+    }
 
     #[test]
     fn test_resize_direction_horizontal() {
