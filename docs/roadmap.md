@@ -12,7 +12,8 @@ Living document tracking project phases, current status, and planned work.
 | 2c | Multi-pane awareness | COMPLETED 2026-05-20 | [archive/spec-phase2c-multipane.md](archive/spec-phase2c-multipane.md) |
 | 2d | Tab bar + statusbar enrichment | IN PROGRESS | [spec-phase2d-tabbar.md](spec-phase2d-tabbar.md) |
 | 2e | gpui-component UI foundation | COMPLETED 2026-06-05 | [archive/spec-gpui-component-adoption.md](archive/spec-gpui-component-adoption.md) |
-| 3 | Remote daemon | READY (scaffolding) | [spec-daemon-scaffolding.md](spec-daemon-scaffolding.md) |
+| 3 | Remote daemon — scaffolding + transport | READY | [spec-daemon-scaffolding.md](spec-daemon-scaffolding.md) |
+| 3 | Remote daemon — worktree file-tree sync | READY | [spec-daemon-filetree.md](spec-daemon-filetree.md) |
 
 ## Current focus
 
@@ -27,6 +28,8 @@ Phase 2e (gpui-component UI foundation) is COMPLETE — it built the substrate f
 **Completed track: terminal interaction fixes (dogfooding)**
 
 A batch of pre-SDD terminal/tmux interaction defects surfaced while dogfooding: `capture-pane`-backed scrollback (#39), `Ctrl+=`/`Ctrl+-` font zoom (#40), and drag-to-resize pane borders (#41) — GUI affordances replacing tmux's rendered interactive layer. COMPLETED 2026-06-07; the fourth outcome (pane zoom, #42) was dropped before implementation and the work moved to the pane/window-management track below. Spec: [archive/spec-terminal-interaction-fixes.md](archive/spec-terminal-interaction-fixes.md). It also added the "tmux control-mode interaction model" decision to [architecture.md](architecture.md).
+
+**Living track: dogfooding fixes** — a standing backlog (a `LIVING` spec, never `COMPLETED` or archived) for small, self-contained UX/interaction papercuts surfaced while using rift. Successor to the completed terminal-interaction-fixes batch above, generalised beyond the terminal. Entries are grouped by the [`papercut` label](https://github.com/skrischer/rift/labels/papercut), not a milestone, since the backlog never closes; a fix that grows a real design surface graduates to its own spec. First entry: Tab keypress forwarding (#116). Spec: [spec-dogfooding-fixes.md](spec-dogfooding-fixes.md).
 
 **Completed track: pane & window management (dogfooding)**
 
@@ -47,6 +50,8 @@ Mouse-driven tmux pane/window lifecycle in the GPU UI: closing a pane via `exit`
 The foundational decisions are resolved (see [spec-daemon-scaffolding.md](spec-daemon-scaffolding.md)): daemon form is Lapce-flat dispatch (not Zed `HeadlessProject`), transport lifts Zed's connection-reuse + auto-deploy, the client↔daemon channel is a dedicated `russh` channel. File-sync (Zed worktree `Snapshot` + incremental updates) and LSP lifecycle (daemon-side, lazy per `DocumentSelector`, `async-lsp`) are pre-decided for their own sub-specs. The one genuinely open item is the VTE parsing location (client-side vs. daemon-side), deferred to a spike before the terminal-streaming sub-spec.
 
 Phase 3 is the biggest architectural change since the project began and needs multiple sub-specs (daemon scaffolding, file tree, git status, LSP integration, terminal streaming). The first — daemon scaffolding + transport — is `READY`, with milestone [Phase 3 — Remote daemon](https://github.com/skrischer/rift/milestone/4) and issues #57–#62.
+
+The second sub-spec — **worktree file-tree sync** — is now `READY`: the daemon scans/watches a project root, maintains a Zed-style worktree `Snapshot`, and streams it to the client as an initial snapshot plus incremental `UpdateWorktree` updates. The file-sync strategy was pre-decided in the scaffolding spec (Zed `Snapshot` + incremental updates, `notify` + `jwalk`, honor VCS ignore rules); the one open decision — whether to also ship the GPUI explorer panel — was resolved at the review gate to **data-layer-only**, leaving the rendered panel (and its git-status decoration) to its own later sub-spec. It redesigns the placeholder `rift-protocol` file messages and fleshes out the empty `crates/explorer`. Spec: [spec-daemon-filetree.md](spec-daemon-filetree.md). Milestone: [Phase 3 — Worktree file-tree sync](https://github.com/skrischer/rift/milestone/9) (issues #107–#111). Its implementation sequences after the scaffolding transport lands.
 
 See [prior-art.md](prior-art.md) for reference implementations (Zed `remote_server`, Lapce proxy, Arbor, `async-lsp`) and candidate dependencies to draw from when writing these specs.
 
