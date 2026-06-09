@@ -38,6 +38,8 @@ Mouse-driven tmux pane/window lifecycle in the GPU UI: closing a pane via `exit`
 
 **Meta track: implementation workflow automation** — COMPLETED 2026-06-08. Automated the issue → merged cycle that emerged across the Phase 2d work: a `just pr-merge` recipe (remote-only merge + cleanup), a CI `app-check` job that finally compiles `rift-app`, board status transitions baked into the worktree recipe (`In Progress`) and the skill close-out (`Done`), an interactive tmux reviewer pane, and a `/implement` skill tying it together. Tooling/DX, not a product phase. Spec: [archive/spec-workflow-automation.md](archive/spec-workflow-automation.md). Milestone: [Workflow automation](https://github.com/skrischer/rift/milestone/6).
 
+**Meta track: planning workflow automation** — READY. The planning-side sibling to the above, filling the slot it reserved: a `just plan-issues` recipe (milestone + per-step issues from a markdown step-file) and a `/plan` skill driving readiness → merged `READY` spec → milestone + issues → roadmap, with the review gate on the in-session Agent tool instead of the tmux pane. The spec was itself dogfooded through the cycle it specifies. Spec: [spec-planning-automation.md](spec-planning-automation.md). Milestone: [Planning automation](https://github.com/skrischer/rift/milestone/7). Issues: #93 (recipe), #94 (skill).
+
 ## What comes after Phase 2d
 
 **Phase 3: Remote daemon** — the major architectural shift. Splits the monolithic app into a GPUI frontend + a remote daemon connected over a dedicated `russh` channel (no WebSocket — `russh` already multiplexes channels). The daemon handles file watching (inotify), git status, and language servers (LSP) on the remote host. The frontend becomes a thin rendering client.
