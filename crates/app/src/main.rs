@@ -178,6 +178,12 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
         .await
         .context("SSH connection failed")?;
 
+    // Auto-deploy the daemon ahead of the tmux session. Detect the remote
+    // platform, then upload+spawn the versioned binary only when absent. Gated
+    // on a configured local musl binary (RIFT_DAEMON_BINARY); without it, skip
+    // and fall through to the existing tmux flow so the app still runs.
+    deploy_daemon(&mut conn).await;
+
     let pty = conn
         .open_pty_exec(80, 24, "tmux -CC new-session -A -s rift")
         .await
@@ -356,4 +362,39 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
     let _ = cmd_handle.join();
     let _ = capture_handle.join();
     Ok(())
+}
+
+/// Best-effort daemon auto-deploy step, run before the tmux session is opened.
+///
+/// Reads the locally-built musl binary from `RIFT_DAEMON_BINARY` (target dir
+/// `RIFT_DAEMON_REMOTE_DIR`, default `$HOME/.rift/bin`) and deploys the versioned
+/// binary via [`rift_ssh::ensure_daemon_deployed`]. A missing path or any deploy
+/// error is logged and swallowed: this step is additive and must not break the
+/// existing tmux flow while the daemon protocol is not yet wired in. The deploy
+/// only uploads — the daemon is launched later via `open_daemon_channel` once a
+/// consumer wires the protocol.
+async fn deploy_daemon(conn: &mut rift_ssh::SshConnection) {
+    let Some(binary_path) = env::var_os("RIFT_DAEMON_BINARY") else {
+        debug!("RIFT_DAEMON_BINARY not set, skipping daemon auto-deploy");
+        return;
+    };
+    let binary_path = PathBuf::from(binary_path);
+
+    let bytes = match tokio::fs::read(&binary_path).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(%e, path = %binary_path.display(), "failed to read local daemon binary, skipping deploy");
+            return;
+        }
+    };
+
+    let remote_dir =
+        env::var("RIFT_DAEMON_REMOTE_DIR").unwrap_or_else(|_| "$HOME/.rift/bin".to_string());
+
+    match rift_ssh::ensure_daemon_deployed(conn, &bytes, &remote_dir, env!("CARGO_PKG_VERSION"))
+        .await
+    {
+        Ok(remote_path) => info!(remote_path, "daemon auto-deploy complete"),
+        Err(e) => warn!(%e, "daemon auto-deploy failed, continuing with tmux only"),
+    }
 }

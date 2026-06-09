@@ -10,6 +10,10 @@ pub enum SshError {
     Channel(String),
     #[error("pty error: {0}")]
     Pty(String),
+    #[error("remote command exited with status {code}: {stderr}")]
+    Exec { code: u32, stderr: String },
+    #[error("unsupported remote platform '{0}' (no daemon binary)")]
+    UnsupportedPlatform(String),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
     #[error(

@@ -1,10 +1,14 @@
 mod connection;
 mod daemon_channel;
+mod deploy;
 mod error;
 mod known_hosts;
 mod pty;
 
 pub use connection::SshConnection;
 pub use daemon_channel::{DaemonChannel, DaemonClient};
+pub use deploy::{
+    ensure_daemon_deployed, needs_upload, remote_binary_name, target_triple_from_uname,
+};
 pub use error::SshError;
 pub use pty::{PtyStream, PtySyncReader, PtySyncWriter, PtyWriter};
