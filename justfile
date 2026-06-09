@@ -202,7 +202,28 @@ plan-issues spec milestone step_file:
     owner="${repo%%/*}"
     proj="${RIFT_PROJECT_NUMBER:-1}"
 
-    # 1. Milestone: reuse an existing one with this title, else create it.
+    # 1. Split the step-file into one file per `## ` heading, then validate every
+    #    step up front -- a malformed step must abort before any GitHub write, so a
+    #    partial run can never leave a stray milestone or half the issues behind.
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    awk -v dir="$tmp" '
+      /^## / { n++; f = sprintf("%s/step-%03d", dir, n) }
+      n > 0 { print > f }
+    ' "$stepfile"
+
+    shopt -s nullglob
+    steps=("$tmp"/step-*)
+    [ ${#steps[@]} -gt 0 ] || { echo "plan-issues: no '## ' step headings found in $stepfile" >&2; exit 1; }
+
+    for f in "${steps[@]}"; do
+      title=$(sed -n '1s/^## //p' "$f")
+      [ -n "$title" ]            || { echo "plan-issues: a step has an empty '## ' heading" >&2; exit 1; }
+      grep -q '^Goal:' "$f"       || { echo "plan-issues: step \"$title\" has no 'Goal:' line" >&2; exit 1; }
+      grep -q '^Acceptance:' "$f" || { echo "plan-issues: step \"$title\" has no 'Acceptance:' line" >&2; exit 1; }
+    done
+
+    # 2. Milestone: reuse an existing one with this title, else create it.
     num=$(gh api "repos/$repo/milestones?state=all" --paginate --jq '.[] | [.number, .title] | @tsv' \
       | awk -F'\t' -v t="$milestone" '$2 == t { print $1; exit }')
     if [ -n "$num" ]; then
@@ -215,23 +236,9 @@ plan-issues spec milestone step_file:
       echo "plan-issues: created milestone #$num \"$milestone\""
     fi
 
-    # 2. Split the step-file into one file per `## ` heading.
-    tmp=$(mktemp -d)
-    trap 'rm -rf "$tmp"' EXIT
-    awk -v dir="$tmp" '
-      /^## / { n++; f = sprintf("%s/step-%03d", dir, n) }
-      n > 0 { print > f }
-    ' "$stepfile"
-
-    shopt -s nullglob
-    steps=("$tmp"/step-*)
-    [ ${#steps[@]} -gt 0 ] || { echo "plan-issues: no '## ' step headings found in $stepfile" >&2; exit 1; }
-
     # 3. One issue per step: <goal> + spec link + `### Acceptance` checklist.
     for f in "${steps[@]}"; do
       title=$(sed -n '1s/^## //p' "$f")
-      grep -q '^Goal:' "$f"       || { echo "plan-issues: step \"$title\" has no 'Goal:' line" >&2; exit 1; }
-      grep -q '^Acceptance:' "$f" || { echo "plan-issues: step \"$title\" has no 'Acceptance:' line" >&2; exit 1; }
       goal=$(sed -n '/^Goal:/,/^Acceptance:/p' "$f" | sed '1s/^Goal:[[:space:]]*//; /^Acceptance:/d')
       accept=$(sed -n '/^Acceptance:/,$p' "$f" | sed '1d')
       body=$(printf '%s\n\nSpec: `%s`\n\n### Acceptance\n%s\n' "$goal" "$spec" "$accept")
@@ -244,7 +251,8 @@ plan-issues spec milestone step_file:
       url=$(gh issue create --title "$title" --label implementation --milestone "$milestone" --body "$body")
       n=$(basename "$url")
       gh project item-add "$proj" --owner "$owner" --url "$url" >/dev/null
-      scripts/set-issue-status.sh "$n" Todo >/dev/null
+      scripts/set-issue-status.sh "$n" Todo >/dev/null \
+        || echo "plan-issues: warn: could not set #$n to Todo; board default applies" >&2
       echo "plan-issues: created $url (#$n, board Todo)"
     done
 
