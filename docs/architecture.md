@@ -156,7 +156,7 @@ cargo clippy --workspace -- -D warnings                             # lint (zero
 cargo fmt --all                                                     # format
 cargo test --workspace                                              # test all
 cargo run -p rift-app                                               # run GPUI app in dev mode
-cargo build --release -p daemon --target x86_64-unknown-linux-musl  # daemon release build (Phase 3+)
+cargo build --release -p rift-daemon --target x86_64-unknown-linux-musl  # daemon release build (Phase 3+)
 ```
 
 ## Cross-compilation and deployment
