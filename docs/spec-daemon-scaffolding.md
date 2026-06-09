@@ -36,6 +36,7 @@ What is true when this work is done? Observable, end-to-end criteria — not act
 ## Constraints
 
 - The daemon binary target is `x86_64-unknown-linux-musl`, statically linked, headless. It must not depend on `gpui`/`gpui-component`.
+- The daemon depends only on crates that cross-compile to static musl. Re-add a sibling crate to `crates/daemon/Cargo.toml` only when the daemon actually uses it, and first verify it (and its transitive deps) is `gpui`-free and musl-clean. `rift-terminal` pulls `gpui`/`gpui-component` and must never become a daemon dependency — terminal rendering stays client-side.
 - Daemon error handling uses `thiserror` in libs and `anyhow` in the binary; no `.unwrap()` in library code (per CLAUDE.md).
 - Adding to `crates/protocol/` is a deliberate API change — both sides depend on it, never on each other.
 - The app runs on the Windows host; SSH `ControlMaster` is a Unix-socket feature, so the Windows side needs Zed's documented fallback path (see Risks).
@@ -92,3 +93,4 @@ Decisions made during implementation. Added as work progresses.
 
 - 2026-06-05: Spec created. Daemon form (Lapce-flat), transport pattern (Zed ControlMaster + auto-deploy), and channel recorded as pre-made; VTE parsing location left open for a spike. See Prior decisions for rationale.
 - 2026-06-05: PR #52 review (NEEDS CHANGES, minor) addressed. (1) Channel changed from WebSocket-over-SSH to a dedicated `russh` channel — WebSocket was unjustified given `russh` already multiplexes and would add a dependency; `architecture.md` aligned. (2) Made the Windows fallback handshake the primary exercised/validated path in Outcome, Verification, and Risks, since `ControlMaster` never applies on the Windows dev host.
+- 2026-06-09: #59 (musl build, PR #99) trimmed the daemon's premature dependencies — `crates/daemon/Cargo.toml` dropped `rift-terminal`, `rift-explorer`, `rift-tmux-core`, and `rift-plugin-api`. All were unused by the current skeleton; `rift-terminal` additionally pulls `gpui`/`gpui-component`, which is forbidden in the daemon and cannot cross-compile to musl, so the static musl build was impossible until it was removed. Kept `rift-protocol`, `tokio`, `anyhow`. Consequence for #58 onward: re-add only the deps the daemon actually uses and keep it `gpui`-free / musl-clean (see Constraints).
