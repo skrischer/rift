@@ -1,6 +1,6 @@
 # Spec: Trial — /plan skill smoke test (DELETE ME)
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-06-09
 > Completed: —
 
@@ -31,7 +31,7 @@ Throwaway spec used to exercise the `/plan` skill end-to-end before marking
 | Decision | Rationale | Date |
 |---|---|---|
 | Trial spec is never merged | It exists only to drive the skill once; merging it would pollute develop history | 2026-06-09 |
-| **OPEN — resolved at the review gate:** the trial step's scope label | Contrived open point to exercise the genuinely-open-decision gate | 2026-06-09 |
+| Trial step uses the `[terminal]` scope label | Resolved at the review gate (contrived point, exercised the genuinely-open-decision gate) | 2026-06-09 |
 
 ## Tracking
 
