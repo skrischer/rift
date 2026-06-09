@@ -26,10 +26,19 @@ pub struct Daemon {
 pub struct Handles {
     /// Send `ClientMessage`s into the dispatch loop.
     pub inbound: mpsc::Sender<ClientMessage>,
-    /// Subscribe to outbound `DaemonMessage` events.
-    pub events: broadcast::Sender<DaemonMessage>,
+    /// Internal publisher handle for the outbound `DaemonMessage` event bus.
+    /// Not public: external callers subscribe via [`Handles::subscribe`] and
+    /// cannot inject events.
+    events: broadcast::Sender<DaemonMessage>,
     /// Observe the latest `State` snapshot.
     pub state: watch::Receiver<State>,
+}
+
+impl Handles {
+    /// Subscribe to the daemon's outbound `DaemonMessage` event stream.
+    pub fn subscribe(&self) -> broadcast::Receiver<DaemonMessage> {
+        self.events.subscribe()
+    }
 }
 
 /// Construct a [`Daemon`] and its [`Handles`] over freshly created channels.
@@ -67,9 +76,14 @@ impl Daemon {
     }
 
     /// Route a single `ClientMessage` to its handler.
-    fn dispatch(&self, msg: ClientMessage) {
+    fn dispatch(&mut self, msg: ClientMessage) {
         match msg {
             ClientMessage::Hello { version: _ } => {
+                // Version negotiation / mismatch handling is deferred to the
+                // transport sub-spec (a spec Risk); for now any version is
+                // accepted and a `Welcome` carrying the daemon's
+                // `PROTOCOL_VERSION` is emitted.
+                //
                 // A receiverless broadcast send is not an error here: events are
                 // fire-and-forget, so a `Welcome` with no subscriber is dropped.
                 let _ = self.events.send(DaemonMessage::Welcome {
@@ -84,7 +98,11 @@ impl Daemon {
         }
     }
 
-    /// Borrow the live `State` for inspection (the `watch` sender's view).
+    /// Return the latest `State` snapshot (the `watch` sender's view).
+    ///
+    /// Stays `State::default()` until handlers begin mutating state; it exists
+    /// for future consumers and keeps the held `watch::Sender` from tripping
+    /// `dead_code` under `-D warnings`.
     pub fn state(&self) -> State {
         self.state.borrow().clone()
     }
@@ -97,7 +115,7 @@ mod tests {
     #[tokio::test]
     async fn test_dispatch_hello_current_version_emits_welcome() {
         let (daemon, handles) = channels(8, 8);
-        let mut events = handles.events.subscribe();
+        let mut events = handles.subscribe();
         let loop_handle = tokio::spawn(daemon.run());
 
         handles
@@ -116,6 +134,7 @@ mod tests {
             }
         );
 
+        // drop all senders so run() observes channel closure and returns
         drop(handles);
         loop_handle.await.expect("dispatch loop joins cleanly");
     }
