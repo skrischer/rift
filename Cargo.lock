@@ -5310,6 +5310,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -5319,6 +5320,7 @@ dependencies = [
  "async-trait",
  "flume",
  "home",
+ "rift-protocol",
  "russh",
  "russh-keys",
  "tempfile",

@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+mod frame;
+
+pub use frame::{encode_frame, FrameDecoder, FrameError};
+
 /// Wire protocol version negotiated during the client/daemon handshake.
 ///
 /// Independent of the crate's semver: bump it when the message wire format

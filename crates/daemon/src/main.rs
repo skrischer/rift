@@ -1,16 +1,12 @@
-use rift_daemon::channels;
+use rift_daemon::serve;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     println!("rift-daemon starting");
 
-    // No transport yet (own Phase 3 sub-spec); construct the dispatch loop and
-    // its channels, then run until the inbound channel closes. With no sender
-    // wired in, `run` returns immediately — the binary stays thin and the loop
-    // lives in the library.
-    let (daemon, handles) = channels(256, 256);
-    drop(handles);
-    daemon.run().await;
-
-    Ok(())
+    // The daemon speaks the `rift-protocol` framing over stdio: the SSH host
+    // wires the daemon's stdin/stdout to a `russh` channel, so reading the
+    // protocol from stdio keeps the binary transport-agnostic and musl-clean
+    // (no russh in the daemon). `serve` returns when stdin reaches EOF.
+    serve(tokio::io::stdin(), tokio::io::stdout()).await
 }

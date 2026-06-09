@@ -5,6 +5,7 @@ use russh::client::{self, Config, Handle};
 use russh_keys::key::PublicKey;
 use tracing::{debug, info};
 
+use crate::daemon_channel::DaemonChannel;
 use crate::error::SshError;
 use crate::known_hosts::verify_host_key;
 use crate::pty::PtyStream;
@@ -83,6 +84,17 @@ impl SshConnection {
         channel.exec(true, command).await?;
 
         Ok(PtyStream::new(channel))
+    }
+
+    /// Open a non-PTY exec channel that carries the `rift-protocol` framing.
+    ///
+    /// Runs `command` (the remote daemon) over a plain session channel — no PTY,
+    /// no shell — so its stdin/stdout become the daemon transport. The returned
+    /// [`DaemonChannel`] is the byte half of the client-side transport seam.
+    pub async fn open_daemon_channel(&mut self, command: &str) -> Result<DaemonChannel, SshError> {
+        let channel = self.handle.channel_open_session().await?;
+        channel.exec(true, command).await?;
+        Ok(DaemonChannel::new(channel))
     }
 }
 
