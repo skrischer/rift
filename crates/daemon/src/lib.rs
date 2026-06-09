@@ -105,20 +105,21 @@ where
     let mut decoder = FrameDecoder::new();
     let mut buf = vec![0u8; SERVE_READ_BUFFER];
 
-    loop {
+    'serve: loop {
         tokio::select! {
             read = reader.read(&mut buf) => {
                 let n = read?;
                 if n == 0 {
                     // Reader EOF: stop accepting input. Dropping `inbound` lets
                     // the dispatch loop drain and exit.
-                    break;
+                    break 'serve;
                 }
                 decoder.push(&buf[..n]);
                 while let Some(msg) = decoder.next_frame::<ClientMessage>()? {
                     if inbound.send(msg).await.is_err() {
-                        // Dispatch loop gone; nothing more to do.
-                        break;
+                        // Dispatch loop gone; stop serving entirely rather than
+                        // reading and discarding further frames.
+                        break 'serve;
                     }
                 }
             }
@@ -133,7 +134,7 @@ where
                     // the dropped events and keep serving rather than tearing the
                     // session down.
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Closed) => break 'serve,
                 }
             }
         }
