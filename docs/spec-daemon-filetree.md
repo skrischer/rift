@@ -1,6 +1,6 @@
 # Spec: Phase 3 — Worktree file-tree sync
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-06-09
 > Completed: —
 
@@ -24,13 +24,13 @@ What is true when this work is done? Observable, end-to-end criteria — not act
 - **Protocol redesign**: replace the placeholder `rift-protocol` file messages (`FileEvent`, `FileSync`) with a proper worktree protocol — an initial `WorktreeSnapshot` message (chunked if large) plus incremental `UpdateWorktree` messages (added / changed / removed entries). A deliberate, additive `crates/protocol/` API change.
 - **Daemon wiring**: the daemon owns the explorer worktree in its `State`, runs the scan/watch off the dispatch loop, and routes snapshot + updates onto the client channel.
 - **Client-side worktree model**: the client receives the initial snapshot and applies incremental updates, maintaining an accurate in-memory tree. Verifiable headless via tests/logging — this is the consuming state, not yet a rendered panel (see the open scope decision).
-- **Single watched root** = the daemon's project root (the directory it is launched in, or a configured project path).
+- **Single watched root** = the daemon's project root. The v1 default is the directory the daemon is launched in (per the scaffolding lifecycle); an explicit configured project path is a later extension, not part of this spec.
 
 ### Out of scope
 
 - **Git-status decoration** of entries — its own sub-spec. The snapshot entry may reserve a status slot, but populating it is not this spec; the premature `git_status` field on the placeholder `FileEvent` is dropped here and re-introduced by the git-status spec on its own terms.
 - **LSP / diagnostics** — its own sub-spec.
-- **The GPUI file-explorer panel** that renders the tree and highlights touched files — deferred to its own sub-spec **if** the data-layer-only scope is chosen (see Prior decisions, the OPEN row).
+- **The GPUI file-explorer panel** that renders the tree and highlights touched files — its own sub-spec (the data-layer-only scope was chosen at the review gate, see Prior decisions). The panel spec consumes this client-side tree model and can render git-status decoration once the git-status spec lands.
 - **Multi-root / per-pane-CWD worktree contexts** (`vision.md` Scenario 2) — single root for v1; multi-root is a later phase.
 - **Fuzzy file search** (`nucleo`) — a consumer of the tree, not part of the sync foundation.
 - **File-content sync** — rift edits happen in tmux/Neovim on the remote; the explorer never needs file *contents* locally. The placeholder `FileSync { content }` message is removed, not redesigned — it contradicts the no-file-sync architecture (`architecture.md` "Why LSP runs on the remote": diagnostics flow as lightweight JSON, never file contents).
@@ -56,7 +56,7 @@ Decisions already made that the implementor must respect. Rationale included so 
 | **Snapshot-as-source-of-truth**; no client-side optimistic tree mutation | The established pane/window discipline (`CLAUDE.md` "state flows through channels"; pane-window-management spec) — the UI emits an intent and re-derives from the next authoritative update, never mutates local state speculatively. | 2026-06-09 |
 | **Single watched root** (the daemon's project root); multi-root deferred | Minimal scope, no premature abstraction. Per-worktree explorer contexts (`vision.md` Scenario 2) are a later phase and would force a multi-root abstraction this spec does not need. | 2026-06-09 |
 | Model a move as **remove + add** at the snapshot level | `notify` rename events are unreliable and backend-specific across platforms; Zed reconciles renames through the snapshot diff rather than trusting a rename event. The protocol carries add/change/remove; a dedicated rename variant is not required. | 2026-06-09 |
-| **OPEN — scope boundary: data-layer-only vs. include the GPUI explorer panel.** Resolved at the review gate. | Neither precedent nor a codebase constraint settles whether this spec ends at "the client holds an accurate live tree model" (panel = its own sub-spec) or also ships the rendered GPUI file-explorer panel that highlights touched files. It is a product-visibility vs. PR-size judgment: the data-layer-only cut is headless-verifiable and keeps the PR small (per `CLAUDE.md` "no large PRs"), but ships nothing the user can *see*; the full slice delivers the first visible north-star moment but needs GPU-station review and is larger. | — |
+| **Scope boundary is data-layer-only**: this spec ends when the client holds an accurate, live in-memory tree model; the rendered GPUI explorer panel is a separate sub-spec | Resolved at the review gate. The data-layer cut is headless-verifiable and keeps the PR small (`CLAUDE.md` "no large PRs"), fits the parallel-dev model (agents verify headless; the GPU station is a review gate), and gives a clean phase boundary: the panel sub-spec then renders this model and can fold in git-status decoration once that spec lands. The deferred cost is that this spec ships nothing the user can *see* — accepted. | 2026-06-09 |
 
 ## Tracking
 
@@ -75,7 +75,6 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 - [ ] Integration test: scanning a fixture tree yields a snapshot matching the on-disk structure; creating / modifying / deleting a file emits the matching incremental update, and applying it to the client model reproduces the new tree
 - [ ] A write inside an ignored directory (`target/foo`, a `.gitignore`d path, `.git/`) emits no update; a write to a tracked file does
 - [ ] A `grep` confirms no `Arc<Mutex<State>>` in the daemon crate and that `crates/explorer` pulls no `gpui`/`gpui-component` (inspect its resolved dependency tree)
-- [ ] (only if the GPUI-panel scope is chosen) GPU-station check: the explorer panel renders the tree and visibly highlights a file as it is modified
 
 ## Risks and mitigations
 
@@ -91,4 +90,5 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 
 Decisions made during implementation. Added as work progresses.
 
-- 2026-06-09: Spec created from `/plan file-tree`. File-sync strategy (Zed `Snapshot` + incremental `UpdateWorktree`, `notify` + `jwalk`), ignore-rule honoring, single-root scope, snapshot-as-truth, and move-as-remove+add recorded as precedent/constraint-decided. The placeholder `rift-protocol` `FileEvent`/`FileSync` messages are flagged for redesign, with `FileSync { content }` slated for removal as it contradicts the no-file-sync architecture. Scope boundary (data-layer-only vs. include the GPUI explorer panel) left OPEN for the review gate.
+- 2026-06-09: Spec created from `/plan file-tree`. File-sync strategy (Zed `Snapshot` + incremental `UpdateWorktree`, `notify` + `jwalk`), ignore-rule honoring, single-root scope, snapshot-as-truth, and move-as-remove+add recorded as precedent/constraint-decided. The placeholder `rift-protocol` `FileEvent`/`FileSync` messages are flagged for redesign, with `FileSync { content }` slated for removal as it contradicts the no-file-sync architecture.
+- 2026-06-09: Review gate (Agent review, VERDICT READY, no blocking findings). Resolved the one open decision — **scope boundary is data-layer-only**; the GPUI explorer panel is deferred to its own sub-spec. Pinned the v1 watched root to the daemon's launch directory. Flipped `DRAFT` → `READY` in the same PR (#106).
