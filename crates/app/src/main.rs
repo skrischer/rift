@@ -179,9 +179,10 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
         .context("SSH connection failed")?;
 
     // Auto-deploy the daemon ahead of the tmux session. Detect the remote
-    // platform, then upload+spawn the versioned binary only when absent. Gated
-    // on a configured local musl binary (RIFT_DAEMON_BINARY); without it, skip
-    // and fall through to the existing tmux flow so the app still runs.
+    // platform, then upload the versioned binary only when absent (the daemon is
+    // launched later via open_daemon_channel, not here). Gated on a configured
+    // local musl binary (RIFT_DAEMON_BINARY); without it, skip and fall through
+    // to the existing tmux flow so the app still runs.
     deploy_daemon(&mut conn).await;
 
     let pty = conn
