@@ -101,12 +101,9 @@ impl Render for Gallery {
 
         let active = self.active_index.and_then(|i| self.entries.get(i).copied());
         let (title, description) = active.map(|e| (e.name, e.description)).unwrap_or_default();
-        // Direct call (not a closure) so `cx`/`window` reborrow at the argument
-        // site and stay usable while the rest of the tree is built below.
-        let content = match active {
-            Some(e) => Some((e.render)(window, cx)),
-            None => None,
-        };
+        // The closure is an immediate `FnOnce`, so it reborrows `window`/`cx` —
+        // both stay usable while the rest of the tree is built below.
+        let content = active.map(|e| (e.render)(window, cx));
 
         h_resizable("gallery-container")
             .child(
