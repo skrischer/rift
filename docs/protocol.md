@@ -15,8 +15,8 @@ All communication runs over a single WebSocket connection, tunneled through SSH 
 ```json
 { "type": "pane_output",  "pane_id": 3, "cells": [...] }
 { "type": "state_update", "sessions": [...] }
-{ "type": "file_event",   "kind": "modify", "path": "src/main.rs", "git_status": "modified" }
-{ "type": "file_tree",    "root": "/home/dev/project", "entries": [...] }
+{ "type": "worktree_snapshot", "root": "/home/dev/project", "entries": [{ "path": "src/main.rs", "kind": "file", "ignored": false, "mtime": {...} }], "final_chunk": true }
+{ "type": "update_worktree",   "added": [...], "changed": [...], "removed": ["src/old.rs"] }
 { "type": "git_status",   "files": [{ "path": "src/main.rs", "status": "modified" }, ...] }
 { "type": "diagnostics",  "uri": "src/main.rs", "items": [{ "range": {...}, "severity": "error", "message": "..." }] }
 ```
