@@ -5272,6 +5272,7 @@ dependencies = [
  "flume",
  "gpui",
  "gpui-component",
+ "gpui-component-assets",
  "gpui_platform",
  "rift-ssh",
  "rift-terminal",
