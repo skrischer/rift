@@ -281,18 +281,17 @@ export RIFT_SSH_HOST := env("RIFT_SSH_HOST", "127.0.0.1")
 export RIFT_SSH_USER := env("RIFT_SSH_USER", "developer")
 export RIFT_SSH_PORT := env("RIFT_SSH_PORT", "22")
 export RIFT_SSH_KEY := env("RIFT_SSH_KEY", home_directory() / ".ssh" / "id_rsa")
-# Local musl daemon binary to auto-deploy and attach to (empty = skip the daemon
-# step, the default). Build it first with:
-#   cargo build --release -p rift-daemon --target x86_64-unknown-linux-musl
-# then pass an ABSOLUTE path so the dev-windows WSLENV `/p` flag can translate it
-# for the native .exe, e.g.:
-#   RIFT_DAEMON_BINARY="$PWD/target/x86_64-unknown-linux-musl/release/rift-daemon" just dev-windows-watch
-export RIFT_DAEMON_BINARY := env("RIFT_DAEMON_BINARY", "")
+# Local musl daemon binary to auto-deploy and attach to. Defaults to the musl
+# release build under target/; `dev`/`dev-windows` build it first (via the
+# release-daemon dependency) so the path is always valid. It is absolute so the
+# dev-windows WSLENV `/p` flag can translate it for the native .exe. Override to
+# point at a different build, or set to "" to skip the daemon step entirely.
+export RIFT_DAEMON_BINARY := env("RIFT_DAEMON_BINARY", justfile_directory() / "target/x86_64-unknown-linux-musl/release/rift-daemon")
 windows_ssh_key := env("RIFT_WINDOWS_SSH_KEY", "C:\\Users\\skrischer\\.ssh\\id_rsa")
 windows_exe := "target/x86_64-pc-windows-gnu/debug/rift.exe"
 windows_gallery_exe := "target/x86_64-pc-windows-gnu/debug/gallery.exe"
 
-dev:
+dev: release-daemon
     WAYLAND_DISPLAY="" \
     RUST_LOG=rift=debug,rift_ssh=debug \
     RIFT_SSH_HOST="{{RIFT_SSH_HOST}}" \
@@ -314,7 +313,7 @@ dev-watch:
     cargo watch -x 'clippy --workspace -- -D warnings' -x 'run -p rift-app'
 
 # Build and run native Windows .exe (cross-compiled via MinGW)
-dev-windows:
+dev-windows: release-daemon
     cargo build -p rift-app --target x86_64-pc-windows-gnu
     -taskkill.exe /F /IM rift.exe 2>/dev/null
     export WSLENV="RUST_LOG:RIFT_SSH_HOST:RIFT_SSH_USER:RIFT_SSH_PORT:RIFT_SSH_KEY:RIFT_DAEMON_BINARY/p" && \
