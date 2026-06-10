@@ -19,7 +19,11 @@ required-features = ["gallery"]
 # Enables the gallery binary and its demo-only dependencies. Adds no compilation
 # to the product build (gpui-component-assets is already in the graph via
 # gpui-component; here it is named directly only for `with_assets(Assets)`).
-gallery = ["dep:gpui-component-assets"]
+# `dep:rust-embed` flips its `debug-embed` feature on via cargo feature
+# unification so gpui-component-assets embeds its icon SVGs in debug builds too —
+# without it rust-embed reads icons from the compile-time path at runtime, which
+# the cross-compiled Windows gallery exe cannot find (icons render blank).
+gallery = ["dep:gpui-component-assets", "dep:rust-embed"]
 
 [dependencies]
 rift-terminal = { path = "../terminal" }
@@ -28,6 +32,10 @@ gpui.workspace = true
 gpui_platform.workspace = true
 gpui-component.workspace = true
 gpui-component-assets = { workspace = true, optional = true }
+# Not used in code; declared only to enable rust-embed's `debug-embed` feature
+# for the gallery (see the `gallery` feature comment). Already in the graph via
+# gpui-component-assets, so this adds no new crate to Cargo.lock.
+rust-embed = { version = "8", optional = true, features = ["debug-embed"] }
 tokio.workspace = true
 flume.workspace = true
 anyhow.workspace = true
