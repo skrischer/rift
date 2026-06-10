@@ -370,11 +370,16 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
 /// protocol has no consumer yet. The socket and log sit beside the versioned
 /// binary (`<binary>.sock` / `<binary>.log`), inheriting its resolved path.
 async fn provision_daemon(conn: &mut rift_ssh::SshConnection) {
-    let Some(binary_path) = env::var_os("RIFT_DAEMON_BINARY") else {
-        debug!("RIFT_DAEMON_BINARY not set, skipping daemon provisioning");
-        return;
+    // An unset or empty `RIFT_DAEMON_BINARY` skips provisioning: the dev recipes
+    // forward the var unconditionally and default it to empty, so empty must read
+    // as "not configured" rather than a path to read.
+    let binary_path = match env::var_os("RIFT_DAEMON_BINARY") {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => {
+            debug!("RIFT_DAEMON_BINARY not set, skipping daemon provisioning");
+            return;
+        }
     };
-    let binary_path = PathBuf::from(binary_path);
 
     let bytes = match tokio::fs::read(&binary_path).await {
         Ok(bytes) => bytes,
