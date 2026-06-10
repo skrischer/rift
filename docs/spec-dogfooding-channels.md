@@ -1,6 +1,6 @@
 # Spec: Dogfooding channels (rift-stable / rift-dev)
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-06-10
 > Completed: —
 
@@ -44,9 +44,12 @@ What is true when this work is done:
 - [ ] A broken dev build leaves stable running and promptable — the original pain no
       longer reproduces.
 - [ ] The tmux session name is read from `RIFT_SESSION` (default `rift`); the daemon
-      isolation knob is the already-existing `RIFT_DAEMON_REMOTE_DIR`.
+      isolation knob is `RIFT_DAEMON_REMOTE_DIR` (already read by the app, not yet
+      surfaced in the dev recipes).
 - [ ] `cargo clippy --workspace -- -D warnings` and `cargo test --workspace` stay
-      green, and the windows-target app build (`app-check`) compiles the change.
+      green; CI `app-check` (`cargo check -p rift-app`, native Linux) compiles the
+      platform-agnostic `RIFT_SESSION` change, and the windows-target binary is
+      verified by the local `just dev-windows` / `build-windows` cross-compile.
 
 ## Scope
 
@@ -56,13 +59,15 @@ What is true when this work is done:
   both the `new-session -A -s <name>` command and the `TmuxClient` label
   (`crates/app/src/main.rs`). One env knob, matching the existing SSH-config pattern.
 - **just recipes (Windows host, the primary dev loop):**
-  - `promote` — build Release, copy the binary to a distinct image name
-    (`rift-stable.exe`), kill the old stable, relaunch it **detached** on session
+  - `promote` — guard that HEAD is `develop` and fast-forwarded to `origin/develop`
+    (refuse otherwise), then build Release, copy the binary to a distinct image name
+    (`rift-stable.exe`), kill the old stable, and relaunch it **detached** on session
     `rift`.
   - `stable` — relaunch the pinned `rift-stable.exe` without rebuilding (e.g. after a
     reboot); hint to run `promote` if it is absent.
   - `dev-windows` updated to forward `RIFT_SESSION` (default `rift`) into the Windows
-    process via `WSLENV`; `taskkill /IM rift.exe` continues to target only dev.
+    process via `WSLENV`; its `taskkill.exe /F /IM rift.exe` continues to target only
+    dev.
   - A shared private launch helper so the env block (SSH vars, later daemon vars) does
     not drift between the dev and stable recipes.
 - **tmux mirror policy (optional):** `window-size largest` for the shared session so a
@@ -97,8 +102,11 @@ What is true when this work is done:
 - **Process-image-name separation is mandatory.** The dev loop kills `rift.exe` by
   image name; stable must run under a different image (`rift-stable.exe`) or promotion
   in dev would kill the daily driver.
-- `rift-app` is **excluded** from `just build` / `just lint`; the only compile check
-  for the app change is the windows-target build and CI `app-check`.
+- `rift-app` is **excluded** from `just build` / `just lint`. CI `app-check` runs
+  `cargo check -p rift-app` on **native Linux** (no windows-target cross-compile exists
+  in CI); the `RIFT_SESSION` read is platform-agnostic, so that covers it, while the
+  windows-target binary is checked only by the local `just dev-windows` /
+  `build-windows` cross-compile.
 - **No `.unwrap()` in library code.** The env read lives in the app binary (`anyhow`
   context is fine); it does not touch a library crate.
 - **Mirror correctness rests on rift staying a stateless renderer over tmux.** Every
@@ -127,7 +135,7 @@ What is true when this work is done:
 | Promotion is manual, never auto-on-merge | The developer explicitly wants to choose when a new feature lands in the tool they depend on. Automate the steps; keep the trigger human. | 2026-06-10 |
 | tmux `window-size largest` for the shared session (optional, via tmux config) | On restart the dev client briefly attaches at 80×24; `largest` keeps the window at the larger client's size so stable's view does not reflow on every dev recompile. Two equally-maximized windows are unaffected. | 2026-06-10 |
 | Adopt the release-channels pattern (side-by-side, isolated per-channel identity) | Precedent: VS Code Insiders installs beside Stable with isolated state for daily-driver dogfooding; Zed ships stable/preview/nightly/dev as separate apps with per-channel state dirs. rift's twist — a shared tmux session for a live mirror — is unique to it being a multiplexer frontend. | 2026-06-10 |
-| **OPEN — resolved at the review gate:** what `promote` builds stable from | Candidates: (a) current local checkout, (b) always `origin/develop`, (c) explicit ref arg. Affects the "stable == accepted develop" guarantee and interacts with the visual gate's `git checkout --detach <branch>` (the checkout may be on a feature branch when `promote` runs). | — |
+| `promote` builds the current checkout, guarded: it asserts HEAD is `develop` and fast-forwarded to `origin/develop`, and refuses otherwise | Guarantees stable == accepted develop with no ref-switching (which would disturb the station's running `dev-watch`). The guard is exactly what stops a promotion mid-gate, when the station sits detached on a feature branch (`CLAUDE.md`, "Parallel development") — it refuses rather than baking un-merged code into the daily driver. Rejected: always-build-`origin/develop` (extra recipe machinery to build a ref without disturbing the working tree) and explicit-ref (puts correctness on the operator and a checkout disturbs `dev-watch`). | 2026-06-10 |
 
 ## Tracking
 
@@ -147,10 +155,12 @@ gallery).
 How the whole spec is known complete:
 
 - [ ] `cargo clippy --workspace -- -D warnings` passes; `cargo test --workspace`
-      passes; CI `app-check` compiles the windows-target app with the `RIFT_SESSION`
-      change.
-- [ ] `just promote` produces `rift-stable.exe`, launches it **detached** (the recipe
-      returns while the app keeps running), attached to session `rift`.
+      passes; CI `app-check` (`cargo check -p rift-app`, native Linux) compiles the
+      `RIFT_SESSION` change; the windows-target binary builds via local
+      `just dev-windows` / `build-windows`.
+- [ ] `just promote` refuses unless HEAD is `develop` ff-synced to `origin/develop`;
+      on a clean develop it produces `rift-stable.exe`, launches it **detached** (the
+      recipe returns while the app keeps running), attached to session `rift`.
 - [ ] `just dev-windows-watch` attaches to `rift` by default; a tab switch, split, and
       keystroke in one instance are reflected in the other, both directions.
 - [ ] `RIFT_SESSION=rift-dev just dev-windows-watch` runs dev on an isolated session
@@ -176,3 +186,12 @@ How the whole spec is known complete:
   + tmux session, single `target/`) is constraint-determined by the worktree topology;
   the release-channels framing is precedent (VS Code Insiders, Zed channels). One
   decision left open for the review gate: what `promote` builds stable from.
+- 2026-06-10: Review gate (PR #148) resolved the open decision — `promote` builds the
+  **current checkout, guarded** (HEAD must be `develop`, fast-forwarded to
+  `origin/develop`; refuse otherwise). Picked over always-`origin/develop` and
+  explicit-ref because it guarantees stable == accepted develop without ref-switching
+  that would disturb the station's `dev-watch`, and the guard is what prevents a
+  mid-gate promotion of un-merged feature code. Also corrected the spec's `app-check`
+  claim — it is a native-Linux `cargo check -p rift-app`, not a windows-target build;
+  the windows binary is checked only by the local `just dev-windows` / `build-windows`
+  cross-compile.
