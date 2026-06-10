@@ -901,19 +901,24 @@ pub(super) fn render_group_box(_window: &mut Window, _cx: &mut App) -> AnyElemen
 // ---------------------------------------------------------------------------
 
 pub(super) fn render_description_list(_window: &mut Window, _cx: &mut App) -> AnyElement {
-    DescriptionList::new()
-        .columns(2)
-        .bordered(true)
+    // `DescriptionList` implements `Sizable` but not `Styled`, so width is
+    // constrained on a wrapper, matching how the other demos size their container.
+    div()
         .max_w(px(560.))
-        .child(DescriptionItem::new("Name").value("Jane Doe"))
-        .child(DescriptionItem::new("Role").value("Maintainer"))
         .child(
-            DescriptionItem::new("Email")
-                .value("jane@example.com")
-                .span(2),
+            DescriptionList::new()
+                .columns(2)
+                .bordered(true)
+                .child(DescriptionItem::new("Name").value("Jane Doe"))
+                .child(DescriptionItem::new("Role").value("Maintainer"))
+                .child(
+                    DescriptionItem::new("Email")
+                        .value("jane@example.com")
+                        .span(2),
+                )
+                .child(DescriptionItem::new("Location").value("Berlin"))
+                .child(DescriptionItem::new("Timezone").value("CET")),
         )
-        .child(DescriptionItem::new("Location").value("Berlin"))
-        .child(DescriptionItem::new("Timezone").value("CET"))
         .into_any_element()
 }
 
