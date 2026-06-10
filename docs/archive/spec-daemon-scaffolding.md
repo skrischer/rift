@@ -1,8 +1,8 @@
 # Spec: Phase 3 — Daemon scaffolding + transport
 
-> Status: READY
+> Status: COMPLETED
 > Created: 2026-06-05
-> Completed: —
+> Completed: 2026-06-10
 
 Stand up the remote daemon as a headless tokio service that the GPUI app reaches over a reconnectable SSH transport, auto-deploys, and talks the `rift-protocol` message loop with — the structural foundation every later Phase 3 sub-spec (file tree, git status, LSP, terminal streaming) builds on.
 
@@ -10,11 +10,11 @@ Stand up the remote daemon as a headless tokio service that the GPUI app reaches
 
 What is true when this work is done? Observable, end-to-end criteria — not activities.
 
-- [ ] The GPUI app connects over SSH, detects the remote platform, and auto-deploys the versioned `rift-daemon` musl binary when it is missing or outdated, then spawns it.
-- [ ] A `ClientMessage` sent from the app reaches the daemon and a `DaemonMessage` reply returns over the transport — a full protocol round-trip works.
-- [ ] The daemon survives an SSH connection drop and a reconnect reattaches to the still-running daemon instead of spawning a second one — validated on the Windows host path (where `ControlMaster` does not apply and the fallback handshake is active), not only on Unix.
-- [ ] The daemon holds a single `State` struct and notifies consumers via `tokio::sync::watch`/`broadcast` — no `Arc<Mutex<State>>`.
-- [ ] The daemon is a flat dispatch loop routing `rift-protocol` messages to handlers — no GPUI dependency, no per-subsystem entity graph.
+- [x] The GPUI app connects over SSH, detects the remote platform, and auto-deploys the versioned `rift-daemon` musl binary when it is missing or outdated, then spawns it.
+- [x] A `ClientMessage` sent from the app reaches the daemon and a `DaemonMessage` reply returns over the transport — a full protocol round-trip works.
+- [x] The daemon survives an SSH connection drop and a reconnect reattaches to the still-running daemon instead of spawning a second one — validated on the Windows host path (where `ControlMaster` does not apply and the fallback handshake is active), not only on Unix.
+- [x] The daemon holds a single `State` struct and notifies consumers via `tokio::sync::watch`/`broadcast` — no `Arc<Mutex<State>>`.
+- [x] The daemon is a flat dispatch loop routing `rift-protocol` messages to handlers — no GPUI dependency, no per-subsystem entity graph.
 
 ## Scope
 
@@ -70,13 +70,13 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 
 ## Verification
 
-- [ ] `cargo clippy --workspace -- -D warnings` passes
-- [ ] `cargo test --workspace` passes
-- [ ] `cargo build --release -p rift-daemon --target x86_64-unknown-linux-musl` produces a static binary
-- [ ] App connects, auto-deploys the daemon when the remote binary is missing or version-mismatched, and spawns it
-- [ ] A `ClientMessage` → daemon → `DaemonMessage` round-trip completes over the `russh` channel
-- [ ] Killing the SSH connection leaves the daemon running; reconnect reattaches without a second daemon process (verified by remote process count), exercised on the Windows dev host where the fallback handshake — not `ControlMaster` — is the active path
-- [ ] The daemon exposes its `State` through channels; a grep confirms no `Arc<Mutex<State>>` in the daemon crate
+- [x] `cargo clippy --workspace -- -D warnings` passes
+- [x] `cargo test --workspace` passes
+- [x] `cargo build --release -p rift-daemon --target x86_64-unknown-linux-musl` produces a static binary
+- [x] App connects, auto-deploys the daemon when the remote binary is missing or version-mismatched, and spawns it
+- [x] A `ClientMessage` → daemon → `DaemonMessage` round-trip completes over the `russh` channel
+- [x] Killing the SSH connection leaves the daemon running; reconnect reattaches without a second daemon process (verified by remote process count), exercised on the Windows dev host where the fallback handshake — not `ControlMaster` — is the active path
+- [x] The daemon exposes its `State` through channels; a grep confirms no `Arc<Mutex<State>>` in the daemon crate
 
 ## Risks and mitigations
 
@@ -96,3 +96,4 @@ Decisions made during implementation. Added as work progresses.
 - 2026-06-09: #59 (musl build, PR #99) trimmed the daemon's premature dependencies — `crates/daemon/Cargo.toml` dropped `rift-terminal`, `rift-explorer`, `rift-tmux-core`, and `rift-plugin-api`. All were unused by the current skeleton; `rift-terminal` additionally pulls `gpui`/`gpui-component`, which is forbidden in the daemon and cannot cross-compile to musl, so the static musl build was impossible until it was removed. Kept `rift-protocol`, `tokio`, `anyhow`. Consequence for #58 onward: re-add only the deps the daemon actually uses and keep it `gpui`-free / musl-clean (see Constraints).
 - 2026-06-09: #60 (transport seam, PR #114). Added a length-delimited JSON frame codec to `rift-protocol` (`u32` big-endian length prefix + `serde_json` payload; partial-read-safe `FrameDecoder`). The daemon speaks the protocol over **stdio** (`rift_daemon::serve` over `AsyncRead`/`AsyncWrite`) — no `russh` in the daemon, keeping it musl-clean; the SSH host wires the daemon's stdin/stdout to a non-PTY `russh` exec channel (`SshConnection::open_daemon_channel`). The single app-side emission seam is `rift_ssh::DaemonClient`. Two framing-integrity invariants fell out of review: the daemon's stdout is **frame-only** (the startup banner moved to stderr), and the protocol channel **drops remote stderr** (`ChannelMsg::ExtendedData`) instead of feeding it to the decoder — either would otherwise corrupt the length-delimited framing.
 - 2026-06-09: #61 (auto-deploy, PR #115). `rift_ssh::ensure_daemon_deployed` does detect (`uname -sm`) + resolve versioned path (`rift-daemon-<version>`) + upload-when-absent only; it does **not** launch the daemon. A detached `&` background spawn over an exec channel is a no-op — the daemon inherits that channel's stdin/stdout, and once the channel drains and `sshd` closes the FDs the daemon reads EOF on stdin and exits (per `serve`'s contract). The real launch is opening the protocol channel on the resolved path via `open_daemon_channel`, deferred until a consumer wires the daemon protocol (the future `TmuxClient` swap); there is no persistent daemon to keep alive before then. **Consequence:** the "auto-deploys … and spawns it" Outcome/Verification line is met by the transport-consumption step, not by deploy. Two further decisions: the deploy logic lives in `crates/ssh` (not `crates/app`) so `cargo test --workspace --exclude rift-app` actually exercises its tests; and only `Linux x86_64` -> `x86_64-unknown-linux-musl` is mapped (a single `RIFT_DAEMON_BINARY` is uploaded with no per-arch selection, so other architectures return `None` rather than silently shipping the wrong binary).
+- 2026-06-10: #62 (reattach, PR #140). The #60/#61 launch model (daemon driven over the exec channel's stdio) is structurally incompatible with surviving a drop — stdin EOF kills it — so the daemon became a long-lived **Unix-domain-socket server** (`serve_uds`) with a single shared dispatch loop: a dropped client ends only its connection while the daemon + `State` persist for the next attach. The host launches it **detached** (`setsid sh -c 'exec <bin> --serve-uds <sock> </dev/null >> <log> 2>&1' &`) so it outlives the exec channel, then polls for the socket and reports readiness via a `RIFT_DAEMON_READY` marker. Reattach-vs-spawn is decided by a `--ping` probe; single-instance is enforced twice (host skips the spawn when the probe says running; the daemon's own bind guard refuses a second bind as a race backstop). Protocol travels over a built-in `--connect` relay subcommand (stdio↔`UnixStream`) wired to a non-PTY `russh` exec channel — no `socat`/`nc` dependency, musl-clean, agent-agnostic. **Bug fixed en route:** the #61 presence probe `test -x <path> && printf MARKER` exited non-zero on the (expected) first-deploy absent case, which `exec_capture` rejects as a failed remote command and aborted auto-deploy; wrapped in `if/then/fi` so it always exits zero and absence is signalled by empty output. **Validation note:** `pgrep -c rift-daemon` reads 2 while connected (the `--serve-uds` server and the `--connect` relay share the binary name) and 1 idle — the single-instance invariant is "exactly one `--serve-uds`". Live-validated on the Windows host (`os="windows"`, no `ControlMaster`): killing SSH leaves the daemon running with the same PID, and reconnect reattaches without a second server. **Dev-loop wiring:** `RIFT_DAEMON_BINARY` is forwarded through the dev recipes (with the `dev-windows` WSLENV `/p` flag translating the absolute WSL path for the native `.exe`), defaults to the musl release path, and `dev`/`dev-windows` build it first via a `release-daemon` dependency.
