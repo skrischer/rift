@@ -468,10 +468,11 @@ impl Render for Gallery {
         let groups: Vec<_> = GROUPS
             .iter()
             .filter_map(|(group, names)| {
-                let items: Vec<(usize, ComponentEntry)> = filtered
+                // Drive within-group order from the declared `names` order (look
+                // each name up in the search-filtered set), not from registry order.
+                let items: Vec<(usize, ComponentEntry)> = names
                     .iter()
-                    .filter(|(_, e)| names.contains(&e.name))
-                    .copied()
+                    .filter_map(|name| filtered.iter().find(|(_, e)| e.name == *name).copied())
                     .collect();
                 if items.is_empty() {
                     return None;
