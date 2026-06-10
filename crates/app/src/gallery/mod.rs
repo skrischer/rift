@@ -338,6 +338,89 @@ impl Gallery {
     }
 }
 
+/// Sidebar grouping for the registry, in display order. gpui-component's own
+/// gallery lists every component flat under one "Components" group, so this
+/// taxonomy is rift's own. Every [`registry`] entry name must appear in exactly
+/// one group (guarded by the `test_every_entry_is_grouped` /
+/// `test_group_names_exist_in_registry` tests).
+const GROUPS: &[(&str, &[&str])] = &[
+    ("Theme", &["Theme Tokens"]),
+    (
+        "Forms & Input",
+        &[
+            "Button",
+            "Dropdown Button",
+            "Input",
+            "OTP Input",
+            "Textarea",
+            "Label",
+            "Checkbox",
+            "Radio",
+            "Switch",
+            "Select",
+            "Combobox",
+            "Form",
+            "Slider",
+        ],
+    ),
+    (
+        "Feedback & Status",
+        &[
+            "Progress",
+            "Spinner",
+            "Skeleton",
+            "Badge",
+            "Tag",
+            "Alert",
+            "Notification",
+            "Tooltip",
+            "Rating",
+        ],
+    ),
+    (
+        "Layout",
+        &[
+            "Separator",
+            "Group Box",
+            "Resizable",
+            "Scrollbar",
+            "Sidebar",
+        ],
+    ),
+    (
+        "Navigation",
+        &["Breadcrumb", "Pagination", "Stepper", "Tabs", "Menu"],
+    ),
+    (
+        "Data Display",
+        &[
+            "List",
+            "Description List",
+            "Avatar",
+            "Icon",
+            "Image",
+            "Kbd",
+            "Link",
+            "Clipboard",
+        ],
+    ),
+    (
+        "Overlay",
+        &[
+            "Accordion",
+            "Collapsible",
+            "Popover",
+            "Hover Card",
+            "Dialog",
+            "Sheet",
+        ],
+    ),
+    (
+        "Pickers",
+        &["Calendar", "Date Picker", "Color Picker", "Settings"],
+    ),
+];
+
 impl Render for Gallery {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.search_input.read(cx).value().trim().to_lowercase();
@@ -372,66 +455,94 @@ impl Render for Gallery {
                 .into_any_element(),
         });
 
-        h_resizable("gallery-container")
+        // The dialog/sheet/notification overlays live as state on the window's
+        // `Root`; the root view must render their layers explicitly, otherwise an
+        // opened modal or pushed notification is never drawn. gpui-component's own
+        // gallery does the same in its root view.
+        let sheet_layer = Root::render_sheet_layer(window, cx);
+        let dialog_layer = Root::render_dialog_layer(window, cx);
+        let notification_layer = Root::render_notification_layer(window, cx);
+
+        // One sidebar group per `GROUPS` category, in declared order, skipping any
+        // group with no entry matching the current search.
+        let groups: Vec<_> = GROUPS
+            .iter()
+            .filter_map(|(group, names)| {
+                let items: Vec<(usize, ComponentEntry)> = filtered
+                    .iter()
+                    .filter(|(_, e)| names.contains(&e.name))
+                    .copied()
+                    .collect();
+                if items.is_empty() {
+                    return None;
+                }
+                Some(SidebarGroup::new(*group).child(SidebarMenu::new().children(
+                    items.into_iter().map(|(full_ix, entry)| {
+                        SidebarMenuItem::new(entry.name)
+                            .active(active_ix == Some(full_ix))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.active_index = Some(full_ix);
+                                cx.notify();
+                            }))
+                    }),
+                )))
+            })
+            .collect();
+
+        div()
+            .size_full()
             .child(
-                resizable_panel()
-                    .size(px(255.))
-                    .size_range(px(200.)..px(360.))
+                h_resizable("gallery-container")
                     .child(
-                        Sidebar::new("gallery-sidebar")
-                            .w(relative(1.))
-                            .border_0()
-                            .header(
-                                div().w_full().px_2().child(
-                                    Input::new(&self.search_input)
-                                        .appearance(false)
-                                        .cleanable(true),
-                                ),
-                            )
-                            .child(SidebarGroup::new("Components").child(
-                                SidebarMenu::new().children(filtered.into_iter().map(
-                                    |(full_ix, entry)| {
-                                        SidebarMenuItem::new(entry.name)
-                                            .active(self.active_index == Some(full_ix))
-                                            .on_click(cx.listener(
-                                                move |this, _: &ClickEvent, _, cx| {
-                                                    this.active_index = Some(full_ix);
-                                                    cx.notify();
-                                                },
-                                            ))
-                                    },
-                                )),
-                            )),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .h_full()
-                    .overflow_x_hidden()
-                    .child(
-                        v_flex()
-                            .p_4()
-                            .gap_1()
-                            .border_b_1()
-                            .border_color(cx.theme().border)
-                            .child(div().text_xl().child(title))
+                        resizable_panel()
+                            .size(px(255.))
+                            .size_range(px(200.)..px(360.))
                             .child(
-                                div()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(description),
+                                Sidebar::new("gallery-sidebar")
+                                    .w(relative(1.))
+                                    .border_0()
+                                    .header(
+                                        div().w_full().px_2().child(
+                                            Input::new(&self.search_input)
+                                                .appearance(false)
+                                                .cleanable(true),
+                                        ),
+                                    )
+                                    .children(groups),
                             ),
                     )
                     .child(
-                        div()
-                            .id("gallery-content")
+                        v_flex()
                             .flex_1()
-                            .overflow_y_scroll()
-                            .p_4()
-                            .when_some(content, |this, content| this.child(content)),
-                    )
-                    .into_any_element(),
+                            .h_full()
+                            .overflow_x_hidden()
+                            .child(
+                                v_flex()
+                                    .p_4()
+                                    .gap_1()
+                                    .border_b_1()
+                                    .border_color(cx.theme().border)
+                                    .child(div().text_xl().child(title))
+                                    .child(
+                                        div()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(description),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("gallery-content")
+                                    .flex_1()
+                                    .overflow_y_scroll()
+                                    .p_4()
+                                    .when_some(content, |this, content| this.child(content)),
+                            )
+                            .into_any_element(),
+                    ),
             )
+            .children(sheet_layer)
+            .children(dialog_layer)
+            .children(notification_layer)
     }
 }
 
@@ -490,5 +601,33 @@ mod tests {
             entries.len(),
             "gallery entry names must be unique"
         );
+    }
+
+    #[test]
+    fn test_every_entry_is_grouped() {
+        for entry in registry() {
+            let count = super::GROUPS
+                .iter()
+                .filter(|(_, names)| names.contains(&entry.name))
+                .count();
+            assert_eq!(
+                count, 1,
+                "registry entry {:?} must belong to exactly one sidebar group (found {count})",
+                entry.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_group_names_exist_in_registry() {
+        let names: HashSet<&str> = registry().iter().map(|e| e.name).collect();
+        for (_, group_names) in super::GROUPS {
+            for name in *group_names {
+                assert!(
+                    names.contains(name),
+                    "sidebar group references unknown entry {name:?}"
+                );
+            }
+        }
     }
 }
