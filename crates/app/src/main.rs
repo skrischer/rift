@@ -175,8 +175,14 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
     // skip and fall through to the existing tmux flow so the app still runs.
     provision_daemon(&mut conn).await;
 
+    // Tmux session name, overridable so a second rift instance can mirror the
+    // same live session (default `rift`) or attach to an isolated one for
+    // destructive tests (`RIFT_SESSION=rift-dev`). Matches the SshConfig env
+    // pattern above. See docs/spec-dogfooding-channels.md.
+    let session = env::var("RIFT_SESSION").unwrap_or_else(|_| "rift".to_string());
+
     let pty = conn
-        .open_pty_exec(80, 24, "tmux -CC new-session -A -s rift")
+        .open_pty_exec(80, 24, &format!("tmux -CC new-session -A -s {session}"))
         .await
         .context("failed to start tmux control mode")?;
 
@@ -188,7 +194,7 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
     let tmux_client = TmuxClient::from_streams(
         writer,
         reader,
-        "rift".to_string(),
+        session,
         "tmux".to_string(),
         TmuxSocketTarget::Default,
         Some(wakeup_tx),
