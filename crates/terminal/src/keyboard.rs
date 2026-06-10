@@ -43,7 +43,7 @@ pub fn encode_keystroke(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>
     }
 
     // Basic special keys (enter, tab, escape, backspace, space)
-    if let Some(bytes) = encode_basic_key(key, shift) {
+    if let Some(bytes) = encode_basic_key(key, ctrl, shift) {
         return if alt {
             let mut prefixed = Vec::with_capacity(1 + bytes.len());
             prefixed.push(0x1b);
@@ -72,13 +72,17 @@ pub fn encode_keystroke(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>
     None
 }
 
-fn encode_basic_key(key: &str, shift: bool) -> Option<Vec<u8>> {
+fn encode_basic_key(key: &str, ctrl: bool, shift: bool) -> Option<Vec<u8>> {
     match key {
         "enter" if shift => Some(vec![b'\n']),
         "enter" => Some(vec![b'\r']),
         "tab" if shift => Some(b"\x1b[Z".to_vec()),
         "tab" => Some(vec![b'\t']),
         "escape" => Some(vec![0x1b]),
+        // Ctrl+Backspace deletes the previous word. ESC+DEL is readline's
+        // backward-kill-word, sharing the word boundary of Ctrl+Left/Right
+        // (`\x1b[1;5D`); it is also the sequence Alt+Backspace already emits.
+        "backspace" if ctrl => Some(vec![0x1b, 0x7f]),
         "backspace" => Some(vec![0x7f]),
         "space" => Some(vec![0x20]),
         _ => None,
@@ -344,6 +348,13 @@ mod tests {
     fn test_encode_backspace() {
         let ks = key("backspace");
         assert_eq!(encode_keystroke(&ks, normal()), Some(vec![0x7f]));
+    }
+
+    #[test]
+    fn test_encode_ctrl_backspace() {
+        // Ctrl+Backspace deletes the previous word: ESC+DEL (backward-kill-word).
+        let ks = ctrl_key("backspace");
+        assert_eq!(encode_keystroke(&ks, normal()), Some(vec![0x1b, 0x7f]));
     }
 
     // --- Arrow keys ---
