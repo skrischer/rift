@@ -159,6 +159,146 @@ pub fn registry() -> Vec<ComponentEntry> {
             description: "Star rating display.",
             demo: Element(demos::render_rating),
         },
+        ComponentEntry {
+            name: "Separator",
+            description: "Horizontal, vertical, dashed and labeled dividers.",
+            demo: Element(demos::render_separator),
+        },
+        ComponentEntry {
+            name: "Group Box",
+            description: "Titled containers grouping related controls.",
+            demo: Element(demos::render_group_box),
+        },
+        ComponentEntry {
+            name: "Description List",
+            description: "Key/value rows in a bordered grid.",
+            demo: Element(demos::render_description_list),
+        },
+        ComponentEntry {
+            name: "Resizable",
+            description: "Draggable split panels.",
+            demo: Element(demos::render_resizable),
+        },
+        ComponentEntry {
+            name: "Scrollbar",
+            description: "A themed scrollbar on overflowing content.",
+            demo: Element(demos::render_scrollbar),
+        },
+        ComponentEntry {
+            name: "Sidebar",
+            description: "Grouped navigation menu with icons.",
+            demo: Element(demos::render_sidebar),
+        },
+        ComponentEntry {
+            name: "List",
+            description: "A selectable list backed by a delegate.",
+            demo: View(demos::build_list),
+        },
+        ComponentEntry {
+            name: "Tabs",
+            description: "A tab bar switching the shown content.",
+            demo: View(demos::build_tabs),
+        },
+        ComponentEntry {
+            name: "Breadcrumb",
+            description: "A path of navigable segments.",
+            demo: Element(demos::render_breadcrumb),
+        },
+        ComponentEntry {
+            name: "Pagination",
+            description: "Page navigation with a current page.",
+            demo: View(demos::build_pagination),
+        },
+        ComponentEntry {
+            name: "Stepper",
+            description: "A multi-step progress indicator.",
+            demo: View(demos::build_stepper),
+        },
+        ComponentEntry {
+            name: "Menu",
+            description: "A dropdown menu and a right-click context menu.",
+            demo: Element(demos::render_menu),
+        },
+        ComponentEntry {
+            name: "Accordion",
+            description: "Expandable disclosure sections.",
+            demo: View(demos::build_accordion),
+        },
+        ComponentEntry {
+            name: "Collapsible",
+            description: "A parent-controlled show/hide region.",
+            demo: View(demos::build_collapsible),
+        },
+        ComponentEntry {
+            name: "Popover",
+            description: "Floating content anchored to a trigger.",
+            demo: Element(demos::render_popover),
+        },
+        ComponentEntry {
+            name: "Hover Card",
+            description: "Content revealed on hover.",
+            demo: Element(demos::render_hover_card),
+        },
+        ComponentEntry {
+            name: "Dialog",
+            description: "A modal dialog opened from a trigger.",
+            demo: Element(demos::render_dialog),
+        },
+        ComponentEntry {
+            name: "Sheet",
+            description: "A side drawer opened from a trigger.",
+            demo: Element(demos::render_sheet),
+        },
+        ComponentEntry {
+            name: "Avatar",
+            description: "Initials and placeholder avatars in several sizes.",
+            demo: Element(demos::render_avatar),
+        },
+        ComponentEntry {
+            name: "Icon",
+            description: "Library icons with sizes and colors.",
+            demo: Element(demos::render_icon),
+        },
+        ComponentEntry {
+            name: "Image",
+            description: "Image sources (offline build shows embedded vector tiles).",
+            demo: Element(demos::render_image),
+        },
+        ComponentEntry {
+            name: "Kbd",
+            description: "Keyboard shortcut chips.",
+            demo: Element(demos::render_kbd),
+        },
+        ComponentEntry {
+            name: "Link",
+            description: "Hyperlinks, including a disabled state.",
+            demo: Element(demos::render_link),
+        },
+        ComponentEntry {
+            name: "Clipboard",
+            description: "A copy-to-clipboard control.",
+            demo: Element(demos::render_clipboard),
+        },
+        ComponentEntry {
+            name: "Calendar",
+            description: "A month calendar.",
+            demo: View(demos::build_calendar),
+        },
+        ComponentEntry {
+            name: "Date Picker",
+            description: "Single-date and date-range pickers.",
+            demo: View(demos::build_date_picker),
+        },
+        ComponentEntry {
+            name: "Color Picker",
+            description: "A color picker seeded from the theme.",
+            demo: View(demos::build_color_picker),
+        },
+        ComponentEntry {
+            name: "Settings",
+            description: "A settings page with grouped fields.",
+            demo: View(demos::build_settings),
+        },
     ]
 }
 
@@ -198,6 +338,89 @@ impl Gallery {
     }
 }
 
+/// Sidebar grouping for the registry, in display order. gpui-component's own
+/// gallery lists every component flat under one "Components" group, so this
+/// taxonomy is rift's own. Every [`registry`] entry name must appear in exactly
+/// one group (guarded by the `test_every_entry_is_grouped` /
+/// `test_group_names_exist_in_registry` tests).
+const GROUPS: &[(&str, &[&str])] = &[
+    ("Theme", &["Theme Tokens"]),
+    (
+        "Forms & Input",
+        &[
+            "Button",
+            "Dropdown Button",
+            "Input",
+            "OTP Input",
+            "Textarea",
+            "Label",
+            "Checkbox",
+            "Radio",
+            "Switch",
+            "Select",
+            "Combobox",
+            "Form",
+            "Slider",
+        ],
+    ),
+    (
+        "Feedback & Status",
+        &[
+            "Progress",
+            "Spinner",
+            "Skeleton",
+            "Badge",
+            "Tag",
+            "Alert",
+            "Notification",
+            "Tooltip",
+            "Rating",
+        ],
+    ),
+    (
+        "Layout",
+        &[
+            "Separator",
+            "Group Box",
+            "Resizable",
+            "Scrollbar",
+            "Sidebar",
+        ],
+    ),
+    (
+        "Navigation",
+        &["Breadcrumb", "Pagination", "Stepper", "Tabs", "Menu"],
+    ),
+    (
+        "Data Display",
+        &[
+            "List",
+            "Description List",
+            "Avatar",
+            "Icon",
+            "Image",
+            "Kbd",
+            "Link",
+            "Clipboard",
+        ],
+    ),
+    (
+        "Overlay",
+        &[
+            "Accordion",
+            "Collapsible",
+            "Popover",
+            "Hover Card",
+            "Dialog",
+            "Sheet",
+        ],
+    ),
+    (
+        "Pickers",
+        &["Calendar", "Date Picker", "Color Picker", "Settings"],
+    ),
+];
+
 impl Render for Gallery {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.search_input.read(cx).value().trim().to_lowercase();
@@ -232,66 +455,95 @@ impl Render for Gallery {
                 .into_any_element(),
         });
 
-        h_resizable("gallery-container")
+        // The dialog/sheet/notification overlays live as state on the window's
+        // `Root`; the root view must render their layers explicitly, otherwise an
+        // opened modal or pushed notification is never drawn. gpui-component's own
+        // gallery does the same in its root view.
+        let sheet_layer = Root::render_sheet_layer(window, cx);
+        let dialog_layer = Root::render_dialog_layer(window, cx);
+        let notification_layer = Root::render_notification_layer(window, cx);
+
+        // One sidebar group per `GROUPS` category, in declared order, skipping any
+        // group with no entry matching the current search.
+        let groups: Vec<_> = GROUPS
+            .iter()
+            .filter_map(|(group, names)| {
+                // Drive within-group order from the declared `names` order (look
+                // each name up in the search-filtered set), not from registry order.
+                let items: Vec<(usize, ComponentEntry)> = names
+                    .iter()
+                    .filter_map(|name| filtered.iter().find(|(_, e)| e.name == *name).copied())
+                    .collect();
+                if items.is_empty() {
+                    return None;
+                }
+                Some(SidebarGroup::new(*group).child(SidebarMenu::new().children(
+                    items.into_iter().map(|(full_ix, entry)| {
+                        SidebarMenuItem::new(entry.name)
+                            .active(active_ix == Some(full_ix))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.active_index = Some(full_ix);
+                                cx.notify();
+                            }))
+                    }),
+                )))
+            })
+            .collect();
+
+        div()
+            .size_full()
             .child(
-                resizable_panel()
-                    .size(px(255.))
-                    .size_range(px(200.)..px(360.))
+                h_resizable("gallery-container")
                     .child(
-                        Sidebar::new("gallery-sidebar")
-                            .w(relative(1.))
-                            .border_0()
-                            .header(
-                                div().w_full().px_2().child(
-                                    Input::new(&self.search_input)
-                                        .appearance(false)
-                                        .cleanable(true),
-                                ),
-                            )
-                            .child(SidebarGroup::new("Components").child(
-                                SidebarMenu::new().children(filtered.into_iter().map(
-                                    |(full_ix, entry)| {
-                                        SidebarMenuItem::new(entry.name)
-                                            .active(self.active_index == Some(full_ix))
-                                            .on_click(cx.listener(
-                                                move |this, _: &ClickEvent, _, cx| {
-                                                    this.active_index = Some(full_ix);
-                                                    cx.notify();
-                                                },
-                                            ))
-                                    },
-                                )),
-                            )),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .h_full()
-                    .overflow_x_hidden()
-                    .child(
-                        v_flex()
-                            .p_4()
-                            .gap_1()
-                            .border_b_1()
-                            .border_color(cx.theme().border)
-                            .child(div().text_xl().child(title))
+                        resizable_panel()
+                            .size(px(255.))
+                            .size_range(px(200.)..px(360.))
                             .child(
-                                div()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(description),
+                                Sidebar::new("gallery-sidebar")
+                                    .w(relative(1.))
+                                    .border_0()
+                                    .header(
+                                        div().w_full().px_2().child(
+                                            Input::new(&self.search_input)
+                                                .appearance(false)
+                                                .cleanable(true),
+                                        ),
+                                    )
+                                    .children(groups),
                             ),
                     )
                     .child(
-                        div()
-                            .id("gallery-content")
+                        v_flex()
                             .flex_1()
-                            .overflow_y_scroll()
-                            .p_4()
-                            .when_some(content, |this, content| this.child(content)),
-                    )
-                    .into_any_element(),
+                            .h_full()
+                            .overflow_x_hidden()
+                            .child(
+                                v_flex()
+                                    .p_4()
+                                    .gap_1()
+                                    .border_b_1()
+                                    .border_color(cx.theme().border)
+                                    .child(div().text_xl().child(title))
+                                    .child(
+                                        div()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(description),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("gallery-content")
+                                    .flex_1()
+                                    .overflow_y_scroll()
+                                    .p_4()
+                                    .when_some(content, |this, content| this.child(content)),
+                            )
+                            .into_any_element(),
+                    ),
             )
+            .children(sheet_layer)
+            .children(dialog_layer)
+            .children(notification_layer)
     }
 }
 
@@ -350,5 +602,33 @@ mod tests {
             entries.len(),
             "gallery entry names must be unique"
         );
+    }
+
+    #[test]
+    fn test_every_entry_is_grouped() {
+        for entry in registry() {
+            let count = super::GROUPS
+                .iter()
+                .filter(|(_, names)| names.contains(&entry.name))
+                .count();
+            assert_eq!(
+                count, 1,
+                "registry entry {:?} must belong to exactly one sidebar group (found {count})",
+                entry.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_group_names_exist_in_registry() {
+        let names: HashSet<&str> = registry().iter().map(|e| e.name).collect();
+        for (_, group_names) in super::GROUPS {
+            for name in *group_names {
+                assert!(
+                    names.contains(name),
+                    "sidebar group references unknown entry {name:?}"
+                );
+            }
+        }
     }
 }
