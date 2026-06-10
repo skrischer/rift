@@ -225,16 +225,11 @@ impl Render for Gallery {
         // variants are `Copy`), so no borrow of `self.entries` lingers while a
         // `View` demo borrows `self.views` to build and cache its entity once.
         let content: Option<AnyElement> = active_ix.map(|i| match self.entries[i].demo {
-            // `demo` is `Copy`, so this read leaves no borrow on `self.entries`.
             Demo::Element(render) => render(window, cx),
-            Demo::View(build) => {
-                if self.views[i].is_none() {
-                    self.views[i] = Some(build(window, cx));
-                }
-                self.views[i]
-                    .clone()
-                    .map_or_else(|| div().into_any_element(), |v| v.into_any_element())
-            }
+            Demo::View(build) => self.views[i]
+                .get_or_insert_with(|| build(window, cx))
+                .clone()
+                .into_any_element(),
         });
 
         h_resizable("gallery-container")

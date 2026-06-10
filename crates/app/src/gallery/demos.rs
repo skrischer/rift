@@ -44,9 +44,12 @@ gpui::actions!(rift_gallery, [DemoCopy, DemoPaste, DemoDelete]);
 
 pub(super) fn render_theme_tokens(_window: &mut Window, cx: &mut App) -> AnyElement {
     let t = cx.theme();
+    // Go through `t.colors` explicitly: `Theme` derefs to `ThemeColor` but also
+    // has its own non-color fields (`list: ListSettings`, `sheet`, …) that shadow
+    // same-named color tokens, so `t.list` would not be an `Hsla`.
     macro_rules! sw {
         ($field:ident) => {
-            swatch_cell(stringify!($field), t.$field, t.border)
+            swatch_cell(stringify!($field), t.colors.$field, t.border)
         };
     }
 
