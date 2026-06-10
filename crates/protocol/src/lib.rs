@@ -196,4 +196,38 @@ mod tests {
             other => panic!("expected UpdateWorktree, got {other:?}"),
         }
     }
+
+    #[test]
+    fn test_worktree_snapshot_final_chunk_true_with_empty_entries_roundtrips() {
+        let msg = DaemonMessage::WorktreeSnapshot {
+            root: "/home/dev/project".to_owned(),
+            entries: vec![],
+            final_chunk: true,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize WorktreeSnapshot");
+        assert!(json.contains(r#""final_chunk":true"#));
+        assert!(json.contains(r#""entries":[]"#));
+
+        let parsed: DaemonMessage =
+            serde_json::from_str(&json).expect("deserialize WorktreeSnapshot");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_worktree_entry_mtime_serializes_as_epoch_secs_and_nanos() {
+        let msg = DaemonMessage::WorktreeSnapshot {
+            root: "/p".to_owned(),
+            entries: vec![WorktreeEntry {
+                path: "a".to_owned(),
+                kind: EntryKind::File,
+                ignored: false,
+                mtime: SystemTime::UNIX_EPOCH + Duration::new(5, 7),
+            }],
+            final_chunk: true,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize WorktreeSnapshot");
+        // Pin the wire shape of `mtime`: the protocol may migrate to MessagePack,
+        // so an accidental change to the timestamp representation must fail a test.
+        assert!(json.contains(r#""mtime":{"secs_since_epoch":5,"nanos_since_epoch":7}"#));
+    }
 }
