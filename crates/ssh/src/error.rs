@@ -14,6 +14,8 @@ pub enum SshError {
     Exec { code: u32, stderr: String },
     #[error("unsupported remote platform '{0}' (no daemon binary)")]
     UnsupportedPlatform(String),
+    #[error("daemon launch did not become ready: {0}")]
+    DaemonLaunch(String),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
     #[error(
