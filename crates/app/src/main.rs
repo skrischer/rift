@@ -8,7 +8,7 @@ use gpui_component::Root;
 use rift_app::apply_theme;
 use rift_terminal::{
     CaptureRequest, CaptureResult, ConnectionStatus, PaneInput, PaneOutput, SelectWindow,
-    SessionView, SubscriptionUpdate, TermSize,
+    SessionView, SubscriptionUpdate, TermSize, TERMINAL_KEY_CONTEXT,
 };
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -53,6 +53,18 @@ fn main() {
         cx.bind_keys(
             (1..=9usize).map(|n| KeyBinding::new(&format!("alt-{n}"), SelectWindow(n), None)),
         );
+        // gpui-component's `Root` view binds `tab`/`shift-tab` to focus navigation
+        // in the "Root" context. Root is an ancestor of every pane, so that action
+        // consumes the keystroke before it reaches the pane's `on_key_down`, and the
+        // terminal never receives Tab (shell completion, agent prompt suggestions).
+        // Shadow it with `NoAction` in the deeper "Terminal" context: deepest context
+        // wins, NoAction yields no binding, so the keystroke falls through to the
+        // existing `encode_keystroke` path (`\t` / `\x1b[Z`). Scoped to "Terminal", so
+        // Tab still navigates focus in dialogs and forms.
+        cx.bind_keys([
+            KeyBinding::new("tab", NoAction, Some(TERMINAL_KEY_CONTEXT)),
+            KeyBinding::new("shift-tab", NoAction, Some(TERMINAL_KEY_CONTEXT)),
+        ]);
         let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
         cx.open_window(
             WindowOptions {
