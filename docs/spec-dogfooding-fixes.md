@@ -116,15 +116,15 @@ The decomposition lives as GitHub issues — one issue per papercut — grouped 
 policy; the issues own the individual fixes and their progress.
 
 - Grouping: [`papercut` label](https://github.com/skrischer/rift/labels/papercut)
-- First entry: **Tab keypress not forwarded to the PTY** — pressing Tab in a pane does
-  not reach the shell/agent, so shell completion (`cd /path/<Tab>`) and Claude Code's
-  slash/prompt suggestions are dead. Observable: `encode_keystroke` already maps Tab
-  correctly (`crates/terminal/src/keyboard.rs`: `"tab" => \t`, `Shift+Tab -> \x1b[Z`)
-  and the pane's `on_key_down` (`crates/terminal/src/pane_view.rs`) has no Tab
-  early-return, yet the byte never reaches `send_input` — so the listener does not fire
-  for Tab. Root cause is **to be confirmed during the fix** (candidate: a focus-layer /
-  tab-stop interaction in GPUI; rift registers no Tab key-binding itself). Category 2
-  (defect in an existing path); the fix forwards Tab and `Shift+Tab` like any other key.
+- First entry (resolved 2026-06-10, #116): **Tab keypress not forwarded to the PTY** —
+  pressing Tab in a pane did not reach the shell/agent, so shell completion
+  (`cd /path/<Tab>`) and Claude Code's slash/prompt suggestions were dead. Root cause,
+  **confirmed during the fix**: gpui-component's `Root` view binds `tab`/`shift-tab` to
+  focus navigation in the `"Root"` context, which wraps every pane and consumes the
+  keystroke before it reaches the pane's `on_key_down` (GPUI dispatches matched bindings
+  ahead of key-down listeners). Category 2 (defect in an existing path); the fix shadows
+  those bindings with `NoAction` in the deeper `"Terminal"` context so Tab falls through
+  to the existing `encode_keystroke` path. See the Decision log for the full mechanism.
 
 Each issue references this spec path in its body. A `fix:` PR may only merge if it closes
 an issue that traces back here (planning gate).
@@ -156,3 +156,26 @@ includes:
   `handover-conventions.md` in the same PR. First entry: Tab keypress not forwarded to
   the PTY (category 2 — defect in the existing key-forwarding path, upstream of
   `encode_keystroke`).
+- 2026-06-10: **Tab forwarding** resolved (#116, PR #137). Confirmed root cause:
+  gpui-component's `Root` view binds `tab`/`shift-tab` to focus navigation in the
+  `"Root"` context (an ancestor of every pane), pre-empting the pane's `on_key_down`
+  because GPUI dispatches matched key *bindings* before falling through to key-down
+  listeners. Fix: shadow both with `NoAction` in the deeper `"Terminal"` context —
+  deepest context wins, and a `NoAction` whose `meta == None` yields an empty binding
+  set, so the keystroke falls through to the existing `encode_keystroke` path
+  (`\t` / `\x1b[Z`). Scoped to `"Terminal"` so Tab still navigates focus in dialogs and
+  forms. The context string was extracted to a shared `rift_terminal::TERMINAL_KEY_CONTEXT`
+  const, referenced by both the binding and the pane's `key_context`, so a rename cannot
+  silently break forwarding across the crate boundary.
+- 2026-06-10: **alt+N out-of-range window creation** resolved (#120, PR #139). Category 1
+  (completing an existing GUI affordance). When N exceeds the window count, the
+  `SelectWindow` handler now sends a single `new-window` via `tmux_command_tx` (tmux
+  auto-selects it), mirroring the `+` tab button; N far beyond the count still creates
+  exactly one window, not N-M.
+- 2026-06-10: **Ctrl+Backspace word deletion** resolved (#121, PR #142). Category 2
+  (defect in an existing path). The backspace encoder ignored the Ctrl modifier and
+  always emitted DEL (`0x7f`). Decision: emit ESC+DEL (`\x1b\x7f`, readline's
+  `backward-kill-word`) rather than `0x17` (`unix-word-rubout`, whitespace-delimited).
+  `\x1b\x7f` shares the alphanumeric word boundary of the already-working Ctrl+Left/Right
+  (`\x1b[1;5D`) and is the sequence Alt+Backspace already emits, so `cd /pfad/zu` loses
+  one path segment per press rather than the whole path. Plain Backspace stays `0x7f`.
