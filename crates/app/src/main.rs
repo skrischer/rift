@@ -167,12 +167,13 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
         .await
         .context("SSH connection failed")?;
 
-    // Auto-deploy the daemon ahead of the tmux session. Detect the remote
-    // platform, then upload the versioned binary only when absent (the daemon is
-    // launched later via open_daemon_channel, not here). Gated on a configured
-    // local musl binary (RIFT_DAEMON_BINARY); without it, skip and fall through
-    // to the existing tmux flow so the app still runs.
-    deploy_daemon(&mut conn).await;
+    // Provision the daemon ahead of the tmux session: detect the platform,
+    // upload the versioned binary when absent, then attach — spawning it
+    // detached if none is running — and confirm the transport with a handshake.
+    // The detached daemon survives SSH drops, so a reconnect reattaches instead
+    // of spawning a second one (#62). Gated on RIFT_DAEMON_BINARY; without it,
+    // skip and fall through to the existing tmux flow so the app still runs.
+    provision_daemon(&mut conn).await;
 
     let pty = conn
         .open_pty_exec(80, 24, "tmux -CC new-session -A -s rift")
@@ -354,18 +355,23 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort daemon auto-deploy step, run before the tmux session is opened.
+/// Best-effort daemon provisioning, run before the tmux session is opened.
 ///
 /// Reads the locally-built musl binary from `RIFT_DAEMON_BINARY` (target dir
-/// `RIFT_DAEMON_REMOTE_DIR`, default `$HOME/.rift/bin`) and deploys the versioned
-/// binary via [`rift_ssh::ensure_daemon_deployed`]. A missing path or any deploy
-/// error is logged and swallowed: this step is additive and must not break the
-/// existing tmux flow while the daemon protocol is not yet wired in. The deploy
-/// only uploads — the daemon is launched later via `open_daemon_channel` once a
-/// consumer wires the protocol.
-async fn deploy_daemon(conn: &mut rift_ssh::SshConnection) {
+/// `RIFT_DAEMON_REMOTE_DIR`, default `$HOME/.rift/bin`), deploys the versioned
+/// binary via [`rift_ssh::ensure_daemon_deployed`], then attaches to the remote
+/// daemon — spawning it detached if none is running — via
+/// [`rift_ssh::connect_or_spawn_daemon`] and confirms the transport with a
+/// `Hello`/`Welcome` handshake. The detached daemon outlives the SSH connection,
+/// so a later reconnect reattaches to it instead of spawning a second one (#62).
+///
+/// Every step is best-effort: a missing `RIFT_DAEMON_BINARY` or any error is
+/// logged and swallowed so the existing tmux flow keeps working while the daemon
+/// protocol has no consumer yet. The socket and log sit beside the versioned
+/// binary (`<binary>.sock` / `<binary>.log`), inheriting its resolved path.
+async fn provision_daemon(conn: &mut rift_ssh::SshConnection) {
     let Some(binary_path) = env::var_os("RIFT_DAEMON_BINARY") else {
-        debug!("RIFT_DAEMON_BINARY not set, skipping daemon auto-deploy");
+        debug!("RIFT_DAEMON_BINARY not set, skipping daemon provisioning");
         return;
     };
     let binary_path = PathBuf::from(binary_path);
@@ -373,7 +379,7 @@ async fn deploy_daemon(conn: &mut rift_ssh::SshConnection) {
     let bytes = match tokio::fs::read(&binary_path).await {
         Ok(bytes) => bytes,
         Err(e) => {
-            warn!(%e, path = %binary_path.display(), "failed to read local daemon binary, skipping deploy");
+            warn!(%e, path = %binary_path.display(), "failed to read local daemon binary, skipping daemon");
             return;
         }
     };
@@ -381,10 +387,61 @@ async fn deploy_daemon(conn: &mut rift_ssh::SshConnection) {
     let remote_dir =
         env::var("RIFT_DAEMON_REMOTE_DIR").unwrap_or_else(|_| "$HOME/.rift/bin".to_string());
 
-    match rift_ssh::ensure_daemon_deployed(conn, &bytes, &remote_dir, env!("CARGO_PKG_VERSION"))
+    let remote_path = match rift_ssh::ensure_daemon_deployed(
+        conn,
+        &bytes,
+        &remote_dir,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    {
+        Ok(remote_path) => {
+            info!(remote_path, "daemon auto-deploy complete");
+            remote_path
+        }
+        Err(e) => {
+            warn!(%e, "daemon auto-deploy failed, continuing with tmux only");
+            return;
+        }
+    };
+
+    // Socket and log sit beside the versioned binary, inheriting its already
+    // resolved absolute path and version (no second $HOME resolution needed).
+    let socket_path = format!("{remote_path}.sock");
+    let log_path = format!("{remote_path}.log");
+
+    let channel = match rift_ssh::connect_or_spawn_daemon(
+        conn,
+        &remote_path,
+        &socket_path,
+        &log_path,
+    )
+    .await
+    {
+        Ok(channel) => channel,
+        Err(e) => {
+            warn!(%e, "daemon attach failed, continuing with tmux only");
+            return;
+        }
+    };
+
+    // Confirm the reattach transport with a protocol round-trip. The channel is
+    // dropped afterwards; the detached daemon keeps running for the next attach.
+    let client = rift_ssh::DaemonClient::new(channel);
+    if let Err(e) = client
+        .send(rift_protocol::ClientMessage::Hello {
+            version: rift_protocol::PROTOCOL_VERSION,
+        })
         .await
     {
-        Ok(remote_path) => info!(remote_path, "daemon auto-deploy complete"),
-        Err(e) => warn!(%e, "daemon auto-deploy failed, continuing with tmux only"),
+        warn!(%e, "daemon handshake send failed");
+        return;
+    }
+    match client.recv().await {
+        Some(rift_protocol::DaemonMessage::Welcome { version }) => {
+            info!(version, "daemon transport ready (Hello/Welcome ok)")
+        }
+        Some(other) => warn!(?other, "unexpected daemon handshake reply"),
+        None => warn!("daemon closed before Welcome"),
     }
 }

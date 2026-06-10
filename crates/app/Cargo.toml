@@ -24,6 +24,7 @@ gallery = ["dep:gpui-component-assets"]
 [dependencies]
 rift-terminal = { path = "../terminal" }
 rift-ssh = { path = "../ssh" }
+rift-protocol = { path = "../protocol" }
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui-component.workspace = true
