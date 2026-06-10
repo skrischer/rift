@@ -261,6 +261,15 @@ pub async fn connect_relay(socket_path: &Path) -> anyhow::Result<()> {
     relay(tokio::io::stdin(), tokio::io::stdout(), socket_path).await
 }
 
+/// Return whether a daemon is currently listening on `socket_path`.
+///
+/// A connect probe (no framing, no relay): the SSH host keys its reattach-vs-
+/// spawn decision on this so it never starts a second daemon when one already
+/// owns the socket.
+pub async fn ping(socket_path: &Path) -> bool {
+    UnixStream::connect(socket_path).await.is_ok()
+}
+
 impl Daemon {
     /// Run the flat dispatch loop until the inbound channel closes.
     ///
@@ -534,6 +543,25 @@ mod tests {
         );
 
         relay_task.abort();
+        server.abort();
+        let _ = tokio::fs::remove_file(&sock).await;
+    }
+
+    #[tokio::test]
+    async fn test_ping_false_when_absent_true_when_listening() {
+        let sock = unique_socket_path();
+        assert!(!ping(&sock).await, "ping must be false before any bind");
+
+        let server = tokio::spawn({
+            let sock = sock.clone();
+            async move { serve_uds(&sock).await }
+        });
+        wait_for_socket(&sock).await;
+        assert!(
+            ping(&sock).await,
+            "ping must be true while the daemon listens"
+        );
+
         server.abort();
         let _ = tokio::fs::remove_file(&sock).await;
     }

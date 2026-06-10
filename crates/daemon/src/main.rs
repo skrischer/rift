@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::Context;
-use rift_daemon::{connect_relay, serve, serve_uds};
+use rift_daemon::{connect_relay, ping, serve, serve_uds};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -24,6 +24,13 @@ async fn main() -> anyhow::Result<()> {
         Some("--connect") => {
             let path = args.next().context("--connect requires a socket path")?;
             connect_relay(Path::new(&path)).await
+        }
+        // Probe mode: exit 0 if a daemon is listening on the socket, 1 otherwise.
+        // The SSH host keys its reattach-vs-spawn decision on this status; no
+        // output is emitted either way.
+        Some("--ping") => {
+            let path = args.next().context("--ping requires a socket path")?;
+            std::process::exit(if ping(Path::new(&path)).await { 0 } else { 1 });
         }
         Some(other) => anyhow::bail!("unknown argument: {other}"),
         // Default stdio mode: speak the protocol over stdin/stdout for a single
