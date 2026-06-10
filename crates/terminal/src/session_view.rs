@@ -1046,7 +1046,9 @@ impl Render for SessionView {
             // Alt+1..9 window switch. The action is dispatched here (an ancestor
             // of the focused pane) before the keystroke reaches the PTY; the
             // 1-based number selects the Nth window in tab order, mirroring the
-            // tab-bar click handler.
+            // tab-bar click handler. When N exceeds the window count, create a
+            // single new window (tmux selects it automatically), completing the
+            // affordance like the `+` tab button — never N-M windows.
             .on_action(cx.listener(|this, action: &SelectWindow, _window, _cx| {
                 if let Some(win) = this.windows.get(action.0.saturating_sub(1)) {
                     if let Err(e) = this
@@ -1055,6 +1057,8 @@ impl Render for SessionView {
                     {
                         debug!(error = %e, "failed to send window switch command");
                     }
+                } else if let Err(e) = this.tmux_command_tx.try_send("new-window".into()) {
+                    debug!(error = %e, "failed to create new window");
                 }
             }))
             .child(tab_bar)
