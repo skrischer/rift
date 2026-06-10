@@ -187,7 +187,7 @@ How the entire spec is known complete:
 | The editor demo's grammar set balloons (~35 crates) | Enable a single grammar (`tree-sitter-rust`) rather than the umbrella `tree-sitter-languages` feature. |
 | Chart/table demos need `rust_decimal` (gpui-component `decimal` feature) | Enable `decimal` under the `gallery` feature only if a demo uses decimal axes; otherwise omit. |
 | WebView follow-up reintroduces a second `gpui` via `gpui-wry` | Out of scope here; the follow-up issue owns proving `gpui-wry` converges on rift's pinned zed rev and the `x86_64-pc-windows-gnu` cross-compile before adding it. |
-| Gallery rots as gpui-component's API drifts | The GPU station builds it via `just gallery`; optionally extend CI `app-check` with `cargo check -p rift-app --features gallery` if the runner can provide the editor-grammar system libs (otherwise the station is the gate). |
+| Gallery rots as gpui-component's API drifts | CI `app-check` now builds it: the skeleton step (#123) added `cargo clippy -p rift-app --features gallery --all-targets -- -D warnings` and `cargo test -p rift-app --features gallery` to the job, so the gallery feature compiles on every push and drift fails CI; the GPU station's `just gallery` stays the visual gate. (The editor-grammar demos may still need station-side checking if the CI runner lacks their system libs.) |
 | Scope creep into a theme editor / interactive knobs | Both explicitly out of scope; this spec ships a static, single-theme gallery. |
 
 ## Decision log
@@ -211,3 +211,13 @@ How the entire spec is known complete:
   - Non-blocking review notes folded in: `gpui-component-assets` is a direct dep of
     `gpui-component` already (named directly only for `with_assets`); single grammar
     instead of the full set; `decimal` enabled only if a chart/table demo needs it.
+- 2026-06-10: Skeleton step (#123, PR #130) merged. Implementation decision: CI
+  `app-check` now gates the `gallery` feature directly, rather than leaving the GPU
+  station as the only build gate — it runs `cargo clippy -p rift-app --features
+  gallery --all-targets -- -D warnings` and `cargo test -p rift-app --features
+  gallery` next to the feature-off `cargo check -p rift-app`. This resolves the
+  Risk-table "optionally extend app-check" item to **done**. The `--all-targets`
+  clippy run earned its keep immediately, catching a `#[test]`-macro recursion (the
+  `gpui::*` glob pulls gpui's `test` attribute macro into scope, shadowing the
+  built-in `#[test]`) that a plain `cargo check` would have missed; the fix narrows
+  the test module's imports to just the symbols it uses.
