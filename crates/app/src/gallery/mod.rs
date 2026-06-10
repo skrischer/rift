@@ -159,6 +159,146 @@ pub fn registry() -> Vec<ComponentEntry> {
             description: "Star rating display.",
             demo: Element(demos::render_rating),
         },
+        ComponentEntry {
+            name: "Separator",
+            description: "Horizontal, vertical, dashed and labeled dividers.",
+            demo: Element(demos::render_separator),
+        },
+        ComponentEntry {
+            name: "Group Box",
+            description: "Titled containers grouping related controls.",
+            demo: Element(demos::render_group_box),
+        },
+        ComponentEntry {
+            name: "Description List",
+            description: "Key/value rows in a bordered grid.",
+            demo: Element(demos::render_description_list),
+        },
+        ComponentEntry {
+            name: "Resizable",
+            description: "Draggable split panels.",
+            demo: Element(demos::render_resizable),
+        },
+        ComponentEntry {
+            name: "Scrollbar",
+            description: "A themed scrollbar on overflowing content.",
+            demo: Element(demos::render_scrollbar),
+        },
+        ComponentEntry {
+            name: "Sidebar",
+            description: "Grouped navigation menu with icons.",
+            demo: Element(demos::render_sidebar),
+        },
+        ComponentEntry {
+            name: "List",
+            description: "A selectable list backed by a delegate.",
+            demo: View(demos::build_list),
+        },
+        ComponentEntry {
+            name: "Tabs",
+            description: "A tab bar switching the shown content.",
+            demo: View(demos::build_tabs),
+        },
+        ComponentEntry {
+            name: "Breadcrumb",
+            description: "A path of navigable segments.",
+            demo: Element(demos::render_breadcrumb),
+        },
+        ComponentEntry {
+            name: "Pagination",
+            description: "Page navigation with a current page.",
+            demo: View(demos::build_pagination),
+        },
+        ComponentEntry {
+            name: "Stepper",
+            description: "A multi-step progress indicator.",
+            demo: View(demos::build_stepper),
+        },
+        ComponentEntry {
+            name: "Menu",
+            description: "A dropdown menu and a right-click context menu.",
+            demo: Element(demos::render_menu),
+        },
+        ComponentEntry {
+            name: "Accordion",
+            description: "Expandable disclosure sections.",
+            demo: View(demos::build_accordion),
+        },
+        ComponentEntry {
+            name: "Collapsible",
+            description: "A parent-controlled show/hide region.",
+            demo: View(demos::build_collapsible),
+        },
+        ComponentEntry {
+            name: "Popover",
+            description: "Floating content anchored to a trigger.",
+            demo: Element(demos::render_popover),
+        },
+        ComponentEntry {
+            name: "Hover Card",
+            description: "Content revealed on hover.",
+            demo: Element(demos::render_hover_card),
+        },
+        ComponentEntry {
+            name: "Dialog",
+            description: "A modal dialog opened from a trigger.",
+            demo: Element(demos::render_dialog),
+        },
+        ComponentEntry {
+            name: "Sheet",
+            description: "A side drawer opened from a trigger.",
+            demo: Element(demos::render_sheet),
+        },
+        ComponentEntry {
+            name: "Avatar",
+            description: "Initials and placeholder avatars in several sizes.",
+            demo: Element(demos::render_avatar),
+        },
+        ComponentEntry {
+            name: "Icon",
+            description: "Library icons with sizes and colors.",
+            demo: Element(demos::render_icon),
+        },
+        ComponentEntry {
+            name: "Image",
+            description: "Image sources (offline build shows embedded vector tiles).",
+            demo: Element(demos::render_image),
+        },
+        ComponentEntry {
+            name: "Kbd",
+            description: "Keyboard shortcut chips.",
+            demo: Element(demos::render_kbd),
+        },
+        ComponentEntry {
+            name: "Link",
+            description: "Hyperlinks, including a disabled state.",
+            demo: Element(demos::render_link),
+        },
+        ComponentEntry {
+            name: "Clipboard",
+            description: "A copy-to-clipboard control.",
+            demo: Element(demos::render_clipboard),
+        },
+        ComponentEntry {
+            name: "Calendar",
+            description: "A month calendar.",
+            demo: View(demos::build_calendar),
+        },
+        ComponentEntry {
+            name: "Date Picker",
+            description: "Single-date and date-range pickers.",
+            demo: View(demos::build_date_picker),
+        },
+        ComponentEntry {
+            name: "Color Picker",
+            description: "A color picker seeded from the theme.",
+            demo: View(demos::build_color_picker),
+        },
+        ComponentEntry {
+            name: "Settings",
+            description: "A settings page with grouped fields.",
+            demo: View(demos::build_settings),
+        },
     ]
 }
 

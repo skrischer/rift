@@ -1,5 +1,6 @@
-//! Component demos for the gallery (issue #124, part 1): the Theme-tokens
-//! reference plus the form/input and feedback components.
+//! Component demos for the gallery. Part 1 (#124): the Theme-tokens reference
+//! plus the form/input and feedback components. Part 2 (#125): the layout,
+//! navigation, overlay and picker components.
 //!
 //! Each entry is either a stateless [`super::Demo::Element`] (rebuilt every
 //! frame from a plain `fn`) or a stateful [`super::Demo::View`] backed by a small
@@ -10,25 +11,49 @@
 
 use gpui::{prelude::*, *};
 use gpui_component::{
+    accordion::Accordion,
     alert::Alert,
+    avatar::Avatar,
     badge::Badge,
+    breadcrumb::{Breadcrumb, BreadcrumbItem},
     button::{Button, ButtonVariants, DropdownButton},
+    calendar::{Calendar, CalendarState},
     checkbox::Checkbox,
+    clipboard::Clipboard,
+    collapsible::Collapsible,
+    color_picker::{ColorPicker, ColorPickerState},
     combobox::{Combobox, ComboboxState},
+    date_picker::{DatePicker, DatePickerState},
+    description_list::{DescriptionItem, DescriptionList},
     form::{field, v_form},
+    group_box::{GroupBox, GroupBoxVariants as _},
     h_flex,
+    hover_card::HoverCard,
     input::{Input, InputState, NumberInput, OtpInput, OtpState},
+    kbd::Kbd,
     label::Label,
+    link::Link,
+    list::{List, ListDelegate, ListItem, ListState},
+    menu::{ContextMenuExt as _, DropdownMenu as _},
     notification::NotificationType,
+    pagination::Pagination,
+    popover::Popover,
     progress::Progress,
     radio::{Radio, RadioGroup},
     rating::Rating,
+    resizable::{h_resizable, resizable_panel},
+    scroll::ScrollableElement as _,
     searchable_list::SearchableVec,
     select::{Select, SelectState},
+    separator::Separator,
+    setting::{NumberFieldOptions, SettingField, SettingGroup, SettingItem, SettingPage, Settings},
+    sidebar::{Sidebar, SidebarGroup, SidebarMenu, SidebarMenuItem},
     skeleton::Skeleton,
     slider::{Slider, SliderState},
     spinner::Spinner,
+    stepper::{Stepper, StepperItem},
     switch::Switch,
+    tab::{Tab, TabBar},
     tag::Tag,
     v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, IndexPath, Sizable as _,
     WindowExt as _,
@@ -817,4 +842,952 @@ pub(super) fn render_rating(_window: &mut Window, _cx: &mut App) -> AnyElement {
         .child(Rating::new("rt-3").value(3).max(5))
         .child(Rating::new("rt-disabled").value(4).max(5).disabled(true))
         .into_any_element()
+}
+
+// ===========================================================================
+// Part 2 (#125): layout, navigation, overlay and picker components.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Separator
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_separator(_window: &mut Window, _cx: &mut App) -> AnyElement {
+    v_flex()
+        .gap_4()
+        .max_w(px(420.))
+        .child("Above the line")
+        .child(Separator::horizontal())
+        .child(Separator::horizontal().label("With label"))
+        .child(Separator::horizontal_dashed())
+        .child(
+            h_flex()
+                .h(px(40.))
+                .gap_3()
+                .items_center()
+                .child("Left")
+                .child(Separator::vertical())
+                .child("Right"),
+        )
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Group box
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_group_box(_window: &mut Window, _cx: &mut App) -> AnyElement {
+    v_flex()
+        .gap_4()
+        .max_w(px(480.))
+        .child(
+            GroupBox::new()
+                .title("Appearance")
+                .child(Switch::new("gb-dark").label("Dark mode").checked(true))
+                .child(Switch::new("gb-compact").label("Compact layout")),
+        )
+        .child(
+            GroupBox::new()
+                .title("Notifications")
+                .fill()
+                .child(Checkbox::new("gb-email").label("Email").checked(true))
+                .child(Checkbox::new("gb-push").label("Push")),
+        )
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Description list
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_description_list(_window: &mut Window, _cx: &mut App) -> AnyElement {
+    DescriptionList::new()
+        .columns(2)
+        .bordered(true)
+        .max_w(px(560.))
+        .child(DescriptionItem::new("Name").value("Jane Doe"))
+        .child(DescriptionItem::new("Role").value("Maintainer"))
+        .child(
+            DescriptionItem::new("Email")
+                .value("jane@example.com")
+                .span(2),
+        )
+        .child(DescriptionItem::new("Location").value("Berlin"))
+        .child(DescriptionItem::new("Timezone").value("CET"))
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Kbd (keyboard shortcuts)
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_kbd(_window: &mut Window, _cx: &mut App) -> AnyElement {
+    // Parsing a literal keystroke can only fail on a typo here, so a panic is
+    // the right signal during development.
+    let key = |s: &str| Kbd::new(Keystroke::parse(s).expect("valid keystroke literal"));
+    h_flex()
+        .gap_3()
+        .flex_wrap()
+        .child(key("cmd-shift-p"))
+        .child(key("ctrl-c"))
+        .child(key("enter"))
+        .child(key("escape").outline())
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Link
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_link(_window: &mut Window, _cx: &mut App) -> AnyElement {
+    v_flex()
+        .gap_3()
+        .child(
+            Link::new("link-repo")
+                .href("https://github.com/skrischer/rift")
+                .child("rift on GitHub"),
+        )
+        .child(
+            Link::new("link-disabled")
+                .disabled(true)
+                .child("Disabled link"),
+        )
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Icon
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_icon(_window: &mut Window, cx: &mut App) -> AnyElement {
+    let names = [
+        IconName::Search,
+        IconName::Check,
+        IconName::Bell,
+        IconName::Inbox,
+        IconName::Heart,
+        IconName::Star,
+        IconName::Info,
+        IconName::Github,
+        IconName::User,
+        IconName::Cpu,
+    ];
+    v_flex()
+        .gap_4()
+        .child(
+            h_flex()
+                .gap_4()
+                .flex_wrap()
+                .children(names.into_iter().map(Icon::new)),
+        )
+        .child(
+            h_flex()
+                .gap_4()
+                .items_center()
+                .child(Icon::new(IconName::Heart).small())
+                .child(Icon::new(IconName::Heart))
+                .child(Icon::new(IconName::Heart).large())
+                .child(
+                    Icon::new(IconName::Heart)
+                        .with_size(px(40.))
+                        .text_color(cx.theme().primary),
+                ),
+        )
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Avatar
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_avatar(_window: &mut Window, _cx: &mut App) -> AnyElement {
+    // Initials mode (no `.src()`) so the demo needs no network or embedded image.
+    h_flex()
+        .gap_4()
+        .items_center()
+        .child(Avatar::new().name("Jane Doe").small())
+        .child(Avatar::new().name("Sebastian Krischer"))
+        .child(Avatar::new().name("Rift Dev").large())
+        .child(Avatar::new().placeholder(IconName::User))
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Image
+// ---------------------------------------------------------------------------
+
+fn image_tile(icon: IconName, border: Hsla, bg: Hsla, fg: Hsla) -> AnyElement {
+    h_flex()
+        .size(px(120.))
+        .items_center()
+        .justify_center()
+        .rounded(px(8.))
+        .border_1()
+        .border_color(border)
+        .bg(bg)
+        .child(Icon::new(icon).with_size(px(56.)).text_color(fg))
+        .into_any_element()
+}
+
+pub(super) fn render_image(_window: &mut Window, cx: &mut App) -> AnyElement {
+    let border = cx.theme().border;
+    let bg = cx.theme().muted;
+    let fg = cx.theme().muted_foreground;
+    v_flex()
+        .gap_3()
+        .child(div().text_color(fg).child(
+            "gpui's img() renders raster or remote image sources (remote URLs need an \
+             http client); this offline gallery build embeds only vector icons, shown \
+             here as framed tiles.",
+        ))
+        .child(
+            h_flex()
+                .gap_4()
+                .child(image_tile(IconName::Globe, border, bg, fg))
+                .child(image_tile(IconName::Map, border, bg, fg))
+                .child(image_tile(IconName::File, border, bg, fg)),
+        )
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Breadcrumb
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_breadcrumb(_window: &mut Window, _cx: &mut App) -> AnyElement {
+    Breadcrumb::new()
+        .child("Home")
+        .child("Projects")
+        .child(BreadcrumbItem::new("rift"))
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Sidebar
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_sidebar(_window: &mut Window, cx: &mut App) -> AnyElement {
+    let border = cx.theme().border;
+    div()
+        .h(px(360.))
+        .w(px(260.))
+        .border_1()
+        .border_color(border)
+        .rounded(px(6.))
+        .overflow_hidden()
+        .child(
+            Sidebar::new("sidebar-demo")
+                .w(relative(1.))
+                .border_0()
+                .child(
+                    SidebarGroup::new("Workspace").child(
+                        SidebarMenu::new()
+                            .child(
+                                SidebarMenuItem::new("Explorer")
+                                    .icon(IconName::Folder)
+                                    .active(true),
+                            )
+                            .child(SidebarMenuItem::new("Search").icon(IconName::Search))
+                            .child(SidebarMenuItem::new("Browse").icon(IconName::Globe)),
+                    ),
+                )
+                .child(
+                    SidebarGroup::new("Account").child(
+                        SidebarMenu::new()
+                            .child(SidebarMenuItem::new("Profile").icon(IconName::User))
+                            .child(SidebarMenuItem::new("Notifications").icon(IconName::Bell))
+                            .child(SidebarMenuItem::new("Preferences").icon(IconName::Settings2)),
+                    ),
+                ),
+        )
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Menu (standalone dropdown + context menu)
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_menu(_window: &mut Window, cx: &mut App) -> AnyElement {
+    let border = cx.theme().border;
+    v_flex()
+        .gap_6()
+        .child(
+            Button::new("menu-dropdown")
+                .outline()
+                .label("Open menu")
+                .dropdown_menu(|menu, _, _| {
+                    menu.menu("Copy", Box::new(DemoCopy))
+                        .menu("Paste", Box::new(DemoPaste))
+                        .separator()
+                        .menu("Delete", Box::new(DemoDelete))
+                }),
+        )
+        .child(
+            div()
+                .id("menu-context")
+                .w(px(280.))
+                .p_4()
+                .border_1()
+                .border_color(border)
+                .rounded(px(6.))
+                .child("Right-click anywhere in this box")
+                .context_menu(|menu, _, _| {
+                    menu.menu("Copy", Box::new(DemoCopy))
+                        .menu("Paste", Box::new(DemoPaste))
+                        .separator()
+                        .menu("Delete", Box::new(DemoDelete))
+                }),
+        )
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Popover
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_popover(_window: &mut Window, _cx: &mut App) -> AnyElement {
+    h_flex()
+        .gap_4()
+        .child(
+            Popover::new("popover-demo")
+                .trigger(
+                    Button::new("popover-trigger")
+                        .outline()
+                        .label("Open popover"),
+                )
+                .content(|_, _, _| {
+                    v_flex()
+                        .gap_2()
+                        .p_2()
+                        .child("Popover title")
+                        .child("Any content can live inside a popover.")
+                }),
+        )
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Hover card
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_hover_card(_window: &mut Window, _cx: &mut App) -> AnyElement {
+    h_flex()
+        .gap_4()
+        .child(
+            HoverCard::new("hover-card-demo")
+                .trigger(
+                    Button::new("hover-card-trigger")
+                        .outline()
+                        .label("Hover me"),
+                )
+                .content(|_, _, _| {
+                    v_flex()
+                        .gap_1()
+                        .p_2()
+                        .child("Hover card")
+                        .child("Shown on hover after a short delay.")
+                }),
+        )
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Dialog (modal opened from a trigger)
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_dialog(_window: &mut Window, _cx: &mut App) -> AnyElement {
+    h_flex()
+        .gap_4()
+        .child(
+            Button::new("dialog-open")
+                .primary()
+                .label("Open dialog")
+                .on_click(|_, window, cx| {
+                    window.open_dialog(cx, |dialog, _, _| {
+                        dialog
+                            .title("Delete file?")
+                            .child("This action cannot be undone.")
+                            .on_ok(|_, _, _| true)
+                            .on_cancel(|_, _, _| true)
+                    });
+                }),
+        )
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Sheet (side drawer opened from a trigger)
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_sheet(_window: &mut Window, _cx: &mut App) -> AnyElement {
+    h_flex()
+        .gap_4()
+        .child(
+            Button::new("sheet-open")
+                .primary()
+                .label("Open sheet")
+                .on_click(|_, window, cx| {
+                    window.open_sheet(cx, |sheet, _, _| {
+                        sheet.title("Details").child(
+                            div()
+                                .p_2()
+                                .child("A sheet slides in from the edge of the window."),
+                        )
+                    });
+                }),
+        )
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Clipboard
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_clipboard(_window: &mut Window, _cx: &mut App) -> AnyElement {
+    h_flex()
+        .gap_3()
+        .items_center()
+        .child("cargo install rift")
+        .child(
+            Clipboard::new("clipboard-demo")
+                .value("cargo install rift")
+                .on_copied(|_, _, _| {}),
+        )
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Scrollbar
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_scrollbar(_window: &mut Window, cx: &mut App) -> AnyElement {
+    let border = cx.theme().border;
+    div()
+        .id("scrollbar-demo")
+        .h(px(220.))
+        .max_w(px(420.))
+        .border_1()
+        .border_color(border)
+        .rounded(px(6.))
+        .p_3()
+        .overflow_y_scrollbar()
+        .child(
+            v_flex()
+                .gap_2()
+                .children((1..=40).map(|i| div().child(format!("Row {i}")))),
+        )
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Resizable
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_resizable(_window: &mut Window, cx: &mut App) -> AnyElement {
+    let border = cx.theme().border;
+    div()
+        .h(px(240.))
+        .border_1()
+        .border_color(border)
+        .rounded(px(6.))
+        .overflow_hidden()
+        .child(
+            h_resizable("resizable-demo")
+                .child(
+                    resizable_panel()
+                        .size(px(160.))
+                        .size_range(px(120.)..px(280.))
+                        .child(div().p_3().child("Sidebar")),
+                )
+                .child(resizable_panel().child(div().p_3().child("Main content"))),
+        )
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Tabs
+// ---------------------------------------------------------------------------
+
+struct TabsDemo {
+    active: usize,
+}
+
+impl Render for TabsDemo {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let labels = ["Account", "Password", "Notifications"];
+        v_flex()
+            .gap_3()
+            .child(
+                TabBar::new("tabs-demo")
+                    .selected_index(self.active)
+                    .on_click(cx.listener(|this, ix: &usize, _, cx| {
+                        this.active = *ix;
+                        cx.notify();
+                    }))
+                    .children(labels.into_iter().map(|l| Tab::new().label(l))),
+            )
+            .child(
+                div()
+                    .p_2()
+                    .child(format!("Content for the {} tab.", labels[self.active])),
+            )
+    }
+}
+
+pub(super) fn build_tabs(_window: &mut Window, cx: &mut App) -> AnyView {
+    cx.new(|_| TabsDemo { active: 0 }).into()
+}
+
+// ---------------------------------------------------------------------------
+// Accordion
+// ---------------------------------------------------------------------------
+
+struct AccordionDemo {
+    open: Vec<usize>,
+}
+
+impl Render for AccordionDemo {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let o0 = self.open.contains(&0);
+        let o1 = self.open.contains(&1);
+        let o2 = self.open.contains(&2);
+        let this = cx.entity().downgrade();
+        Accordion::new("accordion-demo")
+            .multiple(true)
+            .item(move |item| {
+                item.open(o0)
+                    .title("What is rift?")
+                    .child("An agent-centric IDE built in Rust.")
+            })
+            .item(move |item| {
+                item.open(o1)
+                    .title("Is it open source?")
+                    .child("Yes, always free and open source.")
+            })
+            .item(move |item| {
+                item.open(o2)
+                    .title("Which agents does it support?")
+                    .child("Any terminal coding agent, unmodified.")
+            })
+            .on_toggle_click(move |open_ixs: &[usize], _window, cx| {
+                let open = open_ixs.to_vec();
+                let _ = this.update(cx, |this, cx| {
+                    this.open = open;
+                    cx.notify();
+                });
+            })
+    }
+}
+
+pub(super) fn build_accordion(_window: &mut Window, cx: &mut App) -> AnyView {
+    cx.new(|_| AccordionDemo { open: vec![0] }).into()
+}
+
+// ---------------------------------------------------------------------------
+// Collapsible
+// ---------------------------------------------------------------------------
+
+struct CollapsibleDemo {
+    open: bool,
+}
+
+impl Render for CollapsibleDemo {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_2()
+            .child(
+                Button::new("collapsible-toggle")
+                    .outline()
+                    .label(if self.open {
+                        "Hide details"
+                    } else {
+                        "Show details"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.open = !this.open;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Collapsible::new().open(self.open).content(
+                    v_flex()
+                        .gap_1()
+                        .p_2()
+                        .child("These details are revealed when expanded.")
+                        .child("Collapsible is controlled by a parent boolean."),
+                ),
+            )
+    }
+}
+
+pub(super) fn build_collapsible(_window: &mut Window, cx: &mut App) -> AnyView {
+    cx.new(|_| CollapsibleDemo { open: true }).into()
+}
+
+// ---------------------------------------------------------------------------
+// Pagination
+// ---------------------------------------------------------------------------
+
+struct PaginationDemo {
+    page: usize,
+}
+
+impl Render for PaginationDemo {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_3()
+            .child(
+                Pagination::new("pagination-demo")
+                    .total_pages(10)
+                    .current_page(self.page)
+                    .on_click(cx.listener(|this, page: &usize, _, cx| {
+                        this.page = *page;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("Page {} of 10", self.page)),
+            )
+    }
+}
+
+pub(super) fn build_pagination(_window: &mut Window, cx: &mut App) -> AnyView {
+    cx.new(|_| PaginationDemo { page: 1 }).into()
+}
+
+// ---------------------------------------------------------------------------
+// Stepper
+// ---------------------------------------------------------------------------
+
+struct StepperDemo {
+    step: usize,
+}
+
+impl Render for StepperDemo {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_4()
+            .max_w(px(560.))
+            .child(
+                Stepper::new("stepper-demo")
+                    .selected_index(self.step)
+                    .items([
+                        StepperItem::new().child("Account"),
+                        StepperItem::new().child("Profile"),
+                        StepperItem::new().child("Confirm"),
+                    ])
+                    .on_click(cx.listener(|this, step: &usize, _, cx| {
+                        this.step = *step;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("stepper-back")
+                            .outline()
+                            .label("Back")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.step = this.step.saturating_sub(1);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("stepper-next")
+                            .primary()
+                            .label("Next")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.step < 2 {
+                                    this.step += 1;
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            )
+    }
+}
+
+pub(super) fn build_stepper(_window: &mut Window, cx: &mut App) -> AnyView {
+    cx.new(|_| StepperDemo { step: 0 }).into()
+}
+
+// ---------------------------------------------------------------------------
+// List
+// ---------------------------------------------------------------------------
+
+struct GalleryListDelegate {
+    items: Vec<SharedString>,
+    selected: Option<usize>,
+}
+
+impl ListDelegate for GalleryListDelegate {
+    type Item = ListItem;
+
+    fn items_count(&self, _section: usize, _cx: &App) -> usize {
+        self.items.len()
+    }
+
+    fn render_item(
+        &mut self,
+        ix: IndexPath,
+        _window: &mut Window,
+        _cx: &mut Context<ListState<Self>>,
+    ) -> Option<Self::Item> {
+        let label = self.items.get(ix.row)?;
+        Some(
+            ListItem::new(("list-item", ix.row))
+                .selected(self.selected == Some(ix.row))
+                .child(label.clone()),
+        )
+    }
+
+    fn set_selected_index(
+        &mut self,
+        ix: Option<IndexPath>,
+        _window: &mut Window,
+        cx: &mut Context<ListState<Self>>,
+    ) {
+        self.selected = ix.map(|ix| ix.row);
+        cx.notify();
+    }
+}
+
+struct ListDemo {
+    list: Entity<ListState<GalleryListDelegate>>,
+}
+
+impl ListDemo {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let delegate = GalleryListDelegate {
+            items: vec![
+                "Inbox".into(),
+                "Drafts".into(),
+                "Sent".into(),
+                "Archive".into(),
+                "Spam".into(),
+                "Trash".into(),
+            ],
+            selected: Some(0),
+        };
+        Self {
+            list: cx.new(|cx| ListState::new(delegate, window, cx)),
+        }
+    }
+}
+
+impl Render for ListDemo {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .h(px(280.))
+            .max_w(px(360.))
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(px(6.))
+            .child(List::new(&self.list).flex_1().w_full())
+    }
+}
+
+pub(super) fn build_list(window: &mut Window, cx: &mut App) -> AnyView {
+    cx.new(|cx| ListDemo::new(window, cx)).into()
+}
+
+// ---------------------------------------------------------------------------
+// Calendar
+// ---------------------------------------------------------------------------
+
+struct CalendarDemo {
+    state: Entity<CalendarState>,
+}
+
+impl Render for CalendarDemo {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().child(Calendar::new(&self.state).number_of_months(1))
+    }
+}
+
+pub(super) fn build_calendar(window: &mut Window, cx: &mut App) -> AnyView {
+    cx.new(|cx| CalendarDemo {
+        state: cx.new(|cx| CalendarState::new(window, cx)),
+    })
+    .into()
+}
+
+// ---------------------------------------------------------------------------
+// Date picker
+// ---------------------------------------------------------------------------
+
+struct DatePickerDemo {
+    single: Entity<DatePickerState>,
+    range: Entity<DatePickerState>,
+}
+
+impl Render for DatePickerDemo {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_4()
+            .max_w(px(320.))
+            .child(
+                DatePicker::new(&self.single)
+                    .placeholder("Pick a date")
+                    .cleanable(true),
+            )
+            .child(
+                DatePicker::new(&self.range)
+                    .placeholder("Pick a range")
+                    .number_of_months(2),
+            )
+    }
+}
+
+pub(super) fn build_date_picker(window: &mut Window, cx: &mut App) -> AnyView {
+    cx.new(|cx| DatePickerDemo {
+        single: cx.new(|cx| DatePickerState::new(window, cx)),
+        range: cx.new(|cx| DatePickerState::range(window, cx)),
+    })
+    .into()
+}
+
+// ---------------------------------------------------------------------------
+// Color picker
+// ---------------------------------------------------------------------------
+
+struct ColorPickerDemo {
+    color: Entity<ColorPickerState>,
+}
+
+impl Render for ColorPickerDemo {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        ColorPicker::new(&self.color).label("Pick a color")
+    }
+}
+
+pub(super) fn build_color_picker(window: &mut Window, cx: &mut App) -> AnyView {
+    cx.new(|cx| {
+        let primary = cx.theme().primary;
+        ColorPickerDemo {
+            color: cx.new(|cx| ColorPickerState::new(window, cx).default_value(primary)),
+        }
+    })
+    .into()
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+struct SettingsDemo {
+    dark: bool,
+    telemetry: bool,
+    theme_name: SharedString,
+    font_size: f64,
+}
+
+impl Render for SettingsDemo {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.entity();
+        Settings::new("settings-demo").pages(vec![SettingPage::new("General")
+            .icon(IconName::Settings2)
+            .default_open(true)
+            .groups(vec![
+                SettingGroup::new().title("Appearance").items(vec![
+                    SettingItem::new(
+                        "Dark mode",
+                        SettingField::switch(
+                            {
+                                let this = this.clone();
+                                move |cx: &App| this.read(cx).dark
+                            },
+                            {
+                                let this = this.clone();
+                                move |value: bool, cx: &mut App| {
+                                    this.update(cx, |demo, cx| {
+                                        demo.dark = value;
+                                        cx.notify();
+                                    });
+                                }
+                            },
+                        ),
+                    )
+                    .description("Use the dark color scheme."),
+                    SettingItem::new(
+                        "Theme",
+                        SettingField::dropdown(
+                            vec![
+                                ("mocha".into(), "Mocha".into()),
+                                ("latte".into(), "Latte".into()),
+                            ],
+                            {
+                                let this = this.clone();
+                                move |cx: &App| this.read(cx).theme_name.clone()
+                            },
+                            {
+                                let this = this.clone();
+                                move |value: SharedString, cx: &mut App| {
+                                    this.update(cx, |demo, cx| {
+                                        demo.theme_name = value;
+                                        cx.notify();
+                                    });
+                                }
+                            },
+                        ),
+                    ),
+                ]),
+                SettingGroup::new().title("Privacy").items(vec![
+                    SettingItem::new(
+                        "Telemetry",
+                        SettingField::checkbox(
+                            {
+                                let this = this.clone();
+                                move |cx: &App| this.read(cx).telemetry
+                            },
+                            {
+                                let this = this.clone();
+                                move |value: bool, cx: &mut App| {
+                                    this.update(cx, |demo, cx| {
+                                        demo.telemetry = value;
+                                        cx.notify();
+                                    });
+                                }
+                            },
+                        ),
+                    ),
+                    SettingItem::new(
+                        "Font size",
+                        SettingField::number_input(
+                            NumberFieldOptions {
+                                min: 8.0,
+                                max: 32.0,
+                                step: 1.0,
+                            },
+                            {
+                                let this = this.clone();
+                                move |cx: &App| this.read(cx).font_size
+                            },
+                            {
+                                let this = this.clone();
+                                move |value: f64, cx: &mut App| {
+                                    this.update(cx, |demo, cx| {
+                                        demo.font_size = value;
+                                        cx.notify();
+                                    });
+                                }
+                            },
+                        ),
+                    ),
+                ]),
+            ])])
+    }
+}
+
+pub(super) fn build_settings(_window: &mut Window, cx: &mut App) -> AnyView {
+    cx.new(|_| SettingsDemo {
+        dark: true,
+        telemetry: false,
+        theme_name: "mocha".into(),
+        font_size: 14.0,
+    })
+    .into()
 }
