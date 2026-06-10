@@ -67,12 +67,13 @@ pub fn channels(event_capacity: usize, inbound_capacity: usize) -> (Daemon, Hand
     (daemon, handles)
 }
 
-/// Capacities for the channels backing a [`serve`] session.
+/// Capacities for the channels backing a daemon dispatch loop.
 ///
-/// Sized for a single client connection: the inbound queue absorbs bursts of
-/// `ClientMessage`s while the dispatch loop drains them, and the broadcast
-/// backlog bounds how far an outbound writer may lag before lagged events are
-/// dropped.
+/// The inbound queue absorbs bursts of `ClientMessage`s while the dispatch loop
+/// drains them; the broadcast backlog bounds how far an outbound writer may lag
+/// before lagged events are dropped. [`serve`] drives a single connection;
+/// [`serve_uds`] shares one dispatch loop across all attached clients, so these
+/// bound the combined queue depth there.
 const SERVE_INBOUND_CAPACITY: usize = 256;
 const SERVE_EVENT_CAPACITY: usize = 256;
 
@@ -181,8 +182,9 @@ where
 ///
 /// If a live daemon already owns `socket_path` this returns an error — the
 /// caller must attach via [`connect_relay`], not spawn. A stale socket left by a
-/// crashed daemon is removed and rebound. Runs until an accept error or the
-/// process is signalled.
+/// crashed daemon is removed and rebound. Transient per-accept errors are logged
+/// and retried (the daemon must not die on FD pressure and leave nothing to
+/// reattach to); the function returns only on a bind failure or process signal.
 pub async fn serve_uds(socket_path: &Path) -> anyhow::Result<()> {
     if socket_path.exists() {
         // Distinguish a live daemon from a stale socket: a successful connect
@@ -206,7 +208,18 @@ pub async fn serve_uds(socket_path: &Path) -> anyhow::Result<()> {
     let _dispatch = tokio::spawn(daemon.run());
 
     loop {
-        let (stream, _addr) = listener.accept().await?;
+        let (stream, _addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                // A long-lived daemon must not die on a transient accept error
+                // (ECONNABORTED, or EMFILE/ENFILE under FD pressure) — that would
+                // leave nothing to reattach to. Log, back off briefly so a
+                // persistent failure cannot hot-spin, and keep accepting.
+                eprintln!("rift-daemon accept error: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let (reader, writer) = stream.into_split();
         let inbound = handles.inbound.clone();
         let events = handles.subscribe();
@@ -241,7 +254,9 @@ where
     };
     let downstream = async {
         tokio::io::copy(&mut sock_reader, &mut writer).await?;
-        writer.flush().await?;
+        // Mirror upstream's half-close so no buffered bytes are lost if `writer`
+        // is ever a buffering wrapper; on bare stdout/channel halves it is a flush.
+        writer.shutdown().await?;
         Ok::<(), anyhow::Error>(())
     };
 

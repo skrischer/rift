@@ -168,7 +168,10 @@ mod tests {
 
     #[test]
     fn test_launch_command_neutralizes_injection() {
-        // A path with shell metacharacters stays inside single quotes.
+        // A path with shell metacharacters stays inside single quotes. This
+        // checks the poll-loop occurrence (`[ -S '...' ]`); the same path inside
+        // the `setsid sh -c '...'` argument is single-quoted again and therefore
+        // doubly-escaped, so it cannot break out there either.
         let cmd = launch_command("/h/bin", "/h/`id`.sock", "/h/d.log");
         assert!(cmd.contains("'/h/`id`.sock'"));
     }
