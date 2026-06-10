@@ -5274,6 +5274,7 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "gpui_platform",
+ "rift-protocol",
  "rift-ssh",
  "rift-terminal",
  "rust-embed",

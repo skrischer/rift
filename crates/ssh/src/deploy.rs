@@ -66,9 +66,14 @@ const PRESENT_MARKER: &str = "rift-present";
 /// Build the remote presence-probe command for the already-resolved literal
 /// `remote_path`: emit [`PRESENT_MARKER`] iff the path exists and is executable.
 /// The path is single-quoted so it cannot be expanded or break out of quoting.
+///
+/// The `if`/`then`/`fi` wrapper makes the command exit zero whether or not the
+/// binary is present — a bare `test -x … && printf …` would exit non-zero on the
+/// (expected) first-deploy case, which `exec_capture` reports as a failed remote
+/// command. Absence is signalled by empty output, not by the exit status.
 fn presence_probe_command(remote_path: &str) -> String {
     let quoted = shell_single_quote(remote_path);
-    format!("test -x {quoted} && printf '%s' '{PRESENT_MARKER}'")
+    format!("if test -x {quoted}; then printf '%s' '{PRESENT_MARKER}'; fi")
 }
 
 /// Build the remote `mkdir -p` command for the already-resolved literal
@@ -203,7 +208,7 @@ mod tests {
         let cmd = presence_probe_command("/tmp/rift-daemon-0.1.0");
         assert_eq!(
             cmd,
-            "test -x '/tmp/rift-daemon-0.1.0' && printf '%s' 'rift-present'"
+            "if test -x '/tmp/rift-daemon-0.1.0'; then printf '%s' 'rift-present'; fi"
         );
     }
 
@@ -213,7 +218,7 @@ mod tests {
         let cmd = presence_probe_command("/tmp/$(touch pwned)");
         assert_eq!(
             cmd,
-            "test -x '/tmp/$(touch pwned)' && printf '%s' 'rift-present'"
+            "if test -x '/tmp/$(touch pwned)'; then printf '%s' 'rift-present'; fi"
         );
     }
 
