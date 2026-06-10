@@ -221,3 +221,28 @@ How the entire spec is known complete:
   `gpui::*` glob pulls gpui's `test` attribute macro into scope, shadowing the
   built-in `#[test]`) that a plain `cargo check` would have missed; the fix narrows
   the test module's imports to just the symbols it uses.
+- 2026-06-10: Demos part 1 (#124, PR #141) merged — Theme-tokens swatches plus the
+  form/input and feedback component demos. Two implementation decisions:
+  - **Registry shape: a `Demo` enum, not a flat `render_fn`.** The spec sketched the
+    registry as `(name, description, render_fn)` where `render_fn` is a plain
+    `fn(&mut Window, &mut App) -> AnyElement`. That holds for stateless demos, but
+    several gpui-component widgets (`Input`, `OtpInput`, `Select`, `Combobox`, the
+    `Form`, `Slider`) require a persistent `Entity<…State>` that a bare function
+    pointer cannot own across frames. Resolved by splitting the demo column into
+    `Demo::Element(fn(&mut Window, &mut App) -> AnyElement)` (stateless, rebuilt each
+    frame) and `Demo::View(fn(&mut Window, &mut App) -> AnyView)` (stateful, built
+    once and cached in `Gallery.views`). This keeps the flat registry the spec wanted
+    while honouring gpui's state-entity model; it is the registry's intended growth
+    point for the exotic demos (#126) too.
+  - **Icons in debug builds need rust-embed `debug-embed`.** Visual review on the GPU
+    station found icons, the spinner, and the rating stars rendering blank.
+    `gpui-component-assets`' `Assets` uses `#[derive(RustEmbed)]`, which in debug
+    builds (without the `debug-embed` feature) reads SVGs from the *compile-time*
+    filesystem path at *runtime*. Cross-compiled to `x86_64-pc-windows-gnu` and run
+    on the Windows host, that Linux path does not exist, so every icon-backed widget
+    is empty. Fixed by enabling rust-embed's `debug-embed` feature via cargo feature
+    unification — adding `rust-embed = { …, features = ["debug-embed"] }` as an
+    optional dep under the `gallery` feature (not used in code; declared only to flip
+    the feature). No new crate enters the graph (`rust-embed` is already a transitive
+    dep), `Cargo.lock` keeps one `gpui` and one `rust-embed`, and the product `rift`
+    build is untouched. User-approved at the visual gate.
