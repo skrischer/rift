@@ -5276,6 +5276,7 @@ dependencies = [
  "gpui_platform",
  "rift-ssh",
  "rift-terminal",
+ "rust-embed",
  "termy_terminal_ui",
  "tokio",
  "tracing",
