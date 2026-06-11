@@ -89,6 +89,17 @@ The GPU app (`rift-app`) is the only expensive, non-parallelizable build (pulls 
 
 Worktrees live in a sibling container `../rift-worktrees/<branch-with-slashes-as-dashes>` (outside the repo tree, so `rg`/`cargo`/watchers don't traverse them; own `target/` per worktree). Use `just agent-worktree <branch>` to create and `just agent-worktree-rm <branch>` to remove.
 
+### Dogfooding channels
+
+Two side-by-side instances share tmux session `rift` (one daemon, mirrored views) — see `docs/spec-dogfooding-channels.md`:
+
+- **Stable** — the daily driver. `just promote` (HEAD must be `develop`, ff-synced to `origin/develop`) builds the optimized `stable` profile, pins the exe at `%LOCALAPPDATA%\rift\rift-stable.exe` (outside `target/`, so `cargo clean` cannot touch it; own image name, so the dev loop's taskkill cannot either) and relaunches it detached. `just stable` relaunches without rebuilding (e.g. after a reboot).
+- **Dev** — `just dev-windows[-watch]`, the acceptance/visual gate. Mirrors session `rift` by default; `RIFT_SESSION=rift-dev just dev-windows-watch` isolates destructive tests on a throwaway session.
+
+One-time Windows launcher setup (manual, no recipe — it never recurs): create a Desktop shortcut to `%LOCALAPPDATA%\rift\rift-stable.exe` and pin it to the taskbar by hand; run `setx RIFT_SSH_KEY "%USERPROFILE%\.ssh\id_rsa"` once (cmd) — the only env the app's defaults do not cover; host/user/port/session match, and the daemon is skipped while `RIFT_DAEMON_BINARY` is unset.
+
+Optional mirror polish: `set -g window-size largest` in the host's `~/.tmux.conf`, so a dev restart's transient 80x24 attach does not reflow stable's view.
+
 ## Commits
 
 Conventional Commits. Scope matches crate name. Imperative mood, lowercase, no period.
