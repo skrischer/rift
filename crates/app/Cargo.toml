@@ -23,7 +23,14 @@ required-features = ["gallery"]
 # unification so gpui-component-assets embeds its icon SVGs in debug builds too —
 # without it rust-embed reads icons from the compile-time path at runtime, which
 # the cross-compiled Windows gallery exe cannot find (icons render blank).
-gallery = ["dep:gpui-component-assets", "dep:rust-embed"]
+# `gpui-component/tree-sitter-rust` enables a single syntax grammar for the
+# code-editor demo (not the umbrella `tree-sitter-languages` set); charts run on
+# plain f64, so the `decimal` feature is intentionally not enabled.
+gallery = [
+    "dep:gpui-component-assets",
+    "dep:rust-embed",
+    "gpui-component/tree-sitter-rust",
+]
 # Console-free stable launcher: switches the rift binary to the Windows GUI
 # subsystem (see the cfg_attr in src/main.rs). Off by default so dev launches
 # keep their RUST_LOG console; enabled only by `just promote`.

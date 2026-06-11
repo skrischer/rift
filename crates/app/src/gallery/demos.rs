@@ -18,6 +18,7 @@ use gpui_component::{
     breadcrumb::{Breadcrumb, BreadcrumbItem},
     button::{Button, ButtonVariants, DropdownButton},
     calendar::{Calendar, CalendarState},
+    chart::{BarChart, LineChart},
     checkbox::Checkbox,
     clipboard::Clipboard,
     collapsible::Collapsible,
@@ -29,7 +30,7 @@ use gpui_component::{
     group_box::{GroupBox, GroupBoxVariants as _},
     h_flex,
     hover_card::HoverCard,
-    input::{Input, InputState, NumberInput, OtpInput, OtpState},
+    input::{Input, InputState, NumberInput, OtpInput, OtpState, TabSize},
     kbd::Kbd,
     label::Label,
     link::Link,
@@ -54,6 +55,10 @@ use gpui_component::{
     stepper::{Stepper, StepperItem},
     switch::Switch,
     tab::{Tab, TabBar},
+    table::{
+        Column, DataTable, Table, TableBody, TableCell, TableDelegate, TableHead, TableHeader,
+        TableRow, TableState,
+    },
     tag::Tag,
     v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, IndexPath, Sizable as _,
     WindowExt as _,
@@ -1795,4 +1800,294 @@ pub(super) fn build_settings(_window: &mut Window, cx: &mut App) -> AnyView {
         font_size: 14.0,
     })
     .into()
+}
+
+// ---------------------------------------------------------------------------
+// Chart
+// ---------------------------------------------------------------------------
+
+/// A datum for the chart demos: a category label and its numeric value. Charts
+/// map each datum to its axes via closures, so a tiny owned struct keeps them
+/// trivial. Values are plain `f64`, so the gpui-component `decimal` feature is
+/// intentionally not enabled.
+struct ChartPoint {
+    label: SharedString,
+    value: f64,
+}
+
+fn chart_data() -> Vec<ChartPoint> {
+    [
+        ("Jan", 186.0),
+        ("Feb", 305.0),
+        ("Mar", 237.0),
+        ("Apr", 173.0),
+        ("May", 209.0),
+        ("Jun", 264.0),
+    ]
+    .into_iter()
+    .map(|(label, value)| ChartPoint {
+        label: label.into(),
+        value,
+    })
+    .collect()
+}
+
+/// Wrap a chart in a fixed-height, bordered card. Charts fill their parent, so
+/// they need a sized container to lay out against.
+fn chart_card(title: &str, cx: &App, chart: impl IntoElement) -> impl IntoElement {
+    v_flex()
+        .h(px(320.))
+        .p_4()
+        .gap_2()
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded(px(8.))
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(title.to_string()),
+        )
+        .child(div().flex_1().child(chart))
+}
+
+pub(super) fn render_chart(_window: &mut Window, cx: &mut App) -> AnyElement {
+    let bar_color = cx.theme().chart_1;
+    let line_color = cx.theme().chart_2;
+    v_flex()
+        .gap_6()
+        .child(chart_card(
+            "Bar chart",
+            cx,
+            BarChart::new(chart_data())
+                .band(|d| d.label.clone())
+                .value(|d| d.value)
+                .label(|d| d.value.to_string())
+                .corner_radii(px(6.))
+                .fill(move |_, _, _, _| bar_color),
+        ))
+        .child(chart_card(
+            "Line chart",
+            cx,
+            LineChart::new(chart_data())
+                .x(|d| d.label.clone())
+                .y(|d| d.value)
+                .stroke(line_color)
+                .dot(),
+        ))
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Code editor
+// ---------------------------------------------------------------------------
+
+const EDITOR_SAMPLE: &str = "\
+use gpui_component::input::{Input, InputState};
+
+/// Rendered by the gallery's code-editor demo with Rust syntax highlighting
+/// (the `gallery` feature enables a single `tree-sitter-rust` grammar).
+fn greet(name: &str) -> String {
+    format!(\"Hello, {name}!\")
+}
+
+fn main() {
+    for name in [\"rift\", \"gpui\", \"tmux\"] {
+        println!(\"{}\", greet(name));
+    }
+}
+";
+
+struct CodeEditorDemo {
+    state: Entity<InputState>,
+}
+
+pub(super) fn build_code_editor(window: &mut Window, cx: &mut App) -> AnyView {
+    cx.new(|cx| CodeEditorDemo {
+        state: cx.new(|cx| {
+            InputState::new(window, cx)
+                .code_editor("rust")
+                .multi_line(true)
+                .line_number(true)
+                .tab_size(TabSize {
+                    tab_size: 4,
+                    ..Default::default()
+                })
+                .default_value(EDITOR_SAMPLE)
+        }),
+    })
+    .into()
+}
+
+impl Render for CodeEditorDemo {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div().h(px(420.)).child(
+            Input::new(&self.state)
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_size(cx.theme().mono_font_size)
+                .size_full(),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Table (static)
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_table(_window: &mut Window, _cx: &mut App) -> AnyElement {
+    let rows = [
+        ("rift-app", "GPUI application binary", "binary"),
+        ("rift-ssh", "SSH connection and PTY stream", "library"),
+        ("rift-terminal", "GPUI terminal widget", "library"),
+        ("rift-daemon", "Remote host daemon", "binary"),
+        ("rift-protocol", "Shared message types", "library"),
+    ];
+    div()
+        .max_w(px(640.))
+        .child(
+            Table::new()
+                .child(
+                    TableHeader::new().child(
+                        TableRow::new()
+                            .child(TableHead::new().child("Crate"))
+                            .child(TableHead::new().child("Responsibility"))
+                            .child(TableHead::new().child("Kind")),
+                    ),
+                )
+                .child(
+                    TableBody::new().children(rows.into_iter().map(|(name, role, kind)| {
+                        TableRow::new()
+                            .child(TableCell::new().child(name))
+                            .child(TableCell::new().child(role))
+                            .child(TableCell::new().child(kind))
+                    })),
+                ),
+        )
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Data table
+// ---------------------------------------------------------------------------
+
+struct CrateRow {
+    name: &'static str,
+    files: usize,
+    lines: usize,
+    public: bool,
+}
+
+struct GalleryTableDelegate {
+    columns: Vec<Column>,
+    rows: Vec<CrateRow>,
+}
+
+impl TableDelegate for GalleryTableDelegate {
+    fn columns_count(&self, _: &App) -> usize {
+        self.columns.len()
+    }
+
+    fn rows_count(&self, _: &App) -> usize {
+        self.rows.len()
+    }
+
+    fn column(&self, col_ix: usize, _: &App) -> Column {
+        self.columns[col_ix].clone()
+    }
+
+    fn render_td(
+        &mut self,
+        row_ix: usize,
+        col_ix: usize,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let row = &self.rows[row_ix];
+        let text = match col_ix {
+            0 => row.name.to_string(),
+            1 => row.files.to_string(),
+            2 => row.lines.to_string(),
+            _ => (if row.public { "yes" } else { "no" }).to_string(),
+        };
+        div().child(text)
+    }
+}
+
+struct DataTableDemo {
+    state: Entity<TableState<GalleryTableDelegate>>,
+}
+
+pub(super) fn build_data_table(window: &mut Window, cx: &mut App) -> AnyView {
+    let delegate = GalleryTableDelegate {
+        columns: vec![
+            Column::new("name", "Crate"),
+            Column::new("files", "Files").text_right(),
+            Column::new("lines", "Lines").text_right(),
+            Column::new("public", "Public API"),
+        ],
+        rows: vec![
+            CrateRow {
+                name: "rift-app",
+                files: 12,
+                lines: 4200,
+                public: false,
+            },
+            CrateRow {
+                name: "rift-ssh",
+                files: 5,
+                lines: 1300,
+                public: true,
+            },
+            CrateRow {
+                name: "rift-terminal",
+                files: 8,
+                lines: 2600,
+                public: true,
+            },
+            CrateRow {
+                name: "rift-daemon",
+                files: 9,
+                lines: 3100,
+                public: true,
+            },
+            CrateRow {
+                name: "rift-protocol",
+                files: 4,
+                lines: 700,
+                public: true,
+            },
+        ],
+    };
+    cx.new(|cx| DataTableDemo {
+        state: cx.new(|cx| TableState::new(delegate, window, cx)),
+    })
+    .into()
+}
+
+impl Render for DataTableDemo {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .h(px(360.))
+            .child(DataTable::new(&self.state).stripe(true).bordered(true))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WebView (placeholder)
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_webview(_window: &mut Window, _cx: &mut App) -> AnyElement {
+    v_flex()
+        .gap_3()
+        .max_w(px(560.))
+        .child(
+            Alert::info(
+                "webview-placeholder",
+                "WebView is a separate crate (gpui-wry / Wry), not part of the \
+                 gpui-component library. Its demo is delivered by follow-up issue \
+                 #127 so the gallery keeps exactly one gpui in Cargo.lock.",
+            )
+            .title("WebView — delivered by follow-up issue"),
+        )
+        .into_any_element()
 }

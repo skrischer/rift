@@ -299,6 +299,31 @@ pub fn registry() -> Vec<ComponentEntry> {
             description: "A settings page with grouped fields.",
             demo: View(demos::build_settings),
         },
+        ComponentEntry {
+            name: "Code Editor",
+            description: "A Rust code editor with syntax highlighting.",
+            demo: View(demos::build_code_editor),
+        },
+        ComponentEntry {
+            name: "Chart",
+            description: "Bar and line charts over inline data.",
+            demo: Element(demos::render_chart),
+        },
+        ComponentEntry {
+            name: "Table",
+            description: "A static table composed from rows and cells.",
+            demo: Element(demos::render_table),
+        },
+        ComponentEntry {
+            name: "Data Table",
+            description: "A delegate-backed table with striped, bordered rows.",
+            demo: View(demos::build_data_table),
+        },
+        ComponentEntry {
+            name: "WebView",
+            description: "Placeholder — the real demo lands in follow-up #127.",
+            demo: Element(demos::render_webview),
+        },
     ]
 }
 
@@ -361,6 +386,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "Combobox",
             "Form",
             "Slider",
+            "Code Editor",
         ],
     ),
     (
@@ -402,6 +428,9 @@ const GROUPS: &[(&str, &[&str])] = &[
             "Kbd",
             "Link",
             "Clipboard",
+            "Chart",
+            "Table",
+            "Data Table",
         ],
     ),
     (
@@ -419,6 +448,7 @@ const GROUPS: &[(&str, &[&str])] = &[
         "Pickers",
         &["Calendar", "Date Picker", "Color Picker", "Settings"],
     ),
+    ("Embedded", &["WebView"]),
 ];
 
 impl Render for Gallery {
