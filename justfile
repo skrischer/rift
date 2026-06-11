@@ -290,11 +290,13 @@ export RIFT_DAEMON_BINARY := env("RIFT_DAEMON_BINARY", justfile_directory() / "t
 windows_ssh_key := env("RIFT_WINDOWS_SSH_KEY", "C:\\Users\\skrischer\\.ssh\\id_rsa")
 windows_exe := "target/x86_64-pc-windows-gnu/debug/rift.exe"
 windows_gallery_exe := "target/x86_64-pc-windows-gnu/debug/gallery.exe"
-# Stable (Release) daily driver: built into the one heavy target/ under a distinct
-# image name so the dev loop's `taskkill /IM rift.exe` cannot kill it. cargo only
-# writes rift.exe to the release dir, so the copied-aside rift-stable.exe is safe.
-windows_release_exe := "target/x86_64-pc-windows-gnu/release/rift.exe"
-windows_stable_exe := "target/x86_64-pc-windows-gnu/release/rift-stable.exe"
+# Stable daily driver: built into the one heavy target/ under the `stable` cargo profile
+# (release-grade opt + debug-assertions, so the GPUI Windows renderer cross-compiles from
+# WSL via its runtime-shader path — see Cargo.toml). cargo writes rift.exe into the
+# profile dir; the copied-aside rift-stable.exe gets a distinct image name so the dev
+# loop's `taskkill /IM rift.exe` cannot kill the daily driver.
+windows_stable_profile_exe := "target/x86_64-pc-windows-gnu/stable/rift.exe"
+windows_stable_exe := "target/x86_64-pc-windows-gnu/stable/rift-stable.exe"
 # Tmux session the app attaches to. Default `rift` (the shared live session both
 # channels mirror); override to isolate dev, e.g. `RIFT_SESSION=rift-dev just dev-windows-watch`.
 rift_session := env("RIFT_SESSION", "rift")
@@ -377,9 +379,9 @@ promote:
       exit 1
     fi
     just release-daemon
-    cargo build -p rift-app --release --target x86_64-pc-windows-gnu
+    cargo build -p rift-app --profile stable --target x86_64-pc-windows-gnu
     taskkill.exe /F /IM rift-stable.exe 2>/dev/null || true
-    cp "{{windows_release_exe}}" "{{windows_stable_exe}}"
+    cp "{{windows_stable_profile_exe}}" "{{windows_stable_exe}}"
     just _launch-windows "{{windows_stable_exe}}" rift detach
     echo "promote: rift-stable promoted from $(git rev-parse --short HEAD), relaunched on session rift"
 
