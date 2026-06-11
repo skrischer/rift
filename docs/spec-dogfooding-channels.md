@@ -74,8 +74,12 @@ What is true when this work is done:
   The feature is declared in `crates/app/Cargo.toml` `[features]`, excluded from
   `default` — like the existing `gallery` opt-in. Embed a taskbar icon through the
   existing
-  `crates/app/resources/windows/rift.rc` (`embed-resource`, already in the build) — one
-  `ICON` directive plus a developer-supplied `.ico` asset; no new dependency.
+  `crates/app/resources/windows/rift.rc` (`embed-resource`, already in the build) —
+  one `ICON` directive per channel, selected via an rc `#ifdef WINDOWED` macro that
+  `build.rs` defines from the same `windowed` feature: stable embeds the primary
+  brand mark, dev the monochrome outline, so the two channels are visually distinct
+  in the taskbar. Assets are developer-supplied `.ico` files from the brand kit; no
+  new dependency.
 - **just recipes (Windows host, the primary dev loop):**
   - `promote` — guard that HEAD is `develop` and fast-forwarded to `origin/develop`
     (refuse otherwise), then build `--profile stable --features windowed`, copy the
@@ -202,6 +206,7 @@ What is true when this work is done:
 | Direct `.exe` launch + `setx RIFT_SSH_KEY`, over a `wsl.exe … just stable` wrapper | Gives a console-free double-click that pins the real exe in the taskbar and reuses the app's env defaults — matching the "env vars, no config file" decision. Rejected the wrapper: it flashes a console window and still needs the subsystem fix. | 2026-06-11 |
 | Console suppressed via a cargo feature (`cfg_attr(feature = "windowed", windows_subsystem="windows")`), enabled by `promote` | The `stable` profile keeps `debug-assertions` on (shader path), so `not(debug_assertions)` would never fire; a feature decouples console-suppression from the profile. Off by default, so dev keeps its `RUST_LOG` console. No dependency. | 2026-06-11 |
 | Icon embedded via the existing `rift.rc` / `embed-resource` | The Windows resource pipeline already exists (manifest); an `ICON` line + `.ico` adds the taskbar icon with no new dependency and shows even on a direct launch. | 2026-06-11 |
+| Per-channel icons: stable embeds the primary brand mark, dev the monochrome outline | Developer request — the two mirrored instances must be visually distinguishable in the taskbar. Selection rides the existing `windowed` feature (`build.rs` defines a `WINDOWED` rc macro), so no new knob; dev needs no extra build flag. Assets from the brand kit: stable = bolder favicon cut (16/32/48) + 256 brand PNG, dev = rasterized `rift-icon-mono.svg`. | 2026-06-11 |
 
 ## Tracking
 
