@@ -6,3 +6,5 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+ignore.workspace = true
+tracing.workspace = true
