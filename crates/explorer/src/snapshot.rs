@@ -2,9 +2,10 @@
 //! root, entries keyed by their path relative to that root.
 //!
 //! The snapshot is the source of truth the client mirrors — it is never
-//! optimistically mutated downstream, only rebuilt or diffed against. A
-//! [`Snapshot::scan`] walks the tree once, honoring VCS ignore rules; the
-//! incremental watcher that keeps it current is a later step.
+//! optimistically mutated downstream, only rebuilt or diffed against.
+//! [`Snapshot::scan`] walks the tree once, honoring VCS ignore rules, and
+//! [`Snapshot::diff`] turns an old and new snapshot into the [`Change`] deltas the
+//! [`crate::Watcher`] streams as the tree evolves.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -40,6 +41,21 @@ pub struct Entry {
     /// ignored entries later without reshaping the model.
     pub ignored: bool,
     pub mtime: SystemTime,
+}
+
+/// A single delta between two snapshots, produced by [`Snapshot::diff`] and
+/// applied with [`Snapshot::apply`].
+///
+/// A move surfaces as a [`Change::Removed`] of the old path plus a
+/// [`Change::Added`] of the new one — there is no dedicated rename, matching the
+/// spec decision to reconcile moves through the snapshot diff rather than trusting
+/// backend-specific rename events. `Added` and `Changed` carry the full entry so a
+/// consumer can upsert blindly without restatting the path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    Added { path: PathBuf, entry: Entry },
+    Changed { path: PathBuf, entry: Entry },
+    Removed { path: PathBuf },
 }
 
 /// A point-in-time view of the worktree, entries keyed by path relative to `root`.
@@ -154,6 +170,51 @@ impl Snapshot {
     /// Whether the snapshot holds no entries.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Diff this snapshot against a newer one, yielding the deltas that turn `self`
+    /// into `next`: [`Change::Added`] for entries only in `next`, [`Change::Changed`]
+    /// for entries whose value differs (e.g. a bumped `mtime`), and
+    /// [`Change::Removed`] for entries only in `self`. An entry that is equal on both
+    /// sides yields nothing. [`Snapshot::apply`] is the exact inverse — applying the
+    /// result to `self` reproduces `next`.
+    pub fn diff(&self, next: &Snapshot) -> Vec<Change> {
+        let mut changes = Vec::new();
+        for (path, entry) in &next.entries {
+            match self.entries.get(path) {
+                None => changes.push(Change::Added {
+                    path: path.clone(),
+                    entry: entry.clone(),
+                }),
+                Some(previous) if previous != entry => changes.push(Change::Changed {
+                    path: path.clone(),
+                    entry: entry.clone(),
+                }),
+                Some(_) => {}
+            }
+        }
+        for path in self.entries.keys() {
+            if !next.entries.contains_key(path) {
+                changes.push(Change::Removed { path: path.clone() });
+            }
+        }
+        changes
+    }
+
+    /// Apply `changes` (as produced by [`Snapshot::diff`]) in place: `Added`/`Changed`
+    /// upsert the entry, `Removed` deletes it. If `self` started equal to some `a`,
+    /// then `self.apply(&a.diff(&b))` leaves `self` equal to `b`.
+    pub fn apply(&mut self, changes: &[Change]) {
+        for change in changes {
+            match change {
+                Change::Added { path, entry } | Change::Changed { path, entry } => {
+                    self.entries.insert(path.clone(), entry.clone());
+                }
+                Change::Removed { path } => {
+                    self.entries.remove(path);
+                }
+            }
+        }
     }
 }
 
@@ -351,5 +412,127 @@ mod tests {
             Err(ExplorerError::PathNotFound(_)) => {}
             other => panic!("expected PathNotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_diff_added_file_yields_added_change() {
+        let tmp = TempDir::new("diff-add");
+        let root = &tmp.path;
+        write_file(&root.join("a.txt"), "a");
+        let before = Snapshot::scan(root).expect("scan before");
+        write_file(&root.join("b.txt"), "b");
+        let after = Snapshot::scan(root).expect("scan after");
+
+        let changes = before.diff(&after);
+        assert_eq!(
+            changes,
+            vec![Change::Added {
+                path: PathBuf::from("b.txt"),
+                entry: after.get(Path::new("b.txt")).expect("entry").clone(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_diff_removed_file_yields_removed_change() {
+        let tmp = TempDir::new("diff-rm");
+        let root = &tmp.path;
+        write_file(&root.join("a.txt"), "a");
+        write_file(&root.join("b.txt"), "b");
+        let before = Snapshot::scan(root).expect("before");
+        std::fs::remove_file(root.join("b.txt")).expect("remove");
+        let after = Snapshot::scan(root).expect("after");
+
+        let changes = before.diff(&after);
+        assert_eq!(
+            changes,
+            vec![Change::Removed {
+                path: PathBuf::from("b.txt")
+            }]
+        );
+    }
+
+    #[test]
+    fn test_diff_modified_file_yields_changed_with_new_mtime() {
+        let tmp = TempDir::new("diff-mod");
+        let root = &tmp.path;
+        let file = root.join("a.txt");
+        write_file(&file, "a");
+        let before = Snapshot::scan(root).expect("before");
+        let before_mtime = before.get(Path::new("a.txt")).expect("entry").mtime;
+
+        let bumped = before_mtime + std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .expect("open file")
+            .set_modified(bumped)
+            .expect("set mtime");
+        let after = Snapshot::scan(root).expect("after");
+
+        match before.diff(&after).as_slice() {
+            [Change::Changed { path, entry }] => {
+                assert_eq!(path, Path::new("a.txt"));
+                assert!(entry.mtime > before_mtime);
+            }
+            other => panic!("expected a single Changed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_diff_move_is_remove_plus_add() {
+        let tmp = TempDir::new("diff-move");
+        let root = &tmp.path;
+        write_file(&root.join("from/x.txt"), "x");
+        let before = Snapshot::scan(root).expect("before");
+        std::fs::create_dir_all(root.join("to")).expect("mkdir to");
+        std::fs::rename(root.join("from/x.txt"), root.join("to/x.txt")).expect("rename");
+        let after = Snapshot::scan(root).expect("after");
+
+        let changes = before.diff(&after);
+        assert!(changes
+            .iter()
+            .any(|c| matches!(c, Change::Removed { path } if path == Path::new("from/x.txt"))));
+        assert!(changes.iter().any(|c| {
+            matches!(c, Change::Added { path, entry }
+                if path == Path::new("to/x.txt") && entry.kind == EntryKind::File)
+        }));
+    }
+
+    #[test]
+    fn test_diff_identical_snapshots_yield_no_changes() {
+        let tmp = TempDir::new("diff-same");
+        let root = &tmp.path;
+        write_file(&root.join("a.txt"), "a");
+        let a = Snapshot::scan(root).expect("a");
+        let b = Snapshot::scan(root).expect("b");
+        assert!(a.diff(&b).is_empty());
+    }
+
+    #[test]
+    fn test_apply_diff_reproduces_target_snapshot() {
+        let tmp = TempDir::new("apply");
+        let root = &tmp.path;
+        write_file(&root.join("keep.txt"), "keep");
+        write_file(&root.join("remove.txt"), "gone");
+        write_file(&root.join("nested/old.txt"), "old");
+        let mut base = Snapshot::scan(root).expect("base");
+
+        // Remove one file, add another, and bump a third's mtime — a mix of all three
+        // change kinds across the tree.
+        std::fs::remove_file(root.join("remove.txt")).expect("remove");
+        write_file(&root.join("nested/new.txt"), "new");
+        let keep_mtime = base.get(Path::new("keep.txt")).expect("keep").mtime;
+        std::fs::File::options()
+            .write(true)
+            .open(root.join("keep.txt"))
+            .expect("open keep")
+            .set_modified(keep_mtime + std::time::Duration::from_secs(60))
+            .expect("set mtime");
+        let target = Snapshot::scan(root).expect("target");
+
+        let changes = base.diff(&target);
+        base.apply(&changes);
+        assert_eq!(base, target);
     }
 }
