@@ -24,6 +24,10 @@ required-features = ["gallery"]
 # without it rust-embed reads icons from the compile-time path at runtime, which
 # the cross-compiled Windows gallery exe cannot find (icons render blank).
 gallery = ["dep:gpui-component-assets", "dep:rust-embed"]
+# Console-free stable launcher: switches the rift binary to the Windows GUI
+# subsystem (see the cfg_attr in src/main.rs). Off by default so dev launches
+# keep their RUST_LOG console; enabled only by `just promote`.
+windowed = []
 
 [dependencies]
 rift-terminal = { path = "../terminal" }
