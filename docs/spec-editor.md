@@ -1,10 +1,10 @@
 # Spec: Editor — the GUI editing surface
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-06-11
 > Completed: —
 
-rift's GUI becomes a first-class editor: it renders the worktree as a navigable file tree, opens a file into a syntax-highlighted code editor, and — at the v1 boundary resolved at the review gate — saves edits back to the remote over a dedicated request/response buffer channel. This is the **render debut** that turns the Phase 3 data layers (worktree, git, diagnostics) into a visible IDE surface, while every process keeps running in tmux.
+rift's GUI becomes a first-class editor: it renders the worktree as a navigable file tree, opens a file into a syntax-highlighted code editor, saves edits back to the remote over a dedicated request/response buffer channel, and renders the daemon's diagnostics inline against the live buffer (v1 scope cut **C**, resolved at the review gate). This is the **render debut** that turns the Phase 3 data layers (worktree, git, diagnostics) into a visible IDE surface, while every process keeps running in tmux.
 
 ## Outcome
 
@@ -13,8 +13,9 @@ What is true when this work is done? Observable, end-to-end criteria — not act
 - [ ] The worktree renders as a navigable file tree in the GUI (the long-deferred panel render debuts here, consuming the client worktree model); selecting a file opens it.
 - [ ] A selected file opens into a `gpui-component` code editor with Tree-sitter syntax highlighting for its language; a large file (tens of thousands of lines) opens and scrolls without loading-time failure (virtualized rendering).
 - [ ] File contents move only over a dedicated, request/response **buffer channel**: opening a file issues a read request and the daemon returns that file's content with its `mtime`; no file content ever travels on the worktree structure path.
-- [ ] **(write-back — gated by the v1 scope decision)** Editing the buffer and saving writes the whole file back to the remote with the base `mtime`; the daemon rejects a save whose base `mtime` is stale rather than clobbering a newer on-disk version, and the editor surfaces the conflict.
-- [ ] **(concurrent writes — gated as above)** When an agent (in a pane) changes a file open in the editor: a **clean** buffer auto-reloads silently (the agent's edit is watched live); a **dirty** buffer surfaces a conflict instead of silently losing either side.
+- [ ] Editing the buffer and saving writes the whole file back to the remote with the base `mtime`; the daemon rejects a save whose base `mtime` is stale rather than clobbering a newer on-disk version, and the editor surfaces the conflict.
+- [ ] When an agent (in a pane) changes a file open in the editor: a **clean** buffer auto-reloads silently (the agent's edit is watched live); a **dirty** buffer surfaces a conflict instead of silently losing either side.
+- [ ] The diagnostics the daemon already streams (`spec-daemon-lsp.md`) render **inline** in the editor for the open file, and the editor feeds the LSP its **live buffer** via `didChange` (the disk→buffer source-of-truth shift), so an unsaved edit's errors surface without a save first.
 - [ ] The editor is a GUI surface, not a tmux pane: opening files changes no tmux pane/window state, and there is no agent- or editor-process detection or special-casing anywhere in the path.
 
 ## Scope
@@ -22,10 +23,11 @@ What is true when this work is done? Observable, end-to-end criteria — not act
 ### In scope
 
 - **File-tree render** (`crates/app`): a navigable tree rendered from the client worktree model (`spec-daemon-filetree.md`, issue #111), virtualized for large directories (`gpui-component` `VirtualList`). Bounded to **navigate + open a file** — this is the first consumer of the deferred panel render.
-- **Code editor surface** (`crates/app`): open a file into a `gpui-component` code editor (`InputState` in code mode + Tree-sitter highlighting — the component now demoed in the gallery, #180). Read-only viewing always; editing per the v1 scope decision below.
-- **Buffer channel** (`crates/protocol` + daemon + `crates/app`): an additive, **request/response** message set — a read request (`OpenFile { path }`) answered by a content response (`FileContent { path, content, mtime }`), and — if write-back is in v1 — a write request (`SaveFile { path, content, base_mtime }`) answered by an ack (`SaveResult { path, mtime }`) or a conflict (`SaveConflict { path, disk_mtime }`). This is the **first request/response pair in the protocol** (the worktree, git, and diagnostics paths are all push-only); the worktree structure path stays content-free.
-- **Daemon buffer service** (a daemon module, not a new crate): whole-file read and — if in v1 — atomic whole-file write (temp + rename) on the remote, honoring the same root as the worktree watcher. UTF-8 text; non-UTF-8 / binary is out (see below).
-- **Concurrent-write handling** (if write-back is in v1): use the worktree snapshot's per-entry `mtime` (#107) as the "file changed under you" detector for a path open in the editor — clean buffer auto-reloads, dirty buffer surfaces a conflict (depth bounded to detect + reload/keep choice; a full merge UI is out).
+- **Code editor surface** (`crates/app`): open a file into a `gpui-component` code editor (`InputState` in code mode + Tree-sitter highlighting — the component now demoed in the gallery, #180), with editing and write-back (v1 scope cut **C**, resolved at the review gate).
+- **Buffer channel** (`crates/protocol` + daemon + `crates/app`): an additive, **request/response** message set — a read request (`OpenFile { path }`) answered by a content response (`FileContent { path, content, mtime }`), and a write request (`SaveFile { path, content, base_mtime }`) answered by an ack (`SaveResult { path, mtime }`) or a conflict (`SaveConflict { path, disk_mtime }`). This is the **first request/response pair in the protocol** (the worktree, git, and diagnostics paths are all push-only); the worktree structure path stays content-free.
+- **Daemon buffer service** (a daemon module, not a new crate): whole-file read and atomic whole-file write (temp + rename) on the remote, honoring the same root as the worktree watcher. UTF-8 text; non-UTF-8 / binary is out (see below).
+- **Concurrent-write handling**: use the worktree snapshot's per-entry `mtime` (#107) as the "file changed under you" detector for a path open in the editor — clean buffer auto-reloads, dirty buffer surfaces a conflict (depth bounded to detect + reload/keep choice; a full merge UI is out).
+- **Inline diagnostics + live-buffer LSP** (scope cut C): render the diagnostics the daemon already streams (`spec-daemon-lsp.md`) inline in the editor for the open file, and feed the LSP the editor's **live buffer** via `didChange` — executing the disk→buffer source-of-truth shift the LSP spec's forward-note reserved. Bounded to the **open file(s)**; this consumes the existing diagnostics data layer and does not redesign it.
 - **Single watched root** = the worktree root the file-tree spec watches.
 
 ### Out of scope — the hard not-in-v1 list
@@ -33,27 +35,27 @@ What is true when this work is done? Observable, end-to-end criteria — not act
 > `architecture.md` ("The GUI is the editor"): *"Editors eat roadmaps — the editor must never let 'compete with Zed on editor features' pull the roadmap off that axis."* The differentiator is the tmux process layer, not the editor surface. This list is load-bearing.
 
 - **LSP navigation** (hover / go-to-definition / find-references) — the committed sibling sub-spec deferred onto this track from `spec-daemon-lsp.md`; it needs its own request/response data layer and is the natural **next** editor sub-spec once this surface exists.
-- **Inline diagnostics render** (squiggles in the editor) and the **buffer→LSP `didChange` shift** (LSP reading the live buffer instead of disk — `spec-daemon-lsp.md` forward-note) — gated into v1 only under scope cut C; otherwise the immediate follow-on.
 - **Editor power features** — multi-cursor, find/replace, command palette, minimap, code folding, split editor groups, snippets, autocomplete/completion, format-on-save, rename/refactor, code actions. Explicitly not v1.
 - **Rich explorer-panel operations** — create / rename / delete / move files, drag-and-drop, and full git/diagnostics decoration **on the tree** — a follow-on "explorer panel" sub-spec; v1's tree only navigates and opens.
 - **Diff view / git hunk staging** in the editor (the GitComet / hunk territory) — future.
 - **Pluggable per-file-type editors** (image / binary / notebook viewers, the `EditorHost` contract) — future; v1 is UTF-8 source text only.
 - **Multi-window / detached editor windows** — future.
 
-### Open decision (resolved at the review gate)
+### Resolved at the review gate
 
-- **v1 editor scope cut** — how much ships in the first editor milestone. Marked `OPEN` in Prior decisions; resolved via `AskUserQuestion`, then baked in before `READY`.
+- **v1 editor scope cut = C** (view + write-back + inline diagnostics). Resolved with the developer via `AskUserQuestion` (2026-06-11): the first editor milestone ships the file-tree render, open/view with syntax, the full read+write buffer channel with `mtime` conflict + concurrent-write handling, **and** inline diagnostics render with the live-buffer `didChange` shift. This delivers the north-star Scenario 1 signal — type errors surfacing in the editor as the agent (or the human) edits — in the first milestone, at the cost of additionally coupling to the diagnostics data layer (#173–178). See the Prior decisions row and Decision log.
 
 ## Constraints
 
 - **Editor surface is `gpui-component`'s code editor**, not a hand-rolled text engine — it is already a rift dependency and is now demoed in the gallery (#180). Pin the GPUI commit alongside it (the upstream warns to). If its editor proves insufficient, the fallback borrow is `hunk-text` (rope + undo) + `hunk-language` (Tree-sitter registry) (`prior-art.md`, GPL-3.0-compatible) — not a hard dependency.
-- **Implementation sequences after the client worktree model (#111)** lands: the editor renders that tree and opens files from it. The buffer channel itself is independent new work but the surface needs the tree. This spec can reach `READY` in parallel; implementation is gated on the file-tree client model.
+- **Implementation sequences after the client worktree model (#111)** lands: the editor renders that tree and opens files from it. The buffer channel itself is independent new work but the surface needs the tree. This spec can reach `READY` in parallel; implementation is gated on the file-tree client model. The **inline-diagnostics + live-buffer slice (cut C)** additionally sequences after the diagnostics data layer (#173–178, milestone "Phase 3: LSP diagnostics") — it consumes that client model and adds the `didChange` feed; it does not redesign it. The editor surface + buffer channel + write-back do not depend on diagnostics and can land first within the milestone.
 - **The buffer channel is the deliberate request/response exception** to "state flows through channels" (`CLAUDE.md`): structure and decoration push; **file content is pulled on open and pushed on save**, never broadcast. This must be documented as intentional, not read as a violation.
 - **`crates/protocol` stays serialization-agnostic** and content-free on the worktree path; the buffer messages are additive (`protocol.md` Rules). Supersedes nothing on the structure path — the `FileSync { content }` push was already removed (#107).
 - **The daemon buffer service must cross-compile to static musl and stay `gpui`-free** — it is daemon-side I/O. Whole-file read/write is plain `tokio::fs`; no new crate (no premature abstraction).
 - **Whole-file sync, no deltas** — mirrors the LSP disk-backed full-text decision; the editor sends the whole new file on save, the daemon returns the whole file on open. Editor-delta sync is a later optimization, not v1.
 - **Large-file rendering is virtualized** (`prior-art.md` pattern #6) — render only visible lines; mandatory for big files.
-- **Atomic writes** — the daemon writes via temp-file + rename so a crash mid-save never truncates the user's file.
+- **Atomic writes** — the daemon writes via temp-file + rename so a crash mid-save never truncates the user's file. Reads are whole-file slurps with **no read-side atomicity guarantee** — a read racing an agent's non-atomic write may return a torn file; v1 accepts this (agents typically write atomically) and the next worktree update reconciles.
+- **The buffer-channel `mtime` is the same `std::time::SystemTime` as the worktree entry's `mtime` (#107)** — the concurrent-write detector compares the open buffer's base `mtime` against the worktree snapshot across the two paths, so they must be the identical type and clock source, not independently sampled values.
 - **Agent-agnostic** — no Neovim/editor-process integration, protocol, or detection; the editor is rift's own GUI surface, panes stay black boxes (`CLAUDE.md`, `architecture.md`).
 - `anyhow` in the daemon binary, `thiserror` in libraries; no `.unwrap()` in library code.
 
@@ -71,7 +73,7 @@ Decisions already made that the implementor must respect. Rationale included so 
 | **File-tree render lands here** (the deferred panel render debuts), consuming the #111 worktree model; bounded to navigate + open | Constraint-determined: the file-tree / git-status / diagnostics specs each deferred "the rendered panel" to a later sub-spec; the editor is that surface's first real consumer. A tree that opens nothing, or an editor with no way to pick a file, are each half a feature — they belong together. Rich operations + decoration are a later explorer-panel sub-spec. | 2026-06-11 |
 | **Daemon buffer service is a module, not a new crate**; whole-file `tokio::fs` with atomic temp+rename writes | No premature abstraction (`CLAUDE.md`): whole-file read/write is simple I/O; a crate is unjustified until complexity demands it. | 2026-06-11 |
 | **No Neovim/editor-process integration** — the editor is rift's own GUI surface | Agent-agnostic core (`CLAUDE.md`, `architecture.md` "The GUI is the editor"): panes are black boxes; special-casing an editor process is the one thing the project forbids. | 2026-06-10 |
-| **v1 editor scope cut** — A: view-only debut (tree + open + view + buffer-read) · B: view + write-back MVP (B = A plus save + `mtime` conflict + concurrent-write handling) · C: B plus inline diagnostics render — **OPEN, resolved at the review gate** | Neither precedent nor constraint settles where the first milestone cuts. The pivot fixed the *destination* (full write-back editor); the *first bite* is a product judgment the developer owns. `AskUserQuestion` at the review gate. | 2026-06-11 |
+| **v1 editor scope cut = C** — view + write-back + inline diagnostics (file-tree render · open/view + Tree-sitter · read+write buffer channel · `mtime` conflict + concurrent-write handling · inline diagnostics render + live-buffer `didChange`) | Resolved with the developer at the review gate (`AskUserQuestion`, 2026-06-11). Neither precedent nor constraint settled where the first milestone cuts — the pivot fixed the *destination* (full write-back editor), the *first bite* was the developer's product judgment. C ships the north-star Scenario 1 signal (type errors in the editor as the agent edits) in the first milestone, accepting the additional coupling to the diagnostics data layer (#173–178). | 2026-06-11 |
 
 ## Tracking
 
@@ -90,8 +92,9 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 - [ ] Opening a fixture file renders it in the editor with language-appropriate Tree-sitter highlighting, and the rendered content matches the file on disk byte-for-byte (UTF-8)
 - [ ] A read request returns exactly the requested file's content + `mtime`; inspection confirms no file content travels on any worktree / git / diagnostics message (the structure path stays content-free)
 - [ ] A large fixture file (≥ 50k lines) opens and scrolls without a loading-time or frame-time failure (virtualized)
-- [ ] **(write-back, if in v1)** Editing + saving updates the remote file; re-opening returns the saved content; a save with a stale base `mtime` is rejected as a conflict (no clobber), verified with a daemon-side test
-- [ ] **(concurrent writes, if in v1)** An external change to a path open with a **clean** buffer auto-reloads the buffer; an external change with a **dirty** buffer surfaces a conflict and loses neither side, verified with a test driving an out-of-band write
+- [ ] Editing + saving updates the remote file; re-opening returns the saved content; a save with a stale base `mtime` is rejected as a conflict (no clobber), verified with a daemon-side test
+- [ ] An external change to a path open with a **clean** buffer auto-reloads the buffer; an external change with a **dirty** buffer surfaces a conflict and loses neither side, verified with a test driving an out-of-band write
+- [ ] A diagnostic the daemon streams for the open file renders **inline** in the editor; an **unsaved** edit that introduces an error surfaces a diagnostic without a save first (the live-buffer `didChange` feed), and fixing it clears the inline marker
 - [ ] Opening / editing files leaves tmux pane and window state unchanged (the editor is GUI, not a pane); a `grep` confirms no agent/editor-process name detection in the editor path
 
 ## Risks and mitigations
@@ -100,7 +103,8 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 |---|---|
 | **Editor scope creep** — "compete with Zed" pulls the roadmap off the tmux-process-layer axis | The hard not-in-v1 list (Out of scope) is load-bearing and quoted from `architecture.md`; every editor feature past v1 is a deliberate later sub-spec, not a drive-by. |
 | `gpui-component`'s code editor is immature or its API churns (git dep) | Spike the editor widget early against a real file; pin the GPUI commit; `hunk-text` + `hunk-language` are the pre-vetted fallback borrow (`prior-art.md`) if the component's editor is insufficient. |
-| Concurrent agent writes race the human's edit | The `mtime` detector + conflict surface; the daemon rejects a stale-base save; never a silent clobber. Clean-buffer auto-reload is the intended live-edit feature, not a hazard. |
+| Concurrent agent writes race the human's edit | The `mtime` detector + conflict surface; the daemon rejects a stale-base save — no silent clobber on an `mtime`-detectable change. Clean-buffer auto-reload is the intended live-edit feature, not a hazard. |
+| `mtime`-based conflict detection has a false-negative window — a same-second overwrite or an `mtime`-preserving write (`touch -r`) can leave `mtime` unchanged across a content change, so a stale-base save could still clobber | Accepted v1 limitation, mirroring the coarseness of the disk-backed LSP model. The guarantee is "no clobber on an `mtime`-detectable change", not an absolute one; the natural hardening — a content hash / length check alongside `mtime` — is deferred, not v1. |
 | Large-file open / scroll jank | Virtualized rendering (pattern #6); bound and measure; the `hunk` perf harness (25k-line diffs) is the reference. |
 | Partial / corrupt writes on crash, or non-UTF-8 content | Atomic temp+rename writes; v1 is UTF-8 text only — non-UTF-8 / binary is detected and refused (pluggable viewers are a future sub-spec), never silently mangled. |
 | The editor depends on not-yet-built foundation (#111 worktree client model, app↔daemon data wiring) | The spec reaches `READY` now; implementation sequences after the file-tree client model lands — noted in Constraints, mirrors how the Phase 3 sub-specs sequence after each other. |
@@ -110,3 +114,4 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 Decisions made during implementation. Added as work progresses.
 
 - 2026-06-11: Spec created from `/plan editor`, opening the **editor track** seeded by the 2026-06-10 vision/architecture pivot (#153). Recorded as precedent / constraint-decided: the `gpui-component` editor surface, the dedicated request/response buffer channel (the protocol's first request/response, content off the structure path), the `mtime`-based concurrent-write handling, the file-tree render debut consuming #111 (bounded to navigate + open), the daemon buffer module (no new crate), whole-file sync, and the agent-agnostic no-Neovim stance. The one open decision — the v1 scope cut (A view-only / B view+write-back / C +inline-diagnostics) — flagged for the review gate. The hard not-in-v1 list is recorded to hold the roadmap on the tmux-process-layer axis per `architecture.md`.
+- 2026-06-11: Review gate. Fresh-context Agent review returned `READY` (all building-block, dependency, and consistency claims verified against the codebase and sibling specs); non-blocking findings folded in — the `mtime` false-negative window named as an accepted limitation (a same-second / `mtime`-preserving write can still clobber; content-hash hardening deferred), the buffer-channel `mtime` pinned to the same `SystemTime` as the worktree entry, and read-side non-atomicity acknowledged. The open decision was resolved with the developer (`AskUserQuestion`) to **cut C** — view + write-back + inline diagnostics — adding the inline-diagnostics render and the live-buffer `didChange` shift to v1 (and the consequent #173–178 sequencing). Spec flipped `DRAFT → READY`.
