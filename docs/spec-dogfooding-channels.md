@@ -7,7 +7,9 @@
 Two side-by-side rift instances on one machine — a pinned Release **stable** daily
 driver and the existing Debug watch-loop **dev** channel for the acceptance gate —
 sharing one tmux session (and daemon) so the dev loop's recompile-respawn churn can
-never take down the tool the developer works in.
+never take down the tool the developer works in. The stable channel is launchable
+without a terminal — a Windows desktop shortcut to the pinned binary — so it is a true
+daily driver, not a recipe invocation.
 
 ## Why
 
@@ -46,6 +48,10 @@ What is true when this work is done:
 - [ ] The tmux session name is read from `RIFT_SESSION` (default `rift`); the daemon
       isolation knob is `RIFT_DAEMON_REMOTE_DIR` (already read by the app, not yet
       surfaced in the dev recipes).
+- [ ] A Windows desktop shortcut launches the pinned `rift-stable.exe` **without a
+      terminal** (no console window) and always reflects the latest promoted build —
+      the shortcut targets the fixed in-place path that `promote` overwrites, so it is
+      created once. The Release binary carries an embedded taskbar icon.
 - [ ] `cargo clippy --workspace -- -D warnings` and `cargo test --workspace` stay
       green; CI `app-check` (`cargo check -p rift-app`, native Linux) compiles the
       platform-agnostic `RIFT_SESSION` change, and the windows-target binary is
@@ -58,6 +64,12 @@ What is true when this work is done:
 - **App:** read the tmux session name from `RIFT_SESSION` (default `"rift"`), used for
   both the `new-session -A -s <name>` command and the `TmuxClient` label
   (`crates/app/src/main.rs`). One env knob, matching the existing SSH-config pattern.
+- **App (Windows launcher support):** gate the Windows subsystem to GUI for non-debug
+  builds (`#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`) so the
+  Release/stable binary launches with **no console window**, while debug/dev keeps the
+  console for `RUST_LOG`. Embed a taskbar icon through the existing
+  `crates/app/resources/windows/rift.rc` (`embed-resource`, already in the build) — one
+  `ICON` directive plus a developer-supplied `.ico` asset; no new dependency.
 - **just recipes (Windows host, the primary dev loop):**
   - `promote` — guard that HEAD is `develop` and fast-forwarded to `origin/develop`
     (refuse otherwise), then build Release, copy the binary to a distinct image name
@@ -70,6 +82,12 @@ What is true when this work is done:
     dev.
   - A shared private launch helper so the env block (SSH vars, later daemon vars) does
     not drift between the dev and stable recipes.
+  - `install-shortcut` — a one-time PowerShell recipe (`WScript.Shell.CreateShortcut`)
+    that drops a Desktop shortcut (manually pinnable to the taskbar) targeting the
+    wslpath-translated `rift-stable.exe` with the embedded icon, and persists
+    `RIFT_SSH_KEY` via `setx` (Windows user env) for the terminal-free direct launch —
+    the only config the app's defaults do not already cover (host/user/port/session
+    match; the daemon is skipped when `RIFT_DAEMON_BINARY` is unset).
 - **tmux mirror policy (optional):** `window-size largest` for the shared session so a
   dev restart's transient small attach does not reflow stable's view — applied via a
   small recipe or a documented `~/.tmux.conf` line.
@@ -91,6 +109,11 @@ What is true when this work is done:
   the goal.
 - **Window-state persistence** across restarts — already its own deferred track
   (roadmap), not folded in here.
+- **Programmatic taskbar pinning.** Windows has blocked pinning to the taskbar from
+  scripts since Win10; the recipe creates a Desktop/Start shortcut the developer pins
+  by hand.
+- **A Linux/X11 `.desktop` launcher.** Follow-up, mirroring the Windows-host-primary
+  stance already taken for the stable recipe itself.
 - Any agent-specific behaviour.
 
 ## Constraints
@@ -123,6 +146,13 @@ What is true when this work is done:
   bump in dev spawns a **second** daemon (redundant but read-only, no conflict). A
   protocol change in `crates/protocol` **must** carry a version bump, or the two
   builds share a socket with incompatible framing and both break.
+- **The direct launcher reuses the app's env defaults, not a config file.** Only
+  `RIFT_SSH_KEY` deviates from the dev setup (app default `id_ed25519` vs the dev
+  `id_rsa`); it is pinned once via persistent Windows env (`setx`). Host/user/port/
+  session match the defaults and the daemon is skipped when `RIFT_DAEMON_BINARY` is
+  unset — congruent with the "env vars, no config file" decision.
+- **Console gating is `debug_assertions`-based, not target-based**, so the dev
+  watch-loop keeps its `RUST_LOG` console while only Release/stable goes console-free.
 
 ## Prior decisions
 
@@ -136,6 +166,10 @@ What is true when this work is done:
 | tmux `window-size largest` for the shared session (optional, via tmux config) | On restart the dev client briefly attaches at 80×24; `largest` keeps the window at the larger client's size so stable's view does not reflow on every dev recompile. Two equally-maximized windows are unaffected. | 2026-06-10 |
 | Adopt the release-channels pattern (side-by-side, isolated per-channel identity) | Precedent: VS Code Insiders installs beside Stable with isolated state for daily-driver dogfooding; Zed ships stable/preview/nightly/dev as separate apps with per-channel state dirs. rift's twist — a shared tmux session for a live mirror — is unique to it being a multiplexer frontend. | 2026-06-10 |
 | `promote` builds the current checkout, guarded: it asserts HEAD is `develop` and fast-forwarded to `origin/develop`, and refuses otherwise | Guarantees stable == accepted develop with no ref-switching (which would disturb the station's running `dev-watch`). The guard is exactly what stops a promotion mid-gate, when the station sits detached on a feature branch (`CLAUDE.md`, "Parallel development") — it refuses rather than baking un-merged code into the daily driver. Rejected: always-build-`origin/develop` (extra recipe machinery to build a ref without disturbing the working tree) and explicit-ref (puts correctness on the operator and a checkout disturbs `dev-watch`). | 2026-06-10 |
+| The launcher is a one-time `.lnk` to the fixed `rift-stable.exe` path | `promote` overwrites that path in place, so a single shortcut always points at the latest stable — no per-promote regeneration. | 2026-06-11 |
+| Direct `.exe` launch + `setx RIFT_SSH_KEY`, over a `wsl.exe … just stable` wrapper | Gives a console-free double-click that pins the real exe in the taskbar and reuses the app's env defaults — matching the "env vars, no config file" decision. Rejected the wrapper: it flashes a console window and still needs the subsystem fix. | 2026-06-11 |
+| Console suppressed via `cfg_attr(not(debug_assertions), windows_subsystem="windows")` | Release/stable launches with no terminal; debug/dev keeps the console for `RUST_LOG`. One attribute, no dependency. | 2026-06-11 |
+| Icon embedded via the existing `rift.rc` / `embed-resource` | The Windows resource pipeline already exists (manifest); an `ICON` line + `.ico` adds the taskbar icon with no new dependency and shows even on a direct launch. | 2026-06-11 |
 
 ## Tracking
 
@@ -168,6 +202,13 @@ How the whole spec is known complete:
 - [ ] Inducing a dev compile error leaves stable running and promptable — the original
       pain does not reproduce.
 - [ ] Promoting (restart stable) does not lose the tmux session or running agent work.
+- [ ] `just install-shortcut` creates a Desktop shortcut to `rift-stable.exe`;
+      double-clicking it launches stable with **no console window**, attached to
+      session `rift`, showing the embedded icon in the taskbar.
+- [ ] After `just promote`, the same shortcut launches the newly-built stable (fixed
+      path, overwritten in place — no shortcut regeneration).
+- [ ] A debug `just dev-windows` still opens with its `RUST_LOG` console (subsystem
+      gating is debug-only).
 
 ## Risks and mitigations
 
@@ -178,6 +219,8 @@ How the whole spec is known complete:
 | Detached Windows-from-WSL launch may not survive the recipe exit, or env may not pass through `cmd.exe start` | Verified during implementation; fallback `nohup … &`. Captured as a verification step. |
 | Reflow flicker in stable when dev restarts | `window-size largest` (prior decision); equally-sized maximized windows are unaffected regardless. |
 | Two clients racing `set_client_size` | Benign size negotiation bounded by the `window-size` policy; no correctness impact. |
+| Direct launch relies on the app's default SSH/daemon config; a future default divergence beyond the key could silently misconnect | Only the key deviates today and is pinned via `setx`; host/user/port/session match the defaults; the `install-shortcut` recipe documents the assumption. |
+| `windows_subsystem = "windows"` hides early panics that previously printed to the console | Gating is debug-only, so dev keeps the console; for the GUI daily driver a failed launch shows as no window appearing, and Release logging still reaches stderr. |
 
 ## Decision log
 
@@ -195,3 +238,13 @@ How the whole spec is known complete:
   claim — it is a native-Linux `cargo check -p rift-app`, not a windows-target build;
   the windows binary is checked only by the local `just dev-windows` / `build-windows`
   cross-compile.
+- 2026-06-11: Extended with a no-terminal desktop launcher for the stable channel
+  (developer request). Resolved with the developer: fold into this spec (same milestone
+  #12), launch the **direct `rift-stable.exe`** via a one-time `.lnk` with `RIFT_SSH_KEY`
+  pinned by `setx` (over a `wsl.exe … just stable` wrapper, which flashes a console and
+  still needs the subsystem fix), developer-supplied logo. Survey findings: the Windows
+  resource pipeline already exists (`rift.rc` + `embed-resource`), so the icon needs no
+  new dependency; the app's env defaults already cover host/user/port/session and skip
+  the daemon when unset, leaving only the SSH key to pin; the binary has no
+  `windows_subsystem` attribute, so a Release launch currently spawns a console — gated
+  to non-debug builds it goes console-free while dev keeps its `RUST_LOG` console.
