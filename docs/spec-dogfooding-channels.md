@@ -50,7 +50,8 @@ What is true when this work is done:
       surfaced in the dev recipes).
 - [ ] A Windows desktop shortcut launches the pinned `rift-stable.exe` **without a
       terminal** (no console window) and always reflects the latest promoted build —
-      the shortcut targets the fixed in-place path that `promote` overwrites, so it is
+      the shortcut targets the fixed Windows-native path
+      (`%LOCALAPPDATA%\rift\rift-stable.exe`) that `promote` overwrites, so it is
       created once. The binary carries an embedded taskbar icon.
 - [ ] `cargo clippy --workspace -- -D warnings` and `cargo test --workspace` stay
       green; CI `app-check` (`cargo check -p rift-app`, native Linux) compiles the
@@ -78,8 +79,10 @@ What is true when this work is done:
 - **just recipes (Windows host, the primary dev loop):**
   - `promote` — guard that HEAD is `develop` and fast-forwarded to `origin/develop`
     (refuse otherwise), then build `--profile stable --features windowed`, copy the
-    binary to a distinct image name (`rift-stable.exe`), kill the old stable, and
-    relaunch it **detached** on session `rift`.
+    binary to the pinned Windows-native launcher path
+    (`%LOCALAPPDATA%\rift\rift-stable.exe` — distinct image name, outside `target/`),
+    kill the old stable, and relaunch it **detached** (direct binfmt exec via
+    `setsid`) on session `rift`.
   - `stable` — relaunch the pinned `rift-stable.exe` without rebuilding (e.g. after a
     reboot); hint to run `promote` if it is absent.
   - `dev-windows` updated to forward `RIFT_SESSION` (default `rift`) into the Windows
@@ -87,15 +90,13 @@ What is true when this work is done:
     dev.
   - A shared private launch helper so the env block (SSH vars, later daemon vars) does
     not drift between the dev and stable recipes.
-  - `install-shortcut` — a one-time PowerShell recipe (`WScript.Shell.CreateShortcut`)
-    that drops a Desktop shortcut (manually pinnable to the taskbar) targeting the
-    wslpath-translated `rift-stable.exe` with the embedded icon, and persists
-    `RIFT_SSH_KEY` (= the dev `id_rsa`) via `setx` (Windows user env) for the
-    terminal-free direct launch — the only config the app's defaults do not already
-    cover (host/user/port/session match; the daemon is skipped when
-    `RIFT_DAEMON_BINARY` is unset). The shortcut target is a `\\wsl.localhost\…` UNC
-    path (proven by the existing `cmd /c start` launch); the app is env-driven, so the
-    shortcut's working directory is irrelevant — sidestepping the UNC-cwd limitation.
+  - One-time launcher setup is **documented, not automated** (`CLAUDE.md`): create a
+    Desktop shortcut to `%LOCALAPPDATA%\rift\rift-stable.exe` by hand (pin to the
+    taskbar manually) and persist `RIFT_SSH_KEY` (= the dev `id_rsa`) once via `setx`
+    (Windows user env) — the only config the app's defaults do not already cover
+    (host/user/port/session match; the daemon is skipped when `RIFT_DAEMON_BINARY` is
+    unset). The exe is a plain Windows path, so no UNC-target or working-directory
+    caveats apply.
 - **tmux mirror policy (optional):** `window-size largest` for the shared session so a
   dev restart's transient small attach does not reflow stable's view — applied via a
   small recipe or a documented `~/.tmux.conf` line.
@@ -130,6 +131,10 @@ What is true when this work is done:
   app is the only expensive, non-parallelizable build; stable must reuse the one
   `target/` (a copied-aside exe), not a second checkout/worktree that would double the
   ~20 GB of skia/wgpu artifacts.
+- **The pinned stable exe lives outside `target/`** (`%LOCALAPPDATA%\rift`). `target/`
+  belongs to cargo — a `cargo clean` must not delete the daily driver or break the
+  shortcut — and a Windows-native path avoids a `\\wsl.localhost` UNC shortcut target
+  and the 9P redirector overhead on every launch.
 - **Process-image-name separation is mandatory.** The dev loop kills `rift.exe` by
   image name; stable must run under a different image (`rift-stable.exe`) or promotion
   in dev would kill the daily driver.
@@ -192,7 +197,8 @@ What is true when this work is done:
 | tmux `window-size largest` for the shared session (optional, via tmux config) | On restart the dev client briefly attaches at 80×24; `largest` keeps the window at the larger client's size so stable's view does not reflow on every dev recompile. Two equally-maximized windows are unaffected. | 2026-06-10 |
 | Adopt the release-channels pattern (side-by-side, isolated per-channel identity) | Precedent: VS Code Insiders installs beside Stable with isolated state for daily-driver dogfooding; Zed ships stable/preview/nightly/dev as separate apps with per-channel state dirs. rift's twist — a shared tmux session for a live mirror — is unique to it being a multiplexer frontend. | 2026-06-10 |
 | `promote` builds the current checkout, guarded: it asserts HEAD is `develop` and fast-forwarded to `origin/develop`, and refuses otherwise | Guarantees stable == accepted develop with no ref-switching (which would disturb the station's running `dev-watch`). The guard is exactly what stops a promotion mid-gate, when the station sits detached on a feature branch (`CLAUDE.md`, "Parallel development") — it refuses rather than baking un-merged code into the daily driver. Rejected: always-build-`origin/develop` (extra recipe machinery to build a ref without disturbing the working tree) and explicit-ref (puts correctness on the operator and a checkout disturbs `dev-watch`). | 2026-06-10 |
-| The launcher is a one-time `.lnk` to the fixed `rift-stable.exe` path | `promote` overwrites that path in place, so a single shortcut always points at the latest stable — no per-promote regeneration. | 2026-06-11 |
+| The launcher is a one-time, hand-created `.lnk` to the fixed `%LOCALAPPDATA%\rift\rift-stable.exe` path | `promote` overwrites that path in place, so a single shortcut always points at the latest stable — no per-promote regeneration. Shortcut creation is a once-ever action and taskbar pinning is manual regardless (see Out of scope), so a dedicated `install-shortcut` recipe would automate nothing recurring — dropped for a documented manual step. | 2026-06-11 |
+| Stable is pinned under `%LOCALAPPDATA%\rift` and launched detached via `setsid` direct exec (binfmt), not from `target/` via `cmd.exe start` | `target/` belongs to cargo (`cargo clean` would delete the daily driver and break the shortcut); a Windows-native path needs no `\\wsl.localhost` UNC shortcut target and skips the 9P redirector at launch. `cmd.exe` is not resolvable from the recipes on this host (Windows PATH not appended in WSL), while binfmt direct exec is proven by the foreground dev path; `setsid` with detached stdio survives the recipe exit (verified, incl. `taskkill.exe` via absolute `System32` path — the bare name was silently failing for the same PATH reason). | 2026-06-11 |
 | Direct `.exe` launch + `setx RIFT_SSH_KEY`, over a `wsl.exe … just stable` wrapper | Gives a console-free double-click that pins the real exe in the taskbar and reuses the app's env defaults — matching the "env vars, no config file" decision. Rejected the wrapper: it flashes a console window and still needs the subsystem fix. | 2026-06-11 |
 | Console suppressed via a cargo feature (`cfg_attr(feature = "windowed", windows_subsystem="windows")`), enabled by `promote` | The `stable` profile keeps `debug-assertions` on (shader path), so `not(debug_assertions)` would never fire; a feature decouples console-suppression from the profile. Off by default, so dev keeps its `RUST_LOG` console. No dependency. | 2026-06-11 |
 | Icon embedded via the existing `rift.rc` / `embed-resource` | The Windows resource pipeline already exists (manifest); an `ICON` line + `.ico` adds the taskbar icon with no new dependency and shows even on a direct launch. | 2026-06-11 |
@@ -229,9 +235,9 @@ How the whole spec is known complete:
 - [ ] Inducing a dev compile error leaves stable running and promptable — the original
       pain does not reproduce.
 - [ ] Promoting (restart stable) does not lose the tmux session or running agent work.
-- [ ] `just install-shortcut` creates a Desktop shortcut to `rift-stable.exe`;
-      double-clicking it launches stable with **no console window**, attached to
-      session `rift`, showing the embedded icon in the taskbar.
+- [ ] A hand-created Desktop shortcut to `%LOCALAPPDATA%\rift\rift-stable.exe`
+      (one-time setup per `CLAUDE.md`) launches stable with **no console window**,
+      attached to session `rift`, showing the embedded icon in the taskbar.
 - [ ] After `just promote`, the same shortcut launches the newly-built stable (fixed
       path, overwritten in place — no shortcut regeneration).
 - [ ] A debug `just dev-windows` still opens with its `RUST_LOG` console (the `windowed`
@@ -243,11 +249,11 @@ How the whole spec is known complete:
 |---|---|
 | Shared session blast radius — a dev input bug reaches the real work session (e.g. a stray Ctrl-C to a running agent) | The mirror is used during the acceptance gate, not 24/7; risky/destructive tests use the `RIFT_SESSION=rift-dev` isolated session. |
 | Daemon protocol skew if a protocol change ships without a version bump (shared socket, incompatible framing) | The version-keyed socket already routes a bumped dev to its own daemon; the discipline "protocol change ⇒ version bump" is recorded as a constraint and enforced at protocol-PR review. |
-| Detached Windows-from-WSL launch may not survive the recipe exit, or env may not pass through `cmd.exe start` | Verified during implementation; fallback `nohup … &`. Captured as a verification step. |
+| Detached Windows-from-WSL launch may not survive the recipe exit | Resolved: `setsid` direct binfmt exec with detached stdio — verified on the station: the recipe returns, the process survives the launching shell, env passes via `WSLENV` exactly as in the foreground path. |
 | Reflow flicker in stable when dev restarts | `window-size largest` (prior decision); equally-sized maximized windows are unaffected regardless. |
 | Two clients racing `set_client_size` | Benign size negotiation bounded by the `window-size` policy; no correctness impact. |
 | Direct launch relies on the app's default SSH/daemon config; a future default divergence beyond the key could silently misconnect | Only the key deviates today and is pinned via `setx`; host/user/port/session match the defaults; the `install-shortcut` recipe documents the assumption. |
-| `windows_subsystem = "windows"` hides early panics that previously printed to the console | The `windowed` feature is off by default, so dev keeps the console; a failed stable launch shows as no window appearing, and stable can be re-run from a terminal (`just stable`) to surface stderr for diagnosis. |
+| `windows_subsystem = "windows"` hides early panics that previously printed to the console | The `windowed` feature is off by default, so dev keeps the console; a failed stable launch shows as no window appearing, and the pinned exe can be run foreground from a WSL terminal (binfmt direct exec, env via `_launch-windows` without `detach`) to surface stderr for diagnosis. |
 
 ## Decision log
 
@@ -289,3 +295,15 @@ How the whole spec is known complete:
   keeps it on) — it moves to a `windowed` cargo feature that `promote` enables. Rejected
   plain-debug (unoptimized) and a native-Windows release build (needs a Windows toolchain;
   breaks the single-`target/`).
+- 2026-06-11: Simplified the launcher mechanics after the first detached launch broke
+  (`cmd.exe: command not found` — this WSL config does not append the Windows PATH).
+  Replaced `cmd.exe start` with `setsid` direct binfmt exec (no PATH dependency; WSLENV
+  proven by the foreground path; verified detached and surviving the recipe exit),
+  relocated the pinned exe from `target/.../stable/` to `%LOCALAPPDATA%\rift\`
+  (`cargo clean` can no longer delete the daily driver; the shortcut targets a plain
+  Windows path instead of a `\\wsl.localhost` UNC; no 9P redirector at launch), fixed
+  all `taskkill.exe` calls to the absolute `System32` path (the bare name was silently
+  failing for the same PATH reason — promote would have hit the Windows file lock on
+  the second run), and dropped the planned `install-shortcut` recipe — shortcut
+  creation is a once-ever manual action and taskbar pinning is manual regardless, so
+  the recipe automated nothing recurring; the steps are documented in `CLAUDE.md`.
