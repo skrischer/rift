@@ -8,8 +8,8 @@ Current state (Phase 2): single-window terminal connected via SSH using tmux con
 
 Target architecture (Phase 3+): split into two processes connected by an SSH tunnel:
 
-- **GPUI frontend** — a native application that handles all rendering and user interaction.
-- **Daemon** — a statically linked Linux binary that runs on the remote host, manages tmux, watches the filesystem, runs language servers, and parses terminal output.
+- **GPUI frontend** — a native application that handles all rendering, editing, and user interaction.
+- **Daemon** — a statically linked Linux binary that runs on the remote host, manages tmux, watches the filesystem, runs language servers, serves file buffers to the editor, and parses terminal output.
 
 ## Agent-agnostic design
 
@@ -81,28 +81,61 @@ The decision to drive tmux through control mode (`-CC`) rather than as a normal 
 ## Target architecture (Phase 3+)
 
 ```
-┌─────────────────────────────┐       ┌──────────────────────────────┐
-│  Windows host                │       │  Remote host (WSL / VPS)      │
-│                              │       │                               │
-│  GPUI frontend               │  SSH  │  Daemon (static musl binary)  │
-│  ├─ Terminal renderer        │◄─────►│  ├─ tmux control mode client  │
-│  ├─ File explorer            │ russh │  ├─ VTE parser                │
-│  ├─ Context menus            │       │  ├─ File watcher (inotify)    │
-│  └─ Session bar              │       │  ├─ Git status                │
-│                              │       │  └─ Language servers (LSP)    │
-│                              │       │                               │
-│                              │       │  tmux server                  │
-│                              │       │  Neovim (in panes)            │
-└─────────────────────────────┘       └──────────────────────────────┘
+┌───────────────────────────┐       ┌────────────────────────────────┐
+│  Windows host             │       │  Remote host (WSL / VPS)       │
+│                           │       │                                │
+│  GPUI frontend            │       │  Daemon (static musl binary)   │
+│  ├─ Terminal renderer     │       │  ├─ tmux control mode client   │
+│  ├─ Editor + diagnostics  │       │  ├─ VTE parser                 │
+│  ├─ File explorer         │       │  ├─ File watcher (inotify)     │
+│  ├─ Context menus         │  SSH  │  ├─ Git status                 │
+│  └─ Session bar           │◄─────►│  ├─ Language servers (LSP)     │
+│                           │       │  └─ File buffer service        │
+│                           │       │                                │
+│                           │       │  tmux server                   │
+│                           │       │  Agents, dev servers, scripts  │
+└───────────────────────────┘       └────────────────────────────────┘
 ```
 
 ### Why LSP runs on the remote
 
 Language servers need access to the full project environment — `node_modules`, `target/`, `venv/`, `$GOPATH` — to resolve types and dependencies. These directories are not in git, platform-specific, and often gigabytes in size. Syncing them to the local host would require either mirroring the entire dependency tree (hundreds of MB, platform mismatches) or running a parallel package install locally. Every other remote-capable IDE (VS Code Remote, JetBrains Gateway, Zed) runs LSP on the remote for this reason.
 
-The daemon starts language servers on demand and forwards diagnostics as lightweight JSON over a dedicated `russh` channel (russh already multiplexes channels, so no extra framing layer is needed). No file sync, no local project copies, no path translation.
+The daemon starts language servers on demand and forwards diagnostics as lightweight JSON over a dedicated `russh` channel (russh already multiplexes channels, so no extra framing layer is needed). No project mirroring, no local copies of the dependency tree, no path translation.
+
+**File contents and the worktree path are kept separate, on purpose.** The explorer / worktree path carries *structure* — the file tree, ignore status, mtimes, git status, diagnostics — as lightweight messages, and **never file contents**. File contents move only over a deliberate, request/response **buffer channel** that the editor opens: read a file on open, write it back on save (see "The GUI is the editor" below). This is why the placeholder `FileSync { content }` push was removed from the worktree protocol (#107) — unsolicited content on the structure path was the wrong design; editing is an explicit pull/push on its own channel.
+
+Today the daemon's LSP reads document state from **disk** (agents save their edits, so disk is the source of truth) — correct for the read-only diagnostics data layer being built now. Once the editor lands, the document source-of-truth shifts from disk to the **rift buffer**: the editor sends `didChange` for unsaved edits so diagnostics track the live buffer, not just the last save. Work on the current data layer must not bake in a permanent "LSP only ever reads disk" assumption.
 
 When the daemon is introduced, VTE parsing may move server-side (daemon sends pre-parsed cell diffs) or remain client-side (daemon forwards raw PTY streams). That decision is deferred.
+
+## The GUI is the editor (the process runtime stays tmux)
+
+> Decision recorded 2026-06-10. Supersedes the earlier "Neovim handles editing; rift is not a text editor" stance in `vision.md`.
+
+rift's GUI is a first-class editor: it reads and writes the project's files directly, with LSP-grade navigation and edits (go-to-definition, hover, references, rename, format, code actions), and saves back to the remote. The split stays clean:
+
+- **tmux is the process runtime.** Coding agents, dev servers, and build/test scripts all run in tmux panes — persistent, remote, multi-pane. This is unchanged and central; tmux is *not* demoted to "agent runner".
+- **rift is the cockpit and the editor.** Rendering, file viewing/editing, diagnostics, git, navigation — the GUI surface.
+
+**What this overturns** (from `vision.md`): "Not another text editor" and "Neovim runs inside the terminal panes and handles editing." rift now edits.
+
+**What stays** (and is strengthened): "tmux is the engine, the GUI is the cockpit" — now cleaner, since the engine is the *process runtime* and the cockpit gains editing. "Vanilla agents", "remote-first", "reactive awareness", and "tmux-native" are untouched. The differentiator is explicitly *not* the editor surface (Zed and VS Code Remote do that well): it is that rift's process layer is real tmux running vanilla CLI agents. Editors eat roadmaps — the editor must never let "compete with Zed on editor features" pull the roadmap off that axis, so the future editor spec carries a hard not-in-v1 list.
+
+**Neovim** is not integrated and is not a component: it is just another process a user may run in a pane (agent-agnostic — panes are black boxes). Terminal-driven editing keeps working with zero rift code; rift adds a GUI editor, it does not forbid the terminal one. No Neovim protocol, plugin, or special-casing — that would smuggle process-specific code into the agent-agnostic core, the one thing this project forbids.
+
+### Named concern: concurrent writes (agent ↔ human)
+
+Because the agent (in a pane) and the human (in rift's editor) can write the same file, the editor needs a "file changed under you" strategy. The signal already exists: the worktree snapshot carries per-entry `mtime` (#107), so a worktree-changed update for a path open in the editor is exactly the detector —
+
+- **Buffer clean** → silent auto-reload. This is a *feature*, not a hazard: you watch the agent edit your open file live.
+- **Buffer dirty** → conflict UI (the Zed model): surface the divergence and let the user reconcile.
+
+The mechanism is sketched here; the solution is owned by the editor spec, not built now.
+
+### File buffer channel
+
+Editing uses a deliberate request/response buffer channel over the daemon transport: read a file's content on open, write it back on save (whole-file for v1, with an `mtime` conflict check). This is distinct from — and must not be folded into — the worktree/explorer structure path, which never carries contents (see "Why LSP runs on the remote").
 
 ## Connection lifecycle (current)
 

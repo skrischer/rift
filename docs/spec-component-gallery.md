@@ -246,3 +246,32 @@ How the entire spec is known complete:
     the feature). No new crate enters the graph (`rust-embed` is already a transitive
     dep), `Cargo.lock` keeps one `gpui` and one `rust-embed`, and the product `rift`
     build is untouched. User-approved at the visual gate.
+- 2026-06-11: Demos part 2 (#125, PR #146) merged — the layout, navigation, overlay
+  and picker demos, completing the in-library component coverage across parts 1+2
+  (the exotic chart/editor/table set and WebView stay on #126/#127). Three
+  implementation decisions:
+  - **Sidebar taxonomy is rift's own.** The spec sketched a flat sidebar, and
+    gpui-component's own gallery offers no finer grouping (just "Getting Started"
+    plus one flat "Components" list), so there was nothing upstream to adopt. With
+    the registry now at 51 entries the flat list was unreadable, so a static
+    `GROUPS` name-table groups them into eight categories (Theme; Forms & Input;
+    Feedback & Status; Layout; Navigation; Data Display; Overlay; Pickers). Kept as
+    static labelled groups rather than interactive collapsible ones — gpui-component's
+    `SidebarGroup` exposes a static `collapsed` flag but no built-in click-to-toggle
+    header, so collapsibility would be net-new shell work outside this issue; the
+    user settled on grouping-only. Two bijection tests (`test_every_entry_is_grouped`,
+    `test_group_names_exist_in_registry`) keep the table and the registry in sync.
+  - **Overlay layers must be rendered by the root view.** Dialog/Sheet/Notification
+    state lives on the window's `Root`, but those layers only paint if the root view
+    composes `Root::render_sheet_layer` / `render_dialog_layer` /
+    `render_notification_layer` into its tree. The part-1 gallery never did, so the
+    dialog and sheet demos opened invisibly (state flipped, nothing drawn) and
+    part-1's notification toasts never appeared. Fixed by composing the three layers
+    into `Gallery::render`, which also retroactively repaired the part-1
+    notifications. Mirrors gpui-component's own gallery shell. Surfaced at the visual
+    gate, where the modal "did not open" on click.
+  - **Offline demos avoid network and date deps.** The Image demo embeds inline
+    vector tiles rather than exercising `img()` over HTTP (the build has no http
+    client and the gallery must run offline); Calendar and DatePicker are created
+    without a seeded date to avoid pulling a direct `chrono` dependency just to name
+    one. No new crates enter the graph.

@@ -28,16 +28,16 @@ The core differentiator is not session management or worktree isolation — othe
 
 The architecture: **tmux is the engine, the GUI is the cockpit.**
 
-tmux handles what it's already great at — session management, pane multiplexing, persistent processes. The GUI adds what tmux can't — real-time file explorer updates, live LSP diagnostics, visual git diffs, structured agent output, and native mouse interaction including context menus and ctrl+click navigation.
+tmux is the process runtime — session management, pane multiplexing, persistent processes. The coding agents, dev servers, and build/test scripts all run in tmux panes: persistent, remote, multi-pane. The GUI is the cockpit — it adds what the terminal can't: real-time file explorer updates, live LSP diagnostics, visual git diffs, full code navigation, and a first-class editor for reading and changing the code, with native mouse interaction, context menus, and ctrl+click navigation.
 
-When a coding agent edits a file, the file explorer lights up. When it introduces a type error, the diagnostics panel shows it immediately — not after the agent is done, not after you run the compiler, but as it happens. When it commits, the git diff view surfaces what changed. When multiple agents run in parallel across worktrees, you see all of them at a glance.
+When a coding agent edits a file, the file explorer lights up and the file open in the editor reloads under you — you watch it change live. When it introduces a type error, the diagnostics panel shows it immediately — not after the agent is done, not after you run the compiler, but as it happens. You jump to the definition, fix it in place, and the change is saved to the remote. When it commits, the git diff view surfaces what changed. When multiple agents run in parallel across worktrees, you see all of them at a glance.
 
 The IDE doesn't compete with the agent — it amplifies it.
 
 ## What this is not
 
 - **Not another terminal emulator.** Alacritty, WezTerm, and Kitty are excellent at rendering terminal output. This project uses terminal emulation as a building block, not as the product.
-- **Not another text editor.** Neovim runs inside the terminal panes and handles editing. This project doesn't reimplement text editing.
+- **Not just another remote editor.** rift edits code — but the differentiator is never the editor surface itself, which Zed and VS Code Remote already do well. It is that rift's *process layer* is real tmux running vanilla CLI agents, dev servers, and scripts, with reactive IDE awareness wrapped around them. An editor with no agents in its engine is not what this is. Terminal-driven editing still works in any pane (Neovim, Helix, whatever you run) — rift adds a GUI editor, it does not forbid the terminal one.
 - **Not another tmux replacement.** Zellij and others rewrite multiplexing from scratch. This project uses tmux as its engine and adds a visual layer on top.
 - **Not another AI IDE.** Cursor, Windsurf, and Zed build custom agent harnesses around raw LLMs. This project runs vanilla CLI agents unmodified — their harness is the product, not ours to reinvent.
 - **Not another agent orchestrator.** Arbor, Superconductor, Claude Squad, and Nimbalyst manage agent sessions, worktrees, and diffs. This project does that too — but the core value is the reactive IDE layer on top: live diagnostics, file awareness, and code navigation while agents work. Without that layer, it's just another orchestrator.
@@ -77,13 +77,13 @@ The IDE doesn't compete with the agent — it amplifies it.
 ## North star scenarios
 
 **Scenario 1 — Single agent, full visibility.**
-You connect to your VPS via the app. Claude Code runs in the main pane. As it works, the file explorer highlights every file it touches. The diagnostics panel shows errors appearing and resolving in real-time. When it's done, the git panel shows a clean diff of everything that changed. You review visually, approve, and move on.
+You connect to your VPS via the app. Claude Code runs in the main pane. As it works, the file explorer highlights every file it touches. The diagnostics panel shows errors appearing and resolving in real-time. When it's done, the git panel shows a clean diff of everything that changed. You review visually, adjust anything you want directly in the editor, approve, and move on.
 
 **Scenario 2 — Parallel agents, multiple worktrees.**
 You're working on a feature branch in one pane while a second Claude Code instance refactors tests in another worktree. Each pane has its own file explorer context. Diagnostics are scoped per worktree. You glance at both, notice the test agent introduced a type error, and intervene — all without switching windows or running manual commands.
 
 **Scenario 3 — IDE comfort, terminal power.**
-You right-click a function call in the terminal output and select "Go to Definition." The app sends the LSP request, Neovim jumps to the definition. You ctrl+click an import path — same thing. You scroll the file explorer, double-click a test file, it opens in Neovim in a new pane. The mouse works. The keyboard works. It feels like an IDE but the terminal is in charge.
+You right-click a function call and select "Go to Definition." The app sends the LSP request and rift's editor jumps to the definition — in the GUI, not by remote-controlling a terminal editor. You ctrl+click an import path — same thing. You scroll the file explorer, double-click a test file, it opens in the editor; you fix a typo and save, and the change lands on the remote. The mouse works. The keyboard works. It feels like an IDE because it is one — while every process still runs in tmux.
 
 **Scenario 4 — Swap agents, keep everything else.**
 You've been using Claude Code for a feature. Mid-sprint, you want to try Codex on a different task. You open a new pane, it launches Codex instead of Claude Code — one config line different. The file explorer, diagnostics, git diff view all work identically because they don't care which agent is writing the code. The agent is a black box that edits files in a terminal. Everything around it stays the same.

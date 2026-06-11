@@ -1,3 +1,9 @@
+// Console-free stable launcher: GUI subsystem instead of console, so a desktop
+// shortcut launch opens no console window. Gated by the `windowed` feature (not
+// `not(debug_assertions)` — the `stable` profile keeps debug-assertions on for the
+// GPUI runtime-shader path); off by default so dev keeps its RUST_LOG console.
+#![cfg_attr(feature = "windowed", windows_subsystem = "windows")]
+
 use std::env;
 use std::path::PathBuf;
 use std::thread;
@@ -66,9 +72,21 @@ fn main() {
             KeyBinding::new("shift-tab", NoAction, Some(TERMINAL_KEY_CONTEXT)),
         ]);
         let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
+        // Per-channel window title (matching the per-channel taskbar icons), so the
+        // mirrored stable and dev instances are distinguishable in alt-tab and
+        // taskbar hover. Lowercase `rift` per brand rules.
+        let title = if cfg!(feature = "windowed") {
+            "rift"
+        } else {
+            "rift (dev)"
+        };
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Maximized(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some(title.into()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             |window, cx| {
@@ -175,8 +193,14 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
     // skip and fall through to the existing tmux flow so the app still runs.
     provision_daemon(&mut conn).await;
 
+    // Tmux session name, overridable so a second rift instance can mirror the
+    // same live session (default `rift`) or attach to an isolated one for
+    // destructive tests (`RIFT_SESSION=rift-dev`). Matches the SshConfig env
+    // pattern above. See docs/spec-dogfooding-channels.md.
+    let session = env::var("RIFT_SESSION").unwrap_or_else(|_| "rift".to_string());
+
     let pty = conn
-        .open_pty_exec(80, 24, "tmux -CC new-session -A -s rift")
+        .open_pty_exec(80, 24, &format!("tmux -CC new-session -A -s {session}"))
         .await
         .context("failed to start tmux control mode")?;
 
@@ -188,7 +212,7 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
     let tmux_client = TmuxClient::from_streams(
         writer,
         reader,
-        "rift".to_string(),
+        session,
         "tmux".to_string(),
         TmuxSocketTarget::Default,
         Some(wakeup_tx),

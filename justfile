@@ -290,6 +290,21 @@ export RIFT_DAEMON_BINARY := env("RIFT_DAEMON_BINARY", justfile_directory() / "t
 windows_ssh_key := env("RIFT_WINDOWS_SSH_KEY", "C:\\Users\\skrischer\\.ssh\\id_rsa")
 windows_exe := "target/x86_64-pc-windows-gnu/debug/rift.exe"
 windows_gallery_exe := "target/x86_64-pc-windows-gnu/debug/gallery.exe"
+# Stable daily driver: built into the one heavy target/ under the `stable` cargo profile
+# (release-grade opt + debug-assertions, so the GPUI Windows renderer cross-compiles from
+# WSL via its runtime-shader path — see Cargo.toml), then pinned OUTSIDE target/ under
+# %LOCALAPPDATA%\rift: cargo clean cannot delete the daily driver, the desktop shortcut
+# targets a plain Windows path (no \\wsl.localhost UNC), and the distinct image name
+# keeps the dev loop's `taskkill /IM rift.exe` away from it.
+windows_stable_profile_exe := "target/x86_64-pc-windows-gnu/stable/rift.exe"
+windows_stable_dir := env("RIFT_WINDOWS_STABLE_DIR", "/mnt/c/Users/skrischer/AppData/Local/rift")
+windows_stable_exe := windows_stable_dir / "rift-stable.exe"
+# Windows tools by absolute path: this WSL config does not append the Windows PATH
+# (no appendWindowsPath), so bare `taskkill.exe`/`cmd.exe` are not resolvable.
+windows_system32 := "/mnt/c/Windows/System32"
+# Tmux session the app attaches to. Default `rift` (the shared live session both
+# channels mirror); override to isolate dev, e.g. `RIFT_SESSION=rift-dev just dev-windows-watch`.
+rift_session := env("RIFT_SESSION", "rift")
 
 dev: release-daemon
     WAYLAND_DISPLAY="" \
@@ -312,22 +327,97 @@ dev-watch:
     RIFT_DAEMON_BINARY="{{RIFT_DAEMON_BINARY}}" \
     cargo watch -x 'clippy --workspace -- -D warnings' -x 'run -p rift-app'
 
+# Shared Windows launch: export the SSH + session env block (translated for the
+# native .exe via WSLENV) and run EXE on tmux session SESSION. A non-empty DETACH
+# starts the exe in its own session via `setsid` (WSL binfmt direct exec) so the
+# recipe returns while the GUI keeps running (stable/promote); empty runs foreground
+# for the dev watch loop. Private — keeps the env block in one place so the dev and
+# stable recipes never drift.
+[private]
+_launch-windows exe session detach="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export WSLENV="RUST_LOG:RIFT_SSH_HOST:RIFT_SSH_USER:RIFT_SSH_PORT:RIFT_SSH_KEY:RIFT_SESSION:RIFT_DAEMON_BINARY/p"
+    export RUST_LOG=rift=debug,rift_ssh=debug
+    export RIFT_SSH_HOST="{{RIFT_SSH_HOST}}"
+    export RIFT_SSH_USER="{{RIFT_SSH_USER}}"
+    export RIFT_SSH_PORT="{{RIFT_SSH_PORT}}"
+    export RIFT_SSH_KEY="{{windows_ssh_key}}"
+    export RIFT_SESSION="{{session}}"
+    export RIFT_DAEMON_BINARY="{{RIFT_DAEMON_BINARY}}"
+    if [ -n "{{detach}}" ]; then
+      # Direct binfmt exec in its own session with detached stdio: the recipe (and
+      # the promote/stable build) returns while the Windows process keeps running.
+      # WSLENV forwards the env exactly as in the foreground path. Verified: the
+      # process survives the launching shell's exit.
+      setsid "{{exe}}" </dev/null >/dev/null 2>&1 &
+    else
+      "{{exe}}"
+    fi
+
 # Build and run native Windows .exe (cross-compiled via MinGW)
 dev-windows: release-daemon
     cargo build -p rift-app --target x86_64-pc-windows-gnu
-    -taskkill.exe /F /IM rift.exe 2>/dev/null
-    export WSLENV="RUST_LOG:RIFT_SSH_HOST:RIFT_SSH_USER:RIFT_SSH_PORT:RIFT_SSH_KEY:RIFT_DAEMON_BINARY/p" && \
-    export RUST_LOG=rift=debug,rift_ssh=debug && \
-    export RIFT_SSH_HOST="{{RIFT_SSH_HOST}}" && \
-    export RIFT_SSH_USER="{{RIFT_SSH_USER}}" && \
-    export RIFT_SSH_PORT="{{RIFT_SSH_PORT}}" && \
-    export RIFT_SSH_KEY="{{windows_ssh_key}}" && \
-    export RIFT_DAEMON_BINARY="{{RIFT_DAEMON_BINARY}}" && \
-    {{windows_exe}}
+    -{{windows_system32}}/taskkill.exe /F /IM rift.exe 2>/dev/null
+    just _launch-windows {{windows_exe}} {{rift_session}}
 
 # Watch for changes and rebuild+run Windows .exe (requires cargo-watch)
 dev-windows-watch:
     cargo watch -s 'just dev-windows'
+
+# Guard: HEAD must be develop, ff-synced to origin/develop — refuses otherwise so
+# un-merged code never lands in the daily driver (the spec's mid-gate safeguard).
+# Build the accepted develop into the pinned rift-stable.exe and relaunch it detached.
+promote:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    git fetch origin develop
+    branch=$(git rev-parse --abbrev-ref HEAD)
+    if [ "$branch" = "HEAD" ]; then
+      echo "promote: detached HEAD (mid visual-review?) — run 'git checkout develop' first — refusing" >&2
+      exit 1
+    fi
+    if [ "$branch" != "develop" ]; then
+      echo "promote: HEAD is '$branch', not develop — refusing (only accepted develop is promoted)" >&2
+      exit 1
+    fi
+    if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/develop)" ]; then
+      echo "promote: develop is not fast-forwarded to origin/develop — run 'git pull' first — refusing" >&2
+      exit 1
+    fi
+    just release-daemon
+    cargo build -p rift-app --profile stable --features windowed --target x86_64-pc-windows-gnu
+    "{{windows_system32}}/taskkill.exe" /F /IM rift-stable.exe 2>/dev/null || true
+    mkdir -p "{{windows_stable_dir}}"
+    # taskkill /F returns before the process object is gone; until then Windows
+    # keeps the exe write-locked and cp fails with EACCES. Bounded retry.
+    copied=""
+    for _ in $(seq 1 20); do
+      if cp "{{windows_stable_profile_exe}}" "{{windows_stable_exe}}" 2>/dev/null; then
+        copied=1
+        break
+      fi
+      sleep 0.5
+    done
+    if [ -z "$copied" ]; then
+      echo "promote: could not overwrite {{windows_stable_exe}} — still locked by a running rift-stable.exe?" >&2
+      exit 1
+    fi
+    just _launch-windows "{{windows_stable_exe}}" rift detach
+    echo "promote: rift-stable promoted from $(git rev-parse --short HEAD), relaunched on session rift"
+
+# Hints to run `promote` first if rift-stable.exe has not been built yet.
+# Relaunch the pinned rift-stable.exe without rebuilding (e.g. after a reboot).
+stable:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -f "{{windows_stable_exe}}" ]; then
+      echo "stable: {{windows_stable_exe}} not found — run 'just promote' first" >&2
+      exit 1
+    fi
+    "{{windows_system32}}/taskkill.exe" /F /IM rift-stable.exe 2>/dev/null || true
+    just _launch-windows "{{windows_stable_exe}}" rift detach
+    echo "stable: relaunched rift-stable.exe on session rift"
 
 # Build Windows .exe without running
 build-windows:
@@ -337,7 +427,7 @@ build-windows:
 # Mirrors dev-windows; the gallery is a standalone dev window with no SSH wiring.
 gallery:
     cargo build -p rift-app --features gallery --bin gallery --target x86_64-pc-windows-gnu
-    -taskkill.exe /F /IM gallery.exe 2>/dev/null
+    -{{windows_system32}}/taskkill.exe /F /IM gallery.exe 2>/dev/null
     export WSLENV="RUST_LOG" && \
     export RUST_LOG=rift_app=debug && \
     {{windows_gallery_exe}}
