@@ -4,7 +4,7 @@
 > Created: 2026-06-10
 > Completed: —
 
-Two side-by-side rift instances on one machine — a pinned Release **stable** daily
+Two side-by-side rift instances on one machine — a pinned, optimized **stable** daily
 driver and the existing Debug watch-loop **dev** channel for the acceptance gate —
 sharing one tmux session (and daemon) so the dev loop's recompile-respawn churn can
 never take down the tool the developer works in. The stable channel is launchable
@@ -35,9 +35,9 @@ this — it owns the live session; promotion restarts it without losing work.
 
 What is true when this work is done:
 
-- [ ] A `rift-stable` **Release** binary runs as the daily driver under its own
-      process image name, attached to tmux session `rift`, and is never rebuilt or
-      killed by the dev watch loop.
+- [ ] A `rift-stable` binary, built under an optimized `stable` cargo profile, runs as
+      the daily driver under its own process image name, attached to tmux session
+      `rift`, and is never rebuilt or killed by the dev watch loop.
 - [ ] `just promote` rebuilds stable from the accepted source and restarts it in one
       step; the tmux session (and any running agent work) survives the restart.
 - [ ] The dev channel (`just dev-windows[-watch]`) attaches **by default to the same
@@ -51,7 +51,7 @@ What is true when this work is done:
 - [ ] A Windows desktop shortcut launches the pinned `rift-stable.exe` **without a
       terminal** (no console window) and always reflects the latest promoted build —
       the shortcut targets the fixed in-place path that `promote` overwrites, so it is
-      created once. The Release binary carries an embedded taskbar icon.
+      created once. The binary carries an embedded taskbar icon.
 - [ ] `cargo clippy --workspace -- -D warnings` and `cargo test --workspace` stay
       green; CI `app-check` (`cargo check -p rift-app`, native Linux) compiles the
       platform-agnostic `RIFT_SESSION` change, and the windows-target binary is
@@ -64,17 +64,20 @@ What is true when this work is done:
 - **App:** read the tmux session name from `RIFT_SESSION` (default `"rift"`), used for
   both the `new-session -A -s <name>` command and the `TmuxClient` label
   (`crates/app/src/main.rs`). One env knob, matching the existing SSH-config pattern.
-- **App (Windows launcher support):** gate the Windows subsystem to GUI for non-debug
-  builds (`#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`) so the
-  Release/stable binary launches with **no console window**, while debug/dev keeps the
-  console for `RUST_LOG`. Embed a taskbar icon through the existing
+- **App (Windows launcher support):** suppress the console window for the stable build
+  via a cargo feature (`#![cfg_attr(feature = "windowed", windows_subsystem = "windows")]`),
+  enabled only by `promote`'s build — **not** `not(debug_assertions)`, because the
+  `stable` profile keeps `debug-assertions` on (the GPUI Windows renderer needs its
+  runtime-shader path to cross-compile from WSL, see Constraints), so a debug-assertions
+  gate would never fire. The default (feature off) keeps the `RUST_LOG` console for dev.
+  Embed a taskbar icon through the existing
   `crates/app/resources/windows/rift.rc` (`embed-resource`, already in the build) — one
   `ICON` directive plus a developer-supplied `.ico` asset; no new dependency.
 - **just recipes (Windows host, the primary dev loop):**
   - `promote` — guard that HEAD is `develop` and fast-forwarded to `origin/develop`
-    (refuse otherwise), then build Release, copy the binary to a distinct image name
-    (`rift-stable.exe`), kill the old stable, and relaunch it **detached** on session
-    `rift`.
+    (refuse otherwise), then build the optimized `stable` profile (with the `windowed`
+    feature), copy the binary to a distinct image name (`rift-stable.exe`), kill the old
+    stable, and relaunch it **detached** on session `rift`.
   - `stable` — relaunch the pinned `rift-stable.exe` without rebuilding (e.g. after a
     reboot); hint to run `promote` if it is absent.
   - `dev-windows` updated to forward `RIFT_SESSION` (default `rift`) into the Windows
@@ -149,6 +152,17 @@ What is true when this work is done:
   bump in dev spawns a **second** daemon (redundant but read-only, no conflict). A
   protocol change in `crates/protocol` **must** carry a version bump, or the two
   builds share a socket with incompatible framing and both break.
+- **Stable builds under an optimized `stable` cargo profile, not `--release`.** The GPUI
+  Windows DirectX renderer precompiles HLSL shaders at build time only in release
+  (`cfg(not(debug_assertions))`), via a build script that runs solely on a Windows host
+  and shells out to `fxc.exe`. So `cargo build --release` for the windows-gnu target
+  **cannot cross-compile from WSL**: the build script is a silent no-op on Linux and the
+  `include!(shaders_bytes.rs)` then fails to compile. The `stable` profile
+  (`inherits = "release"`, `debug-assertions = true`, same for `build-override`) keeps
+  release-grade optimization but takes the renderer's runtime-shader path — the path the
+  debug dev loop already uses — so it cross-compiles. Verified on the station: a
+  `stable`-profile build completes and the `gpui_windows` build script runs as a no-op
+  (no `fxc`, no `shaders_bytes.rs`).
 - **The direct launcher reuses the app's env defaults, not a config file.** Only the
   SSH key deviates: the working dev key is `id_rsa` (justfile `windows_ssh_key`, the
   value every current launch already uses), while the app's *unused* code default is
@@ -158,15 +172,18 @@ What is true when this work is done:
   decision. The persistent var cannot leak into the dev recipes: `_launch-windows`
   exports `RIFT_SSH_KEY` unconditionally (shadowing any user-env value), and the Linux
   `dev` / `dev-watch` recipes run inside WSL and never see Windows user env.
-- **Console gating is `debug_assertions`-based, not target-based**, so the dev
-  watch-loop keeps its `RUST_LOG` console while only Release/stable goes console-free.
+- **Console gating is a cargo feature (`windowed`), not `debug_assertions`.** The
+  `stable` profile keeps `debug-assertions` on for the shader path (above), so the
+  console-suppress attribute must key on a feature `promote` enables, not on
+  `not(debug_assertions)`; the feature is off by default, so dev keeps its `RUST_LOG`
+  console.
 
 ## Prior decisions
 
 | Decision | Rationale | Date |
 |---|---|---|
 | The dev channel mirrors by default (attaches to session `rift`) | The developer works in stable and fires up dev for the acceptance gate against the same live state. rift routes every UI action through tmux and derives active window/pane from snapshots, so two clients on one session mirror tab/pane/split/kill/resize/keystroke bidirectionally — an ideal same-input/two-renderers regression harness. Isolation stays one env override away. | 2026-06-10 |
-| Stable is a Release build | It is the primary work tool run for hours; the one-time longer Release build buys a smoother daily driver, and promotion is infrequent (the developer chooses when). | 2026-06-10 |
+| Stable builds under an optimized `stable` cargo profile (`inherits = "release"` + `debug-assertions = true`), not plain `--release` | Originally specced as a Release build for a smoother hours-long daily driver. A plain `--release` windows-gnu cross-compile from WSL turned out impossible: GPUI precompiles shaders via a Windows-host-only, `fxc`-dependent build script in release. The `stable` profile keeps release-grade optimization but rides the renderer's runtime-shader path (as debug does), so it cross-compiles from WSL while staying fast. Rejected plain-debug (loses optimization) and a native-Windows release build (needs a Windows toolchain + breaks the single-`target/` topology). | 2026-06-10, revised 2026-06-11 |
 | Channels are separated by process image name + tmux session, not by checkout | The GPU app is the only expensive build; a second checkout/worktree would double the ~20 GB `target/`. A copied-aside `rift-stable.exe` reuses the one `target/` and only needs a distinct image name so the dev loop's `taskkill /IM rift.exe` cannot kill the daily driver. | 2026-06-10 |
 | Session name via `RIFT_SESSION` env (default `rift`); daemon isolation via existing `RIFT_DAEMON_REMOTE_DIR` | Matches the existing `env::var(...).unwrap_or_else(...)` config pattern (`SshConfig`); no new config file. Gives the same mirror-or-isolate switch on both the tmux and the daemon axis. | 2026-06-10 |
 | Promotion is manual, never auto-on-merge | The developer explicitly wants to choose when a new feature lands in the tool they depend on. Automate the steps; keep the trigger human. | 2026-06-10 |
@@ -175,7 +192,7 @@ What is true when this work is done:
 | `promote` builds the current checkout, guarded: it asserts HEAD is `develop` and fast-forwarded to `origin/develop`, and refuses otherwise | Guarantees stable == accepted develop with no ref-switching (which would disturb the station's running `dev-watch`). The guard is exactly what stops a promotion mid-gate, when the station sits detached on a feature branch (`CLAUDE.md`, "Parallel development") — it refuses rather than baking un-merged code into the daily driver. Rejected: always-build-`origin/develop` (extra recipe machinery to build a ref without disturbing the working tree) and explicit-ref (puts correctness on the operator and a checkout disturbs `dev-watch`). | 2026-06-10 |
 | The launcher is a one-time `.lnk` to the fixed `rift-stable.exe` path | `promote` overwrites that path in place, so a single shortcut always points at the latest stable — no per-promote regeneration. | 2026-06-11 |
 | Direct `.exe` launch + `setx RIFT_SSH_KEY`, over a `wsl.exe … just stable` wrapper | Gives a console-free double-click that pins the real exe in the taskbar and reuses the app's env defaults — matching the "env vars, no config file" decision. Rejected the wrapper: it flashes a console window and still needs the subsystem fix. | 2026-06-11 |
-| Console suppressed via `cfg_attr(not(debug_assertions), windows_subsystem="windows")` | Release/stable launches with no terminal; debug/dev keeps the console for `RUST_LOG`. One attribute, no dependency. | 2026-06-11 |
+| Console suppressed via a cargo feature (`cfg_attr(feature = "windowed", windows_subsystem="windows")`), enabled by `promote` | The `stable` profile keeps `debug-assertions` on (shader path), so `not(debug_assertions)` would never fire; a feature decouples console-suppression from the profile. Off by default, so dev keeps its `RUST_LOG` console. No dependency. | 2026-06-11 |
 | Icon embedded via the existing `rift.rc` / `embed-resource` | The Windows resource pipeline already exists (manifest); an `ICON` line + `.ico` adds the taskbar icon with no new dependency and shows even on a direct launch. | 2026-06-11 |
 
 ## Tracking
@@ -200,8 +217,9 @@ How the whole spec is known complete:
       `RIFT_SESSION` change; the windows-target binary builds via local
       `just dev-windows` / `build-windows`.
 - [ ] `just promote` refuses unless HEAD is `develop` ff-synced to `origin/develop`;
-      on a clean develop it produces `rift-stable.exe`, launches it **detached** (the
-      recipe returns while the app keeps running), attached to session `rift`.
+      on a clean develop it builds the `stable` profile, produces `rift-stable.exe`, and
+      launches it **detached** (the recipe returns while the app keeps running), attached
+      to session `rift`.
 - [ ] `just dev-windows-watch` attaches to `rift` by default; a tab switch, split, and
       keystroke in one instance are reflected in the other, both directions.
 - [ ] `RIFT_SESSION=rift-dev just dev-windows-watch` runs dev on an isolated session
@@ -214,8 +232,8 @@ How the whole spec is known complete:
       session `rift`, showing the embedded icon in the taskbar.
 - [ ] After `just promote`, the same shortcut launches the newly-built stable (fixed
       path, overwritten in place — no shortcut regeneration).
-- [ ] A debug `just dev-windows` still opens with its `RUST_LOG` console (subsystem
-      gating is debug-only).
+- [ ] A debug `just dev-windows` still opens with its `RUST_LOG` console (the `windowed`
+      feature is off by default).
 
 ## Risks and mitigations
 
@@ -227,7 +245,7 @@ How the whole spec is known complete:
 | Reflow flicker in stable when dev restarts | `window-size largest` (prior decision); equally-sized maximized windows are unaffected regardless. |
 | Two clients racing `set_client_size` | Benign size negotiation bounded by the `window-size` policy; no correctness impact. |
 | Direct launch relies on the app's default SSH/daemon config; a future default divergence beyond the key could silently misconnect | Only the key deviates today and is pinned via `setx`; host/user/port/session match the defaults; the `install-shortcut` recipe documents the assumption. |
-| `windows_subsystem = "windows"` hides early panics that previously printed to the console | Gating is debug-only, so dev keeps the console; a failed stable launch shows as no window appearing, and stable can be re-run from a terminal (`just stable`) to surface stderr for diagnosis. |
+| `windows_subsystem = "windows"` hides early panics that previously printed to the console | The `windowed` feature is off by default, so dev keeps the console; a failed stable launch shows as no window appearing, and stable can be re-run from a terminal (`just stable`) to surface stderr for diagnosis. |
 
 ## Decision log
 
@@ -254,5 +272,18 @@ How the whole spec is known complete:
   new dependency; the app's env defaults already cover host/user/port/session and skip
   the daemon when unset, leaving only the SSH key to pin (to the dev `id_rsa`, not the
   unused `id_ed25519` code default); the binary has no
-  `windows_subsystem` attribute, so a Release launch currently spawns a console — gated
-  to non-debug builds it goes console-free while dev keeps its `RUST_LOG` console.
+  `windows_subsystem` attribute, so a Release launch currently spawns a console —
+  suppressed by a `windowed` cargo feature (see the next entry for why not
+  `not(debug_assertions)`).
+- 2026-06-11: `just promote`'s Release cross-compile failed on the GPU station —
+  `gpui_windows` `include!`s build-time `fxc`-compiled shaders in release, and that build
+  script only runs on a Windows host, so the windows-gnu cross-compile from WSL is a
+  silent no-op that then fails to compile. Resolved with the developer: build stable under
+  a new `stable` cargo profile (`inherits = "release"` + `debug-assertions = true`, incl.
+  `build-override`) so it takes the renderer's runtime-shader path (as debug does) while
+  keeping release-grade optimization. Verified on the station (3m20s build,
+  `rift-stable.exe` produced, `gpui_windows` build script a no-op). Knock-on: the
+  launcher's console-suppress can no longer key on `not(debug_assertions)` (the profile
+  keeps it on) — it moves to a `windowed` cargo feature that `promote` enables. Rejected
+  plain-debug (unoptimized) and a native-Windows release build (needs a Windows toolchain;
+  breaks the single-`target/`).
