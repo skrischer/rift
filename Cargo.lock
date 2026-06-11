@@ -5298,6 +5298,7 @@ name = "rift-explorer"
 version = "0.1.0"
 dependencies = [
  "ignore",
+ "notify",
  "thiserror 2.0.18",
  "tracing",
 ]
