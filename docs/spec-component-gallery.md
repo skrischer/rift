@@ -275,3 +275,33 @@ How the entire spec is known complete:
     client and the gallery must run offline); Calendar and DatePicker are created
     without a seeded date to avoid pulling a direct `chrono` dependency just to name
     one. No new crates enter the graph.
+- 2026-06-11: Exotic demos (#126, PR #180) merged — the chart, code-editor, static
+  table and delegate-backed data-table demos plus the WebView placeholder, closing
+  the in-library coverage (only the real WebView demo, #127, remains). Four
+  implementation decisions, each resolving a Risk-table item:
+  - **Charts run on `f64`, so the `decimal` feature stays off.** The Risk table left
+    `decimal` conditional on "if a chart/table demo uses decimal axes". None do: the
+    chart value bound is `V: Copy + PartialOrd + Num + ToPrimitive + Sealed`, and
+    `impl Sealed for f64` is unconditional in gpui-component's `plot/scale/sealed.rs`
+    — only `rust_decimal::Decimal` is gated behind `decimal`. So plain `f64` data
+    works and `decimal` is deliberately **not** enabled. Risk-table item resolved to
+    "not needed".
+  - **A single `tree-sitter-rust` grammar via feature passthrough.** The `gallery`
+    feature adds `gpui-component/tree-sitter-rust` (a real, distinct feature), not the
+    umbrella `tree-sitter-languages` set (~35 grammar crates). `Cargo.lock` gains only
+    `tree-sitter-rust 0.24.2` (plus its `cc`/`tree-sitter-language` deps) and keeps
+    exactly one `gpui`; the product `rift` build is untouched. Resolves the
+    "grammar-set balloons" risk.
+  - **Stateless vs. stateful split per the part-1 `Demo` registry.** Chart and the
+    static `Table` are `Demo::Element` (purely declarative, rebuilt each frame); the
+    Code Editor (`InputState`) and Data Table (`TableState<…>`) are `Demo::View` so
+    their widget-state entities survive across frames — the same rule the form/input
+    demos established.
+  - **WebView ships as a visible placeholder, not a hidden entry.** The entry renders
+    an `Alert` that names the deferral and points at follow-up #127, so the gallery's
+    component map reads as complete while the real demo is split out. It is not a
+    forbidden mechanism (no cargo flag for an unimplemented feature, no `todo!()`),
+    and keeps `Cargo.lock` at one `gpui`. The new single-entry **Embedded** sidebar
+    group holds it; Code Editor joined **Forms & Input** and Chart/Table/Data Table
+    joined **Data Display**. The spec stays `READY` (not `COMPLETED`) because #127
+    still traces to it.
