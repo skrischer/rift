@@ -1,3 +1,9 @@
+// Console-free stable launcher: GUI subsystem instead of console, so a desktop
+// shortcut launch opens no console window. Gated by the `windowed` feature (not
+// `not(debug_assertions)` — the `stable` profile keeps debug-assertions on for the
+// GPUI runtime-shader path); off by default so dev keeps its RUST_LOG console.
+#![cfg_attr(feature = "windowed", windows_subsystem = "windows")]
+
 use std::env;
 use std::path::PathBuf;
 use std::thread;

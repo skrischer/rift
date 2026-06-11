@@ -386,7 +386,7 @@ promote:
       exit 1
     fi
     just release-daemon
-    cargo build -p rift-app --profile stable --target x86_64-pc-windows-gnu
+    cargo build -p rift-app --profile stable --features windowed --target x86_64-pc-windows-gnu
     "{{windows_system32}}/taskkill.exe" /F /IM rift-stable.exe 2>/dev/null || true
     mkdir -p "{{windows_stable_dir}}"
     cp "{{windows_stable_profile_exe}}" "{{windows_stable_exe}}"
