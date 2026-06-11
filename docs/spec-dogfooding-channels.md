@@ -85,9 +85,12 @@ What is true when this work is done:
   - `install-shortcut` — a one-time PowerShell recipe (`WScript.Shell.CreateShortcut`)
     that drops a Desktop shortcut (manually pinnable to the taskbar) targeting the
     wslpath-translated `rift-stable.exe` with the embedded icon, and persists
-    `RIFT_SSH_KEY` via `setx` (Windows user env) for the terminal-free direct launch —
-    the only config the app's defaults do not already cover (host/user/port/session
-    match; the daemon is skipped when `RIFT_DAEMON_BINARY` is unset).
+    `RIFT_SSH_KEY` (= the dev `id_rsa`) via `setx` (Windows user env) for the
+    terminal-free direct launch — the only config the app's defaults do not already
+    cover (host/user/port/session match; the daemon is skipped when
+    `RIFT_DAEMON_BINARY` is unset). The shortcut target is a `\\wsl.localhost\…` UNC
+    path (proven by the existing `cmd /c start` launch); the app is env-driven, so the
+    shortcut's working directory is irrelevant — sidestepping the UNC-cwd limitation.
 - **tmux mirror policy (optional):** `window-size largest` for the shared session so a
   dev restart's transient small attach does not reflow stable's view — applied via a
   small recipe or a documented `~/.tmux.conf` line.
@@ -146,11 +149,15 @@ What is true when this work is done:
   bump in dev spawns a **second** daemon (redundant but read-only, no conflict). A
   protocol change in `crates/protocol` **must** carry a version bump, or the two
   builds share a socket with incompatible framing and both break.
-- **The direct launcher reuses the app's env defaults, not a config file.** Only
-  `RIFT_SSH_KEY` deviates from the dev setup (app default `id_ed25519` vs the dev
-  `id_rsa`); it is pinned once via persistent Windows env (`setx`). Host/user/port/
-  session match the defaults and the daemon is skipped when `RIFT_DAEMON_BINARY` is
-  unset — congruent with the "env vars, no config file" decision.
+- **The direct launcher reuses the app's env defaults, not a config file.** Only the
+  SSH key deviates: the working dev key is `id_rsa` (justfile `windows_ssh_key`, the
+  value every current launch already uses), while the app's *unused* code default is
+  `id_ed25519`. So `setx` pins `RIFT_SSH_KEY` to the **dev `id_rsa` path**, not the
+  code default. Host/user/port/session match the defaults and the daemon is skipped
+  when `RIFT_DAEMON_BINARY` is unset — congruent with the "env vars, no config file"
+  decision. The persistent var cannot leak into the dev recipes: `_launch-windows`
+  exports `RIFT_SSH_KEY` unconditionally (shadowing any user-env value), and the Linux
+  `dev` / `dev-watch` recipes run inside WSL and never see Windows user env.
 - **Console gating is `debug_assertions`-based, not target-based**, so the dev
   watch-loop keeps its `RUST_LOG` console while only Release/stable goes console-free.
 
@@ -220,7 +227,7 @@ How the whole spec is known complete:
 | Reflow flicker in stable when dev restarts | `window-size largest` (prior decision); equally-sized maximized windows are unaffected regardless. |
 | Two clients racing `set_client_size` | Benign size negotiation bounded by the `window-size` policy; no correctness impact. |
 | Direct launch relies on the app's default SSH/daemon config; a future default divergence beyond the key could silently misconnect | Only the key deviates today and is pinned via `setx`; host/user/port/session match the defaults; the `install-shortcut` recipe documents the assumption. |
-| `windows_subsystem = "windows"` hides early panics that previously printed to the console | Gating is debug-only, so dev keeps the console; for the GUI daily driver a failed launch shows as no window appearing, and Release logging still reaches stderr. |
+| `windows_subsystem = "windows"` hides early panics that previously printed to the console | Gating is debug-only, so dev keeps the console; a failed stable launch shows as no window appearing, and stable can be re-run from a terminal (`just stable`) to surface stderr for diagnosis. |
 
 ## Decision log
 
@@ -245,6 +252,7 @@ How the whole spec is known complete:
   still needs the subsystem fix), developer-supplied logo. Survey findings: the Windows
   resource pipeline already exists (`rift.rc` + `embed-resource`), so the icon needs no
   new dependency; the app's env defaults already cover host/user/port/session and skip
-  the daemon when unset, leaving only the SSH key to pin; the binary has no
+  the daemon when unset, leaving only the SSH key to pin (to the dev `id_rsa`, not the
+  unused `id_ed25519` code default); the binary has no
   `windows_subsystem` attribute, so a Release launch currently spawns a console — gated
   to non-debug builds it goes console-free while dev keeps its `RUST_LOG` console.
