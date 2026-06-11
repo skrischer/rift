@@ -366,7 +366,7 @@ mod tests {
         // Fire a burst of metadata changes well within one debounce window.
         const WRITES: usize = 6;
         for _ in 0..WRITES {
-            mtime = mtime + Duration::from_secs(60);
+            mtime += Duration::from_secs(60);
             std::fs::File::options()
                 .write(true)
                 .open(&file)
@@ -389,5 +389,48 @@ mod tests {
             .iter()
             .flatten()
             .any(|c| matches!(c, Change::Changed { path, .. } if path == Path::new("hot.txt"))));
+    }
+
+    #[test]
+    fn test_watcher_registers_watch_for_new_subdir() {
+        let tmp = TempDir::new("new-subdir");
+        let root = &tmp.path;
+        write_file(&root.join("src/main.rs"), "fn main() {}");
+        let initial = Snapshot::scan(root).expect("scan");
+        let (_watcher, rx) = Watcher::new(initial).expect("watcher");
+
+        // A brand-new directory plus a file inside it: the parent (root) watch fires,
+        // the rescan picks the file up, and reconcile must register a watch on the new
+        // dir. Collect across batches since the dir and file creations may split.
+        write_file(&root.join("pkg/mod.rs"), "pub mod pkg;");
+        let mut changes = recv_batch(&rx);
+        while let Ok(more) = rx.recv_timeout(DEBOUNCE * 4) {
+            changes.extend(more);
+        }
+        assert!(changes.iter().any(|c| {
+            matches!(c, Change::Added { path, entry }
+                if path == Path::new("pkg/mod.rs") && entry.kind == EntryKind::File)
+        }));
+
+        // Change a file *inside* the new dir. Root's non-recursive watch cannot see
+        // this — only a watch registered on `pkg/` by the reconcile surfaces it, which
+        // proves the dynamic watch is live rather than a one-shot rescan artifact.
+        let bumped = Snapshot::scan(root)
+            .expect("rescan")
+            .get(Path::new("pkg/mod.rs"))
+            .expect("entry")
+            .mtime
+            + Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(root.join("pkg/mod.rs"))
+            .expect("open file")
+            .set_modified(bumped)
+            .expect("set mtime");
+
+        let batch = recv_batch(&rx);
+        assert!(batch
+            .iter()
+            .any(|c| matches!(c, Change::Changed { path, .. } if path == Path::new("pkg/mod.rs"))));
     }
 }
