@@ -39,6 +39,18 @@ struct PtyChannels {
 }
 
 fn main() {
+    // The stable profile keeps debug-assertions on, so GPUI resolves its
+    // compile-time CARGO_MANIFEST_DIR paths at runtime (shader sources,
+    // DirectWrite setup). Those are WSL paths — root-relative on Windows — and
+    // only resolve while the current drive is the WSL distro root. Recipe
+    // launches start inside WSL; an Explorer double-click starts on C:\ and
+    // panics before any window appears. `just promote` bakes the WSL root
+    // (RIFT_DEFAULT_WORKDIR) so the pinned shortcut launches from anywhere.
+    // Best-effort: WSL-side launches already run on the right drive.
+    if let Some(dir) = option_env!("RIFT_DEFAULT_WORKDIR") {
+        let _ = env::set_current_dir(dir);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_target(true)

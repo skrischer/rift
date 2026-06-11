@@ -390,7 +390,13 @@ promote:
     # the pinned desktop shortcut launches without any Windows user env — setx
     # proved unreliable (Explorer's env snapshot does not refresh dependably).
     # Runtime RIFT_SSH_KEY still overrides the baked default.
+    # RIFT_DEFAULT_WORKDIR (the WSL distro root, e.g. \\wsl.localhost\Ubuntu\) is
+    # set as the app's cwd at startup: the stable profile resolves GPUI's baked
+    # WSL CARGO_MANIFEST_DIR paths at runtime (shaders, DirectWrite), which are
+    # root-relative on Windows and need the WSL share as the current drive — an
+    # Explorer launch starts on C:\ and would panic before the window appears.
     RIFT_DEFAULT_SSH_KEY="{{windows_ssh_key}}" \
+    RIFT_DEFAULT_WORKDIR="$(wslpath -w /)" \
       cargo build -p rift-app --profile stable --features windowed --target x86_64-pc-windows-gnu
     "{{windows_system32}}/taskkill.exe" /F /IM rift-stable.exe 2>/dev/null || true
     mkdir -p "{{windows_stable_dir}}"

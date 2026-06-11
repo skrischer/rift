@@ -99,8 +99,11 @@ What is true when this work is done:
     taskbar manually). No env setup: the SSH key — the only config the app's defaults
     do not already cover (host/user/port/session match; the daemon is skipped when
     `RIFT_DAEMON_BINARY` is unset) — is baked into the stable exe at promote-build
-    time (see Constraints). The exe is a plain Windows path, so no UNC-target or
-    working-directory caveats apply.
+    time (see Constraints), and so is the WSL-root working directory the stable
+    profile needs for GPUI's runtime path resolution (`RIFT_DEFAULT_WORKDIR`, set as
+    cwd at startup — an earlier revision wrongly claimed the launcher's working
+    directory was irrelevant). The exe is a plain Windows path, so no UNC shortcut
+    target is involved.
 - **tmux mirror policy (optional):** `window-size largest` for the shared session so a
   dev restart's transient small attach does not reflow stable's view — applied via a
   small recipe or a documented `~/.tmux.conf` line.
@@ -173,7 +176,12 @@ What is true when this work is done:
   release-grade optimization but takes the renderer's runtime-shader path — the path the
   debug dev loop already uses — so it cross-compiles. Verified on the station: a
   `stable`-profile build completes and the `gpui_windows` build script runs as a no-op
-  (no `fxc`, no `shaders_bytes.rs`).
+  (no `fxc`, no `shaders_bytes.rs`). Knock-on: the runtime path resolves GPUI's
+  compile-time `CARGO_MANIFEST_DIR` paths at startup (shader sources, DirectWrite
+  setup) — WSL paths, root-relative on Windows, resolvable only while the current
+  drive is the WSL distro root. `promote` therefore bakes `RIFT_DEFAULT_WORKDIR`
+  (= `wslpath -w /`) and the app sets it as cwd at startup, so an Explorer launch
+  (cwd `C:\`) does not panic in platform init before any window appears.
 - **The direct launcher reuses the app's env defaults, not a config file.** Only the
   SSH key deviates: the working dev key is `id_rsa` (justfile `windows_ssh_key`, the
   value every current launch already uses), while the app's *unused* code default is
@@ -326,3 +334,14 @@ How the whole spec is known complete:
   stderr). A no-env launch of the baked exe connects and stays running. Runtime
   `RIFT_SSH_KEY` (exported by `_launch-windows`) still overrides; dev builds carry no
   baked default.
+- 2026-06-11: Second silent-death cause behind the shortcut launch, after the baked
+  key: with cwd on `C:\` (Explorer launch) the app panicked in GPUI platform init
+  ("Error creating DirectWriteTextSystem … os error 3") before any window. The
+  `stable` profile's runtime path resolves compile-time WSL `CARGO_MANIFEST_DIR`
+  paths (shaders via `D3DCompileFromFile`, DirectWrite), which are root-relative on
+  Windows and resolve only against the WSL distro root as current drive — true for
+  every recipe launch (cwd inside WSL, hence never seen before), false for Explorer.
+  Fix: `promote` bakes `RIFT_DEFAULT_WORKDIR` (= `wslpath -w /`) and `main()` sets it
+  as cwd at startup (best-effort). Corrected the spec's earlier claim that the
+  launcher's working directory is irrelevant. Verified: the same exe dies with cwd
+  `C:\` and runs with the baked workdir.
