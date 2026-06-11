@@ -70,14 +70,16 @@ What is true when this work is done:
   `stable` profile keeps `debug-assertions` on (the GPUI Windows renderer needs its
   runtime-shader path to cross-compile from WSL, see Constraints), so a debug-assertions
   gate would never fire. The default (feature off) keeps the `RUST_LOG` console for dev.
-  Embed a taskbar icon through the existing
+  The feature is declared in `crates/app/Cargo.toml` `[features]`, excluded from
+  `default` — like the existing `gallery` opt-in. Embed a taskbar icon through the
+  existing
   `crates/app/resources/windows/rift.rc` (`embed-resource`, already in the build) — one
   `ICON` directive plus a developer-supplied `.ico` asset; no new dependency.
 - **just recipes (Windows host, the primary dev loop):**
   - `promote` — guard that HEAD is `develop` and fast-forwarded to `origin/develop`
-    (refuse otherwise), then build the optimized `stable` profile (with the `windowed`
-    feature), copy the binary to a distinct image name (`rift-stable.exe`), kill the old
-    stable, and relaunch it **detached** on session `rift`.
+    (refuse otherwise), then build `--profile stable --features windowed`, copy the
+    binary to a distinct image name (`rift-stable.exe`), kill the old stable, and
+    relaunch it **detached** on session `rift`.
   - `stable` — relaunch the pinned `rift-stable.exe` without rebuilding (e.g. after a
     reboot); hint to run `promote` if it is absent.
   - `dev-windows` updated to forward `RIFT_SESSION` (default `rift`) into the Windows
