@@ -96,11 +96,11 @@ What is true when this work is done:
     not drift between the dev and stable recipes.
   - One-time launcher setup is **documented, not automated** (`CLAUDE.md`): create a
     Desktop shortcut to `%LOCALAPPDATA%\rift\rift-stable.exe` by hand (pin to the
-    taskbar manually) and persist `RIFT_SSH_KEY` (= the dev `id_rsa`) once via `setx`
-    (Windows user env) — the only config the app's defaults do not already cover
-    (host/user/port/session match; the daemon is skipped when `RIFT_DAEMON_BINARY` is
-    unset). The exe is a plain Windows path, so no UNC-target or working-directory
-    caveats apply.
+    taskbar manually). No env setup: the SSH key — the only config the app's defaults
+    do not already cover (host/user/port/session match; the daemon is skipped when
+    `RIFT_DAEMON_BINARY` is unset) — is baked into the stable exe at promote-build
+    time (see Constraints). The exe is a plain Windows path, so no UNC-target or
+    working-directory caveats apply.
 - **tmux mirror policy (optional):** `window-size largest` for the shared session so a
   dev restart's transient small attach does not reflow stable's view — applied via a
   small recipe or a documented `~/.tmux.conf` line.
@@ -177,12 +177,15 @@ What is true when this work is done:
 - **The direct launcher reuses the app's env defaults, not a config file.** Only the
   SSH key deviates: the working dev key is `id_rsa` (justfile `windows_ssh_key`, the
   value every current launch already uses), while the app's *unused* code default is
-  `id_ed25519`. So `setx` pins `RIFT_SSH_KEY` to the **dev `id_rsa` path**, not the
-  code default. Host/user/port/session match the defaults and the daemon is skipped
-  when `RIFT_DAEMON_BINARY` is unset — congruent with the "env vars, no config file"
-  decision. The persistent var cannot leak into the dev recipes: `_launch-windows`
-  exports `RIFT_SSH_KEY` unconditionally (shadowing any user-env value), and the Linux
-  `dev` / `dev-watch` recipes run inside WSL and never see Windows user env.
+  `id_ed25519`. `promote` bakes the dev key path into the stable exe as a
+  **compile-time default** (`RIFT_DEFAULT_SSH_KEY`, read via `option_env!`, set from
+  `windows_ssh_key`) — originally this was a `setx` Windows-user-env step, but
+  Explorer's environment snapshot does not refresh dependably after the setx
+  broadcast, so the pinned shortcut kept launching without the key and stable exited
+  silently. Host/user/port/session match the defaults and the daemon is skipped
+  when `RIFT_DAEMON_BINARY` is unset. The baked default cannot leak into the dev
+  recipes: it only exists in promote's build, and `_launch-windows` exports
+  `RIFT_SSH_KEY` unconditionally at runtime (which always wins over the baked value).
 - **Console gating is a cargo feature (`windowed`), not `debug_assertions`.** The
   `stable` profile keeps `debug-assertions` on for the shader path (above), so the
   console-suppress attribute must key on a feature `promote` enables, not on
@@ -204,6 +207,7 @@ What is true when this work is done:
 | The launcher is a one-time, hand-created `.lnk` to the fixed `%LOCALAPPDATA%\rift\rift-stable.exe` path | `promote` overwrites that path in place, so a single shortcut always points at the latest stable — no per-promote regeneration. Shortcut creation is a once-ever action and taskbar pinning is manual regardless (see Out of scope), so a dedicated `install-shortcut` recipe would automate nothing recurring — dropped for a documented manual step. | 2026-06-11 |
 | Stable is pinned under `%LOCALAPPDATA%\rift` and launched detached via `setsid` direct exec (binfmt), not from `target/` via `cmd.exe start` | `target/` belongs to cargo (`cargo clean` would delete the daily driver and break the shortcut); a Windows-native path needs no `\\wsl.localhost` UNC shortcut target and skips the 9P redirector at launch. `cmd.exe` is not resolvable from the recipes on this host (Windows PATH not appended in WSL), while binfmt direct exec is proven by the foreground dev path; `setsid` with detached stdio survives the recipe exit (verified, incl. `taskkill.exe` via absolute `System32` path — the bare name was silently failing for the same PATH reason). | 2026-06-11 |
 | Direct `.exe` launch + `setx RIFT_SSH_KEY`, over a `wsl.exe … just stable` wrapper | Gives a console-free double-click that pins the real exe in the taskbar and reuses the app's env defaults — matching the "env vars, no config file" decision. Rejected the wrapper: it flashes a console window and still needs the subsystem fix. | 2026-06-11 |
+| The SSH-key default is baked into the stable exe at promote-build time (`RIFT_DEFAULT_SSH_KEY` via `option_env!`), replacing the `setx` step | `setx` proved unreliable in practice: Explorer's env snapshot does not refresh dependably after the broadcast, so the pinned shortcut kept launching without the key and stable exited silently (no console, no window). Baking removes the launcher's only external config; runtime `RIFT_SSH_KEY` still overrides, dev builds are unaffected (env unset at their build). | 2026-06-11 |
 | Console suppressed via a cargo feature (`cfg_attr(feature = "windowed", windows_subsystem="windows")`), enabled by `promote` | The `stable` profile keeps `debug-assertions` on (shader path), so `not(debug_assertions)` would never fire; a feature decouples console-suppression from the profile. Off by default, so dev keeps its `RUST_LOG` console. No dependency. | 2026-06-11 |
 | Icon embedded via the existing `rift.rc` / `embed-resource` | The Windows resource pipeline already exists (manifest); an `ICON` line + `.ico` adds the taskbar icon with no new dependency and shows even on a direct launch. | 2026-06-11 |
 | Per-channel icons: stable embeds the primary brand mark, dev the monochrome outline | Developer request — the two mirrored instances must be visually distinguishable in the taskbar. Selection rides the existing `windowed` feature (`build.rs` defines a `WINDOWED` rc macro), so no new knob; dev needs no extra build flag. Assets from the brand kit: stable = bolder favicon cut (16/32/48) + 256 brand PNG, dev = rasterized `rift-icon-mono.svg`. | 2026-06-11 |
@@ -257,7 +261,7 @@ How the whole spec is known complete:
 | Detached Windows-from-WSL launch may not survive the recipe exit | Resolved: `setsid` direct binfmt exec with detached stdio — verified on the station: the recipe returns, the process survives the launching shell, env passes via `WSLENV` exactly as in the foreground path. |
 | Reflow flicker in stable when dev restarts | `window-size largest` (prior decision); equally-sized maximized windows are unaffected regardless. |
 | Two clients racing `set_client_size` | Benign size negotiation bounded by the `window-size` policy; no correctness impact. |
-| Direct launch relies on the app's default SSH/daemon config; a future default divergence beyond the key could silently misconnect | Only the key deviates today and is pinned via `setx`; host/user/port/session match the defaults; the `install-shortcut` recipe documents the assumption. |
+| Direct launch relies on the app's default SSH/daemon config; a future default divergence beyond the key could silently misconnect | Only the key deviates today and is baked at promote-build time; host/user/port/session match the defaults; `CLAUDE.md` documents the assumption. |
 | `windows_subsystem = "windows"` hides early panics that previously printed to the console | The `windowed` feature is off by default, so dev keeps the console; a failed stable launch shows as no window appearing, and the pinned exe can be run foreground from a WSL terminal (binfmt direct exec, env via `_launch-windows` without `detach`) to surface stderr for diagnosis. |
 
 ## Decision log
@@ -312,3 +316,13 @@ How the whole spec is known complete:
   the second run), and dropped the planned `install-shortcut` recipe — shortcut
   creation is a once-ever manual action and taskbar pinning is manual regardless, so
   the recipe automated nothing recurring; the steps are documented in `CLAUDE.md`.
+- 2026-06-11: Replaced the `setx RIFT_SSH_KEY` user-env step with a compile-time
+  default baked by `promote` (`RIFT_DEFAULT_SSH_KEY` → `option_env!`, value from the
+  justfile's `windows_ssh_key`). The setx route failed in practice: Explorer's
+  environment snapshot did not pick up the new variable (even though it landed in
+  `HKCU\Environment`), so the pinned taskbar shortcut kept launching the app without
+  the key — SSH auth failed against the unauthorized `id_ed25519` default and stable
+  exited silently (~1 s, no console, no window; reproduced and confirmed via captured
+  stderr). A no-env launch of the baked exe connects and stays running. Runtime
+  `RIFT_SSH_KEY` (exported by `_launch-windows`) still overrides; dev builds carry no
+  baked default.

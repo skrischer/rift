@@ -386,7 +386,12 @@ promote:
       exit 1
     fi
     just release-daemon
-    cargo build -p rift-app --profile stable --features windowed --target x86_64-pc-windows-gnu
+    # RIFT_DEFAULT_SSH_KEY is baked into the exe at compile time (option_env!) so
+    # the pinned desktop shortcut launches without any Windows user env — setx
+    # proved unreliable (Explorer's env snapshot does not refresh dependably).
+    # Runtime RIFT_SSH_KEY still overrides the baked default.
+    RIFT_DEFAULT_SSH_KEY="{{windows_ssh_key}}" \
+      cargo build -p rift-app --profile stable --features windowed --target x86_64-pc-windows-gnu
     "{{windows_system32}}/taskkill.exe" /F /IM rift-stable.exe 2>/dev/null || true
     mkdir -p "{{windows_stable_dir}}"
     # taskkill /F returns before the process object is gone; until then Windows
