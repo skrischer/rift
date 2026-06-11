@@ -38,6 +38,46 @@ struct PtyChannels {
     connection_status_tx: flume::Sender<ConnectionStatus>,
 }
 
+// Console builds log to stdout (the dev loop's RUST_LOG console). Windowed builds
+// have no console, so a failed launch dies invisibly — they write a per-run log
+// file next to the pinned exe instead (`%LOCALAPPDATA%\rift\rift-stable.log`,
+// truncated each start) and route panics there too, since panics bypass tracing.
+// Without RUST_LOG the dev-loop filter applies, so the file is useful by default.
+fn init_logging() {
+    let filter = || {
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("rift=debug,rift_ssh=debug"))
+    };
+
+    #[cfg(feature = "windowed")]
+    {
+        let log_file = env::var_os("LOCALAPPDATA").and_then(|base| {
+            let dir = PathBuf::from(base).join("rift");
+            std::fs::create_dir_all(&dir).ok()?;
+            std::fs::File::create(dir.join("rift-stable.log")).ok()
+        });
+        if let Some(file) = log_file {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter())
+                .with_target(true)
+                .with_ansi(false)
+                .with_writer(std::sync::Arc::new(file))
+                .init();
+            let default_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                error!("panic: {info}");
+                default_hook(info);
+            }));
+            return;
+        }
+    }
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter())
+        .with_target(true)
+        .init();
+}
+
 fn main() {
     // The stable profile keeps debug-assertions on, so GPUI resolves its
     // compile-time CARGO_MANIFEST_DIR paths at runtime (shader sources,
@@ -51,10 +91,7 @@ fn main() {
         let _ = env::set_current_dir(dir);
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_target(true)
-        .init();
+    init_logging();
 
     info!(
         os = env::consts::OS,

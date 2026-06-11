@@ -270,7 +270,7 @@ How the whole spec is known complete:
 | Reflow flicker in stable when dev restarts | `window-size largest` (prior decision); equally-sized maximized windows are unaffected regardless. |
 | Two clients racing `set_client_size` | Benign size negotiation bounded by the `window-size` policy; no correctness impact. |
 | Direct launch relies on the app's default SSH/daemon config; a future default divergence beyond the key could silently misconnect | Only the key deviates today and is baked at promote-build time; host/user/port/session match the defaults; `CLAUDE.md` documents the assumption. |
-| `windows_subsystem = "windows"` hides early panics that previously printed to the console | The `windowed` feature is off by default, so dev keeps the console; a failed stable launch shows as no window appearing, and the pinned exe can be run foreground from a WSL terminal (binfmt direct exec, env via `_launch-windows` without `detach`) to surface stderr for diagnosis. |
+| `windows_subsystem = "windows"` hides early panics that previously printed to the console | Windowed builds write a per-run log file (`%LOCALAPPDATA%\rift\rift-stable.log`, truncated each start, dev-loop filter by default) and route panics into it via a panic hook — a silent death is diagnosable by opening the file. Dev keeps its console (feature off by default). A console for stable was considered and rejected: closing the console window would kill the app. |
 
 ## Decision log
 
@@ -345,3 +345,12 @@ How the whole spec is known complete:
   as cwd at startup (best-effort). Corrected the spec's earlier claim that the
   launcher's working directory is irrelevant. Verified: the same exe dies with cwd
   `C:\` and runs with the baked workdir.
+- 2026-06-11: Windowed builds get a per-run file log
+  (`%LOCALAPPDATA%\rift\rift-stable.log`, truncated each start, no ANSI, dev-loop
+  filter when `RUST_LOG` is unset) with a panic hook routing panics into it — both
+  real launcher failures were invisible without a console and only diagnosable by
+  re-running from WSL with captured stderr. Considered and rejected: dropping
+  `windowed` so a console opens as a live log surface (developer liked the idea,
+  but closing that console would kill the app — the console belongs to the
+  process); a rotating file appender (new dependency for a dogfooding diagnostic —
+  the last run is what matters). Dev builds keep stdout.

@@ -98,6 +98,8 @@ Two side-by-side instances share tmux session `rift` (one daemon, mirrored views
 
 One-time Windows launcher setup (manual, no recipe — it never recurs): create a Desktop shortcut to `%LOCALAPPDATA%\rift\rift-stable.exe` and pin it to the taskbar by hand. No env setup is needed: `promote` bakes the SSH key path (justfile `windows_ssh_key`) into the stable exe as a compile-time default (runtime `RIFT_SSH_KEY` still overrides); host/user/port/session match the app defaults, and the daemon is skipped while `RIFT_DAEMON_BINARY` is unset.
 
+Stable diagnostics: the windowed build has no console — it logs to `%LOCALAPPDATA%\rift\rift-stable.log` (fresh file per start, panics included). If a launch dies silently, read that file.
+
 Optional mirror polish: `set -g window-size largest` in the host's `~/.tmux.conf`, so a dev restart's transient 80x24 attach does not reflow stable's view.
 
 ## Commits
