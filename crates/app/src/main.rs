@@ -101,8 +101,14 @@ fn main() {
                             .and_then(|p| p.parse().ok())
                             .unwrap_or(22),
                         key: env::var("RIFT_SSH_KEY")
+                            .ok()
+                            // Compile-time default baked by `just promote`
+                            // (RIFT_DEFAULT_SSH_KEY), so the pinned stable exe
+                            // launches from a bare desktop shortcut without any
+                            // user env; runtime RIFT_SSH_KEY still wins.
+                            .or_else(|| option_env!("RIFT_DEFAULT_SSH_KEY").map(String::from))
                             .map(PathBuf::from)
-                            .unwrap_or_else(|_| {
+                            .unwrap_or_else(|| {
                                 let home = env::var("USERPROFILE")
                                     .or_else(|_| env::var("HOME"))
                                     .unwrap_or_else(|_| {
