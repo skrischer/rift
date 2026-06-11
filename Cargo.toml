@@ -33,3 +33,19 @@ termy_terminal_ui = { git = "https://github.com/skrischer/termy", rev = "49d3928
 flume = "0.11"
 alacritty_terminal = "0.26.0"
 smol = "2.0"
+
+# Stable daily-driver profile: release-grade optimization, but debug-assertions ON so
+# the GPUI Windows DirectX renderer takes its runtime-shader path (cfg(debug_assertions))
+# instead of the release path that include!s build-time fxc-compiled shaders. That build
+# script only runs on a Windows host and needs fxc.exe, so it cannot cross-compile from
+# WSL; the runtime path compiles shaders on the Windows host at startup, like the debug
+# dev loop. See docs/spec-dogfooding-channels.md.
+[profile.stable]
+inherits = "release"
+debug-assertions = true
+
+# Ensure gpui_windows's build script is compiled with debug-assertions too, so its
+# cfg(not(debug_assertions)) shader-compilation gate stays off (otherwise it panics
+# looking for fxc.exe on the Linux host).
+[profile.stable.build-override]
+debug-assertions = true
