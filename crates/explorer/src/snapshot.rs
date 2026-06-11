@@ -43,7 +43,7 @@ pub struct Entry {
 }
 
 /// A point-in-time view of the worktree, entries keyed by path relative to `root`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     root: PathBuf,
     entries: BTreeMap<PathBuf, Entry>,
@@ -58,6 +58,10 @@ impl Snapshot {
     /// and never traversed, so symlink loops cannot arise. A directory that cannot be
     /// read (permission denied) or any other per-entry error is skipped and logged,
     /// never fatal to the scan; the only error this returns is an inaccessible `root`.
+    ///
+    /// If a *directory's* own metadata cannot be read it is skipped while the walk
+    /// still descends into it, so a child entry may exist in the map without its
+    /// parent; consumers building a tree must tolerate missing intermediate nodes.
     pub fn scan(root: &Path) -> Result<Self> {
         let root = root.canonicalize().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -224,6 +228,40 @@ mod tests {
             snapshot.get(Path::new("docs/guide.md")).map(|e| e.kind),
             Some(EntryKind::File)
         );
+    }
+
+    #[test]
+    fn test_scan_observes_changed_mtime_on_rescan() {
+        let tmp = TempDir::new("mtime");
+        let root = &tmp.path;
+        let file = root.join("watched.txt");
+        write_file(&file, "v1");
+
+        let before = Snapshot::scan(root).expect("first scan");
+        let before_mtime = before
+            .get(Path::new("watched.txt"))
+            .expect("entry present")
+            .mtime;
+
+        // Bump the mtime deterministically (no sleep) to a known-later instant; this
+        // is the only signal that lets the incremental diff (#109) observe a content
+        // edit, so the rescan must surface it.
+        let bumped = before_mtime + std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .expect("open file")
+            .set_modified(bumped)
+            .expect("set mtime");
+
+        let after = Snapshot::scan(root).expect("rescan");
+        let after_mtime = after
+            .get(Path::new("watched.txt"))
+            .expect("entry present")
+            .mtime;
+
+        assert_ne!(before_mtime, after_mtime);
+        assert!(after_mtime > before_mtime);
     }
 
     #[test]
