@@ -389,7 +389,20 @@ promote:
     cargo build -p rift-app --profile stable --features windowed --target x86_64-pc-windows-gnu
     "{{windows_system32}}/taskkill.exe" /F /IM rift-stable.exe 2>/dev/null || true
     mkdir -p "{{windows_stable_dir}}"
-    cp "{{windows_stable_profile_exe}}" "{{windows_stable_exe}}"
+    # taskkill /F returns before the process object is gone; until then Windows
+    # keeps the exe write-locked and cp fails with EACCES. Bounded retry.
+    copied=""
+    for _ in $(seq 1 20); do
+      if cp "{{windows_stable_profile_exe}}" "{{windows_stable_exe}}" 2>/dev/null; then
+        copied=1
+        break
+      fi
+      sleep 0.5
+    done
+    if [ -z "$copied" ]; then
+      echo "promote: could not overwrite {{windows_stable_exe}} — still locked by a running rift-stable.exe?" >&2
+      exit 1
+    fi
     just _launch-windows "{{windows_stable_exe}}" rift detach
     echo "promote: rift-stable promoted from $(git rev-parse --short HEAD), relaunched on session rift"
 
