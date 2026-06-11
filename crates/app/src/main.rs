@@ -72,9 +72,21 @@ fn main() {
             KeyBinding::new("shift-tab", NoAction, Some(TERMINAL_KEY_CONTEXT)),
         ]);
         let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
+        // Per-channel window title (matching the per-channel taskbar icons), so the
+        // mirrored stable and dev instances are distinguishable in alt-tab and
+        // taskbar hover. Lowercase `rift` per brand rules.
+        let title = if cfg!(feature = "windowed") {
+            "rift"
+        } else {
+            "rift (dev)"
+        };
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Maximized(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some(title.into()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             |window, cx| {
