@@ -5,6 +5,8 @@ use tracing::error;
 #[cfg(feature = "gallery")]
 pub mod gallery;
 
+pub mod worktree;
+
 /// Catppuccin Mocha theme in gpui-component's native theme format. Registered in
 /// the `ThemeRegistry` alongside the built-in Light/Dark themes, leaving room to
 /// add more selectable themes later.
