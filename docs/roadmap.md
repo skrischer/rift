@@ -22,8 +22,8 @@
 | 4 | Editor — GUI editing surface | [spec-editor.md](spec-editor.md) | [Editor](https://github.com/skrischer/rift/milestone/14) |
 | 5 | LSP navigation (hover / go-to-definition / references) | [spec-lsp-navigation.md](spec-lsp-navigation.md) | [LSP navigation](https://github.com/skrischer/rift/milestone/15) |
 | 6 | Terminal streaming (VTE-location spike first) | [spec-terminal-streaming.md](spec-terminal-streaming.md) | [Terminal streaming](https://github.com/skrischer/rift/milestone/16) |
-| 7 | tmux key-table mirroring | [spec-tmux-keytable-mirroring.md](spec-tmux-keytable-mirroring.md) (DRAFT) | — |
-| 8 | tmux status-line mirroring | [spec-tmux-statusline-mirroring.md](spec-tmux-statusline-mirroring.md) (DRAFT) | — |
+| 7 | tmux key-table mirroring | [spec-tmux-keytable-mirroring.md](spec-tmux-keytable-mirroring.md) | [Key-table mirroring](https://github.com/skrischer/rift/milestone/17) |
+| 8 | tmux status-line mirroring | [spec-tmux-statusline-mirroring.md](spec-tmux-statusline-mirroring.md) | [Status-line mirroring](https://github.com/skrischer/rift/milestone/18) |
 | 9 | Window-state persistence | — | — |
 
 A phase gets a Spec link once `/loopkit:plan` drafts it, and a Milestone link once
@@ -34,6 +34,7 @@ it is `READY`. The milestone (open/closed + issue progress) is where status live
 - **Dogfooding fixes** — living papercut backlog: [spec-dogfooding-fixes.md](spec-dogfooding-fixes.md), grouped by the [`papercut` label](https://github.com/skrischer/rift/labels/papercut); never completes.
 - **Component gallery** — [spec-component-gallery.md](spec-component-gallery.md), [milestone 10](https://github.com/skrischer/rift/milestone/10); WebView follow-up (#127) open.
 - **Dogfooding channels** — [spec-dogfooding-channels.md](spec-dogfooding-channels.md), [milestone 12](https://github.com/skrischer/rift/milestone/12).
+- **Logging & diagnostics** — professional debug logging for the dev and stable channels: unified `tracing` setup across app and daemon, console + file sinks, rotation instead of per-run truncation, panic capture. Unplanned — next `/loopkit:plan` candidate (explicit argument); prior-art survey in [prior-art.md](prior-art.md) Category 10.
 - Completed meta tracks (workflow automation, planning automation, pane & window management, terminal interaction fixes) live in [archive/](archive/) and their closed milestones.
 
 ## Current focus
@@ -41,8 +42,8 @@ it is `READY`. The milestone (open/closed + issue progress) is where status live
 **Phase 3.2: Worktree file-tree sync** — the data layer everything downstream
 consumes: git status (3.3) decorates its entries, LSP documents (3.4) follow its
 watcher, the editor (4) renders it. Remaining issues #110, #111; the already-planned
-3.3 / 3.4 / 4 / 5 / 6 queues unblock behind it. Phase 7 (tmux key-table
-mirroring — DRAFT spec exists) is the next phase for `/loopkit:plan` to pick up.
+3.3 / 3.4 / 4 / 5 / 6 / 7 / 8 queues unblock behind it. Phase 9 (window-state
+persistence) is the last unplanned phase for `/loopkit:plan` to pick up.
 
 ## North star
 
