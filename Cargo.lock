@@ -5324,6 +5324,8 @@ dependencies = [
 name = "rift-ssh"
 version = "0.1.0"
 dependencies = [
+ "alacritty_terminal",
+ "anyhow",
  "async-trait",
  "flume",
  "home",

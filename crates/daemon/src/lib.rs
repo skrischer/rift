@@ -1,5 +1,7 @@
 use std::path::Path;
 
+pub mod spike;
+
 use rift_protocol::{encode_frame, ClientMessage, DaemonMessage, FrameDecoder, PROTOCOL_VERSION};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
