@@ -1,6 +1,6 @@
 # Spec: Phase 5 — LSP navigation
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-06-12
 > Completed: —
 
@@ -16,7 +16,7 @@ What is true when this work is done? Observable, end-to-end criteria — not act
 - [ ] Every jump can be unwound: back-navigation returns the editor to the position it jumped from (bounded in-memory stack).
 - [ ] Positions are correct against **unsaved edits**: a request after a not-yet-saved buffer change resolves against the live buffer the editor already feeds via `didChange` (#189), and the client never deals in UTF-16 offsets — the daemon owns all offset-encoding translation.
 - [ ] Responses are correlated to requests: a slow or superseded response never lands on the wrong file or position; concurrent hover requests do not interleave.
-- [ ] A definition target **outside the worktree root** (stdlib, registry deps) behaves per the gate decision (see Open decisions) — never a crash, never a silent dead click.
+- [ ] A definition target **outside the worktree root** (stdlib, registry deps) opens **read-only** in the editor: the jump lands on the range, the buffer is visibly non-editable, and no save path exists for it — never a crash, never a silent dead click.
 - [ ] Agent-agnostic throughout: no agent or editor-process detection anywhere in the path; any language with a server in the existing table gets navigation with zero language-specific code.
 
 ## Scope
@@ -27,6 +27,7 @@ What is true when this work is done? Observable, end-to-end criteria — not act
 - **`crates/lsp` — request path**: extend the push-only client with typed requests (`textDocument/hover`, `textDocument/definition`, `textDocument/references`) through `async-lsp`'s request support; capability check before dispatch; translation `lsp-types` ↔ rift protocol types including **offset-encoding translation** (UTF-8/UTF-16, negotiated per server — the helix-lsp `util.rs` precedent).
 - **Daemon routing**: handle the new `ClientMessage` navigation requests, route to the capable server via the existing registry, respond off the dispatch loop (the loop never blocks on server I/O). Includes a **disk-read fallback** for result locations in files without synced document text (the didOpen breadth is the observed/changed set, so definition/reference targets routinely land outside it): offset-encoding translation and the jump-list's line previews read the file from disk when no synced text exists — never an error path.
 - **Editor UX** (`crates/app`): hover popover (markdown via `gpui-component`), ctrl+click + context-menu go-to-definition, references jump-list, cross-file open through the existing buffer channel, and a bounded back-jump stack.
+- **Read-only out-of-root open** (gate decision): a definition target outside the worktree root opens read-only — a bounded buffer-service carve-out for out-of-root **reads** (no write path, ever) plus a read-only editor mode in the app (no edit, no save). Out-of-root files are not watched: no auto-reload, no conflict handling — the buffer is a snapshot.
 
 ### Out of scope — the hard not-in-v1 list
 
@@ -51,7 +52,7 @@ None. rust-analyzer (the proving server) on the remote `$PATH` is already requir
 - **`crates/protocol` stays `lsp-types`-free** — the daemon translates. Position encoding is part of that translation: LSP servers default to UTF-16 offsets; the client and protocol speak only rift's own position type, and `crates/lsp` owns the conversion against the document text it already syncs.
 - **`crates/lsp` and the daemon stay `gpui`-free and musl-clean** — unchanged gates (`daemon-musl` CI job).
 - **No new dependencies expected.** `async-lsp` already provides typed requests; the hover popover and list UI come from `gpui-component` (existing dep). If the `gpui-component` editor lacks a needed mouse/hover hook, the fallback is direct GPUI mouse-event handling in rift's own editor wrapper — not a new crate.
-- **Out-of-root file access** (if the gate decides read-only open): the buffer service's root restriction is a deliberate boundary; any carve-out must be read-only and explicit, never a general write path outside the root.
+- **Out-of-root file access is read-only and explicit** (gate decision): the buffer service's root restriction stays the deliberate boundary for writes — the carve-out covers reads only, is marked read-only end-to-end (daemon refuses out-of-root saves regardless of client behavior), and is never a general write path outside the root.
 - `thiserror` in libraries, `anyhow` in the daemon binary; no `.unwrap()` in library code.
 
 ## Prior decisions
@@ -68,7 +69,7 @@ Decisions already made that the implementor must respect. Rationale included so 
 | **References UX = transient jump-list, not a dock panel** | Constraint-determined: minimal solution (`CLAUDE.md`); persistent panels are the explorer-panel sub-spec's territory per the editor spec's out-of-scope list. | 2026-06-12 |
 | **A bounded back-jump stack is in scope** | A jump with no way back is half a feature — the same "a tree that opens nothing" logic that bundled the file-tree render with the editor. Depth is bounded (in-memory, back-only; no forward stack, no persistence). | 2026-06-12 |
 | **v1 trigger surface**: hover popover, ctrl+click, context menu (exact keybinds and hover-trigger mechanics pinned in the app issue) | `vision.md` Scenario 3 names ctrl+click and the context-menu "Go to Definition"; hover and find-references are committed by `spec-daemon-lsp.md` (the hover/definition/references triple) and `architecture.md` ("The GUI is the editor"). Anything more is editor polish. | 2026-06-12 |
-| **OPEN — resolved at the spec-acceptance gate**: out-of-root definition targets — (a) refuse with a visible notice naming the target path, or (b) read-only open through a bounded buffer-service carve-out | Genuinely open: neither precedent nor constraint settles it. (a) is cheaper but guts go-to-definition into stdlib/deps — a large share of real jumps in Rust; (b) needs a read-only editor mode + an explicit out-of-root read path in the daemon. | — |
+| **Out-of-root definition targets open read-only** through a bounded buffer-service carve-out (reads only; daemon refuses out-of-root saves; unwatched snapshot — no reload/conflict handling) | Resolved with the developer at the spec-acceptance gate (`AskUserQuestion`, 2026-06-12): refusing the jump would gut go-to-definition into stdlib/deps — a large share of real jumps in Rust; the cost (read-only editor mode + explicit out-of-root read path) was accepted. | 2026-06-12 |
 
 ## Tracking
 
@@ -92,7 +93,7 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 - [ ] Go-to-definition after an **unsaved** edit that moved the symbol resolves against the live buffer (correct target, not the stale disk position)
 - [ ] Find-references lists multiple files; selecting an entry jumps; back-navigation returns to the pre-jump position (and unwinds across multiple jumps)
 - [ ] Hover on a symbol shows the popover with rendered markdown; hover on whitespace/no-result shows nothing
-- [ ] Out-of-root definition target behaves exactly per the gate decision (notice or read-only open), verified with a stdlib/dependency jump in a Rust fixture
+- [ ] An out-of-root definition target (stdlib/dependency jump in a Rust fixture) opens read-only and lands on the range; a save attempt is impossible in the UI **and** an out-of-root `SaveFile` is refused daemon-side (tested directly)
 - [ ] A `grep` confirms no agent/editor-process detection in the navigation path and no `lsp-types` types in `crates/protocol`
 
 ## Risks and mitigations
@@ -111,4 +112,5 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 Decisions made during implementation. Added as work progresses.
 
 - 2026-06-12: Spec created from `/loopkit:plan` (loop mode — roadmap Phase 5). Recorded as precedent / constraint-decided: the request/response navigation family (second after the buffer channel), first-capable-server routing, daemon-side offset-encoding translation, markdown hover via `gpui-component`, transient references jump-list, the bounded back-jump stack, and the hover/ctrl+click/context-menu trigger surface. The one genuinely-open decision — out-of-root definition targets (refuse vs. read-only open) — is flagged for the spec-acceptance gate.
+- 2026-06-12: Spec-acceptance gate. The open decision was resolved with the developer (`AskUserQuestion`): out-of-root definition targets **open read-only** via a bounded buffer-service carve-out (reads only, daemon refuses out-of-root saves, unwatched snapshot). Human prerequisites confirmed as none. Spec flipped `DRAFT → READY`.
 - 2026-06-12: Review gate (fresh-context Agent review, `NEEDS CHANGES` → addressed). Blocking finding folded in: the request-id correlation convention is **established by this spec**, not inherited from the buffer channel (which correlates by path — insufficient for positional requests); #184 alignment is evaluated in the navigation protocol issue. Non-blocking findings folded in: multi-target definitions reuse the jump-list as a picker; navigation requests on a dirty buffer are sequenced behind the pending `didChange` (flush-before-dispatch); a daemon-side disk-read fallback covers result locations in files without synced text (offset translation + line previews); position/range types align with the #176 Diagnostics types (one convention, never two); the Markdown-component and Scenario-3 citations corrected; routing relabeled constraint-determined; the offset fixture uses a non-emoji astral-plane character.
