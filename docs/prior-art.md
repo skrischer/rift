@@ -407,6 +407,38 @@ async fn start(server_stdout: BufReader<ChildStdout>,
 
 ---
 
+### Category 10: Logging & Diagnostics
+
+How the reference projects solve debug logging for GUI apps (console vs file, rotation, panic capture, surfacing logs to the user). All findings verified against current default-branch source (2026-06). Notably, all four roll a custom logger over the `log` facade — none uses `tracing-subscriber` file sinks — but the *patterns* transfer directly to rift's existing `tracing` setup.
+
+#### 1. zed-industries/zed — `zlog` (TOP PRIORITY)
+- **Key files**: `crates/zlog/src/{zlog,sink,filter,env_config}.rs`, `crates/zlog_settings/`, `crates/zed/src/main.rs`, `crates/zed/src/zed.rs` (`open_log_file`), `crates/crashes/src/crashes.rs`
+- **Sink decision by TTY detection, not build profile**: `if stdout_is_a_pty() { init_output_stdout() } else { init_output_file(log_file, Some(old_log_file)) }` — a windowed exe has no TTY and gets the file sink automatically; a terminal launch gets the console. `ZED_FORCE_CLI_MODE` env var covers the spawned-from-CLI case.
+- **Size-based rotation, two files**: `Zed.log` + `Zed.log.old` in the app data dir (`%LOCALAPPDATA%\Zed\logs` on Windows). At 1 MB the current log is copied to `.old` and truncated; an `AtomicU64` + `SizedWriter` wrapper tracks bytes. File opens `append(true)` — history survives restarts.
+- **Filtering**: `ZED_LOG` falling back to `RUST_LOG`, comma-separated `module=level` directives; **runtime reload** via a settings-store observer (`zlog_settings`) — live filter changes without restart.
+- **Panic capture**: panic hook logs `thread '{name}' panicked at {location}` via `log::error!` (lands in the log file), then hands off to a minidump crash-handler subprocess; crash JSON + `.dmp` land next to the logs and are uploaded on next start.
+- **Surfacing**: `zed: open log` action concatenates `.old` + current, keeps the last 1000 lines, opens them in an editor buffer with log syntax highlighting.
+
+#### 2. wezterm — `env-bootstrap/src/ringlog.rs`
+- **Three sinks simultaneously, always on (all profiles)**: (1) per-level **ring buffers** (16 entries each) feeding the in-app debug overlay (`Ctrl+Shift+L`, `wezterm-gui/src/overlay/debug.rs`) — log access with zero console and zero file I/O; (2) stderr with ANSI only when a TTY; (3) a **lazily created per-run file** `<exe>-log-<pid>.txt` in the runtime dir.
+- **No size rotation — per-run PID files + age pruning**: files older than 7 days are deleted, but only on GUI startup ("cli commands should have as low startup overhead as possible").
+- **Filtering**: `WEZTERM_LOG` parsed with `env_logger::filter` (the parser without the logger); default Info plus hardcoded per-module suppression of noisy deps (`wgpu_core`, `wgpu_hal`, `zbus` → Error) — directly relevant for rift's wgpu/GPUI noise.
+- **Panic capture**: hook routes message + `backtrace::Backtrace` through `log::error!` → lands in ring buffer and file, then delegates to the default hook.
+
+#### 3. alacritty — `alacritty/src/logging.rs`
+- **Lazy file creation + user notification on error**: per-run `$TMPDIR/Alacritty-<pid>.log` created **only on first write**; path exported as `$ALACRITTY_LOG` env var so child shells can `cat` it; on Warn/Error the GUI **message bar** shows `"[ERROR] ...\nSee log at $ALACRITTY_LOG"` — the user is told where the log is exactly when something goes wrong, and a silent run creates no file at all.
+- **Cleanup instead of rotation**: RAII guard deletes the log on clean exit unless `debug.persistent_logging = true`; a crash leaves the file behind.
+- **Filtering**: no `RUST_LOG` — CLI `-v/-vv/-vvv` / `-q/-qq` plus a target allowlist (only own crates log below Trace), extra targets via `ALACRITTY_EXTRA_LOG_TARGETS`.
+- **Windows console trick**: `AttachConsole(ATTACH_PARENT_PROCESS)` at start / `FreeConsole()` at exit — the windowed exe writes to the parent's console when launched from a terminal.
+
+#### 4. helix — `helix-term/src/logging.rs`
+- **Minimal zero-dep logger** (~120 lines over the `log` facade; replaced fern+chrono to cut dependencies): file-only sink, append forever, no rotation; `~/.cache/helix/helix.log`, overridable via `--log <path>`; CLI `-v` repeats map to Info/Debug/Trace.
+- **Panic pattern (TUI-specific)**: no panic-to-logfile; instead an eager terminal-reset hook so the default stderr backtrace stays readable.
+
+**Takeaways for rift**: keep the existing `tracing`/`EnvFilter` facade — the gaps are sink strategy, rotation, and the daemon. (1) Zed's TTY-detection beats the current `windowed`-feature gate: it handles dev console, windowed stable, and redirected output with one runtime check. (2) Zed's `.log`/`.log.old` 1 MB pair beats per-run truncation (current `rift-stable.log` loses the previous run's evidence) and beats unbounded append; note `tracing-appender` only rotates by *time* (minutely/daily/never), not size — size rotation needs a small custom writer like Zed's `SizedWriter` (~50 lines). (3) The daemon's stdout carries protocol frames; stderr is its log sink — wezterm's per-run PID-keyed files with age pruning is the model if the daemon ever needs a file sink on the remote host. (4) Panic-into-log via `log::error!`/`tracing::error!` in the hook (Zed, wezterm) — rift's stable build already does this; extend it to all sinks. (5) Surfacing: Alacritty's "tell the user where the log is, only on error" and wezterm's ring-buffer debug overlay are cheap, high-value follow-ups once a status/message surface exists.
+
+---
+
 ## Priority reference projects (top 10)
 
 1. **penso/arbor** — Closest existing implementation of rift's exact concept (Rust + GPUI + daemon + SSH outposts + agent state). Read end-to-end before writing any architecture docs.
