@@ -444,10 +444,16 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
 /// `Hello`/`Welcome` handshake. The detached daemon outlives the SSH connection,
 /// so a later reconnect reattaches to it instead of spawning a second one (#62).
 ///
+/// After the handshake the client stays alive: a spawned consumer task applies
+/// the daemon's worktree stream (`WorktreeSnapshot` / `UpdateWorktree`) to the
+/// client-side [`rift_app::worktree::WorktreeModel`] and logs the resulting
+/// tree state — the protocol's first consumer (#111); rendering is a later
+/// sub-spec.
+///
 /// Every step is best-effort: a missing `RIFT_DAEMON_BINARY` or any error is
-/// logged and swallowed so the existing tmux flow keeps working while the daemon
-/// protocol has no consumer yet. The socket and log sit beside the versioned
-/// binary (`<binary>.sock` / `<binary>.log`), inheriting its resolved path.
+/// logged and swallowed so the existing tmux flow keeps working without the
+/// daemon. The socket and log sit beside the versioned binary
+/// (`<binary>.sock` / `<binary>.log`), inheriting its resolved path.
 async fn provision_daemon(conn: &mut rift_ssh::SshConnection) {
     // An unset or empty `RIFT_DAEMON_BINARY` skips provisioning: the dev recipes
     // forward the var unconditionally and default it to empty, so empty must read
@@ -509,8 +515,10 @@ async fn provision_daemon(conn: &mut rift_ssh::SshConnection) {
         }
     };
 
-    // Confirm the reattach transport with a protocol round-trip. The channel is
-    // dropped afterwards; the detached daemon keeps running for the next attach.
+    // Confirm the reattach transport with a protocol round-trip, then hand the
+    // live client to the consumer task. The daemon re-broadcasts the full
+    // worktree snapshot on every Hello, so the stream following the Welcome
+    // starts with the complete tree.
     let client = rift_ssh::DaemonClient::new(channel);
     if let Err(e) = client
         .send(rift_protocol::ClientMessage::Hello {
@@ -523,9 +531,69 @@ async fn provision_daemon(conn: &mut rift_ssh::SshConnection) {
     }
     match client.recv().await {
         Some(rift_protocol::DaemonMessage::Welcome { version }) => {
-            info!(version, "daemon transport ready (Hello/Welcome ok)")
+            info!(version, "daemon transport ready (Hello/Welcome ok)");
+            tokio::spawn(consume_daemon_messages(client));
         }
         Some(other) => warn!(?other, "unexpected daemon handshake reply"),
         None => warn!("daemon closed before Welcome"),
     }
+}
+
+/// Drive the daemon message stream into the client-side worktree model.
+///
+/// Owns the [`rift_ssh::DaemonClient`] for the session's lifetime and folds
+/// every worktree message into a [`rift_app::worktree::WorktreeModel`],
+/// logging the tree state for headless verification — no rendered consumer
+/// yet (the explorer panel is its own sub-spec). Ends when the channel closes;
+/// the detached daemon keeps running for the next attach.
+async fn consume_daemon_messages(client: rift_ssh::DaemonClient) {
+    use rift_app::worktree::WorktreeModel;
+    use rift_protocol::DaemonMessage;
+
+    let mut model = WorktreeModel::default();
+    while let Some(msg) = client.recv().await {
+        match msg {
+            DaemonMessage::WorktreeSnapshot {
+                root,
+                entries,
+                final_chunk,
+            } => {
+                let chunk_len = entries.len();
+                if model.apply_snapshot_chunk(root, entries, final_chunk) {
+                    info!(
+                        root = model.root().unwrap_or(""),
+                        entries = model.len(),
+                        "worktree snapshot applied"
+                    );
+                } else {
+                    debug!(chunk_len, "worktree snapshot chunk buffered");
+                }
+            }
+            DaemonMessage::UpdateWorktree {
+                added,
+                changed,
+                removed,
+            } => {
+                let (a, c, r) = (added.len(), changed.len(), removed.len());
+                if model.apply_update(added, changed, removed) {
+                    debug!(
+                        added = a,
+                        changed = c,
+                        removed = r,
+                        entries = model.len(),
+                        "worktree update applied"
+                    );
+                } else {
+                    debug!(
+                        added = a,
+                        changed = c,
+                        removed = r,
+                        "worktree update before first snapshot dropped"
+                    );
+                }
+            }
+            other => debug!(?other, "daemon message without a consumer yet"),
+        }
+    }
+    info!("daemon message stream ended");
 }
