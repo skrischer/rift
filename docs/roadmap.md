@@ -24,7 +24,7 @@
 | 6 | Terminal streaming (VTE-location spike first) | [spec-terminal-streaming.md](spec-terminal-streaming.md) | [Terminal streaming](https://github.com/skrischer/rift/milestone/16) |
 | 7 | tmux key-table mirroring | [spec-tmux-keytable-mirroring.md](spec-tmux-keytable-mirroring.md) | [Key-table mirroring](https://github.com/skrischer/rift/milestone/17) |
 | 8 | tmux status-line mirroring | [spec-tmux-statusline-mirroring.md](spec-tmux-statusline-mirroring.md) | [Status-line mirroring](https://github.com/skrischer/rift/milestone/18) |
-| 9 | Window-state persistence | — | — |
+| 9 | Window-state persistence | [spec-window-state-persistence.md](spec-window-state-persistence.md) | [Window-state persistence](https://github.com/skrischer/rift/milestone/19) |
 
 A phase gets a Spec link once `/loopkit:plan` drafts it, and a Milestone link once
 it is `READY`. The milestone (open/closed + issue progress) is where status lives.
@@ -42,8 +42,9 @@ it is `READY`. The milestone (open/closed + issue progress) is where status live
 **Phase 3.2: Worktree file-tree sync** — the data layer everything downstream
 consumes: git status (3.3) decorates its entries, LSP documents (3.4) follow its
 watcher, the editor (4) renders it. Remaining issues #110, #111; the already-planned
-3.3 / 3.4 / 4 / 5 / 6 / 7 / 8 queues unblock behind it. Phase 9 (window-state
-persistence) is the last unplanned phase for `/loopkit:plan` to pick up.
+3.3 / 3.4 / 4 / 5 / 6 / 7 / 8 / 9 queues unblock behind it. **All roadmap phases
+are planned** — the open `/loopkit:plan` candidate is the Logging & diagnostics
+track (explicit argument, see Tracks above).
 
 ## North star
 
