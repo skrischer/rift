@@ -44,6 +44,20 @@ impl WorktreeModel {
         entries: Vec<WorktreeEntry>,
         final_chunk: bool,
     ) -> bool {
+        if let Some(pending) = &self.pending {
+            if pending.root != root {
+                // A different root mid-accumulation means the daemon started a
+                // new snapshot stream; the newest stream wins (snapshot as
+                // source of truth), so the stale partial accumulation is
+                // discarded rather than mixed in.
+                tracing::warn!(
+                    stale = %pending.root,
+                    new = %root,
+                    "worktree snapshot root changed mid-accumulation; restarting"
+                );
+                self.pending = None;
+            }
+        }
         let pending = self.pending.get_or_insert_with(|| PendingSnapshot {
             root,
             entries: Vec::new(),
@@ -59,6 +73,10 @@ impl WorktreeModel {
             .expect("pending snapshot was just populated above");
         self.entries = entries
             .into_iter()
+            // Deliberate duplication, not a borrow-checker escape: the map key
+            // and the wire entry both own the path — keeping the full entry as
+            // the value preserves the wire record for consumers (upsert
+            // blindly, per the spec), so the key is a copy of it.
             .map(|entry| (entry.path.clone(), entry))
             .collect();
         self.root = Some(root);
@@ -80,6 +98,8 @@ impl WorktreeModel {
             return false;
         }
         for entry in added.into_iter().chain(changed) {
+            // Same deliberate key/value path duplication as in
+            // `apply_snapshot_chunk` — the value keeps the full wire entry.
             self.entries.insert(entry.path.clone(), entry);
         }
         for path in &removed {
@@ -182,6 +202,23 @@ mod tests {
         assert_eq!(model.len(), 1);
         assert!(model.get("old.txt").is_none());
         assert!(model.get("new.txt").is_some());
+    }
+
+    #[test]
+    fn test_apply_snapshot_chunk_with_different_root_restarts_accumulation() {
+        let mut model = WorktreeModel::default();
+        assert!(!model.apply_snapshot_chunk("/stale".into(), vec![file("a.txt", 1)], false));
+
+        // A chunk for a different root discards the stale partial accumulation
+        // and starts fresh — the completed tree contains only the new stream.
+        assert!(!model.apply_snapshot_chunk("/proj".into(), vec![file("b.txt", 2)], false));
+        assert!(model.apply_snapshot_chunk("/proj".into(), vec![file("c.txt", 3)], true));
+
+        assert_eq!(model.root(), Some("/proj"));
+        assert_eq!(model.len(), 2);
+        assert!(model.get("a.txt").is_none());
+        assert!(model.get("b.txt").is_some());
+        assert!(model.get("c.txt").is_some());
     }
 
     #[test]

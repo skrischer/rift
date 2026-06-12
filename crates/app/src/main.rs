@@ -532,6 +532,11 @@ async fn provision_daemon(conn: &mut rift_ssh::SshConnection) {
     match client.recv().await {
         Some(rift_protocol::DaemonMessage::Welcome { version }) => {
             info!(version, "daemon transport ready (Hello/Welcome ok)");
+            // Spawned on the session thread's runtime: the task lives as long
+            // as the SSH session (`block_on` in main) and is cancelled silently
+            // when the runtime drops — the "stream ended" log only fires on a
+            // clean channel close. `DaemonClient` owns its channel actor, so
+            // cancellation is a plain drop, never a dangling connection.
             tokio::spawn(consume_daemon_messages(client));
         }
         Some(other) => warn!(?other, "unexpected daemon handshake reply"),
