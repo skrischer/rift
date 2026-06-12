@@ -1,6 +1,6 @@
 # Spec: Logging & diagnostics (tooling/DX track)
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-06-12
 > Completed: —
 
@@ -103,5 +103,6 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 
 Decisions made during implementation. Added as work progresses.
 
+- 2026-06-12: Spec-acceptance gate. No genuinely-open decisions (the Category 10 survey pre-decided the design); the developer accepted the spec and confirmed human prerequisites as none. Spec flipped `DRAFT → READY`.
 - 2026-06-12: Review gate (fresh-context Agent review, `NEEDS CHANGES` → addressed). Blocking findings folded in: (1) the daemon's stderr layer is gated on the TTY rule — an unconditional stderr subscriber would have duplicated every line into the unrotatable launch-redirect file, reintroducing the unbounded growth this track removes; the file-sink default path is now explicitly distinct from the redirect target (the in-scope/risk contradiction resolved); (2) `dev-windows[-watch]` runs through WSL binfmt interop where stdio is a pipe — the Windows dev recipes pin the console-forcing override, and milestone QA covers both dev loops. Non-blocking: the single-rotated-daemon-file choice is owned as this spec's deviation from the survey's wezterm-PID-files model; `std::io::IsTerminal` named (no `atty` crate); per-exe/channel log pairs design out concurrent writers; the `spike.rs` `eprintln!` sites are noted as Phase-6-doomed code the grep criterion must not force polishing.
 - 2026-06-12: Spec created from `/loopkit:plan logging-diagnostics` (explicit-argument track, queued in the roadmap's Tracks section). The design is pre-decided by the developer's Category 10 prior-art survey (`prior-art.md`, source-verified 2026-06): TTY-based sink selection (Zed), size-rotated `.log`/`.log.old` append pair via a small custom writer (Zed; `tracing-appender` is time-only), panic-into-sinks in every profile (Zed/wezterm), `RIFT_LOG`→`RUST_LOG`→default filtering with noisy-dep suppression (Zed/wezterm), daemon on the same facade with stderr + rotated file and the stdout framing invariant untouched. Constraint-decided: the shared `crates/logging` library (2+ consumers), the parallel-track stance (no queue edge). No genuinely-open decisions — the gate is acceptance + prerequisites only.
