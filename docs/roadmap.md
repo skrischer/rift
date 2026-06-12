@@ -21,7 +21,7 @@
 | 3.4 | LSP diagnostics | [spec-daemon-lsp.md](spec-daemon-lsp.md) | [LSP diagnostics](https://github.com/skrischer/rift/milestone/13) |
 | 4 | Editor — GUI editing surface | [spec-editor.md](spec-editor.md) | [Editor](https://github.com/skrischer/rift/milestone/14) |
 | 5 | LSP navigation (hover / go-to-definition / references) | [spec-lsp-navigation.md](spec-lsp-navigation.md) | [LSP navigation](https://github.com/skrischer/rift/milestone/15) |
-| 6 | Terminal streaming (VTE-location spike first) | — | — |
+| 6 | Terminal streaming (VTE-location spike first) | [spec-terminal-streaming.md](spec-terminal-streaming.md) | [Terminal streaming](https://github.com/skrischer/rift/milestone/16) |
 | 7 | tmux key-table mirroring | [spec-tmux-keytable-mirroring.md](spec-tmux-keytable-mirroring.md) (DRAFT) | — |
 | 8 | tmux status-line mirroring | [spec-tmux-statusline-mirroring.md](spec-tmux-statusline-mirroring.md) (DRAFT) | — |
 | 9 | Window-state persistence | — | — |
@@ -41,8 +41,8 @@ it is `READY`. The milestone (open/closed + issue progress) is where status live
 **Phase 3.2: Worktree file-tree sync** — the data layer everything downstream
 consumes: git status (3.3) decorates its entries, LSP documents (3.4) follow its
 watcher, the editor (4) renders it. Remaining issues #110, #111; the already-planned
-3.3 / 3.4 / 4 / 5 queues unblock behind it. Phase 6 (terminal streaming,
-VTE-location spike first) is the next phase for `/loopkit:plan` to pick up.
+3.3 / 3.4 / 4 / 5 / 6 queues unblock behind it. Phase 7 (tmux key-table
+mirroring — DRAFT spec exists) is the next phase for `/loopkit:plan` to pick up.
 
 ## North star
 
