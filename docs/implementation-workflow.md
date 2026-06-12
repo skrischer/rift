@@ -1,5 +1,9 @@
 # Implementation workflow
 
+> For loop behavior, [workflow.md](workflow.md) (the loopkit contract) supersedes
+> this runbook where they differ — notably the per-PR visual gate (step 7), which
+> moved to the milestone QA gate.
+
 How a single issue goes from `READY` spec to merged code, as practiced across the
 Phase 2d statusbar work (#17, #19, #20, #21). This is the mechanical companion to
 `handover-conventions.md` (which owns the design-doc -> issue -> PR chain) and the

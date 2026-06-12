@@ -1,6 +1,8 @@
 # Planning workflow runbook
 
 > Operational companion to [handover-conventions.md](handover-conventions.md).
+> For loop behavior, [workflow.md](workflow.md) (the loopkit contract) supersedes
+> this runbook where they differ.
 
 `handover-conventions.md` is the **rulebook** — the design-doc → issue → PR chain, status
 markers, roles, and CI enforcement. This file is the **runbook**: the concrete step
