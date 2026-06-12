@@ -62,9 +62,10 @@ Useful for: `pane_current_path`, `pane_current_command`, `window_name`, custom f
 3. **Flow control is mandatory.** Without `pause-after`, fast output (builds, `find /`) overwhelms the client. Activate immediately on connect.
 4. **tmux version requirements.** Flow control needs 3.2+. Subscriptions need 3.4+. Hard requirement: 3.4+.
 5. **Graceful disconnect.** Send `detach-client` before closing. tmux 3.5a crashes on abrupt connection kill (tmuxy finding). Handled by termy's `TmuxClient::drop()`.
-6. **PTY requirement.** `tmux -CC` requires a real terminal, not a pipe. Over SSH this is fine (SSH PTY channel).
+6. **PTY requirement — `-CC` only.** `tmux -CC` requires a real terminal: it calls `tcgetattr` on the client tty, which fails on a pipe (`Inappropriate ioctl for device`). Over SSH this is fine (SSH PTY channel). Single `-C` works over plain pipes — verified empirically (spike #201): a `tmux -C` child with piped stdio speaks the full control-mode protocol, which is what lets the daemon own tmux as a child process without allocating a PTY.
 7. **Parallel session creation.** tmux 3.5a crashes when multiple clients create sessions simultaneously. Serialize with a mutex (tmuxy pattern).
 8. **Octal escaping in command responses.** tmux control mode octal-escapes characters < ASCII 32 (e.g. `\x1f` becomes `\037`). Must `unescape_tmux_payload` before parsing field separators. Fixed in termy PR #306.
+9. **`#{...}` arguments must be quoted on command lines.** The control-mode command parser treats an unquoted `#` as a comment start and `{` as a brace block — `display-message -p RIFT:#{pane_id}` is a `parse error`, `display-message -p 'RIFT:#{pane_id}'` works (spike #201 finding; affects all command emission).
 
 ## Reference implementations
 

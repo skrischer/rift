@@ -30,6 +30,19 @@ async fn main() -> anyhow::Result<()> {
             let path = args.next().context("--connect requires a socket path")?;
             connect_relay(Path::new(&path)).await
         }
+        // Throwaway VTE-location spike mode (issue #201): serve the protocol on
+        // a Unix socket while forwarding one tmux session's raw %output bytes.
+        // Delete with the real terminal-streaming implementation (#202-#205).
+        Some("--spike-serve-uds") => {
+            let path = args
+                .next()
+                .context("--spike-serve-uds requires a socket path")?;
+            let session = args
+                .next()
+                .context("--spike-serve-uds requires a tmux session name")?;
+            eprintln!("rift-daemon spike listening on {path} (tmux session {session})");
+            rift_daemon::spike::serve_spike(Path::new(&path), &session).await
+        }
         // Probe mode: exit 0 if a daemon is listening on the socket, 1 otherwise.
         // The SSH host keys its reattach-vs-spawn decision on this status; no
         // output is emitted either way.

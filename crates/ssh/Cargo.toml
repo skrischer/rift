@@ -17,3 +17,7 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+# For the vte_location_spike example only (issue #201): the client-side Term
+# the spike feeds. Already a workspace dependency via rift-terminal.
+alacritty_terminal.workspace = true
+anyhow.workspace = true

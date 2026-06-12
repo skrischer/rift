@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub mod spike;
+
 use rift_explorer::{Change, Entry, Snapshot, Watcher};
 use rift_protocol::{
     encode_frame, ClientMessage, DaemonMessage, EntryKind, FrameDecoder, WorktreeEntry,
