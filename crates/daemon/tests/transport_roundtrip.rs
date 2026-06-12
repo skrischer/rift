@@ -18,7 +18,7 @@ async fn test_serve_hello_over_duplex_returns_welcome() {
     let (daemon_reader, daemon_writer) = tokio::io::split(daemon);
     let (mut client_reader, mut client_writer) = tokio::io::split(client);
 
-    let server = tokio::spawn(async move { serve(daemon_reader, daemon_writer).await });
+    let server = tokio::spawn(async move { serve(daemon_reader, daemon_writer, None).await });
 
     let hello = encode_frame(&ClientMessage::Hello {
         version: PROTOCOL_VERSION,

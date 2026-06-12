@@ -15,8 +15,13 @@ async fn main() -> anyhow::Result<()> {
         // it survives connection drops (issue #62).
         Some("--serve-uds") => {
             let path = args.next().context("--serve-uds requires a socket path")?;
-            eprintln!("rift-daemon listening on {path}");
-            serve_uds(Path::new(&path)).await
+            let root =
+                std::env::current_dir().context("cannot resolve the daemon launch directory")?;
+            eprintln!(
+                "rift-daemon listening on {path}, worktree {}",
+                root.display()
+            );
+            serve_uds(Path::new(&path), Some(root)).await
         }
         // Relay mode: connect the process's stdio to a running daemon's socket.
         // The SSH host wires its channel to this so the channel reaches the
@@ -36,8 +41,10 @@ async fn main() -> anyhow::Result<()> {
         // Default stdio mode: speak the protocol over stdin/stdout for a single
         // session. `serve` returns when stdin reaches EOF.
         None => {
-            eprintln!("rift-daemon starting");
-            serve(tokio::io::stdin(), tokio::io::stdout()).await
+            let root =
+                std::env::current_dir().context("cannot resolve the daemon launch directory")?;
+            eprintln!("rift-daemon starting, worktree {}", root.display());
+            serve(tokio::io::stdin(), tokio::io::stdout(), Some(root)).await
         }
     }
 }
