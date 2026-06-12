@@ -1,79 +1,52 @@
 # rift — Roadmap
 
-Living document tracking project phases, current status, and planned work.
+> Living document: the sequenced queue of phases — the hand-off to `/loopkit:plan`,
+> which picks the next unplanned phase, creates its spec + issues, and links them
+> back here. No status markers — progress lives in the linked GitHub milestones
+> and issues; specs carry only `DRAFT`/`READY`.
 
 ## Phase overview
 
-| Phase | Name | Status | Spec |
+| Phase | Name | Spec | Milestone |
 |---|---|---|---|
-| 1 | SSH terminal + GPUI rendering | COMPLETED | (predates spec system) |
-| 2 (migration) | termy_terminal_ui adoption | COMPLETED 2026-05-07 | [archive/spec-terminal-migration.md](archive/spec-terminal-migration.md) |
-| 2a+2b | tmux control mode integration | COMPLETED 2026-05-08 | [archive/spec-phase2ab-control-mode.md](archive/spec-phase2ab-control-mode.md) |
-| 2c | Multi-pane awareness | COMPLETED 2026-05-20 | [archive/spec-phase2c-multipane.md](archive/spec-phase2c-multipane.md) |
-| 2d | Tab bar + statusbar enrichment | IN PROGRESS | [spec-phase2d-tabbar.md](spec-phase2d-tabbar.md) |
-| 2e | gpui-component UI foundation | COMPLETED 2026-06-05 | [archive/spec-gpui-component-adoption.md](archive/spec-gpui-component-adoption.md) |
-| 3 | Remote daemon — scaffolding + transport | COMPLETED 2026-06-10 | [archive/spec-daemon-scaffolding.md](archive/spec-daemon-scaffolding.md) |
-| 3 | Remote daemon — worktree file-tree sync | READY | [spec-daemon-filetree.md](spec-daemon-filetree.md) |
-| 3 | Remote daemon — git status | READY | [spec-daemon-git-status.md](spec-daemon-git-status.md) |
-| 3 | Remote daemon — LSP diagnostics | READY | [spec-daemon-lsp.md](spec-daemon-lsp.md) |
-| Editor | Editor — GUI editing surface | READY | [spec-editor.md](spec-editor.md) |
+| 1 | SSH terminal + GPUI rendering | (predates spec system) | — |
+| 2 | termy_terminal_ui adoption | [archive/spec-terminal-migration.md](archive/spec-terminal-migration.md) | — |
+| 2a+2b | tmux control mode integration | [archive/spec-phase2ab-control-mode.md](archive/spec-phase2ab-control-mode.md) | — |
+| 2c | Multi-pane awareness | [archive/spec-phase2c-multipane.md](archive/spec-phase2c-multipane.md) | — |
+| 2d | Tab bar + statusbar enrichment | [spec-phase2d-tabbar.md](spec-phase2d-tabbar.md) | [Phase 2d](https://github.com/skrischer/rift/milestone/1) |
+| 2e | gpui-component UI foundation | [archive/spec-gpui-component-adoption.md](archive/spec-gpui-component-adoption.md) | — |
+| 3.1 | Daemon scaffolding + transport | [archive/spec-daemon-scaffolding.md](archive/spec-daemon-scaffolding.md) | [Remote daemon](https://github.com/skrischer/rift/milestone/4) |
+| 3.2 | Worktree file-tree sync | [spec-daemon-filetree.md](spec-daemon-filetree.md) | [File-tree sync](https://github.com/skrischer/rift/milestone/9) |
+| 3.3 | Git status | [spec-daemon-git-status.md](spec-daemon-git-status.md) | [Git status](https://github.com/skrischer/rift/milestone/11) |
+| 3.4 | LSP diagnostics | [spec-daemon-lsp.md](spec-daemon-lsp.md) | [LSP diagnostics](https://github.com/skrischer/rift/milestone/13) |
+| 4 | Editor — GUI editing surface | [spec-editor.md](spec-editor.md) | [Editor](https://github.com/skrischer/rift/milestone/14) |
+| 5 | LSP navigation (hover / go-to-definition / references) | — | — |
+| 6 | Terminal streaming (VTE-location spike first) | — | — |
+| 7 | tmux key-table mirroring | [spec-tmux-keytable-mirroring.md](spec-tmux-keytable-mirroring.md) (DRAFT) | — |
+| 8 | tmux status-line mirroring | [spec-tmux-statusline-mirroring.md](spec-tmux-statusline-mirroring.md) (DRAFT) | — |
+| 9 | Window-state persistence | — | — |
+
+A phase gets a Spec link once `/loopkit:plan` drafts it, and a Milestone link once
+it is `READY`. The milestone (open/closed + issue progress) is where status lives.
+
+## Tracks (tooling/DX, not product phases)
+
+- **Dogfooding fixes** — living papercut backlog: [spec-dogfooding-fixes.md](spec-dogfooding-fixes.md), grouped by the [`papercut` label](https://github.com/skrischer/rift/labels/papercut); never completes.
+- **Component gallery** — [spec-component-gallery.md](spec-component-gallery.md), [milestone 10](https://github.com/skrischer/rift/milestone/10); WebView follow-up (#127) open.
+- **Dogfooding channels** — [spec-dogfooding-channels.md](spec-dogfooding-channels.md), [milestone 12](https://github.com/skrischer/rift/milestone/12).
+- Completed meta tracks (workflow automation, planning automation, pane & window management, terminal interaction fixes) live in [archive/](archive/) and their closed milestones.
 
 ## Current focus
 
-**Phase 2d: Tab bar + statusbar enrichment**
-
-Tab bar for tmux window switching, CWD from subscriptions instead of snapshot polling, git branch display, pane command name, connection status indicator. This completes the tmux integration before moving to the daemon architecture.
-
-Spec: [spec-phase2d-tabbar.md](spec-phase2d-tabbar.md)
-
-Phase 2e (gpui-component UI foundation) is COMPLETE — it built the substrate for the 2d displays: `Root`/theme wiring (#26), an app-wide Catppuccin theme (#33), the window tab bar (#27), and the statusbar container rebuilt on gpui-component primitives with themed slots (#28). The 2d data fields now land on that statusbar. Spec: [archive/spec-gpui-component-adoption.md](archive/spec-gpui-component-adoption.md)
-
-**Completed track: terminal interaction fixes (dogfooding)**
-
-A batch of pre-SDD terminal/tmux interaction defects surfaced while dogfooding: `capture-pane`-backed scrollback (#39), `Ctrl+=`/`Ctrl+-` font zoom (#40), and drag-to-resize pane borders (#41) — GUI affordances replacing tmux's rendered interactive layer. COMPLETED 2026-06-07; the fourth outcome (pane zoom, #42) was dropped before implementation and the work moved to the pane/window-management track below. Spec: [archive/spec-terminal-interaction-fixes.md](archive/spec-terminal-interaction-fixes.md). It also added the "tmux control-mode interaction model" decision to [architecture.md](architecture.md).
-
-**Living track: dogfooding fixes** — a standing backlog (a `LIVING` spec, never `COMPLETED` or archived) for small, self-contained UX/interaction papercuts surfaced while using rift. Successor to the completed terminal-interaction-fixes batch above, generalised beyond the terminal. Entries are grouped by the [`papercut` label](https://github.com/skrischer/rift/labels/papercut), not a milestone, since the backlog never closes; a fix that grows a real design surface graduates to its own spec. First entry: Tab keypress forwarding (#116). Spec: [spec-dogfooding-fixes.md](spec-dogfooding-fixes.md).
-
-**Completed track: pane & window management (dogfooding)**
-
-Mouse-driven tmux pane/window lifecycle in the GPU UI: closing a pane via `exit` no longer quits the app (#68), the tab bar gains `+`/`x` to create and close windows (#69), a left sidebar lists and manages the active window's panes — focus, close, split (#70), and double-clicking a tab renames the window (#71). COMPLETED 2026-06-08. Spec: [archive/spec-pane-window-management.md](archive/spec-pane-window-management.md). Milestone: [Pane & window management](https://github.com/skrischer/rift/milestone/5).
-
-**Planned: tmux key-table mirroring** — make configured tmux keybindings work in a rift pane (today `send-keys -H` bypasses them). Larger effort, split into its own DRAFT spec: [spec-tmux-keytable-mirroring.md](spec-tmux-keytable-mirroring.md). Not scheduled until the interaction fixes land.
-
-**Planned: tmux status-line mirroring** — under `tmux -CC` the user's `status-left/right/style` config is queryable but never rendered, so it is currently ignored. An opt-in mode would mirror it in the native statusbar via a tmux format-string interpreter. Own DRAFT spec: [spec-tmux-statusline-mirroring.md](spec-tmux-statusline-mirroring.md). Sibling to key-table mirroring (both surface a hidden tmux config primitive); the Phase 2d native statusbar stays the default.
-
-**Deferred: window-state persistence** — the app always opens centered/maximized on the default monitor (`crates/app/src/main.rs`, no persistence layer yet), so position and monitor are lost on every restart (most visible under `dev-watch`, which respawns the binary on recompile). Remembering window bounds + display across restarts would be the app's first persistence layer (a state file under `~/.config/rift`, plus the multi-monitor display-matching edge case). Not a dogfooding papercut — graduates to its own small spec when picked up. Deferred 2026-06-09; the dev-loop annoyance is tolerable for now.
-
-**Meta track: implementation workflow automation** — COMPLETED 2026-06-08. Automated the issue → merged cycle that emerged across the Phase 2d work: a `just pr-merge` recipe (remote-only merge + cleanup), a CI `app-check` job that finally compiles `rift-app`, board status transitions baked into the worktree recipe (`In Progress`) and the skill close-out (`Done`), an interactive tmux reviewer pane, and a `/implement` skill tying it together. Tooling/DX, not a product phase. Spec: [archive/spec-workflow-automation.md](archive/spec-workflow-automation.md). Milestone: [Workflow automation](https://github.com/skrischer/rift/milestone/6).
-
-**Meta track: planning workflow automation** — COMPLETED 2026-06-09. The planning-side sibling to the above, filling the slot it reserved: a `just plan-issues` recipe (milestone + per-step issues from a markdown step-file, with a `PLAN_ISSUES_PREVIEW=1` dry-run) and a `/plan` skill driving readiness → merged `READY` spec → milestone + issues → roadmap, with the review gate on the in-session Agent tool instead of the tmux pane. The spec was itself dogfooded through the cycle it specifies, and the `/plan` skill was then verified end-to-end on a throwaway trial. A sibling `chore(pr-merge)` (#97) made the merge recipe re-poll the transient `UNKNOWN` mergeability state surfaced by the dogfood. Tooling/DX, not a product phase. Spec: [archive/spec-planning-automation.md](archive/spec-planning-automation.md). Milestone: [Planning automation](https://github.com/skrischer/rift/milestone/7) (#93 recipe → #96, #94 skill → #100).
-
-**Dev-tooling track: component gallery** — IN PROGRESS. A standalone, in-repo Storybook-style gallery that renders the gpui-component library components against rift's Catppuccin Mocha theme, so UI work can be previewed and picked from one place. It ships as a second `[[bin]] gallery` in `crates/app` (launched via `just gallery`), gated behind a `gallery` cargo feature so the product `rift` build is unaffected, with a trimmed shell (Sidebar + h_resizable + Input search) reusing real gpui-component primitives rather than depending on the heavy upstream `gpui-component-story` crate. Coverage is comprehensive (chart, code editor, tables, plus a Theme-tokens reference page); WebView — a separate `gpui-wry`/Wry crate that floats its own `gpui` — was deferred at the review gate to its own follow-up issue to keep `Cargo.lock` at one `gpui`. Tooling/DX, not a product phase. Spec: [spec-component-gallery.md](spec-component-gallery.md). Milestone: [Component gallery](https://github.com/skrischer/rift/milestone/10): the skeleton binary + shared `apply_theme` + `just gallery` recipe landed (#123, PR #130), with CI `app-check` extended to lint and test the `gallery` feature; demos part 1 landed (#124, PR #141) — Theme-tokens swatches plus the form/input and feedback component demos, with a `Demo::Element`/`Demo::View` registry split for stateful widgets and a rust-embed `debug-embed` fix so icons render in the cross-compiled debug build; demos part 2 landed (#125, PR #146) — the layout/navigation/overlay/picker demos, completing the in-library component coverage, with the 51 entries grouped under an eight-category sidebar taxonomy and the dialog/sheet/notification overlay layers now composed into the gallery's root render; the exotic components (#126) and the WebView follow-up (#127) remain.
-
-**Dev-tooling track: dogfooding channels** — PLANNED. rift is now the primary work tool, but the dev loop (`just dev-windows-watch`) rebuilds and respawns the app on every change to `develop`, and a broken build leaves no GUI to prompt the live tmux sessions. The fix splits the tool into two release-style channels over a single `target/`: a pinned **Release `rift-stable`** daily driver (its own process image name, attached to tmux session `rift`, promoted on demand via `just promote` — guarded to build only a `develop` fast-forwarded to `origin/develop`) and the existing **Debug watch-loop `rift-dev`** reserved for the acceptance/visual gate. Dev attaches to the same session `rift` by **default** — a live bidirectional mirror, because rift routes every UI action through tmux and derives active window/pane from snapshots, so two clients on one session reflect tab/split/keystroke for free — with `RIFT_SESSION=rift-dev` to isolate risky tests; the daemon's congruent knob is the already-existing `RIFT_DAEMON_REMOTE_DIR`. Mirror-by-default and Release-stable were settled with the developer; channel separation by image name + session (not a second checkout) is forced by the single-heavy-`target/` worktree topology; the framing follows the release-channels precedent (VS Code Insiders, Zed channels). Tooling/DX, not a product phase. Spec: [spec-dogfooding-channels.md](spec-dogfooding-channels.md). Milestone: [Dogfooding channels](https://github.com/skrischer/rift/milestone/12) (#150 app + dual-channel recipes, #151 docs + tmux mirror policy).
-
-## What comes after Phase 2d
-
-**Phase 3: Remote daemon** — the major architectural shift. Splits the monolithic app into a GPUI frontend + a remote daemon connected over a dedicated `russh` channel (no WebSocket — `russh` already multiplexes channels). The daemon handles file watching (inotify), git status, and language servers (LSP) on the remote host. The frontend becomes a thin rendering client.
-
-The foundational decisions are resolved (see [archive/spec-daemon-scaffolding.md](archive/spec-daemon-scaffolding.md)): daemon form is Lapce-flat dispatch (not Zed `HeadlessProject`), transport lifts Zed's connection-reuse + auto-deploy, the client↔daemon channel is a dedicated `russh` channel. File-sync (Zed worktree `Snapshot` + incremental updates) and LSP lifecycle (daemon-side, lazy per `DocumentSelector`, `async-lsp`) are pre-decided for their own sub-specs. The one genuinely open item is the VTE parsing location (client-side vs. daemon-side), deferred to a spike before the terminal-streaming sub-spec.
-
-Phase 3 is the biggest architectural change since the project began and needs multiple sub-specs (daemon scaffolding, file tree, git status, LSP integration, terminal streaming). The first — daemon scaffolding + transport — is **COMPLETED** (2026-06-10): the daemon is a headless tokio Unix-domain-socket server with a flat dispatch loop, auto-deployed as a versioned musl binary and reached over a dedicated `russh` channel; it survives an SSH drop and reattaches as a daemon-as-proxy (live-validated on the Windows host, where `ControlMaster` does not apply). Milestone [Phase 3 — Remote daemon](https://github.com/skrischer/rift/milestone/4), issues #57–#62, all closed. Spec: [archive/spec-daemon-scaffolding.md](archive/spec-daemon-scaffolding.md).
-
-The second sub-spec — **worktree file-tree sync** — is now `READY`: the daemon scans/watches a project root, maintains a Zed-style worktree `Snapshot`, and streams it to the client as an initial snapshot plus incremental `UpdateWorktree` updates. The file-sync strategy was pre-decided in the scaffolding spec (Zed `Snapshot` + incremental updates, `notify` + `jwalk`, honor VCS ignore rules); the one open decision — whether to also ship the GPUI explorer panel — was resolved at the review gate to **data-layer-only**, leaving the rendered panel (and its git-status decoration) to its own later sub-spec. It redesigns the placeholder `rift-protocol` file messages and fleshes out the empty `crates/explorer`. Spec: [spec-daemon-filetree.md](spec-daemon-filetree.md). Milestone: [Phase 3 — Worktree file-tree sync](https://github.com/skrischer/rift/milestone/9) (issues #107–#111). Its implementation sequences after the scaffolding transport lands.
-
-The third sub-spec — **git status** — is now `READY`: the daemon computes per-file git status (staged + unstaged) for the watched worktree plus repo-level branch + ahead/behind via `gix` (pure-Rust, musl-clean; `git2`/`libgit2` ruled out by the static-musl constraint), and streams it as incremental decoration on the worktree-snapshot entries — re-introducing the status slot the file-tree spec reserved. Because the worktree watcher ignores `.git/`, it observes a minimal `.git/` whitelist (`HEAD`, `index`, `refs/`, `packed-refs`) as a second watched set so commits, staging, and branch switches are reflected. The one open decision — git-state granularity — was resolved at the review gate to **full porcelain** (per-file index/worktree pair plus repo-level branch state, the eventual successor to the tmux-sourced statusbar branch but not wired into it here); the cut stays **data-layer-only**, read-only, single-root. Spec: [spec-daemon-git-status.md](spec-daemon-git-status.md). Milestone: [Phase 3 — Git status](https://github.com/skrischer/rift/milestone/11) (issues #131–#135). Its implementation sequences after the file-tree sync lands.
-
-The fourth sub-spec — **LSP diagnostics** — is now `READY`: the daemon runs language servers on the remote (daemon-side), feeds them on-disk file content as the watched worktree changes, and streams the diagnostics they publish to the client as live per-`(file, server)` updates (full-set-replace, server-id-keyed so a linter + a type-checker aggregate rather than clobber). It adds a `gpui`-free, musl-clean `crates/lsp` library (`async-lsp`, gated by a one-day rust-analyzer round-trip spike with a `helix-lsp` fork as the pre-vetted MPL-2.0 fallback), a lazy per-`DocumentSelector` multi-server `Registry`, a disk-backed full-text document model driven by the worktree watcher, and an additive `Diagnostics` protocol message carrying rift's own diagnostic types (no `lsp-types` across the boundary). The one open decision — v1 feature scope — was resolved at the review gate to **diagnostics (server-push)**; **interactive navigation (hover / go-to-definition / references) split off to a committed sibling sub-spec on the editor track**, because its only consumer is rift's own GUI editor (the vision/architecture editor pivot, #153), which has no spec yet — building the pull plumbing before it would be premature. The cut stays **data-layer-only**. Spec: [spec-daemon-lsp.md](spec-daemon-lsp.md). Milestone: [Phase 3: LSP diagnostics](https://github.com/skrischer/rift/milestone/13) (issues #173–#178). Its implementation sequences after the file-tree sync lands.
-
-That leaves **terminal streaming** as the remaining Phase 3 sub-spec to plan; it first needs the VTE-parsing-location spike (see above).
-
-A new **GUI editor** track also emerged from the vision/architecture pivot (#153) and is now `READY`: rift's GUI becomes a first-class editor — it renders the worktree as a navigable file tree (the long-deferred panel render debuts here, consuming the #111 client worktree model), opens a file into a `gpui-component` code editor with Tree-sitter highlighting, and saves edits back to the remote over a dedicated, content-bearing **request/response buffer channel** (the protocol's first request/response pair; file content is pulled on open and pushed on save, kept off the push-only worktree structure path) with an `mtime` conflict check and Zed-style concurrent-write handling (a clean buffer auto-reloads, a dirty one surfaces a conflict). The one open decision — where the first milestone cuts (view-only / +write-back / +inline-diagnostics) — was resolved with the developer at the review gate to **C**: v1 additionally renders the daemon's diagnostics inline against the live buffer and feeds the LSP the live buffer via `didChange` (the disk->buffer source-of-truth shift the LSP spec reserved), surfacing the north-star Scenario 1 signal — type errors in the editor as the agent edits — in the first milestone. A **hard not-in-v1 list** (LSP navigation, editor power features, rich explorer operations, diff/staging, pluggable viewers, multi-window) holds the roadmap on the tmux-process-layer axis. **LSP navigation** (hover / go-to-definition / references) is the committed sibling sub-spec deferred onto this track from the LSP diagnostics spec and is the natural next editor sub-spec once this surface exists. Spec: [spec-editor.md](spec-editor.md). Milestone: [Editor — GUI editing surface](https://github.com/skrischer/rift/milestone/14) (issues #184–#189). Its implementation sequences after the file-tree client model (#111) lands; the inline-diagnostics slice additionally sequences after the diagnostics data layer (#173–178).
-
-See [prior-art.md](prior-art.md) for reference implementations (Zed `remote_server`, Lapce proxy, Arbor, `async-lsp`) and candidate dependencies to draw from when writing these specs.
+**Phase 3.2: Worktree file-tree sync** — the data layer everything downstream
+consumes: git status (3.3) decorates its entries, LSP documents (3.4) follow its
+watcher, the editor (4) renders it. Remaining issues #110, #111; the already-planned
+3.3 / 3.4 / 4 queues unblock behind it. Phase 5 (LSP navigation) is the next phase
+for `/loopkit:plan` to pick up once the editor surface exists.
 
 ## North star
 
-The goal is Scenario 1 from [vision.md](vision.md): connect to a VPS, run Claude Code in a pane, see the file explorer highlight every file it touches, diagnostics update in real-time, git panel shows clean diffs. Review visually, approve, move on.
-
-Phase 2d gets us the tab bar and enriched statusbar. Phase 3 builds the daemon-side data layers — worktree, git status, diagnostics. The **editor** track is where those data layers debut on screen: the file-tree render and the inline diagnostics against the live buffer (cut C) are the first rendered surface, delivering the core north star scenario.
+Scenario 1 from [vision.md](vision.md): connect to a VPS, run Claude Code in a
+pane, watch the file explorer light up as it edits, diagnostics update in
+real-time, review the clean diff, approve, move on. The Phase 3 data layers and
+the editor surface deliver exactly that.

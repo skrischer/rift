@@ -6,15 +6,24 @@ Open-source, agent-centric IDE built in Rust. Wraps tmux with a native GPU-accel
 
 Coding agents (Claude Code, Codex, OpenCode, Gemini CLI) run completely unmodified. The IDE reacts to their side effects — file changes, terminal output, git state — never to agent internals. Agents are interchangeable black boxes. If you're writing code that detects or special-cases a specific agent, stop.
 
-Read `docs/vision.md` for the why. Read `docs/architecture.md` for the how.
+## Foundation docs
 
-## Tech stack
+Always in context:
 
-- **Language:** Rust (2021 edition)
-- **Async runtime:** Tokio
-- **GUI framework:** GPUI 0.2.2
-- **Build target (daemon):** `x86_64-unknown-linux-musl`
-- **Build target (app):** Windows (`x86_64-pc-windows-gnu`, cross-compiled from WSL via MinGW) and Linux/X11 (GPUI native); macOS deferred. Primary dev loop runs the GPU app on the Windows host (`just dev-windows`).
+@docs/vision.md
+@docs/constitution.md
+
+On-demand references — deliberately NOT loaded permanently (token budget):
+
+- `docs/architecture.md` — components, boundaries, flows; read before structural changes
+- `docs/prior-art.md` — reference projects and candidate dependencies
+- `docs/roadmap.md` — the sequenced phase queue
+- `docs/workflow.md` — the loopkit workflow contract (branch model, commands, gates, loops)
+- `docs/patterns.md`, `docs/protocol.md`, `docs/tmux-reference.md` — implementation references
+
+## Loopkit autonomy
+
+Within the loopkit skills (`/loopkit:plan`, `/loopkit:implement`) the following are explicitly granted, overriding any stricter global user rules: autonomous commits, pushes, PR creation and merges, and dependency installs when the dependency is named in the issue's spec. Hard limits live in `.claude/settings.json` (deny rules); the full contract is `docs/workflow.md`.
 
 ## Repository layout
 
@@ -41,30 +50,7 @@ cargo run -p rift-app                                            # run GPUI app 
 cargo build --release -p daemon --target x86_64-unknown-linux-musl  # daemon release build (Phase 3+)
 ```
 
-## Architectural rules
-
-**Agent-agnostic by design.** The daemon sees PTY byte streams and filesystem events. It has no concept of which agent runs in a pane. All IDE features derive from these two universal signals. A new CLI agent shipping tomorrow must work with zero code changes.
-
-**Crate boundaries are contracts.** Each crate exposes a public API through `lib.rs`. Internal modules are private. Import through the public API only. `crates/protocol/` is the shared language — both sides depend on it but never on each other.
-
-**Plugins extend, core stays agnostic.** Process-specific pane awareness (detecting agent states, dev server status) lives in plugins, never in the daemon core. The daemon depends on `crates/plugin-api/` (the trait), never on plugin implementations. Plugins are optional cargo features.
-
-**No premature abstraction.** Write concrete implementations first. Extract traits only when two or more implementations share a pattern. "We might need this later" is not a reason to add a trait.
-
-**State flows through channels.** The daemon maintains a single `State` struct. Use `tokio::sync::watch` or `broadcast` channels to notify consumers. Avoid `Arc<Mutex<State>>` where channels work.
-
-**Async for I/O, blocking for CPU.** All I/O is async via Tokio. CPU-bound work (VTE parsing, diff computation) runs on `tokio::task::spawn_blocking`.
-
-## What to avoid
-
-- **No agent-specific code.** No detection of which CLI agent runs. No parsing of agent output formats.
-- **No proprietary dependencies.** MIT, Apache-2.0, ISC, BSD, GPL-3.0 compatible only. Run `cargo deny check licenses` in CI.
-- **No `.unwrap()` in library code.** Use `thiserror` in libs, `anyhow` in binaries. `.expect("reason")` only for true invariants.
-- **No `clone()` to satisfy the borrow checker.** Restructure ownership instead.
-- **No `String` where `&str` suffices.** Be intentional about ownership at API boundaries.
-- **No `todo!()` or `unimplemented!()` in merged code.**
-- **No feature flags for unimplemented features.**
-- **No large PRs.** Split at ~400 lines. Exception: initial scaffolding.
+Architecture principles, conventions, quality gates, and the don't list live in `docs/constitution.md` (loaded above — binding).
 
 ## Branching
 
@@ -85,7 +71,7 @@ The GPU app (`rift-app`) is the only expensive, non-parallelizable build (pulls 
 
 - **Main checkout = the one GPU station.** Stays on `develop`, runs `just dev-watch`. The only place `rift-app` is built and visually previewed.
 - **Agents work headless in worktrees.** They verify with `just lint` / `just test` / `cargo build --workspace --exclude rift-app` — no GPU build, so their `target/` stays small.
-- **Visual review is a gate *before* merge**, not after: the agent first commits its work in the worktree (worktrees share only committed objects, not the working tree, so uncommitted changes are invisible to the main checkout). Then, on the GPU station, `git checkout --detach <branch>` — a plain `git checkout <branch>` fails because the branch is already checked out in the worktree, so use `--detach` to ride the commit while reusing the station's heavy `target/`. Let `dev-watch` rebuild incrementally, then `git checkout develop` to return. Never blind-merge GPU changes into `develop`.
+- **Visual QA happens on the GPU station at the milestone QA gate** (see `docs/workflow.md` — per-PR merges are gated by CI `app-check` + agent review instead). To ride a commit for review: `git checkout --detach <ref>` — a plain `git checkout <branch>` fails when the branch is checked out in a worktree; `--detach` reuses the station's heavy `target/`. Let `dev-watch` rebuild incrementally, then `git checkout develop` to return.
 
 Worktrees live in a sibling container `../rift-worktrees/<branch-with-slashes-as-dashes>` (outside the repo tree, so `rg`/`cargo`/watchers don't traverse them; own `target/` per worktree). Use `just agent-worktree <branch>` to create and `just agent-worktree-rm <branch>` to remove.
 
@@ -115,7 +101,7 @@ chore: update alacritty_terminal to 0.24
 
 ## Planning handover
 
-Planning lives in `docs/` as SDD specs (`docs/spec-template.md`). The chain is **design-doc -> issue -> PR**, mechanically enforced — see `docs/handover-conventions.md` for the full rules.
+Planning lives in `docs/` as SDD specs (`docs/spec-template.md`). The chain is **design-doc -> issue -> PR**, mechanically enforced — see `docs/handover-conventions.md` for the full rules. The operational loop contract (commands, gates, board, loop prompts) is `docs/workflow.md` — the loopkit skills read it instead of hardcoding project specifics.
 
 - Spec (`docs/spec-*.md`) owns the **design**: outcome, scope, constraints, prior decisions, verification.
 - A GitHub **milestone** groups a phase; **issues** own the step decomposition and progress. The step list lives only as issues, never as a task breakdown inside the spec.
@@ -129,7 +115,7 @@ Planning lives in `docs/` as SDD specs (`docs/spec-template.md`). The chain is *
 1. Open a PR that closes the issue (`Closes #N`); the milestone closes when its issues do
 2. When the spec's verification is fully met, set status to `COMPLETED` with date and move it to `archive/`
 3. Add decisions made during implementation to the spec's decision log
-4. Update `docs/roadmap.md` with the current phase status
+4. Keep `docs/roadmap.md`'s phase table and Current focus pointer current (no status markers there — progress lives in milestones)
 
 **If blocked:**
 1. Set spec status to `BLOCKED` with reason in the spec header
@@ -148,10 +134,6 @@ For protocol message types, read `docs/protocol.md` before adding or modifying m
 3. Don't refactor code you weren't asked to touch. Note opportunities in a comment if significant.
 4. When in doubt about a design decision, state your reasoning — don't silently pick an approach.
 5. Respect crate boundaries. Adding to `protocol` is a deliberate API change.
-
-## Testing
-
-Unit tests in `#[cfg(test)] mod tests {}` in the same file. Integration tests in `crates/*/tests/`. Name pattern: `test_<what>_<condition>_<expected>`. Prefer real fixtures over mocks. Every public API function needs at least one test. Parsers need tests for valid and malformed input.
 
 ## Open source
 

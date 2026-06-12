@@ -20,6 +20,10 @@ On the other side, a new wave of agent orchestrators has emerged — tools like 
 
 The missing tool is not another terminal manager or another agent orchestrator. It's an IDE that wraps around terminal agents and provides **reactive code intelligence while they work** — diagnostics updating as files change, errors surfacing before the agent finishes, file structure reflecting reality in real-time.
 
+## Why now
+
+Terminal coding agents went from novelty to primary authoring tool within two years. The harness arms race (Claude Code, Codex, Gemini CLI) produces rapidly improving black-box agents — while every IDE still treats them as a sidebar feature. The window is open: no tool yet provides live IDE awareness around unmodified terminal agents, and the building blocks (GPUI, alacritty_terminal, tmux control mode, russh) are mature enough to assemble it.
+
 ## The solution
 
 rift is an **agent-centric IDE** — a native GUI shell that wraps terminal-based coding agents with **reactive code intelligence**.
@@ -33,6 +37,35 @@ tmux is the process runtime — session management, pane multiplexing, persisten
 When a coding agent edits a file, the file explorer lights up and the file open in the editor reloads under you — you watch it change live. When it introduces a type error, the diagnostics panel shows it immediately — not after the agent is done, not after you run the compiler, but as it happens. You jump to the definition, fix it in place, and the change is saved to the remote. When it commits, the git diff view surfaces what changed. When multiple agents run in parallel across worktrees, you see all of them at a glance.
 
 The IDE doesn't compete with the agent — it amplifies it.
+
+## Target users
+
+- **Primary:** the developer building rift — terminal-based agentic coding on remote hosts (Windows host, WSL/VPS). A personal tool, built for one workflow done exceptionally well.
+- **Secondary:** open-source developers with the same workflow — CLI agents in tmux on a remote box — who want visibility without giving up their agent's harness.
+
+## Success criteria
+
+- Scenario 1 runs end-to-end: an agent's file edit appears in the file explorer and the diagnostics panel without any manual refresh, within 2 seconds of the file hitting disk.
+- rift is the daily driver for its own development (the dogfooding stable channel is in active use).
+- Zero agent-specific code: grepping the non-doc codebase for agent names returns nothing; a new CLI agent works with zero code changes.
+- Swapping the agent in a pane requires exactly one config/command change.
+- Every IDE feature works against a remote host over SSH; no local checkout of the target project is needed.
+
+## Scope
+
+### In
+
+- Native GPUI shell on Windows and Linux/X11
+- tmux control mode as the process engine; SSH-remote daemon for file watching, git status, LSP
+- Reactive file explorer, live LSP diagnostics, git status, GUI editor with remote write-back
+- Multi-pane and multi-worktree awareness
+
+### Out
+
+- macOS (GPUI supports it; deferred until the Windows/Linux loop is solid)
+- Own agent harness, agent protocol integrations, or agent-specific features
+- Telemetry, analytics, paid tiers
+- Collaboration/multiplayer, mobile, plugin marketplace
 
 ## What this is not
 
@@ -87,7 +120,3 @@ You right-click a function call and select "Go to Definition." The app sends the
 
 **Scenario 4 — Swap agents, keep everything else.**
 You've been using Claude Code for a feature. Mid-sprint, you want to try Codex on a different task. You open a new pane, it launches Codex instead of Claude Code — one config line different. The file explorer, diagnostics, git diff view all work identically because they don't care which agent is writing the code. The agent is a black box that edits files in a terminal. Everything around it stays the same.
-
-## Current status
-
-Phase 2 (tmux control mode integration) complete. SSH connection to remote tmux via control mode (`-CC`), event-driven notification processing, flow control, active pane tracking, working directory from tmux snapshots, terminal rendering through GPUI with `alacritty_terminal` and `termy_terminal_ui`. Multi-pane awareness (Phase 2c) complete: per-pane VTE parsers, snapshot-driven pane lifecycle, split-tree layout from tmux pane coordinates. Next: tab bar for tmux window switching, then daemon with file tree, git status, and LSP diagnostics on the remote host.
