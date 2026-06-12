@@ -1,6 +1,6 @@
 # Spec: Phase 9 — Window-state persistence
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-06-12
 > Completed: —
 
@@ -100,4 +100,5 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 Decisions made during implementation. Added as work progresses.
 
 - 2026-06-12: Spec created from `/loopkit:plan` (loop mode — roadmap Phase 9, the last unplanned phase). Recorded constraint-determined: the v1 state set (bounds + maximized + font size), serde-JSON in the platform state dir (no database, no new dependency), per-channel keying from instance identity, change-driven debounced atomic saves, clamp-don't-trust restore, and the hard workspace-persistence exclusion. No genuinely-open decisions — the gate is acceptance + prerequisites only.
+- 2026-06-12: Spec-acceptance gate. No genuinely-open decisions; the developer accepted the spec and confirmed human prerequisites as none. Spec flipped `DRAFT → READY`.
 - 2026-06-12: Review gate (fresh-context Agent review, `NEEDS CHANGES` → addressed). Blocking finding folded in: debounce-only saving would lose the last change in the close-and-reopen flow — the mechanism is now debounced change-driven saves **plus** a best-effort flush on clean close (the Zed precedent does both; change-driven stays primary since the dev channel only dies by `taskkill /F`). Non-blocking: the temp+rename citation now names `spec-editor.md` as a design precedent (no implemented code to mirror yet); the `rift-terminal` font-size API is a named, deliberate crate-boundary addition (persisted value is absolute px, not a ratio); same-channel duplicate instances acknowledged as last-writer-wins. The reviewer confirmed: exe-name keying sound per platform, GPUI APIs present in the pinned checkout (`observe_window_bounds`, `window_bounds()`, `WindowBounds::Maximized` carrying inner bounds), theme correctly omitted (no runtime switcher), XDG fallback necessary and correct, no-`dirs`-crate the right call.
