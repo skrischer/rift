@@ -34,6 +34,7 @@ it is `READY`. The milestone (open/closed + issue progress) is where status live
 - **Dogfooding fixes** — living papercut backlog: [spec-dogfooding-fixes.md](spec-dogfooding-fixes.md), grouped by the [`papercut` label](https://github.com/skrischer/rift/labels/papercut); never completes.
 - **Component gallery** — [spec-component-gallery.md](spec-component-gallery.md), [milestone 10](https://github.com/skrischer/rift/milestone/10); WebView follow-up (#127) open.
 - **Dogfooding channels** — [spec-dogfooding-channels.md](spec-dogfooding-channels.md), [milestone 12](https://github.com/skrischer/rift/milestone/12).
+- **Logging & diagnostics** — professional debug logging for the dev and stable channels: unified `tracing` setup across app and daemon, console + file sinks, rotation instead of per-run truncation, panic capture. Unplanned — next `/loopkit:plan` candidate (explicit argument); prior-art survey in [prior-art.md](prior-art.md) Category 10.
 - Completed meta tracks (workflow automation, planning automation, pane & window management, terminal interaction fixes) live in [archive/](archive/) and their closed milestones.
 
 ## Current focus
