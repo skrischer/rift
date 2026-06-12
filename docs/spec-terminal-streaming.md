@@ -1,6 +1,6 @@
 # Spec: Phase 6 — Terminal streaming
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-06-12
 > Completed: —
 
@@ -17,7 +17,7 @@ What is true when this work is done? Observable, end-to-end criteria — not act
 - [ ] **Reconnect resumes**: dropping SSH and reconnecting reattaches to the running daemon and resumes streaming with a fresh snapshot — tmux remains the session persistence; no terminal state is lost.
 - [ ] **Latency parity**: interactive typing and output feel are not perceptibly worse than the direct `-CC` path — the spike pins the measured bar and the swap meets it.
 - [ ] Agent-agnostic throughout: pane bytes stay opaque; no parsing of any process's output beyond VTE semantics.
-- [ ] The legacy direct `tmux -CC`-over-SSH-PTY path is handled per the gate decision (see Prior decisions) — no silent second code path lingers without a recorded plan.
+- [ ] The legacy direct `tmux -CC`-over-SSH-PTY path remains available as an **env-selected fallback** until the milestone QA gate passes (gate decision); its removal chore is filed at the QA gate — no silent second code path lingers without a recorded plan.
 
 ## Scope
 
@@ -28,7 +28,7 @@ What is true when this work is done? Observable, end-to-end criteria — not act
 - **Protocol — terminal streaming message set** (`crates/protocol`): per-pane output streaming, session/window/pane layout state updates, and the client→daemon input / resize / tmux-command path. The attach request **carries the session name** (the `RIFT_SESSION` knob travels end-to-end). **Supersedes the placeholder sketches in `protocol.md`** (`pane_output` with `cells`, `input`, `resize_pane`, `tmux_command`): if the spike confirms client-side VTE, pane output carries **bytes**, not cells. Exact message granularity and the snapshot-on-attach shape are pinned in the protocol issue — including the **snapshot↔live-stream consistency contract** (no gap and no duplicate between the attach-time snapshot and the live notification stream), which is what backs the reconnect outcome.
 - **Daemon — own the tmux session**: spawn or attach `tmux -C` as a child process over local pipes (single-`-C` control mode works over pipes; `docs/tmux-reference.md` pitfall 6 concerns `-CC` over a tty — the spike's first checkpoint verifies this and the reference is clarified in the same change), one attach per connected rift client, route notifications onto the per-connection stream, own flow control on both legs (tmux→daemon and daemon→client).
 - **App — swap the seam**: the terminal widget's byte source and the input/resize/command emission switch from termy's `TmuxClient` (flume bridge) to the daemon protocol; the rendering stack (`termy_terminal_ui` grid + `alacritty_terminal::Term`) stays untouched.
-- **Legacy-path handling** per the gate decision (remove in-milestone vs. env-selected fallback until the milestone QA gate).
+- **Legacy-path fallback** (gate decision): the direct `-CC` path stays selectable via an env switch until the milestone QA gate passes; the removal chore is filed at the QA gate. Default after the swap lands is the daemon path — the fallback is the escape hatch, not the default.
 
 ### Out of scope
 
@@ -70,7 +70,7 @@ Decisions already made that the implementor must respect. Rationale included so 
 | **Per-client tmux attach**: each connected rift client gets its own daemon-side control-mode attach | Constraint-determined: preserves tmux's native multi-client semantics (per-client size, `window-size largest`) that the dogfooding channels' mirrored stable/dev views rely on; a shared attach would couple the two instances' sizes. | 2026-06-12 |
 | **Single-seam swap; the client render pipeline is untouched** | Constraint-determined: `architecture.md` records the seam precisely so this swap stays narrow; touching the render path would widen a transport change into a rendering rewrite. | 2026-06-12 |
 | **tmux stays the engine** — this phase moves the attach point, it does not reinterpret the interaction model | `architecture.md` "tmux control-mode interaction model" (durable contract + exit criteria) and `vision.md` "tmux-native" are unchanged by this spec. | 2026-06-12 |
-| **OPEN — resolved at the spec-acceptance gate**: fate of the legacy direct `tmux -CC` path — (a) remove in the same milestone (one path, no drift; requires the baked daemon default in the stable exe and no-promote discipline until the milestone QA gate passes), or (b) keep as an env-selected fallback until the milestone QA gate passes, removed in a follow-up chore | Genuinely open: neither precedent nor constraint settles it. This is daily-driver risk management — (a) is cleaner and avoids maintaining two transports, but until the QA gate the only stable escape hatch is not promoting; (b) keeps a known-good runtime escape hatch while the new path proves itself in dogfooding, at the cost of a temporary second path. Either way the stable-launch contract gains the baked daemon default (see Constraints). | — |
+| **The legacy direct `tmux -CC` path stays as an env-selected fallback until the milestone QA gate passes**, then a follow-up chore removes it; the daemon path is the default once the swap lands | Resolved with the developer at the spec-acceptance gate (`AskUserQuestion`, 2026-06-12): daily-driver risk management — a known-good runtime escape hatch while the new transport proves itself in dogfooding outweighs the cost of a temporary second path. The stable-launch contract gains the baked daemon default regardless (see Constraints). | 2026-06-12 |
 
 ## Tracking
 
@@ -92,7 +92,7 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 - [ ] Flow-control test: a flooding pane keeps the UI responsive and other panes streaming; daemon and client buffers observably bounded
 - [ ] Reconnect test: killing the SSH connection leaves tmux + daemon running; reconnect reattaches, snapshots, and resumes streaming
 - [ ] Two simultaneous clients attach with independent sizes and mirrored views (dogfooding-channels semantics)
-- [ ] Legacy-path handling matches the gate decision (removed, or env-selected fallback with a recorded removal issue); a shortcut-launched (env-free) stable build resolves a working daemon via the baked default — verified by launching the promoted exe without environment overrides
+- [ ] The env switch selects the legacy direct path and restores today's behavior end-to-end; without it the daemon path is the default; the removal chore is filed when the milestone QA gate passes; a shortcut-launched (env-free) stable build resolves a working daemon via the baked default — verified by launching the promoted exe without environment overrides
 - [ ] Session lifecycle: `RIFT_SESSION=rift-dev` attaches/creates that session through the daemon; disconnecting one client leaves the other client and the tmux session running; killing the tmux server surfaces a terminal-path-down event, not a daemon crash
 - [ ] A `grep` confirms: no agent detection in the streaming path; `crates/tmux-core` pulls no `gpui`; the daemon pulls no `termy_terminal_ui`
 - [ ] Milestone QA (dev channel): typing feel, fast scroll under load, pane split/zoom/resize interactions — visual acceptance against these scenarios
@@ -114,4 +114,5 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 Decisions made during implementation. Added as work progresses.
 
 - 2026-06-12: Spec created from `/loopkit:plan` (loop mode — roadmap Phase 6). Recorded as constraint-/precedent-decided: daemon ownership of the control-mode client, rift's own `crates/tmux-core` client (tech-debt row), client-side VTE as the spike-gated primary with the cell-diff fallback, per-client attach cardinality, the single-seam swap, and tmux-stays-the-engine. The one genuinely-open decision — the fate of the legacy direct `-CC` path (remove in-milestone vs. env-selected fallback until milestone QA) — is flagged for the spec-acceptance gate.
+- 2026-06-12: Spec-acceptance gate. The open decision was resolved with the developer (`AskUserQuestion`): the legacy direct `-CC` path **stays as an env-selected fallback until the milestone QA gate passes**, removed by a follow-up chore filed at that gate; the daemon path becomes the default when the swap lands. Human prerequisites confirmed as none. Spec flipped `DRAFT → READY`.
 - 2026-06-12: Review gate (fresh-context Agent review, `NEEDS CHANGES` → addressed). Blocking findings folded in: the session-lifecycle contract is now fixed in Constraints (session name travels in the attach request, attach-or-create per attach, per-client child teardown, `%exit` as a terminal-path-down event — preserving the `RIFT_SESSION` dogfooding knob); the dogfooding transition mechanics were corrected — the stable exe must gain a baked daemon default (a shortcut-launched env-free stable would otherwise have no terminal under option (a)), and the promote risk row no longer claims a QA guard `just promote` does not have (recorded no-mid-milestone-promote discipline instead). Non-blocking findings folded in: spike failure returns the spec to the acceptance gate for a fallback amendment; the `-C`-over-pipes vs. `tmux-reference.md` pitfall-6 (`-CC`-over-tty) distinction is named, with the spike verifying it and the reference clarified in the same change; the snapshot↔live-stream consistency contract is named in the protocol delegation.
