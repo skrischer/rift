@@ -1,59 +1,124 @@
-# Spec: tmux key-table mirroring
+# Spec: Phase 7 — tmux key-table mirroring
 
-> Status: DRAFT
-> Created: 2026-06-04
+> Status: READY
+> Created: 2026-06-04 (refreshed 2026-06-12 by /loopkit:plan — Phase 7 planning cycle)
 > Completed: —
 
-Make configured tmux keybindings work while focus is in a rift pane. Today input is sent via `send-keys -t <pane> -H <hex>`, which injects raw bytes into the pane PTY and *bypasses tmux's key tables entirely* (see the "tmux control-mode interaction model" section in `architecture.md`). As a result the prefix chord and every `bind-key` (window/pane management, copy-mode entry, custom bindings) are inert in rift. This spec restores them by mirroring tmux's key tables client-side.
-
-This is intentionally split out of `spec-terminal-interaction-fixes.md` because it is an order of magnitude larger than the dogfooding fixes (prefix state machine, `list-keys` parsing, per-mode tables) and must not block them.
+Make configured tmux keybindings work while focus is in a rift pane. Today input is sent as raw bytes into the pane PTY (`send-keys -H`), which *bypasses tmux's key tables entirely* (`architecture.md`, "tmux control-mode interaction model" — a recorded consequence of the `-CC` contract). As a result the prefix chord and every `bind-key` (window/pane management, custom bindings) are inert in rift. This spec restores them by mirroring tmux's key tables client-side: a `list-keys`-built lookup, a prefix state machine at the established interception point, and dispatch of bound commands through the single command seam.
 
 ## Outcome
 
-What is true when this work is done (to be refined before READY):
+What is true when this work is done? Observable, end-to-end criteria — not activities.
 
-- [ ] Pressing the configured tmux prefix followed by a bound key runs the bound tmux command, matching a native client
-- [ ] Bindings are read from the live tmux config (`list-keys`), not hardcoded — a user's custom bindings work with zero rift changes
-- [ ] Per-mode key tables are respected (at least `prefix` and `root`; copy-mode tables depend on the copy-mode design)
-- [ ] Keys with no binding fall through to the existing `encode_keystroke` → `send-keys -H` path unchanged
+- [ ] Pressing the configured tmux prefix followed by a bound key runs the bound tmux command exactly as in a native client (e.g. `prefix c` creates a window, `prefix %` splits) — for the **`prefix` and `root` tables** (gate decision), including the native unbound-after-prefix root retry; root (`bind -n`) bindings run with rift-native shortcuts keeping precedence.
+- [ ] Bindings come from the **live tmux config** via `list-keys` — a user's custom bindings work with zero rift changes; there is no hardcoded table.
+- [ ] **Repeat bindings** (`bind -r`, e.g. `prefix Left Left Left` to resize) honor tmux's `repeat-time` semantics.
+- [ ] Keys with **no binding fall through unchanged** to the existing `encode_keystroke` → input path; plain typing latency is unaffected (the lookup is in-memory; no per-keypress round-trips).
+- [ ] A bound command that would enter a **pane mode** control clients cannot render (`copy-mode`, `choose-*`, `clock-mode`, `customize-mode`) is **intercepted, not dispatched**: rift surfaces a visible hint naming the GUI affordance that replaces it (mouse-wheel scrollback / the GUI pickers); the shared pane never enters the mode, so co-attached native clients are unaffected.
+- [ ] A bound command that **renders on the issuing client** — which a control client cannot do — never silently no-ops: **`confirm-before` renders a native confirm dialog** (prompt shown, wrapped command dispatched on confirm — `prefix x`/`prefix &` really kill); `command-prompt`, `display-menu`, `display-panes`, and `display-popup` are intercepted with a visible GUI-affordance hint (gate decision).
+- [ ] **Pending-prefix state is visible** (statusbar indicator) and cancelable (Escape); like native tmux at the 3.4 floor there is **no pending-prefix timeout** (tmux's `prefix-timeout` arrives in 3.5, default off — adopt later if wanted); a state-machine error can never swallow typing — passthrough always recovers.
+- [ ] **Config changes are picked up without restarting rift**: prefix/option and binding state are re-queried on attach/reconnect and on the refresh triggers pinned in the issue (at minimum: an explicit refresh, dispatch of a binding-mutating command — `bind-key`/`unbind-key`/`source-file` — and dispatch of `set-option` touching `prefix`/`prefix2`/`repeat-time`).
+- [ ] Agent-agnostic: nothing parses pane content; the only parsed text is the output of rift's own tmux queries (`list-keys`, `show-options`) over the framed command channel.
 
 ## Scope
 
-### In scope (provisional)
+### In scope
 
-- Query tmux key tables via `list-keys` (over the framed `send_command` channel) and build a lookup
-- A prefix state machine: intercept the prefix chord before `encode_keystroke`, capture the next chord, resolve the bound command
-- Dispatch the resolved command as a control command (feasible with zero termy changes — `send_command` already exists)
-- Re-query / invalidate the table when the config changes (mechanism TBD)
+- **`list-keys` lookup**: query over the single command seam, parse into a `(table, key) → command` lookup. The parser handles tmux's quoting/escaping, mouse-binding entries (consciously skipped for keyboard lookup), and unknown lines (skip + log, never fail the table); tested with real-tmux fixtures, valid and malformed (constitution parser rule).
+- **Option discovery via `show-options`**: the prefix is a **session option** (`prefix`, plus `prefix2`), not a binding — `list-keys` alone cannot provide the trigger key; `repeat-time` is likewise an option. Both are queried session-resolved over the same seam and refreshed with the table.
+- **Keystroke → tmux key-name mapping**: GPUI keystrokes mapped to tmux key syntax (`C-b`, `M-Left`, `S-F5`, …) so lookups match `list-keys` entries — the reverse direction of today's `encode_keystroke`. Unmappable keys fall through to typing, never block.
+- **Prefix state machine** at the established interception point (`on_key_down` before `encode_keystroke`, alongside the existing rift-native early returns): capture the chord after the prefix, resolve against the lookup, dispatch or fall through; `repeat-time` support; Escape/timeout cancel; pending-prefix indicator.
+- **Dispatch** of resolved bound commands through the single command seam (today `TmuxClient::send_command`; after Phase 6, the daemon tmux-command path — the mirroring logic is seam-agnostic by constraint).
+- **Pane-mode command interception** (`copy-mode`, `choose-*`, `clock-mode`, `customize-mode`): no dispatch; visible GUI-affordance hint.
+- **Client-interaction command handling** (gate decision): a native confirm dialog for `confirm-before` (parse its `-p` prompt and wrapped command — tmux command syntax, not pane content; dispatch on confirm); intercept-with-hint for `command-prompt`, `display-menu`, `display-panes`, `display-popup`.
+- **Table-switching bindings** (`switch-client -T <table>` to an unmirrored table): intercepted with a hint, not dispatched — dispatching would desync the server-side client table from rift's mirror.
+- **Table refresh/invalidation** on attach/reconnect plus the pinned triggers (binding mutations and `set-option` on `prefix`/`prefix2`/`repeat-time`).
+- **Root table (`bind -n`) mirroring** (gate decision): the root table is consulted for unhandled keys after the rift-native early returns, and as the native retry for unbound prefix-table chords.
 
-### Out of scope (provisional)
+### Out of scope
 
-- copy-mode/choose-mode *rendering* — not delivered to control clients; scrollback is handled separately via `capture-pane` (see `spec-terminal-interaction-fixes.md`)
-- Rebinding or editing tmux config from rift
-- Conflict detection between tmux bindings and rift-native GUI shortcuts (revisit once the table is known)
+- **copy-mode / choose-mode rendering** — not delivered to control clients; permanently replaced by GUI affordances (`archive/spec-terminal-interaction-fixes.md` design framing; scrollback via `capture-pane` already shipped).
+- **Rebinding or editing tmux config from rift.**
+- **Conflict detection/reporting UI** between tmux bindings and rift-native shortcuts — precedence is pinned (rift-native first, see Constraints); surfacing shadowed bindings is a later refinement.
+- **User-defined key tables beyond the v1 cut** (`bind -T mytable`, `switch-client -T`) — a binding that switches to an unmirrored table is treated as unbound (falls through); revisit on demand.
+- **tmux status-line mirroring** — Phase 8, own spec.
+
+## Human prerequisites
+
+None. Everything runs against the user's existing tmux config; no secrets, accounts, or provisioning.
 
 ## Constraints
 
-- Input/command emission must stay behind the single `TmuxClient` seam (Phase 3 transport swap stays single-seam).
-- `list-keys` output parsing must handle the documented control-mode quirks (framing, escaping) — reuse termy's command-response path.
-- No termy changes anticipated; if any are needed, contribute upstream rather than fork.
+- **Single seam, request/response form required**: `list-keys`/`show-options` queries and bound-command dispatch go through the one narrow command interface — today termy's `send_command`, after the Phase 6 transport swap the daemon tmux-command path. The query path needs the seam's **command-response** form (the `%begin`/`%end`-framed reply), which the Phase 6 protocol carries anyway (`capture-pane` scrollback and snapshots already require it) — this cross-phase requirement is explicit, not assumed. The mirroring logic consults an in-memory lookup and emits through the seam; it must not care which transport is behind it.
+- **Sequencing**: the roadmap queue places Phase 7 behind Phase 6 (cross-milestone edge on the prior phase's last issue, #206). The design is seam-agnostic, so the swap landing first means this spec's dispatch path is the daemon one from day one.
+- **Precedence layering is pinned**: rift-native early returns first (existing `Ctrl+Shift+C/V`, font zoom — the GUI affordances), then the tmux table lookup, then `encode_keystroke` fallthrough. A tmux binding shadowed by a rift-native shortcut stays shadowed in v1 (detection UI deferred).
+- **tmux 3.4+** (hard requirement since Phase 2a); `list-keys` output fixtures are captured from real tmux, and unknown/unparseable lines degrade to skip+log, never to a failed table.
+- **Unbound-after-prefix semantics follow native tmux**: a prefix-table miss is retried in the root table before being discarded (never forwarded as typing) — fully replicable since the gate decided the root table is mirrored.
+- **Dispatch targeting relies on rift's focus sync**: bound commands without `-t` resolve against the session's current window/pane — correct only because rift already mirrors focus via `select-pane` on pane focus. That dependency is load-bearing; focus handling must not be changed out from under dispatch.
+- **No agent detection, no pane-content parsing** — the parsed input is tmux's own `list-keys` response on the framed command channel.
+- No termy changes anticipated; if one becomes necessary, contribute upstream / extend the pinned fork as the interaction-fixes capture change did — never a parallel mechanism.
+- `thiserror` in library code; no `.unwrap()`; no emojis in UI (the prefix indicator is text/iconography per existing statusbar conventions).
 
 ## Prior decisions
 
+Decisions already made that the implementor must respect. Rationale included so edge cases can be judged.
+
 | Decision | Rationale | Date |
 |---|---|---|
-| Mirror via `list-keys`, not a hardcoded table | A user's custom bindings must work with zero rift changes; reading the live config is the only agent-/config-agnostic approach | 2026-06-04 |
-| Split out of the interaction-fixes spec | Order-of-magnitude larger (prefix state machine, per-mode tables); would sink the small-fix batch | 2026-06-04 |
-| Feasible with zero termy changes | Prefix interception sits in rift's `on_key_down` before `encode_keystroke`; bound commands dispatch via existing `send_command` | 2026-06-04 |
+| **Mirror via `list-keys`, not a hardcoded table** | A user's custom bindings must work with zero rift changes; reading the live config is the only config-agnostic approach. | 2026-06-04 |
+| **Split out of the interaction-fixes spec** | Order-of-magnitude larger (prefix state machine, per-mode tables); would have sunk the small-fix batch — which has since shipped and archived. | 2026-06-04 |
+| **Client-side interception before `encode_keystroke`** at the `on_key_down` seam | The interception point is established practice (font zoom, clipboard early returns landed there in the interaction fixes); prefix capture must happen before bytes are encoded for the PTY. | 2026-06-04 |
+| **Pane-mode bound commands** (`copy-mode`, `choose-*`, `clock-mode`, `customize-mode`) **are intercepted, never dispatched** | Constraint-determined: control clients are not rendered pane modes (tmux contract), and dispatching would shove the *shared pane* into a mode that breaks co-attached native clients — the exact failure the interaction-fixes spec recorded when rejecting copy-mode forwarding. The GUI affordance (capture-pane scrollback / GUI pickers) already replaces the feature; rift surfaces a hint instead. | 2026-06-12 |
+| **The prefix and `repeat-time` come from `show-options`** (session-resolved; `prefix2` included), refreshed together with the table | Constraint-determined tmux fact: the prefix is a session option checked server-side, not a `list-keys` entry — `bind C-b send-prefix` is convention, not contract; a mirror keyed off `list-keys` alone misses `set -g prefix C-a`. | 2026-06-12 |
+| **Precedence: rift-native shortcuts → tmux tables → PTY fallthrough** | Constraint-determined: the existing early-return structure already runs rift-native handlers first, and rift's GUI affordances are deliberate replacements (interaction-fixes design framing) — a tmux binding must not preempt them. Conflict *surfacing* is deferred, the ordering is not. | 2026-06-12 |
+| **Seam-agnostic dispatch; Phase 7 queues behind Phase 6** | Constraint-determined: the single-seam contract (`architecture.md`) and the Phase 6 transport swap; building against the seam keeps this spec indifferent to which transport is live. | 2026-06-12 |
+| **v1 mirrors the `prefix` and `root` tables**, including the native unbound-after-prefix root retry; rift-native shortcuts keep precedence (shadowing accepted until conflict surfacing exists) | Resolved with the developer at the spec-acceptance gate (`AskUserQuestion`, 2026-06-12): full native parity — `bind -n` power-user bindings (e.g. Alt-arrows pane nav) work — was chosen over the smaller prefix-only cut; the per-keypress in-memory lookup cost is negligible, and the original stub's outcome already leaned this way. | 2026-06-12 |
+| **Client-interaction bound commands: native confirm dialog for `confirm-before`** (render the prompt, dispatch the wrapped command on confirm — `prefix x`/`prefix &` really work); **intercept-with-hint** for `command-prompt`, `display-menu`, `display-panes`, `display-popup` | Resolved with the developer at the spec-acceptance gate (`AskUserQuestion`, 2026-06-12): these commands render on the issuing client, which a control client cannot — dispatching silently no-ops; the bounded confirm dialog (parsing `confirm-before`'s own `-p prompt` + wrapped command — tmux command syntax, not pane content) makes the stock kill confirmations actually function. | 2026-06-12 |
 
 ## Tracking
 
-No milestone or issues until this spec is promoted to READY.
+The decomposition into steps lives as GitHub issues, not here — one issue per step under the Phase 7 milestone. Created once this spec is `READY` and merged to `develop` (the issue-spec gate resolves the spec path against the default branch).
+
+- Milestone: created at `READY` (Phase 7 — tmux key-table mirroring)
+- Issues: created from this spec once `READY` (one per implementable step)
+
+Each issue references this spec path. A PR may only merge if it closes an issue that traces back here (planning gate).
 
 ## Verification
 
-To be defined when promoted. At minimum: prefix + bound key triggers the command; custom user bindings work; unbound keys still reach the PTY.
+- [ ] `cargo clippy --workspace -- -D warnings` passes
+- [ ] `cargo test --workspace` passes
+- [ ] `list-keys` parser fixtures: real-tmux output including quoted/escaped commands, option-carrying binds (`-r`, `-n`), and mouse bindings (consciously skipped); malformed/unknown lines skip+log without failing the table
+- [ ] `show-options` discovery: a config with `set -g prefix C-a` (and a `prefix2`) is mirrored correctly — the chord triggers on the configured key, not on `C-b`; changing `repeat-time` changes the repeat window after refresh
+- [ ] Keystroke-mapping fixtures: modifier combinations and special keys map to tmux key syntax; unmappable keys fall through to typing
+- [ ] `prefix c` opens a new tmux window; a custom binding from `.tmux.conf` runs its command; both visible to a co-attached native client
+- [ ] A `bind -r` resize repeats within `repeat-time` without re-pressing the prefix; stops after the window expires
+- [ ] An unbound key after the prefix is discarded (native semantics); an unbound key without prefix types normally; measured typing path unchanged
+- [ ] A bound `copy-mode` chord shows the GUI-affordance hint and dispatches nothing; a co-attached native client's pane state is untouched
+- [ ] `prefix x` renders the native confirm dialog and kills the pane on confirm / does nothing on cancel; `command-prompt`/`display-*` chords show their hint — never a silent no-op
+- [ ] `prefix prefix` (`send-prefix`) delivers a literal prefix byte to the pane via generic dispatch — not intercepted
+- [ ] Pending-prefix indicator appears on prefix, clears on dispatch/cancel; Escape cancels capture; no timeout (3.4-native parity)
+- [ ] Editing `.tmux.conf` (`bind-key` + `source-file`) and triggering refresh makes the new binding work without restarting rift
+- [ ] A `bind -n` root binding (e.g. Alt-arrow pane navigation) runs its command instead of typing; a key shadowed by a rift-native shortcut keeps the rift behavior; an unbound prefix-table chord retries the root table before being discarded
+- [ ] A `grep` confirms no pane-content parsing and no agent detection in the key path
+- [ ] Milestone QA (dev channel): the user's real tmux config drives windows/panes by keyboard as in a native client
+
+## Risks and mitigations
+
+| Risk | Mitigation |
+|---|---|
+| `list-keys` output format varies across tmux versions or contains exotic quoting | tmux 3.4+ hard floor; fixtures from real tmux; skip+log unknown lines — a partial table beats a failed one. |
+| Keystroke→tmux-key mapping gaps (layouts, special keys) | Unmapped keys always fall through to typing; the mapping grows by fixture; never block the input path. |
+| A state-machine bug swallows typing | Escape and timeout always restore passthrough; the capture state is a single enum at one seam; regression tests on the fallthrough path. |
+| Root-table mirroring shadows or surprises (`bind -n` vs rift shortcuts) | Precedence pinned (rift-native first); shadowing accepted in v1 with conflict surfacing deferred. |
+| Dispatched bound commands change bindings themselves (`bind-key`, `source-file`) leaving the lookup stale | Binding-mutating commands are a pinned refresh trigger; attach/reconnect refresh is the backstop. |
+| Phase 6 swaps the transport underneath this work | Seam-agnostic constraint + queue edge: Phase 7 starts after the swap, dispatching via the daemon path from day one. |
 
 ## Decision log
 
+Decisions made during implementation. Added as work progresses.
+
 - 2026-06-04: Stub created when splitting key-table mirroring out of `spec-terminal-interaction-fixes.md`. Remains DRAFT until the interaction fixes land and the copy-mode/mode-table interplay is settled.
+- 2026-06-12: Refreshed by `/loopkit:plan` (loop mode — roadmap Phase 7). Both stub preconditions are met: the interaction fixes shipped and archived (GUI scrollback via `capture-pane` exists), and the pane-mode interplay is settled by constraint — pane-mode bound commands are intercepted with a GUI-affordance hint, never dispatched (dispatching would break co-attached native clients). New since the stub: the Phase 6 transport swap is planned, so dispatch is recorded seam-agnostic (request/response form of the seam named explicitly) and the phase queues behind #206; precedence layering (rift-native → tmux tables → fallthrough) is pinned; repeat bindings, pending-prefix indicator, and refresh triggers are scoped. Two genuinely-open decisions — the v1 table cut (`prefix`-only vs. `prefix`+`root`) and the v1 handling of client-interaction bound commands — are flagged for the spec-acceptance gate.
+- 2026-06-12: Spec-acceptance gate. Both open decisions were resolved with the developer (`AskUserQuestion`): v1 mirrors **`prefix` + `root`** (full native parity including the post-prefix root retry; rift-native precedence kept), and client-interaction commands get the **native confirm dialog for `confirm-before`** plus intercept-with-hint for the rest. Human prerequisites confirmed as none. Spec flipped `DRAFT → READY`.
+- 2026-06-12: Review gate (fresh-context Agent review, `NEEDS CHANGES` → addressed). Blocking findings folded in: the prefix (and `prefix2`, `repeat-time`) is a session **option** discovered via `show-options`, not a `list-keys` entry — scope, outcomes, and refresh triggers corrected; the interception taxonomy was completed (pane modes gain `clock-mode`/`customize-mode`; the client-interaction class — `confirm-before`, `command-prompt`, `display-menu`, `display-panes`, `display-popup` — surfaced as a second gate decision so stock chords like `prefix x` never silently no-op). Non-blocking findings folded in: no pending-prefix timeout at the 3.4 floor (native parity; `prefix-timeout` is 3.5+), the native unbound-after-prefix **root retry** is recorded with the gate-option-(a) deviation named, `switch-client -T` to an unmirrored table is intercept-with-hint (terminology fixed), `send-prefix` verified as generic dispatch, the seam's request/response requirement made explicit, the dispatch-targeting dependency on rift's `select-pane` focus sync recorded, and mouse-binding fixtures added.
