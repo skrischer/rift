@@ -16,11 +16,13 @@
 
 mod error;
 
+pub mod document;
 pub mod registry;
 pub mod selector;
 pub mod server;
 pub mod spike;
 
+pub use document::{DocumentAction, DocumentChange, DocumentSink, DocumentSync};
 pub use error::LspError;
 pub use registry::Registry;
 pub use selector::{DocumentSelector, ServerSpec};
