@@ -1,8 +1,8 @@
 # Spec: Component gallery
 
-> Status: READY
+> Status: COMPLETED
 > Created: 2026-06-09
-> Completed: —
+> Completed: 2026-06-13
 
 A standalone, in-repo Storybook-style gallery that renders the gpui-component
 components against rift's own Catppuccin Mocha theme, so UI work can be previewed
