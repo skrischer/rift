@@ -37,14 +37,6 @@ it is `READY`. The milestone (open/closed + issue progress) is where status live
 - **Logging & diagnostics** — professional debug logging for the dev and stable channels: [spec-logging-diagnostics.md](spec-logging-diagnostics.md), [milestone 20](https://github.com/skrischer/rift/milestone/20); prior-art survey in [prior-art.md](prior-art.md) Category 10. Issues are immediately workable (parallel track, no queue edge).
 - Completed meta tracks (workflow automation, planning automation, pane & window management, terminal interaction fixes) live in [archive/](archive/) and their closed milestones.
 
-## Current focus
-
-**Phase 3.3: Git status** — decorates the worktree-sync entries (3.2, now
-complete and archived) with git state; milestone 11. The 3.4 / 4 / 5 / 6 / 7 / 8 / 9
-queues unblock behind it. **All roadmap phases and tracks are planned** —
-`/loopkit:plan` is waiting for new phases; the Logging & diagnostics track
-(milestone 20) is immediately workable in parallel.
-
 ## North star
 
 Scenario 1 from [vision.md](vision.md): connect to a VPS, run Claude Code in a
