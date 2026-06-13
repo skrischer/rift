@@ -1,6 +1,6 @@
 # Spec: Daemon re-deploy on a same-version binary change
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-06-13
 > Completed: —
 
@@ -94,19 +94,20 @@ behaviour, verified live on the dev channel:
 - `cargo deny check licenses` must pass; prefer a dependency-free implementation
   (the reverted fingerprint used a hand-rolled FNV-1a — no new crate).
 
-## Open decisions — resolved at the spec-acceptance gate
+## Resolved decision (spec-acceptance gate, 2026-06-13)
 
-| Decision | Options | Status |
-|---|---|---|
-| **Re-deploy + restart strategy** — how a changed same-version binary is replaced and made to run, given the shared running daemon | **Family A — replace + restart:** content-fingerprint decision + atomic upload (write `<path>.tmp`, `chmod +x`, `mv -f` over the live path — rename succeeds while the old inode keeps running) + an explicit daemon stop/respawn when the fingerprint changed (needs a way to stop the remote daemon: pidfile, `pkill -f <socket>`, or a protocol shutdown message). **Family B — content-keyed identity:** name the binary *and* socket by `<version>-<fingerprint>`, so a changed binary is simply a new, absent path → the existing deploy+spawn path runs unchanged (no in-place write, no kill), with bounded cleanup of stale same-version daemons/sockets on launch. **Family C — dev-only:** apply A or B only on the dev channel (needs a reliable dev signal — `debug_assertions` is true for stable too, so this requires an explicit env flag from the dev recipes), leaving stable on today's exact path. | OPEN |
+The one genuinely-open decision — the re-deploy + restart strategy — was resolved
+at the gate to **Family A (atomic replace + restart of the shared daemon)**. The
+full design and the rejected alternatives are recorded in Prior decisions; the
+rationale is in the Decision log.
 
 ## Human prerequisites
 
-- [ ] Confirm the acceptable behaviour for the **shared dogfooding daemon** when a
-      dev rebuild triggers a restart: a brief bounce of the stable channel's view
-      is acceptable, or the restart must be scoped to the dev channel (drives the
-      A/B-vs-C part of the open decision). No secrets or external provisioning are
-      needed; the dev/stable host is already configured.
+- [x] Acceptable behaviour for the **shared dogfooding daemon** confirmed at the
+      gate: a brief bounce of **both** channels on a same-version daemon-code
+      redeploy is accepted (Family A keeps the single shared daemon and restarts
+      it on change). No secrets or external provisioning are needed; the dev/stable
+      host is already configured.
 
 ## Prior decisions
 
@@ -114,7 +115,8 @@ behaviour, verified live on the dev channel:
 |---|---|---|
 | Re-introduce the content-aware deploy *decision* from #268 (compare a dependency-free FNV-1a fingerprint of the local binary against a remote marker) | The decision logic was sound and approved in #271's review; only the upload mechanism (in-place `cat >`) and the missing restart broke it. The fingerprint is hand-rolled (no dependency) and deterministic across toolchains. | 2026-06-13 |
 | Avoid any in-place overwrite of the live binary path | Linux `ETXTBSY` — the concrete failure that reverted #268. Both candidate families honour this (A via rename-into-place, B via a distinct content-keyed path). | 2026-06-13 |
-| Keep the change in `crates/ssh` + `provision_daemon`; no new crate, no protocol change unless the chosen family needs a daemon-shutdown message (then it is a deliberate `protocol` addition) | Respect crate boundaries; `protocol` is a deliberate API change (`CLAUDE.md`). | 2026-06-13 |
+| Keep the change in `crates/ssh` + `provision_daemon`; no new crate, no protocol change (the chosen Family A stops the daemon via a pidfile, not a protocol message) | Respect crate boundaries; `protocol` is a deliberate API change (`CLAUDE.md`), avoided here. | 2026-06-13 |
+| **Re-deploy + restart strategy = Family A (atomic replace + restart of the shared daemon).** Mechanism: (1) re-introduce the FNV-1a fingerprint deploy decision; (2) upload to `<path>.tmp`, `chmod +x`, then `mv -f` over the live path (rename dodges `ETXTBSY` — the running daemon keeps its old inode); (3) the daemon writes a **pidfile** on start (beside the binary, e.g. `<binary>.pid`), and when the fingerprint changed the app stops that pid so `connect_or_spawn_daemon` respawns the fresh binary. | Preserves the deliberate single-daemon, version-keyed-socket model (#62, `spec-dogfooding-channels.md`) with a contained addition. A pidfile is chosen over `pkill -f <socket>` (which would also match the `--connect`/`--ping` invocations) and over a protocol shutdown message (avoids widening `protocol`). Accepted cost: a same-version daemon-code redeploy briefly bounces both dogfooding channels. **Rejected:** Family B (content-keyed binary+socket → two daemons watching one root + a #62 socket-contract change), and Family C (dev-only → leaves `just promote`'s same-version rebuild stale, since promote does not bump the version). *Resolved at the spec-acceptance gate, 2026-06-13.* | 2026-06-13 |
 
 ## Tracking
 
@@ -167,3 +169,13 @@ progresses.
   upload failure and the unaddressed restart, and #268 was reverted (#276). The
   re-deploy+restart strategy (one of three families) is the single genuinely-open
   decision, carried to the spec-acceptance gate.
+- 2026-06-13: Agent spec review — `VERDICT: READY` (technical claims — `ETXTBSY`,
+  the #62 reattach trap, the shared-daemon bounce — validated against the code).
+  Non-blocking notes folded in: prefer a pidfile over the fragile `pkill -f`
+  (baked into the resolved decision), and the released path also needs the fix
+  because `just promote` rebuilds the same version `0.1.0` (so a dev-only Family C
+  was rejected).
+- 2026-06-13: Spec-acceptance gate. Strategy resolved to **Family A** (atomic
+  replace + pidfile-based restart of the shared daemon); the brief two-channel
+  bounce on a same-version daemon-code redeploy was accepted. `DRAFT` → `READY`
+  in the same PR.
