@@ -1,0 +1,402 @@
+//! The lazy, per-language server registry.
+//!
+//! The [`Registry`] is the lifecycle owner the spec mandates
+//! (`docs/spec-daemon-lsp.md`, prior decision "lazy, per-language server
+//! lifecycle … multi-server-per-language via a `Registry`"; `prior-art.md`
+//! pattern #8). It maps a language to the running servers for it
+//! (`HashMap<LanguageId, Vec<ServerId>>`, the Helix `Registry` shape) and, on
+//! observing a changed file, ensures every server its [`DocumentSelector`]
+//! matches is running — started lazily at the worktree root on first sight and
+//! reused for the session.
+//!
+//! Three policies live here, each from a spec risk row:
+//! - **Missing binary**: a server whose binary is not on `$PATH` is logged
+//!   *once* per binary and skipped; it never errors the daemon.
+//! - **Multi-server-per-language**: two specs targeting the same language both
+//!   start and get distinct [`ServerId`]s, addressable independently.
+//! - **Supervision**: a server that has exited is restarted lazily on the next
+//!   matching change, throttled by per-binary exponential backoff; the daemon
+//!   never panics on a server crash.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use lsp_types::PublishDiagnosticsParams;
+use tokio::sync::mpsc;
+use tokio::time::Instant;
+use tracing::{info, warn};
+
+use crate::selector::{DocumentSelector, LanguageId, ServerName, ServerSpec};
+use crate::server::{Server, ServerId};
+use crate::{LspError, Result};
+
+/// First retry delay after a server exit. Doubles on each consecutive failed
+/// restart up to [`MAX_BACKOFF`]; a restart that initializes successfully clears
+/// the backoff for that binary.
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Ceiling for the exponential restart backoff — a server that keeps crashing is
+/// retried at most this often, so a restart-storm cannot busy-spawn.
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Per-binary restart-backoff bookkeeping. Keyed by [`ServerName`] so a crash of
+/// one server does not throttle an unrelated one.
+#[derive(Debug, Clone, Copy)]
+struct Backoff {
+    /// Earliest [`Instant`] a restart of this binary may be attempted.
+    next_attempt: Instant,
+    /// The delay applied after the next failure, doubling each time.
+    delay: Duration,
+}
+
+/// The lazy, per-language server registry.
+///
+/// Holds the running servers, the language → ids index, and the restart-backoff
+/// state. Not `Clone`: it owns the live [`Server`]s. Diagnostics every server
+/// publishes flow out through the channel passed to [`Registry::new`], tagged
+/// with the [`ServerId`] for `(file, server)` aggregation downstream.
+pub struct Registry {
+    selector: DocumentSelector,
+    root_dir: PathBuf,
+    next_id: u64,
+    /// The server store: every live (or recently-exited, pending-prune) server.
+    servers: HashMap<ServerId, Server>,
+    /// The multi-server-per-language index — the Helix `Registry` shape.
+    by_language: HashMap<LanguageId, Vec<ServerId>>,
+    /// Binaries already logged as missing, so the warning fires once per binary.
+    missing_logged: HashSet<ServerName>,
+    /// Per-binary restart throttle.
+    backoff: HashMap<ServerName, Backoff>,
+    /// Cloned into each spawned server's router so its diagnostics reach the
+    /// daemon consumer.
+    diagnostics_tx: mpsc::UnboundedSender<(ServerId, PublishDiagnosticsParams)>,
+}
+
+impl Registry {
+    /// A registry rooted at `root_dir` (the watched worktree root) using the
+    /// built-in language → server table. Diagnostics from every server it
+    /// starts are forwarded on `diagnostics_tx`, tagged with the originating
+    /// [`ServerId`].
+    pub fn new(
+        root_dir: impl Into<PathBuf>,
+        diagnostics_tx: mpsc::UnboundedSender<(ServerId, PublishDiagnosticsParams)>,
+    ) -> Self {
+        Self::with_selector(DocumentSelector::builtin(), root_dir, diagnostics_tx)
+    }
+
+    /// A registry with an explicit selector — used by tests to drive stub
+    /// servers from a custom table without touching the built-in defaults.
+    pub fn with_selector(
+        selector: DocumentSelector,
+        root_dir: impl Into<PathBuf>,
+        diagnostics_tx: mpsc::UnboundedSender<(ServerId, PublishDiagnosticsParams)>,
+    ) -> Self {
+        Self {
+            selector,
+            root_dir: root_dir.into(),
+            next_id: 0,
+            servers: HashMap::new(),
+            by_language: HashMap::new(),
+            missing_logged: HashSet::new(),
+            backoff: HashMap::new(),
+            diagnostics_tx,
+        }
+    }
+
+    /// The ids of the servers currently registered for `language`, in start
+    /// order. Empty when none has started.
+    pub fn servers_for_language(&self, language: LanguageId) -> &[ServerId] {
+        self.by_language
+            .get(language)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// A live server by id, if it exists and has not exited.
+    pub fn server(&self, id: ServerId) -> Option<&Server> {
+        self.servers.get(&id).filter(|s| s.is_alive())
+    }
+
+    /// The number of servers in the store, alive or pending-prune. Primarily for
+    /// tests and diagnostics.
+    pub fn len(&self) -> usize {
+        self.servers.len()
+    }
+
+    /// Whether any server is registered.
+    pub fn is_empty(&self) -> bool {
+        self.servers.is_empty()
+    }
+
+    /// Ensure every server matching `path` is running, starting or restarting as
+    /// needed, and return the ids of the servers now serving it.
+    ///
+    /// This is the lazy lifecycle entry point: called on each observed worktree
+    /// change. For every [`ServerSpec`] the selector matches:
+    /// - a live server is reused (returned as-is);
+    /// - no server (or an exited one) triggers a lazy (re)start at the worktree
+    ///   root, subject to the per-binary backoff for restarts;
+    /// - a missing binary or a spawn/init failure is logged and skipped — never
+    ///   fatal, so one broken server cannot stop the others on the same path.
+    pub async fn observe(&mut self, path: &Path) -> Vec<ServerId> {
+        self.prune_dead();
+
+        let specs: Vec<&'static ServerSpec> = self.selector.matching(path).collect();
+        let mut ids = Vec::with_capacity(specs.len());
+        for spec in specs {
+            if let Some(id) = self.ensure_started(spec).await {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    /// Reuse the live server for `spec` if there is one, otherwise (re)start it.
+    /// Returns the serving id, or `None` when the server is unavailable
+    /// (missing binary, backoff window, or a failed (re)start) — the skip path.
+    async fn ensure_started(&mut self, spec: &'static ServerSpec) -> Option<ServerId> {
+        if let Some(id) = self.live_server_for(spec) {
+            return Some(id);
+        }
+
+        // A dead server for this spec is being restarted: honor the backoff
+        // window and advance it, so a crash-looping server cannot busy-spawn.
+        let restarting = self.backoff.contains_key(spec.binary);
+        if restarting && !self.backoff_elapsed(spec.binary) {
+            return None;
+        }
+
+        match self.start(spec).await {
+            Ok(id) => {
+                // A clean start clears the throttle for this binary.
+                self.backoff.remove(spec.binary);
+                Some(id)
+            }
+            Err(LspError::Spawn { .. }) => {
+                self.log_missing_once(spec.binary);
+                self.bump_backoff(spec.binary);
+                None
+            }
+            Err(error) => {
+                warn!(
+                    server = spec.binary,
+                    language = spec.language,
+                    %error,
+                    "failed to start language server; will retry on the next matching change"
+                );
+                self.bump_backoff(spec.binary);
+                None
+            }
+        }
+    }
+
+    /// The id of a still-alive server matching `spec` (same language and
+    /// binary), if one is registered. Reuse keys on the binary, not just the
+    /// language, so two servers of the same language are each reused
+    /// independently.
+    fn live_server_for(&self, spec: &ServerSpec) -> Option<ServerId> {
+        self.by_language
+            .get(spec.language)?
+            .iter()
+            .copied()
+            .find(|id| {
+                self.servers
+                    .get(id)
+                    .is_some_and(|s| s.name() == spec.binary && s.is_alive())
+            })
+    }
+
+    /// Spawn and register a fresh server for `spec`, assigning the next id.
+    async fn start(&mut self, spec: &ServerSpec) -> Result<ServerId> {
+        let id = ServerId(self.next_id);
+        let server = Server::spawn(id, spec, &self.root_dir, self.diagnostics_tx.clone()).await?;
+        self.next_id += 1;
+        self.by_language.entry(spec.language).or_default().push(id);
+        self.servers.insert(id, server);
+        info!(
+            server = spec.binary,
+            language = spec.language,
+            id = id.0,
+            root = %self.root_dir.display(),
+            "started language server"
+        );
+        Ok(id)
+    }
+
+    /// Drop servers whose main loop has ended, removing them from both the store
+    /// and the language index so the next matching change restarts them.
+    fn prune_dead(&mut self) {
+        let dead: Vec<ServerId> = self
+            .servers
+            .iter()
+            .filter(|(_, s)| !s.is_alive())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in dead {
+            if let Some(server) = self.servers.remove(&id) {
+                if let Some(ids) = self.by_language.get_mut(server.language()) {
+                    ids.retain(|other| *other != id);
+                }
+                info!(
+                    server = server.name(),
+                    language = server.language(),
+                    id = id.0,
+                    "language server exited; pruned, will restart on the next matching change"
+                );
+            }
+        }
+    }
+
+    /// Log a missing binary at most once per binary name.
+    fn log_missing_once(&mut self, binary: ServerName) {
+        if self.missing_logged.insert(binary) {
+            warn!(
+                server = binary,
+                "language server binary not found on $PATH; skipping its language"
+            );
+        }
+    }
+
+    /// Whether `binary`'s backoff window has elapsed (so a restart may proceed).
+    /// An unknown binary has no window — its first start is never throttled.
+    fn backoff_elapsed(&self, binary: ServerName) -> bool {
+        match self.backoff.get(binary) {
+            Some(b) => Instant::now() >= b.next_attempt,
+            None => true,
+        }
+    }
+
+    /// Advance `binary`'s backoff after a failed (re)start: schedule the next
+    /// attempt and double the delay, capped at [`MAX_BACKOFF`].
+    fn bump_backoff(&mut self, binary: ServerName) {
+        let entry = self.backoff.entry(binary).or_insert(Backoff {
+            next_attempt: Instant::now(),
+            delay: INITIAL_BACKOFF,
+        });
+        entry.next_attempt = Instant::now() + entry.delay;
+        entry.delay = (entry.delay * 2).min(MAX_BACKOFF);
+    }
+
+    /// Shut every server down cleanly. Best-effort — a server that ignores the
+    /// request is killed on drop, so a shutdown error is logged, not propagated.
+    pub async fn shutdown(&mut self) {
+        for (id, server) in &mut self.servers {
+            if let Err(error) = server.shutdown().await {
+                warn!(
+                    server = server.name(),
+                    id = id.0,
+                    %error,
+                    "language server shutdown failed; killing on drop"
+                );
+            }
+        }
+        self.servers.clear();
+        self.by_language.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::selector::ServerSpec;
+
+    /// A table whose binary cannot exist on `$PATH`, so every start fails the
+    /// missing-binary path deterministically.
+    const MISSING: &[ServerSpec] = &[ServerSpec {
+        language: "rust",
+        binary: "rift-nonexistent-server-xyz",
+        args: &[],
+        extensions: &["rs"],
+    }];
+
+    /// Two distinct binaries on the same language — the multi-server case. Both
+    /// are missing on `$PATH`, so this exercises the *index* and the
+    /// log-once/backoff bookkeeping without needing real servers installed.
+    const TWO_SAME_LANGUAGE: &[ServerSpec] = &[
+        ServerSpec {
+            language: "rust",
+            binary: "rift-nonexistent-type-checker",
+            args: &[],
+            extensions: &["rs"],
+        },
+        ServerSpec {
+            language: "rust",
+            binary: "rift-nonexistent-linter",
+            args: &[],
+            extensions: &["rs"],
+        },
+    ];
+
+    fn registry(table: &'static [ServerSpec]) -> Registry {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        // An absolute root: `Url::from_file_path` (run before the spawn) rejects
+        // a relative path, so a relative root would short-circuit on
+        // `InvalidUri` before the missing-binary path is ever reached.
+        let root = std::env::current_dir().expect("cwd is readable in tests");
+        Registry::with_selector(DocumentSelector::with_table(table), root, tx)
+    }
+
+    #[tokio::test]
+    async fn test_observe_unmatched_path_starts_no_server() {
+        let mut reg = registry(MISSING);
+        let ids = reg.observe(Path::new("README.md")).await;
+        assert!(ids.is_empty());
+        assert!(reg.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_missing_binary_is_skipped_and_never_fatal() {
+        let mut reg = registry(MISSING);
+        let ids = reg.observe(Path::new("main.rs")).await;
+        assert!(ids.is_empty(), "a missing binary yields no server id");
+        assert!(
+            reg.is_empty(),
+            "no server is registered for a missing binary"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_missing_binary_logged_once() {
+        let mut reg = registry(MISSING);
+        reg.observe(Path::new("a.rs")).await;
+        assert_eq!(reg.missing_logged.len(), 1);
+        // A second observation must not re-log: the set already holds the binary.
+        reg.observe(Path::new("b.rs")).await;
+        assert_eq!(reg.missing_logged.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_failed_start_sets_backoff_window() {
+        let mut reg = registry(MISSING);
+        reg.observe(Path::new("a.rs")).await;
+        // After the first failure a backoff window exists and has not elapsed,
+        // so an immediate re-observe is throttled (no spawn attempt).
+        let binary = MISSING[0].binary;
+        assert!(reg.backoff.contains_key(binary));
+        assert!(!reg.backoff_elapsed(binary));
+    }
+
+    #[tokio::test]
+    async fn test_two_servers_same_language_tracked_independently() {
+        let mut reg = registry(TWO_SAME_LANGUAGE);
+        reg.observe(Path::new("lib.rs")).await;
+        // Both binaries failed to spawn, but both were attempted and both are
+        // logged-missing and backed-off independently — the multi-server index
+        // and per-binary bookkeeping addressing each separately.
+        assert_eq!(reg.missing_logged.len(), 2);
+        assert_eq!(reg.backoff.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_backoff_window_blocks_immediate_restart() {
+        let mut reg = registry(MISSING);
+        reg.observe(Path::new("a.rs")).await;
+        let binary = MISSING[0].binary;
+        let first = reg.backoff[binary].next_attempt;
+        // A re-observe inside the window must not advance the schedule (the
+        // restart is skipped before any spawn attempt).
+        reg.observe(Path::new("a.rs")).await;
+        assert_eq!(reg.backoff[binary].next_attempt, first);
+    }
+}
