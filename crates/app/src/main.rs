@@ -624,6 +624,16 @@ async fn consume_daemon_messages(client: rift_ssh::DaemonClient) {
                 debug!(branch = ?branch, ahead_behind = ?ahead_behind, "repo state applied");
                 model.apply_repo_state(branch, ahead_behind);
             }
+            DaemonMessage::Diagnostics {
+                path,
+                server,
+                items,
+            } => {
+                let count = items.len();
+                debug!(%path, %server, items = count, "diagnostics received");
+                model.apply_diagnostics(path, server, items);
+                debug!(total = model.diagnostic_count(), "diagnostics applied");
+            }
             other => debug!(?other, "daemon message without a consumer yet"),
         }
     }
