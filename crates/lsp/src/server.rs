@@ -26,7 +26,8 @@ use async_lsp::router::Router;
 use async_lsp::tracing::TracingLayer;
 use async_lsp::{LanguageServer, ServerSocket};
 use lsp_types::{
-    ClientCapabilities, InitializeParams, InitializedParams, PublishDiagnosticsParams, Url,
+    ClientCapabilities, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, InitializeParams, InitializedParams, PublishDiagnosticsParams, Url,
     WindowClientCapabilities, WorkspaceFolder,
 };
 use tokio::sync::{mpsc, watch};
@@ -92,9 +93,37 @@ impl Server {
     }
 
     /// A handle to send notifications to this server (e.g. `did_open`,
-    /// `did_change`), wired by the later document-sync issue.
+    /// `did_change`). Prefer the typed [`Server::did_open`] /
+    /// [`Server::did_change`] / [`Server::did_close`] wrappers — they keep
+    /// `async_lsp` an internal detail of this crate so consumers (the daemon's
+    /// document sink) need not name the transport type.
     pub fn socket(&self) -> ServerSocket {
         self.socket.clone()
+    }
+
+    /// Send a `textDocument/didOpen` notification to this server.
+    ///
+    /// Non-blocking: the notification is enqueued on the server socket's
+    /// internal channel, not written synchronously. An error means the server's
+    /// main loop has ended (it exited); the caller logs and the registry
+    /// restarts it lazily on the next matching change.
+    pub fn did_open(&self, params: DidOpenTextDocumentParams) -> Result<()> {
+        self.socket.clone().did_open(params)?;
+        Ok(())
+    }
+
+    /// Send a `textDocument/didChange` notification to this server. See
+    /// [`Server::did_open`] for the non-blocking / error semantics.
+    pub fn did_change(&self, params: DidChangeTextDocumentParams) -> Result<()> {
+        self.socket.clone().did_change(params)?;
+        Ok(())
+    }
+
+    /// Send a `textDocument/didClose` notification to this server. See
+    /// [`Server::did_open`] for the non-blocking / error semantics.
+    pub fn did_close(&self, params: DidCloseTextDocumentParams) -> Result<()> {
+        self.socket.clone().did_close(params)?;
+        Ok(())
     }
 
     /// Spawn `spec`'s binary at `root_dir`, initialize the LSP session there,
