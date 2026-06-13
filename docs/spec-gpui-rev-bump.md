@@ -40,10 +40,12 @@ What is true when this work is done:
 - **One** trial bump in an isolated git worktree (its own `target/`, never the
   station's), moving the lockstep set to one candidate rev and recording the
   result end-to-end: build, test, clippy, single-`gpui` invariant, and — best
-  effort — the #127 WebView render check (re-applying the reverted #127 webview
-  code in the throwaway worktree only).
+  effort — the #127 WebView render check, resurrecting the reverted #127 webview
+  code (PR #243 / commits `50c7840`, `0378877`, `c6cce10`, `06d0e75`) in the
+  throwaway worktree only.
 - A written findings + go/no-go recommendation, recorded in this spec's decision
-  log (and the issue).
+  log — which is preserved when the spec is later set `COMPLETED` and moved to
+  `docs/archive/`, so the artefact survives close-out — and mirrored on the issue.
 
 ### Out of scope
 
@@ -74,6 +76,12 @@ What is true when this work is done:
   the WebView payoff check happens on the GPU station via `just gallery`.
 - Minimal code: the only code this spec produces is the throwaway trial; the
   durable artefact is the findings document.
+
+## Human prerequisites
+
+None. The spike runs entirely on the existing dev setup — the GPU station, the
+existing SSH / dogfooding config, and the in-loop dependency/worktree autonomy
+the constitution already grants. No new secrets, accounts, or provisioning.
 
 ## Prior decisions
 
@@ -117,6 +125,8 @@ How does the developer know the spec is complete?
 | The trial's heavy build disturbs the station / dogfooding stable channel | Run strictly in an isolated worktree with its own `target/`; never build the candidate on the station's main `target/` |
 | The WebView payoff check is unreachable because earlier breakage blocks compilation | Record the furthest point reached; a "cannot even build" result is itself a valid, decision-relevant finding |
 | The candidate rev is a moving target (gpui-component floats) | Pin the exact candidate rev in the trial and record it, so the finding is reproducible |
+| The current one-`gpui` resolution is anomalous (termy hard-pins `83de8a2…`, lock holds `4bee412`, no `[patch]`); it may be fragile or accidental, and a bump could silently break it | Explaining the current resolution is an explicit deliverable; the trial verifies the single-`gpui` invariant after the move rather than assuming it survives |
+| The throwaway worktree's heavy `target/` (~20 GB skia/wgpu) is left behind | Remove it with `just agent-worktree-rm` once the findings are recorded |
 
 ## Decision log
 
