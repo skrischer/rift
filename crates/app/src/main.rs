@@ -500,11 +500,21 @@ async fn provision_daemon(conn: &mut rift_ssh::SshConnection) {
     let socket_path = format!("{remote_path}.sock");
     let log_path = format!("{remote_path}.log");
 
+    // Project root the daemon should watch: RIFT_PROJECT_ROOT (runtime) wins over
+    // a `just promote` compile-time bake (RIFT_DEFAULT_PROJECT_ROOT), mirroring the
+    // RIFT_SSH_KEY / RIFT_DEFAULT_SSH_KEY split. None leaves the daemon on its
+    // launch directory; the root is only honored on a fresh spawn, so a reattach
+    // keeps the already-running daemon's root.
+    let project_root = env::var("RIFT_PROJECT_ROOT")
+        .ok()
+        .or_else(|| option_env!("RIFT_DEFAULT_PROJECT_ROOT").map(String::from));
+
     let channel = match rift_ssh::connect_or_spawn_daemon(
         conn,
         &remote_path,
         &socket_path,
         &log_path,
+        project_root.as_deref(),
     )
     .await
     {
