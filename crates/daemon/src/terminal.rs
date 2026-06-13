@@ -118,8 +118,12 @@ pub(crate) async fn terminal_task(
             },
             _ = resume_poll.tick() => {
                 if let Some(a) = attach.as_mut() {
-                    if !a.paused.is_empty() && outbound.capacity() > 0 {
-                        a.resume_paused().await;
+                    // Resume at most as many panes as the outbound channel has
+                    // free slots, so paused panes don't all un-pause into one
+                    // slot and immediately re-flood.
+                    let room = outbound.capacity();
+                    if room > 0 && !a.paused.is_empty() {
+                        a.resume_paused(room).await;
                     }
                 }
             }
@@ -362,9 +366,14 @@ impl Attach {
         }
     }
 
-    /// Resume every paused pane (tmux flow control), draining the paused set.
-    async fn resume_paused(&mut self) {
-        for pane in std::mem::take(&mut self.paused) {
+    /// Resume up to `limit` paused panes (tmux flow control). Bounding to the
+    /// outbound channel's free slots avoids a thundering herd: with many panes
+    /// paused and little room, only as many as can be absorbed un-pause now; the
+    /// rest wait for the next poll once more room frees.
+    async fn resume_paused(&mut self, limit: usize) {
+        let to_resume: Vec<u32> = self.paused.iter().copied().take(limit).collect();
+        for pane in to_resume {
+            self.paused.remove(&pane);
             if let Err(err) = self
                 .send_command(&format!("refresh-client -A '%{pane}:continue'"))
                 .await
