@@ -6,4 +6,6 @@ pub enum ExplorerError {
     ScanError(String),
     #[error("watch error: {0}")]
     WatchError(String),
+    #[error("git error: {0}")]
+    GitError(String),
 }
