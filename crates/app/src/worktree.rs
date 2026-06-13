@@ -97,9 +97,23 @@ impl WorktreeModel {
         if !self.synced {
             return false;
         }
-        for entry in added.into_iter().chain(changed) {
-            // Same deliberate key/value path duplication as in
-            // `apply_snapshot_chunk` — the value keeps the full wire entry.
+        // `added` upserts unconditionally. A `changed` entry should target a
+        // path the tree already holds; one that does not is a divergence signal
+        // — the client is missing an entry the daemon's baseline has (the #227
+        // snapshot-loss bug). Warn, then upsert anyway: the snapshot stays the
+        // source of truth and the next full snapshot reconciles. The deliberate
+        // key/value path duplication matches `apply_snapshot_chunk` — the value
+        // keeps the full wire entry.
+        for entry in added {
+            self.entries.insert(entry.path.clone(), entry);
+        }
+        for entry in changed {
+            if !self.entries.contains_key(&entry.path) {
+                tracing::warn!(
+                    path = %entry.path,
+                    "worktree changed update targets an unknown path; tree may have diverged"
+                );
+            }
             self.entries.insert(entry.path.clone(), entry);
         }
         for path in &removed {
@@ -246,6 +260,21 @@ mod tests {
         assert!(model.get("gone.txt").is_none());
         let stale = model.get("stale.txt").expect("changed entry present");
         assert_eq!(stale.mtime, SystemTime::UNIX_EPOCH + Duration::from_secs(9));
+    }
+
+    #[test]
+    fn test_apply_update_changed_on_missing_path_still_upserts() {
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk("/proj".into(), vec![file("known.txt", 1)], true);
+
+        // A `changed` for a path absent from the tree is a divergence signal:
+        // `apply_update` logs a warning (verified live at the QA gate) and still
+        // upserts it blindly, per the snapshot-as-source-of-truth contract.
+        let applied = model.apply_update(vec![], vec![file("ghost.txt", 5)], vec![]);
+
+        assert!(applied);
+        assert!(model.get("ghost.txt").is_some());
+        assert_eq!(model.len(), 2);
     }
 
     #[test]

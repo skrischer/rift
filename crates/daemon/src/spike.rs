@@ -18,7 +18,9 @@ use anyhow::Context;
 use rift_protocol::{ClientMessage, DaemonMessage, PROTOCOL_VERSION};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
+
+use crate::State;
 
 /// Broadcast backlog for the spike. Sized so a multi-megabyte flood (the
 /// throughput measurement) never trips the `Lagged` drop path in
@@ -52,6 +54,10 @@ pub async fn serve_spike(socket_path: &Path, session: &str) -> anyhow::Result<()
 
     let (events_tx, _keep_bus_open) = broadcast::channel(SPIKE_EVENT_CAPACITY);
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<ClientMessage>(SPIKE_INBOUND_CAPACITY);
+    // The spike has no worktree; `serve_connection` still wants a `State`
+    // observer, so hand it a never-changing default one. The replay path is a
+    // no-op (worktree is always `None`).
+    let (_keep_state_open, state_rx) = watch::channel(State::default());
 
     // Inbound client messages -> tmux stdin (single writer, so client input
     // and the spike's own commands serialize on one queue).
@@ -83,6 +89,7 @@ pub async fn serve_spike(socket_path: &Path, session: &str) -> anyhow::Result<()
     // TmuxCommand) so the resulting `StateUpdate` lands on a live subscription.
     let accept_inbound = inbound_tx;
     let accept_events = events_tx.clone();
+    let accept_state = state_rx;
     let accept_task = tokio::spawn(async move {
         loop {
             match listener.accept().await {
@@ -90,9 +97,10 @@ pub async fn serve_spike(socket_path: &Path, session: &str) -> anyhow::Result<()
                     let (reader, writer) = stream.into_split();
                     let inbound = accept_inbound.clone();
                     let events = accept_events.subscribe();
+                    let state = accept_state.clone();
                     tokio::spawn(async move {
                         if let Err(e) =
-                            crate::serve_connection(reader, writer, inbound, events).await
+                            crate::serve_connection(reader, writer, inbound, events, state).await
                         {
                             eprintln!("rift-daemon spike connection ended with error: {e}");
                         }

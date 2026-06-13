@@ -1,8 +1,8 @@
 # Spec: Phase 3 — Worktree file-tree sync
 
-> Status: READY
+> Status: COMPLETED
 > Created: 2026-06-09
-> Completed: —
+> Completed: 2026-06-13
 
 The daemon scans and watches a project root, maintains a Zed-style worktree `Snapshot`, and streams it to the client as an initial snapshot plus incremental updates over the `rift-protocol` channel — giving the client a live, accurate model of the remote file tree. This is the first real payload over the scaffolding transport and the data foundation that git-status and LSP both build on.
 
@@ -10,11 +10,11 @@ The daemon scans and watches a project root, maintains a Zed-style worktree `Sna
 
 What is true when this work is done? Observable, end-to-end criteria — not activities.
 
-- [ ] On connect, the daemon scans the project root (honoring VCS ignore rules) and sends the client a complete initial worktree snapshot; the client holds an in-memory tree mirroring the remote file structure.
-- [ ] A file created, modified, deleted, or moved on the remote produces an incremental worktree update that the client applies to stay consistent — no full rescan per change.
-- [ ] Ignored paths are excluded from both the initial scan and incremental updates: a write inside `.git/`, `target/`, or a `.gitignore`d directory produces no update; a write to a tracked file does.
-- [ ] The scan and watch never block the daemon dispatch loop (they run off the loop on a blocking worker), and file-event bursts are coalesced/debounced rather than emitted one message per syscall.
-- [ ] The worktree state lives in the daemon's single `State` and is published to consumers via a `watch`/`broadcast` channel — no `Arc<Mutex<State>>`.
+- [x] On connect, the daemon scans the project root (honoring VCS ignore rules) and sends the client a complete initial worktree snapshot; the client holds an in-memory tree mirroring the remote file structure.
+- [x] A file created, modified, deleted, or moved on the remote produces an incremental worktree update that the client applies to stay consistent — no full rescan per change.
+- [x] Ignored paths are excluded from both the initial scan and incremental updates: a write inside `.git/`, `target/`, or a `.gitignore`d directory produces no update; a write to a tracked file does.
+- [x] The scan and watch never block the daemon dispatch loop (they run off the loop on a blocking worker), and file-event bursts are coalesced/debounced rather than emitted one message per syscall.
+- [x] The worktree state lives in the daemon's single `State` and is published to consumers via a `watch`/`broadcast` channel — no `Arc<Mutex<State>>`.
 
 ## Scope
 
@@ -69,12 +69,12 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 
 ## Verification
 
-- [ ] `cargo clippy --workspace -- -D warnings` passes
-- [ ] `cargo test --workspace` passes
-- [ ] `cargo build --release -p rift-daemon --target x86_64-unknown-linux-musl` still produces a static binary with the explorer dependencies linked
-- [ ] Integration test: scanning a fixture tree yields a snapshot matching the on-disk structure; creating / modifying / deleting a file emits the matching incremental update, and applying it to the client model reproduces the new tree
-- [ ] A write inside an ignored directory (`target/foo`, a `.gitignore`d path, `.git/`) emits no update; a write to a tracked file does
-- [ ] A `grep` confirms no `Arc<Mutex<State>>` in the daemon crate and that `crates/explorer` pulls no `gpui`/`gpui-component` (inspect its resolved dependency tree)
+- [x] `cargo clippy --workspace -- -D warnings` passes
+- [x] `cargo test --workspace` passes
+- [x] `cargo build --release -p rift-daemon --target x86_64-unknown-linux-musl` still produces a static binary with the explorer dependencies linked
+- [x] Integration test: scanning a fixture tree yields a snapshot matching the on-disk structure; creating / modifying / deleting a file emits the matching incremental update, and applying it to the client model reproduces the new tree
+- [x] A write inside an ignored directory (`target/foo`, a `.gitignore`d path, `.git/`) emits no update; a write to a tracked file does
+- [x] A `grep` confirms no `Arc<Mutex<State>>` in the daemon crate and that `crates/explorer` pulls no `gpui`/`gpui-component` (inspect its resolved dependency tree)
 
 ## Risks and mitigations
 
@@ -98,3 +98,4 @@ Decisions made during implementation. Added as work progresses.
 - 2026-06-12 (#110): The worker **arms the watcher before delivering the snapshot** to the dispatch loop. `Watcher::new` registers its watch set synchronously, so once a consumer has observed the snapshot, any later write is guaranteed to produce an event; the reverse order races — a write right after the snapshot lands precedes the watches, and with no event the rescan-on-event watcher never surfaces it (caught by the daemon integration tests). Scan + watcher + the blocking relay of change batches all live on one `spawn_blocking` worker feeding the dispatch loop through an internal `mpsc`; the loop `select!`s it alongside `ClientMessage`s, keeping the single-`State`-plus-channels shape (no `Arc<Mutex<State>>`). A scan/watch failure degrades to "no worktree" and the daemon keeps serving.
 - 2026-06-12 (#110): A `Hello` **re-broadcasts the current snapshot on the shared event bus** so a (re)attaching client starts from the full tree — the scaffolding transport has no per-client send path. Already-attached clients receive the repeat too; a full snapshot is an idempotent replace, so this is redundant but never inconsistent. The client model (#111) must treat a `WorktreeSnapshot` chunk arriving after a `final_chunk` as the start of a new accumulation, not a continuation. Chunking is 1024 entries per `WorktreeSnapshot` frame, `final_chunk` only on the last; an empty tree still yields one final message. Because the dispatch loop is the only emitter, a snapshot's chunks are never interleaved with updates.
 - 2026-06-12 (#110): `serve`/`serve_uds` take the watched root as an explicit `Option<PathBuf>` parameter; the binary passes its launch directory (cwd) in both `--serve-uds` and stdio mode, and tests pass `None`/fixture roots. Test-helper fix recorded for future protocol tests: a `FrameDecoder` must be **caller-owned per connection** — one read may deliver several back-to-back frames, and a per-call decoder silently discards the buffered tail along with itself (this hung every test reading more than one message off a connection).
+- 2026-06-13 (#227): The initial `WorktreeSnapshot` is delivered **per connection**, not over the shared `broadcast` bus. The #110 bus re-broadcast was silently lossy at scale: a tree chunking into more frames than `SERVE_EVENT_CAPACITY` (256) overran the broadcast backlog, and `serve_connection`'s `Lagged` arm skipped the surplus chunks silently — so the client tree came up incomplete and later `changed`-only updates grew its count. `serve_connection` now replays the snapshot from `State` straight to its own socket right after the `Welcome` (backpressured by the transport, loss-free regardless of tree size), and a `state.changed()` branch delivers it to a client that handshook before the scan finished; `broadcast_snapshot` and the `Hello`/`Scanned` re-broadcast are removed. The bus carries only incremental `UpdateWorktree`, and a lagging writer's dropped updates are now logged with their count instead of skipped silently. The client `WorktreeModel` warns when a `changed` update targets a path absent from the tree (a divergence signal), still upserting blindly. Verified live on the dev channel against the ~954k-entry home tree (≈931 chunks, far past the bus capacity): the full `entries=953614` snapshot applied, no count growth across `added=0, changed=N` updates, zero divergence warnings.
