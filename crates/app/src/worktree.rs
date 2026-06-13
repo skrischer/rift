@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use rift_protocol::{AheadBehind, GitEntryStatus, GitStatusEntry, WorktreeEntry};
+use rift_protocol::{AheadBehind, Diagnostic, GitEntryStatus, GitStatusEntry, WorktreeEntry};
 
 /// In-flight accumulation of a chunked snapshot (`final_chunk` not yet seen).
 #[derive(Debug)]
@@ -42,6 +42,15 @@ pub struct WorktreeModel {
     branch: Option<String>,
     /// Ahead/behind vs the upstream (`None` = no upstream / no repo).
     ahead_behind: Option<AheadBehind>,
+    /// Per-file diagnostics, keyed by path (same key space as `entries`) then by
+    /// the publishing language server's id. Independent of the tree, exactly like
+    /// `git`: a set may exist for a path the tree has not added yet (a renderer
+    /// joins the two by path), so diagnostics racing the snapshot can never
+    /// corrupt the tree. The inner per-server keying lets a linter and a
+    /// type-checker aggregate on the same file without clobbering each other.
+    /// Reset whenever a worktree snapshot completes — the daemon replays the full
+    /// diagnostics set right after every snapshot (`spec-daemon-lsp.md`, #177).
+    diagnostics: BTreeMap<String, BTreeMap<String, Vec<Diagnostic>>>,
 }
 
 impl WorktreeModel {
@@ -98,6 +107,13 @@ impl WorktreeModel {
         self.git.clear();
         self.branch = None;
         self.ahead_behind = None;
+        // Same reasoning for diagnostics: the daemon replays the full live error
+        // set right behind every snapshot (`write_snapshot`, #177), so drop the
+        // prior decoration — it is about to be re-applied, and anything not in
+        // the replay has been fixed (or this root has no servers, where nothing
+        // follows and diagnostics stay empty). Keeps a reattach from carrying
+        // stale errors.
+        self.diagnostics.clear();
         true
     }
 
@@ -165,6 +181,34 @@ impl WorktreeModel {
         self.ahead_behind = ahead_behind;
     }
 
+    /// Apply one `Diagnostics` update: full-set-replace `server`'s diagnostics
+    /// for `path` with `items`, mirroring LSP's `publishDiagnostics` semantics.
+    ///
+    /// An empty `items` clears that server's set for the file while leaving every
+    /// other server's set for it intact; when a file's last server clears, the
+    /// path drops out of the map entirely (so an empty inner map is never held).
+    ///
+    /// Applied unconditionally — the diagnostics map is independent of the tree,
+    /// so a set for a path not yet in `entries` is simply buffered and decorates
+    /// the entry once it arrives; it can never corrupt the tree. This is the
+    /// reconciliation rule for an unknown path: buffer, never drop, since the
+    /// daemon only publishes for paths it tracks and the next snapshot resets.
+    pub fn apply_diagnostics(&mut self, path: String, server: String, items: Vec<Diagnostic>) {
+        if items.is_empty() {
+            if let Some(servers) = self.diagnostics.get_mut(&path) {
+                servers.remove(&server);
+                if servers.is_empty() {
+                    self.diagnostics.remove(&path);
+                }
+            }
+            return;
+        }
+        self.diagnostics
+            .entry(path)
+            .or_default()
+            .insert(server, items);
+    }
+
     /// The daemon-side project root, once a complete snapshot has arrived.
     pub fn root(&self) -> Option<&str> {
         self.root.as_deref()
@@ -188,6 +232,28 @@ impl WorktreeModel {
     /// Ahead/behind vs the upstream, or `None` when there is no upstream / repo.
     pub fn ahead_behind(&self) -> Option<AheadBehind> {
         self.ahead_behind
+    }
+
+    /// One file's diagnostics, keyed by the publishing server's id, or `None`
+    /// when the file currently has none.
+    pub fn diagnostics(&self, path: &str) -> Option<&BTreeMap<String, Vec<Diagnostic>>> {
+        self.diagnostics.get(path)
+    }
+
+    /// All per-file diagnostics, keyed by path (same key space as
+    /// [`WorktreeModel::root`]-relative entries) then by server id.
+    pub fn all_diagnostics(&self) -> &BTreeMap<String, BTreeMap<String, Vec<Diagnostic>>> {
+        &self.diagnostics
+    }
+
+    /// Total number of diagnostics held across every file and server — the
+    /// headless verification handle for the live error count.
+    pub fn diagnostic_count(&self) -> usize {
+        self.diagnostics
+            .values()
+            .flat_map(BTreeMap::values)
+            .map(Vec::len)
+            .sum()
     }
 
     /// All entries, keyed by their path relative to [`WorktreeModel::root`].
@@ -565,6 +631,210 @@ mod tests {
                 behind: 0
             })
         );
+    }
+
+    // --- diagnostics model (#178) ---
+
+    use rift_protocol::{Diagnostic, DiagnosticSeverity, Position, Range};
+
+    fn diag(line: u32, severity: DiagnosticSeverity, message: &str) -> Diagnostic {
+        Diagnostic {
+            range: Range {
+                start: Position { line, character: 0 },
+                end: Position { line, character: 1 },
+            },
+            severity,
+            message: message.to_owned(),
+            source: None,
+            code: None,
+        }
+    }
+
+    #[test]
+    fn test_apply_diagnostics_replaces_per_server_set() {
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk("/proj".into(), vec![file("a.rs", 1)], true);
+
+        model.apply_diagnostics(
+            "a.rs".into(),
+            "rust-analyzer".into(),
+            vec![
+                diag(1, DiagnosticSeverity::Error, "mismatched types"),
+                diag(2, DiagnosticSeverity::Warning, "unused variable"),
+            ],
+        );
+        assert_eq!(model.diagnostic_count(), 2);
+        assert_eq!(
+            model
+                .diagnostics("a.rs")
+                .and_then(|s| s.get("rust-analyzer"))
+                .map(Vec::len),
+            Some(2)
+        );
+
+        // A follow-up publish is the full authoritative set, not a delta: it
+        // replaces the prior set wholesale (the error fixed, one warning left).
+        model.apply_diagnostics(
+            "a.rs".into(),
+            "rust-analyzer".into(),
+            vec![diag(2, DiagnosticSeverity::Warning, "unused variable")],
+        );
+        let set = model.diagnostics("a.rs").expect("a.rs still decorated");
+        assert_eq!(set.get("rust-analyzer").map(Vec::len), Some(1));
+        assert_eq!(model.diagnostic_count(), 1);
+    }
+
+    #[test]
+    fn test_empty_set_clears_one_server_without_dropping_the_other() {
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk("/proj".into(), vec![file("a.rs", 1)], true);
+
+        // A type-checker and a linter aggregate on the same file (server-id
+        // keying), without one clobbering the other.
+        model.apply_diagnostics(
+            "a.rs".into(),
+            "rust-analyzer".into(),
+            vec![diag(1, DiagnosticSeverity::Error, "mismatched types")],
+        );
+        model.apply_diagnostics(
+            "a.rs".into(),
+            "clippy".into(),
+            vec![diag(3, DiagnosticSeverity::Warning, "needless clone")],
+        );
+        assert_eq!(model.diagnostics("a.rs").map(BTreeMap::len), Some(2));
+
+        // An empty set clears only that server's diagnostics for the file; the
+        // other server's set stays intact.
+        model.apply_diagnostics("a.rs".into(), "rust-analyzer".into(), vec![]);
+        let set = model.diagnostics("a.rs").expect("clippy set still held");
+        assert_eq!(set.len(), 1);
+        assert!(set.contains_key("clippy"));
+        assert!(!set.contains_key("rust-analyzer"));
+
+        // Clearing the last server's set drops the path out of the map entirely
+        // (no empty inner map lingers).
+        model.apply_diagnostics("a.rs".into(), "clippy".into(), vec![]);
+        assert!(model.diagnostics("a.rs").is_none());
+        assert!(model.all_diagnostics().is_empty());
+        assert_eq!(model.diagnostic_count(), 0);
+    }
+
+    #[test]
+    fn test_diagnostics_for_unknown_path_are_buffered_not_dropped() {
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk("/proj".into(), vec![file("known.rs", 1)], true);
+
+        // A publish for a path the tree does not (yet) hold is buffered: it is
+        // recorded and decorates the entry once it arrives, never corrupting the
+        // tree (the maps are independent).
+        model.apply_diagnostics(
+            "pending.rs".into(),
+            "rust-analyzer".into(),
+            vec![diag(1, DiagnosticSeverity::Error, "cannot find value")],
+        );
+        assert_eq!(
+            model
+                .diagnostics("pending.rs")
+                .and_then(|s| s.get("rust-analyzer"))
+                .map(Vec::len),
+            Some(1)
+        );
+        // The tree is untouched by the diagnostics update.
+        assert!(model.get("pending.rs").is_none());
+        assert_eq!(model.len(), 1);
+    }
+
+    #[test]
+    fn test_clearing_unknown_path_is_a_noop() {
+        // An empty set for a path that was never decorated must not insert an
+        // empty entry — the map stays empty.
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk("/proj".into(), vec![file("a.rs", 1)], true);
+
+        model.apply_diagnostics("ghost.rs".into(), "rust-analyzer".into(), vec![]);
+        assert!(model.all_diagnostics().is_empty());
+        assert_eq!(model.diagnostic_count(), 0);
+    }
+
+    #[test]
+    fn test_snapshot_resets_stale_diagnostics() {
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk("/proj".into(), vec![file("a.rs", 1)], true);
+        model.apply_diagnostics(
+            "a.rs".into(),
+            "rust-analyzer".into(),
+            vec![diag(1, DiagnosticSeverity::Error, "mismatched types")],
+        );
+
+        // A new snapshot (e.g. on reattach) drops the prior diagnostics; the
+        // daemon replays the full live error set right behind it.
+        model.apply_snapshot_chunk("/proj".into(), vec![file("a.rs", 2)], true);
+        assert!(model.all_diagnostics().is_empty());
+        assert_eq!(model.diagnostic_count(), 0);
+    }
+
+    #[test]
+    fn test_diagnostics_before_snapshot_is_reset_by_snapshot() {
+        // Symmetry with the tree's and git's before-first-snapshot tests: a
+        // diagnostics update may arrive before the first snapshot; it is
+        // buffered, then the snapshot reset wipes it so no pre-snapshot error
+        // leaks. The authoritative full diagnostics replay follows the snapshot.
+        let mut model = WorktreeModel::default();
+        model.apply_diagnostics(
+            "early.rs".into(),
+            "rust-analyzer".into(),
+            vec![diag(1, DiagnosticSeverity::Error, "stale")],
+        );
+
+        model.apply_snapshot_chunk("/proj".into(), vec![file("early.rs", 1)], true);
+        assert!(model.diagnostics("early.rs").is_none());
+    }
+
+    #[test]
+    fn test_diagnostics_sequence_reproduces_daemon_view() {
+        // Mirror the daemon's lifecycle: worktree snapshot, then the full
+        // diagnostics replay (one Diagnostics message per (path, server)), then
+        // incremental publishes as the agent edits. The final model must match
+        // what the servers last reported per file.
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk(
+            "/proj".into(),
+            vec![file("typed.rs", 1), file("linted.rs", 1)],
+            true,
+        );
+
+        // Full replay behind the snapshot: a type-checker and a linter both
+        // report on typed.rs; the linter reports on linted.rs.
+        model.apply_diagnostics(
+            "typed.rs".into(),
+            "rust-analyzer".into(),
+            vec![diag(1, DiagnosticSeverity::Error, "mismatched types")],
+        );
+        model.apply_diagnostics(
+            "typed.rs".into(),
+            "clippy".into(),
+            vec![diag(1, DiagnosticSeverity::Warning, "needless return")],
+        );
+        model.apply_diagnostics(
+            "linted.rs".into(),
+            "clippy".into(),
+            vec![diag(5, DiagnosticSeverity::Hint, "redundant clone")],
+        );
+        assert_eq!(model.diagnostic_count(), 3);
+
+        // Incremental: the agent fixes the type error (rust-analyzer publishes an
+        // empty set for typed.rs), and linted.rs is cleaned up entirely.
+        model.apply_diagnostics("typed.rs".into(), "rust-analyzer".into(), vec![]);
+        model.apply_diagnostics("linted.rs".into(), "clippy".into(), vec![]);
+
+        // typed.rs keeps only the linter's warning; linted.rs is gone.
+        let typed = model
+            .diagnostics("typed.rs")
+            .expect("typed.rs still linted");
+        assert_eq!(typed.len(), 1);
+        assert!(typed.contains_key("clippy"));
+        assert!(model.diagnostics("linted.rs").is_none());
+        assert_eq!(model.diagnostic_count(), 1);
     }
 
     #[test]
