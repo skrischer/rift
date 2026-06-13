@@ -153,6 +153,7 @@ struct WatchSet {
     watcher: RecommendedWatcher,
     dirs: BTreeSet<PathBuf>,
     warned: bool,
+    warned_git: bool,
 }
 
 impl WatchSet {
@@ -161,6 +162,7 @@ impl WatchSet {
             watcher,
             dirs: BTreeSet::new(),
             warned: false,
+            warned_git: false,
         }
     }
 
@@ -197,8 +199,12 @@ impl WatchSet {
     /// skipped, never fatal.
     fn watch_external(&mut self, path: &Path, mode: RecursiveMode) {
         if let Err(err) = self.watcher.watch(path, mode) {
-            if !self.warned {
-                self.warned = true;
+            // Separate latch from `warned`: a `.git/` registration failure (a
+            // missing path, or `.git` being a file for a linked worktree) is a
+            // distinct condition from the worktree watch-limit warning, and must
+            // not suppress the other's diagnostics.
+            if !self.warned_git {
+                self.warned_git = true;
                 tracing::warn!(%err, path = %path.display(), "cannot register .git watch; some git-state changes may be missed");
             }
         }
@@ -328,6 +334,12 @@ fn log_event_error(event: &notify::Result<Event>) {
 /// git recompute generate them by opening watched directories — so they must
 /// not trigger a flush, or the watcher feeds back into an endless loop. Errors
 /// are not changes either (they are logged separately).
+///
+/// Excluding the whole `Access(_)` family — including `Access(Close(Write))` —
+/// is safe: `notify`'s supported backends report an actual write as a
+/// `Modify` event, not as a close-for-write Access, so no real mutation is
+/// lost. `EventKind::Any`/`Other` pass through as changes (a spurious extra
+/// rescan, never a missed change).
 fn is_change(event: &notify::Result<Event>) -> bool {
     matches!(event, Ok(ev) if !matches!(ev.kind, notify::EventKind::Access(_)))
 }
@@ -679,8 +691,11 @@ mod tests {
     #[test]
     fn test_git_watch_tolerates_stale_index_lock() {
         let (tmp, _w, _changes, git_rx) = init_repo_with_watcher("lock");
-        // A leftover index.lock (a crashed/concurrent git) must not abort
-        // watching: a change still yields a recompute, and the watcher survives.
+        // A leftover (stale) index.lock must not abort watching: the watcher
+        // keeps recomputing and a later change still yields a status. (gix reads
+        // succeed past a stale lock file; the genuine mid-write torn-index error
+        // can't be reproduced deterministically without a lock-holding process,
+        // but the compute-error path is logged-and-skipped in `run`.)
         write_file(&tmp.path.join(".git/index.lock"), "");
         write_file(&tmp.path.join("after_lock.txt"), "x\n");
 
