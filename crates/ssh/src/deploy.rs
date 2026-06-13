@@ -1,12 +1,14 @@
 //! Auto-deploy of the remote `rift-daemon` binary.
 //!
 //! Detects the remote platform via `uname -sm`, resolves the expected versioned
-//! binary path, and uploads the locally-built musl binary only when that path is
-//! absent. Because the daemon version is encoded in the filename
-//! (`rift-daemon-<version>`), "missing or outdated" collapses to "the versioned
-//! path is absent" — a stale version lives under a different name and is simply
-//! never selected, so "no re-upload when present" collapses to "the path
-//! exists".
+//! binary path, and uploads the locally-built musl binary when the deployed copy
+//! is absent or its contents differ. The version is encoded in the filename
+//! (`rift-daemon-<version>`), so a released version bump resolves to a fresh name
+//! and always deploys. Within one version the filename is stable, so deployment
+//! also compares a content fingerprint (a dependency-free FNV-1a of the binary,
+//! stored beside it in a `.fnv` marker on upload): a rebuilt same-version binary
+//! re-deploys instead of the launch silently keeping the stale copy — the
+//! dev-loop case a bare filename check misses (issue #268).
 //!
 //! Deployment does **not** launch the daemon. A detached background spawn over
 //! an exec channel is a no-op: the daemon would inherit that channel's
@@ -46,34 +48,62 @@ pub fn remote_binary_name(version: &str) -> String {
     format!("rift-daemon-{version}")
 }
 
-/// Whether the daemon binary must be uploaded, given the result of probing the
-/// versioned remote path for an executable file. `true` means absent (or not
-/// executable) and therefore upload is required; `false` means the correct
-/// version is already present and no re-upload is needed.
+/// Whether the daemon binary must be (re-)uploaded: `true` unless the marker the
+/// remote probe returned exactly equals the local binary's `fingerprint`. An
+/// absent binary, an absent/stale marker, or any content change all read as
+/// "upload"; only a byte-identical, already-fingerprinted deploy is skipped.
 ///
 /// `probe_output` is the stdout of the presence probe (see
-/// [`presence_probe_command`]) — the marker is emitted only when the path
-/// exists and is executable.
-pub fn needs_upload(probe_output: &str) -> bool {
-    probe_output.trim() != PRESENT_MARKER
+/// [`presence_probe_command`]) — the stored fingerprint, or empty.
+pub fn needs_upload(probe_output: &str, fingerprint: &str) -> bool {
+    probe_output.trim() != fingerprint
 }
 
-/// Marker echoed by the remote presence probe when the versioned binary is
-/// already in place. Kept distinct from any path so a stray substring cannot be
-/// mistaken for a positive result.
-const PRESENT_MARKER: &str = "rift-present";
+/// 64-bit FNV-1a fingerprint of the binary, hex-encoded. Hand-rolled rather than
+/// pulling a hashing crate (deps rule: a simple custom implementation over a
+/// dependency for one function) and deterministic across toolchains — unlike
+/// `std`'s `DefaultHasher` — so the value a prior deploy stored on the remote can
+/// be compared against a freshly built binary to detect a same-version content
+/// change. Not cryptographic: it only has to notice a recompile, where the worst
+/// case of an unrecognised change is a harmless extra upload.
+pub fn binary_fingerprint(bytes: &[u8]) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
+}
+
+/// Sibling marker path holding the deployed binary's fingerprint.
+fn fingerprint_path(remote_path: &str) -> String {
+    format!("{remote_path}.fnv")
+}
 
 /// Build the remote presence-probe command for the already-resolved literal
-/// `remote_path`: emit [`PRESENT_MARKER`] iff the path exists and is executable.
-/// The path is single-quoted so it cannot be expanded or break out of quoting.
+/// `remote_path`: emit the stored fingerprint iff the binary exists and is
+/// executable, and empty otherwise (absent binary, or a binary deployed before
+/// fingerprinting existed — `cat` of the missing marker is silenced). Both paths
+/// are single-quoted so they cannot be expanded or break out of quoting.
 ///
 /// The `if`/`then`/`fi` wrapper makes the command exit zero whether or not the
-/// binary is present — a bare `test -x … && printf …` would exit non-zero on the
+/// binary is present — a bare `test -x … && cat …` would exit non-zero on the
 /// (expected) first-deploy case, which `exec_capture` reports as a failed remote
 /// command. Absence is signalled by empty output, not by the exit status.
 fn presence_probe_command(remote_path: &str) -> String {
-    let quoted = shell_single_quote(remote_path);
-    format!("if test -x {quoted}; then printf '%s' '{PRESENT_MARKER}'; fi")
+    let bin = shell_single_quote(remote_path);
+    let marker = shell_single_quote(&fingerprint_path(remote_path));
+    format!("if test -x {bin}; then cat {marker} 2>/dev/null; fi")
+}
+
+/// Build the command that writes the fingerprint marker beside the uploaded
+/// binary. Both the value and the path are single-quoted.
+fn write_fingerprint_command(remote_path: &str, fingerprint: &str) -> String {
+    let marker = shell_single_quote(&fingerprint_path(remote_path));
+    let fp = shell_single_quote(fingerprint);
+    format!("printf '%s' {fp} > {marker}")
 }
 
 /// Build the remote `mkdir -p` command for the already-resolved literal
@@ -130,19 +160,19 @@ pub async fn ensure_daemon_deployed(
     let remote_dir = remote_dir.trim_end_matches('/').to_string();
     let remote_path = format!("{remote_dir}/{}", remote_binary_name(version));
 
+    let fingerprint = binary_fingerprint(local_binary);
     let probe = conn
         .exec_capture(&presence_probe_command(&remote_path))
         .await?;
 
-    if needs_upload(&probe) {
-        info!(remote_path, "daemon binary absent, uploading");
+    if needs_upload(&probe, &fingerprint) {
+        info!(remote_path, "daemon binary absent or changed, uploading");
         conn.exec_capture(&mkdir_command(&remote_dir)).await?;
         conn.upload_executable(local_binary, &remote_path).await?;
+        conn.exec_capture(&write_fingerprint_command(&remote_path, &fingerprint))
+            .await?;
     } else {
-        debug!(
-            remote_path,
-            "daemon binary already present, skipping upload"
-        );
+        debug!(remote_path, "daemon binary up to date, skipping upload");
     }
 
     Ok(remote_path)
@@ -189,37 +219,76 @@ mod tests {
 
     #[test]
     fn test_needs_upload_true_when_probe_empty() {
-        assert!(needs_upload(""));
+        // Absent binary or absent marker -> empty probe -> must upload.
+        assert!(needs_upload("", "deadbeefdeadbeef"));
     }
 
     #[test]
-    fn test_needs_upload_false_when_present_marker() {
-        assert!(!needs_upload(PRESENT_MARKER));
-        assert!(!needs_upload("rift-present\n"));
+    fn test_needs_upload_false_when_fingerprint_matches() {
+        assert!(!needs_upload("deadbeefdeadbeef", "deadbeefdeadbeef"));
+        assert!(!needs_upload("deadbeefdeadbeef\n", "deadbeefdeadbeef"));
     }
 
     #[test]
-    fn test_needs_upload_true_when_unexpected_output() {
-        assert!(needs_upload("no such file"));
+    fn test_needs_upload_true_when_fingerprint_differs() {
+        // A same-version content change: stored marker no longer matches.
+        assert!(needs_upload("0000000000000000", "deadbeefdeadbeef"));
     }
 
     #[test]
-    fn test_presence_probe_command_single_quotes_path() {
+    fn test_binary_fingerprint_is_deterministic() {
+        assert_eq!(
+            binary_fingerprint(b"rift-daemon"),
+            binary_fingerprint(b"rift-daemon")
+        );
+    }
+
+    #[test]
+    fn test_binary_fingerprint_differs_on_content_change() {
+        assert_ne!(
+            binary_fingerprint(b"rift-daemon-v1"),
+            binary_fingerprint(b"rift-daemon-v2")
+        );
+    }
+
+    #[test]
+    fn test_binary_fingerprint_matches_known_fnv1a_vectors() {
+        // Canonical 64-bit FNV-1a vectors: empty input is the offset basis.
+        assert_eq!(binary_fingerprint(b""), "cbf29ce484222325");
+        assert_eq!(binary_fingerprint(b"a"), "af63dc4c8601ec8c");
+    }
+
+    #[test]
+    fn test_presence_probe_command_single_quotes_paths() {
         let cmd = presence_probe_command("/tmp/rift-daemon-0.1.0");
         assert_eq!(
             cmd,
-            "if test -x '/tmp/rift-daemon-0.1.0'; then printf '%s' 'rift-present'; fi"
+            "if test -x '/tmp/rift-daemon-0.1.0'; then cat '/tmp/rift-daemon-0.1.0.fnv' 2>/dev/null; fi"
         );
     }
 
     #[test]
     fn test_presence_probe_command_neutralizes_injection() {
-        // A crafted path must be inert inside the probe command.
+        // A crafted path must be inert in both the test and the cat occurrence.
         let cmd = presence_probe_command("/tmp/$(touch pwned)");
         assert_eq!(
             cmd,
-            "if test -x '/tmp/$(touch pwned)'; then printf '%s' 'rift-present'; fi"
+            "if test -x '/tmp/$(touch pwned)'; then cat '/tmp/$(touch pwned).fnv' 2>/dev/null; fi"
         );
+    }
+
+    #[test]
+    fn test_write_fingerprint_command_single_quotes_value_and_path() {
+        assert_eq!(
+            write_fingerprint_command("/tmp/rift-daemon-0.1.0", "af63dc4c8601ec8c"),
+            "printf '%s' 'af63dc4c8601ec8c' > '/tmp/rift-daemon-0.1.0.fnv'"
+        );
+    }
+
+    #[test]
+    fn test_write_fingerprint_command_neutralizes_injection() {
+        let cmd = write_fingerprint_command("/tmp/$(touch pwned)", "deadbeef");
+        assert_eq!(cmd, "printf '%s' 'deadbeef' > '/tmp/$(touch pwned).fnv'");
     }
 
     #[test]
