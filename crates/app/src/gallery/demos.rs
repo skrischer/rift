@@ -2098,9 +2098,13 @@ pub(super) fn build_webview(window: &mut Window, cx: &mut App) -> AnyView {
         let inner = builder
             .build_as_child(&handle)
             .expect("WebView2 runtime builds a child webview");
-        let mut view = gpui_wry::WebView::new(inner, window, cx);
+        gpui_wry::WebView::new(inner, window, cx)
+    });
+    // Navigate after the entity is installed, matching gpui-component's webview
+    // example: a load_url issued inside the construction closure (before the
+    // webview is wrapped in its entity) does not stick.
+    webview.update(cx, |view, _| {
         view.load_url("https://longbridge.github.io/gpui-component");
-        view
     });
     cx.new(|_| WebViewDemo { webview }).into()
 }
