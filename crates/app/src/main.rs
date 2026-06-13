@@ -329,13 +329,15 @@ async fn run_daemon_terminal(
     spawn_input_bridge(client.clone(), ch.input_rx);
     spawn_resize_bridge(client.clone(), ch.size_changed_rx);
     spawn_command_bridge(client.clone(), ch.tmux_command_rx);
-    spawn_capture_bridge(ch.capture_request_rx, ch.capture_result_tx);
+    spawn_capture_bridge(client.clone(), ch.capture_request_rx);
 
     // Forward path: fold the daemon stream into the render channels (pane output,
-    // layout snapshots) and the worktree model. Blocks until the stream ends.
+    // layout snapshots, capture replies) and the worktree model. Blocks until the
+    // stream ends.
     let sinks = TerminalSinks {
         pane_output_tx: ch.pane_output_tx,
         snapshot_tx: ch.snapshot_tx,
+        capture_result_tx: ch.capture_result_tx,
     };
     consume_daemon_messages(client, Some(sinks)).await;
     Ok(())
@@ -687,6 +689,17 @@ async fn consume_daemon_messages(
                     });
                 }
             }
+            // The reply to a capture request: route the captured scrollback back
+            // to the originating pane (empty bytes on a capture error clear its
+            // in-flight flag without wedging the scroll).
+            DaemonMessage::PaneCapture { pane_id, bytes } => {
+                if let Some(sinks) = &terminal {
+                    let _ = sinks.capture_result_tx.send(CaptureResult {
+                        pane_id: format!("%{pane_id}"),
+                        bytes,
+                    });
+                }
+            }
             // Snapshot and update both carry the full latest layout (replace
             // semantics), which is exactly what the render layer's `apply_snapshot`
             // expects — so both fold into one synthesized `TmuxSnapshot`.
@@ -784,6 +797,7 @@ async fn consume_daemon_messages(
 struct TerminalSinks {
     pane_output_tx: flume::Sender<PaneOutput>,
     snapshot_tx: flume::Sender<termy_terminal_ui::TmuxSnapshot>,
+    capture_result_tx: flume::Sender<CaptureResult>,
 }
 
 /// Forward typed input from the render layer onto the protocol as
@@ -855,27 +869,28 @@ fn spawn_command_bridge(
     });
 }
 
-/// Bridge pre-attach scrollback (`capture-pane`) requests.
-///
-/// TODO(#205 capture): the merged protocol/daemon (#203/#204) carry no
-/// capture-pane response, so there is no return channel for the captured text
-/// over the daemon. Until that lands, answer each request with an empty
-/// [`CaptureResult`] so the pane clears its in-flight flag and scrolling never
-/// wedges; pre-attach history is simply unavailable on the daemon path (the live
-/// post-attach scrollback in the client `Term` is unaffected).
+/// Forward pre-attach scrollback (`capture-pane`) requests onto the protocol as
+/// [`rift_protocol::ClientMessage::CapturePane`]; the daemon issues `capture-pane
+/// -p -e` and replies with a `PaneCapture` that the consumer routes back to the
+/// originating pane as a [`CaptureResult`]. The render-side `start_row`/`end_row`
+/// tmux line addresses and the `-J` flag cross the seam unchanged.
 fn spawn_capture_bridge(
+    client: std::sync::Arc<rift_ssh::DaemonClient>,
     capture_rx: flume::Receiver<CaptureRequest>,
-    result_tx: flume::Sender<CaptureResult>,
 ) {
+    use rift_protocol::ClientMessage;
     tokio::spawn(async move {
         while let Ok(req) = capture_rx.recv_async().await {
-            if result_tx
-                .send(CaptureResult {
-                    pane_id: req.pane_id,
-                    bytes: Vec::new(),
-                })
-                .is_err()
-            {
+            let Some(pane_id) = parse_pane_id(&req.pane_id) else {
+                continue;
+            };
+            let msg = ClientMessage::CapturePane {
+                pane_id,
+                start: req.start_row,
+                end: req.end_row,
+                join: req.join_wraps,
+            };
+            if client.send(msg).await.is_err() {
                 break;
             }
         }
