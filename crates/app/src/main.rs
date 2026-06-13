@@ -287,7 +287,9 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
 /// `RIFT_TERMINAL_LEGACY` selects the legacy escape hatch; the dev recipes
 /// forward the var so the fallback is operable end-to-end.
 fn use_daemon_terminal() -> bool {
-    !env::var_os("RIFT_TERMINAL_LEGACY").is_some_and(|v| !v.is_empty())
+    // True (daemon) unless RIFT_TERMINAL_LEGACY is set non-empty: none-or-empty
+    // selects the daemon path, a non-empty value the legacy escape hatch.
+    env::var_os("RIFT_TERMINAL_LEGACY").is_none_or(|v| v.is_empty())
 }
 
 /// Drive the terminal entirely over the daemon protocol: open this client's tmux
