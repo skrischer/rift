@@ -1,6 +1,6 @@
 # Spec: gpui rev bump investigation
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-06-13
 > Completed: —
 
@@ -91,6 +91,7 @@ the constitution already grants. No new secrets, accounts, or provisioning.
 | The motivating consumer is the #127 WebView child-window compositing | On the pinned `gpui` (`4bee412`) the native WebView2 child window is overdrawn by gpui's DXGI surface and `GPUI_DISABLE_DIRECT_COMPOSITION` is ineffective; windowed-child webview compositing needs a newer gpui (see the archived `spec-component-gallery.md` decision log) | 2026-06-13 |
 | Lockstep set = `gpui` + `gpui_platform` + `gpui-component`; the trial keeps one `gpui` | Constitution single-rev rule; all three resolve from git and unify in the lock today (`gpui` at `4bee412`) | 2026-06-13 |
 | The `termy_terminal_ui` fork is a first-class subject of the analysis | rift's pinned termy (`49d3928`) hard-pins `gpui` `rev=83de8a2…`, yet the lock resolves to `4bee412` with no `[patch]` — an anomaly the spike must explain; the fork's pin is a likely hard blocker for any bump | 2026-06-13 |
+| Trial candidate = latest `gpui-component` HEAD, letting it drag the matching `gpui`/`gpui_platform` | It is what a real bump would target and where the webview-compositing fix lives; `gpui-component@HEAD` is tested against the `gpui` it floats, so the set is coherent (empirically `gpui-component` `cda0fc7` → `gpui` `8589cbb`). The trial pins and records the exact resolved revs. (user, spec-acceptance gate) | 2026-06-13 |
 
 ## Tracking
 
@@ -133,3 +134,6 @@ How does the developer know the spec is complete?
 - 2026-06-13: Spec created from the #127 close-out. #127 shipped a WebView notice
   because the live `gpui-wry` embed does not composite on `gpui` `4bee412`; this
   spec investigates the bump that would unblock it, without committing to land it.
+- 2026-06-13: Spec-acceptance gate — candidate rev for the trial set to latest
+  `gpui-component` HEAD (dragging the matching `gpui`/`gpui_platform`); human
+  prerequisites confirmed `none`. Spec accepted and set `READY`.
