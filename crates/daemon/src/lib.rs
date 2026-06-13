@@ -260,20 +260,29 @@ fn snapshot_messages(root: &Path, entries: &BTreeMap<PathBuf, Entry>) -> Vec<Dae
 
 /// Serve one client connection against an already-running dispatch loop.
 ///
-/// Decodes [`ClientMessage`] frames from `reader` into the loop via `inbound`
-/// and writes [`DaemonMessage`] frames from `events` to `writer`. One call
-/// drives one connection; the dispatch loop and the `State` it owns live
-/// outside it, so they persist across reconnects — the reattach contract.
+/// Decodes [`ClientMessage`] frames from `reader` into the loop via `inbound`,
+/// writes [`DaemonMessage`] frames from `events` to `writer`, and replays the
+/// current worktree snapshot from `state` straight to this connection right
+/// after the handshake. One call drives one connection; the dispatch loop and
+/// the `State` it owns live outside it, so they persist across reconnects — the
+/// reattach contract.
+///
+/// The snapshot is delivered per connection — backpressured by the socket —
+/// rather than over the shared `events` bus, whose bounded backlog silently
+/// drops chunks once a large snapshot exceeds its capacity (issue #227). The
+/// bus carries only incremental `UpdateWorktree`s; a lagging writer may still
+/// drop those, but that loss is logged, never silent.
 ///
 /// `inbound` is a clone of the loop's inbound sender (dropped when the
-/// connection ends); `events` is a fresh subscription to the outbound bus.
-/// Returns once the reader reaches EOF, the dispatch loop is gone, or the event
-/// bus closes.
+/// connection ends); `events` is a fresh subscription to the outbound bus;
+/// `state` observes the latest worktree snapshot. Returns once the reader
+/// reaches EOF, the dispatch loop is gone, or the event bus closes.
 async fn serve_connection<R, W>(
     reader: R,
     mut writer: W,
     inbound: mpsc::Sender<ClientMessage>,
     mut events: broadcast::Receiver<DaemonMessage>,
+    mut state: watch::Receiver<State>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -282,6 +291,11 @@ where
     let mut reader = reader;
     let mut decoder = FrameDecoder::new();
     let mut buf = vec![0u8; SERVE_READ_BUFFER];
+    // Per-connection replay bookkeeping: the snapshot is sent once, right behind
+    // the `Welcome`. `handshaken` gates the `state` branch so a snapshot landing
+    // mid-scan is never written ahead of the handshake the client waits for.
+    let mut handshaken = false;
+    let mut snapshot_sent = false;
 
     'serve: loop {
         tokio::select! {
@@ -303,20 +317,81 @@ where
             event = events.recv() => {
                 match event {
                     Ok(msg) => {
+                        let is_welcome = matches!(msg, DaemonMessage::Welcome { .. });
                         let frame = encode_frame(&msg)?;
                         writer.write_all(&frame).await?;
                         writer.flush().await?;
+                        if is_welcome {
+                            // Replay the snapshot immediately behind the
+                            // handshake so the client sees `Welcome` then a
+                            // complete tree. If the scan has not finished, the
+                            // `state` branch delivers it once it lands.
+                            handshaken = true;
+                            if !snapshot_sent {
+                                snapshot_sent = write_snapshot(&mut writer, &state).await?;
+                            }
+                        }
                     }
-                    // Lagged: the writer fell behind the broadcast backlog. Skip
-                    // the dropped events and keep serving rather than tearing the
-                    // connection down.
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    // The bus carries only incremental updates now; a lagging
+                    // writer drops some. Log the count — never silently — so the
+                    // divergence is observable. The snapshot itself is loss-free,
+                    // delivered off-bus above.
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        eprintln!(
+                            "rift-daemon connection lagged: dropped {skipped} worktree update(s)"
+                        );
+                    }
                     Err(broadcast::error::RecvError::Closed) => break 'serve,
+                }
+            }
+            changed = state.changed() => {
+                if changed.is_err() {
+                    // The dispatch loop dropped the `State` sender; it is gone.
+                    break 'serve;
+                }
+                if handshaken && !snapshot_sent {
+                    snapshot_sent = write_snapshot(&mut writer, &state).await?;
                 }
             }
         }
     }
 
+    Ok(())
+}
+
+/// Replay the current worktree snapshot to one connection, backpressured by the
+/// socket so no chunk is dropped regardless of tree size. Returns `true` when a
+/// snapshot was written, `false` when none is ready yet. The `watch` borrow is
+/// released before any `await`: the chunked messages are built up front, then
+/// written.
+async fn write_snapshot<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    state: &watch::Receiver<State>,
+) -> anyhow::Result<bool> {
+    let messages = {
+        let guard = state.borrow();
+        let Some(snapshot) = guard.worktree.as_ref() else {
+            return Ok(false);
+        };
+        snapshot_messages(snapshot.root(), snapshot.entries())
+    };
+    write_messages(writer, &messages).await?;
+    Ok(true)
+}
+
+/// Write a sequence of `DaemonMessage` frames to a connection, flushing once at
+/// the end. Each `write_all` is backpressured by the transport, so the whole
+/// sequence arrives intact however many frames it is — the property the
+/// per-connection snapshot relies on.
+async fn write_messages<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    messages: &[DaemonMessage],
+) -> anyhow::Result<()> {
+    for msg in messages {
+        let frame = encode_frame(msg)?;
+        writer.write_all(&frame).await?;
+    }
+    writer.flush().await?;
     Ok(())
 }
 
@@ -341,12 +416,13 @@ where
     }
     let events = handles.subscribe();
     let inbound = handles.inbound.clone();
+    let state = handles.state.clone();
     // Drop the spare handles so the dispatch loop ends once the connection's
     // `inbound` clone is dropped at EOF.
     drop(handles);
 
     let dispatch = tokio::spawn(daemon.run());
-    let result = serve_connection(reader, writer, inbound, events).await;
+    let result = serve_connection(reader, writer, inbound, events, state).await;
     // `serve_connection` dropped its `inbound` clone on return, so the dispatch
     // loop has observed channel closure and will join.
     dispatch.await?;
@@ -412,8 +488,9 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
         let (reader, writer) = stream.into_split();
         let inbound = handles.inbound.clone();
         let events = handles.subscribe();
+        let state = handles.state.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_connection(reader, writer, inbound, events).await {
+            if let Err(e) = serve_connection(reader, writer, inbound, events, state).await {
                 // Stderr is the daemon's log sink (stdout carries protocol frames
                 // in stdio mode); one failed connection must not stop the daemon.
                 eprintln!("rift-daemon connection ended with error: {e}");
@@ -530,15 +607,15 @@ impl Core {
                 //
                 // A receiverless broadcast send is not an error here: events are
                 // fire-and-forget, so a `Welcome` with no subscriber is dropped.
+                //
+                // The worktree snapshot is not broadcast here: each connection
+                // replays it from `State` straight to its own socket right after
+                // the `Welcome` (see `serve_connection`), off the bounded event
+                // bus whose backlog would silently drop a large snapshot's
+                // chunks (issue #227).
                 let _ = self.events.send(DaemonMessage::Welcome {
                     version: PROTOCOL_VERSION,
                 });
-                // A (re)attaching client needs the full tree, not just future
-                // deltas — re-broadcast the current snapshot after the
-                // handshake. Other attached clients receive it too (single
-                // shared event bus); a full snapshot replaces their model, so
-                // the repeat is redundant but never inconsistent.
-                self.broadcast_snapshot();
             }
             // Terminal/tmux handling is owned by a later Phase 3 sub-spec; this
             // scaffolding only carries the handshake.
@@ -552,9 +629,13 @@ impl Core {
     fn apply_worktree(&mut self, event: WorktreeEvent) {
         match event {
             WorktreeEvent::Scanned(snapshot) => {
+                // Store the snapshot; each connection replays it from `State`
+                // per connection (see `serve_connection`), so there is nothing
+                // to broadcast here. The `State` change wakes already-attached
+                // connections that handshook before the scan finished, so they
+                // replay it too.
                 self.state
                     .send_modify(|state| state.worktree = Some(snapshot));
-                self.broadcast_snapshot();
             }
             WorktreeEvent::Changed(batch) => {
                 self.state.send_modify(|state| {
@@ -564,19 +645,6 @@ impl Core {
                 });
                 let _ = self.events.send(update_message(&batch));
             }
-        }
-    }
-
-    /// Emit the current worktree as chunked `WorktreeSnapshot` messages, or
-    /// nothing while no scan has completed. The dispatch loop is the only
-    /// emitter, so a snapshot's chunks are never interleaved with updates.
-    fn broadcast_snapshot(&self) {
-        let state = self.state.borrow();
-        let Some(worktree) = &state.worktree else {
-            return;
-        };
-        for msg in snapshot_messages(worktree.root(), worktree.entries()) {
-            let _ = self.events.send(msg);
         }
     }
 }
@@ -877,25 +945,33 @@ mod tests {
         .expect("expected event within the timeout")
     }
 
-    /// Collect one complete chunked snapshot: entries accumulated across
-    /// `WorktreeSnapshot` messages until `final_chunk`.
-    async fn recv_snapshot(
-        events: &mut broadcast::Receiver<DaemonMessage>,
+    /// Read framed messages off a live connection until one complete chunked
+    /// `WorktreeSnapshot` has arrived (tolerating the `Welcome` that precedes
+    /// it), returning its entries. Panics on any other message — the snapshot is
+    /// the per-connection replay, never an update.
+    async fn read_full_snapshot<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        decoder: &mut FrameDecoder,
     ) -> Vec<rift_protocol::WorktreeEntry> {
+        let mut welcome_seen = false;
         let mut collected = Vec::new();
         loop {
-            let (mut entries, final_chunk) = recv_until(events, |msg| match msg {
+            match read_daemon_message(reader, decoder).await {
+                DaemonMessage::Welcome { version } => {
+                    assert_eq!(version, PROTOCOL_VERSION);
+                    welcome_seen = true;
+                }
                 DaemonMessage::WorktreeSnapshot {
-                    entries,
+                    entries: mut chunk,
                     final_chunk,
                     ..
-                } => Some((entries, final_chunk)),
-                _ => None,
-            })
-            .await;
-            collected.append(&mut entries);
-            if final_chunk {
-                return collected;
+                } => {
+                    collected.append(&mut chunk);
+                    if final_chunk && welcome_seen {
+                        return collected;
+                    }
+                }
+                other => panic!("unexpected message before snapshot: {other:?}"),
             }
         }
     }
@@ -959,7 +1035,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_worktree_scan_broadcasts_snapshot_and_streams_update_on_change() {
+    async fn test_snapshot_delivery_exceeds_event_capacity_without_loss() {
+        // The old bus-delivered snapshot silently dropped chunks once their
+        // count passed SERVE_EVENT_CAPACITY (the #227 bug). Per-connection
+        // delivery is backpressured by the socket, so every chunk arrives
+        // however many there are. Drive more chunks than the bus could ever hold
+        // through the exact writer a connection uses, over a deliberately small
+        // transport buffer that forces flow control rather than buffering all.
+        let chunk_count = SERVE_EVENT_CAPACITY + 16;
+        let messages: Vec<DaemonMessage> = (0..chunk_count)
+            .map(|i| DaemonMessage::WorktreeSnapshot {
+                root: "/proj".to_owned(),
+                entries: vec![WorktreeEntry {
+                    path: format!("file-{i:05}.txt"),
+                    kind: EntryKind::File,
+                    ignored: false,
+                    mtime: std::time::SystemTime::UNIX_EPOCH,
+                }],
+                final_chunk: i + 1 == chunk_count,
+            })
+            .collect();
+
+        let (client, server) = tokio::io::duplex(1024);
+        let (mut client_reader, _client_writer) = tokio::io::split(client);
+        let (_server_reader, mut server_writer) = tokio::io::split(server);
+
+        let writer = tokio::spawn(async move {
+            write_messages(&mut server_writer, &messages)
+                .await
+                .expect("write all chunks");
+        });
+
+        let mut decoder = FrameDecoder::new();
+        let mut received = 0usize;
+        loop {
+            match read_daemon_message(&mut client_reader, &mut decoder).await {
+                DaemonMessage::WorktreeSnapshot {
+                    entries,
+                    final_chunk,
+                    ..
+                } => {
+                    assert_eq!(entries.len(), 1);
+                    received += 1;
+                    if final_chunk {
+                        break;
+                    }
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+        assert_eq!(received, chunk_count, "every snapshot chunk must arrive");
+        writer.await.expect("writer task joins");
+    }
+
+    #[tokio::test]
+    async fn test_worktree_scan_populates_state_and_streams_update_on_change() {
         let tmp = TempDir::new("scan");
         write_file(&tmp.path.join("src/main.rs"), "fn main() {}");
         write_file(&tmp.path.join("README.md"), "# readme");
@@ -967,22 +1097,25 @@ mod tests {
         let (mut daemon, handles) = channels(64, 8);
         daemon.watch_worktree(tmp.path.clone());
         let mut events = handles.subscribe();
-        let state = handles.state.clone();
+        let mut state = handles.state.clone();
         let loop_handle = tokio::spawn(daemon.run());
 
-        // The initial scan lands as a complete chunked snapshot on the bus.
-        let entries = recv_snapshot(&mut events).await;
-        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
-        assert!(paths.contains(&"README.md"));
-        assert!(paths.contains(&"src"));
-        assert!(paths.contains(&"src/main.rs"));
-
-        // The same tree is observable in the daemon's State.
+        // The initial scan lands in State (the snapshot is replayed per
+        // connection now, not broadcast on the bus). `borrow_and_update` marks
+        // each value seen so the `changed` await cannot miss the transition.
+        loop {
+            if state.borrow_and_update().worktree.is_some() {
+                break;
+            }
+            state.changed().await.expect("state sender alive");
+        }
         let held = state.borrow().worktree.clone().expect("worktree in State");
+        assert!(held.get(Path::new("README.md")).is_some());
+        assert!(held.get(Path::new("src")).is_some());
         assert!(held.get(Path::new("src/main.rs")).is_some());
 
-        // A new file streams as an incremental UpdateWorktree, and the State
-        // follows it.
+        // A new file streams as an incremental UpdateWorktree on the bus, and
+        // the State follows it.
         write_file(&tmp.path.join("src/lib.rs"), "pub fn lib() {}");
         let added = recv_until(&mut events, |msg| match msg {
             DaemonMessage::UpdateWorktree { added, .. } => Some(added),
@@ -999,42 +1132,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hello_after_scan_rebroadcasts_snapshot_for_reattach() {
+    async fn test_serve_uds_replays_snapshot_to_each_attach() {
         let tmp = TempDir::new("reattach");
         write_file(&tmp.path.join("tracked.txt"), "x");
 
-        let (mut daemon, handles) = channels(64, 8);
-        daemon.watch_worktree(tmp.path.clone());
-        let mut events = handles.subscribe();
-        let loop_handle = tokio::spawn(daemon.run());
+        let sock = unique_socket_path();
+        let server = tokio::spawn({
+            let sock = sock.clone();
+            let root = tmp.path.clone();
+            async move { serve_uds(&sock, Some(root)).await }
+        });
+        wait_for_socket(&sock).await;
 
-        // Wait for the initial scan to land so the Hello below races nothing.
-        let _ = recv_snapshot(&mut events).await;
+        // First attach: handshake, receive the full snapshot, then disconnect.
+        {
+            let mut c1 = UnixStream::connect(&sock).await.expect("connect 1");
+            let mut d1 = FrameDecoder::new();
+            c1.write_all(&hello_frame()).await.expect("send Hello 1");
+            c1.flush().await.expect("flush 1");
+            let entries = read_full_snapshot(&mut c1, &mut d1).await;
+            assert!(entries.iter().any(|e| e.path == "tracked.txt"));
+        }
 
-        // A late subscriber (a reattaching client) missed the initial
-        // broadcast; its Hello must trigger a re-send.
-        let mut late = handles.subscribe();
-        handles
-            .inbound
-            .send(ClientMessage::Hello {
-                version: PROTOCOL_VERSION,
-            })
-            .await
-            .expect("send Hello");
-
-        let welcome = recv_until(&mut late, |msg| match msg {
-            DaemonMessage::Welcome { version } => Some(version),
-            _ => None,
-        })
-        .await;
-        assert_eq!(welcome, PROTOCOL_VERSION);
-        let entries = recv_snapshot(&mut late).await;
+        // Reattach: a fresh connection replays the snapshot again. The replay is
+        // per connection (the #62 reattach contract), with no shared bus
+        // involved — so a large snapshot cannot be lost to a lagging subscriber.
+        let mut c2 = UnixStream::connect(&sock).await.expect("reconnect");
+        let mut d2 = FrameDecoder::new();
+        c2.write_all(&hello_frame()).await.expect("send Hello 2");
+        c2.flush().await.expect("flush 2");
+        let entries = read_full_snapshot(&mut c2, &mut d2).await;
         assert!(entries.iter().any(|e| e.path == "tracked.txt"));
 
-        drop(handles);
-        drop(events);
-        drop(late);
-        loop_handle.await.expect("dispatch loop joins cleanly");
+        server.abort();
+        let _ = tokio::fs::remove_file(&sock).await;
     }
 
     #[tokio::test]
@@ -1055,30 +1186,8 @@ mod tests {
         client.write_all(&hello_frame()).await.expect("send Hello");
         client.flush().await.expect("flush Hello");
 
-        // Collect frames until one complete snapshot has arrived; the Welcome
-        // and the snapshot may interleave depending on when the scan finishes
-        // relative to the handshake, so assert content, not strict order.
-        let mut welcome_seen = false;
-        let mut entries = Vec::new();
-        loop {
-            match read_daemon_message(&mut client, &mut decoder).await {
-                DaemonMessage::Welcome { version } => {
-                    assert_eq!(version, PROTOCOL_VERSION);
-                    welcome_seen = true;
-                }
-                DaemonMessage::WorktreeSnapshot {
-                    entries: mut chunk,
-                    final_chunk,
-                    ..
-                } => {
-                    entries.append(&mut chunk);
-                    if final_chunk && welcome_seen {
-                        break;
-                    }
-                }
-                other => panic!("unexpected message before snapshot: {other:?}"),
-            }
-        }
+        // The handshake is followed by the per-connection snapshot replay.
+        let entries = read_full_snapshot(&mut client, &mut decoder).await;
         assert!(entries.iter().any(|e| e.path == "src/main.rs"));
 
         // A change on disk reaches the attached client as an UpdateWorktree.
