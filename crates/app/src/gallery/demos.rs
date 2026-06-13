@@ -2076,68 +2076,20 @@ impl Render for DataTableDemo {
 // WebView (#127)
 // ---------------------------------------------------------------------------
 
-/// Windows: a live embedded browser backed by `gpui-wry` (Wry / WebView2). The
-/// native child webview is positioned by the rendered element's bounds, so it is
-/// hosted in a fixed-height bordered container.
-#[cfg(windows)]
-struct WebViewDemo {
-    webview: Entity<gpui_wry::WebView>,
-}
-
-#[cfg(windows)]
-pub(super) fn build_webview(window: &mut Window, cx: &mut App) -> AnyView {
-    use raw_window_handle::HasWindowHandle as _;
-
-    let webview = cx.new(|cx| {
-        let builder = wry::WebViewBuilder::new();
-        #[cfg(debug_assertions)]
-        let builder = builder.with_devtools(true);
-        let handle = window
-            .window_handle()
-            .expect("gallery window exposes a raw window handle");
-        let inner = builder
-            .build_as_child(&handle)
-            .expect("WebView2 runtime builds a child webview");
-        gpui_wry::WebView::new(inner, window, cx)
-    });
-    // Navigate after the entity is installed, matching gpui-component's webview
-    // example: a load_url issued inside the construction closure (before the
-    // webview is wrapped in its entity) does not stick.
-    webview.update(cx, |view, _| {
-        view.load_url("https://longbridge.github.io/gpui-component");
-    });
-    cx.new(|_| WebViewDemo { webview }).into()
-}
-
-#[cfg(windows)]
-impl Render for WebViewDemo {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .h(px(480.))
-            .border_1()
-            .border_color(cx.theme().border)
-            .rounded(px(8.))
-            .child(self.webview.clone())
-    }
-}
-
-/// Non-Windows: the real WebView renders only on the Windows sign-off target (the
-/// upstream Linux GTK path is non-functional and would pull `libwebkit2gtk` into
-/// the headless/CI builds), so other targets show this notice.
-#[cfg(not(windows))]
 pub(super) fn render_webview(_window: &mut Window, _cx: &mut App) -> AnyElement {
     v_flex()
         .gap_3()
-        .max_w(px(560.))
+        .max_w(px(620.))
         .child(
             Alert::info(
-                "webview-windows-only",
-                "The WebView demo embeds a live browser via gpui-wry (Wry / \
-                 WebView2) and renders only on the Windows sign-off target. The \
-                 upstream Linux path is non-functional, so this build shows a \
-                 notice instead.",
+                "webview-notice",
+                "An embedded WebView via gpui-wry (Wry / WebView2) was proven to \
+                 cross-compile and run on the Windows target, but the live view is \
+                 not visible on rift's pinned gpui rev: gpui overdraws the native \
+                 child window with its own surface. The demo stays a notice until \
+                 gpui's webview compositing is available (see #127 decision log).",
             )
-            .title("WebView — available on Windows only"),
+            .title("WebView — pending gpui webview compositing"),
         )
         .into_any_element()
 }

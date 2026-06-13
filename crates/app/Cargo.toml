@@ -26,16 +26,10 @@ required-features = ["gallery"]
 # `gpui-component/tree-sitter-rust` enables a single syntax grammar for the
 # code-editor demo (not the umbrella `tree-sitter-languages` set); charts run on
 # plain f64, so the `decimal` feature is intentionally not enabled.
-# `gpui-wry`/`wry`/`raw-window-handle` are the WebView demo's stack; they are
-# declared only under the Windows target table below, so enabling them here is a
-# no-op on other targets (which render a "Windows only" notice instead).
 gallery = [
     "dep:gpui-component-assets",
     "dep:rust-embed",
     "gpui-component/tree-sitter-rust",
-    "dep:gpui-wry",
-    "dep:wry",
-    "dep:raw-window-handle",
 ]
 # Console-free stable launcher: switches the rift binary to the Windows GUI
 # subsystem (see the cfg_attr in src/main.rs). Off by default so dev launches
@@ -60,23 +54,6 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 termy_terminal_ui.workspace = true
-
-# The real WebView demo (gallery, Windows only). `gpui-wry` is the `crates/webview`
-# member of the same gpui-component repo rift already pins, so its `gpui.workspace`
-# resolves to rift's single pinned `gpui` — Cargo.lock keeps exactly one `gpui`.
-# Windows-gated because the upstream Linux (GTK) path is non-functional and would
-# pull `libwebkit2gtk` into the headless/CI builds; non-Windows targets render a
-# "Windows only" notice. All three are optional and pulled only by the `gallery`
-# feature, so the product `rift` build never compiles the Wry stack.
-# `gpui-wry`'s `rev` is pinned to the exact rev the workspace `gpui-component` is
-# locked at: both are crates of the same git repo, so a single shared rev keeps
-# Cargo.lock at one checkout (and thus one `gpui`). Leaving it floating would drag
-# the whole source — `gpui-component` included — to the latest rev. Bump this in
-# lockstep whenever the workspace `gpui-component` rev moves.
-[target.'cfg(target_os = "windows")'.dependencies]
-gpui-wry = { git = "https://github.com/longbridge/gpui-component", rev = "9ad30e631e15f9bbba049717767bf4cd98e4f179", optional = true }
-wry = { version = "0.53.3", package = "lb-wry", optional = true }
-raw-window-handle = { version = "0.6", features = ["std"], optional = true }
 
 [build-dependencies]
 embed-resource = "3"
