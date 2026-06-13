@@ -71,6 +71,25 @@ pub enum DaemonMessage {
         branch: Option<String>,
         ahead_behind: Option<AheadBehind>,
     },
+    /// The complete current diagnostic set one language server reports for one
+    /// file, replacing whatever that server last reported for it. Keyed by
+    /// `path` relative to the worktree root (the same key space as
+    /// [`WorktreeEntry::path`]) and by `server` — the daemon-assigned id of the
+    /// publishing language server. The daemon translates each server
+    /// `publishDiagnostics` notification into one of these messages, mirroring
+    /// LSP's full-set-per-`(file, server)` replace semantics: `items` is the
+    /// authoritative set, so an empty `items` clears that server's diagnostics
+    /// for the file while leaving every other server's set for it intact. This
+    /// per-server keying lets a linter and a type-checker aggregate on the same
+    /// file without one clobbering the other. Push-only — the client is a pure
+    /// consumer and never requests diagnostics. A message arriving for a path
+    /// the client has not yet added is reconciled client-side (the worktree
+    /// snapshot is the source of truth; see #135).
+    Diagnostics {
+        path: String,
+        server: String,
+        items: Vec<Diagnostic>,
+    },
     Welcome {
         version: u32,
     },
@@ -150,6 +169,54 @@ pub struct GitStatusEntry {
 pub struct AheadBehind {
     pub ahead: u32,
     pub behind: u32,
+}
+
+/// One diagnostic a language server reports for a file: a source span plus the
+/// human-readable problem.
+///
+/// rift's own type, deliberately independent of `lsp-types` — the daemon
+/// translates each LSP diagnostic into this so the shared protocol stays
+/// dependency-light and serialization-agnostic (it may migrate to MessagePack),
+/// mirroring how worktree and git messages are rift types, not library types.
+/// `source` (the producing tool, e.g. `"rustc"`) and `code` (the rule / error
+/// identifier) are `None` when the server omits them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Diagnostic {
+    pub range: Range,
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+/// How serious a [`Diagnostic`] is, mirroring LSP's four severities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+    Information,
+    Hint,
+}
+
+/// A half-open span within a file, from `start` (inclusive) to `end`
+/// (exclusive), mirroring LSP ranges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Range {
+    pub start: Position,
+    pub end: Position,
+}
+
+/// A zero-based line / character offset within a file, mirroring LSP positions.
+///
+/// `character` is a UTF-16 code-unit offset, matching the LSP default the
+/// daemon's servers speak; the daemon does not re-encode it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Position {
+    pub line: u32,
+    pub character: u32,
 }
 
 #[cfg(test)]
@@ -405,5 +472,106 @@ mod tests {
         // loudly instead of being misread as a valid status.
         let err = serde_json::from_str::<GitStatusCode>(r#""partially_staged""#);
         assert!(err.is_err(), "unknown status code must not deserialize");
+    }
+
+    #[test]
+    fn test_diagnostics_roundtrip_preserves_path_server_and_items() {
+        let msg = DaemonMessage::Diagnostics {
+            path: "src/main.rs".to_owned(),
+            server: "rust-analyzer".to_owned(),
+            items: vec![Diagnostic {
+                range: Range {
+                    start: Position {
+                        line: 10,
+                        character: 4,
+                    },
+                    end: Position {
+                        line: 10,
+                        character: 9,
+                    },
+                },
+                severity: DiagnosticSeverity::Error,
+                message: "cannot find value `foo` in this scope".to_owned(),
+                source: Some("rustc".to_owned()),
+                code: Some("E0425".to_owned()),
+            }],
+        };
+
+        let json = serde_json::to_string(&msg).expect("serialize Diagnostics");
+        assert!(json.contains(r#""type":"diagnostics""#));
+        assert!(json.contains(r#""path":"src/main.rs""#));
+        assert!(json.contains(r#""server":"rust-analyzer""#));
+        assert!(json.contains(r#""severity":"error""#));
+        assert!(json.contains(r#""code":"E0425""#));
+
+        let parsed: DaemonMessage = serde_json::from_str(&json).expect("deserialize Diagnostics");
+        assert_eq!(parsed, msg);
+        match parsed {
+            DaemonMessage::Diagnostics {
+                path,
+                server,
+                items,
+            } => {
+                assert_eq!(path, "src/main.rs");
+                assert_eq!(server, "rust-analyzer");
+                assert_eq!(items.len(), 1);
+            }
+            other => panic!("expected Diagnostics, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_diagnostics_empty_items_clears_one_servers_set() {
+        // An empty `items` is the full-set-replace clear for that `(file,
+        // server)` pair — it must round-trip as an empty list, not vanish.
+        let msg = DaemonMessage::Diagnostics {
+            path: "src/lib.rs".to_owned(),
+            server: "clippy".to_owned(),
+            items: vec![],
+        };
+        let json = serde_json::to_string(&msg).expect("serialize Diagnostics");
+        assert!(json.contains(r#""items":[]"#));
+
+        let parsed: DaemonMessage = serde_json::from_str(&json).expect("deserialize Diagnostics");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_diagnostic_omits_absent_source_and_code() {
+        // A server that supplies neither `source` nor `code` must produce a
+        // diagnostic with those fields absent on the wire, and reading a payload
+        // without them back must yield `None` (forward-compatible defaults).
+        let diag = Diagnostic {
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 1,
+                },
+            },
+            severity: DiagnosticSeverity::Warning,
+            message: "unused import".to_owned(),
+            source: None,
+            code: None,
+        };
+        let json = serde_json::to_string(&diag).expect("serialize Diagnostic");
+        assert!(!json.contains("source"));
+        assert!(!json.contains(r#""code""#));
+
+        let parsed: Diagnostic = serde_json::from_str(&json).expect("deserialize Diagnostic");
+        assert_eq!(parsed, diag);
+        assert!(parsed.source.is_none());
+        assert!(parsed.code.is_none());
+    }
+
+    #[test]
+    fn test_diagnostic_severity_unknown_variant_is_rejected() {
+        // An unknown severity must fail loudly rather than silently defaulting,
+        // matching the git-status-code discipline.
+        let err = serde_json::from_str::<DiagnosticSeverity>(r#""fatal""#);
+        assert!(err.is_err(), "unknown severity must not deserialize");
     }
 }
