@@ -1156,6 +1156,10 @@ mod tests {
                             return collected;
                         }
                     }
+                    // The per-connection replay appends the full git status after
+                    // the tree (for a git-repo root); tolerate it so this helper
+                    // works against a repo, not only a plain dir.
+                    DaemonMessage::UpdateGitStatus { .. } | DaemonMessage::RepoState { .. } => {}
                     other => panic!("unexpected message before snapshot: {other:?}"),
                 }
             }
