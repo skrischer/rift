@@ -175,7 +175,8 @@ How the entire spec is known complete:
       typing in the search box filters entries; selecting an entry renders its demo
       in rift's Catppuccin palette.
 - [ ] The chart, code editor, and table entries render without panicking; the
-      WebView entry renders its "delivered by follow-up issue" placeholder.
+      WebView entry renders its notice (live embed deferred — see the #127
+      decision-log entry).
 - [ ] The **Theme tokens** entry renders the active theme's color swatches with
       names.
 
