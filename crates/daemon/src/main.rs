@@ -15,8 +15,13 @@ async fn main() -> anyhow::Result<()> {
         // it survives connection drops (issue #62).
         Some("--serve-uds") => {
             let path = args.next().context("--serve-uds requires a socket path")?;
-            eprintln!("rift-daemon listening on {path}");
-            serve_uds(Path::new(&path)).await
+            let root =
+                std::env::current_dir().context("cannot resolve the daemon launch directory")?;
+            eprintln!(
+                "rift-daemon listening on {path}, worktree {}",
+                root.display()
+            );
+            serve_uds(Path::new(&path), Some(root)).await
         }
         // Relay mode: connect the process's stdio to a running daemon's socket.
         // The SSH host wires its channel to this so the channel reaches the
@@ -24,6 +29,19 @@ async fn main() -> anyhow::Result<()> {
         Some("--connect") => {
             let path = args.next().context("--connect requires a socket path")?;
             connect_relay(Path::new(&path)).await
+        }
+        // Throwaway VTE-location spike mode (issue #201): serve the protocol on
+        // a Unix socket while forwarding one tmux session's raw %output bytes.
+        // Delete with the real terminal-streaming implementation (#202-#205).
+        Some("--spike-serve-uds") => {
+            let path = args
+                .next()
+                .context("--spike-serve-uds requires a socket path")?;
+            let session = args
+                .next()
+                .context("--spike-serve-uds requires a tmux session name")?;
+            eprintln!("rift-daemon spike listening on {path} (tmux session {session})");
+            rift_daemon::spike::serve_spike(Path::new(&path), &session).await
         }
         // Probe mode: exit 0 if a daemon is listening on the socket, 1 otherwise.
         // The SSH host keys its reattach-vs-spawn decision on this status; no
@@ -36,8 +54,10 @@ async fn main() -> anyhow::Result<()> {
         // Default stdio mode: speak the protocol over stdin/stdout for a single
         // session. `serve` returns when stdin reaches EOF.
         None => {
-            eprintln!("rift-daemon starting");
-            serve(tokio::io::stdin(), tokio::io::stdout()).await
+            let root =
+                std::env::current_dir().context("cannot resolve the daemon launch directory")?;
+            eprintln!("rift-daemon starting, worktree {}", root.display());
+            serve(tokio::io::stdin(), tokio::io::stdout(), Some(root)).await
         }
     }
 }

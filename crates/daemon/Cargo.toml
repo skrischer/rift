@@ -6,5 +6,6 @@ license.workspace = true
 
 [dependencies]
 rift-protocol = { path = "../protocol" }
+rift-explorer = { path = "../explorer" }
 tokio.workspace = true
 anyhow.workspace = true

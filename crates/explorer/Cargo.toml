@@ -7,4 +7,6 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 ignore.workspace = true
+notify.workspace = true
+gix.workspace = true
 tracing.workspace = true
