@@ -953,27 +953,34 @@ mod tests {
         reader: &mut R,
         decoder: &mut FrameDecoder,
     ) -> Vec<rift_protocol::WorktreeEntry> {
-        let mut welcome_seen = false;
-        let mut collected = Vec::new();
-        loop {
-            match read_daemon_message(reader, decoder).await {
-                DaemonMessage::Welcome { version } => {
-                    assert_eq!(version, PROTOCOL_VERSION);
-                    welcome_seen = true;
-                }
-                DaemonMessage::WorktreeSnapshot {
-                    entries: mut chunk,
-                    final_chunk,
-                    ..
-                } => {
-                    collected.append(&mut chunk);
-                    if final_chunk && welcome_seen {
-                        return collected;
+        // Bounded so a regressed delivery path (a dropped chunk that never lets
+        // `final_chunk` arrive) fails the test deterministically instead of
+        // hanging it.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut welcome_seen = false;
+            let mut collected = Vec::new();
+            loop {
+                match read_daemon_message(reader, decoder).await {
+                    DaemonMessage::Welcome { version } => {
+                        assert_eq!(version, PROTOCOL_VERSION);
+                        welcome_seen = true;
                     }
+                    DaemonMessage::WorktreeSnapshot {
+                        entries: mut chunk,
+                        final_chunk,
+                        ..
+                    } => {
+                        collected.append(&mut chunk);
+                        if final_chunk && welcome_seen {
+                            return collected;
+                        }
+                    }
+                    other => panic!("unexpected message before snapshot: {other:?}"),
                 }
-                other => panic!("unexpected message before snapshot: {other:?}"),
             }
-        }
+        })
+        .await
+        .expect("a complete snapshot within the timeout")
     }
 
     fn synthetic_entries(count: usize) -> BTreeMap<PathBuf, Entry> {
@@ -1035,57 +1042,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot_delivery_exceeds_event_capacity_without_loss() {
-        // The old bus-delivered snapshot silently dropped chunks once their
-        // count passed SERVE_EVENT_CAPACITY (the #227 bug). Per-connection
-        // delivery is backpressured by the socket, so every chunk arrives
-        // however many there are. Drive more chunks than the bus could ever hold
-        // through the exact writer a connection uses, over a deliberately small
-        // transport buffer that forces flow control rather than buffering all.
-        let chunk_count = SERVE_EVENT_CAPACITY + 16;
-        let messages: Vec<DaemonMessage> = (0..chunk_count)
-            .map(|i| DaemonMessage::WorktreeSnapshot {
-                root: "/proj".to_owned(),
-                entries: vec![WorktreeEntry {
-                    path: format!("file-{i:05}.txt"),
-                    kind: EntryKind::File,
-                    ignored: false,
-                    mtime: std::time::SystemTime::UNIX_EPOCH,
-                }],
-                final_chunk: i + 1 == chunk_count,
-            })
-            .collect();
+    async fn test_serve_connection_replays_multichunk_snapshot_off_a_tiny_bus() {
+        // Regression for #227: a tree spanning several SNAPSHOT_CHUNK frames,
+        // served over an event bus far smaller than the chunk count, must still
+        // arrive complete — the snapshot is delivered per connection, off the
+        // bus, backpressured by the socket. Under the old bus broadcast the
+        // surplus chunks were silently dropped and `final_chunk` never arrived.
+        let tmp = TempDir::new("multichunk");
+        let file_count = SNAPSHOT_CHUNK * 2 + 1; // three chunks
+        for i in 0..file_count {
+            write_file(&tmp.path.join(format!("f{i:06}.txt")), "x");
+        }
 
-        let (client, server) = tokio::io::duplex(1024);
-        let (mut client_reader, _client_writer) = tokio::io::split(client);
-        let (_server_reader, mut server_writer) = tokio::io::split(server);
+        // Bus capacity 2 is below the snapshot's chunk count (3): if the snapshot
+        // still flowed over the bus, chunks would be dropped and the read below
+        // would time out.
+        let (mut daemon, handles) = channels(2, 8);
+        daemon.watch_worktree(tmp.path.clone());
+        let inbound = handles.inbound.clone();
+        let events = handles.subscribe();
+        let state = handles.state.clone();
+        let loop_handle = tokio::spawn(daemon.run());
 
-        let writer = tokio::spawn(async move {
-            write_messages(&mut server_writer, &messages)
-                .await
-                .expect("write all chunks");
+        let (client, server) = tokio::io::duplex(8 * 1024);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+        let (server_reader, server_writer) = tokio::io::split(server);
+        let conn = tokio::spawn(async move {
+            let _ = serve_connection(server_reader, server_writer, inbound, events, state).await;
         });
 
+        client_writer
+            .write_all(&hello_frame())
+            .await
+            .expect("send Hello");
+        client_writer.flush().await.expect("flush Hello");
+
         let mut decoder = FrameDecoder::new();
-        let mut received = 0usize;
-        loop {
-            match read_daemon_message(&mut client_reader, &mut decoder).await {
-                DaemonMessage::WorktreeSnapshot {
-                    entries,
-                    final_chunk,
-                    ..
-                } => {
-                    assert_eq!(entries.len(), 1);
-                    received += 1;
-                    if final_chunk {
-                        break;
-                    }
-                }
-                other => panic!("unexpected message: {other:?}"),
-            }
-        }
-        assert_eq!(received, chunk_count, "every snapshot chunk must arrive");
-        writer.await.expect("writer task joins");
+        let entries = read_full_snapshot(&mut client_reader, &mut decoder).await;
+        assert_eq!(
+            entries.len(),
+            file_count,
+            "every entry across all chunks must arrive despite the tiny bus"
+        );
+
+        drop(client_writer);
+        drop(client_reader);
+        conn.abort();
+        loop_handle.abort();
     }
 
     #[tokio::test]
