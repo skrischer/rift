@@ -1,0 +1,14 @@
+# Standalone fixture crate for the rust-analyzer spike. The empty `[workspace]`
+# table detaches it from rift's workspace so cargo treats it as its own project
+# root (which rust-analyzer initializes against), and so the outer build never
+# tries to compile it.
+[workspace]
+
+[package]
+name = "spike-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"

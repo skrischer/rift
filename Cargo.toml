@@ -6,6 +6,7 @@ members = [
     "crates/tmux-core",
     "crates/terminal",
     "crates/explorer",
+    "crates/lsp",
     "crates/protocol",
     "crates/plugin-api",
     "crates/ssh",
@@ -32,6 +33,18 @@ notify = "7"
 gix = { version = "0.84", default-features = false, features = ["status", "dirwalk", "revision", "sha1", "max-performance-safe"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# LSP client stack (daemon-side, gpui-free, musl-clean). `async-lsp` pins
+# `lsp-types = 0.95`; depend on that same line so the diagnostic types match the
+# version `async-lsp` speaks across the JSON-RPC boundary. `lsp-types` upstream
+# is stalled (docs/prior-art.md caveat 6) — watch `tower-lsp-community/ls-types`.
+async-lsp = { version = "0.2", default-features = false, features = ["omni-trait", "tracing", "tokio"] }
+lsp-types = "0.95"
+# Bridges the daemon's tokio child-process stdio into the futures-io `AsyncRead`
+# / `AsyncWrite` that `async-lsp`'s `MainLoop::run_buffered` consumes, so the
+# crate stays on tokio alone (no second smol/async-process runtime).
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"
+tower = "0.5"
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform" }
 gpui-component = { git = "https://github.com/longbridge/gpui-component" }

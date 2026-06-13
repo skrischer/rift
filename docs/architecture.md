@@ -158,6 +158,7 @@ Editing uses a deliberate request/response buffer channel over the daemon transp
 | Terminal emulation | `alacritty_terminal` 0.26 |
 | VTE parsing | `vte` (via alacritty_terminal) |
 | SSH connection | `russh` |
+| LSP client | `async-lsp` (MIT OR Apache-2.0) over `lsp-types` 0.95 (MIT) — daemon-side, `gpui`-free, musl-clean |
 | Async runtime | `tokio` |
 | Channel bridge | `flume` |
 | Serialization | `serde` + `serde_json` |
@@ -174,6 +175,7 @@ rift/
 │   ├── daemon/             # Remote daemon binary
 │   ├── tmux-core/          # tmux control mode parser + state (currently using termy's TmuxClient directly)
 │   ├── explorer/           # File watcher, git status — library used by daemon
+│   ├── lsp/                # Daemon-side LSP client (async-lsp) — library used by daemon, gpui-free + musl-clean
 │   ├── protocol/           # Shared message types. Serializable with serde
 │   └── plugin-api/         # Plugin trait for pane awareness (Phase 3+)
 ├── AGENTS.md
