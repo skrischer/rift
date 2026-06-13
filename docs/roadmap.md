@@ -16,7 +16,7 @@
 | 2d | Tab bar + statusbar enrichment | [spec-phase2d-tabbar.md](spec-phase2d-tabbar.md) | [Phase 2d](https://github.com/skrischer/rift/milestone/1) |
 | 2e | gpui-component UI foundation | [archive/spec-gpui-component-adoption.md](archive/spec-gpui-component-adoption.md) | — |
 | 3.1 | Daemon scaffolding + transport | [archive/spec-daemon-scaffolding.md](archive/spec-daemon-scaffolding.md) | [Remote daemon](https://github.com/skrischer/rift/milestone/4) |
-| 3.2 | Worktree file-tree sync | [spec-daemon-filetree.md](spec-daemon-filetree.md) | [File-tree sync](https://github.com/skrischer/rift/milestone/9) |
+| 3.2 | Worktree file-tree sync | [archive/spec-daemon-filetree.md](archive/spec-daemon-filetree.md) | [File-tree sync](https://github.com/skrischer/rift/milestone/9) |
 | 3.3 | Git status | [spec-daemon-git-status.md](spec-daemon-git-status.md) | [Git status](https://github.com/skrischer/rift/milestone/11) |
 | 3.4 | LSP diagnostics | [spec-daemon-lsp.md](spec-daemon-lsp.md) | [LSP diagnostics](https://github.com/skrischer/rift/milestone/13) |
 | 4 | Editor — GUI editing surface | [spec-editor.md](spec-editor.md) | [Editor](https://github.com/skrischer/rift/milestone/14) |
@@ -39,12 +39,11 @@ it is `READY`. The milestone (open/closed + issue progress) is where status live
 
 ## Current focus
 
-**Phase 3.2: Worktree file-tree sync** — the data layer everything downstream
-consumes: git status (3.3) decorates its entries, LSP documents (3.4) follow its
-watcher, the editor (4) renders it. Remaining issues #110, #111; the already-planned
-3.3 / 3.4 / 4 / 5 / 6 / 7 / 8 / 9 queues unblock behind it. **All roadmap phases
-and tracks are planned** — `/loopkit:plan` is waiting for new phases; the
-Logging & diagnostics track (milestone 20) is immediately workable in parallel.
+**Phase 3.3: Git status** — decorates the worktree-sync entries (3.2, now
+complete and archived) with git state; milestone 11. The 3.4 / 4 / 5 / 6 / 7 / 8 / 9
+queues unblock behind it. **All roadmap phases and tracks are planned** —
+`/loopkit:plan` is waiting for new phases; the Logging & diagnostics track
+(milestone 20) is immediately workable in parallel.
 
 ## North star
 
