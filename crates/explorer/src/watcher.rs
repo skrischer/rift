@@ -19,7 +19,11 @@ use std::time::{Duration, Instant};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
 
 use crate::snapshot::{Change, EntryKind};
-use crate::{ExplorerError, Result, Snapshot};
+use crate::{ExplorerError, GitStatus, Result, Snapshot};
+
+/// What [`Watcher::start`] returns: the watcher, the worktree change receiver,
+/// and (in git mode) the git-status receiver.
+type StartParts = (Watcher, Receiver<Vec<Change>>, Option<Receiver<GitStatus>>);
 
 /// Quiet period after the last event before a burst is flushed into a diff.
 const DEBOUNCE: Duration = Duration::from_millis(100);
@@ -46,6 +50,35 @@ impl Watcher {
     /// is the only error returned. A *per-directory* watch failure later (the watch
     /// limit) is logged once and degraded, never fatal.
     pub fn new(initial: Snapshot) -> Result<(Self, Receiver<Vec<Change>>)> {
+        let (watcher, changes, _git) = Self::start(initial, false)?;
+        Ok((watcher, changes))
+    }
+
+    /// Like [`Watcher::new`], but additionally watches the repository's `.git/`
+    /// control files and recomputes the git status on every flush, emitting it
+    /// on a second receiver.
+    ///
+    /// This reuses the *same* `notify` backend and worker as the worktree watch
+    /// — the `.git/` whitelist (`.git` non-recursively for `HEAD` / `index` /
+    /// `packed-refs`, `.git/refs` recursively for branch refs) is a second
+    /// watched set layered on it, not a separate watcher stack. So a worktree
+    /// edit *and* a `.git/`-only change (commit, `git add`, branch switch) each
+    /// trigger a debounced recompute. A recompute that fails (e.g. a transient
+    /// `index.lock` mid-write) is logged and skipped; the next change recomputes.
+    pub fn with_git_status(
+        initial: Snapshot,
+    ) -> Result<(Self, Receiver<Vec<Change>>, Receiver<GitStatus>)> {
+        let (watcher, changes, git) = Self::start(initial, true)?;
+        Ok((
+            watcher,
+            changes,
+            git.expect("git receiver is present when git watching is requested"),
+        ))
+    }
+
+    /// Shared setup for [`Watcher::new`] and [`Watcher::with_git_status`]. With
+    /// `git`, registers the `.git/` whitelist and returns a git-status receiver.
+    fn start(initial: Snapshot, git: bool) -> Result<StartParts> {
         let (event_tx, event_rx) = mpsc::channel();
         let watcher = RecommendedWatcher::new(
             move |result: notify::Result<Event>| {
@@ -60,13 +93,38 @@ impl Watcher {
         // this returns is already observed.
         let mut watches = WatchSet::new(watcher);
         watches.reconcile(&initial);
+        if git {
+            // The worktree scan excludes `.git/`, so add a bounded second watched
+            // set for the control files git mutates: `.git` non-recursively
+            // (HEAD, index, packed-refs are direct children) and `.git/refs`
+            // recursively (branch refs). Non-recursive on `.git` deliberately
+            // skips the heavy `.git/objects` churn during gc/rebase.
+            let git_dir = initial.root().join(".git");
+            watches.watch_external(&git_dir, RecursiveMode::NonRecursive);
+            watches.watch_external(&git_dir.join("refs"), RecursiveMode::Recursive);
+        }
 
         let (change_tx, change_rx) = mpsc::channel();
+        let (git_tx, git_rx) = if git {
+            let (tx, rx) = mpsc::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
         let worker = std::thread::Builder::new()
             .name("rift-explorer-watch".to_owned())
-            .spawn(move || run(watches, initial, event_rx, change_tx, worker_shutdown))
+            .spawn(move || {
+                run(
+                    watches,
+                    initial,
+                    event_rx,
+                    change_tx,
+                    git_tx,
+                    worker_shutdown,
+                )
+            })
             .map_err(|err| ExplorerError::WatchError(err.to_string()))?;
 
         Ok((
@@ -75,6 +133,7 @@ impl Watcher {
                 worker: Some(worker),
             },
             change_rx,
+            git_rx,
         ))
     }
 }
@@ -94,6 +153,7 @@ struct WatchSet {
     watcher: RecommendedWatcher,
     dirs: BTreeSet<PathBuf>,
     warned: bool,
+    warned_git: bool,
 }
 
 impl WatchSet {
@@ -102,6 +162,7 @@ impl WatchSet {
             watcher,
             dirs: BTreeSet::new(),
             warned: false,
+            warned_git: false,
         }
     }
 
@@ -129,6 +190,23 @@ impl WatchSet {
         if self.dirs.remove(dir) {
             // The directory is usually already gone, so an error here is expected.
             let _ = self.watcher.unwatch(dir);
+        }
+    }
+
+    /// Watch `path` once, outside the snapshot-reconciled `dirs` set, so
+    /// [`WatchSet::reconcile`] never unwatches it. Used for the `.git/` control
+    /// whitelist. A missing path or watch-limit failure is logged once and
+    /// skipped, never fatal.
+    fn watch_external(&mut self, path: &Path, mode: RecursiveMode) {
+        if let Err(err) = self.watcher.watch(path, mode) {
+            // Separate latch from `warned`: a `.git/` registration failure (a
+            // missing path, or `.git` being a file for a linked worktree) is a
+            // distinct condition from the worktree watch-limit warning, and must
+            // not suppress the other's diagnostics.
+            if !self.warned_git {
+                self.warned_git = true;
+                tracing::warn!(%err, path = %path.display(), "cannot register .git watch; some git-state changes may be missed");
+            }
         }
     }
 
@@ -163,15 +241,19 @@ fn run(
     mut snapshot: Snapshot,
     events: Receiver<notify::Result<Event>>,
     changes: mpsc::Sender<Vec<Change>>,
+    git: Option<mpsc::Sender<GitStatus>>,
     shutdown: Arc<AtomicBool>,
 ) {
     while !shutdown.load(Ordering::Relaxed) {
         // Block (waking periodically to notice shutdown) until a burst begins.
-        match events.recv_timeout(IDLE_POLL) {
-            Ok(event) => log_event_error(&event),
+        let mut saw_change = match events.recv_timeout(IDLE_POLL) {
+            Ok(event) => {
+                log_event_error(&event);
+                is_change(&event)
+            }
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return,
-        }
+        };
 
         // Coalesce the rest of the burst: drain until the stream is quiet for
         // DEBOUNCE, or the burst has run for MAX_COALESCE.
@@ -183,6 +265,7 @@ fn run(
             match events.recv_timeout(DEBOUNCE) {
                 Ok(event) => {
                     log_event_error(&event);
+                    saw_change |= is_change(&event);
                     if burst_start.elapsed() >= MAX_COALESCE {
                         break;
                     }
@@ -191,23 +274,48 @@ fn run(
             }
         }
 
-        // Reconcile against the current tree and emit any deltas.
-        let next = match Snapshot::scan(snapshot.root()) {
-            Ok(next) => next,
-            Err(err) => {
-                tracing::warn!(%err, "worktree rescan failed; keeping previous snapshot");
-                continue;
-            }
-        };
-        let batch = snapshot.diff(&next);
-        if batch.is_empty() {
+        // A burst of only `Access` (open/read) events is not a change. Our own
+        // rescan and the git recompute open watched directories, which inotify
+        // reports as `Access` — flushing on those would feed back into an
+        // endless rescan loop. Wait for a real create/modify/remove instead.
+        if !saw_change {
             continue;
         }
-        snapshot = next;
-        watches.reconcile(&snapshot);
-        if changes.send(batch).is_err() {
-            // The consumer dropped the receiver; nothing more to do.
-            return;
+
+        // Reconcile against the current tree and emit any worktree deltas. A
+        // rescan failure is logged but must not skip the git recompute below: a
+        // `.git/`-only change leaves the worktree unchanged yet still alters git
+        // status.
+        match Snapshot::scan(snapshot.root()) {
+            Ok(next) => {
+                let batch = snapshot.diff(&next);
+                if !batch.is_empty() {
+                    snapshot = next;
+                    watches.reconcile(&snapshot);
+                    if changes.send(batch).is_err() {
+                        // The consumer dropped the receiver; nothing more to do.
+                        return;
+                    }
+                }
+            }
+            Err(err) => tracing::warn!(%err, "worktree rescan failed; keeping previous snapshot"),
+        }
+
+        // Git status recompute (git mode only). Runs on every flush — a worktree
+        // edit or any `.git/` control change. A compute error (e.g. a transient
+        // `index.lock` while git is mid-write) is logged and skipped; the next
+        // flush recomputes, so a momentary lock never aborts watching.
+        if let Some(git_tx) = &git {
+            match GitStatus::compute(snapshot.root()) {
+                Ok(status) => {
+                    if git_tx.send(status).is_err() {
+                        return;
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "git status recompute failed; retrying on next change")
+                }
+            }
         }
     }
 }
@@ -218,6 +326,22 @@ fn log_event_error(event: &notify::Result<Event>) {
     if let Err(err) = event {
         tracing::warn!(%err, "filesystem watch error");
     }
+}
+
+/// Whether an event represents an actual filesystem change worth a rescan.
+///
+/// `Access` (open/read/close) events are pure reads — and our own rescan and
+/// git recompute generate them by opening watched directories — so they must
+/// not trigger a flush, or the watcher feeds back into an endless loop. Errors
+/// are not changes either (they are logged separately).
+///
+/// Excluding the whole `Access(_)` family — including `Access(Close(Write))` —
+/// is safe: `notify`'s supported backends report an actual write as a
+/// `Modify` event, not as a close-for-write Access, so no real mutation is
+/// lost. `EventKind::Any`/`Other` pass through as changes (a spurious extra
+/// rescan, never a missed change).
+fn is_change(event: &notify::Result<Event>) -> bool {
+    matches!(event, Ok(ev) if !matches!(ev.kind, notify::EventKind::Access(_)))
 }
 
 #[cfg(test)]
@@ -432,5 +556,154 @@ mod tests {
         assert!(batch
             .iter()
             .any(|c| matches!(c, Change::Changed { path, .. } if path == Path::new("pkg/mod.rs"))));
+    }
+
+    // --- git-status watching (#133) ---
+
+    use crate::{GitStatus, GitStatusCode};
+    use std::process::Command;
+
+    /// Run a git command in `dir`, asserting success. Real `git` is the ground
+    /// truth for the `.git/` mutations the watcher must observe.
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// An initialized repo with one committed file on `main`, plus a started
+    /// git-status watcher and its receivers.
+    fn init_repo_with_watcher(
+        tag: &str,
+    ) -> (TempDir, Watcher, Receiver<Vec<Change>>, Receiver<GitStatus>) {
+        let tmp = TempDir::new(tag);
+        git(&tmp.path, &["init", "-q", "-b", "main"]);
+        write_file(&tmp.path.join("tracked.txt"), "v1\n");
+        git(&tmp.path, &["add", "tracked.txt"]);
+        git(&tmp.path, &["commit", "-q", "-m", "init"]);
+
+        let snapshot = Snapshot::scan(&tmp.path).expect("scan");
+        let (watcher, changes, git_rx) = Watcher::with_git_status(snapshot).expect("git watcher");
+        (tmp, watcher, changes, git_rx)
+    }
+
+    fn recv_git(rx: &Receiver<GitStatus>) -> GitStatus {
+        rx.recv_timeout(RECV_TIMEOUT)
+            .expect("a git status within the timeout")
+    }
+
+    /// Drain to the most recent git status received within a short settle window,
+    /// so coalesced/late recomputes don't leave a stale value under inspection.
+    fn recv_latest_git(rx: &Receiver<GitStatus>) -> GitStatus {
+        let mut last = recv_git(rx);
+        while let Ok(next) = rx.recv_timeout(DEBOUNCE * 4) {
+            last = next;
+        }
+        last
+    }
+
+    #[test]
+    fn test_git_watch_worktree_edit_triggers_recompute() {
+        let (tmp, _w, _changes, git_rx) = init_repo_with_watcher("wt-edit");
+        // An untracked file is a pure worktree change (no `.git/` mutation): it
+        // must still trigger a git recompute.
+        write_file(&tmp.path.join("loose.txt"), "x\n");
+
+        let status = recv_latest_git(&git_rx);
+        assert_eq!(
+            status.get(Path::new("loose.txt")).map(|s| s.worktree),
+            Some(GitStatusCode::Untracked)
+        );
+    }
+
+    #[test]
+    fn test_git_watch_staging_triggers_recompute_via_git_index() {
+        let (tmp, _w, _changes, git_rx) = init_repo_with_watcher("stage");
+        write_file(&tmp.path.join("tracked.txt"), "v2\n");
+        // `git add` mutates `.git/index` — observed through the `.git` whitelist.
+        git(&tmp.path, &["add", "tracked.txt"]);
+
+        let status = recv_latest_git(&git_rx);
+        assert_eq!(
+            status.get(Path::new("tracked.txt")).map(|s| s.index),
+            Some(GitStatusCode::Modified),
+            "staging must surface on the index side after a recompute"
+        );
+    }
+
+    #[test]
+    fn test_git_watch_commit_triggers_recompute_to_clean() {
+        let (tmp, _w, _changes, git_rx) = init_repo_with_watcher("commit");
+        write_file(&tmp.path.join("tracked.txt"), "v2\n");
+        git(&tmp.path, &["add", "tracked.txt"]);
+        // Committing (a `.git/`-only change beyond the index) clears the status.
+        git(&tmp.path, &["commit", "-q", "-m", "change"]);
+
+        let status = recv_latest_git(&git_rx);
+        assert!(
+            status.get(Path::new("tracked.txt")).is_none(),
+            "after commit the file is clean: {:?}",
+            status.get(Path::new("tracked.txt"))
+        );
+    }
+
+    #[test]
+    fn test_git_watch_branch_switch_updates_repo_state() {
+        let (tmp, _w, _changes, git_rx) = init_repo_with_watcher("branch");
+        // A branch switch mutates `.git/HEAD` only — observed via the whitelist.
+        git(&tmp.path, &["checkout", "-q", "-b", "feature"]);
+
+        let status = recv_latest_git(&git_rx);
+        assert_eq!(status.repo().branch.as_deref(), Some("feature"));
+    }
+
+    #[test]
+    fn test_git_watch_coalesces_rapid_edits() {
+        let (tmp, _w, _changes, git_rx) = init_repo_with_watcher("coalesce");
+        const WRITES: usize = 6;
+        for i in 0..WRITES {
+            write_file(&tmp.path.join(format!("f{i}.txt")), "x\n");
+        }
+
+        let mut recomputes = vec![recv_git(&git_rx)];
+        while let Ok(status) = git_rx.recv_timeout(DEBOUNCE * 4) {
+            recomputes.push(status);
+        }
+        assert!(
+            recomputes.len() < WRITES,
+            "expected coalescing: {} recomputes for {WRITES} writes",
+            recomputes.len()
+        );
+    }
+
+    #[test]
+    fn test_git_watch_tolerates_stale_index_lock() {
+        let (tmp, _w, _changes, git_rx) = init_repo_with_watcher("lock");
+        // A leftover (stale) index.lock must not abort watching: the watcher
+        // keeps recomputing and a later change still yields a status. (gix reads
+        // succeed past a stale lock file; the genuine mid-write torn-index error
+        // can't be reproduced deterministically without a lock-holding process,
+        // but the compute-error path is logged-and-skipped in `run`.)
+        write_file(&tmp.path.join(".git/index.lock"), "");
+        write_file(&tmp.path.join("after_lock.txt"), "x\n");
+
+        let status = recv_latest_git(&git_rx);
+        assert_eq!(
+            status.get(Path::new("after_lock.txt")).map(|s| s.worktree),
+            Some(GitStatusCode::Untracked),
+            "watcher must keep recomputing despite a present index.lock"
+        );
     }
 }
