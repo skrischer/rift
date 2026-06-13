@@ -48,6 +48,7 @@ streams pane bytes and layout state back.
 { "type": "pane_output",     "pane_id": 3, "bytes": [27, 91, 49, 109, ...] }
 { "type": "layout_snapshot", "session": "rift", "windows": [ <window>, ... ] }
 { "type": "layout_update",   "session": "rift", "windows": [ <window>, ... ] }
+{ "type": "terminal_exit",   "session": "rift", "reason": "server exited" }
 ```
 
 ```jsonc
@@ -71,6 +72,11 @@ streams pane bytes and layout state back.
 - `layout_update` is the **full latest layout** after a structural change (window
   add/close, pane split/resize, active-window switch) — a replace, not a delta, so
   applying it is idempotent.
+- `terminal_exit` signals the attach's terminal path went down — the tmux server
+  exited (`%exit`) or the control-mode child died. It is a per-attach signal, not a
+  daemon failure: the daemon keeps serving its other clients, and the client may
+  re-`attach` to resume against a still-live session (`reason` is tmux's `%exit`
+  text when present, else `null`).
 
 ### Snapshot ↔ live-stream consistency contract
 
@@ -107,8 +113,9 @@ their own phases (explorer / git-status); summarized here for completeness:
 ```
 
 > `state_update` (`{ "sessions": [...] }`) was the scaffolding placeholder for
-> session/layout state. It is superseded by `layout_snapshot` / `layout_update`
-> and is retired with the throwaway spike wiring (`crates/daemon/src/spike.rs`).
+> session/layout state. It was superseded by `layout_snapshot` / `layout_update`
+> and **removed** together with the throwaway spike wiring when the daemon took
+> ownership of the tmux session (#204).
 
 ## Diagnostics
 
