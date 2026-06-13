@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use rift_protocol::WorktreeEntry;
+use rift_protocol::{AheadBehind, GitEntryStatus, GitStatusEntry, WorktreeEntry};
 
 /// In-flight accumulation of a chunked snapshot (`final_chunk` not yet seen).
 #[derive(Debug)]
@@ -32,6 +32,16 @@ pub struct WorktreeModel {
     pending: Option<PendingSnapshot>,
     /// Whether a complete snapshot has ever been applied.
     synced: bool,
+    /// Per-path git status, keyed the same way as `entries`. Independent of the
+    /// tree: a status may exist for a path the tree has not added yet (a renderer
+    /// joins the two by path), so a racing git update can never corrupt the tree.
+    /// Reset whenever a worktree snapshot completes — the daemon re-sends the full
+    /// git status right after every snapshot (`spec-daemon-git-status.md`, #134).
+    git: BTreeMap<String, GitEntryStatus>,
+    /// Repo-level branch name (`None` = detached HEAD or no repo).
+    branch: Option<String>,
+    /// Ahead/behind vs the upstream (`None` = no upstream / no repo).
+    ahead_behind: Option<AheadBehind>,
 }
 
 impl WorktreeModel {
@@ -81,6 +91,13 @@ impl WorktreeModel {
             .collect();
         self.root = Some(root);
         self.synced = true;
+        // The daemon re-sends the full git status immediately behind every
+        // snapshot, so drop the prior decoration here — it is about to be
+        // re-applied from that replay, and anything not in it has gone clean
+        // (or this is a non-repo root, where nothing follows and git stays empty).
+        self.git.clear();
+        self.branch = None;
+        self.ahead_behind = None;
         true
     }
 
@@ -122,9 +139,55 @@ impl WorktreeModel {
         true
     }
 
+    /// Apply an incremental git-status update: upsert each `changed` entry's
+    /// status by path, drop the decoration for each `cleared` path (the file
+    /// returned to clean).
+    ///
+    /// Applied unconditionally — the git map is independent of the tree, so a
+    /// status for a path not yet in `entries` is simply buffered and decorates
+    /// the entry once it arrives; it can never corrupt the tree. This is the
+    /// reconciliation rule for an unknown path: buffer, never drop, since the
+    /// daemon only sends status for paths it tracks and the next snapshot resets.
+    pub fn apply_git_update(&mut self, changed: Vec<GitStatusEntry>, cleared: Vec<String>) {
+        for entry in changed {
+            self.git.insert(entry.path, entry.status);
+        }
+        for path in &cleared {
+            self.git.remove(path);
+        }
+    }
+
+    /// Apply the repo-level git state: current branch and ahead/behind. Replaces
+    /// the held values wholesale (the daemon sends the full repo state, not a
+    /// delta).
+    pub fn apply_repo_state(&mut self, branch: Option<String>, ahead_behind: Option<AheadBehind>) {
+        self.branch = branch;
+        self.ahead_behind = ahead_behind;
+    }
+
     /// The daemon-side project root, once a complete snapshot has arrived.
     pub fn root(&self) -> Option<&str> {
         self.root.as_deref()
+    }
+
+    /// The git status of one path, or `None` if the path is clean / undecorated.
+    pub fn git_status(&self, path: &str) -> Option<GitEntryStatus> {
+        self.git.get(path).copied()
+    }
+
+    /// All per-path git statuses, keyed by path relative to [`WorktreeModel::root`].
+    pub fn git_statuses(&self) -> &BTreeMap<String, GitEntryStatus> {
+        &self.git
+    }
+
+    /// The current branch name, or `None` for a detached HEAD / non-repo root.
+    pub fn branch(&self) -> Option<&str> {
+        self.branch.as_deref()
+    }
+
+    /// Ahead/behind vs the upstream, or `None` when there is no upstream / repo.
+    pub fn ahead_behind(&self) -> Option<AheadBehind> {
+        self.ahead_behind
     }
 
     /// All entries, keyed by their path relative to [`WorktreeModel::root`].
@@ -289,6 +352,219 @@ mod tests {
         model.apply_snapshot_chunk("/proj".into(), vec![file("real.txt", 2)], true);
         assert_eq!(model.len(), 1);
         assert!(model.get("early.txt").is_none());
+    }
+
+    // --- git status decoration (#135) ---
+
+    use rift_protocol::{GitEntryStatus, GitStatusCode, GitStatusEntry};
+
+    fn git_entry(path: &str, index: GitStatusCode, worktree: GitStatusCode) -> GitStatusEntry {
+        GitStatusEntry {
+            path: path.to_owned(),
+            status: GitEntryStatus { index, worktree },
+        }
+    }
+
+    #[test]
+    fn test_apply_git_update_upserts_and_clears() {
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk("/proj".into(), vec![file("a.rs", 1), file("b.rs", 1)], true);
+
+        model.apply_git_update(
+            vec![
+                git_entry("a.rs", GitStatusCode::Unmodified, GitStatusCode::Modified),
+                git_entry("b.rs", GitStatusCode::Added, GitStatusCode::Unmodified),
+            ],
+            vec![],
+        );
+        assert_eq!(
+            model.git_status("a.rs"),
+            Some(GitEntryStatus {
+                index: GitStatusCode::Unmodified,
+                worktree: GitStatusCode::Modified
+            })
+        );
+        assert_eq!(
+            model.git_status("b.rs").map(|s| s.index),
+            Some(GitStatusCode::Added)
+        );
+
+        // `cleared` drops the decoration (the file returned to clean).
+        model.apply_git_update(vec![], vec!["a.rs".into()]);
+        assert_eq!(model.git_status("a.rs"), None);
+        assert!(model.git_status("b.rs").is_some());
+    }
+
+    #[test]
+    fn test_apply_git_update_unknown_path_is_buffered_not_dropped() {
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk("/proj".into(), vec![file("known.rs", 1)], true);
+
+        // A status for a path the tree does not (yet) hold is buffered: it is
+        // recorded and decorates the entry once it arrives, never corrupting the
+        // tree (the maps are independent).
+        model.apply_git_update(
+            vec![git_entry(
+                "pending.rs",
+                GitStatusCode::Unmodified,
+                GitStatusCode::Untracked,
+            )],
+            vec![],
+        );
+        assert_eq!(
+            model.git_status("pending.rs").map(|s| s.worktree),
+            Some(GitStatusCode::Untracked)
+        );
+        // The tree is untouched by the git update.
+        assert!(model.get("pending.rs").is_none());
+        assert_eq!(model.len(), 1);
+    }
+
+    #[test]
+    fn test_git_update_before_snapshot_is_reset_by_snapshot() {
+        // Symmetry with the tree's `apply_update_before_first_snapshot`: a git
+        // update may arrive before the first snapshot; it is buffered, then the
+        // snapshot reset wipes it so no pre-snapshot decoration leaks. The
+        // authoritative full git replay follows the snapshot.
+        let mut model = WorktreeModel::default();
+        model.apply_git_update(
+            vec![git_entry(
+                "early.rs",
+                GitStatusCode::Unmodified,
+                GitStatusCode::Modified,
+            )],
+            vec![],
+        );
+        model.apply_repo_state(Some("stale".into()), None);
+
+        model.apply_snapshot_chunk("/proj".into(), vec![file("early.rs", 1)], true);
+        assert_eq!(model.git_status("early.rs"), None);
+        assert_eq!(model.branch(), None);
+    }
+
+    #[test]
+    fn test_apply_repo_state_stores_branch_and_ahead_behind() {
+        let mut model = WorktreeModel::default();
+        model.apply_repo_state(
+            Some("main".into()),
+            Some(AheadBehind {
+                ahead: 2,
+                behind: 1,
+            }),
+        );
+        assert_eq!(model.branch(), Some("main"));
+        assert_eq!(
+            model.ahead_behind(),
+            Some(AheadBehind {
+                ahead: 2,
+                behind: 1
+            })
+        );
+
+        // Detached / no upstream replaces wholesale.
+        model.apply_repo_state(None, None);
+        assert_eq!(model.branch(), None);
+        assert_eq!(model.ahead_behind(), None);
+    }
+
+    #[test]
+    fn test_snapshot_resets_stale_git_decoration() {
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk("/proj".into(), vec![file("a.rs", 1)], true);
+        model.apply_git_update(
+            vec![git_entry(
+                "a.rs",
+                GitStatusCode::Unmodified,
+                GitStatusCode::Modified,
+            )],
+            vec![],
+        );
+        model.apply_repo_state(Some("main".into()), None);
+
+        // A new snapshot (e.g. on reattach) drops the prior git decoration and
+        // repo state; the daemon re-sends the full git status right behind it.
+        model.apply_snapshot_chunk("/proj".into(), vec![file("a.rs", 2)], true);
+        assert_eq!(model.git_status("a.rs"), None);
+        assert_eq!(model.branch(), None);
+        assert!(model.git_statuses().is_empty());
+    }
+
+    #[test]
+    fn test_git_status_sequence_reproduces_daemon_view() {
+        // Mirror the daemon's lifecycle: worktree snapshot, then the full git
+        // replay (UpdateGitStatus with everything + RepoState), then incremental
+        // updates as the user stages and edits. The final decoration must match
+        // git's own view (staged vs unstaged) plus the branch.
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk(
+            "/proj".into(),
+            vec![
+                file("staged.rs", 1),
+                file("dirty.rs", 1),
+                file("loose.rs", 1),
+            ],
+            true,
+        );
+
+        // Full replay behind the snapshot.
+        model.apply_git_update(
+            vec![
+                git_entry("staged.rs", GitStatusCode::Added, GitStatusCode::Unmodified),
+                git_entry(
+                    "dirty.rs",
+                    GitStatusCode::Unmodified,
+                    GitStatusCode::Modified,
+                ),
+                git_entry(
+                    "loose.rs",
+                    GitStatusCode::Unmodified,
+                    GitStatusCode::Untracked,
+                ),
+            ],
+            vec![],
+        );
+        model.apply_repo_state(
+            Some("main".into()),
+            Some(AheadBehind {
+                ahead: 1,
+                behind: 0,
+            }),
+        );
+
+        // Incremental: dirty.rs gets staged (moves to the index side); loose.rs
+        // gets committed away (cleared).
+        model.apply_git_update(
+            vec![git_entry(
+                "dirty.rs",
+                GitStatusCode::Modified,
+                GitStatusCode::Unmodified,
+            )],
+            vec!["loose.rs".into()],
+        );
+
+        assert_eq!(
+            model.git_status("staged.rs"),
+            Some(GitEntryStatus {
+                index: GitStatusCode::Added,
+                worktree: GitStatusCode::Unmodified
+            })
+        );
+        assert_eq!(
+            model.git_status("dirty.rs"),
+            Some(GitEntryStatus {
+                index: GitStatusCode::Modified,
+                worktree: GitStatusCode::Unmodified
+            })
+        );
+        assert_eq!(model.git_status("loose.rs"), None);
+        assert_eq!(model.branch(), Some("main"));
+        assert_eq!(
+            model.ahead_behind(),
+            Some(AheadBehind {
+                ahead: 1,
+                behind: 0
+            })
+        );
     }
 
     #[test]
