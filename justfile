@@ -347,7 +347,10 @@ _launch-windows exe session detach="":
     # RIFT_PROJECT_ROOT carries no `/p`: it is a path on the SSH host (Linux), not
     # a Windows path, so it must cross to the native exe verbatim (only
     # RIFT_DAEMON_BINARY needs WSL->Windows translation for the local read).
-    export WSLENV="RUST_LOG:RIFT_SSH_HOST:RIFT_SSH_USER:RIFT_SSH_PORT:RIFT_SSH_KEY:RIFT_SESSION:RIFT_PROJECT_ROOT:RIFT_DAEMON_BINARY/p"
+    # RIFT_TERMINAL_LEGACY (the #205 fallback switch) crosses verbatim too — any
+    # non-empty value selects the legacy direct `tmux -CC` path; unset/empty leaves
+    # the daemon terminal as the default.
+    export WSLENV="RUST_LOG:RIFT_SSH_HOST:RIFT_SSH_USER:RIFT_SSH_PORT:RIFT_SSH_KEY:RIFT_SESSION:RIFT_PROJECT_ROOT:RIFT_TERMINAL_LEGACY:RIFT_DAEMON_BINARY/p"
     export RUST_LOG=rift=debug,rift_ssh=debug
     export RIFT_SSH_HOST="{{RIFT_SSH_HOST}}"
     export RIFT_SSH_USER="{{RIFT_SSH_USER}}"
@@ -355,6 +358,7 @@ _launch-windows exe session detach="":
     export RIFT_SSH_KEY="{{windows_ssh_key}}"
     export RIFT_SESSION="{{session}}"
     export RIFT_PROJECT_ROOT="{{RIFT_PROJECT_ROOT}}"
+    export RIFT_TERMINAL_LEGACY="${RIFT_TERMINAL_LEGACY:-}"
     export RIFT_DAEMON_BINARY="{{RIFT_DAEMON_BINARY}}"
     if [ -n "{{detach}}" ]; then
       # Direct binfmt exec in its own session with detached stdio: the recipe (and
@@ -409,9 +413,15 @@ promote:
     # RIFT_DEFAULT_PROJECT_ROOT bakes the daemon's watched root via option_env! so
     # a bare desktop-shortcut launch (no env) still watches the project; runtime
     # RIFT_PROJECT_ROOT overrides it. Mirrors the RIFT_DEFAULT_SSH_KEY bake.
+    # RIFT_DEFAULT_DAEMON_BINARY bakes the local musl daemon path (the #205 swap
+    # makes the daemon load-bearing for the terminal): an env-free shortcut launch
+    # then reads/uploads the daemon and streams the terminal over it. The bake is
+    # the Windows form of the WSL musl path (wslpath -w) so the native exe can read
+    # it; runtime RIFT_DAEMON_BINARY still overrides. Mirrors the SSH-key bake.
     RIFT_DEFAULT_SSH_KEY="{{windows_ssh_key}}" \
     RIFT_DEFAULT_WORKDIR="$(wslpath -w /)" \
     RIFT_DEFAULT_PROJECT_ROOT="{{RIFT_PROJECT_ROOT}}" \
+    RIFT_DEFAULT_DAEMON_BINARY="$(wslpath -w '{{RIFT_DAEMON_BINARY}}')" \
       cargo build -p rift-app --profile stable --features windowed --target x86_64-pc-windows-gnu
     "{{windows_system32}}/taskkill.exe" /F /IM rift-stable.exe 2>/dev/null || true
     mkdir -p "{{windows_stable_dir}}"

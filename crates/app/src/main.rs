@@ -234,25 +234,120 @@ fn main() {
 
 async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
     use rift_ssh::SshConnection;
-    use termy_terminal_ui::{TmuxClient, TmuxNotification, TmuxSocketTarget};
 
     let mut conn = SshConnection::connect(&ssh.host, ssh.port, &ssh.user, &ssh.key)
         .await
         .context("SSH connection failed")?;
 
-    // Provision the daemon ahead of the tmux session: detect the platform,
-    // upload the versioned binary when absent, then attach — spawning it
-    // detached if none is running — and confirm the transport with a handshake.
-    // The detached daemon survives SSH drops, so a reconnect reattaches instead
-    // of spawning a second one (#62). Gated on RIFT_DAEMON_BINARY; without it,
-    // skip and fall through to the existing tmux flow so the app still runs.
-    provision_daemon(&mut conn).await;
+    // Provision the daemon ahead of the terminal: detect the platform, upload the
+    // versioned binary when absent, then attach — spawning it detached if none is
+    // running — and confirm the transport with a handshake. The detached daemon
+    // survives SSH drops, so a reconnect reattaches instead of spawning a second
+    // one (#62). Returns the live client on success; `None` when no daemon binary
+    // is configured (or a step fails), in which case the legacy tmux path still
+    // runs without daemon-backed features.
+    let daemon_client = provision_daemon(&mut conn).await;
 
     // Tmux session name, overridable so a second rift instance can mirror the
     // same live session (default `rift`) or attach to an isolated one for
     // destructive tests (`RIFT_SESSION=rift-dev`). Matches the SshConfig env
     // pattern above. See docs/spec-dogfooding-channels.md.
     let session = env::var("RIFT_SESSION").unwrap_or_else(|_| "rift".to_string());
+
+    // Terminal byte source (Phase 6 swap, #205): the daemon protocol is the
+    // default; the legacy direct `tmux -CC` over an SSH PTY stays as an
+    // env-selected escape hatch until the milestone QA gate (gate decision in
+    // docs/spec-terminal-streaming.md). The render stack is identical either way —
+    // only where the bytes come from changes.
+    if use_daemon_terminal() {
+        match daemon_client {
+            Some(client) => {
+                info!("terminal source: daemon protocol");
+                return run_daemon_terminal(client, session, ch).await;
+            }
+            None => warn!(
+                "daemon terminal selected but no daemon available; \
+                 falling back to the legacy tmux path"
+            ),
+        }
+    } else if let Some(client) = daemon_client {
+        // Legacy terminal, but keep the daemon's worktree/git/diagnostics stream
+        // alive on its own task (today's behavior) while tmux drives the terminal.
+        info!("terminal source: legacy tmux (daemon worktree stream active)");
+        tokio::spawn(consume_daemon_messages(std::sync::Arc::new(client), None));
+    } else {
+        info!("terminal source: legacy tmux (no daemon configured)");
+    }
+
+    run_legacy_terminal(conn, session, ch).await
+}
+
+/// Whether the terminal sources its bytes from the daemon protocol (the default)
+/// rather than the legacy direct `tmux -CC` path. Any non-empty
+/// `RIFT_TERMINAL_LEGACY` selects the legacy escape hatch; the dev recipes
+/// forward the var so the fallback is operable end-to-end.
+fn use_daemon_terminal() -> bool {
+    !env::var_os("RIFT_TERMINAL_LEGACY").is_some_and(|v| !v.is_empty())
+}
+
+/// Drive the terminal entirely over the daemon protocol: open this client's tmux
+/// attach, bridge the reverse path (input, resize, raw commands, capture) onto
+/// the protocol, and fold the daemon's pane-output / layout / worktree stream
+/// into the existing render channels. Blocks until the daemon channel closes or
+/// the tmux attach reports `TerminalExit`; returning ends the session
+/// (`Disconnected` → quit), matching the legacy `tmux` exit path. The SSH
+/// connection (`conn`) stays alive for the session because it outlives this await
+/// in [`run_ssh_session`]'s frame.
+async fn run_daemon_terminal(
+    client: rift_ssh::DaemonClient,
+    session: String,
+    ch: PtyChannels,
+) -> Result<()> {
+    use rift_protocol::ClientMessage;
+    use std::sync::Arc;
+
+    let client = Arc::new(client);
+
+    // Open this client's own tmux attach, carrying `RIFT_SESSION` end-to-end. The
+    // daemon answers with a LayoutSnapshot baseline, then the live stream.
+    if let Err(e) = client
+        .send(ClientMessage::Attach {
+            session: session.clone(),
+        })
+        .await
+    {
+        warn!(%e, "failed to open daemon terminal attach");
+        return Ok(());
+    }
+    let _ = ch.connection_status_tx.send(ConnectionStatus::Connected);
+
+    // Reverse-path bridges: each forwards a render-side flume stream onto the
+    // protocol. They live as long as the daemon client; a closed channel ends the
+    // bridge. Pane ids cross the seam as tmux's native `%N` form.
+    spawn_input_bridge(client.clone(), ch.input_rx);
+    spawn_resize_bridge(client.clone(), ch.size_changed_rx);
+    spawn_command_bridge(client.clone(), ch.tmux_command_rx);
+    spawn_capture_bridge(ch.capture_request_rx, ch.capture_result_tx);
+
+    // Forward path: fold the daemon stream into the render channels (pane output,
+    // layout snapshots) and the worktree model. Blocks until the stream ends.
+    let sinks = TerminalSinks {
+        pane_output_tx: ch.pane_output_tx,
+        snapshot_tx: ch.snapshot_tx,
+    };
+    consume_daemon_messages(client, Some(sinks)).await;
+    Ok(())
+}
+
+/// The legacy terminal path: open a `tmux -CC` control-mode session over an SSH
+/// PTY and stream it through termy's [`TmuxClient`]. Identical to the pre-#205
+/// behavior; retained as the env-selected fallback until the milestone QA gate.
+async fn run_legacy_terminal(
+    mut conn: rift_ssh::SshConnection,
+    session: String,
+    ch: PtyChannels,
+) -> Result<()> {
+    use termy_terminal_ui::{TmuxClient, TmuxNotification, TmuxSocketTarget};
 
     let pty = conn
         .open_pty_exec(80, 24, &format!("tmux -CC new-session -A -s {session}"))
@@ -434,43 +529,45 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort daemon provisioning, run before the tmux session is opened.
+/// Best-effort daemon provisioning, run before the terminal is opened.
 ///
-/// Reads the locally-built musl binary from `RIFT_DAEMON_BINARY` (target dir
-/// `RIFT_DAEMON_REMOTE_DIR`, default `$HOME/.rift/bin`), deploys the versioned
-/// binary via [`rift_ssh::ensure_daemon_deployed`], then attaches to the remote
-/// daemon — spawning it detached if none is running — via
+/// Reads the locally-built musl binary from `RIFT_DAEMON_BINARY` (or the
+/// `just promote` compile-time bake `RIFT_DEFAULT_DAEMON_BINARY`; remote target
+/// dir `RIFT_DAEMON_REMOTE_DIR`, default `$HOME/.rift/bin`), deploys the
+/// versioned binary via [`rift_ssh::ensure_daemon_deployed`], then attaches to
+/// the remote daemon — spawning it detached if none is running — via
 /// [`rift_ssh::connect_or_spawn_daemon`] and confirms the transport with a
 /// `Hello`/`Welcome` handshake. The detached daemon outlives the SSH connection,
 /// so a later reconnect reattaches to it instead of spawning a second one (#62).
 ///
-/// After the handshake the client stays alive: a spawned consumer task applies
-/// the daemon's worktree stream (`WorktreeSnapshot` / `UpdateWorktree`) to the
-/// client-side [`rift_app::worktree::WorktreeModel`] and logs the resulting
-/// tree state — the protocol's first consumer (#111); rendering is a later
-/// sub-spec.
-///
-/// Every step is best-effort: a missing `RIFT_DAEMON_BINARY` or any error is
-/// logged and swallowed so the existing tmux flow keeps working without the
-/// daemon. The socket and log sit beside the versioned binary
-/// (`<binary>.sock` / `<binary>.log`), inheriting its resolved path.
-async fn provision_daemon(conn: &mut rift_ssh::SshConnection) {
-    // An unset or empty `RIFT_DAEMON_BINARY` skips provisioning: the dev recipes
-    // forward the var unconditionally and default it to empty, so empty must read
-    // as "not configured" rather than a path to read.
+/// Returns the live [`rift_ssh::DaemonClient`] on a clean handshake; the caller
+/// decides how to drive it (the terminal byte stream in daemon mode, or just the
+/// worktree/git/diagnostics consumer in legacy mode). Every step is best-effort:
+/// an unconfigured binary or any error logs and returns `None`, so the legacy
+/// tmux flow keeps working without the daemon. The socket and log sit beside the
+/// versioned binary (`<binary>.sock` / `<binary>.log`), inheriting its path.
+async fn provision_daemon(conn: &mut rift_ssh::SshConnection) -> Option<rift_ssh::DaemonClient> {
+    // RIFT_DAEMON_BINARY (runtime) wins over the `just promote` compile-time bake
+    // RIFT_DEFAULT_DAEMON_BINARY (mirroring the RIFT_SSH_KEY / RIFT_DEFAULT_SSH_KEY
+    // split), so a bare desktop-shortcut launch of the pinned stable exe resolves a
+    // working daemon without any user env. Both unset/empty skips the daemon: the
+    // terminal then needs the legacy path (the daemon is load-bearing under #205).
     let binary_path = match env::var_os("RIFT_DAEMON_BINARY") {
         Some(p) if !p.is_empty() => PathBuf::from(p),
-        _ => {
-            debug!("RIFT_DAEMON_BINARY not set, skipping daemon provisioning");
-            return;
-        }
+        _ => match option_env!("RIFT_DEFAULT_DAEMON_BINARY").filter(|s| !s.is_empty()) {
+            Some(baked) => PathBuf::from(baked),
+            None => {
+                debug!("no daemon binary configured (RIFT_DAEMON_BINARY / baked default), skipping daemon");
+                return None;
+            }
+        },
     };
 
     let bytes = match tokio::fs::read(&binary_path).await {
         Ok(bytes) => bytes,
         Err(e) => {
             warn!(%e, path = %binary_path.display(), "failed to read local daemon binary, skipping daemon");
-            return;
+            return None;
         }
     };
 
@@ -491,7 +588,7 @@ async fn provision_daemon(conn: &mut rift_ssh::SshConnection) {
         }
         Err(e) => {
             warn!(%e, "daemon auto-deploy failed, continuing with tmux only");
-            return;
+            return None;
         }
     };
 
@@ -521,14 +618,13 @@ async fn provision_daemon(conn: &mut rift_ssh::SshConnection) {
         Ok(channel) => channel,
         Err(e) => {
             warn!(%e, "daemon attach failed, continuing with tmux only");
-            return;
+            return None;
         }
     };
 
-    // Confirm the reattach transport with a protocol round-trip, then hand the
-    // live client to the consumer task. The daemon re-broadcasts the full
-    // worktree snapshot on every Hello, so the stream following the Welcome
-    // starts with the complete tree.
+    // Confirm the reattach transport with a protocol round-trip. The daemon
+    // re-broadcasts the full worktree snapshot on every Hello, so the stream
+    // following the Welcome starts with the complete tree.
     let client = rift_ssh::DaemonClient::new(channel);
     if let Err(e) = client
         .send(rift_protocol::ClientMessage::Hello {
@@ -537,37 +633,77 @@ async fn provision_daemon(conn: &mut rift_ssh::SshConnection) {
         .await
     {
         warn!(%e, "daemon handshake send failed");
-        return;
+        return None;
     }
     match client.recv().await {
         Some(rift_protocol::DaemonMessage::Welcome { version }) => {
             info!(version, "daemon transport ready (Hello/Welcome ok)");
-            // Spawned on the session thread's runtime: the task lives as long
-            // as the SSH session (`block_on` in main) and is cancelled silently
-            // when the runtime drops — the "stream ended" log only fires on a
-            // clean channel close. `DaemonClient` owns its channel actor, so
-            // cancellation is a plain drop, never a dangling connection.
-            tokio::spawn(consume_daemon_messages(client));
+            Some(client)
         }
-        Some(other) => warn!(?other, "unexpected daemon handshake reply"),
-        None => warn!("daemon closed before Welcome"),
+        Some(other) => {
+            warn!(?other, "unexpected daemon handshake reply");
+            None
+        }
+        None => {
+            warn!("daemon closed before Welcome");
+            None
+        }
     }
 }
 
-/// Drive the daemon message stream into the client-side worktree model.
+/// Drive the daemon message stream into the render channels and the worktree
+/// model.
 ///
-/// Owns the [`rift_ssh::DaemonClient`] for the session's lifetime and folds
-/// every worktree message into a [`rift_app::worktree::WorktreeModel`],
-/// logging the tree state for headless verification — no rendered consumer
-/// yet (the explorer panel is its own sub-spec). Ends when the channel closes;
-/// the detached daemon keeps running for the next attach.
-async fn consume_daemon_messages(client: rift_ssh::DaemonClient) {
+/// The single reader of the shared [`rift_ssh::DaemonClient`]: it folds every
+/// worktree/git/diagnostics message into a [`rift_app::worktree::WorktreeModel`]
+/// (logging tree state for headless verification — no rendered consumer yet) and,
+/// when `terminal` is `Some`, routes the per-pane byte stream and layout
+/// snapshots into the terminal render channels (#205). With `terminal` `None`
+/// (legacy mode) the terminal arms are inert — the app never sent `Attach`, so the
+/// daemon streams no terminal events. Ends when the channel closes or a
+/// `TerminalExit` ends the active attach; the detached daemon keeps running for
+/// the next attach.
+async fn consume_daemon_messages(
+    client: std::sync::Arc<rift_ssh::DaemonClient>,
+    terminal: Option<TerminalSinks>,
+) {
     use rift_app::worktree::WorktreeModel;
     use rift_protocol::DaemonMessage;
 
     let mut model = WorktreeModel::default();
     while let Some(msg) = client.recv().await {
         match msg {
+            // --- terminal byte stream (daemon terminal mode only) ---
+            DaemonMessage::PaneOutput { pane_id, bytes } => {
+                if let Some(sinks) = &terminal {
+                    // Pane ids cross the render seam in tmux's native `%N` form,
+                    // matching the synthesized snapshot below and the command
+                    // targets the session view builds.
+                    let _ = sinks.pane_output_tx.send(PaneOutput {
+                        pane_id: format!("%{pane_id}"),
+                        bytes,
+                    });
+                }
+            }
+            // Snapshot and update both carry the full latest layout (replace
+            // semantics), which is exactly what the render layer's `apply_snapshot`
+            // expects — so both fold into one synthesized `TmuxSnapshot`.
+            DaemonMessage::LayoutSnapshot { session, windows }
+            | DaemonMessage::LayoutUpdate { session, windows } => {
+                if let Some(sinks) = &terminal {
+                    let _ = sinks.snapshot_tx.send(layout_to_snapshot(session, windows));
+                }
+            }
+            DaemonMessage::TerminalExit { session, reason } => {
+                info!(%session, ?reason, "daemon terminal path down");
+                if terminal.is_some() {
+                    // The tmux attach ended; end the session so the app surfaces
+                    // it the same way the legacy `tmux` exit does (Disconnected →
+                    // quit). Reconnect is #206.
+                    break;
+                }
+            }
+            // --- worktree / git / diagnostics (every mode) ---
             DaemonMessage::WorktreeSnapshot {
                 root,
                 entries,
@@ -638,4 +774,186 @@ async fn consume_daemon_messages(client: rift_ssh::DaemonClient) {
         }
     }
     info!("daemon message stream ended");
+}
+
+/// The render-side sinks the daemon terminal stream feeds: per-pane output and
+/// full-layout snapshots. Held by [`consume_daemon_messages`] in daemon mode; the
+/// reverse path (input, resize, commands, capture) runs through the bridge tasks.
+struct TerminalSinks {
+    pane_output_tx: flume::Sender<PaneOutput>,
+    snapshot_tx: flume::Sender<termy_terminal_ui::TmuxSnapshot>,
+}
+
+/// Forward typed input from the render layer onto the protocol as
+/// [`rift_protocol::ClientMessage::Input`]; the daemon replays it to the pane via
+/// `send-keys -H` (opaque bytes, agent-agnostic). Ends when either channel closes.
+fn spawn_input_bridge(
+    client: std::sync::Arc<rift_ssh::DaemonClient>,
+    input_rx: flume::Receiver<PaneInput>,
+) {
+    use rift_protocol::ClientMessage;
+    tokio::spawn(async move {
+        while let Ok(input) = input_rx.recv_async().await {
+            let Some(pane_id) = parse_pane_id(&input.pane_id) else {
+                continue;
+            };
+            let msg = ClientMessage::Input {
+                pane_id,
+                data: bytes_to_string(input.bytes),
+            };
+            if client.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Forward client viewport resizes onto the protocol as
+/// [`rift_protocol::ClientMessage::ResizePane`]; the daemon applies them with
+/// `refresh-client -C <cols>x<rows>` (the control client's single viewport, so
+/// `pane_id` is unused there — any value carries).
+fn spawn_resize_bridge(
+    client: std::sync::Arc<rift_ssh::DaemonClient>,
+    size_rx: flume::Receiver<TermSize>,
+) {
+    use rift_protocol::ClientMessage;
+    tokio::spawn(async move {
+        while let Ok(size) = size_rx.recv_async().await {
+            let msg = ClientMessage::ResizePane {
+                pane_id: 0,
+                cols: size.cols as u16,
+                rows: size.rows as u16,
+            };
+            if client.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Forward raw tmux commands (the session view's window/pane affordances) onto
+/// the protocol as [`rift_protocol::ClientMessage::TmuxCommand`]; the daemon runs
+/// them verbatim.
+fn spawn_command_bridge(
+    client: std::sync::Arc<rift_ssh::DaemonClient>,
+    cmd_rx: flume::Receiver<String>,
+) {
+    use rift_protocol::ClientMessage;
+    tokio::spawn(async move {
+        while let Ok(cmd) = cmd_rx.recv_async().await {
+            debug!(cmd = %cmd, "sending tmux command (daemon)");
+            if client
+                .send(ClientMessage::TmuxCommand { cmd })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+}
+
+/// Bridge pre-attach scrollback (`capture-pane`) requests.
+///
+/// TODO(#205 capture): the merged protocol/daemon (#203/#204) carry no
+/// capture-pane response, so there is no return channel for the captured text
+/// over the daemon. Until that lands, answer each request with an empty
+/// [`CaptureResult`] so the pane clears its in-flight flag and scrolling never
+/// wedges; pre-attach history is simply unavailable on the daemon path (the live
+/// post-attach scrollback in the client `Term` is unaffected).
+fn spawn_capture_bridge(
+    capture_rx: flume::Receiver<CaptureRequest>,
+    result_tx: flume::Sender<CaptureResult>,
+) {
+    tokio::spawn(async move {
+        while let Ok(req) = capture_rx.recv_async().await {
+            if result_tx
+                .send(CaptureResult {
+                    pane_id: req.pane_id,
+                    bytes: Vec::new(),
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+}
+
+/// Parse tmux's `%N` pane id into the protocol's integer pane id. A render-side
+/// id that does not match the synthesized `%N` form is dropped by the caller.
+fn parse_pane_id(id: &str) -> Option<u32> {
+    id.strip_prefix('%')?.parse().ok()
+}
+
+/// Render keyboard/paste input bytes as the protocol's `String` payload. Terminal
+/// input is UTF-8 (typed text) or ASCII (control sequences from the keystroke
+/// encoder), so this is lossless in practice; a malformed run degrades to a lossy
+/// decode rather than dropping the keystroke.
+fn bytes_to_string(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+/// Build the render layer's [`termy_terminal_ui::TmuxSnapshot`] from the daemon's
+/// protocol layout. The render `apply_snapshot` replaces its whole model from
+/// this, so a `LayoutSnapshot` and a `LayoutUpdate` map identically. Window and
+/// pane ids take tmux's native `@N` / `%N` form, matching the command targets the
+/// session view embeds and the `%N` pane ids on `PaneOutput`. Per-pane
+/// CWD/command are subscription-driven on the legacy path and absent from the
+/// daemon layout query, so they start empty here.
+fn layout_to_snapshot(
+    session: String,
+    windows: Vec<rift_protocol::WindowLayout>,
+) -> termy_terminal_ui::TmuxSnapshot {
+    use termy_terminal_ui::{TmuxPaneState, TmuxSnapshot, TmuxWindowState};
+
+    let windows = windows
+        .into_iter()
+        .enumerate()
+        .map(|(index, window)| {
+            let window_id = format!("@{}", window.window_id);
+            let active_pane_id = window
+                .panes
+                .iter()
+                .find(|p| p.active)
+                .map(|p| format!("%{}", p.pane_id));
+            let panes = window
+                .panes
+                .into_iter()
+                .map(|pane| TmuxPaneState {
+                    id: format!("%{}", pane.pane_id),
+                    window_id: window_id.clone(),
+                    session_id: String::new(),
+                    is_active: pane.active,
+                    left: pane.left,
+                    top: pane.top,
+                    width: pane.width,
+                    height: pane.height,
+                    cursor_x: 0,
+                    cursor_y: 0,
+                    current_path: String::new(),
+                    current_command: String::new(),
+                })
+                .collect();
+            TmuxWindowState {
+                id: window_id,
+                // The daemon layout query carries no tmux window index; the layout
+                // order is a stable, monotonic stand-in for the tab number (display
+                // only — window selection targets the `@N` id, not this).
+                index: index as i32,
+                name: window.name,
+                layout: String::new(),
+                is_active: window.active,
+                automatic_rename: false,
+                active_pane_id,
+                panes,
+            }
+        })
+        .collect();
+
+    TmuxSnapshot {
+        session_name: session,
+        session_id: None,
+        windows,
+    }
 }
