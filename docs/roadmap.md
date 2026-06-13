@@ -35,6 +35,7 @@ it is `READY`. The milestone (open/closed + issue progress) is where status live
 - **Dogfooding fixes** — living papercut backlog: [spec-dogfooding-fixes.md](spec-dogfooding-fixes.md), grouped by the [`papercut` label](https://github.com/skrischer/rift/labels/papercut); never completes.
 - **Dogfooding channels** — [spec-dogfooding-channels.md](spec-dogfooding-channels.md), [milestone 12](https://github.com/skrischer/rift/milestone/12).
 - **Logging & diagnostics** — professional debug logging for the dev and stable channels: [spec-logging-diagnostics.md](spec-logging-diagnostics.md), [milestone 20](https://github.com/skrischer/rift/milestone/20); prior-art survey in [prior-art.md](prior-art.md) Category 10. Issues are immediately workable (parallel track, no queue edge).
+- **gpui rev bump investigation** — [spec-gpui-rev-bump.md](spec-gpui-rev-bump.md), [milestone 22](https://github.com/skrischer/rift/milestone/22); spike spun out of #127 (the live WebView needs a newer gpui than the pinned `4bee412`). Analyse + one trial bump + document go/no-go; lands no production bump.
 - Completed meta tracks (workflow automation, planning automation, pane & window management, terminal interaction fixes, component gallery) live in [archive/](archive/) and their closed milestones.
 
 ## North star
