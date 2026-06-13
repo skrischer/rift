@@ -175,7 +175,8 @@ How the entire spec is known complete:
       typing in the search box filters entries; selecting an entry renders its demo
       in rift's Catppuccin palette.
 - [ ] The chart, code editor, and table entries render without panicking; the
-      WebView entry renders its "delivered by follow-up issue" placeholder.
+      WebView entry renders its notice (live embed deferred — see the #127
+      decision-log entry).
 - [ ] The **Theme tokens** entry renders the active theme's color swatches with
       names.
 
@@ -305,3 +306,26 @@ How the entire spec is known complete:
     group holds it; Code Editor joined **Forms & Input** and Chart/Table/Data Table
     joined **Data Display**. The spec stays `READY` (not `COMPLETED`) because #127
     still traces to it.
+- 2026-06-13: WebView (#127, PR #243) ships as a notice, not a live embed — blocked
+  by the pinned `gpui` rev, not by the dependency. Findings from the attempt:
+  - **The `gpui-wry` stack cross-compiles and runs.** `gpui-wry` (the `crates/webview`
+    member of the same gpui-component repo, pinned to its rev so the shared git source
+    stays at one checkout — one `gpui`), `lb-wry` and `raw-window-handle`, declared
+    Windows-only and pulled by the `gallery` feature, build for
+    `x86_64-pc-windows-gnu` and pass `cargo deny check licenses`. The exe needs
+    `WebView2Loader.dll` (a load-time import the windows-gnu build links but does not
+    bundle) copied from `webview2-com-sys` next to it — proven working. The
+    cross-compile risk the spec flagged resolves to **feasible**.
+  - **The live view does not composite on the pinned `gpui` (`4bee412`).**
+    `build_as_child` creates the native WebView2 child window (it captures input —
+    clicking the entry even traps later clicks elsewhere), but gpui presents its DXGI
+    swapchain over the whole client area, overdrawing the child window's pixels.
+    `GPUI_DISABLE_DIRECT_COMPOSITION=true` (set in-process and forwarded via WSLENV)
+    does not change this on `4bee412`. Windowed-child webview compositing needs a
+    newer gpui — out of scope here (the pin is deliberate; a bump re-touches the whole
+    foundation and would invalidate verified APIs).
+  - **Decision: ship the notice, drop the Wry stack.** The acceptance allows a notice
+    when the live view is infeasible. The notice now states the real reason and that
+    the embed goes live once gpui's webview compositing lands. The Wry stack and the
+    recipe's DLL-copy + DirectComposition env are removed, so `Cargo.lock` returns to
+    one `gpui` with no Wry crates. Revisit after a gpui rev bump.
