@@ -110,6 +110,14 @@ their own phases (explorer / git-status); summarized here for completeness:
 > session/layout state. It is superseded by `layout_snapshot` / `layout_update`
 > and is retired with the throwaway spike wiring (`crates/daemon/src/spike.rs`).
 
+## Diagnostics
+
+```json
+{ "type": "diagnostics", "path": "src/main.rs", "server": "rust-analyzer", "items": [{ "range": { "start": { "line": 10, "character": 4 }, "end": { "line": 10, "character": 9 } }, "severity": "error", "message": "...", "source": "rustc", "code": "E0425" }] }
+```
+
+`diagnostics` is keyed by `path` (relative to the worktree root, the same key space as the worktree entries) and by `server` (the daemon-assigned id of the publishing language server). `items` is the complete current set that server reports for the file, replacing whatever it last reported — an empty `items` clears that server's diagnostics for the file while leaving other servers' sets intact. `source` and `code` are omitted when the server provides neither. The diagnostic types are rift's own (`Diagnostic` / `Range` / `Position` / `DiagnosticSeverity`); `lsp-types` does not cross the protocol boundary. Push-only — the client never requests diagnostics.
+
 ## Rules
 
 All message types live in `crates/protocol/`. Adding a new message type is a
