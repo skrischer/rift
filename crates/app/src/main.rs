@@ -597,6 +597,23 @@ async fn consume_daemon_messages(client: rift_ssh::DaemonClient) {
                     );
                 }
             }
+            DaemonMessage::UpdateGitStatus { changed, cleared } => {
+                let (c, r) = (changed.len(), cleared.len());
+                model.apply_git_update(changed, cleared);
+                debug!(
+                    changed = c,
+                    cleared = r,
+                    decorated = model.git_statuses().len(),
+                    "git status update applied"
+                );
+            }
+            DaemonMessage::RepoState {
+                branch,
+                ahead_behind,
+            } => {
+                debug!(branch = ?branch, ahead_behind = ?ahead_behind, "repo state applied");
+                model.apply_repo_state(branch, ahead_behind);
+            }
             other => debug!(?other, "daemon message without a consumer yet"),
         }
     }
