@@ -25,6 +25,11 @@ anyhow = "1"
 thiserror = "2"
 ignore = "0.4"
 notify = "7"
+# Pure-Rust git for the read-only status path (musl-clean; git2/libgit2 is a C
+# dep ruled out by the static-musl daemon build). `max-performance` (zlib-ng, C)
+# is deliberately NOT enabled — `status` + `dirwalk` over the default pure-Rust
+# zlib keep the daemon statically linkable.
+gix = { version = "0.84", default-features = false, features = ["status", "dirwalk", "revision", "sha1", "max-performance-safe"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
