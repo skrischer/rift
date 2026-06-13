@@ -115,7 +115,7 @@ Planning lives in `docs/` as SDD specs (`docs/spec-template.md`). The chain is *
 1. Open a PR that closes the issue (`Closes #N`); the milestone closes when its issues do
 2. When the spec's verification is fully met, set status to `COMPLETED` with date and move it to `archive/`
 3. Add decisions made during implementation to the spec's decision log
-4. Keep `docs/roadmap.md`'s phase table and Current focus pointer current (no status markers there — progress lives in milestones)
+4. Keep `docs/roadmap.md`'s phase table current (no status markers there — progress lives in the GitHub milestones and issues, the single source of truth)
 
 **If blocked:**
 1. Set spec status to `BLOCKED` with reason in the spec header
