@@ -112,6 +112,12 @@ impl GitStatus {
                                 entry.index = GitStatusCode::Unmerged;
                                 entry.worktree = GitStatusCode::Unmerged;
                             }
+                            // `intent-to-add` is an *index* marker (`git add -N`):
+                            // the file is promised to the index as an add. It
+                            // surfaces through the index-worktree item, but the
+                            // staged side is the correct column (git porcelain's
+                            // `A`), so set the index — not the worktree — side.
+                            WorktreeOutcome::IntentToAdd => entry.index = GitStatusCode::Added,
                         }
                     }
                 }
@@ -145,6 +151,9 @@ enum WorktreeOutcome {
     Worktree(GitStatusCode),
     /// A merge conflict — both index and worktree are unmerged.
     Conflict,
+    /// An `intent-to-add` entry — staged as added on the index side, even
+    /// though gix surfaces it through the index-worktree item.
+    IntentToAdd,
 }
 
 /// Convert a git repo-relative `BStr` path into a `PathBuf`.
@@ -192,9 +201,14 @@ fn index_worktree_status(
                 EntryStatus::Change(Change::Modification { .. }) => GitStatusCode::Modified,
                 // A modified submodule is reported as a worktree modification.
                 EntryStatus::Change(Change::SubmoduleModification(_)) => GitStatusCode::Modified,
-                // `intent-to-add` is an index entry for a not-yet-staged file:
-                // git shows it on the worktree side as added.
-                EntryStatus::IntentToAdd => GitStatusCode::Added,
+                // `intent-to-add` is an index-side add, not a worktree change —
+                // handled by the caller as the index column (git porcelain `A`).
+                EntryStatus::IntentToAdd => {
+                    return Some((
+                        bstr_to_path(rela_path.as_ref()),
+                        WorktreeOutcome::IntentToAdd,
+                    ));
+                }
                 // No actual change — only a stat refresh would help next time.
                 EntryStatus::NeedsUpdate(_) => return None,
             };
@@ -241,7 +255,9 @@ fn repo_state(repo: &gix::Repository) -> RepoState {
 /// Count commits the local branch is ahead of / behind its upstream, via a
 /// hidden-tip revision walk (`ahead` = reachable from local but not upstream,
 /// and vice versa). `None` when HEAD is detached, has no upstream, or a tip
-/// cannot be resolved.
+/// cannot be resolved. Best-effort: a corrupt-object error mid-walk (e.g. a
+/// shallow clone's boundary) is dropped, so the count can under-report on a
+/// shallow or partially-fetched repository.
 fn ahead_behind(repo: &gix::Repository) -> Option<AheadBehind> {
     let head_ref = repo.head_ref().ok().flatten()?;
     let upstream_name = head_ref
@@ -427,6 +443,23 @@ mod tests {
     }
 
     #[test]
+    fn test_intent_to_add_marks_index_added_not_worktree() {
+        // `git add -N` records an intent-to-add: an index-side add. gix surfaces
+        // it through the index-worktree item, but the staged column is correct
+        // (git porcelain `A`), so the index side must carry Added.
+        let repo = init_repo("intent");
+        write(&repo.path.join("intent.txt"), "content\n");
+        git(&repo.path, &["add", "-N", "intent.txt"]);
+
+        let status = GitStatus::compute(&repo.path).expect("compute");
+        assert_eq!(
+            status_of(&status, "intent.txt").map(|s| s.index),
+            Some(GitStatusCode::Added),
+            "intent-to-add must mark the index (staged) side"
+        );
+    }
+
+    #[test]
     fn test_deleted_tracked_file_marks_worktree_deleted() {
         let repo = init_repo("deleted");
         std::fs::remove_file(repo.path.join("tracked.txt")).expect("remove");
@@ -495,7 +528,13 @@ mod tests {
             .expect("git status");
         let listed: std::collections::BTreeSet<String> = String::from_utf8_lossy(&porcelain.stdout)
             .lines()
-            .map(|line| line[3..].to_owned())
+            .map(|line| {
+                // Porcelain v1: `XY <path>`, or `XY <old> -> <new>` for a
+                // rename. Take the destination so a rename fixture would still
+                // compare against the path we key by.
+                let rest = &line[3..];
+                rest.rsplit(" -> ").next().unwrap_or(rest).to_owned()
+            })
             .collect();
         let ours: std::collections::BTreeSet<String> = status
             .entries()
