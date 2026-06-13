@@ -500,20 +500,16 @@ async fn provision_daemon(conn: &mut rift_ssh::SshConnection) {
     let socket_path = format!("{remote_path}.sock");
     let log_path = format!("{remote_path}.log");
 
-    let channel = match rift_ssh::connect_or_spawn_daemon(
-        conn,
-        &remote_path,
-        &socket_path,
-        &log_path,
-    )
-    .await
-    {
-        Ok(channel) => channel,
-        Err(e) => {
-            warn!(%e, "daemon attach failed, continuing with tmux only");
-            return;
-        }
-    };
+    let channel =
+        match rift_ssh::connect_or_spawn_daemon(conn, &remote_path, &socket_path, &log_path, None)
+            .await
+        {
+            Ok(channel) => channel,
+            Err(e) => {
+                warn!(%e, "daemon attach failed, continuing with tmux only");
+                return;
+            }
+        };
 
     // Confirm the reattach transport with a protocol round-trip, then hand the
     // live client to the consumer task. The daemon re-broadcasts the full
