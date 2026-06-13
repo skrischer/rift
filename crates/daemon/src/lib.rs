@@ -786,9 +786,11 @@ impl Core {
                     version: PROTOCOL_VERSION,
                 });
             }
-            // Terminal/tmux handling is owned by a later Phase 3 sub-spec; this
-            // scaffolding only carries the handshake.
-            ClientMessage::Input { .. }
+            // Terminal/tmux handling (attach, input, resize, command emission)
+            // is owned by a later Phase 6 daemon sub-spec; this scaffolding only
+            // carries the handshake.
+            ClientMessage::Attach { .. }
+            | ClientMessage::Input { .. }
             | ClientMessage::ResizePane { .. }
             | ClientMessage::TmuxCommand { .. } => {}
         }
