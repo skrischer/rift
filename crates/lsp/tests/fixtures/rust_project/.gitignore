@@ -1,0 +1,4 @@
+# rust-analyzer indexes this fixture during the spike, generating a build
+# directory and a lockfile. Both are reproducible; keep them out of git.
+/target
+/Cargo.lock
