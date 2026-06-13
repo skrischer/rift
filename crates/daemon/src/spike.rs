@@ -6,9 +6,9 @@
 //! forwards raw decoded `%output` bytes to connected clients as
 //! `DaemonMessage::PaneOutput` frames, and routes `ClientMessage::Input` /
 //! `TmuxCommand` back to the tmux stdin. Deliberately minimal: no flow
-//! control, no command-response correlation, the placeholder protocol
-//! messages are reused as-is (`PaneOutput.cells` carries raw bytes; the real
-//! message set is issue #203). The pane id is announced to clients through a
+//! control, no command-response correlation, the protocol messages are reused
+//! as-is (`PaneOutput.bytes` carries raw bytes; the real message set is issue
+//! #203). The pane id is announced to clients through a
 //! `StateUpdate` whose single entry is the `%<id>` string.
 
 use std::path::Path;
@@ -75,7 +75,7 @@ pub async fn serve_spike(socket_path: &Path, session: &str) -> anyhow::Result<()
                     format!("send-keys -t %{pane_id} -H {}\n", hex_args(data.as_bytes()))
                 }
                 ClientMessage::TmuxCommand { cmd } => format!("{cmd}\n"),
-                ClientMessage::ResizePane { .. } => continue,
+                ClientMessage::ResizePane { .. } | ClientMessage::Attach { .. } => continue,
             };
             if tmux_in.write_all(line.as_bytes()).await.is_err() {
                 break;
@@ -120,10 +120,7 @@ pub async fn serve_spike(socket_path: &Path, session: &str) -> anyhow::Result<()
     let mut lines = BufReader::new(tmux_out).lines();
     while let Some(line) = lines.next_line().await? {
         if let Some((pane_id, bytes)) = parse_output_line(&line) {
-            let _ = events_tx.send(DaemonMessage::PaneOutput {
-                pane_id,
-                cells: bytes,
-            });
+            let _ = events_tx.send(DaemonMessage::PaneOutput { pane_id, bytes });
         } else if let Some(pane) = line.strip_prefix("RIFT_PANE:") {
             let _ = events_tx.send(DaemonMessage::StateUpdate {
                 sessions: vec![pane.to_owned()],

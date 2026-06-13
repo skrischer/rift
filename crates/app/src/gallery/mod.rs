@@ -321,7 +321,7 @@ pub fn registry() -> Vec<ComponentEntry> {
         },
         ComponentEntry {
             name: "WebView",
-            description: "Placeholder — the real demo lands in follow-up #127.",
+            description: "An embedded browser via Wry — pending gpui webview compositing.",
             demo: Element(demos::render_webview),
         },
     ]

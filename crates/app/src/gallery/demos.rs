@@ -2073,21 +2073,23 @@ impl Render for DataTableDemo {
 }
 
 // ---------------------------------------------------------------------------
-// WebView (placeholder)
+// WebView (#127)
 // ---------------------------------------------------------------------------
 
 pub(super) fn render_webview(_window: &mut Window, _cx: &mut App) -> AnyElement {
     v_flex()
         .gap_3()
-        .max_w(px(560.))
+        .max_w(px(620.))
         .child(
             Alert::info(
-                "webview-placeholder",
-                "WebView is a separate crate (gpui-wry / Wry), not part of the \
-                 gpui-component library. Its demo is delivered by follow-up issue \
-                 #127 so the gallery keeps exactly one gpui in Cargo.lock.",
+                "webview-notice",
+                "An embedded WebView via gpui-wry (Wry / WebView2) was proven to \
+                 cross-compile and run on the Windows target, but the live view is \
+                 not visible on rift's pinned gpui rev: gpui overdraws the native \
+                 child window with its own surface. The demo stays a notice until \
+                 gpui's webview compositing is available (see #127 decision log).",
             )
-            .title("WebView — delivered by follow-up issue"),
+            .title("WebView — pending gpui webview compositing"),
         )
         .into_any_element()
 }
