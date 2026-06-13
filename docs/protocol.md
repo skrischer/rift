@@ -18,8 +18,10 @@ All communication runs over a single WebSocket connection, tunneled through SSH 
 { "type": "worktree_snapshot", "root": "/home/dev/project", "entries": [{ "path": "src/main.rs", "kind": "file", "ignored": false, "mtime": {...} }], "final_chunk": true }
 { "type": "update_worktree",   "added": [...], "changed": [...], "removed": ["src/old.rs"] }
 { "type": "git_status",   "files": [{ "path": "src/main.rs", "status": "modified" }, ...] }
-{ "type": "diagnostics",  "uri": "src/main.rs", "items": [{ "range": {...}, "severity": "error", "message": "..." }] }
+{ "type": "diagnostics",  "path": "src/main.rs", "server": "rust-analyzer", "items": [{ "range": { "start": { "line": 10, "character": 4 }, "end": { "line": 10, "character": 9 } }, "severity": "error", "message": "...", "source": "rustc", "code": "E0425" }] }
 ```
+
+`diagnostics` is keyed by `path` (relative to the worktree root, the same key space as the worktree entries) and by `server` (the daemon-assigned id of the publishing language server). `items` is the complete current set that server reports for the file, replacing whatever it last reported — an empty `items` clears that server's diagnostics for the file while leaving other servers' sets intact. `source` and `code` are omitted when the server provides neither. The diagnostic types are rift's own (`Diagnostic` / `Range` / `Position` / `DiagnosticSeverity`); `lsp-types` does not cross the protocol boundary. Push-only — the client never requests diagnostics.
 
 ## Rules
 
