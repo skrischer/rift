@@ -281,6 +281,11 @@ export RIFT_SSH_HOST := env("RIFT_SSH_HOST", "127.0.0.1")
 export RIFT_SSH_USER := env("RIFT_SSH_USER", "developer")
 export RIFT_SSH_PORT := env("RIFT_SSH_PORT", "22")
 export RIFT_SSH_KEY := env("RIFT_SSH_KEY", home_directory() / ".ssh" / "id_rsa")
+# Remote project root the daemon watches (file tree + git status). A path on the
+# SSH host — always Linux, even when the app runs on Windows — so the daemon
+# scans the project checkout instead of the SSH login dir ($HOME). Mirrors the
+# RIFT_SSH_KEY knob; `promote` bakes the RIFT_DEFAULT_PROJECT_ROOT fallback.
+export RIFT_PROJECT_ROOT := env("RIFT_PROJECT_ROOT", "/home/developer/CascadeProjects/rift")
 # Local musl daemon binary to auto-deploy and attach to. Defaults to the musl
 # release build under target/; `dev`/`dev-windows` build it first (via the
 # release-daemon dependency) so the path is always valid. It is absolute so the
@@ -314,6 +319,7 @@ dev: release-daemon
     RIFT_SSH_PORT="{{RIFT_SSH_PORT}}" \
     RIFT_SSH_KEY="{{RIFT_SSH_KEY}}" \
     RIFT_DAEMON_BINARY="{{RIFT_DAEMON_BINARY}}" \
+    RIFT_PROJECT_ROOT="{{RIFT_PROJECT_ROOT}}" \
     cargo run -p rift-app
 
 # Watch for changes: lint then rebuild (requires cargo-watch)
@@ -325,6 +331,7 @@ dev-watch:
     RIFT_SSH_PORT="{{RIFT_SSH_PORT}}" \
     RIFT_SSH_KEY="{{RIFT_SSH_KEY}}" \
     RIFT_DAEMON_BINARY="{{RIFT_DAEMON_BINARY}}" \
+    RIFT_PROJECT_ROOT="{{RIFT_PROJECT_ROOT}}" \
     cargo watch -x 'clippy --workspace -- -D warnings' -x 'run -p rift-app'
 
 # Shared Windows launch: export the SSH + session env block (translated for the
@@ -337,13 +344,17 @@ dev-watch:
 _launch-windows exe session detach="":
     #!/usr/bin/env bash
     set -euo pipefail
-    export WSLENV="RUST_LOG:RIFT_SSH_HOST:RIFT_SSH_USER:RIFT_SSH_PORT:RIFT_SSH_KEY:RIFT_SESSION:RIFT_DAEMON_BINARY/p"
+    # RIFT_PROJECT_ROOT carries no `/p`: it is a path on the SSH host (Linux), not
+    # a Windows path, so it must cross to the native exe verbatim (only
+    # RIFT_DAEMON_BINARY needs WSL->Windows translation for the local read).
+    export WSLENV="RUST_LOG:RIFT_SSH_HOST:RIFT_SSH_USER:RIFT_SSH_PORT:RIFT_SSH_KEY:RIFT_SESSION:RIFT_PROJECT_ROOT:RIFT_DAEMON_BINARY/p"
     export RUST_LOG=rift=debug,rift_ssh=debug
     export RIFT_SSH_HOST="{{RIFT_SSH_HOST}}"
     export RIFT_SSH_USER="{{RIFT_SSH_USER}}"
     export RIFT_SSH_PORT="{{RIFT_SSH_PORT}}"
     export RIFT_SSH_KEY="{{windows_ssh_key}}"
     export RIFT_SESSION="{{session}}"
+    export RIFT_PROJECT_ROOT="{{RIFT_PROJECT_ROOT}}"
     export RIFT_DAEMON_BINARY="{{RIFT_DAEMON_BINARY}}"
     if [ -n "{{detach}}" ]; then
       # Direct binfmt exec in its own session with detached stdio: the recipe (and
@@ -395,8 +406,12 @@ promote:
     # WSL CARGO_MANIFEST_DIR paths at runtime (shaders, DirectWrite), which are
     # root-relative on Windows and need the WSL share as the current drive — an
     # Explorer launch starts on C:\ and would panic before the window appears.
+    # RIFT_DEFAULT_PROJECT_ROOT bakes the daemon's watched root via option_env! so
+    # a bare desktop-shortcut launch (no env) still watches the project; runtime
+    # RIFT_PROJECT_ROOT overrides it. Mirrors the RIFT_DEFAULT_SSH_KEY bake.
     RIFT_DEFAULT_SSH_KEY="{{windows_ssh_key}}" \
     RIFT_DEFAULT_WORKDIR="$(wslpath -w /)" \
+    RIFT_DEFAULT_PROJECT_ROOT="{{RIFT_PROJECT_ROOT}}" \
       cargo build -p rift-app --profile stable --features windowed --target x86_64-pc-windows-gnu
     "{{windows_system32}}/taskkill.exe" /F /IM rift-stable.exe 2>/dev/null || true
     mkdir -p "{{windows_stable_dir}}"
