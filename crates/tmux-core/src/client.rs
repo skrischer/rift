@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 
 use crate::event::Event;
 use crate::parser;
+use crate::vis::decode_octal;
 
 /// Connection lifecycle of a control-mode client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -165,9 +166,13 @@ impl Client {
             }
             None => {
                 if let Some(block) = self.block.as_mut() {
+                    // tmux octal-escapes command-response bytes too (control
+                    // bytes and the backslash; docs/tmux-reference.md pitfall 8),
+                    // so decode before the lossy-UTF-8 conversion. Pure-ASCII
+                    // replies pass through unchanged.
                     block
                         .output
-                        .push(String::from_utf8_lossy(line).into_owned());
+                        .push(String::from_utf8_lossy(&decode_octal(line)).into_owned());
                 }
             }
         }
@@ -288,6 +293,24 @@ mod tests {
                 id: Some(cmd.id),
                 error: false,
                 output: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_feed_block_output_lines_are_octal_decoded() {
+        // tmux octal-escapes command-response bytes too (pitfall 8): `\134` is a
+        // backslash, `\015` a carriage return. The reply must arrive decoded,
+        // mirroring the %output path.
+        let mut client = Client::new();
+        let cmd = client.send_command("display-message -p '...'");
+        let events = client.feed(b"%begin 1 2 1\nval\\134end\\015\n%end 1 2 1\n");
+        assert_eq!(
+            events,
+            vec![Event::CommandReply {
+                id: Some(cmd.id),
+                error: false,
+                output: vec!["val\\end\r".to_owned()],
             }]
         );
     }
