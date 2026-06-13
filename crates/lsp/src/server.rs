@@ -27,8 +27,9 @@ use async_lsp::tracing::TracingLayer;
 use async_lsp::{LanguageServer, ServerSocket};
 use lsp_types::{
     ClientCapabilities, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, InitializeParams, InitializedParams, PublishDiagnosticsParams, Url,
-    WindowClientCapabilities, WorkspaceFolder,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, InitializeParams, InitializedParams,
+    PublishDiagnosticsParams, TextDocumentClientCapabilities, TextDocumentSyncClientCapabilities,
+    Url, WindowClientCapabilities, WorkspaceFolder,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -116,6 +117,15 @@ impl Server {
     /// [`Server::did_open`] for the non-blocking / error semantics.
     pub fn did_change(&self, params: DidChangeTextDocumentParams) -> Result<()> {
         self.socket.clone().did_change(params)?;
+        Ok(())
+    }
+
+    /// Send a `textDocument/didSave` notification to this server. See
+    /// [`Server::did_open`] for the non-blocking / error semantics. The
+    /// disk-backed document sync sends this after each change so a server's
+    /// save-triggered checks (rust-analyzer's `checkOnSave`) re-run on a fix.
+    pub fn did_save(&self, params: DidSaveTextDocumentParams) -> Result<()> {
+        self.socket.clone().did_save(params)?;
         Ok(())
     }
 
@@ -237,9 +247,10 @@ impl Server {
     }
 
     /// Run the LSP handshake (`initialize` → `initialized`) at the worktree
-    /// root. Capabilities mirror the spike's minimal set — enough for servers
-    /// that gate work-done progress, nothing the v1 diagnostics path does not
-    /// use.
+    /// root. Capabilities are the minimal set the v1 diagnostics path needs:
+    /// work-done progress (servers that gate work on it), plus declaring
+    /// `textDocument/didSave` so a server honors the save notifications the
+    /// disk-backed sync sends and re-runs its save-triggered checks (#272).
     async fn initialize(&mut self, root_uri: Url) -> Result<()> {
         self.socket
             .initialize(InitializeParams {
@@ -248,6 +259,13 @@ impl Server {
                     name: "root".into(),
                 }]),
                 capabilities: ClientCapabilities {
+                    text_document: Some(TextDocumentClientCapabilities {
+                        synchronization: Some(TextDocumentSyncClientCapabilities {
+                            did_save: Some(true),
+                            ..TextDocumentSyncClientCapabilities::default()
+                        }),
+                        ..TextDocumentClientCapabilities::default()
+                    }),
                     window: Some(WindowClientCapabilities {
                         work_done_progress: Some(true),
                         ..WindowClientCapabilities::default()

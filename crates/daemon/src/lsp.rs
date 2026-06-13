@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use rift_explorer::Change;
 use rift_lsp::lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    NumberOrString, PublishDiagnosticsParams,
+    DidSaveTextDocumentParams, NumberOrString, PublishDiagnosticsParams,
 };
 use rift_lsp::{DocumentChange, DocumentSelector, DocumentSink, DocumentSync, Registry, ServerId};
 use rift_protocol::{Diagnostic, DiagnosticSeverity, Position, Range};
@@ -113,6 +113,11 @@ impl DocumentSink for ServerSink<'_> {
 
     fn did_change(&mut self, params: DidChangeTextDocumentParams) -> rift_lsp::Result<()> {
         self.fan_out("didChange", |server| server.did_change(params.clone()));
+        Ok(())
+    }
+
+    fn did_save(&mut self, params: DidSaveTextDocumentParams) -> rift_lsp::Result<()> {
+        self.fan_out("didSave", |server| server.did_save(params.clone()));
         Ok(())
     }
 

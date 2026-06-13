@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 
 use lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem, Url,
-    VersionedTextDocumentIdentifier,
+    DidSaveTextDocumentParams, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, Url, VersionedTextDocumentIdentifier,
 };
 
 use crate::{LspError, Result};
@@ -95,6 +95,10 @@ pub trait DocumentSink {
     fn did_open(&mut self, params: DidOpenTextDocumentParams) -> Result<()>;
     /// Push a full-text replacement (`textDocument/didChange`).
     fn did_change(&mut self, params: DidChangeTextDocumentParams) -> Result<()>;
+    /// Notify that the document was saved (`textDocument/didSave`). The
+    /// disk-backed model treats every observed write as a save, so this fires
+    /// after each open/change to make save-triggered server checks re-run.
+    fn did_save(&mut self, params: DidSaveTextDocumentParams) -> Result<()>;
     /// Close a document (`textDocument/didClose`).
     fn did_close(&mut self, params: DidCloseTextDocumentParams) -> Result<()>;
 }
@@ -182,7 +186,7 @@ impl DocumentSync {
             source,
         })?;
 
-        match self.open.get_mut(relative) {
+        let action = match self.open.get_mut(relative) {
             Some(doc) => {
                 doc.version += 1;
                 let version = doc.version;
@@ -197,7 +201,11 @@ impl DocumentSync {
                         text: text.clone(),
                     }],
                 })?;
-                Ok(Some(DocumentAction::Change { uri, version, text }))
+                DocumentAction::Change {
+                    uri: uri.clone(),
+                    version,
+                    text,
+                }
             }
             None => {
                 let version = 0;
@@ -216,14 +224,28 @@ impl DocumentSync {
                         version,
                     },
                 );
-                Ok(Some(DocumentAction::Open {
-                    uri,
+                DocumentAction::Open {
+                    uri: uri.clone(),
                     language_id: language_id.to_owned(),
                     version,
                     text,
-                }))
+                }
             }
-        }
+        };
+
+        // The disk-backed model treats every observed write as a save: each
+        // matching create/modify is the file landing on disk. Emitting didSave
+        // after the open/change makes servers whose checks only run on save
+        // (rust-analyzer's `checkOnSave` / cargo check) re-run and clear stale
+        // diagnostics on a fix — without it a corrected file's check-sourced
+        // diagnostics never refresh (issue #272). Full text re-read is not
+        // needed here (the server already has it from the open/change), so the
+        // save carries no text.
+        sink.did_save(DidSaveTextDocumentParams {
+            text_document: TextDocumentIdentifier { uri },
+            text: None,
+        })?;
+        Ok(Some(action))
     }
 
     /// Handle a removal: close an open document, ignore a never-opened one.
@@ -317,6 +339,7 @@ mod tests {
     struct RecordingSink {
         opened: Vec<(Url, String, String)>,
         changed: Vec<(Url, i32, String)>,
+        saved: Vec<Url>,
         closed: Vec<Url>,
     }
 
@@ -336,6 +359,11 @@ mod tests {
                 .unwrap_or_default();
             self.changed
                 .push((params.text_document.uri, params.text_document.version, text));
+            Ok(())
+        }
+
+        fn did_save(&mut self, params: DidSaveTextDocumentParams) -> Result<()> {
+            self.saved.push(params.text_document.uri);
             Ok(())
         }
 
@@ -368,6 +396,7 @@ mod tests {
         assert_eq!(text, "fn main() {}");
         assert_eq!(uri.to_file_path().unwrap(), tmp.path.join("src/main.rs"));
         assert!(sync.is_open(Path::new("src/main.rs")));
+        assert_eq!(sink.saved.len(), 1, "a disk-backed open is also a save");
     }
 
     #[test]
@@ -402,6 +431,14 @@ mod tests {
         let (_, version, text) = &sink.changed[0];
         assert_eq!(text, "v2 changed", "full-text re-read from disk");
         assert_eq!(*version, 1, "version increments past the didOpen version 0");
+        // A fix is a disk write, so each open/change saves: the save after the
+        // change is what makes a server's checkOnSave re-run and clear stale
+        // check-sourced diagnostics (issue #272).
+        assert_eq!(sink.saved.len(), 2, "open and change each emit a didSave");
+        assert_eq!(
+            sink.saved[1], sink.changed[0].0,
+            "save targets the changed doc"
+        );
     }
 
     #[test]
@@ -455,6 +492,7 @@ mod tests {
 
         assert!(matches!(action, Some(DocumentAction::Close { .. })));
         assert_eq!(sink.closed.len(), 1);
+        assert_eq!(sink.saved.len(), 1, "the open saved; the close does not");
         assert!(!sync.is_open(Path::new("gone.rs")));
     }
 
@@ -486,6 +524,11 @@ mod tests {
         assert_eq!(sink.opened.len(), 1);
         assert_eq!(sink.changed.len(), 2);
         assert_eq!(sink.closed.len(), 1);
+        assert_eq!(
+            sink.saved.len(),
+            3,
+            "each open/change is a save; close does not save"
+        );
         assert_eq!(sync.open_count(), 0);
         // Versions are monotonic: open=0, change=1, change=2.
         assert_eq!(sink.changed[0].1, 1);
