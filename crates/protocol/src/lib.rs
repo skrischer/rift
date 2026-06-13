@@ -49,6 +49,28 @@ pub enum DaemonMessage {
         changed: Vec<WorktreeEntry>,
         removed: Vec<String>,
     },
+    /// Incremental git-status change decorating the worktree entries. The
+    /// client upserts the status of every `changed` path and drops the
+    /// decoration for every `cleared` path (the file returned to clean / was
+    /// removed from git's view). Keyed by path relative to the worktree root —
+    /// the same key space as [`WorktreeEntry::path`]; ignored paths never
+    /// appear. The daemon diffs its previous git state against the new one to
+    /// produce these deltas, mirroring the `UpdateWorktree` pattern. A status
+    /// arriving for a path the client has not yet added is reconciled
+    /// client-side (the worktree snapshot is the source of truth; see #135).
+    UpdateGitStatus {
+        changed: Vec<GitStatusEntry>,
+        cleared: Vec<String>,
+    },
+    /// Repo-level git state for the watched worktree, recomputed on `.git/`
+    /// changes (commit, branch switch, staging). `branch` is `None` when HEAD
+    /// is detached; `ahead_behind` is `None` when the current branch has no
+    /// upstream. Produced and streamed by Phase 3.3, but not wired into the
+    /// statusbar by it (the #18 statusbar swap is a later step).
+    RepoState {
+        branch: Option<String>,
+        ahead_behind: Option<AheadBehind>,
+    },
     Welcome {
         version: u32,
     },
@@ -74,6 +96,60 @@ pub struct WorktreeEntry {
 pub enum EntryKind {
     File,
     Dir,
+}
+
+/// One side's porcelain status code for a path.
+///
+/// Git models each path as an **index** (staged) component and a **worktree**
+/// (unstaged) component — the `XY` pair of `git status --porcelain`.
+/// [`GitEntryStatus`] carries both. Most codes can appear on either side;
+/// [`GitStatusCode::Untracked`] is only ever a worktree-side code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitStatusCode {
+    /// No change on this side.
+    Unmodified,
+    Modified,
+    /// The file's type changed (e.g. regular file <-> symlink).
+    TypeChange,
+    Added,
+    Deleted,
+    Renamed,
+    Copied,
+    /// Updated but unmerged — a merge conflict.
+    Unmerged,
+    /// Present in the worktree but not tracked by git.
+    Untracked,
+}
+
+/// The git status of one path: its index (staged) and worktree (unstaged)
+/// components, mirroring git's porcelain `XY`.
+///
+/// Examples: an untracked file is `{ index: Unmodified, worktree: Untracked }`;
+/// a file staged and then left alone is `{ index: Modified, worktree:
+/// Unmodified }`; a tracked file edited but not staged is `{ index:
+/// Unmodified, worktree: Modified }`. A clean (unmodified on both sides) path
+/// carries no status at all — it is never sent, and a path returning to clean
+/// is reported via `cleared` in [`DaemonMessage::UpdateGitStatus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitEntryStatus {
+    pub index: GitStatusCode,
+    pub worktree: GitStatusCode,
+}
+
+/// A path paired with its git status, keyed by path relative to the worktree
+/// root — the same key space as [`WorktreeEntry::path`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitStatusEntry {
+    pub path: String,
+    pub status: GitEntryStatus,
+}
+
+/// Ahead/behind commit counts of the current branch versus its upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AheadBehind {
+    pub ahead: u32,
+    pub behind: u32,
 }
 
 #[cfg(test)]
@@ -229,5 +305,105 @@ mod tests {
         // Pin the wire shape of `mtime`: the protocol may migrate to MessagePack,
         // so an accidental change to the timestamp representation must fail a test.
         assert!(json.contains(r#""mtime":{"secs_since_epoch":5,"nanos_since_epoch":7}"#));
+    }
+
+    #[test]
+    fn test_update_git_status_roundtrip_preserves_changed_and_cleared() {
+        let msg = DaemonMessage::UpdateGitStatus {
+            changed: vec![
+                GitStatusEntry {
+                    path: "src/main.rs".to_owned(),
+                    status: GitEntryStatus {
+                        index: GitStatusCode::Unmodified,
+                        worktree: GitStatusCode::Modified,
+                    },
+                },
+                GitStatusEntry {
+                    path: "new.rs".to_owned(),
+                    status: GitEntryStatus {
+                        index: GitStatusCode::Added,
+                        worktree: GitStatusCode::Unmodified,
+                    },
+                },
+            ],
+            cleared: vec!["was_dirty.rs".to_owned()],
+        };
+
+        let json = serde_json::to_string(&msg).expect("serialize UpdateGitStatus");
+        assert!(json.contains(r#""type":"update_git_status""#));
+        assert!(json.contains(r#""index":"added""#));
+        assert!(json.contains(r#""worktree":"modified""#));
+
+        let parsed: DaemonMessage =
+            serde_json::from_str(&json).expect("deserialize UpdateGitStatus");
+        assert_eq!(parsed, msg);
+        match parsed {
+            DaemonMessage::UpdateGitStatus { changed, cleared } => {
+                assert_eq!(changed.len(), 2);
+                assert_eq!(cleared, vec!["was_dirty.rs".to_owned()]);
+            }
+            other => panic!("expected UpdateGitStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_git_entry_status_untracked_and_conflict_pairs_roundtrip() {
+        // The two edge pairs: an untracked file (worktree-only `Untracked`) and
+        // a merge conflict (`Unmerged` on both sides).
+        let untracked = GitEntryStatus {
+            index: GitStatusCode::Unmodified,
+            worktree: GitStatusCode::Untracked,
+        };
+        let conflict = GitEntryStatus {
+            index: GitStatusCode::Unmerged,
+            worktree: GitStatusCode::Unmerged,
+        };
+        for status in [untracked, conflict] {
+            let json = serde_json::to_string(&status).expect("serialize GitEntryStatus");
+            let parsed: GitEntryStatus =
+                serde_json::from_str(&json).expect("deserialize GitEntryStatus");
+            assert_eq!(parsed, status);
+        }
+    }
+
+    #[test]
+    fn test_repo_state_roundtrip_branch_and_detached_head() {
+        let on_branch = DaemonMessage::RepoState {
+            branch: Some("main".to_owned()),
+            ahead_behind: Some(AheadBehind {
+                ahead: 2,
+                behind: 1,
+            }),
+        };
+        let json = serde_json::to_string(&on_branch).expect("serialize RepoState");
+        assert!(json.contains(r#""type":"repo_state""#));
+        assert!(json.contains(r#""branch":"main""#));
+        assert!(json.contains(r#""ahead":2"#));
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize RepoState"),
+            on_branch
+        );
+
+        // Detached HEAD with no upstream: both fields are absent (`None`).
+        let detached = DaemonMessage::RepoState {
+            branch: None,
+            ahead_behind: None,
+        };
+        let json = serde_json::to_string(&detached).expect("serialize detached RepoState");
+        assert!(json.contains(r#""branch":null"#));
+        assert!(json.contains(r#""ahead_behind":null"#));
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize detached RepoState"),
+            detached
+        );
+    }
+
+    #[test]
+    fn test_git_status_code_unknown_variant_is_rejected() {
+        // serde rejects an unknown enum variant rather than silently defaulting,
+        // so a future daemon emitting a code this client does not know fails
+        // loudly instead of being misread as a valid status.
+        let err = serde_json::from_str::<GitStatusCode>(r#""partially_staged""#);
+        assert!(err.is_err(), "unknown status code must not deserialize");
     }
 }
