@@ -31,6 +31,7 @@ streams pane bytes and layout state back.
 { "type": "input",        "pane_id": 3, "data": "ls\n" }
 { "type": "resize_pane",  "pane_id": 3, "cols": 120, "rows": 40 }
 { "type": "tmux_command", "cmd": "split-window -h" }
+{ "type": "capture_pane", "pane_id": 3, "start": "-", "end": "-128", "join": false }
 ```
 
 - `attach` carries the **session name end-to-end**, so the `RIFT_SESSION` knob
@@ -41,11 +42,17 @@ streams pane bytes and layout state back.
   forwards it to tmux and never interprets pane input or output (agent-agnostic).
 - `resize_pane` maps to this client's tmux resize/`refresh-client -C`.
 - `tmux_command` is a raw command line emitted on this client's control-mode attach.
+- `capture_pane` requests a bounded `capture-pane` of pre-attach scrollback:
+  `start`/`end` are tmux `-S`/`-E` line addresses (`"-"` for the extreme, a
+  negative number for a history offset), `join` is `-J`. The daemon answers with
+  exactly one `pane_capture` for this pane — a **request/response** exchange,
+  separate from the live `%output` stream.
 
 ### Daemon → client
 
 ```json
 { "type": "pane_output",     "pane_id": 3, "bytes": [27, 91, 49, 109, ...] }
+{ "type": "pane_capture",    "pane_id": 3, "bytes": [27, 91, 51, 49, 109, ...] }
 { "type": "layout_snapshot", "session": "rift", "windows": [ <window>, ... ] }
 { "type": "layout_update",   "session": "rift", "windows": [ <window>, ... ] }
 { "type": "terminal_exit",   "session": "rift", "reason": "server exited" }
@@ -66,6 +73,11 @@ streams pane bytes and layout state back.
 - `pane_output` carries **raw terminal bytes, not cells** (the VTE-location spike
   verdict, #201): the client feeds them straight into its
   `alacritty_terminal::Term`. The byte run is opaque ANSI; ordering is per-pane.
+- `pane_capture` is the reply to a `capture_pane`: the captured pre-attach
+  scrollback as opaque bytes (tmux-decoded, ANSI preserved via `capture-pane -e`),
+  or empty on a capture error. The client routes it to its **scrollback history**,
+  not the live `Term` — this is how pre-attach scrollback keeps working over the
+  daemon seam (the "command emission" path of the design spec).
 - `layout_snapshot` is the complete window/pane layout for the session, sent once
   per attach as the consistency-contract baseline (below). The client replaces its
   entire layout model with it.
@@ -96,9 +108,9 @@ is **gap-free and duplicate-free**:
 On reconnect the daemon reattaches and sends a fresh `layout_snapshot`; the client
 resets to it and resumes from the new baseline (tmux is the session persistence, so
 no terminal state is lost). Pane **scrollback** that predates the attach is fetched
-separately via `capture-pane` (command emission) and is outside this contract —
-the contract governs only the seam between the attach snapshot and the live
-`%output` stream.
+separately via the `capture_pane` / `pane_capture` request/response pair and is
+outside this contract — the contract governs only the seam between the attach
+snapshot and the live `%output` stream.
 
 ## Worktree, git, and repo state
 
