@@ -1,8 +1,8 @@
 # Spec: Phase 3 — Git status
 
-> Status: READY
+> Status: COMPLETED
 > Created: 2026-06-09
-> Completed: —
+> Completed: 2026-06-13
 
 The daemon computes per-file git status (staged + unstaged) for the watched worktree plus repo-level branch state, recomputing on both worktree and `.git/` changes, and streams it to the client as incremental updates that decorate the worktree-snapshot entries — giving the client a live, accurate git status for every tracked or changed file. This re-introduces the per-entry status slot the file-tree spec deliberately reserved, and is the second consumer of the worktree foundation alongside the future explorer panel.
 
@@ -10,13 +10,13 @@ The daemon computes per-file git status (staged + unstaged) for the watched work
 
 What is true when this work is done? Observable, end-to-end criteria — not activities.
 
-- [ ] After the initial worktree snapshot, the daemon computes git status for the worktree and the client's worktree model carries an accurate per-file status — distinguishing **staged (index)** from **unstaged (worktree)** changes — for every tracked / changed file (modified, added, deleted, renamed, untracked, conflicted).
-- [ ] The client holds the repo-level state: current **branch name** and **ahead/behind** counts versus the upstream.
-- [ ] A file modified, created, deleted, or staged on the remote produces an incremental git-status update the client applies — no full worktree rescan — and the per-file status converges to git's own view (`git status --porcelain` on the remote agrees, staged vs unstaged included).
-- [ ] A change that lives **inside** `.git/` — a commit, a `git add`, a branch switch — is reflected: per-file statuses and the repo-level branch/ahead-behind update, even though the worktree watcher ignores `.git/`.
-- [ ] Git-status computation runs off the daemon dispatch loop (on a blocking worker), and recompute is debounced/coalesced so an agent rewriting many files does not flood the channel or stall dispatch.
-- [ ] Ignored paths carry no status (consistent with the worktree snapshot excluding them): a write to a `.gitignore`d path or inside `target/` produces no git-status update.
-- [ ] The git state lives in the daemon's single `State` and is published to consumers via a `watch`/`broadcast` channel — no `Arc<Mutex<State>>`.
+- [x] After the initial worktree snapshot, the daemon computes git status for the worktree and the client's worktree model carries an accurate per-file status — distinguishing **staged (index)** from **unstaged (worktree)** changes — for every tracked / changed file (modified, added, deleted, renamed, untracked, conflicted).
+- [x] The client holds the repo-level state: current **branch name** and **ahead/behind** counts versus the upstream.
+- [x] A file modified, created, deleted, or staged on the remote produces an incremental git-status update the client applies — no full worktree rescan — and the per-file status converges to git's own view (`git status --porcelain` on the remote agrees, staged vs unstaged included).
+- [x] A change that lives **inside** `.git/` — a commit, a `git add`, a branch switch — is reflected: per-file statuses and the repo-level branch/ahead-behind update, even though the worktree watcher ignores `.git/`.
+- [x] Git-status computation runs off the daemon dispatch loop (on a blocking worker), and recompute is debounced/coalesced so an agent rewriting many files does not flood the channel or stall dispatch.
+- [x] Ignored paths carry no status (consistent with the worktree snapshot excluding them): a write to a `.gitignore`d path or inside `target/` produces no git-status update.
+- [x] The git state lives in the daemon's single `State` and is published to consumers via a `watch`/`broadcast` channel — no `Arc<Mutex<State>>`.
 
 ## Scope
 
@@ -75,14 +75,14 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 
 ## Verification
 
-- [ ] `cargo clippy --workspace -- -D warnings` passes
-- [ ] `cargo test --workspace` passes
-- [ ] `cargo deny check licenses` passes with the full `gix` transitive tree resolved
-- [ ] `cargo build --release -p rift-daemon --target x86_64-unknown-linux-musl` still produces a static binary with `gix` linked
-- [ ] Integration test against a fixture git repo: modifying a tracked file marks its `worktree` (unstaged) component modified; `git add`-ing it moves the change to the `index` (staged) component; creating an untracked file marks it untracked; deleting a tracked file marks it deleted; committing clears the status — each via the matching incremental update applied to the client model
-- [ ] A branch switch / commit in the fixture (a `.git/`-only change) recomputes and updates both the per-file statuses and the repo-level branch name + ahead/behind
-- [ ] A write to an ignored path (`target/foo`, a `.gitignore`d path) emits no git-status update
-- [ ] A `grep` confirms no `Arc<Mutex<State>>` in the daemon crate and that `crates/explorer` pulls no `gpui`/`gpui-component` and no `git2`/`libgit2-sys` (inspect its resolved dependency tree — `gix` only)
+- [x] `cargo clippy --workspace -- -D warnings` passes
+- [x] `cargo test --workspace` passes
+- [x] `cargo deny check licenses` passes with the full `gix` transitive tree resolved
+- [x] `cargo build --release -p rift-daemon --target x86_64-unknown-linux-musl` still produces a static binary with `gix` linked
+- [x] Integration test against a fixture git repo: modifying a tracked file marks its `worktree` (unstaged) component modified; `git add`-ing it moves the change to the `index` (staged) component; creating an untracked file marks it untracked; deleting a tracked file marks it deleted; committing clears the status — each via the matching incremental update applied to the client model
+- [x] A branch switch / commit in the fixture (a `.git/`-only change) recomputes and updates both the per-file statuses and the repo-level branch name + ahead/behind
+- [x] A write to an ignored path (`target/foo`, a `.gitignore`d path) emits no git-status update
+- [x] A `grep` confirms no `Arc<Mutex<State>>` in the daemon crate and that `crates/explorer` pulls no `gpui`/`gpui-component` and no `git2`/`libgit2-sys` (inspect its resolved dependency tree — `gix` only)
 
 ## Risks and mitigations
 
@@ -100,3 +100,9 @@ Decisions made during implementation. Added as work progresses.
 
 - 2026-06-09: Spec created from `/plan git-status`. `gix` recorded as precedent-decided (GitComet + Hunk read path) and constraint-reinforced (musl rules out `git2`/`libgit2`); per-entry decoration + incremental updates, `spawn_blocking`+debounce, the `.git/` whitelist, snapshot-as-truth, read-only, data-layer-only, and single-root recorded as precedent/constraint-decided. The one open decision — git-state granularity (minimal per-file vs. full porcelain + branch) — flagged for the review gate.
 - 2026-06-09: Review gate (Agent review, VERDICT READY, no blocking findings). Resolved the open decision via `AskUserQuestion` — **full porcelain**: per-file `index`+`worktree` status pair plus repo-level branch + ahead/behind; the daemon branch is produced/streamed but the statusbar rewire (#18) stays out of scope. Addressed the non-blocking findings: clarified that the `gix`/`git2` reference projects pair `git2` only for writes (excluded here) so the read-path precedent is cleanly `gix`; added `cargo deny check licenses` to Verification for the `gix` transitive tree; noted the `.git/` whitelist is a second watched set on the file-tree `notify` backend, not a separate watcher. Flipped `DRAFT` → `READY` in the same PR (#129).
+- 2026-06-13 (#131): Protocol surface added — `GitStatusCode` (porcelain per-side code), `GitEntryStatus { index, worktree }` (the `XY` pair), `GitStatusEntry { path, status }`, `AheadBehind`, and two additive `DaemonMessage` variants: `UpdateGitStatus { changed, cleared }` (incremental, mirroring `UpdateWorktree`) and `RepoState { branch, ahead_behind }` (`branch: None` = detached HEAD, `ahead_behind: None` = no upstream). The placeholder `git_status: Option<String>` the file-tree spec dropped is not re-introduced.
+- 2026-06-13 (#132): `gix`-backed computation in `crates/explorer/src/git.rs`. `gix = 0.84`, `default-features = false`, features `status, dirwalk, revision, sha1, max-performance-safe` — pure-Rust, musl-clean; `max-performance` (zlib-ng, C) and `git2`/`libgit2` deliberately excluded. Mapping: `Item::TreeIndex` → index/staged side, `Item::IndexWorktree` → worktree/unstaged side; conflict → both `Unmerged`; `intent-to-add` → index `Added` (an index marker, caught in review where it was first mis-mapped to the worktree column). Repo state via `head_name().shorten()` + a `with_hidden` revision walk for ahead/behind. Explorer-local types mirror the protocol wire types; the daemon maps them, keeping `crates/explorer` protocol-independent. Tests build real `git` CLI fixtures and assert against `git status --porcelain`.
+- 2026-06-13 (#133): `Watcher::with_git_status` layers the `.git/` control whitelist (`.git` non-recursive for HEAD/index/packed-refs, `.git/refs` recursive) onto the **same** notify backend/worker as the worktree watch (`Watcher::new` is a thin wrapper over a shared `start`); it recomputes `GitStatus` on every debounced flush. Fixed a latent feedback loop affecting **both** watchers: notify reports `Access(Open)` events, which our own rescan/recompute generate by opening watched dirs — the worker now flushes only on a real create/modify/remove, never on `Access`. A recompute error (transient `index.lock`) is logged and skipped.
+- 2026-06-13 (#134): The daemon owns the latest `GitStatus` in its single `watch`-backed `State` (no `Arc<Mutex>`), diffs consecutive recomputes to broadcast incremental `UpdateGitStatus` + `RepoState`, and replays the full git status per connection right behind the worktree snapshot (the #227 loss-free pattern). The worker computes the initial status to detect whether the root is a repo: if so it arms `with_git_status`, else it degrades to worktree-only `Watcher::new` (a non-repo root streams its tree without per-flush git-error spam).
+- 2026-06-13 (#135): Client `WorktreeModel` carries git decoration — a per-path git status map **independent** of the tree (a status for a not-yet-known path is buffered, never corrupts the tree: the reconciliation rule for an unknown path) plus repo-level branch + ahead/behind. A completed worktree snapshot resets the decoration, since the daemon re-sends the full status right behind every snapshot.
+- 2026-06-13: Milestone-QA gate. The git-status pipeline was verified **live end-to-end** against the real rift repo (daemon launched in the repo, a minimal UDS client): a clean repo reports `branch: develop` and no entries; an untracked file streams `update_git_status { worktree: untracked }`; `git add` streams `{ index: added }`; `git reset` + remove streams `cleared`. Every transition matches git's own view. **Observed limitation (spec-acknowledged, not a regression):** on the dev channel the daemon is spawned in the SSH login dir (`$HOME`), which is not a git repo, so it correctly logs `no git status … worktree-only` and streams the tree only. The spec scopes v1's watched root to "the directory the daemon is launched in", with a configured project path as "a later extension, not part of this spec" — tracked as a follow-up so the data layer becomes useful on the dev channel.
