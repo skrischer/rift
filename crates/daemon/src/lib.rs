@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub mod lsp;
-pub mod spike;
+mod terminal;
 
 use lsp::{document_changes, LspDiagnostics, LspWorker};
 use rift_explorer::{Change, Entry, GitStatus, Snapshot, Watcher};
@@ -16,14 +16,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, watch};
 
-/// Single source of truth for the daemon's observable state.
+/// Single source of truth for the daemon's observable worktree/git state.
 ///
-/// Mirrors `DaemonMessage::StateUpdate`. Held as the value of a
-/// `tokio::sync::watch` channel so consumers observe the latest snapshot
-/// without sharing a mutex.
+/// Held as the value of a `tokio::sync::watch` channel so consumers observe the
+/// latest snapshot without sharing a mutex. The terminal path is not part of
+/// this shared state — each connection drives its own per-client tmux attach
+/// (see [`terminal`]).
 #[derive(Debug, Clone, Default)]
 pub struct State {
-    pub sessions: Vec<String>,
     /// Latest worktree snapshot, present once the initial scan completes.
     /// Kept current by applying the watcher's change batches in place.
     pub worktree: Option<Snapshot>,
@@ -151,6 +151,13 @@ const SERVE_EVENT_CAPACITY: usize = 256;
 /// Read buffer for a single transport read. The transport delivers arbitrary
 /// chunk sizes; the [`FrameDecoder`] reassembles frames regardless of this size.
 const SERVE_READ_BUFFER: usize = 8 * 1024;
+
+/// Per-connection terminal channel bounds. `INBOUND` queues the connection's
+/// terminal `ClientMessage`s for its tmux attach; `OUTBOUND` bounds the attach's
+/// event backlog — the daemon→client flow-control leg, so a flooding pane can
+/// never grow this without bound (its backpressure pauses the pane tmux-side).
+const TERMINAL_INBOUND_CAPACITY: usize = 256;
+const TERMINAL_OUTBOUND_CAPACITY: usize = 256;
 
 /// Queue depth for worktree events flowing from the blocking worker into the
 /// dispatch loop. Bounds how far the worker may run ahead while the loop is busy.
@@ -520,6 +527,7 @@ async fn serve_connection<R, W>(
     inbound: mpsc::Sender<ClientMessage>,
     mut events: broadcast::Receiver<DaemonMessage>,
     mut state: watch::Receiver<State>,
+    tmux_server: Option<String>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -534,6 +542,20 @@ where
     let mut handshaken = false;
     let mut snapshot_sent = false;
 
+    // This connection's own tmux attach: terminal `ClientMessage`s are routed to
+    // a dedicated `terminal_task` (each client gets its own `tmux -C` child), and
+    // its outbound events are multiplexed onto this socket alongside the shared
+    // worktree/git stream. Keeping the terminal path per connection is what gives
+    // each rift client an independent attach (per-client size, flow control).
+    let (terminal_in_tx, terminal_in_rx) = mpsc::channel(TERMINAL_INBOUND_CAPACITY);
+    let (terminal_out_tx, mut terminal_out_rx) = mpsc::channel(TERMINAL_OUTBOUND_CAPACITY);
+    let terminal = tokio::spawn(terminal::terminal_task(
+        terminal_in_rx,
+        terminal_out_tx,
+        tmux_server,
+    ));
+    let mut terminal_done = false;
+
     'serve: loop {
         tokio::select! {
             read = reader.read(&mut buf) => {
@@ -545,9 +567,25 @@ where
                 }
                 decoder.push(&buf[..n]);
                 while let Some(msg) = decoder.next_frame::<ClientMessage>()? {
-                    if inbound.send(msg).await.is_err() {
-                        // Dispatch loop gone; nothing left to serve.
-                        break 'serve;
+                    // Terminal messages drive this connection's own tmux attach;
+                    // everything else (the handshake) goes to the shared loop.
+                    match msg {
+                        ClientMessage::Attach { .. }
+                        | ClientMessage::Input { .. }
+                        | ClientMessage::ResizePane { .. }
+                        | ClientMessage::TmuxCommand { .. } => {
+                            if terminal_in_tx.send(msg).await.is_err() {
+                                // Terminal task gone; the terminal path is dead,
+                                // but the worktree path can keep serving.
+                                terminal_done = true;
+                            }
+                        }
+                        ClientMessage::Hello { .. } => {
+                            if inbound.send(msg).await.is_err() {
+                                // Dispatch loop gone; nothing left to serve.
+                                break 'serve;
+                            }
+                        }
                     }
                 }
             }
@@ -590,10 +628,46 @@ where
                     snapshot_sent = write_snapshot(&mut writer, &state).await?;
                 }
             }
+            terminal_event = terminal_out_rx.recv(), if !terminal_done => {
+                match terminal_event {
+                    // This connection's tmux attach produced an event (pane bytes,
+                    // a layout change, or terminal-path-down): write it to the
+                    // socket alongside the shared worktree/git stream.
+                    Some(msg) => {
+                        let frame = encode_frame(&msg)?;
+                        writer.write_all(&frame).await?;
+                        writer.flush().await?;
+                    }
+                    // The terminal task ended; stop polling its channel so this
+                    // branch cannot busy-loop. The worktree path keeps serving.
+                    None => terminal_done = true,
+                }
+            }
         }
     }
 
+    // End this connection's tmux attach. The task then detaches the control
+    // child (the tmux session persists) and exits.
+    shutdown_terminal(terminal_in_tx, terminal_out_rx, terminal).await;
+
     Ok(())
+}
+
+/// Tear down a connection's terminal task: drop BOTH channel ends, then join.
+///
+/// Dropping `in_tx` wakes a task parked at `inbound.recv()`; dropping `out_rx`
+/// wakes one parked in `process()` on a full OUTBOUND send (a flooding pane
+/// while the connection stopped draining the channel). Both drops must happen
+/// BEFORE the await — a task parked on a full send is never woken by dropping
+/// the sender alone, so awaiting first would hang the connection forever.
+async fn shutdown_terminal(
+    in_tx: mpsc::Sender<ClientMessage>,
+    out_rx: mpsc::Receiver<DaemonMessage>,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    drop(in_tx);
+    drop(out_rx);
+    let _ = handle.await;
 }
 
 /// Replay the current worktree snapshot to one connection, backpressured by the
@@ -673,7 +747,8 @@ where
     drop(handles);
 
     let dispatch = tokio::spawn(daemon.run());
-    let result = serve_connection(reader, writer, inbound, events, state).await;
+    // `None`: production uses the default tmux server for terminal attaches.
+    let result = serve_connection(reader, writer, inbound, events, state, None).await;
     // `serve_connection` dropped its `inbound` clone on return, so the dispatch
     // loop has observed channel closure and will join.
     dispatch.await?;
@@ -742,7 +817,7 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
         let events = handles.subscribe();
         let state = handles.state.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_connection(reader, writer, inbound, events, state).await {
+            if let Err(e) = serve_connection(reader, writer, inbound, events, state, None).await {
                 // Stderr is the daemon's log sink (stdout carries protocol frames
                 // in stdio mode); one failed connection must not stop the daemon.
                 eprintln!("rift-daemon connection ended with error: {e}");
@@ -894,9 +969,10 @@ impl Core {
                     version: PROTOCOL_VERSION,
                 });
             }
-            // Terminal/tmux handling (attach, input, resize, command emission)
-            // is owned by a later Phase 6 daemon sub-spec; this scaffolding only
-            // carries the handshake.
+            // Terminal/tmux messages never reach the shared dispatch loop:
+            // `serve_connection` routes them to this connection's own
+            // `terminal_task` (per-client attach). The arm stays as a defensive
+            // no-op in case a caller drives the loop directly.
             ClientMessage::Attach { .. }
             | ClientMessage::Input { .. }
             | ClientMessage::ResizePane { .. }
@@ -1408,7 +1484,8 @@ mod tests {
         let (mut client_reader, mut client_writer) = tokio::io::split(client);
         let (server_reader, server_writer) = tokio::io::split(server);
         let conn = tokio::spawn(async move {
-            let _ = serve_connection(server_reader, server_writer, inbound, events, state).await;
+            let _ =
+                serve_connection(server_reader, server_writer, inbound, events, state, None).await;
         });
 
         client_writer
@@ -1428,6 +1505,159 @@ mod tests {
         drop(client_writer);
         drop(client_reader);
         conn.abort();
+        loop_handle.abort();
+    }
+
+    /// Kills an isolated `-L` tmux server on drop, so a terminal test leaves no
+    /// stray tmux behind and never touches the developer's server.
+    struct IsolatedTmux(String);
+
+    impl Drop for IsolatedTmux {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", &self.0, "kill-server"])
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_terminal_joins_a_task_parked_on_full_outbound() {
+        // Deterministic regression for the teardown deadlock (#263 review).
+        // serve_connection's teardown is `shutdown_terminal`. Park a real
+        // terminal task in `process()` on a full (cap-1) outbound channel, then
+        // call shutdown_terminal: it must RETURN. It does so by dropping the
+        // receiver before joining — if it awaited the handle first, the parked
+        // task would never wake and this times out. (The full serve_connection
+        // break-path that exposed this is racy to force; this tests the exact
+        // teardown code it runs.)
+        let server = IsolatedTmux(format!("rift204td-{}", std::process::id()));
+        let (in_tx, in_rx) = mpsc::channel(64);
+        // Capacity 1: the attach's snapshot plus the pane's initial draw overrun
+        // it, so the task parks on a send with nobody reading.
+        let (out_tx, out_rx) = mpsc::channel(1);
+        let handle = tokio::spawn(terminal::terminal_task(
+            in_rx,
+            out_tx,
+            Some(server.0.clone()),
+        ));
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+        // Let the attach produce >1 message and park on the full channel.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !handle.is_finished(),
+            "task must be parked on the full outbound channel"
+        );
+
+        let done = tokio::time::timeout(
+            Duration::from_secs(10),
+            shutdown_terminal(in_tx, out_rx, handle),
+        )
+        .await;
+        assert!(
+            done.is_ok(),
+            "shutdown_terminal hung joining a task parked on a full outbound channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serve_connection_returns_on_disconnect_during_flood() {
+        // Integration smoke: the whole serve_connection path against real tmux —
+        // attach, flood a pane, stop reading, disconnect — must RETURN.
+        let server = IsolatedTmux(format!("rift204conn-{}", std::process::id()));
+
+        let (daemon, handles) = channels(64, 64);
+        let inbound = handles.inbound.clone();
+        let events = handles.subscribe();
+        let state = handles.state.clone();
+        let loop_handle = tokio::spawn(daemon.run());
+
+        let (client, server_io) = tokio::io::duplex(64 * 1024);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+
+        let tmux_name = server.0.clone();
+        let conn = tokio::spawn(async move {
+            serve_connection(
+                server_reader,
+                server_writer,
+                inbound,
+                events,
+                state,
+                Some(tmux_name),
+            )
+            .await
+        });
+
+        // Handshake, then attach and wait for the layout snapshot.
+        client_writer
+            .write_all(&hello_frame())
+            .await
+            .expect("hello");
+        client_writer.flush().await.expect("flush hello");
+        let mut decoder = FrameDecoder::new();
+        loop {
+            if matches!(
+                read_daemon_message(&mut client_reader, &mut decoder).await,
+                DaemonMessage::Welcome { .. }
+            ) {
+                break;
+            }
+        }
+        client_writer
+            .write_all(
+                &encode_frame(&ClientMessage::Attach {
+                    session: "rift".to_owned(),
+                })
+                .expect("encode attach"),
+            )
+            .await
+            .expect("attach");
+        client_writer.flush().await.expect("flush attach");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(
+                    read_daemon_message(&mut client_reader, &mut decoder).await,
+                    DaemonMessage::LayoutSnapshot { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("layout snapshot");
+
+        // Flood the pane, then stop reading and disconnect.
+        client_writer
+            .write_all(
+                &encode_frame(&ClientMessage::Input {
+                    pane_id: 0,
+                    data: "yes RIFTFLOOD\n".to_owned(),
+                })
+                .expect("encode input"),
+            )
+            .await
+            .expect("flood");
+        client_writer.flush().await.expect("flush flood");
+        // Give the flood a moment to fill buffers, then disconnect mid-stream.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(client_reader);
+        drop(client_writer);
+
+        // serve_connection must return (the fix drops terminal_out_rx before
+        // awaiting the possibly-parked terminal task).
+        let result = tokio::time::timeout(Duration::from_secs(15), conn).await;
+        assert!(
+            result.is_ok(),
+            "serve_connection hung on disconnect during a flood"
+        );
+
         loop_handle.abort();
     }
 

@@ -102,8 +102,16 @@ pub enum DaemonMessage {
         session: String,
         windows: Vec<WindowLayout>,
     },
-    StateUpdate {
-        sessions: Vec<String>,
+    /// The terminal path for `session` went down: the daemon's tmux control
+    /// attach ended — the tmux server exited (`%exit`) or the control-mode
+    /// child died. The client's pane streams for this attach stop; it may
+    /// re-`attach` to resume (tmux is the session persistence, so a still-live
+    /// server reattaches with a fresh snapshot). `reason` is tmux's `%exit`
+    /// message when it supplied one. This is a terminal-path-down signal, never
+    /// a daemon failure — the daemon keeps serving its other clients.
+    TerminalExit {
+        session: String,
+        reason: Option<String>,
     },
     /// Initial worktree contents, sent on connect. A large tree is split across
     /// several `WorktreeSnapshot` messages: the client appends `entries` from
@@ -541,6 +549,34 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<DaemonMessage>(&json).expect("deserialize empty LayoutSnapshot"),
             msg
+        );
+    }
+
+    #[test]
+    fn test_terminal_exit_roundtrip_with_and_without_reason() {
+        // The terminal-path-down signal: carries the session and tmux's optional
+        // %exit reason, and round-trips both shapes.
+        let with_reason = DaemonMessage::TerminalExit {
+            session: "rift".to_owned(),
+            reason: Some("server exited".to_owned()),
+        };
+        let json = serde_json::to_string(&with_reason).expect("serialize TerminalExit");
+        assert!(json.contains(r#""type":"terminal_exit""#));
+        assert!(json.contains(r#""session":"rift""#));
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize TerminalExit"),
+            with_reason
+        );
+
+        let no_reason = DaemonMessage::TerminalExit {
+            session: "rift-dev".to_owned(),
+            reason: None,
+        };
+        let json = serde_json::to_string(&no_reason).expect("serialize TerminalExit");
+        assert!(json.contains(r#""reason":null"#));
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize TerminalExit"),
+            no_reason
         );
     }
 

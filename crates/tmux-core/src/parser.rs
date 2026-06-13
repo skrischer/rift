@@ -29,6 +29,11 @@ pub(crate) fn parse_notification(line: &[u8]) -> Option<Event> {
     let (head, rest) = split_first_space(line);
     match head {
         b"%output" => parse_output(rest),
+        // tmux switches to `%extended-output %<pane> <age> : <text>` once flow
+        // control (`pause-after`) is active on the client. Same pane bytes, just
+        // annotated with output age (ms) — decode to the same [`Event::Output`],
+        // dropping the age, so the byte stream is identical to the unpaused path.
+        b"%extended-output" => parse_extended_output(rest),
         b"%layout-change" => parse_layout_change(rest),
         b"%window-add" => parse_window_id(rest).map(|window| Event::WindowAdd { window }),
         b"%window-close" | b"%unlinked-window-close" => {
@@ -45,6 +50,24 @@ pub(crate) fn parse_notification(line: &[u8]) -> Option<Event> {
         }),
         _ => None,
     }
+}
+
+/// `%<pane> <age> : <payload>` (flow-control form) — strip the pane id and the
+/// age token, then decode the payload after the ` : ` separator. The payload may
+/// contain ` : ` itself, so only the first separator is consumed.
+fn parse_extended_output(rest: &[u8]) -> Option<Event> {
+    let after_pct = rest.strip_prefix(b"%")?;
+    let sp1 = after_pct.iter().position(|&b| b == b' ')?;
+    let (id, after_pane) = after_pct.split_at(sp1);
+    let pane = parse_u32(id)?;
+    // after_pane = " <age> : <payload>"; skip the leading space, then the age.
+    let after_age = &after_pane[1..];
+    let sp2 = after_age.iter().position(|&b| b == b' ')?;
+    let payload = after_age[sp2 + 1..].strip_prefix(b": ")?;
+    Some(Event::Output {
+        pane,
+        data: decode_octal(payload),
+    })
 }
 
 /// `%<pane> <payload>` — the space after the pane id is mandatory (an empty
@@ -145,6 +168,34 @@ mod tests {
                 data: Vec::new(),
             })
         );
+    }
+
+    #[test]
+    fn test_parse_notification_extended_output_decodes_payload_dropping_age() {
+        // Flow-control form (real tmux 3.4): "%extended-output %<pane> <age> :
+        // <text>". The age is dropped; the text decodes like %output.
+        assert_eq!(
+            parse_notification(b"%extended-output %0 0 : ls\\015\\012"),
+            Some(Event::Output {
+                pane: 0,
+                data: b"ls\r\n".to_vec(),
+            })
+        );
+        // A payload containing " : " keeps everything after the first separator.
+        assert_eq!(
+            parse_notification(b"%extended-output %2 17 : a : b"),
+            Some(Event::Output {
+                pane: 2,
+                data: b"a : b".to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_notification_extended_output_malformed_returns_none() {
+        assert_eq!(parse_notification(b"%extended-output 0 0 : hi"), None); // pane no %
+        assert_eq!(parse_notification(b"%extended-output %0 0 hi"), None); // no ": " separator
+        assert_eq!(parse_notification(b"%extended-output %0"), None); // truncated
     }
 
     #[test]
