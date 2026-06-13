@@ -443,8 +443,12 @@ gallery:
     # x64 loader vendored in webview2-com-sys next to the exe (issue #127).
     cp "$(ls ~/.cargo/registry/src/*/webview2-com-sys-*/x64/WebView2Loader.dll | head -1)" "$(dirname {{windows_gallery_exe}})/"
     -{{windows_system32}}/taskkill.exe /F /IM gallery.exe 2>/dev/null
-    export WSLENV="RUST_LOG" && \
+    # The WebView demo needs DirectComposition off so the native child webview
+    # composites over the GPUI surface. Set it here and forward it across the WSL
+    # boundary via WSLENV (only listed vars reach the Windows process) (issue #127).
+    export WSLENV="RUST_LOG:GPUI_DISABLE_DIRECT_COMPOSITION" && \
     export RUST_LOG=rift_app=debug && \
+    export GPUI_DISABLE_DIRECT_COMPOSITION=true && \
     {{windows_gallery_exe}}
 
 # Check licenses (requires cargo-deny)
