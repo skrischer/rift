@@ -573,7 +573,8 @@ where
                         ClientMessage::Attach { .. }
                         | ClientMessage::Input { .. }
                         | ClientMessage::ResizePane { .. }
-                        | ClientMessage::TmuxCommand { .. } => {
+                        | ClientMessage::TmuxCommand { .. }
+                        | ClientMessage::CapturePane { .. } => {
                             if terminal_in_tx.send(msg).await.is_err() {
                                 // Terminal task gone; the terminal path is dead,
                                 // but the worktree path can keep serving.
@@ -976,7 +977,8 @@ impl Core {
             ClientMessage::Attach { .. }
             | ClientMessage::Input { .. }
             | ClientMessage::ResizePane { .. }
-            | ClientMessage::TmuxCommand { .. } => {}
+            | ClientMessage::TmuxCommand { .. }
+            | ClientMessage::CapturePane { .. } => {}
         }
     }
 
