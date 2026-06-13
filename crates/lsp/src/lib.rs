@@ -16,8 +16,10 @@
 
 mod error;
 
+pub mod document;
 pub mod spike;
 
+pub use document::{DocumentAction, DocumentChange, DocumentSink, DocumentSync};
 pub use error::LspError;
 
 /// `lsp-types` re-exported at the version this crate's `async-lsp` speaks, so
