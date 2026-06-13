@@ -16,9 +16,15 @@
 
 mod error;
 
+pub mod registry;
+pub mod selector;
+pub mod server;
 pub mod spike;
 
 pub use error::LspError;
+pub use registry::Registry;
+pub use selector::{DocumentSelector, ServerSpec};
+pub use server::{Server, ServerId};
 
 /// `lsp-types` re-exported at the version this crate's `async-lsp` speaks, so
 /// consumers translating diagnostics never pin a mismatching copy.
