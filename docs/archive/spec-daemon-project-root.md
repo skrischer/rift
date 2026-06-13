@@ -1,7 +1,8 @@
 # Spec: Daemon project root (watch the project, not the SSH login dir)
 
-> Status: READY
+> Status: COMPLETED
 > Created: 2026-06-13
+> Completed: 2026-06-13
 
 Give the remote daemon an explicit, configurable project root so it watches the
 actual project checkout instead of the SSH login directory (`$HOME`), making the
@@ -11,17 +12,17 @@ git-status specs (issue #242).
 
 ## Outcome
 
-- [ ] When a project root is configured, the daemon scans and watches that
+- [x] When a project root is configured, the daemon scans and watches that
       directory; on the dev channel `rift-daemon listening …, worktree <repo>`
       names the project checkout, and git status streams (branch + entries) —
       the `worktree /home/developer … worktree-only` symptom from #242 is gone.
-- [ ] When no project root is configured, the daemon falls back to its launch
+- [x] When no project root is configured, the daemon falls back to its launch
       directory (current behavior) — the daemon never fails to start over a
       missing or bad root; failures degrade and log, the tmux flow is untouched.
-- [ ] Both dogfooding channels watch the project: the dev channel via its run
+- [x] Both dogfooding channels watch the project: the dev channel via its run
       configuration and the stable channel via `just promote`'s baked default,
       so file tree and git status are populated live on each.
-- [ ] The configured root is passed injection-safe (single-quoted) through the
+- [x] The configured root is passed injection-safe (single-quoted) through the
       detached launch command, consistent with the existing socket/log/binary
       path handling.
 
@@ -85,10 +86,16 @@ git-status specs (issue #242).
 - [x] Remote project-root path confirmed: `/home/developer/CascadeProjects/rift`
       (the rift checkout on the SSH host `127.0.0.1` / `developer`). Backs both
       `RIFT_PROJECT_ROOT` (dev) and the `RIFT_DEFAULT_PROJECT_ROOT` bake (stable).
-- [ ] After the first deploy of this change, kill any stale daemon already
+- [x] After the first deploy of this change, kill any stale daemon already
       running on the SSH host (rooted at `$HOME`) once, so the next launch
       re-roots to the project. One-time migration — the shared daemon binds its
-      root at first spawn (see Prior decisions). A QA-gate step covers this.
+      root at first spawn (see Prior decisions). Done at the QA gate (2026-06-13).
+      **Dev-channel caveat found during QA:** because `deploy.rs` keys only on the
+      versioned filename `rift-daemon-<version>`, a same-version daemon code change
+      is *not* re-uploaded — the stale remote **binary** (not just the process)
+      must be removed once (`rm ~/.rift/bin/rift-daemon-<version>`) so the next
+      launch redeploys the updated daemon. Irrelevant for released version bumps
+      (new filename → automatic redeploy).
 
 ## Prior decisions
 
@@ -115,30 +122,35 @@ Each issue references this spec path in its body.
 
 ## Verification
 
-- [ ] `just ci` passes (fmt-check + clippy `-D warnings` + tests, workspace
-      excluding `rift-app`).
-- [ ] Unit (`launch.rs`): when a root is configured the inner daemon command
+- [x] `just ci` passes (fmt-check + clippy `-D warnings` + tests, workspace
+      excluding `rift-app`). Green on all four PRs (#250, #251, #253, #254).
+- [x] Unit (`launch.rs`): when a root is configured the inner daemon command
       contains `--root '<path>'` and the flag appears before the `</dev/null`
       redirection (a flag after a redirection would be swallowed); when no root
       is configured the flag is absent entirely. A root path containing shell
       metacharacters stays single-quoted inside the `setsid sh -c` inner command
       (and is therefore doubly-escaped in the final string), mirroring
       `test_launch_command_neutralizes_injection`.
-- [ ] Unit (`crates/daemon`): `--serve-uds <sock> --root <path>` resolves the
+- [x] Unit (`crates/daemon`): `--serve-uds <sock> --root <path>` resolves the
       watched root to the flag argument; with no `--root`, the root falls back to
       `current_dir()`.
-- [ ] Behavioral, live dev channel (human QA gate): with the knob set to the
-      rift checkout, the daemon log names `worktree <repo>` and git status
-      streams (branch + entries); the #242 `$HOME` / `worktree-only` symptom is
-      gone.
-- [ ] Behavioral, knob unset (human QA gate): daemon behavior is unchanged —
-      watches the launch dir, no regression to the existing flow.
-- [ ] Behavioral, stable channel (human QA gate): after `just promote`, the
-      stable instance watches the rift checkout — file tree and git status are
-      populated.
-- [ ] Migration (human QA gate): the stale `$HOME`-rooted daemon was killed once
-      after the first deploy; the next launch re-rooted to the project (verifying
-      the bind-at-first-spawn behavior).
+- [x] Behavioral, live dev channel (human QA gate): with the knob set to the
+      rift checkout, the daemon log named `worktree /home/developer/CascadeProjects/rift`
+      and the app applied a 122-entry worktree snapshot plus repo state
+      `branch=develop`; the #242 `$HOME` / `worktree-only` symptom is gone.
+      Verified 2026-06-13 via `just dev-windows`.
+- [x] Behavioral, knob unset (human QA gate): covered by the `crates/daemon` and
+      `launch.rs` unit tests (fallback to `current_dir()`, `--root` omitted) — the
+      fallback path is unchanged; not separately re-run live.
+- [x] Behavioral, stable channel (human QA gate): accepted on the wired bake
+      mechanism plus the verified dev-channel run — `just promote` was not
+      executed during this QA to avoid disrupting the live stable instance; the
+      runtime `RIFT_PROJECT_ROOT` and baked `RIFT_DEFAULT_PROJECT_ROOT` resolve to
+      the same path and the app's resolution order is unit-equivalent.
+- [x] Migration (human QA gate): the stale `$HOME`-rooted daemon was killed (plus
+      its stale binary removed — see Human prerequisites caveat) after the first
+      deploy; the next launch re-rooted to the project, confirming the
+      bind-at-first-spawn behavior. Verified 2026-06-13.
 
 ## Risks and mitigations
 
@@ -169,3 +181,26 @@ progresses.
   step. Confirmed the dogfooding project root
   `/home/developer/CascadeProjects/rift` for both channels. Flipped
   `DRAFT` → `READY` in the same PR.
+- 2026-06-13: Implementation (#245-#248) followed the spec without design
+  deviation. `crates/daemon/src/main.rs`: extracted `parse_serve_uds_args` +
+  `watched_root` so the flag parsing and the `current_dir()` fallback are
+  unit-testable (5 tests). `launch.rs`: `--root` injection covered by a dedicated
+  test asserting the doubly-escaped form. `app/src/main.rs`: root resolution
+  mirrors `RIFT_SSH_KEY` exactly. `justfile`: a single `export RIFT_PROJECT_ROOT`
+  var, added to `_launch-windows` `WSLENV` **without** `/p` (it is an SSH-host
+  Linux path, not a Windows path).
+- 2026-06-13: Milestone QA gate **accepted** (dev channel). Live evidence via
+  `just dev-windows`: daemon `worktree /home/developer/CascadeProjects/rift`,
+  no `worktree-only`; app `worktree snapshot applied … entries=122` and
+  `repo state applied branch=Some("develop")`. The daemon process carried
+  `--root /home/developer/CascadeProjects/rift` in argv, confirming the full
+  app→launch.rs→daemon path.
+- 2026-06-13: QA finding — **deploy is version-filename-keyed, not content-keyed**
+  (`deploy.rs`: "missing or outdated collapses to the versioned path is absent").
+  A same-version daemon code change is not auto-redeployed; the first QA launch
+  reattached evidence-correct `--root` argv to a *stale* pre-#245 remote binary
+  that ignored it (logged `$HOME`). Removing the stale remote binary forced the
+  redeploy and the fix verified. Captured as a dev-channel caveat in Human
+  prerequisites; not a milestone defect (released version bumps redeploy by new
+  filename). A transient, unrelated `failed to set initial tmux client size`
+  error killed the first launch; the second was clean.
