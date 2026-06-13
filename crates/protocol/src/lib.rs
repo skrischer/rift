@@ -11,21 +11,96 @@ pub use frame::{encode_frame, FrameDecoder, FrameError};
 /// changes in a way that requires both sides to agree.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Messages the client sends to the daemon.
+///
+/// `Attach` opens this client's own tmux control-mode attach for a named
+/// session; `Input`, `ResizePane`, and `TmuxCommand` then drive that attach, and
+/// the daemon streams the reverse path back as [`DaemonMessage`] layout and
+/// pane-output events. Pane input is opaque bytes — the protocol forwards it to
+/// tmux and never interprets it (agent-agnostic).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
-    Input { pane_id: u32, data: String },
-    ResizePane { pane_id: u32, cols: u16, rows: u16 },
-    TmuxCommand { cmd: String },
-    Hello { version: u32 },
+    /// Open a terminal attach for `session`, carrying the `RIFT_SESSION` knob
+    /// end-to-end: the daemon runs attach-or-create (`new-session -A -s
+    /// <session>`) per attach, so the dogfooding isolation session
+    /// (`RIFT_SESSION=rift-dev`) survives the protocol seam. The daemon answers
+    /// with a [`DaemonMessage::LayoutSnapshot`] baseline, then the live stream.
+    Attach {
+        session: String,
+    },
+    Input {
+        pane_id: u32,
+        data: String,
+    },
+    ResizePane {
+        pane_id: u32,
+        cols: u16,
+        rows: u16,
+    },
+    TmuxCommand {
+        cmd: String,
+    },
+    Hello {
+        version: u32,
+    },
 }
 
+/// Messages the daemon sends to the client.
+///
+/// ## Terminal snapshot ↔ live-stream consistency contract
+///
+/// On [`ClientMessage::Attach`] the daemon opens this client's own tmux
+/// control-mode attach and sends exactly one [`LayoutSnapshot`] — the complete
+/// window/pane layout as of the attach instant — and from that instant streams
+/// the live notifications: [`LayoutUpdate`] for every structural change and
+/// [`PaneOutput`] for pane bytes. The seam between the snapshot and the live
+/// stream is **gap-free and duplicate-free**:
+///
+/// - **No gap**: the daemon subscribes to tmux's notification stream before it
+///   reads the snapshot, so every change at or after the snapshot instant
+///   appears in the live stream; none is lost in the handover.
+/// - **No duplicate**: the snapshot is the baseline state, not a replay — no
+///   layout change already reflected in it is re-sent as a live event.
+///   [`LayoutUpdate`] carries the full latest layout (replace semantics), so even
+///   a coalesced or reordered change converges without double-applying.
+///
+/// On reconnect the daemon reattaches and sends a fresh [`LayoutSnapshot`]; the
+/// client resets its layout to it and resumes from the new baseline — tmux
+/// remains the session persistence, so no terminal state is lost. Pane scrollback
+/// that predates the attach is fetched separately via `capture-pane` (command
+/// emission) and is outside this contract — it governs only the seam between the
+/// attach snapshot and the live `%output` stream.
+///
+/// [`LayoutSnapshot`]: DaemonMessage::LayoutSnapshot
+/// [`LayoutUpdate`]: DaemonMessage::LayoutUpdate
+/// [`PaneOutput`]: DaemonMessage::PaneOutput
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonMessage {
+    /// Raw terminal bytes for one pane, in stream order. Per the VTE-location
+    /// spike verdict the daemon forwards bytes, not cells: the client feeds them
+    /// straight into its `alacritty_terminal::Term`, so the payload is an opaque
+    /// ANSI byte run the protocol never interprets (agent-agnostic). `pane_id` is
+    /// tmux's `%<n>` pane id as an integer.
     PaneOutput {
         pane_id: u32,
-        cells: Vec<u8>,
+        bytes: Vec<u8>,
+    },
+    /// The complete window/pane layout for `session`, sent once per attach as the
+    /// baseline of the consistency contract (see the type-level docs). The client
+    /// replaces its entire layout model with this — on first attach and again on
+    /// every reconnect.
+    LayoutSnapshot {
+        session: String,
+        windows: Vec<WindowLayout>,
+    },
+    /// The full latest window/pane layout for `session` after a structural change
+    /// (window add/close, pane split/resize, active-window switch). Carries the
+    /// whole layout, not a delta, so applying it is an idempotent replace.
+    LayoutUpdate {
+        session: String,
+        windows: Vec<WindowLayout>,
     },
     StateUpdate {
         sessions: Vec<String>,
@@ -93,6 +168,36 @@ pub enum DaemonMessage {
     Welcome {
         version: u32,
     },
+}
+
+/// One tmux window inside a [`DaemonMessage::LayoutSnapshot`] /
+/// [`DaemonMessage::LayoutUpdate`]: its identity, title, active flag, and the
+/// panes it holds. `window_id` is tmux's `@<n>` window id as an integer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowLayout {
+    pub window_id: u32,
+    pub name: String,
+    /// Whether this is the session's active (currently selected) window.
+    pub active: bool,
+    pub panes: Vec<PaneLayout>,
+}
+
+/// One tmux pane's identity, active flag, and geometry within its window.
+///
+/// Geometry is in terminal cells, matching tmux's layout coordinates: `left` and
+/// `top` are the pane's offset from the window's top-left corner, `width` and
+/// `height` its size. `pane_id` is tmux's `%<n>` pane id as an integer — the same
+/// id space as the `pane_id` in [`DaemonMessage::PaneOutput`] and
+/// [`ClientMessage::Input`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneLayout {
+    pub pane_id: u32,
+    /// Whether this is the window's active pane.
+    pub active: bool,
+    pub left: u16,
+    pub top: u16,
+    pub width: u16,
+    pub height: u16,
 }
 
 /// A single worktree entry, keyed by its path relative to the worktree root.
@@ -223,6 +328,230 @@ pub struct Position {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn test_attach_roundtrip_carries_session_name() {
+        // The attach request is the seam that carries `RIFT_SESSION` end-to-end,
+        // so the session name must survive serialization untouched.
+        let msg = ClientMessage::Attach {
+            session: "rift-dev".to_owned(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize Attach");
+        assert_eq!(json, r#"{"type":"attach","session":"rift-dev"}"#);
+
+        let parsed: ClientMessage = serde_json::from_str(&json).expect("deserialize Attach");
+        assert_eq!(parsed, msg);
+        match parsed {
+            ClientMessage::Attach { session } => assert_eq!(session, "rift-dev"),
+            other => panic!("expected Attach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_input_roundtrip_preserves_pane_and_data() {
+        let msg = ClientMessage::Input {
+            pane_id: 3,
+            data: "ls\n".to_owned(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize Input");
+        assert!(json.contains(r#""type":"input""#));
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&json).expect("deserialize Input"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_resize_pane_roundtrip_preserves_dimensions() {
+        let msg = ClientMessage::ResizePane {
+            pane_id: 7,
+            cols: 120,
+            rows: 40,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize ResizePane");
+        assert!(json.contains(r#""type":"resize_pane""#));
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&json).expect("deserialize ResizePane"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_tmux_command_roundtrip_preserves_cmd() {
+        let msg = ClientMessage::TmuxCommand {
+            cmd: "split-window -h".to_owned(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize TmuxCommand");
+        assert!(json.contains(r#""type":"tmux_command""#));
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&json).expect("deserialize TmuxCommand"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_client_message_unknown_type_is_rejected() {
+        // An unknown tag fails loudly rather than being silently misread, so a
+        // future client message a daemon does not know is not mistaken for a
+        // known one.
+        let err = serde_json::from_str::<ClientMessage>(r#"{"type":"frobnicate"}"#);
+        assert!(
+            err.is_err(),
+            "unknown client message type must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_attach_missing_session_field_is_rejected() {
+        let err = serde_json::from_str::<ClientMessage>(r#"{"type":"attach"}"#);
+        assert!(
+            err.is_err(),
+            "attach without a session must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_pane_output_roundtrip_carries_bytes_field() {
+        // The spike verdict pins pane output as raw bytes, not cells: the wire
+        // field is `bytes` and round-trips the exact byte run (control bytes
+        // included).
+        let msg = DaemonMessage::PaneOutput {
+            pane_id: 2,
+            bytes: vec![0x1b, b'[', b'1', b'm', b'h', b'i'],
+        };
+        let json = serde_json::to_string(&msg).expect("serialize PaneOutput");
+        assert!(json.contains(r#""type":"pane_output""#));
+        assert!(json.contains(r#""bytes":[27,91,49,109,104,105]"#));
+        assert!(
+            !json.contains("cells"),
+            "pane output must not carry a cells field"
+        );
+
+        let parsed: DaemonMessage = serde_json::from_str(&json).expect("deserialize PaneOutput");
+        assert_eq!(parsed, msg);
+        match parsed {
+            DaemonMessage::PaneOutput { pane_id, bytes } => {
+                assert_eq!(pane_id, 2);
+                assert_eq!(bytes, vec![0x1b, b'[', b'1', b'm', b'h', b'i']);
+            }
+            other => panic!("expected PaneOutput, got {other:?}"),
+        }
+    }
+
+    fn sample_layout() -> Vec<WindowLayout> {
+        vec![
+            WindowLayout {
+                window_id: 1,
+                name: "editor".to_owned(),
+                active: true,
+                panes: vec![
+                    PaneLayout {
+                        pane_id: 0,
+                        active: true,
+                        left: 0,
+                        top: 0,
+                        width: 80,
+                        height: 24,
+                    },
+                    PaneLayout {
+                        pane_id: 1,
+                        active: false,
+                        left: 81,
+                        top: 0,
+                        width: 79,
+                        height: 24,
+                    },
+                ],
+            },
+            WindowLayout {
+                window_id: 2,
+                name: "logs".to_owned(),
+                active: false,
+                panes: vec![PaneLayout {
+                    pane_id: 2,
+                    active: true,
+                    left: 0,
+                    top: 0,
+                    width: 160,
+                    height: 24,
+                }],
+            },
+        ]
+    }
+
+    #[test]
+    fn test_window_and_pane_layout_roundtrip_preserves_all_fields() {
+        for window in sample_layout() {
+            let json = serde_json::to_string(&window).expect("serialize WindowLayout");
+            let parsed: WindowLayout =
+                serde_json::from_str(&json).expect("deserialize WindowLayout");
+            assert_eq!(parsed, window);
+        }
+    }
+
+    #[test]
+    fn test_layout_snapshot_roundtrip_preserves_windows_and_panes() {
+        let msg = DaemonMessage::LayoutSnapshot {
+            session: "rift".to_owned(),
+            windows: sample_layout(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize LayoutSnapshot");
+        assert!(json.contains(r#""type":"layout_snapshot""#));
+        assert!(json.contains(r#""session":"rift""#));
+
+        let parsed: DaemonMessage =
+            serde_json::from_str(&json).expect("deserialize LayoutSnapshot");
+        assert_eq!(parsed, msg);
+        match parsed {
+            DaemonMessage::LayoutSnapshot { session, windows } => {
+                assert_eq!(session, "rift");
+                assert_eq!(windows.len(), 2);
+                assert_eq!(windows[0].panes.len(), 2);
+                assert!(windows[0].active);
+                assert!(windows[0].panes[0].active);
+            }
+            other => panic!("expected LayoutSnapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_layout_update_roundtrip_preserves_layout() {
+        let msg = DaemonMessage::LayoutUpdate {
+            session: "rift-dev".to_owned(),
+            windows: sample_layout(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize LayoutUpdate");
+        assert!(json.contains(r#""type":"layout_update""#));
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize LayoutUpdate"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_layout_snapshot_empty_windows_roundtrips() {
+        // A fresh session may attach before any window exists; an empty layout is
+        // a valid baseline, not an error.
+        let msg = DaemonMessage::LayoutSnapshot {
+            session: "rift".to_owned(),
+            windows: vec![],
+        };
+        let json = serde_json::to_string(&msg).expect("serialize empty LayoutSnapshot");
+        assert!(json.contains(r#""windows":[]"#));
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize empty LayoutSnapshot"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_daemon_message_unknown_type_is_rejected() {
+        let err = serde_json::from_str::<DaemonMessage>(r#"{"type":"sparkle"}"#);
+        assert!(
+            err.is_err(),
+            "unknown daemon message type must not deserialize"
+        );
+    }
 
     #[test]
     fn test_hello_roundtrip_current_version_preserves_version() {

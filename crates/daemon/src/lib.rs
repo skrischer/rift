@@ -2,11 +2,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub mod lsp;
 pub mod spike;
 
+use lsp::{document_changes, LspDiagnostics, LspWorker};
 use rift_explorer::{Change, Entry, GitStatus, Snapshot, Watcher};
+use rift_lsp::{DocumentChange, DocumentSelector};
 use rift_protocol::{
-    encode_frame, ClientMessage, DaemonMessage, EntryKind, FrameDecoder, WorktreeEntry,
+    encode_frame, ClientMessage, DaemonMessage, Diagnostic, EntryKind, FrameDecoder, WorktreeEntry,
     PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -29,6 +32,23 @@ pub struct State {
     /// each recompute; the dispatch loop diffs consecutive values to stream
     /// incremental updates.
     pub git: Option<GitStatus>,
+    /// Latest diagnostics per `(worktree-relative path, server id)`, mirroring
+    /// LSP's full-set-per-`(file, server)` replace semantics. Each language
+    /// server's published set replaces only its own entry for the file, so a
+    /// linter and a type-checker aggregate without clobbering one another. An
+    /// empty published set clears that server's entry entirely (the key is
+    /// removed) so the map only ever holds live diagnostics. Replayed per
+    /// connection alongside the worktree and git snapshots.
+    pub diagnostics: BTreeMap<DiagnosticKey, Vec<Diagnostic>>,
+}
+
+/// Map key for [`State::diagnostics`]: a worktree-relative path paired with the
+/// daemon-assigned id of the publishing server, as a string. The per-server
+/// component is what lets two servers' sets for one file coexist.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DiagnosticKey {
+    pub path: String,
+    pub server: String,
 }
 
 /// Internal events from the worktree worker into the dispatch loop.
@@ -52,6 +72,11 @@ enum WorktreeEvent {
 pub struct Daemon {
     inbound: mpsc::Receiver<ClientMessage>,
     worktree: Option<mpsc::Receiver<WorktreeEvent>>,
+    /// Diagnostics translated by the off-loop LSP worker, polled as a dispatch
+    /// branch. `None` until [`Daemon::watch_lsp`] arms the worker; the branch
+    /// then pends forever (never fires) so the loop is unaffected when LSP is
+    /// off.
+    lsp_diagnostics: Option<mpsc::Receiver<LspDiagnostics>>,
     core: Core,
 }
 
@@ -61,6 +86,10 @@ pub struct Daemon {
 struct Core {
     events: broadcast::Sender<DaemonMessage>,
     state: watch::Sender<State>,
+    /// Forwards document changes (mapped from worktree `Changed` batches) to the
+    /// off-loop LSP worker. `None` when LSP is not armed; the dispatch loop then
+    /// derives no document changes and the branch is inert.
+    doc_changes: Option<mpsc::Sender<Vec<DocumentChange>>>,
 }
 
 /// Sender handles for driving a [`Daemon`].
@@ -94,9 +123,11 @@ pub fn channels(event_capacity: usize, inbound_capacity: usize) -> (Daemon, Hand
     let daemon = Daemon {
         inbound: inbound_rx,
         worktree: None,
+        lsp_diagnostics: None,
         core: Core {
             events: events_tx.clone(),
             state: state_tx,
+            doc_changes: None,
         },
     };
     let handles = Handles {
@@ -124,6 +155,11 @@ const SERVE_READ_BUFFER: usize = 8 * 1024;
 /// Queue depth for worktree events flowing from the blocking worker into the
 /// dispatch loop. Bounds how far the worker may run ahead while the loop is busy.
 const WORKTREE_EVENT_CAPACITY: usize = 64;
+
+/// Queue depth for document-change batches the dispatch loop forwards to the
+/// off-loop LSP worker, and for the diagnostics the worker hands back. Bounds
+/// the in-flight backlog without coupling either side to the other's pace.
+const LSP_CHANNEL_CAPACITY: usize = 64;
 
 /// Entries per `WorktreeSnapshot` chunk. Bounds a single frame's size so a
 /// large tree streams as several frames instead of one giant allocation.
@@ -275,6 +311,17 @@ async fn next_worktree_event(
     }
 }
 
+/// Receive the next translated diagnostics update from the off-loop LSP worker,
+/// or pend forever when LSP is not armed (so the `select!` branch never fires).
+async fn next_lsp_diagnostics(
+    rx: &mut Option<mpsc::Receiver<LspDiagnostics>>,
+) -> Option<LspDiagnostics> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Map an explorer entry onto its wire representation. Paths cross the
 /// boundary lossily as UTF-8 (`to_string_lossy`) — the protocol is JSON today,
 /// so a non-UTF-8 path cannot round-trip regardless.
@@ -385,6 +432,35 @@ fn git_delta_messages(old: Option<&GitStatus>, new: &GitStatus) -> Vec<DaemonMes
         messages.push(repo_state_message(new.repo()));
     }
     messages
+}
+
+/// Build the `Diagnostics` message carrying one server's full current set for
+/// one file — the wire form of an [`LspDiagnostics`] update. An empty `items`
+/// clears that server's set for the file, matching LSP's full-set replace.
+fn diagnostics_message(diag: &LspDiagnostics) -> DaemonMessage {
+    DaemonMessage::Diagnostics {
+        path: diag.path.clone(),
+        server: diag.server.clone(),
+        items: diag.items.clone(),
+    }
+}
+
+/// Replay the full held diagnostics set as one `Diagnostics` message per
+/// `(path, server)` — the full state a freshly attached connection needs, the
+/// diagnostics analogue of `git_delta_messages(None, …)`. Only live sets are
+/// held (an empty publish removes its key), so every replayed message is
+/// non-empty.
+fn diagnostics_snapshot_messages(
+    diagnostics: &BTreeMap<DiagnosticKey, Vec<Diagnostic>>,
+) -> Vec<DaemonMessage> {
+    diagnostics
+        .iter()
+        .map(|(key, items)| DaemonMessage::Diagnostics {
+            path: key.path.clone(),
+            server: key.server.clone(),
+            items: items.clone(),
+        })
+        .collect()
 }
 
 /// Split a worktree into chunked `WorktreeSnapshot` messages: every chunk
@@ -542,6 +618,11 @@ async fn write_snapshot<W: AsyncWrite + Unpin>(
         if let Some(git) = guard.git.as_ref() {
             messages.extend(git_delta_messages(None, git));
         }
+        // Replay the held diagnostics too, so a (re)attaching client receives
+        // the full live error set — one `Diagnostics` message per
+        // `(path, server)` — alongside the tree and git decoration. Incremental
+        // updates then ride the bus.
+        messages.extend(diagnostics_snapshot_messages(&guard.diagnostics));
         messages
     };
     write_messages(writer, &messages).await?;
@@ -581,7 +662,8 @@ where
 {
     let (mut daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
     if let Some(root) = worktree_root {
-        daemon.watch_worktree(root);
+        daemon.watch_worktree(root.clone());
+        daemon.watch_lsp(root, DocumentSelector::builtin());
     }
     let events = handles.subscribe();
     let inbound = handles.inbound.clone();
@@ -635,7 +717,8 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
 
     let (mut daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
     if let Some(root) = worktree_root {
-        daemon.watch_worktree(root);
+        daemon.watch_worktree(root.clone());
+        daemon.watch_lsp(root, DocumentSelector::builtin());
     }
     // Held for the lifetime of the accept loop, so the dispatch loop and its
     // `State` stay alive even while no client is attached.
@@ -731,6 +814,25 @@ impl Daemon {
         self.worktree = Some(rx);
     }
 
+    /// Start LSP diagnostics: run a [`LspWorker`] for `root` on its own task,
+    /// off the dispatch loop, wired so document changes (mapped from worktree
+    /// `Changed` batches) flow to it and translated diagnostics flow back into
+    /// the loop. `selector` chooses the language → server table — the built-in
+    /// one in production, a stub-server table in tests. Must be called before
+    /// [`Daemon::run`], from within a tokio runtime.
+    ///
+    /// Language servers are external child processes the worker spawns and
+    /// drives; the dispatch loop only forwards changes and folds the resulting
+    /// diagnostics, never blocking on server I/O.
+    pub fn watch_lsp(&mut self, root: PathBuf, selector: DocumentSelector) {
+        let (doc_tx, doc_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
+        let (diag_tx, diag_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
+        let worker = LspWorker::new(root, selector, doc_rx, diag_tx);
+        tokio::spawn(worker.run());
+        self.core.doc_changes = Some(doc_tx);
+        self.lsp_diagnostics = Some(diag_rx);
+    }
+
     /// Run the flat dispatch loop until the inbound channel closes.
     ///
     /// Each `ClientMessage` and each worktree event is matched directly to a
@@ -740,6 +842,7 @@ impl Daemon {
         let Daemon {
             mut inbound,
             mut worktree,
+            mut lsp_diagnostics,
             mut core,
         } = self;
         loop {
@@ -753,6 +856,11 @@ impl Daemon {
                     // The worker ended (scan failure or shutdown); stop polling
                     // the closed channel.
                     None => worktree = None,
+                },
+                diagnostics = next_lsp_diagnostics(&mut lsp_diagnostics) => match diagnostics {
+                    Some(diagnostics) => core.apply_diagnostics(diagnostics),
+                    // The LSP worker ended; stop polling the closed channel.
+                    None => lsp_diagnostics = None,
                 },
             }
         }
@@ -786,9 +894,11 @@ impl Core {
                     version: PROTOCOL_VERSION,
                 });
             }
-            // Terminal/tmux handling is owned by a later Phase 3 sub-spec; this
-            // scaffolding only carries the handshake.
-            ClientMessage::Input { .. }
+            // Terminal/tmux handling (attach, input, resize, command emission)
+            // is owned by a later Phase 6 daemon sub-spec; this scaffolding only
+            // carries the handshake.
+            ClientMessage::Attach { .. }
+            | ClientMessage::Input { .. }
             | ClientMessage::ResizePane { .. }
             | ClientMessage::TmuxCommand { .. } => {}
         }
@@ -807,6 +917,24 @@ impl Core {
                     .send_modify(|state| state.worktree = Some(snapshot));
             }
             WorktreeEvent::Changed(batch) => {
+                // Forward the file-level changes to the off-loop LSP worker for
+                // document sync *before* mutating the held snapshot — the send
+                // never blocks the loop on server I/O (the worker owns that).
+                // Only the observed / changed set drives `didOpen` / `didChange`
+                // / `didClose` (spec: no eager whole-tree open), so the initial
+                // `Scanned` snapshot is deliberately not forwarded.
+                if let Some(doc_changes) = &self.doc_changes {
+                    let changes = document_changes(&batch);
+                    if !changes.is_empty() {
+                        // A full queue means the worker is lagging; drop this
+                        // batch rather than block the dispatch loop. The next
+                        // change re-syncs from disk, so a dropped batch only
+                        // delays diagnostics, never corrupts the model.
+                        if let Err(err) = doc_changes.try_send(changes) {
+                            eprintln!("rift-daemon: dropped document-sync batch: {err}");
+                        }
+                    }
+                }
                 self.state.send_modify(|state| {
                     if let Some(worktree) = &mut state.worktree {
                         worktree.apply(&batch);
@@ -827,6 +955,33 @@ impl Core {
                 }
             }
         }
+    }
+
+    /// Fold one server's full diagnostic set for a file into the `State` and
+    /// onto the event bus.
+    ///
+    /// Full-set-replace per `(path, server)`: the published set replaces only
+    /// this server's entry for the file, leaving every other server's entry
+    /// intact (the aggregation the spec mandates). An empty set removes the key
+    /// so the held map carries only live diagnostics — which keeps the
+    /// per-connection replay free of stale empty sets. Either way a `Diagnostics`
+    /// message is broadcast (the empty one is how the client clears its set),
+    /// and each attaching connection replays the live map from `State`, so a
+    /// lagged bus reconciles on reattach.
+    fn apply_diagnostics(&mut self, diagnostics: LspDiagnostics) {
+        let message = diagnostics_message(&diagnostics);
+        let key = DiagnosticKey {
+            path: diagnostics.path,
+            server: diagnostics.server,
+        };
+        self.state.send_modify(|state| {
+            if diagnostics.items.is_empty() {
+                state.diagnostics.remove(&key);
+            } else {
+                state.diagnostics.insert(key, diagnostics.items);
+            }
+        });
+        let _ = self.events.send(message);
     }
 }
 
