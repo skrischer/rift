@@ -4,7 +4,7 @@ use std::time::Duration;
 
 pub mod spike;
 
-use rift_explorer::{Change, Entry, Snapshot, Watcher};
+use rift_explorer::{Change, Entry, GitStatus, Snapshot, Watcher};
 use rift_protocol::{
     encode_frame, ClientMessage, DaemonMessage, EntryKind, FrameDecoder, WorktreeEntry,
     PROTOCOL_VERSION,
@@ -24,6 +24,11 @@ pub struct State {
     /// Latest worktree snapshot, present once the initial scan completes.
     /// Kept current by applying the watcher's change batches in place.
     pub worktree: Option<Snapshot>,
+    /// Latest git status for the worktree, present when the root is a git
+    /// repository and the first recompute has landed. Replaced wholesale by
+    /// each recompute; the dispatch loop diffs consecutive values to stream
+    /// incremental updates.
+    pub git: Option<GitStatus>,
 }
 
 /// Internal events from the worktree worker into the dispatch loop.
@@ -32,6 +37,9 @@ enum WorktreeEvent {
     Scanned(Snapshot),
     /// A coalesced batch of changes against the previously delivered state.
     Changed(Vec<Change>),
+    /// A fresh full git status (recomputed on a worktree or `.git/` change).
+    /// The dispatch loop diffs it against the held one to emit incrementals.
+    GitRecomputed(GitStatus),
 }
 
 /// Wiring for the daemon's flat dispatch loop.
@@ -141,42 +149,117 @@ fn worktree_worker(root: PathBuf, events: mpsc::Sender<WorktreeEvent>) {
             return;
         }
     };
-    // Arm the watcher BEFORE delivering the snapshot: `Watcher::new` registers
-    // its watch set synchronously, so once a consumer has observed the snapshot,
-    // any later write is guaranteed to produce an event. The reverse order races
-    // — a write right after the snapshot lands would precede the watches and,
+
+    // Compute the initial git status before arming the watcher. A successful
+    // compute means the root is a git repository, so enable git watching
+    // (`with_git_status`) — the `.git/` whitelist plus a recompute per flush. An
+    // error (not a repo, or git unreadable) degrades to worktree-only watching
+    // (`Watcher::new`), so a non-repo root still streams its file tree without
+    // spamming per-flush git errors.
+    //
+    // The watcher is armed BEFORE the snapshot/status is delivered: it registers
+    // its watch set synchronously, so once a consumer has observed the initial
+    // state, any later change is guaranteed to produce an event. The reverse
+    // order races — a write right after delivery would precede the watches and,
     // with no event, the rescan-on-event watcher would never surface it. The
     // clone is the two-owner boundary: the watcher keeps the diff baseline, the
     // dispatch loop's `State` gets its own copy.
-    let (_watcher, changes) = match Watcher::new(snapshot.clone()) {
-        Ok(pair) => pair,
-        Err(err) => {
-            eprintln!("rift-daemon worktree watch failed: {err}");
-            return;
+    match GitStatus::compute(&root) {
+        Ok(initial_git) => {
+            let (_watcher, changes, git_rx) = match Watcher::with_git_status(snapshot.clone()) {
+                Ok(triple) => triple,
+                Err(err) => {
+                    eprintln!("rift-daemon worktree watch failed: {err}");
+                    return;
+                }
+            };
+            if events
+                .blocking_send(WorktreeEvent::Scanned(snapshot))
+                .is_err()
+                || events
+                    .blocking_send(WorktreeEvent::GitRecomputed(initial_git))
+                    .is_err()
+            {
+                return;
+            }
+            relay_events(&changes, Some(&git_rx), &events);
         }
-    };
-    if events
-        .blocking_send(WorktreeEvent::Scanned(snapshot))
-        .is_err()
-    {
-        return;
+        Err(err) => {
+            eprintln!(
+                "rift-daemon: no git status for {} ({err}); worktree-only",
+                root.display()
+            );
+            let (_watcher, changes) = match Watcher::new(snapshot.clone()) {
+                Ok(pair) => pair,
+                Err(err) => {
+                    eprintln!("rift-daemon worktree watch failed: {err}");
+                    return;
+                }
+            };
+            if events
+                .blocking_send(WorktreeEvent::Scanned(snapshot))
+                .is_err()
+            {
+                return;
+            }
+            relay_events(&changes, None, &events);
+        }
     }
-    // `_watcher` stays alive for the loop's duration; dropping it (on return)
-    // stops the watch thread and releases the OS watches.
+}
+
+/// Relay the watcher's change batches (and, in git mode, git-status recomputes)
+/// into the dispatch loop until a channel closes or the loop is gone.
+///
+/// In git mode the git channel is the primary wait: `with_git_status` emits a
+/// recompute on *every* flush, while worktree changes are emitted only on a
+/// non-empty diff and always *before* the flush's git tick. So blocking on the
+/// git tick and then draining the worktree changes already queued preserves the
+/// order (tree update before its git decoration). Without git, this is the
+/// original worktree-only relay.
+fn relay_events(
+    changes: &std::sync::mpsc::Receiver<Vec<Change>>,
+    git: Option<&std::sync::mpsc::Receiver<GitStatus>>,
+    events: &mpsc::Sender<WorktreeEvent>,
+) {
+    use std::sync::mpsc::RecvTimeoutError;
     loop {
-        match changes.recv_timeout(WORKTREE_IDLE_POLL) {
-            Ok(batch) => {
-                if events.blocking_send(WorktreeEvent::Changed(batch)).is_err() {
-                    return;
+        match git {
+            Some(git_rx) => match git_rx.recv_timeout(WORKTREE_IDLE_POLL) {
+                Ok(status) => {
+                    // Drain the worktree changes this flush queued before its
+                    // git tick, so the tree update precedes the git decoration.
+                    while let Ok(batch) = changes.try_recv() {
+                        if events.blocking_send(WorktreeEvent::Changed(batch)).is_err() {
+                            return;
+                        }
+                    }
+                    if events
+                        .blocking_send(WorktreeEvent::GitRecomputed(status))
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
-            }
-            // Idle: only worth waking for if the dispatch loop has gone away.
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if events.is_closed() {
-                    return;
+                Err(RecvTimeoutError::Timeout) => {
+                    if events.is_closed() {
+                        return;
+                    }
                 }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(RecvTimeoutError::Disconnected) => return,
+            },
+            None => match changes.recv_timeout(WORKTREE_IDLE_POLL) {
+                Ok(batch) => {
+                    if events.blocking_send(WorktreeEvent::Changed(batch)).is_err() {
+                        return;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if events.is_closed() {
+                        return;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => return,
+            },
         }
     }
 }
@@ -224,6 +307,84 @@ fn update_message(batch: &[Change]) -> DaemonMessage {
         changed,
         removed,
     }
+}
+
+/// Map an explorer porcelain code onto its protocol wire code (1:1).
+fn wire_git_code(code: rift_explorer::GitStatusCode) -> rift_protocol::GitStatusCode {
+    use rift_explorer::GitStatusCode as E;
+    use rift_protocol::GitStatusCode as P;
+    match code {
+        E::Unmodified => P::Unmodified,
+        E::Modified => P::Modified,
+        E::TypeChange => P::TypeChange,
+        E::Added => P::Added,
+        E::Deleted => P::Deleted,
+        E::Renamed => P::Renamed,
+        E::Copied => P::Copied,
+        E::Unmerged => P::Unmerged,
+        E::Untracked => P::Untracked,
+    }
+}
+
+/// Map an explorer git entry status + its path onto a wire `GitStatusEntry`.
+fn wire_git_entry(
+    path: &Path,
+    status: &rift_explorer::GitEntryStatus,
+) -> rift_protocol::GitStatusEntry {
+    rift_protocol::GitStatusEntry {
+        path: path.to_string_lossy().into_owned(),
+        status: rift_protocol::GitEntryStatus {
+            index: wire_git_code(status.index),
+            worktree: wire_git_code(status.worktree),
+        },
+    }
+}
+
+/// Build the `RepoState` message from an explorer repo state.
+fn repo_state_message(repo: &rift_explorer::RepoState) -> DaemonMessage {
+    DaemonMessage::RepoState {
+        branch: repo.branch.clone(),
+        ahead_behind: repo.ahead_behind.map(|ab| rift_protocol::AheadBehind {
+            ahead: ab.ahead,
+            behind: ab.behind,
+        }),
+    }
+}
+
+/// Diff `old` git status against `new`, producing the incremental messages that
+/// carry `old` to `new`: an `UpdateGitStatus` (entries whose status changed or
+/// appeared in `changed`, paths that went clean in `cleared`) emitted only when
+/// non-empty, plus a `RepoState` emitted only when the repo-level state changed.
+///
+/// With `old = None` this yields the full state — every entry as `changed`, no
+/// `cleared`, and the `RepoState` — which is exactly what a freshly attached
+/// connection needs replayed.
+fn git_delta_messages(old: Option<&GitStatus>, new: &GitStatus) -> Vec<DaemonMessage> {
+    let mut messages = Vec::new();
+    let old_entries = old.map(|g| g.entries());
+
+    let mut changed = Vec::new();
+    for (path, status) in new.entries() {
+        if old_entries.and_then(|entries| entries.get(path)) != Some(status) {
+            changed.push(wire_git_entry(path, status));
+        }
+    }
+    let mut cleared = Vec::new();
+    if let Some(entries) = old_entries {
+        for path in entries.keys() {
+            if !new.entries().contains_key(path) {
+                cleared.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    if !changed.is_empty() || !cleared.is_empty() {
+        messages.push(DaemonMessage::UpdateGitStatus { changed, cleared });
+    }
+
+    if old.map(|g| g.repo()) != Some(new.repo()) {
+        messages.push(repo_state_message(new.repo()));
+    }
+    messages
 }
 
 /// Split a worktree into chunked `WorktreeSnapshot` messages: every chunk
@@ -373,7 +534,15 @@ async fn write_snapshot<W: AsyncWrite + Unpin>(
         let Some(snapshot) = guard.worktree.as_ref() else {
             return Ok(false);
         };
-        snapshot_messages(snapshot.root(), snapshot.entries())
+        let mut messages = snapshot_messages(snapshot.root(), snapshot.entries());
+        // Replay the full git status (if any) right behind the tree, so a
+        // (re)attaching client gets the complete git decoration loss-free —
+        // `git_delta_messages(None, …)` is the full set. Incremental updates
+        // then ride the bus.
+        if let Some(git) = guard.git.as_ref() {
+            messages.extend(git_delta_messages(None, git));
+        }
+        messages
     };
     write_messages(writer, &messages).await?;
     Ok(true)
@@ -644,6 +813,18 @@ impl Core {
                     }
                 });
                 let _ = self.events.send(update_message(&batch));
+            }
+            WorktreeEvent::GitRecomputed(new_git) => {
+                // Diff against the held status (built before storing the new one,
+                // so the comparison sees the previous state), then store the new
+                // full status. Each attaching connection replays the full status
+                // from `State`, so even if these incrementals are missed (lagged
+                // bus), a reattach reconciles.
+                let messages = git_delta_messages(self.state.borrow().git.as_ref(), &new_git);
+                self.state.send_modify(|state| state.git = Some(new_git));
+                for msg in messages {
+                    let _ = self.events.send(msg);
+                }
             }
         }
     }
@@ -1228,6 +1409,229 @@ mod tests {
         assert!(
             ping(&sock).await,
             "ping must be true while the daemon listens"
+        );
+
+        server.abort();
+        let _ = tokio::fs::remove_file(&sock).await;
+    }
+
+    // --- git status wiring (#134) ---
+
+    use rift_explorer::{GitEntryStatus as ExGitEntryStatus, GitStatusCode as ExCode};
+
+    /// Build an explorer `GitStatus` from `(path, index, worktree)` triples and
+    /// an optional branch, via the public `compute` path is overkill for unit
+    /// tests — instead exercise `git_delta_messages` against a real computed
+    /// status from a git fixture (below). This helper builds the daemon-side
+    /// fixture repos.
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_git_repo(tag: &str) -> TempDir {
+        let tmp = TempDir::new(tag);
+        git(&tmp.path, &["init", "-q", "-b", "main"]);
+        write_file(&tmp.path.join("tracked.txt"), "v1\n");
+        git(&tmp.path, &["add", "tracked.txt"]);
+        git(&tmp.path, &["commit", "-q", "-m", "init"]);
+        tmp
+    }
+
+    #[test]
+    fn test_git_delta_messages_full_when_old_is_none() {
+        let repo = init_git_repo("delta-full");
+        write_file(&repo.path.join("loose.txt"), "x\n");
+        let status = GitStatus::compute(&repo.path).expect("compute");
+
+        let messages = git_delta_messages(None, &status);
+        // Full set: one UpdateGitStatus (all entries as changed, nothing cleared)
+        // and a RepoState.
+        let update = messages
+            .iter()
+            .find_map(|m| match m {
+                DaemonMessage::UpdateGitStatus { changed, cleared } => Some((changed, cleared)),
+                _ => None,
+            })
+            .expect("an UpdateGitStatus");
+        assert!(update.1.is_empty(), "full set clears nothing");
+        assert!(update.0.iter().any(|e| e.path == "loose.txt"
+            && e.status.worktree == rift_protocol::GitStatusCode::Untracked));
+        assert!(messages
+            .iter()
+            .any(|m| matches!(m, DaemonMessage::RepoState { branch, .. } if branch.as_deref() == Some("main"))));
+    }
+
+    #[test]
+    fn test_git_delta_messages_incremental_changed_and_cleared() {
+        let repo = init_git_repo("delta-incr");
+        // old: one untracked file. new: that file gone, a different one modified.
+        write_file(&repo.path.join("gone.txt"), "g\n");
+        let old = GitStatus::compute(&repo.path).expect("old");
+        std::fs::remove_file(repo.path.join("gone.txt")).expect("rm");
+        write_file(&repo.path.join("tracked.txt"), "v2\n");
+        let new = GitStatus::compute(&repo.path).expect("new");
+
+        let messages = git_delta_messages(Some(&old), &new);
+        let (changed, cleared) = messages
+            .iter()
+            .find_map(|m| match m {
+                DaemonMessage::UpdateGitStatus { changed, cleared } => Some((changed, cleared)),
+                _ => None,
+            })
+            .expect("an UpdateGitStatus");
+        assert!(
+            changed.iter().any(|e| e.path == "tracked.txt"
+                && e.status.worktree == rift_protocol::GitStatusCode::Modified),
+            "the newly-modified file is changed"
+        );
+        assert!(
+            cleared.iter().any(|p| p == "gone.txt"),
+            "the removed-from-status file is cleared"
+        );
+    }
+
+    #[test]
+    fn test_git_delta_messages_repo_only_change_emits_only_repo_state() {
+        let repo = init_git_repo("delta-repo");
+        let old = GitStatus::compute(&repo.path).expect("old");
+        git(&repo.path, &["checkout", "-q", "-b", "feature"]);
+        let new = GitStatus::compute(&repo.path).expect("new");
+
+        let messages = git_delta_messages(Some(&old), &new);
+        // Only the branch changed; no per-file status delta.
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, DaemonMessage::UpdateGitStatus { .. })),
+            "no per-file delta for a branch-only change: {messages:?}"
+        );
+        assert!(messages.iter().any(
+            |m| matches!(m, DaemonMessage::RepoState { branch, .. } if branch.as_deref() == Some("feature"))
+        ));
+    }
+
+    #[test]
+    fn test_git_delta_messages_no_change_is_empty() {
+        let repo = init_git_repo("delta-none");
+        let a = GitStatus::compute(&repo.path).expect("a");
+        let b = GitStatus::compute(&repo.path).expect("b");
+        assert!(git_delta_messages(Some(&a), &b).is_empty());
+    }
+
+    #[test]
+    fn test_wire_git_code_maps_every_variant() {
+        use rift_protocol::GitStatusCode as P;
+        for (e, p) in [
+            (ExCode::Unmodified, P::Unmodified),
+            (ExCode::Modified, P::Modified),
+            (ExCode::TypeChange, P::TypeChange),
+            (ExCode::Added, P::Added),
+            (ExCode::Deleted, P::Deleted),
+            (ExCode::Renamed, P::Renamed),
+            (ExCode::Copied, P::Copied),
+            (ExCode::Unmerged, P::Unmerged),
+            (ExCode::Untracked, P::Untracked),
+        ] {
+            assert_eq!(wire_git_code(e), p);
+        }
+    }
+
+    #[test]
+    fn test_wire_git_entry_maps_path_and_both_sides() {
+        let entry = wire_git_entry(
+            Path::new("src/main.rs"),
+            &ExGitEntryStatus {
+                index: ExCode::Added,
+                worktree: ExCode::Modified,
+            },
+        );
+        assert_eq!(entry.path, "src/main.rs");
+        assert_eq!(entry.status.index, rift_protocol::GitStatusCode::Added);
+        assert_eq!(
+            entry.status.worktree,
+            rift_protocol::GitStatusCode::Modified
+        );
+    }
+
+    /// Drain framed messages off a connection until no message arrives within
+    /// `settle`, returning all collected. Tolerates ordering/duplicates (the
+    /// per-connection replay and the bus broadcast can both deliver git state).
+    async fn drain_messages<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        decoder: &mut FrameDecoder,
+        settle: Duration,
+    ) -> Vec<DaemonMessage> {
+        let mut msgs = Vec::new();
+        while let Ok(msg) = tokio::time::timeout(settle, read_daemon_message(reader, decoder)).await
+        {
+            msgs.push(msg);
+        }
+        msgs
+    }
+
+    fn untracked_in(msgs: &[DaemonMessage], path: &str) -> bool {
+        msgs.iter().any(|m| {
+            matches!(m, DaemonMessage::UpdateGitStatus { changed, .. }
+                if changed.iter().any(|e| e.path == path
+                    && e.status.worktree == rift_protocol::GitStatusCode::Untracked))
+        })
+    }
+
+    #[tokio::test]
+    async fn test_serve_uds_git_repo_streams_status_and_updates() {
+        let repo = init_git_repo("uds-git");
+        write_file(&repo.path.join("loose.txt"), "x\n");
+
+        let sock = unique_socket_path();
+        let server = tokio::spawn({
+            let sock = sock.clone();
+            let root = repo.path.clone();
+            async move { serve_uds(&sock, Some(root)).await }
+        });
+        wait_for_socket(&sock).await;
+
+        let mut client = UnixStream::connect(&sock).await.expect("connect");
+        let mut decoder = FrameDecoder::new();
+        client.write_all(&hello_frame()).await.expect("send Hello");
+        client.flush().await.expect("flush Hello");
+
+        // Initial: the replay (and/or bus) delivers the worktree snapshot plus
+        // the full git status — the untracked file and the branch.
+        let initial = drain_messages(&mut client, &mut decoder, Duration::from_secs(2)).await;
+        assert!(
+            untracked_in(&initial, "loose.txt"),
+            "initial git status carries the untracked file: {initial:?}"
+        );
+        assert!(
+            initial.iter().any(|m| matches!(m, DaemonMessage::RepoState { branch, .. } if branch.as_deref() == Some("main"))),
+            "initial repo state carries the branch: {initial:?}"
+        );
+
+        // A `git add` mutates `.git/index`; the daemon recomputes and streams an
+        // incremental moving the change to the index (staged) side.
+        git(&repo.path, &["add", "loose.txt"]);
+        let after = drain_messages(&mut client, &mut decoder, Duration::from_secs(3)).await;
+        assert!(
+            after.iter().any(|m| {
+                matches!(m, DaemonMessage::UpdateGitStatus { changed, .. }
+                    if changed.iter().any(|e| e.path == "loose.txt"
+                        && e.status.index == rift_protocol::GitStatusCode::Added))
+            }),
+            "staging streams an index-side update: {after:?}"
         );
 
         server.abort();
