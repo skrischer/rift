@@ -16,7 +16,7 @@
 //! bounded daemon→client channel backpressures the read loop; paused panes are
 //! resumed as soon as that channel has room, so the loop never deadlocks.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -204,6 +204,11 @@ struct Attach {
     /// Panes tmux has paused (flow control); resumed once the outbound channel
     /// has room.
     paused: HashSet<u32>,
+    /// In-flight `capture-pane` queries, mapping each command's [`CommandId`] to
+    /// the pane it captures, so the reply is forwarded as a
+    /// [`DaemonMessage::PaneCapture`] for that pane. Several may be in flight at
+    /// once (one per pane); each is removed when its reply arrives.
+    captures: HashMap<CommandId, u32>,
 }
 
 impl Attach {
@@ -236,6 +241,7 @@ impl Attach {
             layout_query: None,
             layout_dirty: false,
             paused: HashSet::new(),
+            captures: HashMap::new(),
         };
         // Enable tmux's per-pane flow control for this attach (tmux→daemon leg).
         attach
@@ -276,6 +282,24 @@ impl Attach {
             }
             ClientMessage::TmuxCommand { cmd } => {
                 self.send_command(&cmd).await?;
+            }
+            ClientMessage::CapturePane {
+                pane_id,
+                start,
+                end,
+                join,
+            } => {
+                // Bounded scrollback capture. `-e` preserves ANSI (color parity
+                // with the live stream); `-J` rejoins soft-wrapped rows. The
+                // reply's output is forwarded as a PaneCapture for this pane,
+                // correlated by the returned CommandId. `start`/`end` are tmux
+                // `-S`/`-E` line addresses (may begin with `-`), passed as their
+                // own tokens; the pane target is `%<id>`.
+                let join_flag = if join { " -J" } else { "" };
+                let command =
+                    format!("capture-pane -p -e{join_flag} -S {start} -E {end} -t %{pane_id}");
+                let id = self.send_command(&command).await?;
+                self.captures.insert(id, pane_id);
             }
             // Empty input is a no-op; Attach is handled by the task; Hello never
             // reaches the terminal task.
@@ -331,6 +355,23 @@ impl Attach {
                             self.layout_dirty = false;
                             self.request_layout().await;
                         }
+                    } else if let Some(pane) = id.and_then(|id| self.captures.remove(&id)) {
+                        // A `capture-pane` reply: forward the captured bytes (empty
+                        // on a capture error, so the client clears its in-flight
+                        // flag and can retry). The output lines are already
+                        // tmux-decoded by the Client's command-block decode.
+                        let bytes = if error {
+                            Vec::new()
+                        } else {
+                            join_capture(&output)
+                        };
+                        outbound
+                            .send(DaemonMessage::PaneCapture {
+                                pane_id: pane,
+                                bytes,
+                            })
+                            .await
+                            .map_err(|_| Closed)?;
                     }
                     // Other replies are acks for input/resize/raw commands — the
                     // Client already consumed their guards; nothing to forward.
@@ -412,6 +453,14 @@ fn hex_bytes(data: &[u8]) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+/// Join a `capture-pane` reply's lines into the byte payload the client feeds to
+/// its scrollback `Term`: one line per pane row, newline-separated (matching the
+/// 1:1 row mapping the client's capture parser expects). The lines are already
+/// tmux-decoded by the [`Client`]'s command-block decode.
+fn join_capture(output: &[String]) -> Vec<u8> {
+    output.join("\n").into_bytes()
 }
 
 /// Pull the `%<pane>` id out of a `%pause`/`%continue` notification argument.
@@ -734,6 +783,77 @@ mod tests {
         assert!(
             found.is_some(),
             "typed marker did not round-trip to the pane"
+        );
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_capture_pane_returns_scrollback() {
+        let server = TmuxServer::new("capture");
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+        let pane_id = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::LayoutSnapshot { windows, .. } => Some(windows[0].panes[0].pane_id),
+            _ => None,
+        })
+        .await
+        .expect("snapshot");
+
+        // Print a unique marker so it lands in the pane's captured content.
+        in_tx
+            .send(ClientMessage::Input {
+                pane_id,
+                data: "printf 'RIFTCAPTURE777\\n'\n".to_owned(),
+            })
+            .await
+            .expect("input");
+        // Wait until the marker has been echoed live, so a capture now sees it.
+        let mut live = Vec::new();
+        recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::PaneOutput { bytes, .. } => {
+                live.extend_from_slice(bytes);
+                live.windows(b"RIFTCAPTURE777".len())
+                    .any(|w| w == b"RIFTCAPTURE777")
+                    .then_some(())
+            }
+            _ => None,
+        })
+        .await
+        .expect("marker echoed live");
+
+        // Capture the whole pane (history + visible) and assert the marker is in
+        // the reply, correlated to this pane.
+        in_tx
+            .send(ClientMessage::CapturePane {
+                pane_id,
+                start: "-".to_owned(),
+                end: "-".to_owned(),
+                join: false,
+            })
+            .await
+            .expect("capture");
+
+        let captured = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::PaneCapture { pane_id: p, bytes } if *p == pane_id => {
+                Some(bytes.clone())
+            }
+            _ => None,
+        })
+        .await
+        .expect("pane capture reply");
+        assert!(
+            captured
+                .windows(b"RIFTCAPTURE777".len())
+                .any(|w| w == b"RIFTCAPTURE777"),
+            "captured scrollback must contain the printed marker"
         );
 
         drop(in_tx);

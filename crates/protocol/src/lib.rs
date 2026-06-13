@@ -41,6 +41,20 @@ pub enum ClientMessage {
     TmuxCommand {
         cmd: String,
     },
+    /// Request a bounded `capture-pane` of pre-attach scrollback for `pane_id`.
+    /// `start`/`end` are tmux line addresses for `-S`/`-E` (`"-"` for the
+    /// extreme, a negative number for a history offset); `join` is `-J` (rejoin
+    /// soft-wrapped rows). The daemon answers with exactly one
+    /// [`DaemonMessage::PaneCapture`] for this pane — the captured bytes, or
+    /// empty on a capture error. This is a request/response exchange, separate
+    /// from the live `%output` stream and the snapshot↔live-stream contract
+    /// (pre-attach scrollback is explicitly outside that contract).
+    CapturePane {
+        pane_id: u32,
+        start: String,
+        end: String,
+        join: bool,
+    },
     Hello {
         version: u32,
     },
@@ -84,6 +98,18 @@ pub enum DaemonMessage {
     /// ANSI byte run the protocol never interprets (agent-agnostic). `pane_id` is
     /// tmux's `%<n>` pane id as an integer.
     PaneOutput {
+        pane_id: u32,
+        bytes: Vec<u8>,
+    },
+    /// The reply to a [`ClientMessage::CapturePane`]: the captured pre-attach
+    /// scrollback for `pane_id` as opaque bytes (tmux-decoded, ANSI included via
+    /// `capture-pane -e`), or empty on a capture error so the client can clear
+    /// its in-flight flag and retry. One per request, correlated by `pane_id`.
+    /// Distinct from [`PaneOutput`] — the client routes this to its scrollback
+    /// history, not the live `Term`.
+    ///
+    /// [`PaneOutput`]: DaemonMessage::PaneOutput
+    PaneCapture {
         pane_id: u32,
         bytes: Vec<u8>,
     },
@@ -398,6 +424,25 @@ mod tests {
     }
 
     #[test]
+    fn test_capture_pane_roundtrip_preserves_range_and_join() {
+        let msg = ClientMessage::CapturePane {
+            pane_id: 4,
+            start: "-".to_owned(),
+            end: "-128".to_owned(),
+            join: true,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize CapturePane");
+        assert!(json.contains(r#""type":"capture_pane""#));
+        assert!(json.contains(r#""start":"-""#));
+        assert!(json.contains(r#""end":"-128""#));
+        assert!(json.contains(r#""join":true"#));
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&json).expect("deserialize CapturePane"),
+            msg
+        );
+    }
+
+    #[test]
     fn test_client_message_unknown_type_is_rejected() {
         // An unknown tag fails loudly rather than being silently misread, so a
         // future client message a daemon does not know is not mistaken for a
@@ -444,6 +489,33 @@ mod tests {
             }
             other => panic!("expected PaneOutput, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_pane_capture_roundtrip_carries_bytes() {
+        // The capture reply carries opaque bytes (ANSI included), and an empty
+        // capture (error / no history) round-trips as an empty list, not absent.
+        let msg = DaemonMessage::PaneCapture {
+            pane_id: 6,
+            bytes: vec![0x1b, b'[', b'3', b'1', b'm', b'h', b'i'],
+        };
+        let json = serde_json::to_string(&msg).expect("serialize PaneCapture");
+        assert!(json.contains(r#""type":"pane_capture""#));
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize PaneCapture"),
+            msg
+        );
+
+        let empty = DaemonMessage::PaneCapture {
+            pane_id: 6,
+            bytes: vec![],
+        };
+        let json = serde_json::to_string(&empty).expect("serialize empty PaneCapture");
+        assert!(json.contains(r#""bytes":[]"#));
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize empty PaneCapture"),
+            empty
+        );
     }
 
     fn sample_layout() -> Vec<WindowLayout> {
