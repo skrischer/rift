@@ -421,6 +421,28 @@ mod tests {
     }
 
     #[test]
+    fn test_git_update_before_snapshot_is_reset_by_snapshot() {
+        // Symmetry with the tree's `apply_update_before_first_snapshot`: a git
+        // update may arrive before the first snapshot; it is buffered, then the
+        // snapshot reset wipes it so no pre-snapshot decoration leaks. The
+        // authoritative full git replay follows the snapshot.
+        let mut model = WorktreeModel::default();
+        model.apply_git_update(
+            vec![git_entry(
+                "early.rs",
+                GitStatusCode::Unmodified,
+                GitStatusCode::Modified,
+            )],
+            vec![],
+        );
+        model.apply_repo_state(Some("stale".into()), None);
+
+        model.apply_snapshot_chunk("/proj".into(), vec![file("early.rs", 1)], true);
+        assert_eq!(model.git_status("early.rs"), None);
+        assert_eq!(model.branch(), None);
+    }
+
+    #[test]
     fn test_apply_repo_state_stores_branch_and_ahead_behind() {
         let mut model = WorktreeModel::default();
         model.apply_repo_state(
