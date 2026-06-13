@@ -267,7 +267,7 @@ async fn start_daemon_path(
     tokio::spawn(async move {
         while let Some(msg) = reader.recv().await {
             let mapped = match msg {
-                DaemonMessage::PaneOutput { pane_id, cells } => Msg::Output(pane_id, cells),
+                DaemonMessage::PaneOutput { pane_id, bytes } => Msg::Output(pane_id, bytes),
                 DaemonMessage::StateUpdate { sessions } => {
                     match sessions
                         .first()
