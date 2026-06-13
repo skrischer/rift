@@ -1,0 +1,44 @@
+%begin 1781354510 265 0
+%end 1781354510 265 0
+%window-add @0
+%sessions-changed
+%session-changed $0 cap
+%output %0 \033[?2004h\033[01;32mdeveloper@skrischer-xps\033[00m:\033[01;34m/tmp\033[00m$ 
+%begin 1781354511 271 1
+0: [80x24] [history 0/2000, 1850 bytes] %0 (active)
+%end 1781354511 271 1
+%begin 1781354511 272 1
+%end 1781354511 272 1
+%session-renamed $0 rift-fix
+%begin 1781354512 274 1
+parse error: unknown command: not-a-real-command
+%error 1781354512 274 1
+%begin 1781354512 275 1
+%end 1781354512 275 1
+%session-window-changed $0 @1
+%window-add @1
+%output %1 \033[?2004h\033[01;32mdeveloper@skrischer-xps\033[00m:\033[01;34m/tmp\033[00m$ 
+%begin 1781354513 278 1
+%end 1781354513 278 1
+%session-window-changed $0 @0
+%begin 1781354513 280 1
+%end 1781354513 280 1
+%unlinked-window-close @1
+%begin 1781354514 282 1
+%end 1781354514 282 1
+%window-pane-changed @0 %2
+%layout-change @0 0206,80x24,0,0{40x24,0,0,0,39x24,41,0,2} 0206,80x24,0,0{40x24,0,0,0,39x24,41,0,2} *
+%output %0 \015\033[K\015\033[01;32mdeveloper@skrischer-xps\033[00m:\033[01;34m/tmp\033[00m$ 
+%output %2 \033[?2004h\033[01;32mdeveloper@skrischer-xps\033[00m:\033[01;34m/tmp\033[00m$ 
+%begin 1781354515 285 1
+%end 1781354515 285 1
+%pane-mode-changed %2
+%window-renamed @0 [tmux]
+%begin 1781354515 288 1
+%end 1781354515 288 1
+%pane-mode-changed %2
+%window-renamed @0 bash
+%begin 1781354516 291 1
+%end 1781354516 291 1
+%sessions-changed
+%exit
