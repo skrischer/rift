@@ -49,16 +49,32 @@ fn daemon_is_running(probe_output: &str) -> bool {
 /// its stdio redirected to a log so it outlives this exec channel, then poll for
 /// the socket and print [`MARKER_READY`] (or [`MARKER_TIMEOUT`]). Always exits
 /// zero; readiness is reported via the marker, not the exit status.
-fn launch_command(binary_path: &str, socket_path: &str, log_path: &str) -> String {
+///
+/// When `root` is set, a single-quoted `--root <path>` is appended to the daemon
+/// invocation so it watches that directory; absent, the flag is omitted and the
+/// daemon falls back to its launch directory.
+fn launch_command(
+    binary_path: &str,
+    socket_path: &str,
+    log_path: &str,
+    root: Option<&str>,
+) -> String {
     let bin = shell_single_quote(binary_path);
     let sock = shell_single_quote(socket_path);
     let log = shell_single_quote(log_path);
+    // The watched-root flag sits before the redirections so the shell hands it to
+    // the daemon as an argument instead of swallowing it into the redirect; it is
+    // single-quoted like every other remote path. Omitted entirely when unset.
+    let root_arg = match root {
+        Some(root) => format!(" --root {}", shell_single_quote(root)),
+        None => String::new(),
+    };
     // Inner command handed to `setsid sh -c`: `exec` replaces the shell with the
     // daemon so the new session leader *is* the daemon; stdin from /dev/null and
     // stdout/stderr appended to the log detach it from this channel's FDs, so
     // the daemon keeps running once the channel closes.
     let inner = shell_single_quote(&format!(
-        "exec {bin} --serve-uds {sock} </dev/null >> {log} 2>&1"
+        "exec {bin} --serve-uds {sock}{root_arg} </dev/null >> {log} 2>&1"
     ));
     format!(
         "setsid sh -c {inner} >/dev/null 2>&1 & \
@@ -97,12 +113,14 @@ fn relay_command(binary_path: &str, socket_path: &str) -> String {
 /// future SSH connections, wait for the socket, then open the relay channel.
 /// `binary_path` is the resolved remote daemon path (see
 /// [`crate::ensure_daemon_deployed`]); `log_path` receives the detached daemon's
-/// stdio.
+/// stdio. `root`, when set, is the project directory the daemon watches; it only
+/// takes effect on a fresh spawn — a reattach keeps the running daemon's root.
 pub async fn connect_or_spawn_daemon(
     conn: &mut SshConnection,
     binary_path: &str,
     socket_path: &str,
     log_path: &str,
+    root: Option<&str>,
 ) -> Result<DaemonChannel, SshError> {
     let probe = conn
         .exec_capture(&probe_command(binary_path, socket_path))
@@ -112,7 +130,7 @@ pub async fn connect_or_spawn_daemon(
     } else {
         debug!(socket_path, "no daemon running, spawning detached");
         let launched = conn
-            .exec_capture(&launch_command(binary_path, socket_path, log_path))
+            .exec_capture(&launch_command(binary_path, socket_path, log_path, root))
             .await?;
         launch_succeeded(&launched)?;
     }
@@ -150,7 +168,7 @@ mod tests {
 
     #[test]
     fn test_launch_command_detaches_serves_and_polls() {
-        let cmd = launch_command("/h/rift-daemon-0.1.0", "/h/d.sock", "/h/d.log");
+        let cmd = launch_command("/h/rift-daemon-0.1.0", "/h/d.sock", "/h/d.log", None);
         // Detached via setsid, daemon serves the socket with stdio redirected
         // away from this channel (the inner command is single-quoted for the
         // `sh -c`, so its own quoting is escaped — these are the surviving
@@ -172,8 +190,32 @@ mod tests {
         // checks the poll-loop occurrence (`[ -S '...' ]`); the same path inside
         // the `setsid sh -c '...'` argument is single-quoted again and therefore
         // doubly-escaped, so it cannot break out there either.
-        let cmd = launch_command("/h/bin", "/h/`id`.sock", "/h/d.log");
+        let cmd = launch_command("/h/bin", "/h/`id`.sock", "/h/d.log", None);
         assert!(cmd.contains("'/h/`id`.sock'"));
+    }
+
+    #[test]
+    fn test_launch_command_with_root_emits_flag_before_redirect() {
+        let cmd = launch_command("/h/bin", "/h/d.sock", "/h/d.log", Some("/srv/project"));
+        // The root path is single-quoted inside the inner command and therefore
+        // doubly-escaped in the final `setsid sh -c '...'` string. The flag must
+        // precede `</dev/null` or the shell would treat it as part of the redirect.
+        assert!(cmd.contains("--root '\\''/srv/project'\\'' </dev/null"));
+    }
+
+    #[test]
+    fn test_launch_command_without_root_omits_flag() {
+        let cmd = launch_command("/h/bin", "/h/d.sock", "/h/d.log", None);
+        assert!(!cmd.contains("--root"));
+    }
+
+    #[test]
+    fn test_launch_command_root_neutralizes_injection() {
+        // A root path with shell metacharacters stays single-quoted inside the
+        // `setsid sh -c` inner command (doubly-escaped in the final string), so it
+        // cannot break out — mirroring the socket-path injection guard above.
+        let cmd = launch_command("/h/bin", "/h/d.sock", "/h/d.log", Some("/h/$(touch pwned)"));
+        assert!(cmd.contains("--root '\\''/h/$(touch pwned)'\\''"));
     }
 
     #[test]
