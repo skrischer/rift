@@ -8,5 +8,6 @@ license.workspace = true
 rift-protocol = { path = "../protocol" }
 rift-explorer = { path = "../explorer" }
 rift-lsp = { path = "../lsp" }
+rift-tmux-core = { path = "../tmux-core" }
 tokio.workspace = true
 anyhow.workspace = true

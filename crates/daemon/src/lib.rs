@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub mod spike;
+mod terminal;
 
 use rift_explorer::{Change, Entry, GitStatus, Snapshot, Watcher};
 use rift_protocol::{
@@ -13,14 +13,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, watch};
 
-/// Single source of truth for the daemon's observable state.
+/// Single source of truth for the daemon's observable worktree/git state.
 ///
-/// Mirrors `DaemonMessage::StateUpdate`. Held as the value of a
-/// `tokio::sync::watch` channel so consumers observe the latest snapshot
-/// without sharing a mutex.
+/// Held as the value of a `tokio::sync::watch` channel so consumers observe the
+/// latest snapshot without sharing a mutex. The terminal path is not part of
+/// this shared state — each connection drives its own per-client tmux attach
+/// (see [`terminal`]).
 #[derive(Debug, Clone, Default)]
 pub struct State {
-    pub sessions: Vec<String>,
     /// Latest worktree snapshot, present once the initial scan completes.
     /// Kept current by applying the watcher's change batches in place.
     pub worktree: Option<Snapshot>,
@@ -120,6 +120,13 @@ const SERVE_EVENT_CAPACITY: usize = 256;
 /// Read buffer for a single transport read. The transport delivers arbitrary
 /// chunk sizes; the [`FrameDecoder`] reassembles frames regardless of this size.
 const SERVE_READ_BUFFER: usize = 8 * 1024;
+
+/// Per-connection terminal channel bounds. `INBOUND` queues the connection's
+/// terminal `ClientMessage`s for its tmux attach; `OUTBOUND` bounds the attach's
+/// event backlog — the daemon→client flow-control leg, so a flooding pane can
+/// never grow this without bound (its backpressure pauses the pane tmux-side).
+const TERMINAL_INBOUND_CAPACITY: usize = 256;
+const TERMINAL_OUTBOUND_CAPACITY: usize = 256;
 
 /// Queue depth for worktree events flowing from the blocking worker into the
 /// dispatch loop. Bounds how far the worker may run ahead while the loop is busy.
@@ -458,6 +465,20 @@ where
     let mut handshaken = false;
     let mut snapshot_sent = false;
 
+    // This connection's own tmux attach: terminal `ClientMessage`s are routed to
+    // a dedicated `terminal_task` (each client gets its own `tmux -C` child), and
+    // its outbound events are multiplexed onto this socket alongside the shared
+    // worktree/git stream. Keeping the terminal path per connection is what gives
+    // each rift client an independent attach (per-client size, flow control).
+    let (terminal_in_tx, terminal_in_rx) = mpsc::channel(TERMINAL_INBOUND_CAPACITY);
+    let (terminal_out_tx, mut terminal_out_rx) = mpsc::channel(TERMINAL_OUTBOUND_CAPACITY);
+    let terminal = tokio::spawn(terminal::terminal_task(
+        terminal_in_rx,
+        terminal_out_tx,
+        None,
+    ));
+    let mut terminal_done = false;
+
     'serve: loop {
         tokio::select! {
             read = reader.read(&mut buf) => {
@@ -469,9 +490,25 @@ where
                 }
                 decoder.push(&buf[..n]);
                 while let Some(msg) = decoder.next_frame::<ClientMessage>()? {
-                    if inbound.send(msg).await.is_err() {
-                        // Dispatch loop gone; nothing left to serve.
-                        break 'serve;
+                    // Terminal messages drive this connection's own tmux attach;
+                    // everything else (the handshake) goes to the shared loop.
+                    match msg {
+                        ClientMessage::Attach { .. }
+                        | ClientMessage::Input { .. }
+                        | ClientMessage::ResizePane { .. }
+                        | ClientMessage::TmuxCommand { .. } => {
+                            if terminal_in_tx.send(msg).await.is_err() {
+                                // Terminal task gone; the terminal path is dead,
+                                // but the worktree path can keep serving.
+                                terminal_done = true;
+                            }
+                        }
+                        ClientMessage::Hello { .. } => {
+                            if inbound.send(msg).await.is_err() {
+                                // Dispatch loop gone; nothing left to serve.
+                                break 'serve;
+                            }
+                        }
                     }
                 }
             }
@@ -514,8 +551,29 @@ where
                     snapshot_sent = write_snapshot(&mut writer, &state).await?;
                 }
             }
+            terminal_event = terminal_out_rx.recv(), if !terminal_done => {
+                match terminal_event {
+                    // This connection's tmux attach produced an event (pane bytes,
+                    // a layout change, or terminal-path-down): write it to the
+                    // socket alongside the shared worktree/git stream.
+                    Some(msg) => {
+                        let frame = encode_frame(&msg)?;
+                        writer.write_all(&frame).await?;
+                        writer.flush().await?;
+                    }
+                    // The terminal task ended; stop polling its channel so this
+                    // branch cannot busy-loop. The worktree path keeps serving.
+                    None => terminal_done = true,
+                }
+            }
         }
     }
+
+    // End this connection's tmux attach by closing its inbound channel; the
+    // terminal task detaches the control child (the tmux session persists) and
+    // exits. Awaiting it makes teardown deterministic for callers and tests.
+    drop(terminal_in_tx);
+    let _ = terminal.await;
 
     Ok(())
 }
@@ -786,9 +844,10 @@ impl Core {
                     version: PROTOCOL_VERSION,
                 });
             }
-            // Terminal/tmux handling (attach, input, resize, command emission)
-            // is owned by a later Phase 6 daemon sub-spec; this scaffolding only
-            // carries the handshake.
+            // Terminal/tmux messages never reach the shared dispatch loop:
+            // `serve_connection` routes them to this connection's own
+            // `terminal_task` (per-client attach). The arm stays as a defensive
+            // no-op in case a caller drives the loop directly.
             ClientMessage::Attach { .. }
             | ClientMessage::Input { .. }
             | ClientMessage::ResizePane { .. }
