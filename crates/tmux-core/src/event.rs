@@ -10,8 +10,11 @@ use crate::client::CommandId;
 /// verbatim as [`Event::Other`] so the stream never desyncs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// `%output %<pane> <data>` — pane bytes with octal escapes decoded. The
-    /// bytes are opaque (agent-agnostic): VTE interpretation stays client-side.
+    /// `%output %<pane> <data>` — pane bytes with octal escapes decoded. Also
+    /// covers `%extended-output %<pane> <age> : <data>`, the form tmux uses once
+    /// flow control (`pause-after`) is active; the age annotation is dropped so
+    /// both forms yield the same byte stream. The bytes are opaque
+    /// (agent-agnostic): VTE interpretation stays client-side.
     Output { pane: u32, data: Vec<u8> },
     /// `%layout-change @<window> <layout> [<visible_layout>] [<flags>]`. The
     /// layout strings are kept raw; geometry parsing is out of scope here.
