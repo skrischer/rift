@@ -321,7 +321,10 @@ pub fn registry() -> Vec<ComponentEntry> {
         },
         ComponentEntry {
             name: "WebView",
-            description: "Placeholder — the real demo lands in follow-up #127.",
+            description: "An embedded browser via Wry (live on Windows; notice elsewhere).",
+            #[cfg(windows)]
+            demo: View(demos::build_webview),
+            #[cfg(not(windows))]
             demo: Element(demos::render_webview),
         },
     ]
@@ -581,6 +584,12 @@ impl Render for Gallery {
 /// [`crate::apply_theme`] path so the gallery renders in rift's palette, then loads
 /// gpui-component icon assets via [`Assets`].
 pub fn run() {
+    // The Wry child webview (WebView demo, Windows only) does not compose with
+    // GPUI's DirectComposition surface; disabling it lets the native webview
+    // render over the window. Matches gpui-component's own webview example.
+    #[cfg(windows)]
+    std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "true");
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_target(true)

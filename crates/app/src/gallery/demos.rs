@@ -2073,21 +2073,67 @@ impl Render for DataTableDemo {
 }
 
 // ---------------------------------------------------------------------------
-// WebView (placeholder)
+// WebView (#127)
 // ---------------------------------------------------------------------------
 
+/// Windows: a live embedded browser backed by `gpui-wry` (Wry / WebView2). The
+/// native child webview is positioned by the rendered element's bounds, so it is
+/// hosted in a fixed-height bordered container.
+#[cfg(windows)]
+struct WebViewDemo {
+    webview: Entity<gpui_wry::WebView>,
+}
+
+#[cfg(windows)]
+pub(super) fn build_webview(window: &mut Window, cx: &mut App) -> AnyView {
+    use raw_window_handle::HasWindowHandle as _;
+
+    let webview = cx.new(|cx| {
+        let builder = wry::WebViewBuilder::new();
+        #[cfg(debug_assertions)]
+        let builder = builder.with_devtools(true);
+        let handle = window
+            .window_handle()
+            .expect("gallery window exposes a raw window handle");
+        let inner = builder
+            .build_as_child(&handle)
+            .expect("WebView2 runtime builds a child webview");
+        let mut view = gpui_wry::WebView::new(inner, window, cx);
+        view.load_url("https://longbridge.github.io/gpui-component");
+        view
+    });
+    cx.new(|_| WebViewDemo { webview }).into()
+}
+
+#[cfg(windows)]
+impl Render for WebViewDemo {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .h(px(480.))
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(px(8.))
+            .child(self.webview.clone())
+    }
+}
+
+/// Non-Windows: the real WebView renders only on the Windows sign-off target (the
+/// upstream Linux GTK path is non-functional and would pull `libwebkit2gtk` into
+/// the headless/CI builds), so other targets show this notice.
+#[cfg(not(windows))]
 pub(super) fn render_webview(_window: &mut Window, _cx: &mut App) -> AnyElement {
     v_flex()
         .gap_3()
         .max_w(px(560.))
         .child(
             Alert::info(
-                "webview-placeholder",
-                "WebView is a separate crate (gpui-wry / Wry), not part of the \
-                 gpui-component library. Its demo is delivered by follow-up issue \
-                 #127 so the gallery keeps exactly one gpui in Cargo.lock.",
+                "webview-windows-only",
+                "The WebView demo embeds a live browser via gpui-wry (Wry / \
+                 WebView2) and renders only on the Windows sign-off target. The \
+                 upstream Linux path is non-functional, so this build shows a \
+                 notice instead.",
             )
-            .title("WebView — delivered by follow-up issue"),
+            .title("WebView — available on Windows only"),
         )
         .into_any_element()
 }
