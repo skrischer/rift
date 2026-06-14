@@ -42,7 +42,13 @@ rift-ssh = { path = "../ssh" }
 rift-protocol = { path = "../protocol" }
 gpui.workspace = true
 gpui_platform.workspace = true
-gpui-component.workspace = true
+# `tree-sitter-languages` enables the umbrella set of Tree-sitter grammars so the
+# code editor highlights a file by its extension (the gallery's single
+# `tree-sitter-rust` is a demo-only subset). Enabled here on the product `rift`
+# binary's dependency, not behind the `gallery` feature, so the shipping editor
+# highlights every supported language. `code_editor(<ext>)` resolves the grammar
+# and falls back to plain text for an unknown extension.
+gpui-component = { workspace = true, features = ["tree-sitter-languages"] }
 gpui-component-assets = { workspace = true, optional = true }
 # Not used in code; declared only to enable rust-embed's `debug-embed` feature
 # for the gallery (see the `gallery` feature comment). Already in the graph via
@@ -50,6 +56,9 @@ gpui-component-assets = { workspace = true, optional = true }
 rust-embed = { version = "8", optional = true, features = ["debug-embed"] }
 tokio.workspace = true
 flume.workspace = true
+# GPUI-side timeout for the buffer-channel open request (`smol::Timer`; the
+# tokio timer does not fire on the GPUI executor — docs/patterns.md).
+smol.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

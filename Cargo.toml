@@ -45,10 +45,20 @@ lsp-types = "0.95"
 tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
 tower = "0.5"
+# gpui-component is pinned to a specific commit (the editor surface lands here;
+# an upstream force-push must never shift the widget set under us). The GPUI
+# commit is pinned *alongside* it through Cargo.lock, not with a `rev` here:
+# gpui-component depends on `gpui` / `gpui_platform` from the same zed git URL
+# *without* a rev, so a `rev` on our lines would be a second, non-unifying source
+# and split the graph into two incompatible `gpui` copies (and a same-source
+# `[patch]` is rejected by Cargo). Left rev-less, a git dep does not float on
+# `cargo build` — the committed Cargo.lock pins the exact gpui commit
+# (4bee41211…, matching the gpui-component pin), and it moves only on an explicit
+# `cargo update`. Bump the two in lockstep.
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform" }
-gpui-component = { git = "https://github.com/longbridge/gpui-component" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "9ad30e631e15f9bbba049717767bf4cd98e4f179" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "9ad30e631e15f9bbba049717767bf4cd98e4f179" }
 termy_terminal_ui = { git = "https://github.com/skrischer/termy", rev = "49d3928570c8b50fabb4f7d3d5f6322d3296fafa" }
 flume = "0.11"
 alacritty_terminal = "0.26.0"
