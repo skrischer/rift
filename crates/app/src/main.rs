@@ -39,19 +39,24 @@ struct PtyChannels {
 }
 
 /// The daemon-side endpoints of the editor surface's buffer-channel and worktree
-/// wiring (#187). The tokio session reader (`consume_daemon_messages`) forwards
-/// worktree-family messages and `FileContent` replies onto these senders, and an
-/// open-file bridge drains `open_file_rx` into `ClientMessage::OpenFile`
-/// requests. The matching GPUI-side endpoints live on
-/// [`rift_app::workspace::WorkspaceChannels`].
+/// wiring (#187, #188). The tokio session reader (`consume_daemon_messages`)
+/// forwards worktree-family messages and the buffer-channel replies
+/// (`FileContent` / `SaveResult` / `SaveConflict`) onto these senders; an
+/// open-file bridge drains `open_file_rx` into `ClientMessage::OpenFile` reads and
+/// a save-file bridge drains `save_file_rx` into `SaveFile` writes. The matching
+/// GPUI-side endpoints live on [`rift_app::workspace::WorkspaceChannels`].
 struct EditorChannels {
     /// Worktree-family daemon messages routed to the file tree's model.
     worktree_tx: flume::Sender<rift_protocol::DaemonMessage>,
-    /// `FileContent` replies routed to the editor.
-    file_content_tx: flume::Sender<rift_protocol::DaemonMessage>,
-    /// Root-relative paths to open, emitted by the tree; each becomes an
-    /// `OpenFile` request.
+    /// Buffer-channel replies routed to the editor: `FileContent` (load),
+    /// `SaveResult` (save landed), `SaveConflict` (save refused).
+    buffer_tx: flume::Sender<rift_protocol::DaemonMessage>,
+    /// Root-relative paths to open, emitted by the tree (or the editor's
+    /// auto-reload); each becomes an `OpenFile` request.
     open_file_rx: flume::Receiver<String>,
+    /// `SaveFile` write requests the editor built from the open buffer; forwarded
+    /// onto the protocol verbatim by the save-file bridge.
+    save_file_rx: flume::Receiver<rift_protocol::ClientMessage>,
 }
 
 // Console builds log to stdout (the dev loop's RUST_LOG console). Windowed builds
@@ -136,6 +141,23 @@ fn main() {
             KeyBinding::new("tab", NoAction, Some(TERMINAL_KEY_CONTEXT)),
             KeyBinding::new("shift-tab", NoAction, Some(TERMINAL_KEY_CONTEXT)),
         ]);
+        // Save the open buffer over the buffer channel (#188). Scoped to the
+        // editor's key context so it fires only when focus is in the editor, never
+        // for an unrelated input. Both chords are bound so the binding matches the
+        // host's muscle memory (Ctrl+S on Windows/Linux, Cmd+S on macOS) without a
+        // per-OS cfg — the inactive chord simply never arrives.
+        cx.bind_keys([
+            KeyBinding::new(
+                "ctrl-s",
+                rift_app::editor::Save,
+                Some(rift_app::editor::EDITOR_KEY_CONTEXT),
+            ),
+            KeyBinding::new(
+                "cmd-s",
+                rift_app::editor::Save,
+                Some(rift_app::editor::EDITOR_KEY_CONTEXT),
+            ),
+        ]);
         let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
         // Per-channel window title (matching the per-channel taskbar icons), so the
         // mirrored stable and dev instances are distinguishable in alt-tab and
@@ -161,8 +183,10 @@ fn main() {
                 // ends thread into the SSH session below; the GPUI-side ends into
                 // the `WorkspaceView`.
                 let (worktree_tx, worktree_rx) = flume::unbounded();
-                let (file_content_tx, file_content_rx) = flume::unbounded();
+                let (buffer_tx, buffer_rx) = flume::unbounded();
                 let (open_file_tx, open_file_rx) = flume::unbounded::<String>();
+                let (save_file_tx, save_file_rx) =
+                    flume::unbounded::<rift_protocol::ClientMessage>();
 
                 let session_view = cx.new(|cx| {
                     let (view, handle) = SessionView::new(cx);
@@ -215,8 +239,9 @@ fn main() {
 
                     let editor_channels = EditorChannels {
                         worktree_tx,
-                        file_content_tx,
+                        buffer_tx,
                         open_file_rx,
+                        save_file_rx,
                     };
 
                     let key_exists = ssh.key.exists();
@@ -260,8 +285,9 @@ fn main() {
                         session_view,
                         workspace::WorkspaceChannels {
                             worktree_rx,
-                            file_content_rx,
+                            buffer_rx,
                             open_file_tx,
+                            save_file_tx,
                         },
                         window,
                         cx,
@@ -326,6 +352,7 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels, editor: EditorChannel
         info!("terminal source: legacy tmux (daemon worktree stream active)");
         let client = std::sync::Arc::new(client);
         spawn_open_file_bridge(client.clone(), editor.open_file_rx.clone());
+        spawn_save_file_bridge(client.clone(), editor.save_file_rx.clone());
         tokio::spawn(consume_daemon_messages(client, None, editor));
     } else {
         info!("terminal source: legacy tmux (no daemon configured)");
@@ -384,9 +411,11 @@ async fn run_daemon_terminal(
     spawn_command_bridge(client.clone(), ch.tmux_command_rx);
     spawn_capture_bridge(client.clone(), ch.capture_request_rx);
     // Buffer channel reverse path: the editor's open requests become `OpenFile`
-    // reads (#187). The forward `FileContent` replies return via
-    // `consume_daemon_messages` on `editor.file_content_tx`.
+    // reads (#187) and its save requests `SaveFile` writes (#188). The forward
+    // replies (`FileContent` / `SaveResult` / `SaveConflict`) return via
+    // `consume_daemon_messages` on `editor.buffer_tx`.
     spawn_open_file_bridge(client.clone(), editor.open_file_rx.clone());
+    spawn_save_file_bridge(client.clone(), editor.save_file_rx.clone());
 
     // Forward path: fold the daemon stream into the render channels (pane output,
     // layout snapshots, capture replies), the file tree, and the editor. Blocks
@@ -717,8 +746,9 @@ async fn provision_daemon(conn: &mut rift_ssh::SshConnection) -> Option<rift_ssh
 ///
 /// The single reader of the shared [`rift_ssh::DaemonClient`]: it forwards every
 /// worktree-structure message (snapshot / update / git / repo / diagnostics) to
-/// the file tree's model on `editor.worktree_tx`, the `FileContent` buffer reply
-/// to the editor on `editor.file_content_tx`, and — when `terminal` is `Some` —
+/// the file tree's model on `editor.worktree_tx`, the buffer-channel replies
+/// (`FileContent` / `SaveResult` / `SaveConflict`) to the editor on
+/// `editor.buffer_tx`, and — when `terminal` is `Some` —
 /// the per-pane byte stream and layout snapshots into the terminal render
 /// channels (#205). With `terminal` `None` (legacy mode) the terminal arms are
 /// inert — the app never sent `Attach`, so the daemon streams no terminal events,
@@ -787,12 +817,15 @@ async fn consume_daemon_messages(
             | DaemonMessage::Diagnostics { .. }) => {
                 let _ = editor.worktree_tx.send(msg);
             }
-            // --- buffer channel reply -> editor (every mode) ---
-            // The only daemon message carrying file content: the read reply for an
-            // `OpenFile`. Forward to the editor, which loads it if it still matches
-            // the open in flight.
-            msg @ DaemonMessage::FileContent { .. } => {
-                let _ = editor.file_content_tx.send(msg);
+            // --- buffer channel replies -> editor (every mode) ---
+            // The request/response replies on the buffer channel: the `OpenFile`
+            // read reply (the only message carrying file content) and the
+            // `SaveFile` write replies (`SaveResult` / `SaveConflict`). Forward
+            // each to the editor, which routes it by path against the open buffer.
+            msg @ (DaemonMessage::FileContent { .. }
+            | DaemonMessage::SaveResult { .. }
+            | DaemonMessage::SaveConflict { .. }) => {
+                let _ = editor.buffer_tx.send(msg);
             }
             other => debug!(?other, "daemon message without a consumer yet"),
         }
@@ -804,7 +837,7 @@ async fn consume_daemon_messages(
 /// [`rift_protocol::ClientMessage::OpenFile`] reads (#187). Each path the file
 /// tree emitted becomes one read request; the daemon answers with a
 /// `FileContent` reply that returns through [`consume_daemon_messages`] on
-/// `editor.file_content_tx`. A *refused* request (binary / path escape) draws no
+/// `editor.buffer_tx`. A *refused* request (binary / path escape) draws no
 /// reply by protocol, so the editor's own timeout recovers it. Ends when either
 /// channel closes.
 fn spawn_open_file_bridge(
@@ -816,6 +849,30 @@ fn spawn_open_file_bridge(
         while let Ok(path) = open_file_rx.recv_async().await {
             debug!(%path, "sending open-file request");
             if client.send(ClientMessage::OpenFile { path }).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Forward the editor's save requests onto the protocol as
+/// [`rift_protocol::ClientMessage::SaveFile`] writes (#188). Each is the whole
+/// open buffer plus its base `mtime`; the daemon answers with a `SaveResult` or a
+/// `SaveConflict` that returns through [`consume_daemon_messages`] on
+/// `editor.buffer_tx`. A *refused* write (a path escape, non-UTF-8) draws no reply
+/// by protocol, so the editor's own save timeout recovers it. Ends when either
+/// channel closes. The editor builds the full `SaveFile` (path, content,
+/// base_mtime), so the bridge forwards it unchanged.
+fn spawn_save_file_bridge(
+    client: std::sync::Arc<rift_ssh::DaemonClient>,
+    save_file_rx: flume::Receiver<rift_protocol::ClientMessage>,
+) {
+    tokio::spawn(async move {
+        while let Ok(msg) = save_file_rx.recv_async().await {
+            if let rift_protocol::ClientMessage::SaveFile { path, .. } = &msg {
+                debug!(%path, "sending save-file request");
+            }
+            if client.send(msg).await.is_err() {
                 break;
             }
         }
