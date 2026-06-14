@@ -1,16 +1,28 @@
-//! Disk-backed document sync (issue #175).
+//! Document sync (issue #175; live-buffer feed #189).
 //!
 //! Turns worktree change events into LSP `didOpen` / `didChange` / `didClose`
-//! actions, reading each document's full text from disk so diagnostics reflect
-//! the on-disk state. Sync is full-text (`TextDocumentSyncKind::Full`): rift
-//! owns no editor buffers and the daemon only ever has the whole new file from
-//! disk, so there are no incremental deltas to send (spec: disk-backed
-//! full-text document model).
+//! actions. By default each document's full text is read from disk so
+//! diagnostics reflect the on-disk state. Sync is full-text
+//! (`TextDocumentSyncKind::Full`): there are no incremental deltas to send — the
+//! daemon only ever has the whole new file.
 //!
 //! v1 `didOpen` breadth is the *observed / changed* file set: the first time a
 //! matching file is seen as created or modified it is opened; later
 //! modifications drive `didChange`; removal drives `didClose`. There is no
 //! eager whole-tree open (spec prior decision).
+//!
+//! ## Live-buffer feed (the disk→buffer source-of-truth shift, #189)
+//!
+//! Once rift's own editor opens a file, its **live buffer** becomes the LSP's
+//! source of truth for that path (`spec-editor.md` cut C, executing the forward
+//! note the LSP spec reserved). [`DocumentSync::apply_buffer_change`] feeds the
+//! buffer's text as a `didChange`, and while a path has a live buffer the
+//! disk-driven path for it is **suppressed** ([`DocumentSync::apply`] no-ops a
+//! disk modify for a live path) so an agent's on-disk write cannot clobber the
+//! buffer's diagnostics. [`DocumentSync::apply_buffer_close`] ends the override
+//! and reverts the path to the disk-backed baseline (re-reading disk and pushing
+//! it as a `didChange`). This is bounded to the open file(s) and consumes the
+//! existing disk-backed model — it does not redesign it.
 //!
 //! This module is deliberately self-contained: it consumes a minimal
 //! [`DocumentChange`] stream and emits actions through a small [`DocumentSink`]
@@ -19,7 +31,7 @@
 //! concrete server registry as the sink is the daemon's job (issue #177); this
 //! module knows nothing of either.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use lsp_types::{
@@ -120,6 +132,11 @@ struct OpenDocument {
 pub struct DocumentSync {
     root: PathBuf,
     open: HashMap<PathBuf, OpenDocument>,
+    /// Paths whose source of truth is currently the editor's live buffer, not
+    /// disk (the disk→buffer shift, #189). While a path is here the disk-driven
+    /// `apply` no-ops a modify for it; `apply_buffer_close` removes it and reverts
+    /// to disk.
+    live: HashSet<PathBuf>,
 }
 
 impl DocumentSync {
@@ -130,12 +147,19 @@ impl DocumentSync {
         Self {
             root: root.into(),
             open: HashMap::new(),
+            live: HashSet::new(),
         }
     }
 
     /// Whether the document at `relative` is currently open.
     pub fn is_open(&self, relative: &Path) -> bool {
         self.open.contains_key(relative)
+    }
+
+    /// Whether `relative`'s source of truth is currently the editor's live buffer
+    /// (a buffer feed is active for it).
+    pub fn is_live(&self, relative: &Path) -> bool {
+        self.live.contains(relative)
     }
 
     /// Number of currently-open documents.
@@ -151,6 +175,9 @@ impl DocumentSync {
     /// - `Removed` for a currently-open file: `didClose`.
     /// - A file whose language is unrecognized, or a removal of a file that was
     ///   never opened, is a no-op (`Ok(None)`).
+    /// - A `Created` / `Modified` for a path with a **live buffer** is a no-op:
+    ///   the editor's buffer is the source of truth, so an agent's on-disk write
+    ///   must not clobber it (#189). The buffer feed drives `didChange` instead.
     ///
     /// Returns the action taken so callers (and tests) can observe it. An
     /// unreadable file (e.g. removed between the change event and the read)
@@ -163,16 +190,81 @@ impl DocumentSync {
     ) -> Result<Option<DocumentAction>> {
         match change {
             DocumentChange::Created { path } | DocumentChange::Modified { path } => {
-                self.apply_upsert(path, sink)
+                // The live buffer owns this path: disk modifications are
+                // suppressed so the buffer's diagnostics are not overwritten.
+                if self.live.contains(path) {
+                    return Ok(None);
+                }
+                let text = self.read_disk(path)?;
+                self.upsert_with_text(path, text, sink)
             }
             DocumentChange::Removed { path } => self.apply_remove(path, sink),
         }
     }
 
-    /// Handle a create / modify: open on first observation, else full-text change.
-    fn apply_upsert<S: DocumentSink>(
+    /// Feed the editor's live buffer for `relative` (#189): the disk→buffer
+    /// source-of-truth shift. Marks the path live (so disk modifications for it
+    /// are thereafter suppressed) and drives a `didOpen` on first observation or a
+    /// full-text `didChange` once open — same as the disk path, but the text comes
+    /// from the buffer, not disk. An unrecognized-language path is a no-op.
+    pub fn apply_buffer_change<S: DocumentSink>(
         &mut self,
         relative: &Path,
+        content: String,
+        sink: &mut S,
+    ) -> Result<Option<DocumentAction>> {
+        if language_id_for(relative).is_none() {
+            return Ok(None);
+        }
+        self.live.insert(relative.to_path_buf());
+        self.upsert_with_text(relative, content, sink)
+    }
+
+    /// End the live-buffer feed for `relative` (#189): revert the path to the
+    /// disk-backed baseline. Clears the live flag and, when the document is open
+    /// and still on disk, re-reads disk and pushes it as a `didChange` so
+    /// diagnostics converge back to the on-disk state. A path with no active
+    /// buffer is a no-op; a buffer whose file no longer exists on disk leaves the
+    /// last buffer state in place (the next worktree change reconciles).
+    pub fn apply_buffer_close<S: DocumentSink>(
+        &mut self,
+        relative: &Path,
+        sink: &mut S,
+    ) -> Result<Option<DocumentAction>> {
+        if !self.live.remove(relative) {
+            return Ok(None);
+        }
+        // Only re-sync from disk if the document is open and the file is readable;
+        // a removed file is left to the next worktree change to close.
+        if !self.open.contains_key(relative) {
+            return Ok(None);
+        }
+        match self.read_disk(relative) {
+            Ok(text) => self.upsert_with_text(relative, text, sink),
+            // The file is gone (or unreadable): keep the last buffer state; the
+            // next worktree `Removed` / `Modified` reconciles it.
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Read `relative`'s full UTF-8 text from disk, mapping an I/O failure to
+    /// [`LspError::ReadDocument`].
+    fn read_disk(&self, relative: &Path) -> Result<String> {
+        let absolute = self.root.join(relative);
+        std::fs::read_to_string(&absolute).map_err(|source| LspError::ReadDocument {
+            path: absolute.display().to_string(),
+            source,
+        })
+    }
+
+    /// Open `relative` on first observation, else push a full-text `didChange`,
+    /// using `text` as the document content whatever its source (disk or live
+    /// buffer). Emits a trailing `didSave` so save-triggered server checks re-run
+    /// (#272). The shared core of the disk path and the live-buffer feed.
+    fn upsert_with_text<S: DocumentSink>(
+        &mut self,
+        relative: &Path,
+        text: String,
         sink: &mut S,
     ) -> Result<Option<DocumentAction>> {
         let Some(language_id) = language_id_for(relative) else {
@@ -181,10 +273,6 @@ impl DocumentSync {
         let absolute = self.root.join(relative);
         let uri = Url::from_file_path(&absolute)
             .map_err(|()| LspError::InvalidUri(absolute.display().to_string()))?;
-        let text = std::fs::read_to_string(&absolute).map_err(|source| LspError::ReadDocument {
-            path: absolute.display().to_string(),
-            source,
-        })?;
 
         let action = match self.open.get_mut(relative) {
             Some(doc) => {
@@ -233,14 +321,13 @@ impl DocumentSync {
             }
         };
 
-        // The disk-backed model treats every observed write as a save: each
-        // matching create/modify is the file landing on disk. Emitting didSave
-        // after the open/change makes servers whose checks only run on save
-        // (rust-analyzer's `checkOnSave` / cargo check) re-run and clear stale
-        // diagnostics on a fix — without it a corrected file's check-sourced
-        // diagnostics never refresh (issue #272). Full text re-read is not
-        // needed here (the server already has it from the open/change), so the
-        // save carries no text.
+        // Emit didSave after each open/change so servers whose checks only run on
+        // save (rust-analyzer's `checkOnSave` / cargo check) re-run and clear
+        // stale diagnostics on a fix — without it a corrected file's check-sourced
+        // diagnostics never refresh (issue #272). The disk path treats every
+        // observed write as a save; the live-buffer feed (#189) does the same so
+        // its diagnostics stay as fresh as the disk path's. The server already has
+        // the text from the open/change, so the save carries none.
         sink.did_save(DidSaveTextDocumentParams {
             text_document: TextDocumentIdentifier { uri },
             text: None,
@@ -248,12 +335,15 @@ impl DocumentSync {
         Ok(Some(action))
     }
 
-    /// Handle a removal: close an open document, ignore a never-opened one.
+    /// Handle a removal: close an open document, ignore a never-opened one. A
+    /// removed path also drops any live-buffer override for it — the file is gone,
+    /// so the buffer feed can no longer be the source of truth.
     fn apply_remove<S: DocumentSink>(
         &mut self,
         relative: &Path,
         sink: &mut S,
     ) -> Result<Option<DocumentAction>> {
+        self.live.remove(relative);
         let Some(doc) = self.open.remove(relative) else {
             return Ok(None);
         };
@@ -619,5 +709,166 @@ mod tests {
         assert_eq!(language_id_for(Path::new("README.md")), Some("markdown"));
         assert_eq!(language_id_for(Path::new("Makefile")), None);
         assert_eq!(language_id_for(Path::new("a.unknownext")), None);
+    }
+
+    // --- live-buffer feed (#189): the disk→buffer source-of-truth shift ---
+
+    #[test]
+    fn test_buffer_change_opens_with_buffer_text_not_disk() {
+        // The first buffer feed for a never-opened file opens it with the buffer's
+        // content — the LSP's source of truth is the buffer, not the on-disk text.
+        let tmp = TempDir::new("buf-open");
+        write_file(&tmp.path, "main.rs", "fn main() {}");
+        let mut sync = DocumentSync::new(&tmp.path);
+        let mut sink = RecordingSink::default();
+
+        let action = sync
+            .apply_buffer_change(
+                Path::new("main.rs"),
+                "fn main() { let x: u32 = \"oops\"; }".to_owned(),
+                &mut sink,
+            )
+            .expect("buffer change opens");
+
+        assert!(matches!(action, Some(DocumentAction::Open { .. })));
+        assert_eq!(sink.opened.len(), 1);
+        let (_, _, text) = &sink.opened[0];
+        assert_eq!(text, "fn main() { let x: u32 = \"oops\"; }");
+        assert!(sync.is_live(Path::new("main.rs")));
+        assert!(sync.is_open(Path::new("main.rs")));
+        assert_eq!(sink.saved.len(), 1, "a buffer change is also a save");
+    }
+
+    #[test]
+    fn test_unsaved_buffer_edit_surfaces_change_without_a_disk_write() {
+        // The core acceptance: an edit to an open buffer drives a didChange from
+        // the buffer text while the on-disk file is untouched (still the original).
+        let tmp = TempDir::new("buf-unsaved");
+        write_file(&tmp.path, "lib.rs", "pub fn ok() {}");
+        let mut sync = DocumentSync::new(&tmp.path);
+        let mut sink = RecordingSink::default();
+
+        // Open via the disk path (an existing file), then edit the live buffer.
+        sync.apply(
+            &DocumentChange::Created {
+                path: PathBuf::from("lib.rs"),
+            },
+            &mut sink,
+        )
+        .expect("disk open");
+
+        let action = sync
+            .apply_buffer_change(Path::new("lib.rs"), "pub fn ok( {}".to_owned(), &mut sink)
+            .expect("buffer change");
+
+        assert!(matches!(action, Some(DocumentAction::Change { .. })));
+        let (_, _, text) = sink.changed.last().expect("a change was pushed");
+        assert_eq!(
+            text, "pub fn ok( {}",
+            "the server sees the buffer, not disk"
+        );
+        // The on-disk file is unchanged — the feed wrote nothing to disk.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path.join("lib.rs")).unwrap(),
+            "pub fn ok() {}"
+        );
+    }
+
+    #[test]
+    fn test_disk_modify_is_suppressed_while_buffer_is_live() {
+        // While a buffer is live, an agent's on-disk write for the same path is a
+        // no-op: the buffer owns the LSP's source of truth, so the agent's edit
+        // cannot clobber the buffer's diagnostics.
+        let tmp = TempDir::new("buf-suppress");
+        write_file(&tmp.path, "a.rs", "fn a() {}");
+        let mut sync = DocumentSync::new(&tmp.path);
+        let mut sink = RecordingSink::default();
+
+        sync.apply_buffer_change(Path::new("a.rs"), "fn a( {}".to_owned(), &mut sink)
+            .expect("buffer change opens");
+        let changes_before = sink.changed.len();
+
+        // An agent rewrites the file on disk; the worktree surfaces a Modified.
+        write_file(&tmp.path, "a.rs", "fn a() { agent_edit(); }");
+        let action = sync
+            .apply(
+                &DocumentChange::Modified {
+                    path: PathBuf::from("a.rs"),
+                },
+                &mut sink,
+            )
+            .expect("disk modify is suppressed");
+
+        assert_eq!(action, None, "a live path's disk modify is a no-op");
+        assert_eq!(
+            sink.changed.len(),
+            changes_before,
+            "no didChange from the disk write"
+        );
+    }
+
+    #[test]
+    fn test_buffer_close_reverts_to_disk_baseline() {
+        // Closing the buffer ends the override and pushes the on-disk content as a
+        // didChange, so diagnostics converge back to the disk state (the saved /
+        // agent-written version).
+        let tmp = TempDir::new("buf-close");
+        write_file(&tmp.path, "x.rs", "fn x() {}");
+        let mut sync = DocumentSync::new(&tmp.path);
+        let mut sink = RecordingSink::default();
+
+        sync.apply_buffer_change(Path::new("x.rs"), "fn x( {}".to_owned(), &mut sink)
+            .expect("buffer open");
+        assert!(sync.is_live(Path::new("x.rs")));
+
+        // The disk now holds a different (valid) version — e.g. the save landed.
+        write_file(&tmp.path, "x.rs", "fn x() { ok(); }");
+        let action = sync
+            .apply_buffer_close(Path::new("x.rs"), &mut sink)
+            .expect("buffer close");
+
+        assert!(matches!(action, Some(DocumentAction::Change { .. })));
+        let (_, _, text) = sink.changed.last().expect("a change was pushed");
+        assert_eq!(text, "fn x() { ok(); }", "reverted to the on-disk content");
+        assert!(!sync.is_live(Path::new("x.rs")));
+
+        // And a later disk modify is no longer suppressed.
+        write_file(&tmp.path, "x.rs", "fn x() { ok(); more(); }");
+        let action = sync
+            .apply(
+                &DocumentChange::Modified {
+                    path: PathBuf::from("x.rs"),
+                },
+                &mut sink,
+            )
+            .expect("disk modify after close");
+        assert!(matches!(action, Some(DocumentAction::Change { .. })));
+    }
+
+    #[test]
+    fn test_buffer_close_for_inactive_path_is_a_noop() {
+        let tmp = TempDir::new("buf-close-noop");
+        let mut sync = DocumentSync::new(&tmp.path);
+        let mut sink = RecordingSink::default();
+
+        let action = sync
+            .apply_buffer_close(Path::new("never.rs"), &mut sink)
+            .expect("close with no live buffer");
+        assert_eq!(action, None);
+        assert!(sink.changed.is_empty());
+    }
+
+    #[test]
+    fn test_buffer_change_for_unrecognized_extension_is_a_noop() {
+        let tmp = TempDir::new("buf-unknown");
+        let mut sync = DocumentSync::new(&tmp.path);
+        let mut sink = RecordingSink::default();
+
+        let action = sync
+            .apply_buffer_change(Path::new("notes.txt"), "hello".to_owned(), &mut sink)
+            .expect("apply");
+        assert_eq!(action, None);
+        assert!(!sync.is_live(Path::new("notes.txt")));
+        assert!(sink.opened.is_empty());
     }
 }

@@ -45,6 +45,21 @@ pub struct LspDiagnostics {
     pub items: Vec<Diagnostic>,
 }
 
+/// A live-buffer event from the editor (#189): the disk→buffer source-of-truth
+/// shift. Carried from the dispatch loop to the off-loop [`LspWorker`], which
+/// applies it to its [`DocumentSync`] so the open buffer drives `didChange`
+/// instead of disk. `path` is worktree-relative (the protocol key space).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BufferEvent {
+    /// The editor's buffer for `path` changed: feed `content` to the server(s) as
+    /// a `didChange` and mark the path live (disk modifications for it are then
+    /// suppressed).
+    Changed { path: String, content: String },
+    /// The editor closed the buffer for `path`: drop the override and revert to
+    /// the disk-backed baseline.
+    Closed { path: String },
+}
+
 /// Map an explorer change batch onto the [`DocumentChange`] stream document sync
 /// consumes. `Added` / `Changed` carry a full entry; only file entries drive a
 /// document (a directory carries no text), so directory changes are dropped
@@ -141,6 +156,8 @@ pub struct LspWorker {
     registry: Registry,
     sync: DocumentSync,
     doc_changes: mpsc::Receiver<Vec<DocumentChange>>,
+    /// Live-buffer events from the editor (#189), driving the disk→buffer shift.
+    buffer_events: mpsc::Receiver<BufferEvent>,
     diagnostics_out: mpsc::Sender<LspDiagnostics>,
     /// The registry's diagnostics channel, drained by `run`.
     server_diagnostics: mpsc::UnboundedReceiver<(ServerId, PublishDiagnosticsParams)>,
@@ -148,12 +165,14 @@ pub struct LspWorker {
 
 impl LspWorker {
     /// Wire a worker for `root` using `selector`'s language → server table.
-    /// `doc_changes` carries change batches from the dispatch loop;
+    /// `doc_changes` carries disk-driven change batches from the dispatch loop;
+    /// `buffer_events` carries the editor's live-buffer feed (#189);
     /// `diagnostics_out` carries translated diagnostics back to it.
     pub fn new(
         root: PathBuf,
         selector: DocumentSelector,
         doc_changes: mpsc::Receiver<Vec<DocumentChange>>,
+        buffer_events: mpsc::Receiver<BufferEvent>,
         diagnostics_out: mpsc::Sender<LspDiagnostics>,
     ) -> Self {
         let (server_tx, server_diagnostics) = mpsc::unbounded_channel();
@@ -164,13 +183,14 @@ impl LspWorker {
             registry,
             sync,
             doc_changes,
+            buffer_events,
             diagnostics_out,
             server_diagnostics,
         }
     }
 
-    /// Drive the worker until either channel into it closes (the dispatch loop
-    /// went away) — then shut every server down cleanly.
+    /// Drive the worker until a channel into it closes (the dispatch loop went
+    /// away) — then shut every server down cleanly.
     pub async fn run(mut self) {
         loop {
             tokio::select! {
@@ -178,6 +198,13 @@ impl LspWorker {
                     Some(batch) => self.apply_changes(batch).await,
                     // The dispatch loop dropped the sender; nothing more to sync.
                     None => break,
+                },
+                event = self.buffer_events.recv() => match event {
+                    Some(event) => self.apply_buffer_event(event).await,
+                    // The buffer-event sender dropped (dispatch loop gone). The
+                    // disk path may still run, so do not stop on this alone;
+                    // `doc_changes` / the registry channel close drives the stop.
+                    None => std::future::pending::<()>().await,
                 },
                 published = self.server_diagnostics.recv() => match published {
                     Some((id, params)) => self.publish(id, params),
@@ -189,6 +216,38 @@ impl LspWorker {
             }
         }
         self.registry.shutdown().await;
+    }
+
+    /// Apply one live-buffer event (#189): feed the editor's buffer to the
+    /// matching server(s) as a `didChange`, or revert a closed buffer to disk.
+    ///
+    /// Mirrors [`apply_changes`](Self::apply_changes): ensure the matching servers
+    /// are running, then drive [`DocumentSync`] against a [`ServerSink`] over the
+    /// disjoint `registry` / `sync` fields. When no server matches (unknown
+    /// language, or all unavailable) the sink is empty — sync still tracks the
+    /// path's live/closed state, but there is nothing to notify.
+    async fn apply_buffer_event(&mut self, event: BufferEvent) {
+        let path = match &event {
+            BufferEvent::Changed { path, .. } | BufferEvent::Closed { path } => PathBuf::from(path),
+        };
+        let ids = self.registry.observe(&path).await;
+        // The sink borrows `registry` immutably while `sync` is borrowed mutably —
+        // distinct fields, so the split borrow holds (as in `apply_changes`).
+        let mut sink = ServerSink::for_servers(&self.registry, ids);
+        let result = match event {
+            BufferEvent::Changed { content, .. } => {
+                self.sync.apply_buffer_change(&path, content, &mut sink)
+            }
+            BufferEvent::Closed { .. } => self.sync.apply_buffer_close(&path, &mut sink),
+        };
+        if let Err(error) = result {
+            // A read failure on close (file gone) or a URI error is not fatal:
+            // log and move on, exactly as the disk path does.
+            eprintln!(
+                "rift-daemon: live-buffer sync failed for {}: {error}",
+                path.display()
+            );
+        }
     }
 
     /// Sync one change batch: ensure the matching servers are running, then

@@ -67,9 +67,12 @@ use gpui::{
     div, px, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, Styled as _, Subscription, Window,
 };
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::highlighter::{
+    Diagnostic as EditorDiagnostic, DiagnosticSeverity as EditorSeverity,
+};
+use gpui_component::input::{Input, InputEvent, InputState, Position as EditorPosition};
 use gpui_component::ActiveTheme as _;
-use rift_protocol::ClientMessage;
+use rift_protocol::{ClientMessage, Diagnostic, DiagnosticSeverity};
 
 /// The save action: write the open buffer back to the remote. Dispatched from the
 /// editor's key context, bound to `Ctrl+S` / `Cmd+S` in `main.rs`. A bare
@@ -99,6 +102,13 @@ const SAVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default tab width for the code editor, matching the gallery demo.
 const TAB_SIZE: usize = 4;
+
+/// How long the editor waits after the last keystroke before feeding the live
+/// buffer to the LSP (`BufferChanged`, #189). Debouncing coalesces a burst of
+/// typing into one feed so the daemon's `didChange` and the language server's
+/// re-analysis are not driven on every character. Short enough that an unsaved
+/// error surfaces promptly, long enough to skip mid-word churn.
+const BUFFER_FEED_DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// What the editor is currently showing.
 enum EditorState {
@@ -184,6 +194,35 @@ pub fn decide_external_change(
     }
 }
 
+/// Translate a daemon protocol [`Diagnostic`] into the editor component's
+/// [`EditorDiagnostic`] (#189): map the range, severity, message, source, and
+/// code onto the form `InputState`'s `DiagnosticSet` renders inline. The protocol
+/// `Position` (LSP-style zero-based line / UTF-16 character) maps directly onto
+/// the editor's [`EditorPosition`] (the same `lsp_types::Position`), so the inline
+/// marker lands on the live buffer's coordinates.
+fn to_editor_diagnostic(diagnostic: &Diagnostic) -> EditorDiagnostic {
+    let start = EditorPosition::new(
+        diagnostic.range.start.line,
+        diagnostic.range.start.character,
+    );
+    let end = EditorPosition::new(diagnostic.range.end.line, diagnostic.range.end.character);
+    let severity = match diagnostic.severity {
+        DiagnosticSeverity::Error => EditorSeverity::Error,
+        DiagnosticSeverity::Warning => EditorSeverity::Warning,
+        DiagnosticSeverity::Information => EditorSeverity::Info,
+        DiagnosticSeverity::Hint => EditorSeverity::Hint,
+    };
+    let mut editor =
+        EditorDiagnostic::new(start..end, diagnostic.message.clone()).with_severity(severity);
+    if let Some(source) = &diagnostic.source {
+        editor = editor.with_source(source.clone());
+    }
+    if let Some(code) = &diagnostic.code {
+        editor = editor.with_code(code.clone());
+    }
+    editor
+}
+
 /// The code editor view: a `gpui-component` `InputState` in code-editor mode plus
 /// the open buffer's bookkeeping.
 pub struct EditorView {
@@ -212,6 +251,12 @@ pub struct EditorView {
     /// Write-request sender: a [`Save`] turns the buffer into a `SaveFile` on this
     /// channel, which the tokio side emits as `ClientMessage::SaveFile`.
     save_file_tx: Sender<ClientMessage>,
+    /// Live-buffer feed sender (#189): a debounced edit becomes a
+    /// `ClientMessage::BufferChanged` and a close/switch/save becomes a
+    /// `BufferClosed` on this channel, so the daemon feeds the LSP the live buffer
+    /// (the disk→buffer source-of-truth shift) and an unsaved error surfaces
+    /// without a save first.
+    buffer_change_tx: Sender<ClientMessage>,
     /// Monotonic open-request id. Incremented on every [`EditorView::begin_open`];
     /// the timeout and the reply both carry the generation they were issued for,
     /// so a late reply or a fired timer for a superseded open is ignored.
@@ -220,6 +265,10 @@ pub struct EditorView {
     /// save timeout for a save that has since been answered (or superseded by a
     /// later save) never trips the current one.
     save_generation: u64,
+    /// Monotonic buffer-feed id, fenced independently: each keystroke arms a
+    /// debounce timer carrying this generation, and only the latest one fires a
+    /// `BufferChanged`, so a burst of typing coalesces into one feed.
+    buffer_generation: u64,
 }
 
 impl EditorView {
@@ -227,12 +276,14 @@ impl EditorView {
     /// neutral language; [`EditorView::begin_open`] re-derives the language from
     /// each opened file's extension before its content loads.
     ///
-    /// `open_file_tx` re-issues an `OpenFile` for a clean auto-reload, and
-    /// `save_file_tx` carries a `SaveFile` for a save — both threaded to the tokio
-    /// side by `main.rs`.
+    /// `open_file_tx` re-issues an `OpenFile` for a clean auto-reload,
+    /// `save_file_tx` carries a `SaveFile` for a save, and `buffer_change_tx`
+    /// carries the live-buffer feed (`BufferChanged` / `BufferClosed`, #189) — all
+    /// threaded to the tokio side by `main.rs`.
     pub fn new(
         open_file_tx: Sender<String>,
         save_file_tx: Sender<ClientMessage>,
+        buffer_change_tx: Sender<ClientMessage>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -255,21 +306,106 @@ impl EditorView {
             base_mtime: None,
             open_file_tx,
             save_file_tx,
+            buffer_change_tx,
             generation: 0,
             save_generation: 0,
+            buffer_generation: 0,
         }
     }
 
-    /// Subscribe to an input's `Change` event so an edit marks the buffer dirty.
-    /// A programmatic `set_value` (load / auto-reload) also emits `Change`, so the
-    /// dirty flag is cleared right after those calls — see [`EditorView::load`].
+    /// Subscribe to an input's `Change` event: a keystroke marks the buffer dirty
+    /// and arms the debounced live-buffer feed (#189). A programmatic `set_value`
+    /// (load / auto-reload) also emits `Change`, so the dirty flag is cleared right
+    /// after those calls — see [`EditorView::load`]. The feed is armed only while a
+    /// file is loaded; a `Change` during load (the `set_value` that fills the
+    /// buffer) is not fed, since `load` clears `dirty` and re-bases right after.
     fn subscribe_dirty(input: &Entity<InputState>, cx: &mut Context<Self>) -> Subscription {
         cx.subscribe(input, |this, _input, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) && !this.dirty {
-                this.dirty = true;
-                cx.notify();
+            if matches!(event, InputEvent::Change) {
+                if !this.dirty {
+                    this.dirty = true;
+                    cx.notify();
+                }
+                this.arm_buffer_feed(cx);
             }
         })
+    }
+
+    /// Arm (or re-arm) the debounced live-buffer feed for the open file (#189).
+    /// Each `Change` bumps `buffer_generation` and schedules a timer; only the
+    /// timer for the latest generation actually sends the `BufferChanged`, so a
+    /// burst of typing coalesces into one feed of the current buffer text. A no-op
+    /// unless a file is loaded.
+    fn arm_buffer_feed(&mut self, cx: &mut Context<Self>) {
+        let EditorState::Loaded { path } = &self.state else {
+            return;
+        };
+        let path = path.clone();
+        self.buffer_generation = self.buffer_generation.wrapping_add(1);
+        let generation = self.buffer_generation;
+
+        cx.spawn(async move |this, cx| {
+            smol::Timer::after(BUFFER_FEED_DEBOUNCE).await;
+            cx.update(|cx| {
+                let _ = this.update(cx, |this, cx| {
+                    // Only the latest keystroke's timer fires the feed.
+                    if this.buffer_generation != generation {
+                        return;
+                    }
+                    // Still the same open, loaded file.
+                    let EditorState::Loaded { path: open } = &this.state else {
+                        return;
+                    };
+                    if *open != path {
+                        return;
+                    }
+                    let content = this.input.read(cx).value().to_string();
+                    if let Err(e) = this
+                        .buffer_change_tx
+                        .try_send(ClientMessage::BufferChanged {
+                            path: path.clone(),
+                            content,
+                        })
+                    {
+                        tracing::debug!(error = %e, %path, "failed to enqueue live-buffer feed");
+                    }
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Tell the daemon to drop the live-buffer override for `path` and revert it
+    /// to the disk-backed baseline (#189): sent when the editor switches away from
+    /// a file, auto-reloads it, or saves it (disk then matches the buffer). A bumped
+    /// `buffer_generation` cancels any in-flight debounce so a stale feed cannot
+    /// re-establish the override after it is closed.
+    fn close_live_buffer(&mut self, path: String) {
+        self.buffer_generation = self.buffer_generation.wrapping_add(1);
+        if let Err(e) = self
+            .buffer_change_tx
+            .try_send(ClientMessage::BufferClosed { path: path.clone() })
+        {
+            tracing::debug!(error = %e, %path, "failed to enqueue live-buffer close");
+        }
+    }
+
+    /// Replace the editor's inline diagnostics with `items` (#189): the diagnostics
+    /// the daemon streams for the open file, rendered against the live buffer's
+    /// coordinates via `InputState`'s `DiagnosticSet`. A full replace mirrors LSP's
+    /// publish semantics — an empty `items` clears every inline marker, so fixing
+    /// an error (which clears the daemon's set) clears the marker. Consumes the
+    /// existing client diagnostics model (#178); it does not redesign it.
+    pub fn set_diagnostics(&mut self, items: &[Diagnostic], cx: &mut Context<Self>) {
+        let editor_items: Vec<EditorDiagnostic> = items.iter().map(to_editor_diagnostic).collect();
+        self.input.update(cx, |input, cx| {
+            if let Some(set) = input.diagnostics_mut() {
+                set.clear();
+                set.extend(editor_items);
+            }
+            cx.notify();
+        });
+        cx.notify();
     }
 
     /// The path of the file currently open or loading, if any — a headless handle
@@ -312,6 +448,13 @@ impl EditorView {
     /// editor is cleared to empty content meanwhile so a previous file's text is
     /// never shown under the new path.
     pub fn begin_open(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        // End any live-buffer feed for the file being closed (#189), so the daemon
+        // reverts the previous path to disk-backed. Covers both switching files and
+        // re-opening the same path for an auto-reload (the reload rebases on disk).
+        if let Some(previous) = self.open_path().map(str::to_owned) {
+            self.close_live_buffer(previous);
+        }
+
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
 
@@ -457,6 +600,11 @@ impl EditorView {
         self.dirty = false;
         self.save_state = SaveState::Idle;
         self.save_generation = self.save_generation.wrapping_add(1);
+        // The save landed: disk now matches the buffer, so end the live-buffer
+        // override and return `path` to the disk-backed baseline (#189). A later
+        // edit re-arms the feed; until then an agent's disk write is no longer
+        // suppressed for this path.
+        self.close_live_buffer(path);
         cx.notify();
     }
 
@@ -694,5 +842,72 @@ mod tests {
             decide_external_change(at(200), at(100), true),
             ExternalChange::None
         );
+    }
+
+    // --- inline-diagnostic translation (#189) ---
+    //
+    // The protocol→editor diagnostic mapping is pure, so the load-bearing parts —
+    // the range lands on the live buffer's coordinates and the severity / source /
+    // code carry over — are verified here without GPUI.
+
+    use rift_protocol::{Position, Range};
+
+    fn proto_diag(
+        severity: DiagnosticSeverity,
+        source: Option<&str>,
+        code: Option<&str>,
+    ) -> Diagnostic {
+        Diagnostic {
+            range: Range {
+                start: Position {
+                    line: 10,
+                    character: 4,
+                },
+                end: Position {
+                    line: 10,
+                    character: 9,
+                },
+            },
+            severity,
+            message: "mismatched types".to_owned(),
+            source: source.map(str::to_owned),
+            code: code.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn test_to_editor_diagnostic_maps_range_message_source_and_code() {
+        let editor = to_editor_diagnostic(&proto_diag(
+            DiagnosticSeverity::Error,
+            Some("rustc"),
+            Some("E0308"),
+        ));
+        assert_eq!(editor.range.start, EditorPosition::new(10, 4));
+        assert_eq!(editor.range.end, EditorPosition::new(10, 9));
+        assert_eq!(editor.severity, EditorSeverity::Error);
+        assert_eq!(editor.message.as_ref(), "mismatched types");
+        assert_eq!(editor.source.as_deref(), Some("rustc"));
+        assert_eq!(editor.code.as_deref(), Some("E0308"));
+    }
+
+    #[test]
+    fn test_to_editor_diagnostic_maps_each_severity() {
+        let cases = [
+            (DiagnosticSeverity::Error, EditorSeverity::Error),
+            (DiagnosticSeverity::Warning, EditorSeverity::Warning),
+            (DiagnosticSeverity::Information, EditorSeverity::Info),
+            (DiagnosticSeverity::Hint, EditorSeverity::Hint),
+        ];
+        for (proto, expected) in cases {
+            let editor = to_editor_diagnostic(&proto_diag(proto, None, None));
+            assert_eq!(editor.severity, expected);
+        }
+    }
+
+    #[test]
+    fn test_to_editor_diagnostic_omits_absent_source_and_code() {
+        let editor = to_editor_diagnostic(&proto_diag(DiagnosticSeverity::Warning, None, None));
+        assert!(editor.source.is_none());
+        assert!(editor.code.is_none());
     }
 }

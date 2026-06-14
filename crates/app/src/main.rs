@@ -57,6 +57,10 @@ struct EditorChannels {
     /// `SaveFile` write requests the editor built from the open buffer; forwarded
     /// onto the protocol verbatim by the save-file bridge.
     save_file_rx: flume::Receiver<rift_protocol::ClientMessage>,
+    /// Live-buffer feed (#189): `BufferChanged` / `BufferClosed` the editor emits
+    /// so the daemon feeds the LSP the live buffer; forwarded onto the protocol
+    /// verbatim by the buffer-change bridge.
+    buffer_change_rx: flume::Receiver<rift_protocol::ClientMessage>,
 }
 
 // Console builds log to stdout (the dev loop's RUST_LOG console). Windowed builds
@@ -187,6 +191,8 @@ fn main() {
                 let (open_file_tx, open_file_rx) = flume::unbounded::<String>();
                 let (save_file_tx, save_file_rx) =
                     flume::unbounded::<rift_protocol::ClientMessage>();
+                let (buffer_change_tx, buffer_change_rx) =
+                    flume::unbounded::<rift_protocol::ClientMessage>();
 
                 let session_view = cx.new(|cx| {
                     let (view, handle) = SessionView::new(cx);
@@ -242,6 +248,7 @@ fn main() {
                         buffer_tx,
                         open_file_rx,
                         save_file_rx,
+                        buffer_change_rx,
                     };
 
                     let key_exists = ssh.key.exists();
@@ -288,6 +295,7 @@ fn main() {
                             buffer_rx,
                             open_file_tx,
                             save_file_tx,
+                            buffer_change_tx,
                         },
                         window,
                         cx,
@@ -353,6 +361,7 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels, editor: EditorChannel
         let client = std::sync::Arc::new(client);
         spawn_open_file_bridge(client.clone(), editor.open_file_rx.clone());
         spawn_save_file_bridge(client.clone(), editor.save_file_rx.clone());
+        spawn_buffer_change_bridge(client.clone(), editor.buffer_change_rx.clone());
         tokio::spawn(consume_daemon_messages(client, None, editor));
     } else {
         info!("terminal source: legacy tmux (no daemon configured)");
@@ -416,6 +425,10 @@ async fn run_daemon_terminal(
     // `consume_daemon_messages` on `editor.buffer_tx`.
     spawn_open_file_bridge(client.clone(), editor.open_file_rx.clone());
     spawn_save_file_bridge(client.clone(), editor.save_file_rx.clone());
+    // Live-buffer feed reverse path (#189): the editor's `BufferChanged` /
+    // `BufferClosed` forward verbatim so the daemon feeds the LSP the live buffer.
+    // Push-only — diagnostics return on the worktree stream as `Diagnostics`.
+    spawn_buffer_change_bridge(client.clone(), editor.buffer_change_rx.clone());
 
     // Forward path: fold the daemon stream into the render channels (pane output,
     // layout snapshots, capture replies), the file tree, and the editor. Blocks
@@ -871,6 +884,33 @@ fn spawn_save_file_bridge(
         while let Ok(msg) = save_file_rx.recv_async().await {
             if let rift_protocol::ClientMessage::SaveFile { path, .. } = &msg {
                 debug!(%path, "sending save-file request");
+            }
+            if client.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Forward the editor's live-buffer feed onto the protocol (#189): each
+/// `BufferChanged` (debounced edit) or `BufferClosed` (close / switch / save) is
+/// sent verbatim so the daemon feeds the LSP the live buffer (the disk→buffer
+/// source-of-truth shift). Push-only — there is no reply; diagnostics return on
+/// the worktree stream as `Diagnostics`. Ends when either channel closes.
+fn spawn_buffer_change_bridge(
+    client: std::sync::Arc<rift_ssh::DaemonClient>,
+    buffer_change_rx: flume::Receiver<rift_protocol::ClientMessage>,
+) {
+    tokio::spawn(async move {
+        while let Ok(msg) = buffer_change_rx.recv_async().await {
+            match &msg {
+                rift_protocol::ClientMessage::BufferChanged { path, .. } => {
+                    debug!(%path, "sending live-buffer change")
+                }
+                rift_protocol::ClientMessage::BufferClosed { path } => {
+                    debug!(%path, "sending live-buffer close")
+                }
+                _ => {}
             }
             if client.send(msg).await.is_err() {
                 break;

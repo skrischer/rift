@@ -137,6 +137,21 @@ their own phases (explorer / git-status); summarized here for completeness:
 
 `diagnostics` is keyed by `path` (relative to the worktree root, the same key space as the worktree entries) and by `server` (the daemon-assigned id of the publishing language server). `items` is the complete current set that server reports for the file, replacing whatever it last reported — an empty `items` clears that server's diagnostics for the file while leaving other servers' sets intact. `source` and `code` are omitted when the server provides neither. The diagnostic types are rift's own (`Diagnostic` / `Range` / `Position` / `DiagnosticSeverity`); `lsp-types` does not cross the protocol boundary. Push-only — the client never requests diagnostics.
 
+### Live-buffer feed (`spec-editor.md`, cut C)
+
+```json
+// client → daemon
+{ "type": "buffer_changed", "path": "src/main.rs", "content": "..." }
+{ "type": "buffer_closed",  "path": "src/main.rs" }
+```
+
+The LSP document model is **disk-backed by default** (`spec-daemon-lsp.md`): the daemon feeds the language server on-disk content as the worktree changes. Once rift's own editor opens a file, the editor's **live buffer** becomes the LSP's source of truth for that file — the disk→buffer source-of-truth shift the LSP spec's forward-note reserved — so an **unsaved** edit's errors surface without a save first.
+
+- `buffer_changed` carries the open buffer's whole current UTF-8 `content` (the editor debounces it on edit). The daemon forwards it to the matching server(s) as a `didChange` (version bumped), so diagnostics recompute against the buffer, not disk. It is **not** a write: nothing touches the filesystem. While a `path` has a live buffer, the daemon suppresses the disk-driven `didChange` for it (the buffer owns it), so an agent's on-disk write does not clobber the live buffer's diagnostics.
+- `buffer_closed` ends the feed (the editor closed the file, switched files, or auto-reloaded). The daemon drops the override and reverts `path` to the disk-backed baseline — re-reading on-disk content and pushing it as a `didChange` so diagnostics converge back to the on-disk state, coherently with the pre-buffer behavior.
+
+Both are **additive and push-only** — there is no reply; diagnostics flow back over the existing push-only `diagnostics` path. The `content` carries no `mtime`: the feed is the LSP source of truth, not a save (saves stay on the buffer channel below).
+
 ## Buffer channel
 
 The buffer channel is the **first request/response pair in the protocol** and the

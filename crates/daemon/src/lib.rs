@@ -6,7 +6,7 @@ mod buffer;
 pub mod lsp;
 mod terminal;
 
-use lsp::{document_changes, LspDiagnostics, LspWorker};
+use lsp::{document_changes, BufferEvent, LspDiagnostics, LspWorker};
 use rift_explorer::{Change, Entry, GitStatus, Snapshot, Watcher};
 use rift_lsp::{DocumentChange, DocumentSelector};
 use rift_protocol::{
@@ -91,6 +91,10 @@ struct Core {
     /// off-loop LSP worker. `None` when LSP is not armed; the dispatch loop then
     /// derives no document changes and the branch is inert.
     doc_changes: Option<mpsc::Sender<Vec<DocumentChange>>>,
+    /// Forwards the editor's live-buffer events (`BufferChanged` / `BufferClosed`,
+    /// #189) to the off-loop LSP worker — the disk→buffer source-of-truth shift.
+    /// `None` when LSP is not armed; the dispatch loop then drops buffer events.
+    buffer_events: Option<mpsc::Sender<BufferEvent>>,
 }
 
 /// Sender handles for driving a [`Daemon`].
@@ -129,6 +133,7 @@ pub fn channels(event_capacity: usize, inbound_capacity: usize) -> (Daemon, Hand
             events: events_tx.clone(),
             state: state_tx,
             doc_changes: None,
+            buffer_events: None,
         },
     };
     let handles = Handles {
@@ -663,8 +668,14 @@ where
                                 writer.flush().await?;
                             }
                         }
-                        // The handshake goes to the shared loop.
-                        ClientMessage::Hello { .. } => {
+                        // The handshake and the live-buffer feed go to the shared
+                        // loop: the LSP worker that consumes the buffer events lives
+                        // off that single loop (one document model + servers for the
+                        // daemon), not per connection. Push-only — no reply here;
+                        // diagnostics return on the shared broadcast bus.
+                        ClientMessage::Hello { .. }
+                        | ClientMessage::BufferChanged { .. }
+                        | ClientMessage::BufferClosed { .. } => {
                             if inbound.send(msg).await.is_err() {
                                 // Dispatch loop gone; nothing left to serve.
                                 break 'serve;
@@ -985,10 +996,12 @@ impl Daemon {
     /// diagnostics, never blocking on server I/O.
     pub fn watch_lsp(&mut self, root: PathBuf, selector: DocumentSelector) {
         let (doc_tx, doc_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
+        let (buffer_tx, buffer_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
         let (diag_tx, diag_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
-        let worker = LspWorker::new(root, selector, doc_rx, diag_tx);
+        let worker = LspWorker::new(root, selector, doc_rx, buffer_rx, diag_tx);
         tokio::spawn(worker.run());
         self.core.doc_changes = Some(doc_tx);
+        self.core.buffer_events = Some(buffer_tx);
         self.lsp_diagnostics = Some(diag_rx);
     }
 
@@ -1053,6 +1066,19 @@ impl Core {
                     version: PROTOCOL_VERSION,
                 });
             }
+            // Live-buffer feed (#189): the editor's `BufferChanged` / `BufferClosed`
+            // reach the shared dispatch loop (routed here by `serve_connection`,
+            // like `Hello`) because the LSP worker — the single owner of the
+            // document model and servers — lives off this loop, not per connection.
+            // Forward each to it as a `BufferEvent`; a full queue drops the event
+            // (the next `BufferChanged` re-feeds, so a dropped one only delays
+            // diagnostics, never corrupts the model), and an unarmed LSP drops it.
+            ClientMessage::BufferChanged { path, content } => {
+                self.forward_buffer_event(BufferEvent::Changed { path, content });
+            }
+            ClientMessage::BufferClosed { path } => {
+                self.forward_buffer_event(BufferEvent::Closed { path });
+            }
             // Terminal/tmux messages never reach the shared dispatch loop:
             // `serve_connection` routes them to this connection's own
             // `terminal_task` (per-client attach). The buffer-channel requests
@@ -1067,6 +1093,17 @@ impl Core {
             | ClientMessage::CapturePane { .. }
             | ClientMessage::OpenFile { .. }
             | ClientMessage::SaveFile { .. } => {}
+        }
+    }
+
+    /// Forward a live-buffer event to the off-loop LSP worker, dropping it (with a
+    /// log) when the worker's queue is full or LSP is not armed — the same
+    /// non-blocking discipline the disk document-change forward uses.
+    fn forward_buffer_event(&self, event: BufferEvent) {
+        if let Some(buffer_events) = &self.buffer_events {
+            if let Err(err) = buffer_events.try_send(event) {
+                eprintln!("rift-daemon: dropped live-buffer event: {err}");
+            }
         }
     }
 
