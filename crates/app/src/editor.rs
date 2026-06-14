@@ -124,11 +124,12 @@ enum SaveState {
     Idle,
     /// A `SaveFile` is in flight, awaiting its reply (or the timeout).
     Saving,
-    /// The daemon refused the save (`SaveConflict`): the file changed on disk
-    /// under the editor. The buffer is untouched; the user chooses reload-or-keep.
-    /// `disk_mtime` is the current on-disk value the conflict reported (kept for
-    /// the headless handle).
-    Conflict { disk_mtime: SystemTime },
+    /// The file changed on disk under the editor — a `SaveConflict` reply or a
+    /// dirty-buffer concurrent external change. The buffer is untouched; the user
+    /// chooses reload-or-keep (re-open to reload, which re-issues `OpenFile` and
+    /// rebases on a fresh `mtime`, or save again to keep their version). The
+    /// reported on-disk `mtime` is not retained — reload fetches its own.
+    Conflict,
     /// The save drew no reply within [`SAVE_TIMEOUT`] (refused or lost). The
     /// buffer is untouched; the user may retry.
     Failed,
@@ -298,7 +299,7 @@ impl EditorView {
     /// reply, or a dirty-buffer concurrent external change) — a headless handle
     /// for the conflict assertions.
     pub fn has_conflict(&self) -> bool {
-        matches!(self.save_state, SaveState::Conflict { .. })
+        matches!(self.save_state, SaveState::Conflict)
     }
 
     /// Begin opening `path`: switch the editor to its loading state, point the
@@ -462,17 +463,13 @@ impl EditorView {
     /// Apply a `SaveConflict` reply: the file changed on disk under the editor, so
     /// the daemon refused the write. Surface the conflict **without touching the
     /// buffer** — the user's edits stay; they choose reload-or-keep. Accepted only
-    /// when it matches the open path.
-    pub fn apply_save_conflict(
-        &mut self,
-        path: String,
-        disk_mtime: SystemTime,
-        cx: &mut Context<Self>,
-    ) {
+    /// when it matches the open path. The reply's `disk_mtime` is not retained — a
+    /// reload re-issues `OpenFile` and rebases on the fresh `mtime` that returns.
+    pub fn apply_save_conflict(&mut self, path: String, cx: &mut Context<Self>) {
         if self.open_path() != Some(path.as_str()) {
             return;
         }
-        self.save_state = SaveState::Conflict { disk_mtime };
+        self.save_state = SaveState::Conflict;
         self.save_generation = self.save_generation.wrapping_add(1);
         cx.notify();
     }
@@ -517,9 +514,7 @@ impl EditorView {
                 }
             }
             ExternalChange::Conflict => {
-                self.save_state = SaveState::Conflict {
-                    disk_mtime: snapshot_mtime,
-                };
+                self.save_state = SaveState::Conflict;
                 cx.notify();
             }
         }
@@ -555,7 +550,7 @@ impl Render for EditorView {
         let banner: Option<(String, gpui::Hsla)> = match &self.save_state {
             SaveState::Idle => None,
             SaveState::Saving => Some(("Saving\u{2026}".to_owned(), cx.theme().muted_foreground)),
-            SaveState::Conflict { .. } => Some((
+            SaveState::Conflict => Some((
                 "Changed on disk since you opened it \u{2014} re-open to reload, \
                  or save again to keep your version"
                     .to_owned(),
