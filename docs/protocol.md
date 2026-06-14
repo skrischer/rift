@@ -137,11 +137,54 @@ their own phases (explorer / git-status); summarized here for completeness:
 
 `diagnostics` is keyed by `path` (relative to the worktree root, the same key space as the worktree entries) and by `server` (the daemon-assigned id of the publishing language server). `items` is the complete current set that server reports for the file, replacing whatever it last reported — an empty `items` clears that server's diagnostics for the file while leaving other servers' sets intact. `source` and `code` are omitted when the server provides neither. The diagnostic types are rift's own (`Diagnostic` / `Range` / `Position` / `DiagnosticSeverity`); `lsp-types` does not cross the protocol boundary. Push-only — the client never requests diagnostics.
 
+## Buffer channel
+
+The buffer channel is the **first request/response pair in the protocol** and the
+only path that carries file content. Worktree, git, and diagnostics all push
+structure and decoration; **file content is pulled on open and pushed on save**,
+never broadcast — so the worktree structure path stays content-free (the
+`FileSync { content }` push was removed in #107 precisely because unsolicited
+content on the structure path was the wrong design). Specified by `spec-editor.md`.
+
+```json
+// client → daemon
+{ "type": "open_file", "path": "src/main.rs" }
+{ "type": "save_file", "path": "src/main.rs", "content": "...", "base_mtime": { "secs_since_epoch": 5, "nanos_since_epoch": 7 } }
+// daemon → client
+{ "type": "file_content",  "path": "src/main.rs", "content": "...", "mtime":      { "secs_since_epoch": 5, "nanos_since_epoch": 7 } }
+{ "type": "save_result",   "path": "src/main.rs", "mtime":      { "secs_since_epoch": 9, "nanos_since_epoch": 0 } }
+{ "type": "save_conflict", "path": "src/main.rs", "disk_mtime": { "secs_since_epoch": 9, "nanos_since_epoch": 0 } }
+```
+
+- `open_file` is the read request: it carries only the `path` (relative to the
+  worktree root, the same key space as the worktree entries). The daemon answers
+  with exactly one `file_content` for that path — the file's whole UTF-8 content
+  plus its `mtime`. The request carries no content.
+- `save_file` is the write request: the whole new UTF-8 `content` (no deltas) plus
+  `base_mtime`, the `mtime` the editor read on open. The daemon answers with one
+  `save_result` (the write landed, carrying the new on-disk `mtime`) or one
+  `save_conflict` (the on-disk `mtime` no longer matches `base_mtime`, so the
+  write was **rejected, not clobbered**; `disk_mtime` is the current on-disk value
+  for the editor to rebase against). The daemon's write is atomic (temp + rename).
+- The `mtime` / `base_mtime` / `disk_mtime` fields are the **identical
+  `std::time::SystemTime`** (same wire shape `{ secs_since_epoch, nanos_since_epoch }`)
+  as the worktree entry's `mtime` (#107), so the base read on the structure path
+  can be compared against a save on the buffer path — the concurrent-write
+  detector. They are not independently sampled clock values.
+
 ## Rules
 
 All message types live in `crates/protocol/`. Adding a new message type is a
 deliberate API change — both daemon and client must be updated. Keep additions
 **additive**: existing consumers must keep compiling and deserializing.
+
+Most paths are **push-only** (structure and decoration: worktree, git,
+diagnostics — "push is the source of truth"). The two request/response exceptions
+are deliberate and scoped: `capture_pane` / `pane_capture` for pre-attach
+scrollback, and the **buffer channel** (`open_file` → `file_content`,
+`save_file` → `save_result` / `save_conflict`) for file content. The push-only
+rule governs structure and decoration, never file content — editing is an
+explicit pull on open and push on save.
 
 The protocol may migrate to MessagePack if JSON serialization becomes a bottleneck.
 Keep message types serialization-agnostic (derive `serde::Serialize` +
