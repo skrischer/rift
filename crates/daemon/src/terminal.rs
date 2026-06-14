@@ -302,9 +302,13 @@ impl Attach {
                 self.captures.insert(id, pane_id);
             }
             // Empty input is a no-op; Attach is handled by the task; Hello never
-            // reaches the terminal task.
+            // reaches the terminal task. The buffer-channel requests
+            // (`OpenFile`/`SaveFile`) are not terminal messages — their daemon
+            // service is wired in a later editor step (#185), not here.
             ClientMessage::Input { .. }
             | ClientMessage::Attach { .. }
+            | ClientMessage::OpenFile { .. }
+            | ClientMessage::SaveFile { .. }
             | ClientMessage::Hello { .. } => {}
         }
         Ok(())

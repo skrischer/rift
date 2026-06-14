@@ -581,7 +581,13 @@ where
                                 terminal_done = true;
                             }
                         }
-                        ClientMessage::Hello { .. } => {
+                        // The handshake and the buffer-channel requests
+                        // (`OpenFile`/`SaveFile`) go to the shared loop; the
+                        // buffer service that answers them is wired in a later
+                        // editor step (#185), where `dispatch` currently no-ops.
+                        ClientMessage::Hello { .. }
+                        | ClientMessage::OpenFile { .. }
+                        | ClientMessage::SaveFile { .. } => {
                             if inbound.send(msg).await.is_err() {
                                 // Dispatch loop gone; nothing left to serve.
                                 break 'serve;
@@ -973,12 +979,16 @@ impl Core {
             // Terminal/tmux messages never reach the shared dispatch loop:
             // `serve_connection` routes them to this connection's own
             // `terminal_task` (per-client attach). The arm stays as a defensive
-            // no-op in case a caller drives the loop directly.
+            // no-op in case a caller drives the loop directly. The buffer-channel
+            // requests (`OpenFile`/`SaveFile`) are likewise a no-op here — their
+            // daemon service is wired in a later editor step (#185).
             ClientMessage::Attach { .. }
             | ClientMessage::Input { .. }
             | ClientMessage::ResizePane { .. }
             | ClientMessage::TmuxCommand { .. }
-            | ClientMessage::CapturePane { .. } => {}
+            | ClientMessage::CapturePane { .. }
+            | ClientMessage::OpenFile { .. }
+            | ClientMessage::SaveFile { .. } => {}
         }
     }
 

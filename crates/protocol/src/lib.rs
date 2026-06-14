@@ -55,6 +55,33 @@ pub enum ClientMessage {
         end: String,
         join: bool,
     },
+    /// Read request on the buffer channel: pull the current content of the file
+    /// at `path` (relative to the worktree root, the same key space as
+    /// [`WorktreeEntry::path`]). The daemon answers with exactly one
+    /// [`DaemonMessage::FileContent`] for this path — the file's whole UTF-8 text
+    /// plus its `mtime`. This is the **first request/response pair in the
+    /// protocol** (the worktree, git, and diagnostics paths are all push-only):
+    /// file content is **pulled on open**, never broadcast, so it stays off the
+    /// content-free worktree structure path.
+    OpenFile {
+        path: String,
+    },
+    /// Write request on the buffer channel: replace the file at `path` (relative
+    /// to the worktree root) with `content` — the whole new UTF-8 text, no
+    /// deltas. `base_mtime` is the `mtime` the editor last read for this path (the
+    /// open buffer's base); the daemon compares it against the on-disk `mtime` to
+    /// detect a change made under the editor. It answers with one
+    /// [`DaemonMessage::SaveResult`] carrying the new `mtime` on success, or one
+    /// [`DaemonMessage::SaveConflict`] when the on-disk `mtime` no longer matches
+    /// `base_mtime` — a stale base is **rejected, never clobbered**. The write is
+    /// atomic on the daemon side (temp + rename). `base_mtime` is the same
+    /// `std::time::SystemTime` as [`WorktreeEntry::mtime`], so the base can be
+    /// compared across the structure and buffer paths.
+    SaveFile {
+        path: String,
+        content: String,
+        base_mtime: SystemTime,
+    },
     Hello {
         version: u32,
     },
@@ -198,6 +225,38 @@ pub enum DaemonMessage {
         path: String,
         server: String,
         items: Vec<Diagnostic>,
+    },
+    /// The reply to a [`ClientMessage::OpenFile`]: the whole current UTF-8
+    /// `content` of the file at `path` (relative to the worktree root) plus its
+    /// `mtime`. The `mtime` is the same `std::time::SystemTime` as
+    /// [`WorktreeEntry::mtime`] — the editor keeps it as the open buffer's base
+    /// and hands it back as [`ClientMessage::SaveFile`]'s `base_mtime`, so a save
+    /// can be checked against the on-disk version across the structure and buffer
+    /// paths. This is the only daemon message that carries file content; the
+    /// worktree, git, and diagnostics paths stay content-free.
+    FileContent {
+        path: String,
+        content: String,
+        mtime: SystemTime,
+    },
+    /// The success reply to a [`ClientMessage::SaveFile`]: the write landed and
+    /// `path` (relative to the worktree root) now has the new on-disk `mtime`. The
+    /// editor adopts this as the buffer's new base `mtime` for the next save. Same
+    /// `std::time::SystemTime` as [`WorktreeEntry::mtime`].
+    SaveResult {
+        path: String,
+        mtime: SystemTime,
+    },
+    /// The conflict reply to a [`ClientMessage::SaveFile`]: the file at `path`
+    /// (relative to the worktree root) changed on disk since the editor read it —
+    /// its `disk_mtime` no longer matches the save's `base_mtime` — so the daemon
+    /// **rejected** the write rather than clobber the newer on-disk version. The
+    /// editor surfaces the conflict; `disk_mtime` is the current on-disk value
+    /// (the same `std::time::SystemTime` as [`WorktreeEntry::mtime`]), letting the
+    /// editor re-open from disk to rebase. No write happened.
+    SaveConflict {
+        path: String,
+        disk_mtime: SystemTime,
     },
     Welcome {
         version: u32,
@@ -1010,5 +1069,211 @@ mod tests {
         // matching the git-status-code discipline.
         let err = serde_json::from_str::<DiagnosticSeverity>(r#""fatal""#);
         assert!(err.is_err(), "unknown severity must not deserialize");
+    }
+
+    #[test]
+    fn test_open_file_roundtrip_preserves_path() {
+        // The buffer channel's read request: carries only the path, no content —
+        // content is pulled back on the reply, never sent on the request.
+        let msg = ClientMessage::OpenFile {
+            path: "src/main.rs".to_owned(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize OpenFile");
+        assert_eq!(json, r#"{"type":"open_file","path":"src/main.rs"}"#);
+
+        let parsed: ClientMessage = serde_json::from_str(&json).expect("deserialize OpenFile");
+        assert_eq!(parsed, msg);
+        match parsed {
+            ClientMessage::OpenFile { path } => assert_eq!(path, "src/main.rs"),
+            other => panic!("expected OpenFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_save_file_roundtrip_preserves_path_content_and_base_mtime() {
+        // The write request carries the whole file plus the base `mtime` the
+        // editor read on open — the conflict detector's input.
+        let msg = ClientMessage::SaveFile {
+            path: "src/lib.rs".to_owned(),
+            content: "fn main() {}\n".to_owned(),
+            base_mtime: SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 42),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize SaveFile");
+        assert!(json.contains(r#""type":"save_file""#));
+        assert!(json.contains(r#""content":"fn main() {}\n""#));
+
+        let parsed: ClientMessage = serde_json::from_str(&json).expect("deserialize SaveFile");
+        assert_eq!(parsed, msg);
+        match parsed {
+            ClientMessage::SaveFile {
+                path,
+                content,
+                base_mtime,
+            } => {
+                assert_eq!(path, "src/lib.rs");
+                assert_eq!(content, "fn main() {}\n");
+                assert_eq!(
+                    base_mtime,
+                    SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 42)
+                );
+            }
+            other => panic!("expected SaveFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_file_content_roundtrip_preserves_path_content_and_mtime() {
+        // The read reply carries the whole file content and its `mtime` — the
+        // only daemon message that carries file content.
+        let msg = DaemonMessage::FileContent {
+            path: "src/main.rs".to_owned(),
+            content: "use std::io;\n".to_owned(),
+            mtime: SystemTime::UNIX_EPOCH + Duration::new(1_700_000_001, 500),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize FileContent");
+        assert!(json.contains(r#""type":"file_content""#));
+        assert!(json.contains(r#""content":"use std::io;\n""#));
+
+        let parsed: DaemonMessage = serde_json::from_str(&json).expect("deserialize FileContent");
+        assert_eq!(parsed, msg);
+        match parsed {
+            DaemonMessage::FileContent {
+                path,
+                content,
+                mtime,
+            } => {
+                assert_eq!(path, "src/main.rs");
+                assert_eq!(content, "use std::io;\n");
+                assert_eq!(
+                    mtime,
+                    SystemTime::UNIX_EPOCH + Duration::new(1_700_000_001, 500)
+                );
+            }
+            other => panic!("expected FileContent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_save_result_roundtrip_preserves_path_and_mtime() {
+        let msg = DaemonMessage::SaveResult {
+            path: "src/lib.rs".to_owned(),
+            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_100),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize SaveResult");
+        assert!(json.contains(r#""type":"save_result""#));
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize SaveResult"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_save_conflict_roundtrip_preserves_path_and_disk_mtime() {
+        // The stale-base rejection: carries the current on-disk `mtime` so the
+        // editor can rebase. No write happened.
+        let msg = DaemonMessage::SaveConflict {
+            path: "src/lib.rs".to_owned(),
+            disk_mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_200),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize SaveConflict");
+        assert!(json.contains(r#""type":"save_conflict""#));
+        assert!(json.contains(r#""disk_mtime""#));
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize SaveConflict"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_buffer_channel_mtime_matches_worktree_entry_wire_shape() {
+        // The buffer channel's `mtime` / `base_mtime` / `disk_mtime` must be the
+        // identical `SystemTime` representation as the worktree entry's `mtime`
+        // (#107), so a base read on one path can be compared on the other. Pin
+        // all four to the same wire shape with the same instant.
+        let mtime = SystemTime::UNIX_EPOCH + Duration::new(5, 7);
+        let expected = r#"{"secs_since_epoch":5,"nanos_since_epoch":7}"#;
+
+        let entry = WorktreeEntry {
+            path: "a".to_owned(),
+            kind: EntryKind::File,
+            ignored: false,
+            mtime,
+        };
+        let content = DaemonMessage::FileContent {
+            path: "a".to_owned(),
+            content: String::new(),
+            mtime,
+        };
+        let save = ClientMessage::SaveFile {
+            path: "a".to_owned(),
+            content: String::new(),
+            base_mtime: mtime,
+        };
+        let conflict = DaemonMessage::SaveConflict {
+            path: "a".to_owned(),
+            disk_mtime: mtime,
+        };
+
+        let entry_json = serde_json::to_string(&entry).expect("serialize WorktreeEntry");
+        assert!(entry_json.contains(&format!(r#""mtime":{expected}"#)));
+        assert!(serde_json::to_string(&content)
+            .expect("serialize FileContent")
+            .contains(&format!(r#""mtime":{expected}"#)));
+        assert!(serde_json::to_string(&save)
+            .expect("serialize SaveFile")
+            .contains(&format!(r#""base_mtime":{expected}"#)));
+        assert!(serde_json::to_string(&conflict)
+            .expect("serialize SaveConflict")
+            .contains(&format!(r#""disk_mtime":{expected}"#)));
+    }
+
+    #[test]
+    fn test_structure_path_messages_carry_no_file_content() {
+        // The buffer channel is the only path that moves file content. The
+        // worktree / git / diagnostics messages must stay content-free: a sample
+        // of each must not serialize a `content` field.
+        let worktree = DaemonMessage::WorktreeSnapshot {
+            root: "/p".to_owned(),
+            entries: vec![WorktreeEntry {
+                path: "a.rs".to_owned(),
+                kind: EntryKind::File,
+                ignored: false,
+                mtime: SystemTime::UNIX_EPOCH,
+            }],
+            final_chunk: true,
+        };
+        let update = DaemonMessage::UpdateWorktree {
+            added: vec![WorktreeEntry {
+                path: "a.rs".to_owned(),
+                kind: EntryKind::File,
+                ignored: false,
+                mtime: SystemTime::UNIX_EPOCH,
+            }],
+            changed: vec![],
+            removed: vec![],
+        };
+        let git = DaemonMessage::UpdateGitStatus {
+            changed: vec![GitStatusEntry {
+                path: "a.rs".to_owned(),
+                status: GitEntryStatus {
+                    index: GitStatusCode::Unmodified,
+                    worktree: GitStatusCode::Modified,
+                },
+            }],
+            cleared: vec![],
+        };
+        let diagnostics = DaemonMessage::Diagnostics {
+            path: "a.rs".to_owned(),
+            server: "rust-analyzer".to_owned(),
+            items: vec![],
+        };
+
+        for msg in [worktree, update, git, diagnostics] {
+            let json = serde_json::to_string(&msg).expect("serialize structure message");
+            assert!(
+                !json.contains("content"),
+                "structure-path message must carry no file content: {json}"
+            );
+        }
     }
 }
