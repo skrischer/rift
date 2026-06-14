@@ -355,11 +355,8 @@ mod tests {
 
         // Collapse `src`: src stays, but everything under `src/` disappears.
         tree.toggle_dir("src");
-        let visible: Vec<&str> = tree
-            .visible_rows()
-            .iter()
-            .map(|r| r.path.as_str())
-            .collect();
+        let rows = tree.visible_rows();
+        let visible: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(visible, vec!["src", "top.rs"]);
         assert!(tree.is_collapsed("src"));
 
@@ -381,11 +378,8 @@ mod tests {
         ]);
 
         tree.toggle_dir("src");
-        let visible: Vec<&str> = tree
-            .visible_rows()
-            .iter()
-            .map(|r| r.path.as_str())
-            .collect();
+        let rows = tree.visible_rows();
+        let visible: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(visible, vec!["src", "src2", "src2/b.rs"]);
     }
 
@@ -403,11 +397,8 @@ mod tests {
 
         tree.toggle_dir("a/b");
         tree.toggle_dir("a");
-        let visible: Vec<&str> = tree
-            .visible_rows()
-            .iter()
-            .map(|r| r.path.as_str())
-            .collect();
+        let rows = tree.visible_rows();
+        let visible: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(visible, vec!["a", "z.rs"]);
     }
 
