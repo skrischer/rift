@@ -33,8 +33,8 @@
 
 use flume::{Receiver, Sender};
 use gpui::{
-    div, px, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement as _, Render,
-    Styled as _, Window,
+    div, px, AppContext as _, Context, Entity, FocusHandle, Focusable, IntoElement,
+    ParentElement as _, Render, Styled as _, Window,
 };
 use gpui_component::ActiveTheme as _;
 use rift_protocol::DaemonMessage;
@@ -112,18 +112,22 @@ impl WorkspaceView {
         .detach();
 
         // Worktree structure stream -> file-tree model. Each message folds into
-        // the model, then a notify repaints the tree.
+        // the model, then a notify repaints the tree. Routed through this view's
+        // weak handle so a dropped view (window closed) ends the loop gracefully —
+        // the `WeakEntity::update` `Result`, not the infallible `App` update, is
+        // the exit signal (mirroring the terminal snapshot bridge).
         {
-            let file_tree = file_tree.clone();
-            cx.spawn(async move |_this, cx| loop {
+            cx.spawn(async move |this, cx| loop {
                 let Ok(msg) = worktree_rx.recv_async().await else {
                     break;
                 };
                 let result = cx.update(|cx| {
-                    file_tree.update(cx, |tree, cx| {
-                        apply_worktree_message(tree, msg);
-                        cx.notify();
-                    });
+                    this.update(cx, |view, cx| {
+                        view.file_tree.update(cx, |tree, cx| {
+                            apply_worktree_message(tree, msg);
+                            cx.notify();
+                        });
+                    })
                 });
                 if result.is_err() {
                     break;

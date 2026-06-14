@@ -37,7 +37,8 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use gpui::{
-    div, px, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _, Window,
+    div, px, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render,
+    Styled as _, Window,
 };
 use gpui_component::input::{Input, InputState};
 use gpui_component::ActiveTheme as _;
