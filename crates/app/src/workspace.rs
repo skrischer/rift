@@ -23,18 +23,26 @@
 //!   git/diagnostics decoration on the tree is a later explorer-panel sub-spec,
 //!   but the model carries them already.) After each fold, the open path's new
 //!   snapshot `mtime` is handed to the editor as the **concurrent-write signal**
-//!   (#188): a clean buffer auto-reloads, a dirty one surfaces a conflict.
+//!   (#188): a clean buffer auto-reloads, a dirty one surfaces a conflict. After a
+//!   `Diagnostics` fold the open file's set is re-pushed to the editor as **inline
+//!   markers** (#189) — consuming the existing client diagnostics model (#178), so
+//!   a fixed error clears its marker.
 //! - **Buffer reply** (`buffer_rx`): a `FileContent { path, content, mtime }`
-//!   loads into the [`EditorView`]; a `SaveResult` / `SaveConflict` resolves a
+//!   loads into the [`EditorView`] (and its inline diagnostics are re-applied,
+//!   since opening rebuilt the input); a `SaveResult` / `SaveConflict` resolves a
 //!   save (commit the new base `mtime`, or surface the conflict without losing
 //!   the buffer).
 //!
-//! The reverse path runs through two request channels. `open_file_tx` issues an
+//! The reverse path runs through three request channels. `open_file_tx` issues an
 //! `OpenFile` read: when the tree emits [`FileTreeEvent::OpenFile`] (or the editor
 //! auto-reloads), this view tells the editor to begin opening (arming its timeout)
 //! and sends the path to the tokio side. `save_file_tx` carries a `SaveFile` the
-//! editor builds from the open buffer on a [`crate::editor::Save`]. The daemon's
-//! replies return on `buffer_rx`, closing each loop.
+//! editor builds from the open buffer on a [`crate::editor::Save`]. `buffer_change_tx`
+//! carries the **live-buffer feed** (#189): the editor sends `BufferChanged` on a
+//! debounced edit and `BufferClosed` on close / switch / save, so the daemon feeds
+//! the LSP the live buffer and an unsaved error surfaces without a save first. The
+//! daemon's read/write replies return on `buffer_rx`; diagnostics return on
+//! `worktree_rx` as `Diagnostics`.
 
 use flume::{Receiver, Sender};
 use gpui::{
@@ -70,6 +78,10 @@ pub struct WorkspaceChannels {
     /// Write requests: a `ClientMessage::SaveFile` the editor built from the open
     /// buffer. The tokio side forwards it onto the protocol verbatim.
     pub save_file_tx: Sender<ClientMessage>,
+    /// Live-buffer feed (#189): a `ClientMessage::BufferChanged` (debounced edit)
+    /// or `BufferClosed` (close / switch / save) the editor emits so the daemon
+    /// feeds the LSP the live buffer. The tokio side forwards it verbatim.
+    pub buffer_change_tx: Sender<ClientMessage>,
 }
 
 /// The composed app root.
@@ -98,12 +110,13 @@ impl WorkspaceView {
             buffer_rx,
             open_file_tx,
             save_file_tx,
+            buffer_change_tx,
         } = channels;
 
         let file_tree = cx.new(|_| FileTree::new());
         let editor = {
             let open_file_tx = open_file_tx.clone();
-            cx.new(|cx| EditorView::new(open_file_tx, save_file_tx, window, cx))
+            cx.new(|cx| EditorView::new(open_file_tx, save_file_tx, buffer_change_tx, window, cx))
         };
 
         // Open requests originate from the tree's `OpenFile` event: arm the
@@ -137,6 +150,7 @@ impl WorkspaceView {
                     break;
                 };
                 let result = this.update_in(cx, |view, window, cx| {
+                    let is_diagnostics = matches!(msg, DaemonMessage::Diagnostics { .. });
                     view.file_tree.update(cx, |tree, cx| {
                         apply_worktree_message(tree, msg);
                         cx.notify();
@@ -148,6 +162,14 @@ impl WorkspaceView {
                     // the model the tree already mirrors keeps the comparison
                     // base-vs-snapshot — never an independent stat.
                     view.notify_editor_of_open_path_mtime(window, cx);
+                    // Inline diagnostics (#189): after a diagnostics fold, re-push
+                    // the open file's full set to the editor so its inline markers
+                    // converge with the model (fixing an error clears the marker).
+                    // Only on a diagnostics message — the structure folds do not
+                    // touch the diagnostics map.
+                    if is_diagnostics {
+                        view.push_open_file_diagnostics(cx);
+                    }
                 });
                 if result.is_err() {
                     break;
@@ -158,26 +180,38 @@ impl WorkspaceView {
 
         // Buffer replies -> editor: `FileContent` loads, `SaveResult` commits the
         // new base `mtime`, `SaveConflict` surfaces the conflict. Each routed
-        // method ignores a reply for a path no longer open.
+        // method ignores a reply for a path no longer open. Routed through this
+        // view's weak handle so a load can be followed by re-pushing the freshly
+        // opened file's inline diagnostics (#189) — the `begin_open` recreated the
+        // input with an empty `DiagnosticSet`, so the open file's existing set must
+        // be re-applied once its content has loaded.
         {
-            let editor = editor.clone();
-            cx.spawn_in(window, async move |_this, cx| loop {
+            cx.spawn_in(window, async move |this, cx| loop {
                 let Ok(msg) = buffer_rx.recv_async().await else {
                     break;
                 };
-                let result = editor.update_in(cx, |editor, window, cx| match msg {
-                    DaemonMessage::FileContent {
-                        path,
-                        content,
-                        mtime,
-                    } => editor.load(path, content, mtime, window, cx),
-                    DaemonMessage::SaveResult { path, mtime } => {
-                        editor.apply_save_result(path, mtime, cx)
+                let result = this.update_in(cx, |view, window, cx| {
+                    let loaded = matches!(msg, DaemonMessage::FileContent { .. });
+                    view.editor.update(cx, |editor, cx| match msg {
+                        DaemonMessage::FileContent {
+                            path,
+                            content,
+                            mtime,
+                        } => editor.load(path, content, mtime, window, cx),
+                        DaemonMessage::SaveResult { path, mtime } => {
+                            editor.apply_save_result(path, mtime, cx)
+                        }
+                        DaemonMessage::SaveConflict { path, .. } => {
+                            editor.apply_save_conflict(path, cx)
+                        }
+                        _ => {}
+                    });
+                    // After a load the editor rebuilt its input with an empty
+                    // `DiagnosticSet`, so re-apply the open file's inline markers
+                    // (#189) from the model the tree mirrors.
+                    if loaded {
+                        view.push_open_file_diagnostics(cx);
                     }
-                    DaemonMessage::SaveConflict { path, .. } => {
-                        editor.apply_save_conflict(path, cx)
-                    }
-                    _ => {}
                 });
                 if result.is_err() {
                     break;
@@ -219,6 +253,37 @@ impl WorkspaceView {
         };
         self.editor.update(cx, |editor, cx| {
             editor.note_external_change(mtime, window, cx);
+        });
+    }
+
+    /// Push the open file's full diagnostic set (aggregated across servers) from
+    /// the file tree's model onto the editor's inline markers (#189). Looks the
+    /// open path up in the same model the tree mirrors — the existing client
+    /// diagnostics layer (#178), consumed, not redesigned — and hands a flattened
+    /// `Vec<Diagnostic>` to [`EditorView::set_diagnostics`]. An open path with no
+    /// diagnostics applies an empty set, which clears every inline marker (so a
+    /// fixed error clears). A no-op when no file is open.
+    fn push_open_file_diagnostics(&self, cx: &mut Context<Self>) {
+        let Some(open_path) = self
+            .editor
+            .read(cx)
+            .open_path()
+            .map(std::borrow::ToOwned::to_owned)
+        else {
+            return;
+        };
+        // Flatten the per-server sets into one list — the editor renders all
+        // servers' diagnostics for the file together (a linter + a type-checker
+        // aggregate), mirroring the model's per-`(file, server)` keying.
+        let items: Vec<rift_protocol::Diagnostic> = self
+            .file_tree
+            .read(cx)
+            .model()
+            .diagnostics(&open_path)
+            .map(|by_server| by_server.values().flatten().cloned().collect())
+            .unwrap_or_default();
+        self.editor.update(cx, |editor, cx| {
+            editor.set_diagnostics(&items, cx);
         });
     }
 }

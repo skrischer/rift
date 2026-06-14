@@ -82,6 +82,32 @@ pub enum ClientMessage {
         content: String,
         base_mtime: SystemTime,
     },
+    /// Live-buffer feed for the open file (the disk→buffer source-of-truth shift,
+    /// `spec-editor.md` scope cut C). The editor sends the open buffer's whole
+    /// current UTF-8 `content` (debounced on edit) so the daemon forwards it to
+    /// the language server(s) as a `didChange` — the buffer, not the on-disk
+    /// content, becomes the LSP's source of truth for `path`, so an **unsaved**
+    /// edit's errors surface without a save first. `path` is relative to the
+    /// worktree root (the same key space as [`WorktreeEntry::path`]).
+    ///
+    /// This is **not** a write: nothing touches disk. It is additive and push-only
+    /// (no reply); diagnostics flow back over the existing push-only
+    /// [`DaemonMessage::Diagnostics`] path, recomputed against the buffer. While a
+    /// path has a live buffer the daemon suppresses disk-driven `didChange` for it
+    /// (the buffer owns it); [`ClientMessage::BufferClosed`] reverts it to the
+    /// disk-backed baseline.
+    BufferChanged {
+        path: String,
+        content: String,
+    },
+    /// End the live-buffer feed for `path` (the editor closed the file, opened a
+    /// different one, or auto-reloaded). The daemon drops the buffer override and
+    /// reverts `path` to the disk-backed baseline — re-reading on-disk content and
+    /// pushing it as a `didChange` so diagnostics converge to the on-disk state,
+    /// coherently with the pre-buffer behavior. Additive and push-only.
+    BufferClosed {
+        path: String,
+    },
     Hello {
         version: u32,
     },
@@ -1087,6 +1113,45 @@ mod tests {
             ClientMessage::OpenFile { path } => assert_eq!(path, "src/main.rs"),
             other => panic!("expected OpenFile, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_buffer_changed_roundtrip_preserves_path_and_content() {
+        // The live-buffer feed carries the whole current buffer text but, unlike
+        // SaveFile, no `mtime` — it is not a write, only the LSP's source of truth.
+        let msg = ClientMessage::BufferChanged {
+            path: "src/main.rs".to_owned(),
+            content: "fn main() { let x: u32 = \"oops\"; }\n".to_owned(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize BufferChanged");
+        assert!(json.contains(r#""type":"buffer_changed""#));
+        assert!(json.contains(r#""path":"src/main.rs""#));
+        // No `mtime` / `base_mtime` — the feed is not a write.
+        assert!(!json.contains("mtime"));
+
+        let parsed: ClientMessage = serde_json::from_str(&json).expect("deserialize BufferChanged");
+        assert_eq!(parsed, msg);
+        match parsed {
+            ClientMessage::BufferChanged { path, content } => {
+                assert_eq!(path, "src/main.rs");
+                assert!(content.contains("oops"));
+            }
+            other => panic!("expected BufferChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_buffer_closed_roundtrip_preserves_path() {
+        // Ending the live-buffer feed carries only the path; the daemon reverts it
+        // to the disk-backed baseline.
+        let msg = ClientMessage::BufferClosed {
+            path: "src/lib.rs".to_owned(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize BufferClosed");
+        assert_eq!(json, r#"{"type":"buffer_closed","path":"src/lib.rs"}"#);
+
+        let parsed: ClientMessage = serde_json::from_str(&json).expect("deserialize BufferClosed");
+        assert_eq!(parsed, msg);
     }
 
     #[test]

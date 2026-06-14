@@ -23,7 +23,7 @@ use std::time::Duration;
 use rift_daemon::{channels, DiagnosticKey, Handles};
 use rift_lsp::selector::ServerSpec;
 use rift_lsp::DocumentSelector;
-use rift_protocol::{DaemonMessage, DiagnosticSeverity};
+use rift_protocol::{ClientMessage, DaemonMessage, DiagnosticSeverity};
 use tokio::sync::broadcast;
 
 /// The marker that makes the (single / type-checker) stub publish a diagnostic.
@@ -368,6 +368,84 @@ async fn test_write_to_ignored_path_emits_no_diagnostics() {
     })
     .await
     .expect("the non-ignored file yields a diagnostic");
+
+    drop(handles);
+    drop(events);
+    loop_handle.await.expect("dispatch loop joins");
+}
+
+#[tokio::test]
+async fn test_live_buffer_surfaces_unsaved_error_without_a_disk_write() {
+    // The cut-C acceptance (#189): an UNSAVED edit's error surfaces without a save
+    // first. The on-disk file never carries the marker; only the live buffer
+    // (`BufferChanged`) does — yet the stub publishes a diagnostic for it, proving
+    // the buffer, not disk, is the LSP's source of truth. Fixing the buffer clears
+    // it; closing the buffer reverts to disk (also clean) coherently.
+    let _bin = stage_stub_on_path();
+    let tmp = TempDir::new("live-buffer");
+    // The disk file is clean — no marker. If the LSP read disk, no diagnostic.
+    write_file(&tmp.path, "buf.rs", "fn main() {}");
+
+    let (mut daemon, handles) = channels(256, 16);
+    daemon.watch_worktree(tmp.path.clone());
+    daemon.watch_lsp(tmp.path.clone(), DocumentSelector::with_table(ONE_SERVER));
+    let mut events = handles.subscribe();
+    let loop_handle = tokio::spawn(daemon.run());
+    wait_for_scan(&handles).await;
+
+    // The editor feeds the open buffer's content with the marker — an unsaved edit
+    // (nothing is written to disk). The buffer becomes the LSP source of truth, so
+    // the stub publishes a diagnostic against it.
+    handles
+        .inbound
+        .send(ClientMessage::BufferChanged {
+            path: "buf.rs".to_string(),
+            content: format!("fn main() {{ }} // {ERROR_MARKER}"),
+        })
+        .await
+        .expect("send BufferChanged");
+
+    let items = recv_diagnostics_until(&mut events, |path, server, items| {
+        (path == "buf.rs" && server == "0" && !items.is_empty()).then_some(items)
+    })
+    .await;
+    assert_eq!(
+        items.len(),
+        1,
+        "the unsaved buffer's marker yields a diagnostic"
+    );
+    assert_eq!(items[0].severity, DiagnosticSeverity::Error);
+
+    // The on-disk file is still clean — the feed wrote nothing to disk.
+    assert_eq!(
+        std::fs::read_to_string(tmp.path.join("buf.rs")).unwrap(),
+        "fn main() {}",
+        "the live-buffer feed must not touch disk"
+    );
+
+    // Fixing the buffer (drop the marker) clears the diagnostic without a save.
+    handles
+        .inbound
+        .send(ClientMessage::BufferChanged {
+            path: "buf.rs".to_string(),
+            content: "fn main() {}".to_string(),
+        })
+        .await
+        .expect("send fixing BufferChanged");
+    recv_diagnostics_until(&mut events, |path, server, items| {
+        (path == "buf.rs" && server == "0" && items.is_empty()).then_some(())
+    })
+    .await;
+
+    // Closing the buffer reverts to the disk-backed baseline (still clean), so the
+    // diagnostic stays cleared — the disk→buffer override is released coherently.
+    handles
+        .inbound
+        .send(ClientMessage::BufferClosed {
+            path: "buf.rs".to_string(),
+        })
+        .await
+        .expect("send BufferClosed");
 
     drop(handles);
     drop(events);

@@ -303,12 +303,15 @@ impl Attach {
             }
             // Empty input is a no-op; Attach is handled by the task; Hello never
             // reaches the terminal task. The buffer-channel requests
-            // (`OpenFile`/`SaveFile`) are not terminal messages — their daemon
-            // service is wired in a later editor step (#185), not here.
+            // (`OpenFile`/`SaveFile`) and the live-buffer feed (`BufferChanged`/
+            // `BufferClosed`, #189) are not terminal messages — they are routed to
+            // the per-connection buffer service or the shared LSP loop, not here.
             ClientMessage::Input { .. }
             | ClientMessage::Attach { .. }
             | ClientMessage::OpenFile { .. }
             | ClientMessage::SaveFile { .. }
+            | ClientMessage::BufferChanged { .. }
+            | ClientMessage::BufferClosed { .. }
             | ClientMessage::Hello { .. } => {}
         }
         Ok(())
