@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod buffer;
 pub mod lsp;
 mod terminal;
 
@@ -502,6 +503,69 @@ fn snapshot_messages(root: &Path, entries: &BTreeMap<PathBuf, Entry>) -> Vec<Dae
     messages
 }
 
+/// Answer a buffer-channel request (`OpenFile` / `SaveFile`) against the watched
+/// worktree root, producing the reply `DaemonMessage` for the requesting
+/// connection.
+///
+/// The root is the canonicalized [`Snapshot::root`] held in `State` — the same
+/// root the worktree watcher uses, so the request's path keys the same space as
+/// a worktree entry, and the buffer service confines reads/writes to it. A
+/// failure (a path escape, non-UTF-8 content, a missing file, or a write error)
+/// is logged to stderr (the daemon's log sink) and the request is dropped — v1
+/// has no buffer-error message in the protocol, so a refused request simply
+/// produces no reply, and the editor falls back to its own timeout. The two
+/// success/conflict outcomes map directly onto the protocol replies.
+async fn buffer_reply(state: &watch::Receiver<State>, msg: ClientMessage) -> Option<DaemonMessage> {
+    // The borrow is released before any `await`: the root is cloned out up front
+    // (the snapshot's canonical root), then the file I/O runs unborrowed.
+    let root = {
+        let guard = state.borrow();
+        match guard.worktree.as_ref() {
+            Some(snapshot) => snapshot.root().to_path_buf(),
+            // No worktree scanned yet: there is no root to confine to, so the
+            // request cannot be served. Drop it.
+            None => {
+                eprintln!("rift-daemon: buffer request before the worktree is ready, dropping");
+                return None;
+            }
+        }
+    };
+
+    match msg {
+        ClientMessage::OpenFile { path } => match buffer::read_file(&root, &path).await {
+            Ok((content, mtime)) => Some(DaemonMessage::FileContent {
+                path,
+                content,
+                mtime,
+            }),
+            Err(err) => {
+                eprintln!("rift-daemon: open_file {path:?} refused: {err}");
+                None
+            }
+        },
+        ClientMessage::SaveFile {
+            path,
+            content,
+            base_mtime,
+        } => match buffer::write_file(&root, &path, &content, base_mtime).await {
+            Ok(buffer::SaveOutcome::Saved(mtime)) => {
+                Some(DaemonMessage::SaveResult { path, mtime })
+            }
+            Ok(buffer::SaveOutcome::Conflict(disk_mtime)) => {
+                Some(DaemonMessage::SaveConflict { path, disk_mtime })
+            }
+            Err(err) => {
+                eprintln!("rift-daemon: save_file {path:?} refused: {err}");
+                None
+            }
+        },
+        // `buffer_reply` is only ever called with a buffer-channel message; any
+        // other variant is a caller bug, handled as a no-reply rather than a
+        // panic so a stray message can never take the connection down.
+        _ => None,
+    }
+}
+
 /// Serve one client connection against an already-running dispatch loop.
 ///
 /// Decodes [`ClientMessage`] frames from `reader` into the loop via `inbound`,
@@ -568,7 +632,9 @@ where
                 decoder.push(&buf[..n]);
                 while let Some(msg) = decoder.next_frame::<ClientMessage>()? {
                     // Terminal messages drive this connection's own tmux attach;
-                    // everything else (the handshake) goes to the shared loop.
+                    // the buffer-channel requests are answered per connection
+                    // (request/response, replying to this socket); the handshake
+                    // goes to the shared loop.
                     match msg {
                         ClientMessage::Attach { .. }
                         | ClientMessage::Input { .. }
@@ -581,13 +647,24 @@ where
                                 terminal_done = true;
                             }
                         }
-                        // The handshake and the buffer-channel requests
-                        // (`OpenFile`/`SaveFile`) go to the shared loop; the
-                        // buffer service that answers them is wired in a later
-                        // editor step (#185), where `dispatch` currently no-ops.
-                        ClientMessage::Hello { .. }
-                        | ClientMessage::OpenFile { .. }
-                        | ClientMessage::SaveFile { .. } => {
+                        // The buffer channel is the protocol's request/response
+                        // path: the reply goes back to *this* connection's writer,
+                        // never onto the shared broadcast bus. The worktree root
+                        // the buffer service confines to is the canonicalized
+                        // `Snapshot::root()` held in `State` — the same root the
+                        // worktree watcher uses, so a buffer path keys the same
+                        // space as a worktree entry.
+                        ClientMessage::OpenFile { .. } | ClientMessage::SaveFile { .. } => {
+                            // A refused request (escape, non-UTF-8, I/O error)
+                            // yields no reply — logged in `buffer_reply`.
+                            if let Some(reply) = buffer_reply(&state, msg).await {
+                                let frame = encode_frame(&reply)?;
+                                writer.write_all(&frame).await?;
+                                writer.flush().await?;
+                            }
+                        }
+                        // The handshake goes to the shared loop.
+                        ClientMessage::Hello { .. } => {
                             if inbound.send(msg).await.is_err() {
                                 // Dispatch loop gone; nothing left to serve.
                                 break 'serve;
@@ -978,10 +1055,11 @@ impl Core {
             }
             // Terminal/tmux messages never reach the shared dispatch loop:
             // `serve_connection` routes them to this connection's own
-            // `terminal_task` (per-client attach). The arm stays as a defensive
-            // no-op in case a caller drives the loop directly. The buffer-channel
-            // requests (`OpenFile`/`SaveFile`) are likewise a no-op here — their
-            // daemon service is wired in a later editor step (#185).
+            // `terminal_task` (per-client attach). The buffer-channel requests
+            // (`OpenFile`/`SaveFile`) likewise never reach it — they are answered
+            // per connection by `buffer_reply`, request/response back to that
+            // socket, not on the broadcast bus. The arm stays as a defensive
+            // no-op in case a caller drives the loop directly.
             ClientMessage::Attach { .. }
             | ClientMessage::Input { .. }
             | ClientMessage::ResizePane { .. }
