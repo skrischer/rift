@@ -1,7 +1,7 @@
 //! The app root view: the cockpit that composes the three live surfaces —
 //! the file-tree explorer (#186), the code editor (#187), and the terminal
 //! [`SessionView`] — into one layout, and wires the file-tree/editor pair onto
-//! the daemon transport (`docs/spec-editor.md`, the render debut).
+//! the daemon transport (`docs/spec-editor.md`, the render debut + write-back).
 //!
 //! `SessionView` lives in `rift-terminal` and cannot reach back into `rift-app`
 //! (the dependency runs app -> terminal), so the explorer + editor are mounted
@@ -13,7 +13,7 @@
 //!
 //! The single reader of the daemon stream runs on the tokio side
 //! (`main.rs::consume_daemon_messages`). It forwards, over `flume` channels, the
-//! worktree-family messages and the `FileContent` reply into this view, which
+//! worktree-family messages and the buffer-channel replies into this view, which
 //! folds them onto the GPUI foreground — mirroring how the terminal snapshot /
 //! pane-output streams already bridge the two runtimes (`docs/patterns.md`):
 //!
@@ -21,15 +21,20 @@
 //!   diagnostics messages fold into the [`FileTree`]'s [`WorktreeModel`] so the
 //!   tree appears and updates live. (The tree only renders structure today;
 //!   git/diagnostics decoration on the tree is a later explorer-panel sub-spec,
-//!   but the model carries them already.)
-//! - **Buffer reply** (`file_content_rx`): a `FileContent { path, content, mtime }`
-//!   loads into the [`EditorView`].
+//!   but the model carries them already.) After each fold, the open path's new
+//!   snapshot `mtime` is handed to the editor as the **concurrent-write signal**
+//!   (#188): a clean buffer auto-reloads, a dirty one surfaces a conflict.
+//! - **Buffer reply** (`buffer_rx`): a `FileContent { path, content, mtime }`
+//!   loads into the [`EditorView`]; a `SaveResult` / `SaveConflict` resolves a
+//!   save (commit the new base `mtime`, or surface the conflict without losing
+//!   the buffer).
 //!
-//! The reverse path — issuing an `OpenFile` read request — runs through
-//! `open_file_tx`: when the tree emits [`FileTreeEvent::OpenFile`], this view
-//! tells the editor to begin opening (arming its timeout) and sends the path to
-//! the tokio side, which emits the `ClientMessage::OpenFile`. The daemon's
-//! `FileContent` reply returns on `file_content_rx`, closing the loop.
+//! The reverse path runs through two request channels. `open_file_tx` issues an
+//! `OpenFile` read: when the tree emits [`FileTreeEvent::OpenFile`] (or the editor
+//! auto-reloads), this view tells the editor to begin opening (arming its timeout)
+//! and sends the path to the tokio side. `save_file_tx` carries a `SaveFile` the
+//! editor builds from the open buffer on a [`crate::editor::Save`]. The daemon's
+//! replies return on `buffer_rx`, closing each loop.
 
 use flume::{Receiver, Sender};
 use gpui::{
@@ -37,7 +42,7 @@ use gpui::{
     ParentElement as _, Render, Styled as _, Window,
 };
 use gpui_component::ActiveTheme as _;
-use rift_protocol::DaemonMessage;
+use rift_protocol::{ClientMessage, DaemonMessage};
 use rift_terminal::SessionView;
 use tracing::debug;
 
@@ -49,18 +54,22 @@ use crate::file_tree::{FileTree, FileTreeEvent};
 const EXPLORER_WIDTH: f32 = 240.0;
 
 /// The flume endpoints the workspace consumes to bridge the daemon stream (run
-/// by the tokio side) onto its GPUI surfaces, plus the request endpoint it emits
-/// `OpenFile` paths on. Handed in at construction so `main.rs` owns the matching
-/// senders/receiver it threads into `consume_daemon_messages`.
+/// by the tokio side) onto its GPUI surfaces, plus the request endpoints it emits
+/// `OpenFile` / `SaveFile` on. Handed in at construction so `main.rs` owns the
+/// matching senders/receivers it threads into `consume_daemon_messages`.
 pub struct WorkspaceChannels {
     /// Worktree-family daemon messages (snapshot / update / git / repo /
     /// diagnostics) to fold into the file tree's model.
     pub worktree_rx: Receiver<DaemonMessage>,
-    /// `FileContent` replies to load into the editor.
-    pub file_content_rx: Receiver<DaemonMessage>,
+    /// Buffer-channel replies to route to the editor: `FileContent` (load),
+    /// `SaveResult` (save landed), `SaveConflict` (save refused).
+    pub buffer_rx: Receiver<DaemonMessage>,
     /// Read requests: the root-relative path of a file to open. The tokio side
     /// turns each into a `ClientMessage::OpenFile`.
     pub open_file_tx: Sender<String>,
+    /// Write requests: a `ClientMessage::SaveFile` the editor built from the open
+    /// buffer. The tokio side forwards it onto the protocol verbatim.
+    pub save_file_tx: Sender<ClientMessage>,
 }
 
 /// The composed app root.
@@ -84,14 +93,18 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let file_tree = cx.new(|_| FileTree::new());
-        let editor = cx.new(|cx| EditorView::new(window, cx));
-
         let WorkspaceChannels {
             worktree_rx,
-            file_content_rx,
+            buffer_rx,
             open_file_tx,
+            save_file_tx,
         } = channels;
+
+        let file_tree = cx.new(|_| FileTree::new());
+        let editor = {
+            let open_file_tx = open_file_tx.clone();
+            cx.new(|cx| EditorView::new(open_file_tx, save_file_tx, window, cx))
+        };
 
         // Open requests originate from the tree's `OpenFile` event: arm the
         // editor's open (and its timeout) and send the path to the tokio side.
@@ -115,19 +128,26 @@ impl WorkspaceView {
         // the model, then a notify repaints the tree. Routed through this view's
         // weak handle so a dropped view (window closed) ends the loop gracefully —
         // the `WeakEntity::update` `Result`, not the infallible `App` update, is
-        // the exit signal (mirroring the terminal snapshot bridge).
+        // the exit signal (mirroring the terminal snapshot bridge). `spawn_in`
+        // (not `spawn`) so the editor's auto-reload can re-arm a load with the
+        // window in scope.
         {
-            cx.spawn(async move |this, cx| loop {
+            cx.spawn_in(window, async move |this, cx| loop {
                 let Ok(msg) = worktree_rx.recv_async().await else {
                     break;
                 };
-                let result = cx.update(|cx| {
-                    this.update(cx, |view, cx| {
-                        view.file_tree.update(cx, |tree, cx| {
-                            apply_worktree_message(tree, msg);
-                            cx.notify();
-                        });
-                    })
+                let result = this.update_in(cx, |view, window, cx| {
+                    view.file_tree.update(cx, |tree, cx| {
+                        apply_worktree_message(tree, msg);
+                        cx.notify();
+                    });
+                    // Concurrent-write signal (#188): after folding the structure
+                    // update, hand the editor the open path's new snapshot `mtime`.
+                    // The editor compares it against the buffer's base `mtime` and
+                    // auto-reloads (clean) or surfaces a conflict (dirty). Tapping
+                    // the model the tree already mirrors keeps the comparison
+                    // base-vs-snapshot — never an independent stat.
+                    view.notify_editor_of_open_path_mtime(window, cx);
                 });
                 if result.is_err() {
                     break;
@@ -136,24 +156,28 @@ impl WorkspaceView {
             .detach();
         }
 
-        // Buffer replies -> editor. A `FileContent` loads into the editor (its
-        // `load` ignores a reply for a file no longer being opened).
+        // Buffer replies -> editor: `FileContent` loads, `SaveResult` commits the
+        // new base `mtime`, `SaveConflict` surfaces the conflict. Each routed
+        // method ignores a reply for a path no longer open.
         {
             let editor = editor.clone();
             cx.spawn_in(window, async move |_this, cx| loop {
-                let Ok(msg) = file_content_rx.recv_async().await else {
+                let Ok(msg) = buffer_rx.recv_async().await else {
                     break;
                 };
-                let DaemonMessage::FileContent {
-                    path,
-                    content,
-                    mtime,
-                } = msg
-                else {
-                    continue;
-                };
-                let result = editor.update_in(cx, |editor, window, cx| {
-                    editor.load(path, content, mtime, window, cx);
+                let result = editor.update_in(cx, |editor, window, cx| match msg {
+                    DaemonMessage::FileContent {
+                        path,
+                        content,
+                        mtime,
+                    } => editor.load(path, content, mtime, window, cx),
+                    DaemonMessage::SaveResult { path, mtime } => {
+                        editor.apply_save_result(path, mtime, cx)
+                    }
+                    DaemonMessage::SaveConflict { path, .. } => {
+                        editor.apply_save_conflict(path, cx)
+                    }
+                    _ => {}
                 });
                 if result.is_err() {
                     break;
@@ -168,6 +192,34 @@ impl WorkspaceView {
             session_view,
             open_file_tx,
         }
+    }
+
+    /// Feed the editor the open path's current snapshot `mtime` as the
+    /// concurrent-write signal (#188). Looks the open path up in the file tree's
+    /// mirrored model — the same `mtime` the buffer's base is compared against —
+    /// and, when present, hands it to [`EditorView::note_external_change`]. A no-op
+    /// when no file is open or the open path is not (yet) in the tree.
+    fn notify_editor_of_open_path_mtime(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open_path) = self
+            .editor
+            .read(cx)
+            .open_path()
+            .map(std::borrow::ToOwned::to_owned)
+        else {
+            return;
+        };
+        let Some(mtime) = self
+            .file_tree
+            .read(cx)
+            .model()
+            .get(&open_path)
+            .map(|entry| entry.mtime)
+        else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.note_external_change(mtime, window, cx);
+        });
     }
 }
 
