@@ -22,9 +22,11 @@
 //! to its stderr (`crates/daemon/src/lib.rs::buffer_reply`). So the open carries
 //! its own bounded timeout: if no `FileContent` arrives within [`OPEN_TIMEOUT`]
 //! the editor falls back to an unobtrusive "could not open" state rather than
-//! waiting forever. Correlation is by a monotonic request generation: only the
-//! most recent open is live, so a late or lost reply for a superseded request is
-//! ignored.
+//! waiting forever. A reply is matched to the live open **by path** ([`EditorView::load`]
+//! only accepts a `FileContent` whose path is the one currently `Loading`), so a
+//! late or superseded reply is ignored — only the most recent open is live. The
+//! timeout is fenced separately by a **monotonic request generation**, so a fired
+//! timer for an open that has since been replaced never trips the current one.
 //!
 //! Opening a file touches no tmux pane or window state — the editor is a GUI
 //! surface, not a pane — and nothing here inspects pane processes, agents, or
