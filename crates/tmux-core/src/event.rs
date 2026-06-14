@@ -31,6 +31,14 @@ pub enum Event {
     WindowClose { window: u32 },
     /// `%session-changed $<session> <name>`.
     SessionChanged { session: u32, name: String },
+    /// `%session-window-changed $<session> @<window>` — the attached session's
+    /// active window changed (a `select-window` / tab switch). Carries no
+    /// geometry; a consumer re-queries the layout to refresh the active flags.
+    SessionWindowChanged { session: u32, window: u32 },
+    /// `%window-pane-changed @<window> %<pane>` — the active pane within a window
+    /// changed (a `select-pane`). Like [`Event::SessionWindowChanged`], it only
+    /// signals that the active marker moved; the layout is re-queried for it.
+    WindowPaneChanged { window: u32, pane: u32 },
     /// `%pane-mode-changed %<pane>` — the pane entered or left copy mode.
     PaneModeChanged { pane: u32 },
     /// A completed command block (`%begin` … `%end`/`%error`). `id` is the

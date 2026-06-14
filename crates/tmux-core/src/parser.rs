@@ -40,6 +40,8 @@ pub(crate) fn parse_notification(line: &[u8]) -> Option<Event> {
             parse_window_id(rest).map(|window| Event::WindowClose { window })
         }
         b"%session-changed" => parse_session_changed(rest),
+        b"%session-window-changed" => parse_session_window_changed(rest),
+        b"%window-pane-changed" => parse_window_pane_changed(rest),
         b"%pane-mode-changed" => parse_pane_id(rest).map(|pane| Event::PaneModeChanged { pane }),
         b"%exit" => Some(Event::Exit {
             reason: (!rest.is_empty()).then(|| String::from_utf8_lossy(rest).into_owned()),
@@ -108,6 +110,22 @@ fn parse_session_changed(rest: &[u8]) -> Option<Event> {
         session,
         name: String::from_utf8_lossy(name).into_owned(),
     })
+}
+
+/// `$<session> @<window>` — both ids are single tokens.
+fn parse_session_window_changed(rest: &[u8]) -> Option<Event> {
+    let (sess, win) = split_first_space(rest);
+    let session = parse_u32(sess.strip_prefix(b"$")?)?;
+    let window = parse_u32(win.strip_prefix(b"@")?)?;
+    Some(Event::SessionWindowChanged { session, window })
+}
+
+/// `@<window> %<pane>` — both ids are single tokens.
+fn parse_window_pane_changed(rest: &[u8]) -> Option<Event> {
+    let (win, pane) = split_first_space(rest);
+    let window = parse_u32(win.strip_prefix(b"@")?)?;
+    let pane = parse_u32(pane.strip_prefix(b"%")?)?;
+    Some(Event::WindowPaneChanged { window, pane })
 }
 
 fn parse_window_id(rest: &[u8]) -> Option<u32> {
@@ -268,6 +286,43 @@ mod tests {
             parse_notification(b"%pane-mode-changed %1"),
             Some(Event::PaneModeChanged { pane: 1 })
         );
+    }
+
+    #[test]
+    fn test_parse_notification_session_window_changed() {
+        // Active window changed (a select-window / tab switch). Real tmux 3.4.
+        assert_eq!(
+            parse_notification(b"%session-window-changed $0 @2"),
+            Some(Event::SessionWindowChanged {
+                session: 0,
+                window: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_notification_session_window_changed_malformed_returns_none() {
+        assert_eq!(parse_notification(b"%session-window-changed 0 @2"), None); // session no $
+        assert_eq!(parse_notification(b"%session-window-changed $0 2"), None); // window no @
+        assert_eq!(parse_notification(b"%session-window-changed $0"), None); // truncated
+        assert_eq!(parse_notification(b"%session-window-changed $x @2"), None); // non-numeric
+    }
+
+    #[test]
+    fn test_parse_notification_window_pane_changed() {
+        // Active pane within a window changed (a select-pane). Real tmux 3.4.
+        assert_eq!(
+            parse_notification(b"%window-pane-changed @0 %3"),
+            Some(Event::WindowPaneChanged { window: 0, pane: 3 })
+        );
+    }
+
+    #[test]
+    fn test_parse_notification_window_pane_changed_malformed_returns_none() {
+        assert_eq!(parse_notification(b"%window-pane-changed 0 %3"), None); // window no @
+        assert_eq!(parse_notification(b"%window-pane-changed @0 3"), None); // pane no %
+        assert_eq!(parse_notification(b"%window-pane-changed @0"), None); // truncated
+        assert_eq!(parse_notification(b"%window-pane-changed @0 %x"), None); // non-numeric
     }
 
     #[test]
