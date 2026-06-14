@@ -164,7 +164,11 @@ impl EditorView {
         // fall back to the failed state rather than wait forever.
         cx.spawn(async move |this, cx| {
             smol::Timer::after(OPEN_TIMEOUT).await;
-            let _ = cx.update(|cx| {
+            // `AsyncApp::update` returns its closure's value (`()` here), not a
+            // `Result`; the inner `WeakEntity::update` `Result` is discarded (a
+            // dropped view makes the timeout moot). Bare statement, so the unit
+            // value is not let-bound (clippy::let_unit_value).
+            cx.update(|cx| {
                 let _ = this.update(cx, |this, cx| {
                     if this.generation == generation {
                         if let EditorState::Loading { .. } = this.state {
