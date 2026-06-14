@@ -5,7 +5,9 @@ use tracing::error;
 #[cfg(feature = "gallery")]
 pub mod gallery;
 
+pub mod editor;
 pub mod file_tree;
+pub mod workspace;
 pub mod worktree;
 
 /// Catppuccin Mocha theme in gpui-component's native theme format. Registered in

@@ -11,7 +11,7 @@ use std::thread;
 use anyhow::{Context as _, Result};
 use gpui::*;
 use gpui_component::Root;
-use rift_app::apply_theme;
+use rift_app::{apply_theme, workspace};
 use rift_terminal::{
     CaptureRequest, CaptureResult, ConnectionStatus, PaneInput, PaneOutput, SelectWindow,
     SessionView, SubscriptionUpdate, TermSize, TERMINAL_KEY_CONTEXT,
@@ -36,6 +36,22 @@ struct PtyChannels {
     capture_request_rx: flume::Receiver<CaptureRequest>,
     capture_result_tx: flume::Sender<CaptureResult>,
     connection_status_tx: flume::Sender<ConnectionStatus>,
+}
+
+/// The daemon-side endpoints of the editor surface's buffer-channel and worktree
+/// wiring (#187). The tokio session reader (`consume_daemon_messages`) forwards
+/// worktree-family messages and `FileContent` replies onto these senders, and an
+/// open-file bridge drains `open_file_rx` into `ClientMessage::OpenFile`
+/// requests. The matching GPUI-side endpoints live on
+/// [`rift_app::workspace::WorkspaceChannels`].
+struct EditorChannels {
+    /// Worktree-family daemon messages routed to the file tree's model.
+    worktree_tx: flume::Sender<rift_protocol::DaemonMessage>,
+    /// `FileContent` replies routed to the editor.
+    file_content_tx: flume::Sender<rift_protocol::DaemonMessage>,
+    /// Root-relative paths to open, emitted by the tree; each becomes an
+    /// `OpenFile` request.
+    open_file_rx: flume::Receiver<String>,
 }
 
 // Console builds log to stdout (the dev loop's RUST_LOG console). Windowed builds
@@ -139,6 +155,15 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
+                // Editor surface (#187) wiring: the daemon stream reader forwards
+                // worktree structure and `FileContent` replies onto these, and the
+                // tree's open requests come back on `open_file`. The daemon-side
+                // ends thread into the SSH session below; the GPUI-side ends into
+                // the `WorkspaceView`.
+                let (worktree_tx, worktree_rx) = flume::unbounded();
+                let (file_content_tx, file_content_rx) = flume::unbounded();
+                let (open_file_tx, open_file_rx) = flume::unbounded::<String>();
+
                 let session_view = cx.new(|cx| {
                     let (view, handle) = SessionView::new(cx);
 
@@ -188,6 +213,12 @@ fn main() {
                         connection_status_tx: handle.connection_status_tx,
                     };
 
+                    let editor_channels = EditorChannels {
+                        worktree_tx,
+                        file_content_tx,
+                        open_file_rx,
+                    };
+
                     let key_exists = ssh.key.exists();
                     debug!(
                         host = %ssh.host,
@@ -202,7 +233,7 @@ fn main() {
                         let rt =
                             tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
                         rt.block_on(async move {
-                            if let Err(e) = run_ssh_session(&ssh, channels).await {
+                            if let Err(e) = run_ssh_session(&ssh, channels, editor_channels).await {
                                 error!(
                                     %e,
                                     host = %ssh.host,
@@ -219,12 +250,30 @@ fn main() {
                     view
                 });
 
-                let focus_handle = session_view.focus_handle(cx);
+                // The app root: the file-tree explorer + code editor mounted beside
+                // the terminal (#187). `SessionView` lives in `rift-terminal`, which
+                // cannot reach `rift-app`'s explorer/editor, so the composition lives
+                // here. Focus still delegates to the terminal so keystrokes reach the
+                // active pane.
+                let workspace = cx.new(|cx| {
+                    workspace::WorkspaceView::new(
+                        session_view,
+                        workspace::WorkspaceChannels {
+                            worktree_rx,
+                            file_content_rx,
+                            open_file_tx,
+                        },
+                        window,
+                        cx,
+                    )
+                });
+
+                let focus_handle = workspace.focus_handle(cx);
                 window.defer(cx, move |window, cx| {
                     focus_handle.focus(window, cx);
                 });
 
-                cx.new(|cx| Root::new(session_view, window, cx))
+                cx.new(|cx| Root::new(workspace, window, cx))
             },
         )
         .unwrap();
@@ -232,7 +281,7 @@ fn main() {
     });
 }
 
-async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
+async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels, editor: EditorChannels) -> Result<()> {
     use rift_ssh::SshConnection;
 
     let mut conn = SshConnection::connect(&ssh.host, ssh.port, &ssh.user, &ssh.key)
@@ -263,7 +312,7 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
         match daemon_client {
             Some(client) => {
                 info!("terminal source: daemon protocol");
-                return run_daemon_terminal(client, session, ch).await;
+                return run_daemon_terminal(client, session, ch, editor).await;
             }
             None => warn!(
                 "daemon terminal selected but no daemon available; \
@@ -271,10 +320,13 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels) -> Result<()> {
             ),
         }
     } else if let Some(client) = daemon_client {
-        // Legacy terminal, but keep the daemon's worktree/git/diagnostics stream
-        // alive on its own task (today's behavior) while tmux drives the terminal.
+        // Legacy terminal, but keep the daemon's worktree/git/diagnostics +
+        // buffer-channel stream alive on its own task (today's behavior) while
+        // tmux drives the terminal.
         info!("terminal source: legacy tmux (daemon worktree stream active)");
-        tokio::spawn(consume_daemon_messages(std::sync::Arc::new(client), None));
+        let client = std::sync::Arc::new(client);
+        spawn_open_file_bridge(client.clone(), editor.open_file_rx.clone());
+        tokio::spawn(consume_daemon_messages(client, None, editor));
     } else {
         info!("terminal source: legacy tmux (no daemon configured)");
     }
@@ -304,6 +356,7 @@ async fn run_daemon_terminal(
     client: rift_ssh::DaemonClient,
     session: String,
     ch: PtyChannels,
+    editor: EditorChannels,
 ) -> Result<()> {
     use rift_protocol::ClientMessage;
     use std::sync::Arc;
@@ -330,16 +383,20 @@ async fn run_daemon_terminal(
     spawn_resize_bridge(client.clone(), ch.size_changed_rx);
     spawn_command_bridge(client.clone(), ch.tmux_command_rx);
     spawn_capture_bridge(client.clone(), ch.capture_request_rx);
+    // Buffer channel reverse path: the editor's open requests become `OpenFile`
+    // reads (#187). The forward `FileContent` replies return via
+    // `consume_daemon_messages` on `editor.file_content_tx`.
+    spawn_open_file_bridge(client.clone(), editor.open_file_rx.clone());
 
     // Forward path: fold the daemon stream into the render channels (pane output,
-    // layout snapshots, capture replies) and the worktree model. Blocks until the
-    // stream ends.
+    // layout snapshots, capture replies), the file tree, and the editor. Blocks
+    // until the stream ends.
     let sinks = TerminalSinks {
         pane_output_tx: ch.pane_output_tx,
         snapshot_tx: ch.snapshot_tx,
         capture_result_tx: ch.capture_result_tx,
     };
-    consume_daemon_messages(client, Some(sinks)).await;
+    consume_daemon_messages(client, Some(sinks), editor).await;
     Ok(())
 }
 
@@ -655,26 +712,27 @@ async fn provision_daemon(conn: &mut rift_ssh::SshConnection) -> Option<rift_ssh
     }
 }
 
-/// Drive the daemon message stream into the render channels and the worktree
-/// model.
+/// Drive the daemon message stream into the render channels, the file tree, and
+/// the editor.
 ///
-/// The single reader of the shared [`rift_ssh::DaemonClient`]: it folds every
-/// worktree/git/diagnostics message into a [`rift_app::worktree::WorktreeModel`]
-/// (logging tree state for headless verification — no rendered consumer yet) and,
-/// when `terminal` is `Some`, routes the per-pane byte stream and layout
-/// snapshots into the terminal render channels (#205). With `terminal` `None`
-/// (legacy mode) the terminal arms are inert — the app never sent `Attach`, so the
-/// daemon streams no terminal events. Ends when the channel closes or a
-/// `TerminalExit` ends the active attach; the detached daemon keeps running for
-/// the next attach.
+/// The single reader of the shared [`rift_ssh::DaemonClient`]: it forwards every
+/// worktree-structure message (snapshot / update / git / repo / diagnostics) to
+/// the file tree's model on `editor.worktree_tx`, the `FileContent` buffer reply
+/// to the editor on `editor.file_content_tx`, and — when `terminal` is `Some` —
+/// the per-pane byte stream and layout snapshots into the terminal render
+/// channels (#205). With `terminal` `None` (legacy mode) the terminal arms are
+/// inert — the app never sent `Attach`, so the daemon streams no terminal events,
+/// but the worktree + buffer channel still flow. Ends when the channel closes or
+/// a `TerminalExit` ends the active attach; the detached daemon keeps running for
+/// the next attach. The structure/buffer sends are best-effort: a closed
+/// GPUI-side receiver (window gone) drops the message rather than fail the loop.
 async fn consume_daemon_messages(
     client: std::sync::Arc<rift_ssh::DaemonClient>,
     terminal: Option<TerminalSinks>,
+    editor: EditorChannels,
 ) {
-    use rift_app::worktree::WorktreeModel;
     use rift_protocol::DaemonMessage;
 
-    let mut model = WorktreeModel::default();
     while let Some(msg) = client.recv().await {
         match msg {
             // --- terminal byte stream (daemon terminal mode only) ---
@@ -718,77 +776,50 @@ async fn consume_daemon_messages(
                     break;
                 }
             }
-            // --- worktree / git / diagnostics (every mode) ---
-            DaemonMessage::WorktreeSnapshot {
-                root,
-                entries,
-                final_chunk,
-            } => {
-                let chunk_len = entries.len();
-                if model.apply_snapshot_chunk(root, entries, final_chunk) {
-                    info!(
-                        root = model.root().unwrap_or(""),
-                        entries = model.len(),
-                        "worktree snapshot applied"
-                    );
-                } else {
-                    debug!(chunk_len, "worktree snapshot chunk buffered");
-                }
+            // --- worktree structure -> file tree (every mode) ---
+            // The structure-path messages fold into the file tree's model on the
+            // GPUI side; forward each unchanged. A send failure means the window
+            // closed — drop it, the recv loop ends on the next channel close.
+            msg @ (DaemonMessage::WorktreeSnapshot { .. }
+            | DaemonMessage::UpdateWorktree { .. }
+            | DaemonMessage::UpdateGitStatus { .. }
+            | DaemonMessage::RepoState { .. }
+            | DaemonMessage::Diagnostics { .. }) => {
+                let _ = editor.worktree_tx.send(msg);
             }
-            DaemonMessage::UpdateWorktree {
-                added,
-                changed,
-                removed,
-            } => {
-                let (a, c, r) = (added.len(), changed.len(), removed.len());
-                if model.apply_update(added, changed, removed) {
-                    debug!(
-                        added = a,
-                        changed = c,
-                        removed = r,
-                        entries = model.len(),
-                        "worktree update applied"
-                    );
-                } else {
-                    debug!(
-                        added = a,
-                        changed = c,
-                        removed = r,
-                        "worktree update before first snapshot dropped"
-                    );
-                }
-            }
-            DaemonMessage::UpdateGitStatus { changed, cleared } => {
-                let (c, r) = (changed.len(), cleared.len());
-                model.apply_git_update(changed, cleared);
-                debug!(
-                    changed = c,
-                    cleared = r,
-                    decorated = model.git_statuses().len(),
-                    "git status update applied"
-                );
-            }
-            DaemonMessage::RepoState {
-                branch,
-                ahead_behind,
-            } => {
-                debug!(branch = ?branch, ahead_behind = ?ahead_behind, "repo state applied");
-                model.apply_repo_state(branch, ahead_behind);
-            }
-            DaemonMessage::Diagnostics {
-                path,
-                server,
-                items,
-            } => {
-                let count = items.len();
-                debug!(%path, %server, items = count, "diagnostics received");
-                model.apply_diagnostics(path, server, items);
-                debug!(total = model.diagnostic_count(), "diagnostics applied");
+            // --- buffer channel reply -> editor (every mode) ---
+            // The only daemon message carrying file content: the read reply for an
+            // `OpenFile`. Forward to the editor, which loads it if it still matches
+            // the open in flight.
+            msg @ DaemonMessage::FileContent { .. } => {
+                let _ = editor.file_content_tx.send(msg);
             }
             other => debug!(?other, "daemon message without a consumer yet"),
         }
     }
     info!("daemon message stream ended");
+}
+
+/// Forward the editor's file-open requests onto the protocol as
+/// [`rift_protocol::ClientMessage::OpenFile`] reads (#187). Each path the file
+/// tree emitted becomes one read request; the daemon answers with a
+/// `FileContent` reply that returns through [`consume_daemon_messages`] on
+/// `editor.file_content_tx`. A *refused* request (binary / path escape) draws no
+/// reply by protocol, so the editor's own timeout recovers it. Ends when either
+/// channel closes.
+fn spawn_open_file_bridge(
+    client: std::sync::Arc<rift_ssh::DaemonClient>,
+    open_file_rx: flume::Receiver<String>,
+) {
+    use rift_protocol::ClientMessage;
+    tokio::spawn(async move {
+        while let Ok(path) = open_file_rx.recv_async().await {
+            debug!(%path, "sending open-file request");
+            if client.send(ClientMessage::OpenFile { path }).await.is_err() {
+                break;
+            }
+        }
+    });
 }
 
 /// The render-side sinks the daemon terminal stream feeds: per-pane output and
