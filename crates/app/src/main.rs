@@ -51,6 +51,8 @@ struct EditorChannels {
     /// Buffer-channel replies routed to the editor: `FileContent` (load),
     /// `SaveResult` (save landed), `SaveConflict` (save refused).
     buffer_tx: flume::Sender<rift_protocol::DaemonMessage>,
+    /// Nav replies routed to the editor: `DefinitionResponse` (#196).
+    nav_tx: flume::Sender<rift_protocol::DaemonMessage>,
     /// Root-relative paths to open, emitted by the tree (or the editor's
     /// auto-reload); each becomes an `OpenFile` request.
     open_file_rx: flume::Receiver<String>,
@@ -61,6 +63,8 @@ struct EditorChannels {
     /// so the daemon feeds the LSP the live buffer; forwarded onto the protocol
     /// verbatim by the buffer-change bridge.
     buffer_change_rx: flume::Receiver<rift_protocol::ClientMessage>,
+    /// Navigation requests: `DefinitionRequest` (#196).
+    nav_request_rx: flume::Receiver<rift_protocol::ClientMessage>,
 }
 
 // Console builds log to stdout (the dev loop's RUST_LOG console). Windowed builds
@@ -161,6 +165,19 @@ fn main() {
                 rift_app::editor::Save,
                 Some(rift_app::editor::EDITOR_KEY_CONTEXT),
             ),
+            // Go-to-definition (#196): F12 mirrors VS Code / JetBrains muscle memory.
+            // Ctrl+click fires the action programmatically (not via this binding).
+            KeyBinding::new(
+                "f12",
+                rift_app::editor::GoToDefinition,
+                Some(rift_app::editor::EDITOR_KEY_CONTEXT),
+            ),
+            // Back-navigation (#196): Alt+Left mirrors VS Code / JetBrains muscle memory.
+            KeyBinding::new(
+                "alt-left",
+                rift_app::editor::GoBack,
+                Some(rift_app::editor::EDITOR_KEY_CONTEXT),
+            ),
         ]);
         let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
         // Per-channel window title (matching the per-channel taskbar icons), so the
@@ -188,10 +205,13 @@ fn main() {
                 // the `WorkspaceView`.
                 let (worktree_tx, worktree_rx) = flume::unbounded();
                 let (buffer_tx, buffer_rx) = flume::unbounded();
+                let (nav_daemon_tx, nav_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
                 let (open_file_tx, open_file_rx) = flume::unbounded::<String>();
                 let (save_file_tx, save_file_rx) =
                     flume::unbounded::<rift_protocol::ClientMessage>();
                 let (buffer_change_tx, buffer_change_rx) =
+                    flume::unbounded::<rift_protocol::ClientMessage>();
+                let (nav_request_tx, nav_request_rx) =
                     flume::unbounded::<rift_protocol::ClientMessage>();
 
                 let session_view = cx.new(|cx| {
@@ -246,9 +266,11 @@ fn main() {
                     let editor_channels = EditorChannels {
                         worktree_tx,
                         buffer_tx,
+                        nav_tx: nav_daemon_tx,
                         open_file_rx,
                         save_file_rx,
                         buffer_change_rx,
+                        nav_request_rx,
                     };
 
                     let key_exists = ssh.key.exists();
@@ -293,9 +315,11 @@ fn main() {
                         workspace::WorkspaceChannels {
                             worktree_rx,
                             buffer_rx,
+                            nav_rx,
                             open_file_tx,
                             save_file_tx,
                             buffer_change_tx,
+                            nav_tx: nav_request_tx,
                         },
                         window,
                         cx,
@@ -362,6 +386,7 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels, editor: EditorChannel
         spawn_open_file_bridge(client.clone(), editor.open_file_rx.clone());
         spawn_save_file_bridge(client.clone(), editor.save_file_rx.clone());
         spawn_buffer_change_bridge(client.clone(), editor.buffer_change_rx.clone());
+        spawn_nav_bridge(client.clone(), editor.nav_request_rx.clone());
         tokio::spawn(consume_daemon_messages(client, None, editor));
     } else {
         info!("terminal source: legacy tmux (no daemon configured)");
@@ -429,6 +454,9 @@ async fn run_daemon_terminal(
     // `BufferClosed` forward verbatim so the daemon feeds the LSP the live buffer.
     // Push-only — diagnostics return on the worktree stream as `Diagnostics`.
     spawn_buffer_change_bridge(client.clone(), editor.buffer_change_rx.clone());
+    // Navigation request reverse path (#196): `DefinitionRequest` forwards verbatim.
+    // The `DefinitionResponse` returns via `consume_daemon_messages` on `editor.nav_tx`.
+    spawn_nav_bridge(client.clone(), editor.nav_request_rx.clone());
 
     // Forward path: fold the daemon stream into the render channels (pane output,
     // layout snapshots, capture replies), the file tree, and the editor. Blocks
@@ -840,6 +868,13 @@ async fn consume_daemon_messages(
             | DaemonMessage::SaveConflict { .. }) => {
                 let _ = editor.buffer_tx.send(msg);
             }
+            // --- nav replies -> editor (every mode) ---
+            // Definition (and future hover / references) responses route to the
+            // editor's nav reply channel, which the workspace's `nav_rx` loop
+            // forwards to `apply_definition_response` on the GPUI side (#196).
+            msg @ DaemonMessage::DefinitionResponse { .. } => {
+                let _ = editor.nav_tx.send(msg);
+            }
             other => debug!(?other, "daemon message without a consumer yet"),
         }
     }
@@ -911,6 +946,30 @@ fn spawn_buffer_change_bridge(
                     debug!(%path, "sending live-buffer close")
                 }
                 _ => {}
+            }
+            if client.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Forward the editor's navigation requests onto the protocol (#196): each
+/// `DefinitionRequest` the editor emits after ctrl+click or the context-menu
+/// action is sent verbatim; the daemon answers with a `DefinitionResponse` that
+/// returns through [`consume_daemon_messages`] on `editor.nav_tx`. Ends when
+/// either channel closes.
+fn spawn_nav_bridge(
+    client: std::sync::Arc<rift_ssh::DaemonClient>,
+    nav_request_rx: flume::Receiver<rift_protocol::ClientMessage>,
+) {
+    tokio::spawn(async move {
+        while let Ok(msg) = nav_request_rx.recv_async().await {
+            if let rift_protocol::ClientMessage::DefinitionRequest {
+                ref id, ref path, ..
+            } = msg
+            {
+                debug!(?id, %path, "sending definition request");
             }
             if client.send(msg).await.is_err() {
                 break;
