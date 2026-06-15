@@ -488,10 +488,14 @@ pub struct Range {
     pub end: Position,
 }
 
-/// A zero-based line / character offset within a file, mirroring LSP positions.
+/// A zero-based line / character offset within a file.
 ///
-/// `character` is a UTF-16 code-unit offset, matching the LSP default the
-/// daemon's servers speak; the daemon does not re-encode it.
+/// `character` is a **UTF-8 character offset** (number of Unicode scalar values
+/// from the start of the line, not bytes). This is rift's canonical wire
+/// encoding; `crates/lsp` translates to and from the UTF-16 code-unit offsets
+/// that LSP servers negotiate before sending or receiving positions
+/// (`docs/spec-lsp-navigation.md` §Constraints — "the client and protocol
+/// speak only rift's own position type").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Position {
     pub line: u32,
