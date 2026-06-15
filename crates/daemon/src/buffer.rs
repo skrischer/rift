@@ -1,5 +1,6 @@
 //! The daemon's buffer service: whole-file read and atomic whole-file write,
-//! confined to the watched worktree root.
+//! confined to the watched worktree root — with a read-only carve-out for
+//! out-of-root navigation targets.
 //!
 //! This is the daemon side of the editor buffer channel (`spec-editor.md`): the
 //! client pulls a file's whole UTF-8 content on open ([`read_file`]) and pushes
@@ -9,11 +10,16 @@
 //!
 //! Three invariants the spec pins:
 //!
-//! - **Root confinement** — every path is resolved against the worktree root and
-//!   rejected if it escapes (`..`, an absolute path, or a symlink that points
-//!   out). The root is the same canonicalized root the worktree watcher uses
-//!   ([`rift_explorer::Snapshot::root`]), so a buffer path keys the same space as
-//!   a worktree entry.
+//! - **Root confinement (writes), read-only carve-out (reads)** — a **write** is
+//!   resolved against the worktree root and rejected if it escapes (`..`, an
+//!   absolute path, or a symlink that points out). The root is the same
+//!   canonicalized root the worktree watcher uses
+//!   ([`rift_explorer::Snapshot::root`]), so a relative buffer path keys the same
+//!   space as a worktree entry. A **read** of an **absolute** path is the
+//!   out-of-root carve-out (`spec-lsp-navigation.md`, 2026-06-12): the editor
+//!   jumps to a stdlib/dependency definition outside the root and opens it
+//!   **read-only**. The daemon serves that read; it never serves a write outside
+//!   the root, so the carve-out cannot widen into one.
 //! - **UTF-8 only** — v1 is source text. Non-UTF-8 / binary content is detected
 //!   and refused, never silently mangled, on both read and write (pluggable
 //!   binary viewers are a future sub-spec).
@@ -45,9 +51,11 @@ use std::time::SystemTime;
 #[derive(Debug)]
 pub enum BufferError {
     /// The requested path escaped the worktree root — a `..` segment, an
-    /// absolute path, or a symlink resolving outside the root. Refused, not
-    /// served: the buffer service never reads or writes outside the watched
-    /// tree.
+    /// absolute path on a **write**, or a symlink resolving outside the root.
+    /// Refused, not served: the buffer service never **writes** outside the
+    /// watched tree, and a relative read may not climb out of it either. (An
+    /// **absolute read** is the deliberate out-of-root carve-out and is served
+    /// read-only, not refused — see [`read_file`].)
     PathEscape(String),
     /// The file's content is not valid UTF-8. v1 is UTF-8 text only; binary is
     /// detected and refused rather than mangled.
@@ -99,25 +107,36 @@ pub enum SaveOutcome {
     Conflict(SystemTime),
 }
 
-/// Read the whole file at `rel_path` (relative to `root`) as UTF-8 text, paired
-/// with its current on-disk `mtime`.
+/// Read the whole file at `path` as UTF-8 text, paired with its current on-disk
+/// `mtime`.
 ///
-/// `root` must be the canonicalized worktree root. The path is confined to it:
-/// an escape (`..`, an absolute path, or a symlink pointing out) is refused with
-/// [`BufferError::PathEscape`], never read. Non-UTF-8 content is refused with
-/// [`BufferError::NotUtf8`] rather than mangled.
-pub async fn read_file(root: &Path, rel_path: &str) -> Result<(String, SystemTime), BufferError> {
-    let resolved = resolve(root, rel_path)?;
+/// `path` is normally **relative** to the canonicalized worktree `root` and is
+/// confined to it: an escape (`..` or a symlink pointing out) is refused with
+/// [`BufferError::PathEscape`], never read.
+///
+/// As the **out-of-root read carve-out** (`spec-lsp-navigation.md`,
+/// 2026-06-12), an **absolute** `path` is served **read-only**: it is the
+/// daemon-side path of a navigation target outside the worktree root (a stdlib
+/// or dependency file the editor jumped to, carried as
+/// [`rift_protocol::NavLocation`] with `out_of_root = true`). Such a path is
+/// read whole and returned, but never written — [`write_file`] refuses every
+/// absolute path, so the carve-out can never widen into a write outside the
+/// root. Read-only confinement is enforced client-side off `out_of_root`; the
+/// daemon serves the bytes on a single-user remote (the accepted threat model).
+///
+/// Non-UTF-8 content is refused with [`BufferError::NotUtf8`] rather than
+/// mangled, on both the in-root and out-of-root read paths.
+pub async fn read_file(root: &Path, path: &str) -> Result<(String, SystemTime), BufferError> {
+    let resolved = resolve_read(root, path)?;
 
     let bytes = tokio::fs::read(&resolved)
         .await
         .map_err(|source| BufferError::Io {
-            path: rel_path.to_owned(),
+            path: path.to_owned(),
             source,
         })?;
-    let content =
-        String::from_utf8(bytes).map_err(|_| BufferError::NotUtf8(rel_path.to_owned()))?;
-    let mtime = mtime_of(&resolved, rel_path).await?;
+    let content = String::from_utf8(bytes).map_err(|_| BufferError::NotUtf8(path.to_owned()))?;
+    let mtime = mtime_of(&resolved, path).await?;
 
     Ok((content, mtime))
 }
@@ -288,6 +307,31 @@ fn resolve(root: &Path, rel_path: &str) -> Result<PathBuf, BufferError> {
     }
 
     Ok(resolved)
+}
+
+/// Resolve `path` for a **read**, splitting on the out-of-root carve-out.
+///
+/// - A **relative** `path` is confined to `root` exactly as a write is
+///   ([`resolve`]): `..` and symlink escapes are refused.
+/// - An **absolute** `path` is the out-of-root carve-out: it is a navigation
+///   target outside the worktree (a [`rift_protocol::NavLocation`] with
+///   `out_of_root = true`) and is served **read-only**. It is returned as-is for
+///   reading; no confinement check applies because the target is deliberately
+///   outside the root, and no write path ever accepts it ([`write_file`] always
+///   routes through [`resolve`], which refuses absolute paths). An empty path is
+///   still an escape.
+///
+/// This is the read-only counterpart to [`resolve`]: writes stay confined to the
+/// root, reads gain the out-of-root carve-out.
+fn resolve_read(root: &Path, path: &str) -> Result<PathBuf, BufferError> {
+    let candidate = Path::new(path);
+    if candidate.is_absolute() {
+        // Out-of-root read carve-out: served read-only, no confinement check.
+        // Never reachable from the write path — `write_file` uses `resolve`,
+        // which refuses any absolute path, so this can never widen a write.
+        return Ok(candidate.to_path_buf());
+    }
+    resolve(root, path)
 }
 
 /// The longest existing ancestor of `path` (including `path` itself when it
@@ -508,11 +552,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_rejects_absolute_path() {
+    async fn test_write_rejects_absolute_path() {
+        // The write path keeps refusing absolute paths — the out-of-root
+        // carve-out is read-only. (An absolute *read* is served read-only; see
+        // `test_out_of_root_read_file_absolute_path_is_served_read_only`.)
         let tmp = TempDir::new("escape-abs");
-        let err = read_file(&tmp.path, "/etc/passwd")
-            .await
-            .expect_err("absolute path is refused");
+        let err = write_file(
+            &tmp.path,
+            "/etc/rift-buffer-should-not-write.txt",
+            "should not land",
+            SystemTime::UNIX_EPOCH,
+        )
+        .await
+        .expect_err("absolute path is refused on write");
         assert!(matches!(err, BufferError::PathEscape(_)), "got {err:?}");
     }
 
@@ -620,19 +672,72 @@ mod tests {
         );
     }
 
-    /// Out-of-root reads are served: `read_file` with a path that looks like a
-    /// relative out-of-root path via `..` is refused (path escape guard), but
-    /// the read path for navigation targets uses the absolute path which is also
-    /// caught — this test confirms the coverage for the absolute-path read case.
+    /// Out-of-root carve-out: an absolute path **outside** the worktree root is
+    /// served read-only — the daemon returns its content so the editor can open
+    /// an out-of-root navigation target (a stdlib/dependency definition) as a
+    /// read-only buffer. The path lives outside `root` and is `out_of_root` on
+    /// the wire; the read is the accepted single-user-remote carve-out. This is
+    /// the acceptance-level test for the spec's "out-of-root reads served
+    /// read-only" item (issue #195).
     #[tokio::test]
-    async fn test_out_of_root_read_file_absolute_path_is_refused() {
-        let tmp = TempDir::new("out-of-root-read");
-        let err = read_file(&tmp.path, "/etc/passwd")
+    async fn test_out_of_root_read_file_absolute_path_is_served_read_only() {
+        let tmp = TempDir::new("out-of-root-read-served");
+        // A file outside the worktree root (a sibling of it), simulating a
+        // stdlib/dependency file an absolute NavLocation points at.
+        let outside = tmp.path.parent().expect("temp has a parent");
+        let target = outside.join("rift-buffer-out-of-root-dep.rs");
+        std::fs::write(&target, b"pub fn dep() {}\n").expect("write out-of-root file");
+        let on_disk = std::fs::metadata(&target)
+            .expect("stat")
+            .modified()
+            .expect("mtime");
+
+        let abs = target.to_str().expect("utf-8 path");
+        let (content, mtime) = read_file(&tmp.path, abs)
             .await
-            .expect_err("out-of-root absolute-path read must be refused by buffer service");
+            .expect("out-of-root absolute read is served read-only");
+        assert_eq!(
+            content, "pub fn dep() {}\n",
+            "out-of-root read returns the file content"
+        );
+        assert_eq!(mtime, on_disk, "out-of-root read reports the on-disk mtime");
+
+        let _ = std::fs::remove_file(&target);
+    }
+
+    /// The carve-out is **read-only**: the exact same out-of-root absolute path
+    /// that `read_file` serves is **refused** by `write_file` and the target is
+    /// left untouched — the read carve-out can never widen into a write outside
+    /// the root.
+    #[tokio::test]
+    async fn test_out_of_root_absolute_path_read_served_but_write_refused() {
+        let tmp = TempDir::new("out-of-root-read-write");
+        let outside = tmp.path.parent().expect("temp has a parent");
+        let target = outside.join("rift-buffer-out-of-root-readonly.rs");
+        std::fs::write(&target, b"original out-of-root\n").expect("write out-of-root file");
+        let abs = target.to_str().expect("utf-8 path");
+
+        // Read is served.
+        let (content, _mtime) = read_file(&tmp.path, abs)
+            .await
+            .expect("out-of-root read is served");
+        assert_eq!(content, "original out-of-root\n");
+
+        // Write of the same absolute path is refused as a path escape.
+        let err = write_file(&tmp.path, abs, "clobbered", SystemTime::UNIX_EPOCH)
+            .await
+            .expect_err("out-of-root absolute-path write must be refused");
         assert!(
             matches!(err, BufferError::PathEscape(_)),
             "expected PathEscape, got {err:?}"
         );
+        // The out-of-root file is untouched by the refused write.
+        assert_eq!(
+            std::fs::read(&target).expect("read back"),
+            b"original out-of-root\n",
+            "a refused out-of-root write must not touch the target"
+        );
+
+        let _ = std::fs::remove_file(&target);
     }
 }
