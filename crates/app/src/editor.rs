@@ -693,6 +693,17 @@ impl EditorView {
 
     /// React to the worktree snapshot reporting a new `mtime` for the open
     /// path. Runs the pure [`decide_external_change`] decision and acts on it.
+    ///
+    /// While a save is in flight (`SaveState::Saving`) the decision is
+    /// suppressed: the save's own atomic write bumps the on-disk `mtime`, and
+    /// the explorer watcher turns that into a worktree update that can reach the
+    /// app *before* the `SaveResult` reply (the worktree update rides the
+    /// broadcast bus, the reply rides the buffer channel). Acting on that
+    /// self-induced bump would surface a false conflict against the editor's own
+    /// in-flight write (#307). The `SaveResult` / `SaveConflict` reply is the
+    /// authoritative reconciliation: it commits the new base `mtime` (so the
+    /// now-stale worktree bump becomes `snapshot <= base` → `None`) or surfaces
+    /// the genuine conflict itself.
     pub fn note_external_change(
         &mut self,
         snapshot_mtime: SystemTime,
@@ -706,7 +717,8 @@ impl EditorView {
         let Some(base) = self.base_mtime else {
             return;
         };
-        match decide_external_change(base, snapshot_mtime, self.dirty) {
+        let saving = matches!(self.save_state, SaveState::Saving);
+        match decide_external_change(base, snapshot_mtime, self.dirty, saving) {
             ExternalChange::None => {}
             ExternalChange::Reload => {
                 self.begin_open(path.clone(), self.read_only, window, cx);
@@ -1356,6 +1368,10 @@ impl Render for EditorView {
 ///
 /// This is the load-bearing concurrent-write rule (`docs/spec-editor.md`):
 ///
+/// - `saving` → [`ExternalChange::None`] (the editor's own in-flight save bumps
+///   the on-disk `mtime`; that self-induced worktree update must not be read as
+///   an external change — the `SaveResult` / `SaveConflict` reply reconciles it,
+///   #307)
 /// - `snapshot <= base` → [`ExternalChange::None`]
 /// - `snapshot > base` and clean buffer → [`ExternalChange::Reload`]
 /// - `snapshot > base` and dirty buffer → [`ExternalChange::Conflict`]
@@ -1363,7 +1379,11 @@ pub fn decide_external_change(
     base: SystemTime,
     snapshot: SystemTime,
     dirty: bool,
+    saving: bool,
 ) -> ExternalChange {
+    if saving {
+        return ExternalChange::None;
+    }
     if snapshot <= base {
         return ExternalChange::None;
     }
@@ -1446,7 +1466,7 @@ mod tests {
     #[test]
     fn test_clean_buffer_with_newer_snapshot_reloads() {
         assert_eq!(
-            decide_external_change(at(100), at(200), false),
+            decide_external_change(at(100), at(200), false, false),
             ExternalChange::Reload
         );
     }
@@ -1454,7 +1474,7 @@ mod tests {
     #[test]
     fn test_dirty_buffer_with_newer_snapshot_conflicts() {
         assert_eq!(
-            decide_external_change(at(100), at(200), true),
+            decide_external_change(at(100), at(200), true, false),
             ExternalChange::Conflict
         );
     }
@@ -1462,11 +1482,11 @@ mod tests {
     #[test]
     fn test_equal_snapshot_is_no_change_regardless_of_dirty() {
         assert_eq!(
-            decide_external_change(at(100), at(100), false),
+            decide_external_change(at(100), at(100), false, false),
             ExternalChange::None
         );
         assert_eq!(
-            decide_external_change(at(100), at(100), true),
+            decide_external_change(at(100), at(100), true, false),
             ExternalChange::None
         );
     }
@@ -1474,12 +1494,53 @@ mod tests {
     #[test]
     fn test_older_snapshot_is_no_change() {
         assert_eq!(
-            decide_external_change(at(200), at(100), false),
+            decide_external_change(at(200), at(100), false, false),
             ExternalChange::None
         );
         assert_eq!(
-            decide_external_change(at(200), at(100), true),
+            decide_external_change(at(200), at(100), true, false),
             ExternalChange::None
+        );
+    }
+
+    // --- self-induced save bump suppression (#307) ---
+
+    #[test]
+    fn test_save_in_flight_suppresses_self_induced_conflict() {
+        // Reproduces #307 at the logic level: the save's own atomic write bumps
+        // the on-disk mtime; the explorer watcher's worktree update (newer
+        // snapshot) can reach the app before the SaveResult reply, while the
+        // buffer is still dirty and the base is the pre-save mtime. Without the
+        // `saving` guard this is `snapshot > base && dirty` → Conflict (the
+        // false banner). With the guard in flight it must be a no-op.
+        assert_eq!(
+            decide_external_change(at(100), at(200), true, true),
+            ExternalChange::None
+        );
+        // The same applies to a clean buffer mid-save (no spurious reload).
+        assert_eq!(
+            decide_external_change(at(100), at(200), false, true),
+            ExternalChange::None
+        );
+    }
+
+    #[test]
+    fn test_genuine_dirty_external_change_still_conflicts_when_not_saving() {
+        // Acceptance #2 / #5: a real out-of-band write to a dirty buffer with no
+        // save in flight must still surface the conflict — the guard only
+        // suppresses the editor's own in-flight save, never a genuine change.
+        assert_eq!(
+            decide_external_change(at(100), at(200), true, false),
+            ExternalChange::Conflict
+        );
+    }
+
+    #[test]
+    fn test_clean_external_change_still_reloads_when_not_saving() {
+        // The clean-buffer auto-reload path is unaffected by the guard.
+        assert_eq!(
+            decide_external_change(at(100), at(200), false, false),
+            ExternalChange::Reload
         );
     }
 
