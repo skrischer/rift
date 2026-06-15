@@ -494,9 +494,11 @@ impl EditorView {
         self.dirty = false;
         self.read_only = read_only;
         self.jump_list = None;
-        // Dismiss any hover popover from the previous file: it is stale the
-        // moment the path changes.
+        // Dismiss any hover popover from the previous file and cancel any
+        // in-flight hover request so a delayed response for the old file does
+        // not land on the new one.
         self.hover_content = None;
+        self.latest_hover_id = None;
 
         self.input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -754,13 +756,19 @@ impl EditorView {
 
     /// Arm (or re-arm) the mouse-rest debounce timer for hover (#197).
     ///
-    /// Called from the `MouseMoveEvent` handler on the outer div. Bumps
-    /// `hover_move_generation` so any in-flight timer from the previous mouse
-    /// movement sees the mismatch and does nothing. When the timer fires and
-    /// the generation still matches, the hover request is dispatched at the
+    /// Called from the `MouseMoveEvent` handler on the outer div. A no-op when
+    /// no file is loaded (saves a detached task spawn on empty/loading state).
+    /// Bumps `hover_move_generation` so any in-flight timer from the previous
+    /// mouse movement sees the mismatch and does nothing. When the timer fires
+    /// and the generation still matches, the hover request is dispatched at the
     /// current cursor position (which follows the last click, making
     /// hover-after-click natural).
     fn arm_hover_debounce(&mut self, cx: &mut Context<Self>) {
+        // Only arm when a file is actually loaded; avoids spawning tasks while
+        // the editor is empty, loading, or failed.
+        if !matches!(self.state, EditorState::Loaded { .. }) {
+            return;
+        }
         self.hover_move_generation = self.hover_move_generation.wrapping_add(1);
         let generation = self.hover_move_generation;
         cx.spawn(async move |this, cx| {
@@ -1138,9 +1146,12 @@ impl Render for EditorView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _window, cx| {
-                    // Dismiss any visible hover popover on click.
-                    if this.hover_content.is_some() {
+                    // Dismiss any visible hover popover on click and cancel any
+                    // in-flight hover request so a delayed response does not
+                    // re-open the popover after the user clicked away.
+                    if this.hover_content.is_some() || this.latest_hover_id.is_some() {
                         this.hover_content = None;
+                        this.latest_hover_id = None;
                         cx.notify();
                     }
                     if event.modifiers.secondary() {
