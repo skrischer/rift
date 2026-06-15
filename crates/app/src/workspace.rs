@@ -72,7 +72,8 @@ pub struct WorkspaceChannels {
     /// Buffer-channel replies to route to the editor: `FileContent` (load),
     /// `SaveResult` (save landed), `SaveConflict` (save refused).
     pub buffer_rx: Receiver<DaemonMessage>,
-    /// Nav replies to route to the editor: `DefinitionResponse` (#196).
+    /// Nav replies to route to the editor: `DefinitionResponse` (#196),
+    /// `HoverResponse` (#197), `ReferencesResponse` (#198).
     pub nav_rx: Receiver<DaemonMessage>,
     /// Read requests: the root-relative path of a file to open. The tokio side
     /// turns each into a `ClientMessage::OpenFile`.

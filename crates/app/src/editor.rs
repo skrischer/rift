@@ -543,10 +543,11 @@ impl EditorView {
         self.jump_list = None;
         self.jump_list_kind = None;
         // Dismiss any hover popover from the previous file and cancel any
-        // in-flight hover request so a delayed response for the old file does
-        // not land on the new one.
+        // in-flight hover/references request so a delayed response for the old
+        // file does not land on the new one.
         self.hover_content = None;
         self.latest_hover_id = None;
+        self.latest_ref_id = None;
 
         self.input = cx.new(|cx| {
             InputState::new(window, cx)
