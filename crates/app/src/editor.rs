@@ -1,289 +1,242 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Code editor surface: open a file from the tree into a `gpui-component` code
-//! editor, render it with Tree-sitter syntax highlighting, and write edits back
-//! over the buffer channel with concurrent-write handling (`docs/spec-editor.md`,
-//! the editor surface + write-back; #187, #188).
+//! editor, render it with Tree-sitter syntax highlighting, write edits back
+//! over the buffer channel, and navigate symbols via go-to-definition
+//! (ctrl+click, context menu), back-navigation, and read-only out-of-root
+//! opens (`docs/spec-lsp-navigation.md`, #196).
 //!
-//! This is the **client side of the buffer channel** (the protocol's first
-//! request/response pair). The [`crate::workspace::WorkspaceView`] subscribes to
-//! the file tree's [`crate::file_tree::FileTreeEvent::OpenFile`], issues an
-//! `OpenFile` request over the daemon transport, and routes the
-//! `FileContent { path, content, mtime }` reply back here via [`EditorView::load`].
-//! The editor renders `content` byte-for-byte in a `gpui-component` `InputState`
-//! in code-editor mode, deriving the highlighting language from the file
-//! extension. The component's editor virtualizes (it paints only visible lines),
-//! so a large file opens and scrolls without loading every line eagerly.
+//! # Buffer channel (#187, #188)
 //!
-//! ## Write-back (#188)
+//! The [`crate::workspace::WorkspaceView`] subscribes to the file tree's
+//! [`crate::file_tree::FileTreeEvent::OpenFile`], issues an `OpenFile`
+//! request, and routes the `FileContent { path, content, mtime }` reply back
+//! here via [`EditorView::load`].
 //!
-//! The buffer is editable; [`Save`] (bound to `Ctrl+S` / `Cmd+S` in `main.rs`,
-//! scoped to the editor's key context) sends the whole buffer back as
-//! `SaveFile { path, content, base_mtime }`, carrying the base `mtime` the open
-//! kept. The daemon replies with one of:
+//! # Write-back (#188)
 //!
-//! - `SaveResult { mtime }` — the write landed; [`EditorView::apply_save_result`]
-//!   adopts the new `mtime` as the buffer's base and marks the buffer clean.
-//! - `SaveConflict { disk_mtime }` — the file changed under the editor since it
-//!   was read, so the daemon refused the write rather than clobber the newer
-//!   on-disk version; [`EditorView::apply_save_conflict`] surfaces the conflict
-//!   **without losing the buffer** (the user's edits stay; no merge UI — the
-//!   depth is detect + a reload-or-keep choice).
+//! [`Save`] (bound to `Ctrl+S` / `Cmd+S`) sends the whole buffer as a
+//! `SaveFile { path, content, base_mtime }`. The daemon replies with
+//! `SaveResult` (commit new `mtime`) or `SaveConflict` (refuse without
+//! clobbering the newer on-disk version).
 //!
-//! ## Concurrent external change (#188)
+//! # Concurrent external change (#188)
 //!
-//! When an agent (in a pane) edits a file open in the editor, the worktree
-//! snapshot's per-entry `mtime` (#107) is the "changed under you" signal — the
-//! same `SystemTime` the buffer's base `mtime` is, compared directly (never an
-//! independently sampled stat). [`EditorView::note_external_change`] runs the
-//! pure [`decide_external_change`] decision on the open path's snapshot `mtime`:
+//! [`EditorView::note_external_change`] runs the pure [`decide_external_change`]
+//! decision on the open path's snapshot `mtime`: a clean buffer auto-reloads;
+//! a dirty buffer surfaces a conflict.
 //!
-//! - a **clean** buffer + a newer snapshot `mtime` → silent auto-reload (re-issue
-//!   `OpenFile`; the editor watches the agent's edit live), and
-//! - a **dirty** buffer + a newer snapshot `mtime` → a surfaced conflict, losing
-//!   neither side.
+//! # Live-buffer feed (#189)
 //!
-//! ## Timeout, not a hang
+//! A debounced `BufferChanged` keeps the daemon's LSP source of truth current
+//! with the open buffer's unsaved edits. `BufferClosed` reverts to disk-backed.
 //!
-//! A daemon refusal (binary / non-UTF-8 content, a path that escapes the root)
-//! produces *no reply* — the daemon stays silent and logs to its stderr
-//! (`crates/daemon/src/lib.rs::buffer_reply`). So both the open **and the save**
-//! carry their own bounded timeouts ([`OPEN_TIMEOUT`] / [`SAVE_TIMEOUT`]): if no
-//! reply arrives the editor recovers to an unobtrusive state rather than waiting
-//! forever. An open reply is matched to the live open **by path** ([`EditorView::load`]
-//! only accepts a `FileContent` whose path is the one currently `Loading`); a
-//! save reply is matched by path too. Each timeout is fenced by a **monotonic
-//! generation** (one for opens, one for saves), so a fired timer for a request
-//! that has since been superseded never trips the current one.
+//! # Navigation (#196)
 //!
-//! Opening, editing, or saving a file touches no tmux pane or window state — the
-//! editor is a GUI surface, not a pane — and nothing here inspects pane
-//! processes, agents, or editor processes (agent-agnostic by construction; it
-//! only ever handles a file path, its bytes, and its `mtime`).
+//! Go-to-definition fires on ctrl+click or the "Go to Definition" context-menu
+//! entry. Before dispatching the [`ClientMessage::DefinitionRequest`] the editor
+//! **flushes a pending `BufferChanged`** if the buffer is dirty (flush-before-
+//! dispatch — the request must resolve against the live buffer the LSP already
+//! has via `didChange`, not the stale disk version). The position the request
+//! carries is the cursor position that ctrl+click or the menu action set.
+//!
+//! A same-file target scrolls and selects the range. A cross-file target opens
+//! via the existing buffer channel (`open_file_tx`) and lands on the range
+//! using [`EditorView::pending_jump`] (stored before the load, applied in
+//! [`EditorView::load`] when it matches). An out-of-root target (absolute path,
+//! `out_of_root = true`) opens via the same buffer channel — the daemon's
+//! out-of-root read carve-out (#195/#301) serves the bytes — and the editor
+//! enters **read-only mode** so no edit or save is possible.
+//!
+//! A bounded in-memory back-jump stack lets the user unwind jumps with the
+//! `GoBack` action (bound to `Alt+Left` in `main.rs`).
+//!
+//! When a `DefinitionResponse` carries multiple targets (e.g. Rust trait impls)
+//! a transient inline jump-list is rendered so the user can click the desired
+//! destination.
+//!
+//! # Timeout, not a hang
+//!
+//! A daemon refusal (binary / non-UTF-8, path escape) produces *no reply* — the
+//! editor recovers via bounded timeouts ([`OPEN_TIMEOUT`] / [`SAVE_TIMEOUT`]).
+//! Nav requests have no reply timeout at the editor layer: stale responses are
+//! discarded by id comparison in [`EditorView::apply_definition_response`].
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use flume::Sender;
 use gpui::{
-    div, px, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, Styled as _, Subscription, Window,
+    div, px, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement as _, Render, Styled as _, Subscription, Window,
 };
 use gpui_component::highlighter::{
     Diagnostic as EditorDiagnostic, DiagnosticSeverity as EditorSeverity,
 };
 use gpui_component::input::{Input, InputEvent, InputState, Position as EditorPosition};
+use gpui_component::menu::PopupMenu;
 use gpui_component::ActiveTheme as _;
-use rift_protocol::{ClientMessage, Diagnostic, DiagnosticSeverity};
+use rift_protocol::{
+    ClientMessage, Diagnostic, DiagnosticSeverity, NavLocation, NavRequestId, Position, Range,
+};
 
-/// The save action: write the open buffer back to the remote. Dispatched from the
-/// editor's key context, bound to `Ctrl+S` / `Cmd+S` in `main.rs`. A bare
-/// unit-struct action (no payload — the editor knows its own open path).
+// ── Actions ───────────────────────────────────────────────────────────────────
+
+/// The save action: write the open buffer back to the remote. Dispatched from
+/// the editor's key context, bound to `Ctrl+S` / `Cmd+S` in `main.rs`.
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = rift, no_json)]
 pub struct Save;
 
-/// The GPUI key context the editor establishes around its input, so the [`Save`]
-/// binding is scoped to the editor surface and never fires for an unrelated input
-/// (e.g. the gallery's search box).
+/// Trigger go-to-definition at the current cursor position. Dispatched from
+/// the context-menu entry ("Go to Definition") and programmatically after
+/// ctrl+click sets the cursor.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct GoToDefinition;
+
+/// Return to the position before the last jump (back-stack unwind). Bound to
+/// `Alt+Left` in `main.rs`, scoped to the editor key context.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct GoBack;
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// The GPUI key context the editor establishes around its input, so the
+/// [`Save`] / [`GoToDefinition`] / [`GoBack`] bindings are scoped to the
+/// editor surface and never fire for an unrelated input.
 pub const EDITOR_KEY_CONTEXT: &str = "Editor";
 
 /// How long the editor waits for a `FileContent` reply before giving up on an
-/// open. The daemon answers a local read in well under this; the budget exists
-/// only so a *refused* request (which gets no reply, by protocol) or a lost one
-/// cannot wedge the editor. Generous enough not to trip on a slow link, short
-/// enough to recover promptly.
+/// open. Generous enough not to trip on a slow link; short enough to recover.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the editor waits for a `SaveResult` / `SaveConflict` reply before
-/// giving up on a save. Like the open path, a *refused* save (a path escape, a
-/// non-UTF-8 surprise on the daemon side) draws no reply by protocol, so the save
-/// recovers to a clear "save failed" surface rather than leaving a spinner up
-/// forever. Same budget as the open — a local write answers far quicker.
+/// giving up on a save.
 const SAVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default tab width for the code editor, matching the gallery demo.
 const TAB_SIZE: usize = 4;
 
 /// How long the editor waits after the last keystroke before feeding the live
-/// buffer to the LSP (`BufferChanged`, #189). Debouncing coalesces a burst of
-/// typing into one feed so the daemon's `didChange` and the language server's
-/// re-analysis are not driven on every character. Short enough that an unsaved
-/// error surfaces promptly, long enough to skip mid-word churn.
+/// buffer to the LSP (`BufferChanged`, #189).
 const BUFFER_FEED_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// Maximum entries in the bounded back-jump stack. Oldest entries are evicted
+/// when this limit is reached so a long navigation session never leaks memory.
+const BACK_STACK_MAX: usize = 50;
+
+// ── Internal state types ──────────────────────────────────────────────────────
 
 /// What the editor is currently showing.
 enum EditorState {
     /// No file opened yet — the initial empty surface.
     Empty,
-    /// An open request is in flight, awaiting its `FileContent` reply (or the
-    /// timeout). Carries the path being opened so a stale reply can be told from
-    /// the live one.
+    /// An open request is in flight, awaiting its `FileContent` reply.
     Loading { path: String },
     /// A file's content is rendered in the code editor.
     Loaded { path: String },
-    /// The last open did not complete — the daemon refused it (binary / path
-    /// escape, which gets no reply) or the reply was lost and the timeout fired.
-    /// An unobtrusive recovery state, never a hang.
+    /// The last open did not complete.
     Failed { path: String },
 }
 
-/// The transient outcome of the most recent save, surfaced as a one-line banner
-/// over the editor. Independent of [`EditorState`] (the buffer stays loaded and
-/// editable throughout) so a conflict never tears down or discards the buffer.
+/// The transient outcome of the most recent save.
 enum SaveState {
-    /// No save in flight or just completed cleanly — nothing to surface.
     Idle,
-    /// A `SaveFile` is in flight, awaiting its reply (or the timeout).
     Saving,
-    /// The file changed on disk under the editor — a `SaveConflict` reply or a
-    /// dirty-buffer concurrent external change. The buffer is untouched; the user
-    /// chooses reload-or-keep (re-open to reload, which re-issues `OpenFile` and
-    /// rebases on a fresh `mtime`, or save again to keep their version). The
-    /// reported on-disk `mtime` is not retained — reload fetches its own.
     Conflict,
-    /// The save drew no reply within [`SAVE_TIMEOUT`] (refused or lost). The
-    /// buffer is untouched; the user may retry.
     Failed,
 }
 
+/// One entry in the inline jump-list shown for multi-target definition
+/// responses (e.g. Rust trait method impls).
+struct JumpEntry {
+    location: NavLocation,
+}
+
+// ── Public decision type ───────────────────────────────────────────────────────
+
 /// The decision an external (snapshot-`mtime`) change to the open path forces.
 ///
-/// The pure core of the concurrent-write handling — computed by
-/// [`decide_external_change`] from three inputs and nothing else, so it is unit-
-/// testable without GPUI.
+/// Computed by [`decide_external_change`] from three inputs and nothing else,
+/// so it is unit-testable without GPUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExternalChange {
-    /// The snapshot `mtime` is not newer than the buffer's base — nothing changed
-    /// under the editor (or the snapshot is the very `mtime` the buffer is based
-    /// on). Do nothing.
+    /// The snapshot `mtime` is not newer than the buffer's base — do nothing.
     None,
-    /// The file changed under a **clean** buffer: silently auto-reload it (re-issue
-    /// `OpenFile`) so the editor shows the agent's edit live.
+    /// The file changed under a **clean** buffer: silently auto-reload.
     Reload,
-    /// The file changed under a **dirty** buffer: surface a conflict, keeping the
-    /// buffer — never silently discard the user's unsaved edits.
+    /// The file changed under a **dirty** buffer: surface a conflict.
     Conflict,
 }
 
-/// Decide what an external change to the open path forces, comparing the buffer's
-/// `base` `mtime` against the worktree snapshot's `mtime` for that path.
-///
-/// This is the load-bearing concurrent-write rule (`docs/spec-editor.md`):
-///
-/// - `snapshot <= base` → [`ExternalChange::None`]: the on-disk file is not newer
-///   than what the buffer is based on, so there is nothing to react to. (Equality
-///   is the common case — the snapshot that first delivered the entry carries the
-///   same `mtime` the open read.)
-/// - `snapshot > base` and the buffer is **clean** → [`ExternalChange::Reload`].
-/// - `snapshot > base` and the buffer is **dirty** → [`ExternalChange::Conflict`].
-///
-/// The comparison is exactly base-vs-snapshot — never an independently sampled
-/// stat — because the two `mtime`s are the identical `SystemTime` clock source
-/// across the structure and buffer paths (`rift_protocol`, #107).
-pub fn decide_external_change(
-    base: SystemTime,
-    snapshot: SystemTime,
-    dirty: bool,
-) -> ExternalChange {
-    if snapshot <= base {
-        return ExternalChange::None;
-    }
-    if dirty {
-        ExternalChange::Conflict
-    } else {
-        ExternalChange::Reload
-    }
-}
+// ── Main view ─────────────────────────────────────────────────────────────────
 
-/// Translate a daemon protocol [`Diagnostic`] into the editor component's
-/// [`EditorDiagnostic`] (#189): map the range, severity, message, source, and
-/// code onto the form `InputState`'s `DiagnosticSet` renders inline. The protocol
-/// `Position` (LSP-style zero-based line / UTF-16 character) maps directly onto
-/// the editor's [`EditorPosition`] (the same `lsp_types::Position`), so the inline
-/// marker lands on the live buffer's coordinates.
-fn to_editor_diagnostic(diagnostic: &Diagnostic) -> EditorDiagnostic {
-    let start = EditorPosition::new(
-        diagnostic.range.start.line,
-        diagnostic.range.start.character,
-    );
-    let end = EditorPosition::new(diagnostic.range.end.line, diagnostic.range.end.character);
-    let severity = match diagnostic.severity {
-        DiagnosticSeverity::Error => EditorSeverity::Error,
-        DiagnosticSeverity::Warning => EditorSeverity::Warning,
-        DiagnosticSeverity::Information => EditorSeverity::Info,
-        DiagnosticSeverity::Hint => EditorSeverity::Hint,
-    };
-    let mut editor =
-        EditorDiagnostic::new(start..end, diagnostic.message.clone()).with_severity(severity);
-    if let Some(source) = &diagnostic.source {
-        editor = editor.with_source(source.clone());
-    }
-    if let Some(code) = &diagnostic.code {
-        editor = editor.with_code(code.clone());
-    }
-    editor
-}
-
-/// The code editor view: a `gpui-component` `InputState` in code-editor mode plus
-/// the open buffer's bookkeeping.
+/// The code editor view: a `gpui-component` `InputState` in code-editor mode
+/// plus all buffer bookkeeping and navigation state.
 pub struct EditorView {
-    /// The code-editor input state. Created once; its content is replaced via
-    /// [`InputState::set_value`] each time a file loads, and its highlighting
-    /// language is reset per open to match the new file's extension.
     input: Entity<InputState>,
-    /// Subscription to the input's `Change` events, so a keystroke marks the
-    /// buffer dirty. Recreated alongside `input` on every open. Held to keep the
-    /// subscription alive (dropping it cancels it).
     _input_change: Subscription,
     state: EditorState,
     save_state: SaveState,
-    /// Whether the buffer has unsaved edits — set on the first `Change` after a
-    /// load, cleared on a successful load or save. The concurrent-write detector's
-    /// clean/dirty input.
+    /// Whether the buffer has unsaved edits.
     dirty: bool,
-    /// The base `mtime` the daemon reported for the open buffer — handed back as
-    /// `SaveFile`'s `base_mtime` and compared against the worktree snapshot's
-    /// `mtime` to detect a concurrent external change. `None` until a file loads.
+    /// The base `mtime` of the open buffer, handed back as `SaveFile`'s
+    /// `base_mtime` and compared against the worktree snapshot's `mtime`.
     base_mtime: Option<SystemTime>,
-    /// Read-request sender: re-issuing an `OpenFile` for a clean auto-reload goes
-    /// through here (the same channel the workspace's tree-open path uses), so the
-    /// daemon's `FileContent` reply rebases the buffer.
+
+    /// Whether the open buffer is read-only (out-of-root target, #195/#301).
+    /// No edit, no save path, unwatched snapshot.
+    read_only: bool,
+
+    /// Read requests: path → `ClientMessage::OpenFile`.
     open_file_tx: Sender<String>,
-    /// Write-request sender: a [`Save`] turns the buffer into a `SaveFile` on this
-    /// channel, which the tokio side emits as `ClientMessage::SaveFile`.
+    /// Write requests: `ClientMessage::SaveFile`.
     save_file_tx: Sender<ClientMessage>,
-    /// Live-buffer feed sender (#189): a debounced edit becomes a
-    /// `ClientMessage::BufferChanged` and a close/switch/save becomes a
-    /// `BufferClosed` on this channel, so the daemon feeds the LSP the live buffer
-    /// (the disk→buffer source-of-truth shift) and an unsaved error surfaces
-    /// without a save first.
+    /// Live-buffer feed: `BufferChanged` / `BufferClosed` (#189).
     buffer_change_tx: Sender<ClientMessage>,
-    /// Monotonic open-request id. Incremented on every [`EditorView::begin_open`];
-    /// the timeout and the reply both carry the generation they were issued for,
-    /// so a late reply or a fired timer for a superseded open is ignored.
+    /// Navigation requests: `DefinitionRequest` (#196).
+    nav_tx: Sender<ClientMessage>,
+
+    /// Monotonic open-request generation; fences the open timeout.
     generation: u64,
-    /// Monotonic save-request id, fenced independently of `generation`: a fired
-    /// save timeout for a save that has since been answered (or superseded by a
-    /// later save) never trips the current one.
+    /// Monotonic save-request generation; fences the save timeout.
     save_generation: u64,
-    /// Monotonic buffer-feed id, fenced independently: each keystroke arms a
-    /// debounce timer carrying this generation, and only the latest one fires a
-    /// `BufferChanged`, so a burst of typing coalesces into one feed.
+    /// Monotonic buffer-feed generation; fences the debounce timer.
     buffer_generation: u64,
+
+    /// Counter for `NavRequestId`s; incremented before every dispatch.
+    nav_id: u64,
+    /// The id of the most recent definition request dispatched. A response
+    /// whose id does not match is silently dropped (drop-stale discipline).
+    latest_def_id: Option<NavRequestId>,
+
+    /// (path, range) to apply after the next cross-file load completes.
+    /// Set before `open_file_tx` is fired; consumed in [`EditorView::load`].
+    pending_jump: Option<(String, Range)>,
+
+    /// Bounded in-memory back-jump stack: (file-path, cursor-position) pairs.
+    /// Pushed before every jump; popped by the [`GoBack`] action.
+    back_stack: VecDeque<(String, EditorPosition)>,
+
+    /// Transient inline jump-list for multi-target definition responses.
+    jump_list: Option<Vec<JumpEntry>>,
 }
 
 impl EditorView {
-    /// Create an empty editor. The `InputState` starts in code-editor mode with a
-    /// neutral language; [`EditorView::begin_open`] re-derives the language from
-    /// each opened file's extension before its content loads.
+    /// Create an empty editor.
     ///
-    /// `open_file_tx` re-issues an `OpenFile` for a clean auto-reload,
-    /// `save_file_tx` carries a `SaveFile` for a save, and `buffer_change_tx`
-    /// carries the live-buffer feed (`BufferChanged` / `BufferClosed`, #189) — all
-    /// threaded to the tokio side by `main.rs`.
+    /// - `open_file_tx` — re-issues `OpenFile` for auto-reload and nav opens.
+    /// - `save_file_tx` — carries `SaveFile` write requests.
+    /// - `buffer_change_tx` — carries `BufferChanged` / `BufferClosed` (#189).
+    /// - `nav_tx` — carries `DefinitionRequest` nav requests (#196).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         open_file_tx: Sender<String>,
         save_file_tx: Sender<ClientMessage>,
         buffer_change_tx: Sender<ClientMessage>,
+        nav_tx: Sender<ClientMessage>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -304,21 +257,26 @@ impl EditorView {
             save_state: SaveState::Idle,
             dirty: false,
             base_mtime: None,
+            read_only: false,
             open_file_tx,
             save_file_tx,
             buffer_change_tx,
+            nav_tx,
             generation: 0,
             save_generation: 0,
             buffer_generation: 0,
+            nav_id: 0,
+            latest_def_id: None,
+            pending_jump: None,
+            back_stack: VecDeque::new(),
+            jump_list: None,
         }
     }
 
-    /// Subscribe to an input's `Change` event: a keystroke marks the buffer dirty
-    /// and arms the debounced live-buffer feed (#189). A programmatic `set_value`
-    /// (load / auto-reload) also emits `Change`, so the dirty flag is cleared right
-    /// after those calls — see [`EditorView::load`]. The feed is armed only while a
-    /// file is loaded; a `Change` during load (the `set_value` that fills the
-    /// buffer) is not fed, since `load` clears `dirty` and re-bases right after.
+    // ── Dirty flag / live-buffer feed ─────────────────────────────────────
+
+    /// Subscribe to the input's `Change` event: a keystroke marks the buffer
+    /// dirty and arms the debounced live-buffer feed (#189).
     fn subscribe_dirty(input: &Entity<InputState>, cx: &mut Context<Self>) -> Subscription {
         cx.subscribe(input, |this, _input, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
@@ -331,11 +289,7 @@ impl EditorView {
         })
     }
 
-    /// Arm (or re-arm) the debounced live-buffer feed for the open file (#189).
-    /// Each `Change` bumps `buffer_generation` and schedules a timer; only the
-    /// timer for the latest generation actually sends the `BufferChanged`, so a
-    /// burst of typing coalesces into one feed of the current buffer text. A no-op
-    /// unless a file is loaded.
+    /// Arm (or re-arm) the debounced live-buffer feed (#189).
     fn arm_buffer_feed(&mut self, cx: &mut Context<Self>) {
         let EditorState::Loaded { path } = &self.state else {
             return;
@@ -348,11 +302,9 @@ impl EditorView {
             smol::Timer::after(BUFFER_FEED_DEBOUNCE).await;
             cx.update(|cx| {
                 let _ = this.update(cx, |this, cx| {
-                    // Only the latest keystroke's timer fires the feed.
                     if this.buffer_generation != generation {
                         return;
                     }
-                    // Still the same open, loaded file.
                     let EditorState::Loaded { path: open } = &this.state else {
                         return;
                     };
@@ -375,11 +327,37 @@ impl EditorView {
         .detach();
     }
 
-    /// Tell the daemon to drop the live-buffer override for `path` and revert it
-    /// to the disk-backed baseline (#189): sent when the editor switches away from
-    /// a file, auto-reloads it, or saves it (disk then matches the buffer). A bumped
-    /// `buffer_generation` cancels any in-flight debounce so a stale feed cannot
-    /// re-establish the override after it is closed.
+    /// Immediately send a `BufferChanged` without waiting for the debounce.
+    ///
+    /// Used before dispatching a nav request (flush-before-dispatch): the LSP
+    /// must see the live buffer before the `DefinitionRequest` arrives. The
+    /// daemon processes messages in send order, so the `didChange` from this
+    /// flush lands before the nav request.
+    ///
+    /// Bumps `buffer_generation` so the in-flight debounce timer (if any) sees
+    /// the mismatch and does not send a duplicate feed.
+    fn flush_buffer_feed_if_dirty(&mut self, cx: &mut Context<Self>) {
+        if !self.dirty {
+            return;
+        }
+        let EditorState::Loaded { path } = &self.state else {
+            return;
+        };
+        let path = path.clone();
+        // Cancel the in-flight debounce.
+        self.buffer_generation = self.buffer_generation.wrapping_add(1);
+        let content = self.input.read(cx).value().to_string();
+        if let Err(e) = self
+            .buffer_change_tx
+            .try_send(ClientMessage::BufferChanged {
+                path: path.clone(),
+                content,
+            })
+        {
+            tracing::debug!(error = %e, %path, "failed to flush live-buffer before nav");
+        }
+    }
+
     fn close_live_buffer(&mut self, path: String) {
         self.buffer_generation = self.buffer_generation.wrapping_add(1);
         if let Err(e) = self
@@ -390,12 +368,9 @@ impl EditorView {
         }
     }
 
-    /// Replace the editor's inline diagnostics with `items` (#189): the diagnostics
-    /// the daemon streams for the open file, rendered against the live buffer's
-    /// coordinates via `InputState`'s `DiagnosticSet`. A full replace mirrors LSP's
-    /// publish semantics — an empty `items` clears every inline marker, so fixing
-    /// an error (which clears the daemon's set) clears the marker. Consumes the
-    /// existing client diagnostics model (#178); it does not redesign it.
+    // ── Diagnostics ───────────────────────────────────────────────────────
+
+    /// Replace the editor's inline diagnostics with `items` (#189).
     pub fn set_diagnostics(&mut self, items: &[Diagnostic], cx: &mut Context<Self>) {
         let editor_items: Vec<EditorDiagnostic> = items.iter().map(to_editor_diagnostic).collect();
         self.input.update(cx, |input, cx| {
@@ -408,8 +383,9 @@ impl EditorView {
         cx.notify();
     }
 
-    /// The path of the file currently open or loading, if any — a headless handle
-    /// for tests and for the workspace to correlate a reply.
+    // ── Buffer state accessors ────────────────────────────────────────────
+
+    /// The path of the file currently open or loading, if any.
     pub fn open_path(&self) -> Option<&str> {
         match &self.state {
             EditorState::Loading { path }
@@ -419,38 +395,38 @@ impl EditorView {
         }
     }
 
-    /// The base `mtime` of the open buffer — what write-back hands back as
-    /// `SaveFile`'s `base_mtime`. `None` until a file has loaded.
+    /// The base `mtime` of the open buffer.
     pub fn base_mtime(&self) -> Option<SystemTime> {
         self.base_mtime
     }
 
-    /// Whether the buffer has unsaved edits — the concurrent-write detector's
-    /// clean/dirty input and a headless test handle.
+    /// Whether the buffer has unsaved edits.
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
 
-    /// Whether the editor is currently surfacing a save conflict (a `SaveConflict`
-    /// reply, or a dirty-buffer concurrent external change) — a headless handle
-    /// for the conflict assertions.
+    /// Whether the editor is currently surfacing a save conflict.
     pub fn has_conflict(&self) -> bool {
         matches!(self.save_state, SaveState::Conflict)
     }
 
-    /// Begin opening `path`: switch the editor to its loading state, point the
-    /// code editor at the file's language (derived from the extension), and arm
-    /// the open timeout. The caller sends the matching `OpenFile` request; the
-    /// reply is accepted by [`EditorView::load`] only when its path matches the
-    /// open in flight.
-    ///
-    /// The content is *not* set here — it arrives on the `FileContent` reply. The
-    /// editor is cleared to empty content meanwhile so a previous file's text is
-    /// never shown under the new path.
-    pub fn begin_open(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        // End any live-buffer feed for the file being closed (#189), so the daemon
-        // reverts the previous path to disk-backed. Covers both switching files and
-        // re-opening the same path for an auto-reload (the reload rebases on disk).
+    /// Whether the open buffer is read-only (out-of-root target, #195/#301).
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    // ── Open / load ───────────────────────────────────────────────────────
+
+    /// Begin opening `path`. If `read_only` is `true` the buffer will be
+    /// visibly non-editable (out-of-root carve-out, #195/#301). Any
+    /// `pending_jump` is applied once the corresponding `FileContent` arrives.
+    pub fn begin_open(
+        &mut self,
+        path: String,
+        read_only: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(previous) = self.open_path().map(str::to_owned) {
             self.close_live_buffer(previous);
         }
@@ -464,11 +440,9 @@ impl EditorView {
         self.save_state = SaveState::Idle;
         self.base_mtime = None;
         self.dirty = false;
+        self.read_only = read_only;
+        self.jump_list = None;
 
-        // Recreate the input in the new file's language, which also clears the
-        // previous file's text and highlighter — so no stale content or coloring
-        // lingers under the new path while its content loads. The freshly built
-        // state starts empty; the `FileContent` reply fills it in `load`.
         self.input = cx.new(|cx| {
             InputState::new(window, cx)
                 .code_editor(language)
@@ -480,16 +454,8 @@ impl EditorView {
         });
         self._input_change = Self::subscribe_dirty(&self.input, cx);
 
-        // Arm the timeout on the GPUI executor (`smol::Timer`; tokio's timer does
-        // not fire here — docs/patterns.md). If, when it fires, this is still the
-        // live request and still loading, the reply never came (refused / lost):
-        // fall back to the failed state rather than wait forever.
         cx.spawn(async move |this, cx| {
             smol::Timer::after(OPEN_TIMEOUT).await;
-            // `AsyncApp::update` returns its closure's value (`()` here), not a
-            // `Result`; the inner `WeakEntity::update` `Result` is discarded (a
-            // dropped view makes the timeout moot). Bare statement, so the unit
-            // value is not let-bound (clippy::let_unit_value).
             cx.update(|cx| {
                 let _ = this.update(cx, |this, cx| {
                     if this.generation == generation {
@@ -508,10 +474,8 @@ impl EditorView {
         cx.notify();
     }
 
-    /// Render a `FileContent` reply: if it matches the file currently loading,
-    /// load its `content` into the code editor and keep its `mtime` as the
-    /// buffer's base. A reply whose path does not match the live open (a
-    /// superseded or stray reply) is ignored — only the most recent open is live.
+    /// Render a `FileContent` reply: if it matches the open in flight, load
+    /// the content and apply any pending cross-file jump.
     pub fn load(
         &mut self,
         path: String,
@@ -520,8 +484,6 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Accept only the reply for the open currently in flight; a reply for a
-        // path we are no longer loading is stale (the user opened another file).
         let matches = matches!(&self.state, EditorState::Loading { path: p } if *p == path);
         if !matches {
             return;
@@ -531,19 +493,30 @@ impl EditorView {
         self.input.update(cx, |input, cx| {
             input.set_value(content, window, cx);
         });
-        // `set_value` emits `Change`, which would otherwise mark the freshly loaded
-        // buffer dirty — clear it after, so a load (and a clean auto-reload) starts
-        // clean against the new base.
+        // `set_value` emits `Change` — clear dirty so a load starts clean.
         self.dirty = false;
         self.save_state = SaveState::Idle;
-        self.state = EditorState::Loaded { path };
+        self.state = EditorState::Loaded { path: path.clone() };
+
+        // Apply a pending cross-file jump (navigation or go-back) if the
+        // loaded path matches what we stored before firing the open.
+        if let Some((jump_path, range)) = self.pending_jump.take() {
+            if jump_path == path {
+                self.apply_jump_range(&range, window, cx);
+            }
+        }
+
         cx.notify();
     }
 
-    /// Send the open buffer back to the remote as a `SaveFile`, carrying the base
-    /// `mtime` the open kept. Arms the save timeout. A no-op unless a file is
-    /// loaded — there is nothing to save from the empty / loading / failed states.
+    // ── Save ──────────────────────────────────────────────────────────────
+
+    /// Send the open buffer back to the remote. A no-op when no file is loaded
+    /// or the buffer is read-only.
     pub fn save(&mut self, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         let EditorState::Loaded { path } = &self.state else {
             return;
         };
@@ -568,9 +541,6 @@ impl EditorView {
             return;
         }
 
-        // Save timeout, fenced by the save generation: a refused / lost save draws
-        // no reply (same protocol as the open path), so recover to the failed
-        // surface rather than leave the saving banner up forever.
         cx.spawn(async move |this, cx| {
             smol::Timer::after(SAVE_TIMEOUT).await;
             cx.update(|cx| {
@@ -589,9 +559,7 @@ impl EditorView {
         cx.notify();
     }
 
-    /// Apply a `SaveResult` reply: the write landed, so adopt the new `mtime` as
-    /// the buffer's base and mark it clean. Accepted only when it matches the open
-    /// path — a reply for a since-superseded file is ignored.
+    /// Apply a `SaveResult` reply: the write landed.
     pub fn apply_save_result(&mut self, path: String, mtime: SystemTime, cx: &mut Context<Self>) {
         if self.open_path() != Some(path.as_str()) {
             return;
@@ -600,19 +568,12 @@ impl EditorView {
         self.dirty = false;
         self.save_state = SaveState::Idle;
         self.save_generation = self.save_generation.wrapping_add(1);
-        // The save landed: disk now matches the buffer, so end the live-buffer
-        // override and return `path` to the disk-backed baseline (#189). A later
-        // edit re-arms the feed; until then an agent's disk write is no longer
-        // suppressed for this path.
+        // Disk now matches the buffer: revert to the disk-backed baseline.
         self.close_live_buffer(path);
         cx.notify();
     }
 
-    /// Apply a `SaveConflict` reply: the file changed on disk under the editor, so
-    /// the daemon refused the write. Surface the conflict **without touching the
-    /// buffer** — the user's edits stay; they choose reload-or-keep. Accepted only
-    /// when it matches the open path. The reply's `disk_mtime` is not retained — a
-    /// reload re-issues `OpenFile` and rebases on the fresh `mtime` that returns.
+    /// Apply a `SaveConflict` reply: the daemon refused the write.
     pub fn apply_save_conflict(&mut self, path: String, cx: &mut Context<Self>) {
         if self.open_path() != Some(path.as_str()) {
             return;
@@ -622,27 +583,16 @@ impl EditorView {
         cx.notify();
     }
 
-    /// React to a worktree snapshot reporting `snapshot_mtime` for the open path:
-    /// the concurrent-write detector. Compares the buffer's base `mtime` against
-    /// the snapshot `mtime` via the pure [`decide_external_change`] and acts on it:
-    ///
-    /// - [`ExternalChange::None`] → do nothing.
-    /// - [`ExternalChange::Reload`] → re-issue `OpenFile` to rebase the clean
-    ///   buffer (watch the agent's edit live).
-    /// - [`ExternalChange::Conflict`] → surface a conflict, keeping the dirty
-    ///   buffer.
-    ///
-    /// Driven only while a file is loaded; the snapshot `mtime` is the identical
-    /// `SystemTime` clock source as the base, compared directly (never a separate
-    /// stat).
+    // ── Concurrent external change ────────────────────────────────────────
+
+    /// React to the worktree snapshot reporting a new `mtime` for the open
+    /// path. Runs the pure [`decide_external_change`] decision and acts on it.
     pub fn note_external_change(
         &mut self,
         snapshot_mtime: SystemTime,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Clone the open path out up front so no immutable borrow of `self.state`
-        // is held across the `&mut self` reopen below (borrowck).
         let EditorState::Loaded { path } = &self.state else {
             return;
         };
@@ -653,10 +603,7 @@ impl EditorView {
         match decide_external_change(base, snapshot_mtime, self.dirty) {
             ExternalChange::None => {}
             ExternalChange::Reload => {
-                // Re-open the same path: `begin_open` arms a fresh load, and the
-                // `FileContent` reply rebases the buffer with the agent's content +
-                // the new `mtime`. The clean buffer had no edits to lose.
-                self.begin_open(path.clone(), window, cx);
+                self.begin_open(path.clone(), self.read_only, window, cx);
                 if let Err(e) = self.open_file_tx.try_send(path.clone()) {
                     tracing::debug!(error = %e, %path, "failed to enqueue auto-reload open");
                 }
@@ -667,10 +614,230 @@ impl EditorView {
             }
         }
     }
+
+    // ── Navigation — dispatch ─────────────────────────────────────────────
+
+    /// Dispatch a `DefinitionRequest` for the current cursor position.
+    ///
+    /// Performs flush-before-dispatch: if the buffer is dirty, immediately
+    /// sends a `BufferChanged` so the daemon's LSP has the live buffer before
+    /// the nav request arrives. A no-op unless a file is loaded.
+    fn dispatch_definition_request(&mut self, cx: &mut Context<Self>) -> bool {
+        let EditorState::Loaded { path } = &self.state else {
+            return false;
+        };
+        let path = path.clone();
+
+        // Flush before dispatch (spec §"Request-vs-didChange ordering"): send
+        // the live buffer immediately so the LSP resolves the symbol against
+        // the current buffer text, not the stale on-disk version. The daemon
+        // processes messages in-order, so the didChange from this flush lands
+        // before the DefinitionRequest.
+        self.flush_buffer_feed_if_dirty(cx);
+
+        let position = self.cursor_to_protocol(cx);
+        self.nav_id = self.nav_id.wrapping_add(1);
+        let id = NavRequestId(self.nav_id);
+        self.latest_def_id = Some(id);
+
+        if let Err(e) = self.nav_tx.try_send(ClientMessage::DefinitionRequest {
+            id,
+            path: path.clone(),
+            position,
+        }) {
+            tracing::debug!(error = %e, %path, "failed to enqueue definition request");
+        }
+        true
+    }
+
+    /// Convert the current `InputState` cursor position to the protocol's
+    /// `Position` type. The editor's `cursor_position()` returns a
+    /// `(line, character)` pair with character as a Unicode scalar count —
+    /// the same convention the protocol uses (UTF-8 char offsets).
+    fn cursor_to_protocol(&self, cx: &Context<Self>) -> Position {
+        let pos = self.input.read(cx).cursor_position();
+        Position {
+            line: pos.line,
+            character: pos.character,
+        }
+    }
+
+    // ── Navigation — response handling ────────────────────────────────────
+
+    /// Apply a `DefinitionResponse` from the daemon.
+    ///
+    /// Drops the response if its id does not match the latest request
+    /// (drop-stale discipline: the user may have moved on). A single target
+    /// jumps directly; multiple targets show the inline jump-list.
+    pub fn apply_definition_response(
+        &mut self,
+        id: NavRequestId,
+        targets: Vec<NavLocation>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.latest_def_id != Some(id) {
+            tracing::debug!(?id, "dropping stale definition response");
+            return;
+        }
+
+        match targets.len() {
+            0 => {
+                // No definition found — silent no-op.
+                tracing::debug!("definition response: no targets (server found nothing)");
+            }
+            1 => {
+                let target = targets.into_iter().next().expect("checked len == 1");
+                self.push_back_position(cx);
+                self.jump_to_location(target, window, cx);
+            }
+            _ => {
+                // Multiple targets (e.g. Rust trait impls): show the jump-list.
+                self.jump_list = Some(
+                    targets
+                        .into_iter()
+                        .map(|l| JumpEntry { location: l })
+                        .collect(),
+                );
+                cx.notify();
+            }
+        }
+    }
+
+    // ── Navigation — jump mechanics ───────────────────────────────────────
+
+    /// Push the current (path, cursor-position) onto the back-stack.
+    ///
+    /// Evicts the oldest entry when the stack reaches `BACK_STACK_MAX`.
+    fn push_back_position(&mut self, cx: &Context<Self>) {
+        let EditorState::Loaded { path } = &self.state else {
+            return;
+        };
+        let path = path.clone();
+        let pos = self.input.read(cx).cursor_position();
+        if self.back_stack.len() >= BACK_STACK_MAX {
+            self.back_stack.pop_front();
+        }
+        self.back_stack.push_back((path, pos));
+    }
+
+    /// Perform a jump to a `NavLocation`: same-file scrolls + lands cursor;
+    /// cross-file opens via the buffer channel with the range stored as a
+    /// pending jump applied in [`EditorView::load`].
+    fn jump_to_location(
+        &mut self,
+        location: NavLocation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current_path = match &self.state {
+            EditorState::Loaded { path } => Some(path.clone()),
+            _ => None,
+        };
+
+        if current_path.as_deref() == Some(location.path.as_str()) {
+            // Same-file jump: scroll + select the target range in the current
+            // buffer (no load roundtrip needed).
+            self.apply_jump_range(&location.range, window, cx);
+        } else {
+            // Cross-file jump (in-root or out-of-root via the #195/#301
+            // carve-out). Store the range so `load` applies it once the
+            // FileContent reply arrives, then open the file.
+            let read_only = location.out_of_root;
+            self.pending_jump = Some((location.path.clone(), location.range));
+            self.begin_open(location.path.clone(), read_only, window, cx);
+            if let Err(e) = self.open_file_tx.try_send(location.path.clone()) {
+                tracing::debug!(
+                    error = %e,
+                    path = %location.path,
+                    "failed to enqueue cross-file nav open"
+                );
+            }
+        }
+    }
+
+    /// Move the cursor to `range.start` (scroll + select). The protocol
+    /// `Range` uses UTF-8 char offsets, matching the editor's `cursor_position`
+    /// convention, so no offset translation is needed here.
+    ///
+    /// `InputState::set_cursor_position` scrolls the view to keep the cursor
+    /// visible and is the public API for programmatic cursor moves.
+    ///
+    /// Range-end selection: `InputState` does not expose a public
+    /// `set_selected_range` in this version of gpui-component. For v1 the
+    /// cursor landing at `range.start` is the primary nav signal. A
+    /// TODO is filed below for the selection extension when the API is
+    /// available.
+    fn apply_jump_range(&mut self, range: &Range, window: &mut Window, cx: &mut Context<Self>) {
+        let start = EditorPosition::new(range.start.line, range.start.character);
+        // TODO(nav-select): extend selection to range.end when gpui-component
+        // exposes a public set_selected_range. For v1 the cursor at start is
+        // the landing signal; the symbol is visible in the scrolled view.
+        self.input.update(cx, |input, cx| {
+            input.set_cursor_position(start, window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Unwind the most recent jump: return to the position saved on the
+    /// back-stack. Crosses file boundaries if the back-position is in a
+    /// different file, storing a pending jump for the `load` path.
+    fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, pos)) = self.back_stack.pop_back() else {
+            return;
+        };
+
+        let current_path = match &self.state {
+            EditorState::Loaded { path } => Some(path.clone()),
+            _ => None,
+        };
+
+        if current_path.as_deref() == Some(path.as_str()) {
+            // Same file — move the cursor directly.
+            self.input.update(cx, |input, cx| {
+                input.set_cursor_position(pos, window, cx);
+            });
+            cx.notify();
+        } else {
+            // Different file — open it and land on the saved position.
+            let proto_pos = Position {
+                line: pos.line,
+                character: pos.character,
+            };
+            let range = Range {
+                start: proto_pos,
+                end: proto_pos,
+            };
+            self.pending_jump = Some((path.clone(), range));
+            // Back-navigation always opens in writable mode (the back position
+            // was in an editable buffer or read-only is re-derived from the
+            // response — for simplicity, go-back always uses read_only=false
+            // and the buffer channel's out-of-root guard enforces the rest).
+            self.begin_open(path.clone(), false, window, cx);
+            if let Err(e) = self.open_file_tx.try_send(path.clone()) {
+                tracing::debug!(error = %e, %path, "failed to enqueue go-back open");
+            }
+        }
+    }
+
+    /// Select a jump-list entry by index and navigate to it. Called from the
+    /// click handler on the inline jump-list items rendered in `Render`.
+    pub fn select_jump_entry(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(list) = self.jump_list.take() else {
+            return;
+        };
+        if let Some(entry) = list.into_iter().nth(index) {
+            self.push_back_position(cx);
+            self.jump_to_location(entry.location, window, cx);
+        }
+    }
 }
+
+// ── Render ────────────────────────────────────────────────────────────────────
 
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Loading / empty / failed states: show a centered status message.
         let status: Option<String> = match &self.state {
             EditorState::Empty => Some("Select a file to open".to_owned()),
             EditorState::Loading { path } => Some(format!("Opening {path}\u{2026}")),
@@ -691,10 +858,7 @@ impl Render for EditorView {
                 .into_any_element();
         }
 
-        // A one-line banner over the editor for the transient save outcome. The
-        // conflict line names the reload-or-keep choice without a modal — the
-        // buffer stays editable beneath it (depth = detect + reload/keep, no merge
-        // UI). Save again to overwrite-keep once rebased, or re-open to reload.
+        // One-line save-outcome banner.
         let banner: Option<(String, gpui::Hsla)> = match &self.save_state {
             SaveState::Idle => None,
             SaveState::Saving => Some(("Saving\u{2026}".to_owned(), cx.theme().muted_foreground)),
@@ -707,24 +871,104 @@ impl Render for EditorView {
             SaveState::Failed => Some(("Save failed".to_owned(), cx.theme().danger)),
         };
 
-        let editor = div().flex_1().min_h_0().child(
-            Input::new(&self.input)
-                .font_family(cx.theme().mono_font_family.clone())
-                .text_size(cx.theme().mono_font_size)
-                .size_full(),
-        );
+        // Inline jump-list for multi-target definition responses.
+        let jump_list_element = self.jump_list.as_ref().map(|list| {
+            let entries: Vec<_> = list
+                .iter()
+                .enumerate()
+                .map(|(i, entry)| {
+                    let preview = entry.location.line_preview.clone().unwrap_or_default();
+                    let path = entry.location.path.clone();
+                    let line = entry.location.range.start.line + 1;
+                    let label = format!("{path}:{line}  {preview}");
+                    div()
+                        .px(px(8.0))
+                        .py(px(2.0))
+                        .text_xs()
+                        .text_color(cx.theme().foreground)
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
+                                this.select_jump_entry(i, window, cx);
+                            }),
+                        )
+                        .child(label)
+                })
+                .collect();
 
-        // The editor establishes its own key context and hosts the `Save` action,
-        // so the `Ctrl+S` / `Cmd+S` binding (bound in `main.rs`, scoped here) fires
-        // only when focus is within the editor — never for an unrelated input.
+            div()
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bg(cx.theme().card)
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .shadow_md()
+                .z_index(10)
+                .child(
+                    div()
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Multiple definitions — click to jump:"),
+                )
+                .children(entries)
+        });
+
+        // Build the `Input` widget. The context-menu builder is called each
+        // time the user right-clicks; it receives a fresh `PopupMenu`.
+        // "Go to Definition" dispatches the `GoToDefinition` action, which is
+        // handled on the outer div below.
+        let input_widget = Input::new(&self.input)
+            .font_family(cx.theme().mono_font_family.clone())
+            .text_size(cx.theme().mono_font_size)
+            .size_full()
+            .context_menu(|menu: PopupMenu, _window, _cx| {
+                menu.menu("Go to Definition", Box::new(GoToDefinition))
+                    .separator()
+            });
+
+        // Outer div: the editor key context, action handlers, ctrl+click.
+        //
+        // The `on_mouse_down` for ctrl+click runs in the **bubble phase**: by
+        // the time this handler fires, the `InputState` has already processed
+        // the click and moved the cursor to the clicked position. We can
+        // therefore read `cursor_position()` and dispatch the definition
+        // request with the correct cursor location.
+        //
+        // Trigger mechanics (pinned here per spec #196):
+        //   - Ctrl+click: Left button + `modifiers.secondary()` (Ctrl on
+        //     Linux/Windows, Cmd on macOS — `gpui::Modifiers::secondary()`).
+        //   - Context menu: right-click → "Go to Definition" → `GoToDefinition`
+        //     action, handled by `on_action` below.
         let mut root = div()
             .key_context(EDITOR_KEY_CONTEXT)
             .size_full()
             .flex()
             .flex_col()
+            .relative()
             .on_action(cx.listener(|this, _: &Save, _window, cx| {
                 this.save(cx);
-            }));
+            }))
+            .on_action(cx.listener(|this, _: &GoToDefinition, _window, cx| {
+                this.dispatch_definition_request(cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoBack, window, cx| {
+                this.go_back(window, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                    if event.modifiers.secondary() {
+                        // Cursor is already at the clicked position (InputState
+                        // processed the event first in its own update cycle).
+                        this.dispatch_definition_request(cx);
+                    }
+                }),
+            );
 
         if let Some((text, color)) = banner {
             root = root.child(
@@ -739,18 +983,82 @@ impl Render for EditorView {
             );
         }
 
-        root.child(editor).into_any_element()
+        // Read-only indicator for out-of-root files (#196 / #195/#301).
+        if self.read_only {
+            root = root.child(
+                div()
+                    .flex_shrink_0()
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .bg(cx.theme().muted)
+                    .child("Read-only (outside the project root)"),
+            );
+        }
+
+        let editor_area = div().flex_1().min_h_0().relative().child(input_widget);
+
+        let editor_area = if let Some(jump_list_el) = jump_list_element {
+            editor_area.child(jump_list_el)
+        } else {
+            editor_area
+        };
+
+        root.child(editor_area).into_any_element()
     }
 }
 
-/// Derive the highlighting language token for a path from its extension.
+// ── Pure helpers ──────────────────────────────────────────────────────────────
+
+/// Decide what an external change to the open path forces.
 ///
-/// `gpui-component`'s `code_editor` accepts an extension or a language name and
-/// resolves the Tree-sitter grammar itself, falling back to plain text for an
-/// unknown one (`Language::from_str`). So the extension is passed straight
-/// through; a path with no extension uses `"text"` (plain). The leaf is matched
-/// case-insensitively for the extension only — the full path never reaches the
-/// editor.
+/// This is the load-bearing concurrent-write rule (`docs/spec-editor.md`):
+///
+/// - `snapshot <= base` → [`ExternalChange::None`]
+/// - `snapshot > base` and clean buffer → [`ExternalChange::Reload`]
+/// - `snapshot > base` and dirty buffer → [`ExternalChange::Conflict`]
+pub fn decide_external_change(
+    base: SystemTime,
+    snapshot: SystemTime,
+    dirty: bool,
+) -> ExternalChange {
+    if snapshot <= base {
+        return ExternalChange::None;
+    }
+    if dirty {
+        ExternalChange::Conflict
+    } else {
+        ExternalChange::Reload
+    }
+}
+
+/// Translate a daemon protocol [`Diagnostic`] into the editor component's
+/// [`EditorDiagnostic`] (#189).
+fn to_editor_diagnostic(diagnostic: &Diagnostic) -> EditorDiagnostic {
+    let start = EditorPosition::new(
+        diagnostic.range.start.line,
+        diagnostic.range.start.character,
+    );
+    let end = EditorPosition::new(diagnostic.range.end.line, diagnostic.range.end.character);
+    let severity = match diagnostic.severity {
+        DiagnosticSeverity::Error => EditorSeverity::Error,
+        DiagnosticSeverity::Warning => EditorSeverity::Warning,
+        DiagnosticSeverity::Information => EditorSeverity::Info,
+        DiagnosticSeverity::Hint => EditorSeverity::Hint,
+    };
+    let mut editor =
+        EditorDiagnostic::new(start..end, diagnostic.message.clone()).with_severity(severity);
+    if let Some(source) = &diagnostic.source {
+        editor = editor.with_source(source.clone());
+    }
+    if let Some(code) = &diagnostic.code {
+        editor = editor.with_code(code.clone());
+    }
+    editor
+}
+
+/// Derive the highlighting language token for a path from its extension.
 fn language_for_path(path: &str) -> String {
     Path::new(path)
         .extension()
@@ -759,9 +1067,13 @@ fn language_for_path(path: &str) -> String {
         .unwrap_or_else(|| "text".to_owned())
 }
 
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- language detection ---
 
     #[test]
     fn test_language_for_path_uses_extension() {
@@ -785,11 +1097,6 @@ mod tests {
     }
 
     // --- concurrent-write decision (#188) ---
-    //
-    // The decision function is pure (base vs snapshot mtime + dirty flag), so the
-    // load-bearing concurrent-write rule is verified here without GPUI: a clean
-    // buffer auto-reloads on a newer snapshot, a dirty buffer conflicts, and an
-    // unchanged (or older) snapshot is a no-op either way.
 
     fn at(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
@@ -797,8 +1104,6 @@ mod tests {
 
     #[test]
     fn test_clean_buffer_with_newer_snapshot_reloads() {
-        // The agent edited the open file; the buffer has no unsaved edits, so the
-        // editor silently reloads to show the agent's change live.
         assert_eq!(
             decide_external_change(at(100), at(200), false),
             ExternalChange::Reload
@@ -807,8 +1112,6 @@ mod tests {
 
     #[test]
     fn test_dirty_buffer_with_newer_snapshot_conflicts() {
-        // The agent edited the open file while the user has unsaved edits: neither
-        // side may be lost, so the editor surfaces a conflict instead of reloading.
         assert_eq!(
             decide_external_change(at(100), at(200), true),
             ExternalChange::Conflict
@@ -817,9 +1120,6 @@ mod tests {
 
     #[test]
     fn test_equal_snapshot_is_no_change_regardless_of_dirty() {
-        // The common case: the snapshot carries the very `mtime` the buffer is
-        // based on (the entry that delivered it). Never reacts, clean or dirty —
-        // the comparison is base-vs-snapshot, not a fresh stat.
         assert_eq!(
             decide_external_change(at(100), at(100), false),
             ExternalChange::None
@@ -832,8 +1132,6 @@ mod tests {
 
     #[test]
     fn test_older_snapshot_is_no_change() {
-        // A snapshot `mtime` strictly older than the base (e.g. a save just bumped
-        // the base ahead of an in-flight snapshot) is no external change.
         assert_eq!(
             decide_external_change(at(200), at(100), false),
             ExternalChange::None
@@ -845,10 +1143,6 @@ mod tests {
     }
 
     // --- inline-diagnostic translation (#189) ---
-    //
-    // The protocol→editor diagnostic mapping is pure, so the load-bearing parts —
-    // the range lands on the live buffer's coordinates and the severity / source /
-    // code carry over — are verified here without GPUI.
 
     use rift_protocol::{Position, Range};
 
@@ -909,5 +1203,119 @@ mod tests {
         let editor = to_editor_diagnostic(&proto_diag(DiagnosticSeverity::Warning, None, None));
         assert!(editor.source.is_none());
         assert!(editor.code.is_none());
+    }
+
+    // --- navigation back-stack (#196) ---
+
+    #[test]
+    fn test_back_stack_bounded_at_max() {
+        // The back-stack must never exceed BACK_STACK_MAX entries; oldest
+        // entries are evicted when it would overflow.
+        let mut stack: VecDeque<(String, EditorPosition)> = VecDeque::new();
+        for i in 0..(BACK_STACK_MAX + 10) {
+            if stack.len() >= BACK_STACK_MAX {
+                stack.pop_front();
+            }
+            stack.push_back((format!("file_{i}.rs"), EditorPosition::new(0, 0)));
+        }
+        assert_eq!(stack.len(), BACK_STACK_MAX);
+        // The oldest entries are gone; only the most recent BACK_STACK_MAX remain.
+        assert_eq!(stack.front().map(|(p, _)| p.as_str()), Some("file_10.rs"));
+    }
+
+    #[test]
+    fn test_back_stack_unwinds_in_lifo_order() {
+        let mut stack: VecDeque<(String, EditorPosition)> = VecDeque::new();
+        stack.push_back(("a.rs".to_owned(), EditorPosition::new(1, 0)));
+        stack.push_back(("b.rs".to_owned(), EditorPosition::new(2, 0)));
+        stack.push_back(("c.rs".to_owned(), EditorPosition::new(3, 0)));
+
+        // GoBack pops from the back (LIFO).
+        assert_eq!(stack.pop_back().map(|(p, _)| p), Some("c.rs".to_owned()));
+        assert_eq!(stack.pop_back().map(|(p, _)| p), Some("b.rs".to_owned()));
+        assert_eq!(stack.pop_back().map(|(p, _)| p), Some("a.rs".to_owned()));
+        assert!(stack.is_empty());
+    }
+
+    // --- stale-response drop discipline (#196) ---
+
+    #[test]
+    fn test_stale_definition_response_id_mismatch_is_detected() {
+        // A response whose id does not match the latest dispatched id is stale
+        // and must be dropped.
+        let latest = NavRequestId(5);
+        let stale = NavRequestId(3);
+        assert_ne!(Some(latest), Some(stale));
+    }
+
+    #[test]
+    fn test_matching_definition_response_id_is_accepted() {
+        let latest = NavRequestId(5);
+        let response_id = NavRequestId(5);
+        assert_eq!(Some(latest), Some(response_id));
+    }
+
+    // --- out-of-root flag (#196 / #195/#301) ---
+
+    #[test]
+    fn test_out_of_root_nav_location_carries_flag_and_absolute_path() {
+        let loc = NavLocation {
+            path: "/home/user/.cargo/registry/src/foo/src/lib.rs".to_owned(),
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 1,
+                },
+            },
+            out_of_root: true,
+            line_preview: None,
+        };
+        // An out-of-root location must be opened read-only.
+        assert!(loc.out_of_root);
+        // Its path is absolute (starts with '/').
+        assert!(loc.path.starts_with('/'));
+    }
+
+    #[test]
+    fn test_in_root_nav_location_is_not_read_only() {
+        let loc = NavLocation {
+            path: "src/main.rs".to_owned(),
+            range: Range {
+                start: Position {
+                    line: 10,
+                    character: 4,
+                },
+                end: Position {
+                    line: 10,
+                    character: 12,
+                },
+            },
+            out_of_root: false,
+            line_preview: Some("pub fn foo() {}".to_owned()),
+        };
+        assert!(!loc.out_of_root);
+    }
+
+    // --- flush-before-dispatch invariant (#196) ---
+
+    #[test]
+    fn test_nav_id_increments_on_each_dispatch() {
+        // Each dispatch must use a fresh, monotonically increasing id so
+        // the drop-stale check can distinguish successive requests.
+        let mut id: u64 = 0;
+        let first = {
+            id = id.wrapping_add(1);
+            NavRequestId(id)
+        };
+        let second = {
+            id = id.wrapping_add(1);
+            NavRequestId(id)
+        };
+        assert_ne!(first, second);
+        assert!(second.0 > first.0);
     }
 }

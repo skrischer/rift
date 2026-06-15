@@ -72,6 +72,8 @@ pub struct WorkspaceChannels {
     /// Buffer-channel replies to route to the editor: `FileContent` (load),
     /// `SaveResult` (save landed), `SaveConflict` (save refused).
     pub buffer_rx: Receiver<DaemonMessage>,
+    /// Nav replies to route to the editor: `DefinitionResponse` (#196).
+    pub nav_rx: Receiver<DaemonMessage>,
     /// Read requests: the root-relative path of a file to open. The tokio side
     /// turns each into a `ClientMessage::OpenFile`.
     pub open_file_tx: Sender<String>,
@@ -82,6 +84,8 @@ pub struct WorkspaceChannels {
     /// or `BufferClosed` (close / switch / save) the editor emits so the daemon
     /// feeds the LSP the live buffer. The tokio side forwards it verbatim.
     pub buffer_change_tx: Sender<ClientMessage>,
+    /// Navigation requests: `DefinitionRequest` (#196).
+    pub nav_tx: Sender<ClientMessage>,
 }
 
 /// The composed app root.
@@ -108,15 +112,26 @@ impl WorkspaceView {
         let WorkspaceChannels {
             worktree_rx,
             buffer_rx,
+            nav_rx,
             open_file_tx,
             save_file_tx,
             buffer_change_tx,
+            nav_tx,
         } = channels;
 
         let file_tree = cx.new(|_| FileTree::new());
         let editor = {
             let open_file_tx = open_file_tx.clone();
-            cx.new(|cx| EditorView::new(open_file_tx, save_file_tx, buffer_change_tx, window, cx))
+            cx.new(|cx| {
+                EditorView::new(
+                    open_file_tx,
+                    save_file_tx,
+                    buffer_change_tx,
+                    nav_tx,
+                    window,
+                    cx,
+                )
+            })
         };
 
         // Open requests originate from the tree's `OpenFile` event: arm the
@@ -128,7 +143,7 @@ impl WorkspaceView {
             |this, _tree, event: &FileTreeEvent, window, cx| {
                 let FileTreeEvent::OpenFile { path } = event;
                 this.editor.update(cx, |editor, cx| {
-                    editor.begin_open(path.clone(), window, cx);
+                    editor.begin_open(path.clone(), false, window, cx);
                 });
                 if let Err(e) = this.open_file_tx.try_send(path.clone()) {
                     debug!(error = %e, %path, "failed to enqueue open-file request");
@@ -212,6 +227,31 @@ impl WorkspaceView {
                     if loaded {
                         view.push_open_file_diagnostics(cx);
                     }
+                });
+                if result.is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
+
+        // Nav reply stream -> editor: `DefinitionResponse` routes to
+        // `apply_definition_response`. Other nav message kinds (hover, references)
+        // arrive here once those issues land; for now the match is exhaustive via
+        // the catch-all arm. Routed through this view's weak handle so a closed
+        // window ends the loop gracefully.
+        {
+            cx.spawn_in(window, async move |this, cx| loop {
+                let Ok(msg) = nav_rx.recv_async().await else {
+                    break;
+                };
+                let result = this.update_in(cx, |view, window, cx| {
+                    view.editor.update(cx, |editor, cx| match msg {
+                        DaemonMessage::DefinitionResponse { id, targets } => {
+                            editor.apply_definition_response(id, targets, window, cx);
+                        }
+                        _ => {}
+                    });
                 });
                 if result.is_err() {
                     break;
