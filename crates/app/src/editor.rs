@@ -2,8 +2,9 @@
 //! Code editor surface: open a file from the tree into a `gpui-component` code
 //! editor, render it with Tree-sitter syntax highlighting, write edits back
 //! over the buffer channel, and navigate symbols via go-to-definition
-//! (ctrl+click, context menu), hover popovers, back-navigation, and read-only
-//! out-of-root opens (`docs/spec-lsp-navigation.md`, #196, #197).
+//! (ctrl+click, context menu), find-references (Shift+F12), hover popovers,
+//! back-navigation, and read-only out-of-root opens
+//! (`docs/spec-lsp-navigation.md`, #196, #197, #198).
 //!
 //! # Buffer channel (#187, #188)
 //!
@@ -53,6 +54,23 @@
 //! When a `DefinitionResponse` carries multiple targets (e.g. Rust trait impls)
 //! a transient inline jump-list is rendered so the user can click the desired
 //! destination.
+//!
+//! # Find-references (#198)
+//!
+//! Find-references is triggered by:
+//! - **`Shift+F12`** (scoped to the `Editor` key context, bound in `main.rs`):
+//!   dispatches [`ClientMessage::ReferencesRequest`] at the cursor position.
+//! - **Context-menu "Find References"**: same dispatch path.
+//!
+//! The response is applied by [`EditorView::apply_references_response`]. The
+//! results are shown in the same transient inline jump-list the multi-target
+//! definition path uses, so the UX (click-to-jump, back-nav) is identical.
+//! Back-navigation pushes the pre-jump position onto the back-stack before the
+//! jump, exactly as definition does via [`EditorView::select_jump_entry`].
+//!
+//! Stale-response discipline mirrors the definition and hover paths:
+//! `latest_ref_id` tracks the most recent request; a response whose id does not
+//! match is silently dropped.
 //!
 //! # Hover popover (#197)
 //!
@@ -132,6 +150,14 @@ pub struct GoBack;
 #[action(namespace = rift, no_json)]
 pub struct ShowHover;
 
+/// Trigger find-references at the current cursor position. Dispatched from
+/// the context-menu entry ("Find References") and from the `Shift+F12` keybind
+/// (bound in `main.rs`, scoped to the editor key context). Results are shown
+/// in the transient inline jump-list shared with multi-target definitions (#198).
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct FindReferences;
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// The GPUI key context the editor establishes around its input, so the
@@ -186,9 +212,18 @@ enum SaveState {
 }
 
 /// One entry in the inline jump-list shown for multi-target definition
-/// responses (e.g. Rust trait method impls).
+/// responses (e.g. Rust trait method impls) and for find-references results.
 struct JumpEntry {
     location: NavLocation,
+}
+
+/// The kind of results currently shown in the inline jump-list. Used to
+/// render an appropriate header line in the jump-list overlay.
+enum JumpListKind {
+    /// Multi-target definition results (Rust trait impls etc.).
+    Definitions,
+    /// Find-references results.
+    References,
 }
 
 // ── Public decision type ───────────────────────────────────────────────────────
@@ -251,6 +286,10 @@ pub struct EditorView {
     /// does not match is silently dropped (drop-stale discipline — mirrors the
     /// definition id discipline so concurrent hovers do not interleave).
     latest_hover_id: Option<NavRequestId>,
+    /// The id of the most recent references request dispatched. A response
+    /// whose id does not match is silently dropped (drop-stale discipline,
+    /// mirroring the definition and hover paths — #198).
+    latest_ref_id: Option<NavRequestId>,
     /// The hover content currently displayed in the popover, or `None` when
     /// no popover is visible. Set by [`EditorView::apply_hover_response`];
     /// cleared on mouse-down or when a new hover request is dispatched.
@@ -269,8 +308,14 @@ pub struct EditorView {
     /// with the same access mode the original forward jump used.
     back_stack: VecDeque<(String, EditorPosition, bool)>,
 
-    /// Transient inline jump-list for multi-target definition responses.
+    /// Transient inline jump-list for multi-target definition responses and
+    /// find-references results. Populated by `apply_definition_response`
+    /// (multiple targets) or `apply_references_response` (#198).
     jump_list: Option<Vec<JumpEntry>>,
+    /// The kind of results currently in `jump_list`. Used to render an
+    /// appropriate header in the jump-list overlay. `None` when `jump_list` is
+    /// `None` (the two fields are always set/cleared together).
+    jump_list_kind: Option<JumpListKind>,
 }
 
 impl EditorView {
@@ -317,11 +362,13 @@ impl EditorView {
             nav_id: 0,
             latest_def_id: None,
             latest_hover_id: None,
+            latest_ref_id: None,
             hover_content: None,
             hover_move_generation: 0,
             pending_jump: None,
             back_stack: VecDeque::new(),
             jump_list: None,
+            jump_list_kind: None,
         }
     }
 
@@ -494,11 +541,13 @@ impl EditorView {
         self.dirty = false;
         self.read_only = read_only;
         self.jump_list = None;
+        self.jump_list_kind = None;
         // Dismiss any hover popover from the previous file and cancel any
-        // in-flight hover request so a delayed response for the old file does
-        // not land on the new one.
+        // in-flight hover/references request so a delayed response for the old
+        // file does not land on the new one.
         self.hover_content = None;
         self.latest_hover_id = None;
+        self.latest_ref_id = None;
 
         self.input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -754,6 +803,43 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Dispatch a `ReferencesRequest` for the current cursor position (#198).
+    ///
+    /// Mirrors [`Self::dispatch_definition_request`]: performs flush-before-
+    /// dispatch, increments `nav_id`, records `latest_ref_id`, and clears any
+    /// stale jump-list from a previous request. Results are shown in the same
+    /// transient inline jump-list the multi-target definition path uses.
+    /// A no-op unless a file is loaded.
+    fn dispatch_references_request(&mut self, cx: &mut Context<Self>) {
+        let EditorState::Loaded { path } = &self.state else {
+            return;
+        };
+        let path = path.clone();
+
+        // Flush-before-dispatch (spec §"Request-vs-didChange ordering"): the
+        // LSP must see the live buffer before the `ReferencesRequest` arrives.
+        self.flush_buffer_feed_if_dirty(cx);
+
+        // Clear any previous jump-list so a stale list is not visible while
+        // the daemon is in flight.
+        self.jump_list = None;
+        self.jump_list_kind = None;
+
+        let position = self.cursor_to_protocol(cx);
+        self.nav_id = self.nav_id.wrapping_add(1);
+        let id = NavRequestId(self.nav_id);
+        self.latest_ref_id = Some(id);
+
+        if let Err(e) = self.nav_tx.try_send(ClientMessage::ReferencesRequest {
+            id,
+            path: path.clone(),
+            position,
+        }) {
+            tracing::debug!(error = %e, %path, "failed to enqueue references request");
+        }
+        cx.notify();
+    }
+
     /// Arm (or re-arm) the mouse-rest debounce timer for hover (#197).
     ///
     /// Called from the `MouseMoveEvent` handler on the outer div. A no-op when
@@ -821,6 +907,7 @@ impl EditorView {
                         .map(|l| JumpEntry { location: l })
                         .collect(),
                 );
+                self.jump_list_kind = Some(JumpListKind::Definitions);
                 cx.notify();
             }
         }
@@ -845,6 +932,40 @@ impl EditorView {
         }
 
         self.hover_content = content;
+        cx.notify();
+    }
+
+    /// Apply a `ReferencesResponse` from the daemon (#198).
+    ///
+    /// Drops the response if its id does not match the latest references
+    /// request (drop-stale discipline: mirrors definition and hover). An empty
+    /// target list is a silent no-op (the server found no references). A
+    /// non-empty list populates the inline jump-list with `JumpListKind::References`
+    /// so the render layer shows the "references" header.
+    pub fn apply_references_response(
+        &mut self,
+        id: NavRequestId,
+        targets: Vec<NavLocation>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.latest_ref_id != Some(id) {
+            tracing::debug!(?id, "dropping stale references response");
+            return;
+        }
+
+        if targets.is_empty() {
+            // No references found — silent no-op.
+            tracing::debug!("references response: no targets (server found nothing)");
+            return;
+        }
+
+        self.jump_list = Some(
+            targets
+                .into_iter()
+                .map(|l| JumpEntry { location: l })
+                .collect(),
+        );
+        self.jump_list_kind = Some(JumpListKind::References);
         cx.notify();
     }
 
@@ -973,6 +1094,7 @@ impl EditorView {
         let Some(list) = self.jump_list.take() else {
             return;
         };
+        self.jump_list_kind = None;
         if let Some(entry) = list.into_iter().nth(index) {
             self.push_back_position(cx);
             self.jump_to_location(entry.location, window, cx);
@@ -1018,8 +1140,14 @@ impl Render for EditorView {
             SaveState::Failed => Some(("Save failed".to_owned(), cx.theme().danger)),
         };
 
-        // Inline jump-list for multi-target definition responses.
+        // Inline jump-list for multi-target definition responses and find-references
+        // results (#196, #198). The header label differs by kind; entries are
+        // identical in both cases (path:line + preview, click to jump).
         let jump_list_element = self.jump_list.as_ref().map(|list| {
+            let header = match self.jump_list_kind {
+                Some(JumpListKind::References) => "References — click to jump:",
+                Some(JumpListKind::Definitions) | None => "Multiple definitions — click to jump:",
+            };
             let entries: Vec<_> = list
                 .iter()
                 .enumerate()
@@ -1059,7 +1187,7 @@ impl Render for EditorView {
                         .py(px(4.0))
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .child("Multiple definitions — click to jump:"),
+                        .child(header),
                 )
                 .children(entries)
         });
@@ -1078,6 +1206,7 @@ impl Render for EditorView {
             .disabled(self.read_only)
             .context_menu(|menu: PopupMenu, _window, _cx| {
                 menu.menu("Go to Definition", Box::new(GoToDefinition))
+                    .menu("Find References", Box::new(FindReferences))
                     .menu("Show Hover", Box::new(ShowHover))
                     .separator()
             });
@@ -1142,6 +1271,9 @@ impl Render for EditorView {
             }))
             .on_action(cx.listener(|this, _: &ShowHover, _window, cx| {
                 this.dispatch_hover_request(cx);
+            }))
+            .on_action(cx.listener(|this, _: &FindReferences, _window, cx| {
+                this.dispatch_references_request(cx);
             }))
             .on_mouse_down(
                 MouseButton::Left,

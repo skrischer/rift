@@ -72,7 +72,8 @@ pub struct WorkspaceChannels {
     /// Buffer-channel replies to route to the editor: `FileContent` (load),
     /// `SaveResult` (save landed), `SaveConflict` (save refused).
     pub buffer_rx: Receiver<DaemonMessage>,
-    /// Nav replies to route to the editor: `DefinitionResponse` (#196).
+    /// Nav replies to route to the editor: `DefinitionResponse` (#196),
+    /// `HoverResponse` (#197), `ReferencesResponse` (#198).
     pub nav_rx: Receiver<DaemonMessage>,
     /// Read requests: the root-relative path of a file to open. The tokio side
     /// turns each into a `ClientMessage::OpenFile`.
@@ -237,9 +238,9 @@ impl WorkspaceView {
 
         // Nav reply stream -> editor: `DefinitionResponse` routes to
         // `apply_definition_response`; `HoverResponse` routes to
-        // `apply_hover_response` (#197). Two arms avoid the
-        // `clippy::single_match` lint. Routed through this view's weak handle
-        // so a closed window ends the loop gracefully.
+        // `apply_hover_response` (#197); `ReferencesResponse` routes to
+        // `apply_references_response` (#198). Routed through this view's weak
+        // handle so a closed window ends the loop gracefully.
         {
             cx.spawn_in(window, async move |this, cx| loop {
                 let Ok(msg) = nav_rx.recv_async().await else {
@@ -252,6 +253,9 @@ impl WorkspaceView {
                         }
                         DaemonMessage::HoverResponse { id, content } => {
                             editor.apply_hover_response(id, content, cx);
+                        }
+                        DaemonMessage::ReferencesResponse { id, locations } => {
+                            editor.apply_references_response(id, locations, cx);
                         }
                         _ => {}
                     });
