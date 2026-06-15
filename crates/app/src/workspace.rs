@@ -246,11 +246,10 @@ impl WorkspaceView {
                     break;
                 };
                 let result = this.update_in(cx, |view, window, cx| {
-                    view.editor.update(cx, |editor, cx| match msg {
-                        DaemonMessage::DefinitionResponse { id, targets } => {
+                    view.editor.update(cx, |editor, cx| {
+                        if let DaemonMessage::DefinitionResponse { id, targets } = msg {
                             editor.apply_definition_response(id, targets, window, cx);
                         }
-                        _ => {}
                     });
                 });
                 if result.is_err() {
