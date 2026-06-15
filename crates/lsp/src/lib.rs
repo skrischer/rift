@@ -23,9 +23,13 @@ pub mod selector;
 pub mod server;
 pub mod spike;
 
+/// Re-exported so the daemon's navigation dispatch layer can hold an owned,
+/// `Send + 'static` socket handle without taking a direct dependency on
+/// `async-lsp` (the version is pinned here by `rift-lsp`'s own Cargo.toml).
+pub use async_lsp::ServerSocket;
 pub use document::{DocumentAction, DocumentChange, DocumentSink, DocumentSync};
 pub use error::LspError;
-pub use nav::{NavRequester, PositionEncoding};
+pub use nav::{NavRequester, OwnedNavRequester, PositionEncoding};
 pub use registry::Registry;
 pub use selector::{DocumentSelector, ServerSpec};
 pub use server::{Server, ServerId};

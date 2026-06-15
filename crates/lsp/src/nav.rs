@@ -452,6 +452,125 @@ impl<'a> NavRequester<'a> {
     }
 }
 
+// ── OwnedNavRequester ────────────────────────────────────────────────────────
+
+/// Owned, `Send + 'static` nav requester for use in spawned tasks.
+///
+/// Unlike [`NavRequester`] (which borrows a `&Server`), this holds a cloned
+/// [`async_lsp::ServerSocket`] so it can be moved into a `tokio::spawn`
+/// without capturing the server registry. The daemon's dispatch layer
+/// constructs one by calling [`Registry::first_capable_for_path`] synchronously
+/// in the worker task, then moves the handle into the spawned request task.
+pub struct OwnedNavRequester {
+    socket: async_lsp::ServerSocket,
+    caps: ServerCapabilities,
+    encoding: PositionEncoding,
+    root_dir: PathBuf,
+}
+
+impl OwnedNavRequester {
+    /// Construct from a cloned socket, capabilities snapshot, encoding, and root.
+    pub fn new(
+        socket: async_lsp::ServerSocket,
+        caps: ServerCapabilities,
+        encoding: PositionEncoding,
+        root_dir: PathBuf,
+    ) -> Self {
+        Self {
+            socket,
+            caps,
+            encoding,
+            root_dir,
+        }
+    }
+
+    /// Issue a `textDocument/hover` request. Returns `None` when the server
+    /// does not advertise hover capability or responds with no content.
+    pub async fn hover(
+        mut self,
+        path: &Path,
+        pos: Position,
+        text: &str,
+    ) -> Result<Option<HoverContent>> {
+        use async_lsp::LanguageServer;
+        if !has_hover(&self.caps) {
+            return Ok(None);
+        }
+        let uri = path_to_uri(path)?;
+        let lsp_pos = rift_pos_to_lsp(pos, text, self.encoding);
+        let params = HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: lsp_pos,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+        let result = self.socket.hover(params).await?;
+        Ok(result.map(|h| hover_to_protocol(h, text, self.encoding)))
+    }
+
+    /// Issue a `textDocument/definition` request. Returns empty when the server
+    /// does not advertise definition capability or responds with no locations.
+    pub async fn definition(
+        mut self,
+        path: &Path,
+        pos: Position,
+        text: &str,
+    ) -> Result<Vec<rift_protocol::NavLocation>> {
+        use async_lsp::LanguageServer;
+        if !has_definition(&self.caps) {
+            return Ok(vec![]);
+        }
+        let uri = path_to_uri(path)?;
+        let lsp_pos = rift_pos_to_lsp(pos, text, self.encoding);
+        let params = GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: lsp_pos,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: Default::default(),
+        };
+        let result = self.socket.definition(params).await?;
+        Ok(match result {
+            Some(resp) => definition_response_to_protocol(resp, &self.root_dir, self.encoding),
+            None => vec![],
+        })
+    }
+
+    /// Issue a `textDocument/references` request. Returns empty when the server
+    /// does not advertise references capability or responds with no locations.
+    pub async fn references(
+        mut self,
+        path: &Path,
+        pos: Position,
+        text: &str,
+    ) -> Result<Vec<rift_protocol::NavLocation>> {
+        use async_lsp::LanguageServer;
+        if !has_references(&self.caps) {
+            return Ok(vec![]);
+        }
+        let uri = path_to_uri(path)?;
+        let lsp_pos = rift_pos_to_lsp(pos, text, self.encoding);
+        let params = ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: lsp_pos,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: Default::default(),
+            context: ReferenceContext {
+                include_declaration: true,
+            },
+        };
+        let result = self.socket.references(params).await?;
+        Ok(match result {
+            Some(locs) => references_to_protocol(locs, &self.root_dir, self.encoding),
+            None => vec![],
+        })
+    }
+}
+
 // ── Routing helper ────────────────────────────────────────────────────────────
 
 /// Whether `caps` advertises hover support.
