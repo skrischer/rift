@@ -254,8 +254,8 @@ impl WorkspaceView {
                         DaemonMessage::HoverResponse { id, content } => {
                             editor.apply_hover_response(id, content, cx);
                         }
-                        DaemonMessage::ReferencesResponse { id, targets } => {
-                            editor.apply_references_response(id, targets, cx);
+                        DaemonMessage::ReferencesResponse { id, locations } => {
+                            editor.apply_references_response(id, locations, cx);
                         }
                         _ => {}
                     });
