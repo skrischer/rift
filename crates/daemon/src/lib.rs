@@ -533,8 +533,11 @@ fn snapshot_messages(root: &Path, entries: &BTreeMap<PathBuf, Entry>) -> Vec<Dae
 /// connection.
 ///
 /// The root is the canonicalized [`Snapshot::root`] held in `State` — the same
-/// root the worktree watcher uses, so the request's path keys the same space as
-/// a worktree entry, and the buffer service confines reads/writes to it. A
+/// root the worktree watcher uses, so a relative request path keys the same
+/// space as a worktree entry, and the buffer service confines **writes** to it.
+/// A relative read is confined too; an **absolute** read is the out-of-root
+/// carve-out (a navigation target outside the root, opened read-only) and is
+/// served by [`buffer::read_file`] — writes of an absolute path stay refused. A
 /// failure (a path escape, non-UTF-8 content, a missing file, or a write error)
 /// is logged to stderr (the daemon's log sink) and the request is dropped — v1
 /// has no buffer-error message in the protocol, so a refused request simply
