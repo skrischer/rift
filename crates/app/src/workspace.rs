@@ -237,9 +237,9 @@ impl WorkspaceView {
 
         // Nav reply stream -> editor: `DefinitionResponse` routes to
         // `apply_definition_response`; `HoverResponse` routes to
-        // `apply_hover_response` (#197). Two arms avoid the
-        // `clippy::single_match` lint. Routed through this view's weak handle
-        // so a closed window ends the loop gracefully.
+        // `apply_hover_response` (#197); `ReferencesResponse` routes to
+        // `apply_references_response` (#198). Routed through this view's weak
+        // handle so a closed window ends the loop gracefully.
         {
             cx.spawn_in(window, async move |this, cx| loop {
                 let Ok(msg) = nav_rx.recv_async().await else {
@@ -252,6 +252,9 @@ impl WorkspaceView {
                         }
                         DaemonMessage::HoverResponse { id, content } => {
                             editor.apply_hover_response(id, content, cx);
+                        }
+                        DaemonMessage::ReferencesResponse { id, targets } => {
+                            editor.apply_references_response(id, targets, cx);
                         }
                         _ => {}
                     });
