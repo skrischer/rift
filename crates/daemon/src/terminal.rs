@@ -306,12 +306,17 @@ impl Attach {
             // (`OpenFile`/`SaveFile`) and the live-buffer feed (`BufferChanged`/
             // `BufferClosed`, #189) are not terminal messages — they are routed to
             // the per-connection buffer service or the shared LSP loop, not here.
+            // Navigation requests (hover/definition/references, #193) are handled
+            // by the shared dispatch loop and LSP worker — never the terminal task.
             ClientMessage::Input { .. }
             | ClientMessage::Attach { .. }
             | ClientMessage::OpenFile { .. }
             | ClientMessage::SaveFile { .. }
             | ClientMessage::BufferChanged { .. }
             | ClientMessage::BufferClosed { .. }
+            | ClientMessage::HoverRequest { .. }
+            | ClientMessage::DefinitionRequest { .. }
+            | ClientMessage::ReferencesRequest { .. }
             | ClientMessage::Hello { .. } => {}
         }
         Ok(())

@@ -187,6 +187,87 @@ content on the structure path was the wrong design). Specified by `spec-editor.m
   can be compared against a save on the buffer path — the concurrent-write
   detector. They are not independently sampled clock values.
 
+## Navigation channel
+
+The navigation channel is the **third request/response family in the protocol**,
+adding hover, go-to-definition, and find-references. Specified by
+`docs/spec-lsp-navigation.md`.
+
+### Request-id correlation convention
+
+Every navigation request carries an explicit `NavRequestId` (`u64` counter,
+client-assigned). The daemon echoes it unchanged in the matching response so
+the client can:
+
+1. **Correlate** the response to the inflight request.
+2. **Drop stale responses** — when the user has moved on, the client compares
+   the echoed `id` against its current inflight id and silently discards the
+   response if they differ. A slow server can never land its result on the wrong
+   file or position.
+
+This explicit id is the protocol's **request-id correlation convention**,
+established by the navigation family. The buffer channel correlates by `path`,
+which is sufficient there (each file has at most one open-or-save in flight at
+a time); the navigation channel requires an explicit id because concurrent
+requests can target the **same file at different positions**, making path-only
+correlation ambiguous. Whether the buffer channel retroactively adopts the id
+convention is deferred — it is additive either way.
+
+### Client → daemon
+
+```json
+{ "type": "hover_request",      "id": 1, "path": "src/main.rs", "position": { "line": 5, "character": 10 } }
+{ "type": "definition_request", "id": 2, "path": "src/main.rs", "position": { "line": 5, "character": 10 } }
+{ "type": "references_request", "id": 3, "path": "src/main.rs", "position": { "line": 5, "character": 10 } }
+```
+
+- `path` is relative to the worktree root — the same key space as worktree
+  entries. `position` uses the same `Position` type as `Diagnostics` (one
+  convention, never two). `id` is the correlation key; a monotonically
+  increasing `u64` counter starting at `0` is the canonical client choice.
+
+### Daemon → client
+
+```jsonc
+// hover_response: None when the server has nothing to say (silent no-op for the UI)
+{ "type": "hover_response", "id": 1, "content": { "markdown": "**fn foo()** — ...", "range": { "start": {...}, "end": {...} } } }
+{ "type": "hover_response", "id": 1, "content": null }
+
+// definition_response: empty targets = no definition found (silent no-op)
+{ "type": "definition_response", "id": 2, "targets": [{ "path": "src/lib.rs", "range": {...}, "line_preview": "pub fn foo() {}" }] }
+{ "type": "definition_response", "id": 2, "targets": [] }
+
+// references_response: empty locations = no references found (silent no-op)
+{ "type": "references_response", "id": 3, "locations": [{ "path": "src/main.rs", "range": {...}, "line_preview": "    foo(x)" }] }
+{ "type": "references_response", "id": 3, "locations": [] }
+```
+
+- `id` echoes the request's `NavRequestId` — always present on responses.
+- `content` is `null` (not absent) when the server has no hover for the
+  position; the client shows no popover (silent no-op, never an error).
+- A `definition_response` with multiple `targets` (e.g. Rust trait method
+  impls) is surfaced in the same jump-list the references path uses; a single
+  target jumps directly.
+- `out_of_root` is `true` (present on the wire) when `path` is absolute and
+  lives outside the worktree root (stdlib / registry dependency). The client
+  opens these read-only — no save path. Omitted (defaults to `false`) for
+  in-root targets.
+- `line_preview` is a trimmed source line for jump-list display; omitted when
+  the daemon cannot read the file (never an error path).
+- `range` in `hover_content` is omitted when the server does not supply it.
+
+### Daemon-side implementation notes (follow-on issues)
+
+The navigation channel types are defined in `crates/protocol` (#193).
+Daemon routing (the LSP request path in `crates/lsp` and `crates/daemon`) is
+wired in follow-on issues. Until then, navigation requests received by the
+daemon are absorbed by the shared dispatch loop's defensive no-op arm.
+
+The daemon owns **offset-encoding translation**: LSP servers default to UTF-16
+offsets; `crates/protocol`'s `Position` speaks rift's own position (UTF-8
+character offset), and `crates/lsp` translates against the document text it
+already syncs — the client and protocol never see UTF-16.
+
 ## Rules
 
 All message types live in `crates/protocol/`. Adding a new message type is a
@@ -194,12 +275,14 @@ deliberate API change — both daemon and client must be updated. Keep additions
 **additive**: existing consumers must keep compiling and deserializing.
 
 Most paths are **push-only** (structure and decoration: worktree, git,
-diagnostics — "push is the source of truth"). The two request/response exceptions
-are deliberate and scoped: `capture_pane` / `pane_capture` for pre-attach
-scrollback, and the **buffer channel** (`open_file` → `file_content`,
-`save_file` → `save_result` / `save_conflict`) for file content. The push-only
-rule governs structure and decoration, never file content — editing is an
-explicit pull on open and push on save.
+diagnostics — "push is the source of truth"). The three request/response
+exceptions are deliberate and scoped: `capture_pane` / `pane_capture` for
+pre-attach scrollback; the **buffer channel** (`open_file` → `file_content`,
+`save_file` → `save_result` / `save_conflict`) for file content; and the
+**navigation channel** (`hover_request` → `hover_response`,
+`definition_request` → `definition_response`,
+`references_request` → `references_response`) for LSP pull queries. The
+push-only rule governs structure and decoration, never request/response pairs.
 
 The protocol may migrate to MessagePack if JSON serialization becomes a bottleneck.
 Keep message types serialization-agnostic (derive `serde::Serialize` +
