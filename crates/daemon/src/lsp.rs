@@ -405,13 +405,22 @@ impl LspWorker {
 
         match req {
             NavRequest::Hover { id, path, position } => {
+                // Record the latest id before the capability check: if no server
+                // is available the early-return means the client gets no response
+                // (treated as "server not ready"), and a subsequent hover request
+                // that does find a server will correctly supersede this id.
                 self.latest_hover_id = Some(id);
                 let Some(requester) = self.find_capable_server(&path, NavCap::Hover) else {
                     return;
                 };
                 let abs_path = root.join(&path);
                 tokio::spawn(async move {
-                    let text = rift_lsp::nav::read_text_from_disk(&abs_path).unwrap_or_default();
+                    let abs_path2 = abs_path.clone();
+                    let text = tokio::task::spawn_blocking(move || {
+                        rift_lsp::nav::read_text_from_disk(&abs_path2).unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default();
                     match requester.hover(&abs_path, position, &text).await {
                         Ok(content) => {
                             let _ = tx.send((id, DaemonMessage::HoverResponse { id, content }));
@@ -429,7 +438,12 @@ impl LspWorker {
                 };
                 let abs_path = root.join(&path);
                 tokio::spawn(async move {
-                    let text = rift_lsp::nav::read_text_from_disk(&abs_path).unwrap_or_default();
+                    let abs_path2 = abs_path.clone();
+                    let text = tokio::task::spawn_blocking(move || {
+                        rift_lsp::nav::read_text_from_disk(&abs_path2).unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default();
                     match requester.definition(&abs_path, position, &text).await {
                         Ok(targets) => {
                             let _ =
@@ -448,7 +462,12 @@ impl LspWorker {
                 };
                 let abs_path = root.join(&path);
                 tokio::spawn(async move {
-                    let text = rift_lsp::nav::read_text_from_disk(&abs_path).unwrap_or_default();
+                    let abs_path2 = abs_path.clone();
+                    let text = tokio::task::spawn_blocking(move || {
+                        rift_lsp::nav::read_text_from_disk(&abs_path2).unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default();
                     match requester.references(&abs_path, position, &text).await {
                         Ok(locations) => {
                             let _ =
@@ -479,7 +498,11 @@ impl LspWorker {
             Some(latest_id) if latest_id == id => {
                 // This response is still current: forward to the dispatch loop.
                 // A closed receiver means the loop is gone; dropping is correct.
-                let _ = self.nav_responses.try_send(msg);
+                if let Err(err) = self.nav_responses.try_send(msg) {
+                    eprintln!(
+                        "rift-daemon: dropped nav response (dispatch loop full or closed): {err}"
+                    );
+                }
             }
             _ => {
                 // Superseded — a newer request was dispatched; drop silently.
@@ -722,9 +745,9 @@ mod tests {
 
         // Simulate: latest hover id is 2 (the second request was dispatched).
         // A response for id=1 arrives first (slow server, out of order).
-        let (completed_nav_tx, completed_nav_rx) =
+        // Not used — we test forward_nav_response directly via the harness.
+        let (_completed_nav_tx, _completed_nav_rx) =
             tokio::sync::mpsc::unbounded_channel::<(NavRequestId, DaemonMessage)>();
-        let _ = completed_nav_rx; // not used here — we test forward_nav_response directly
 
         // Build a minimal LspWorker with the fields we need by calling
         // forward_nav_response directly on a partial struct through a helper.

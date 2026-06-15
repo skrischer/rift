@@ -119,17 +119,6 @@ impl Registry {
         self.servers.get(&id).filter(|s| s.is_alive())
     }
 
-    /// All server ids currently in the store, in insertion order. Includes both
-    /// alive and recently-exited (pending-prune) servers — callers that need
-    /// only live ones should filter with [`Registry::server`].
-    ///
-    /// Used by the navigation dispatch layer to iterate over all registered
-    /// servers and find the first one that advertises a given capability for a
-    /// path, without requiring the registry to expose its internal selector.
-    pub fn all_server_ids(&self) -> impl Iterator<Item = ServerId> + '_ {
-        self.servers.keys().copied()
-    }
-
     /// Find the first live server in the registry that serves `path` (by the
     /// selector's extension matching) and passes the `check` predicate on its
     /// `ServerCapabilities`. Returns a cloned [`ServerSocket`] and

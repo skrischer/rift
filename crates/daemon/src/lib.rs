@@ -1084,8 +1084,13 @@ impl Daemon {
                         // round-trip finished.
                         let _ = core.events.send(msg);
                     }
-                    // The LSP worker ended; stop polling.
-                    None => nav_responses = None,
+                    // The LSP worker ended; stop polling both sides so
+                    // subsequent nav requests are dropped cleanly (no noise
+                    // from try_send on a closed channel).
+                    None => {
+                        nav_responses = None;
+                        core.nav_requests = None;
+                    }
                 },
             }
         }
