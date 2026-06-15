@@ -216,9 +216,10 @@ pub struct EditorView {
     /// Set before `open_file_tx` is fired; consumed in [`EditorView::load`].
     pending_jump: Option<(String, Range)>,
 
-    /// Bounded in-memory back-jump stack: (file-path, cursor-position) pairs.
-    /// Pushed before every jump; popped by the [`GoBack`] action.
-    back_stack: VecDeque<(String, EditorPosition)>,
+    /// Bounded in-memory back-jump stack: (path, position, read_only) triples.
+    /// `read_only` preserves the out-of-root flag so GoBack re-opens the file
+    /// with the same access mode the original forward jump used.
+    back_stack: VecDeque<(String, EditorPosition, bool)>,
 
     /// Transient inline jump-list for multi-target definition responses.
     jump_list: Option<Vec<JumpEntry>>,
@@ -706,8 +707,10 @@ impl EditorView {
 
     // ── Navigation — jump mechanics ───────────────────────────────────────
 
-    /// Push the current (path, cursor-position) onto the back-stack.
+    /// Push the current (path, position, read_only) onto the back-stack.
     ///
+    /// The `read_only` flag is preserved so GoBack can re-open the file with
+    /// the same access mode (out-of-root targets must stay read-only on unwind).
     /// Evicts the oldest entry when the stack reaches `BACK_STACK_MAX`.
     fn push_back_position(&mut self, cx: &Context<Self>) {
         let EditorState::Loaded { path } = &self.state else {
@@ -715,10 +718,11 @@ impl EditorView {
         };
         let path = path.clone();
         let pos = self.input.read(cx).cursor_position();
+        let read_only = self.read_only;
         if self.back_stack.len() >= BACK_STACK_MAX {
             self.back_stack.pop_front();
         }
-        self.back_stack.push_back((path, pos));
+        self.back_stack.push_back((path, pos, read_only));
     }
 
     /// Perform a jump to a `NavLocation`: same-file scrolls + lands cursor;
@@ -781,9 +785,11 @@ impl EditorView {
 
     /// Unwind the most recent jump: return to the position saved on the
     /// back-stack. Crosses file boundaries if the back-position is in a
-    /// different file, storing a pending jump for the `load` path.
+    /// different file, storing a pending jump for the `load` path. The
+    /// `read_only` flag stored in the entry is preserved so out-of-root targets
+    /// remain read-only on unwind.
     fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((path, pos)) = self.back_stack.pop_back() else {
+        let Some((path, pos, read_only)) = self.back_stack.pop_back() else {
             return;
         };
 
@@ -793,13 +799,15 @@ impl EditorView {
         };
 
         if current_path.as_deref() == Some(path.as_str()) {
-            // Same file — move the cursor directly.
+            // Same file — restore the access mode and move the cursor directly.
+            self.read_only = read_only;
             self.input.update(cx, |input, cx| {
                 input.set_cursor_position(pos, window, cx);
             });
             cx.notify();
         } else {
-            // Different file — open it and land on the saved position.
+            // Different file — open it (preserving the original read_only mode)
+            // and land on the saved position via pending_jump.
             let proto_pos = Position {
                 line: pos.line,
                 character: pos.character,
@@ -809,11 +817,7 @@ impl EditorView {
                 end: proto_pos,
             };
             self.pending_jump = Some((path.clone(), range));
-            // Back-navigation always opens in writable mode (the back position
-            // was in an editable buffer or read-only is re-derived from the
-            // response — for simplicity, go-back always uses read_only=false
-            // and the buffer channel's out-of-root guard enforces the rest).
-            self.begin_open(path.clone(), false, window, cx);
+            self.begin_open(path.clone(), read_only, window, cx);
             if let Err(e) = self.open_file_tx.try_send(path.clone()) {
                 tracing::debug!(error = %e, %path, "failed to enqueue go-back open");
             }
@@ -922,10 +926,13 @@ impl Render for EditorView {
         // time the user right-clicks; it receives a fresh `PopupMenu`.
         // "Go to Definition" dispatches the `GoToDefinition` action, which is
         // handled on the outer div below.
+        // `.disabled` blocks all key events and edit operations in the
+        // `InputState`, enforcing the out-of-root read-only contract (#196/#301).
         let input_widget = Input::new(&self.input)
             .font_family(cx.theme().mono_font_family.clone())
             .text_size(cx.theme().mono_font_size)
             .size_full()
+            .disabled(self.read_only)
             .context_menu(|menu: PopupMenu, _window, _cx| {
                 menu.menu("Go to Definition", Box::new(GoToDefinition))
                     .separator()
@@ -1211,29 +1218,34 @@ mod tests {
     fn test_back_stack_bounded_at_max() {
         // The back-stack must never exceed BACK_STACK_MAX entries; oldest
         // entries are evicted when it would overflow.
-        let mut stack: VecDeque<(String, EditorPosition)> = VecDeque::new();
+        let mut stack: VecDeque<(String, EditorPosition, bool)> = VecDeque::new();
         for i in 0..(BACK_STACK_MAX + 10) {
             if stack.len() >= BACK_STACK_MAX {
                 stack.pop_front();
             }
-            stack.push_back((format!("file_{i}.rs"), EditorPosition::new(0, 0)));
+            stack.push_back((format!("file_{i}.rs"), EditorPosition::new(0, 0), false));
         }
         assert_eq!(stack.len(), BACK_STACK_MAX);
         // The oldest entries are gone; only the most recent BACK_STACK_MAX remain.
-        assert_eq!(stack.front().map(|(p, _)| p.as_str()), Some("file_10.rs"));
+        assert_eq!(
+            stack.front().map(|(p, _, _)| p.as_str()),
+            Some("file_10.rs")
+        );
     }
 
     #[test]
     fn test_back_stack_unwinds_in_lifo_order() {
-        let mut stack: VecDeque<(String, EditorPosition)> = VecDeque::new();
-        stack.push_back(("a.rs".to_owned(), EditorPosition::new(1, 0)));
-        stack.push_back(("b.rs".to_owned(), EditorPosition::new(2, 0)));
-        stack.push_back(("c.rs".to_owned(), EditorPosition::new(3, 0)));
+        let mut stack: VecDeque<(String, EditorPosition, bool)> = VecDeque::new();
+        stack.push_back(("a.rs".to_owned(), EditorPosition::new(1, 0), false));
+        stack.push_back(("b.rs".to_owned(), EditorPosition::new(2, 0), false));
+        stack.push_back(("c.rs".to_owned(), EditorPosition::new(3, 0), true));
 
-        // GoBack pops from the back (LIFO).
-        assert_eq!(stack.pop_back().map(|(p, _)| p), Some("c.rs".to_owned()));
-        assert_eq!(stack.pop_back().map(|(p, _)| p), Some("b.rs".to_owned()));
-        assert_eq!(stack.pop_back().map(|(p, _)| p), Some("a.rs".to_owned()));
+        // GoBack pops from the back (LIFO); read_only is preserved per entry.
+        let (p, _, ro) = stack.pop_back().unwrap();
+        assert_eq!(p, "c.rs");
+        assert!(ro, "c.rs was out-of-root, so read_only must be true");
+        assert_eq!(stack.pop_back().map(|(p, _, _)| p), Some("b.rs".to_owned()));
+        assert_eq!(stack.pop_back().map(|(p, _, _)| p), Some("a.rs".to_owned()));
         assert!(stack.is_empty());
     }
 
