@@ -15,6 +15,11 @@
 //! that flag to know a server died and to restart it lazily on the next
 //! matching change. A server exit never propagates as a panic — it is a logged
 //! state transition (`docs/spec-daemon-lsp.md`, the supervision risk row).
+//!
+//! Navigation requests (`textDocument/hover`, `textDocument/definition`,
+//! `textDocument/references`) are also issued through this handle. The server's
+//! `ServerCapabilities` are stored after initialization so callers can perform
+//! a capability check before dispatching — see the [`crate::nav`] module.
 
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -27,9 +32,10 @@ use async_lsp::tracing::TracingLayer;
 use async_lsp::{LanguageServer, ServerSocket};
 use lsp_types::{
     ClientCapabilities, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, InitializeParams, InitializedParams,
-    PublishDiagnosticsParams, TextDocumentClientCapabilities, TextDocumentSyncClientCapabilities,
-    Url, WindowClientCapabilities, WorkspaceFolder,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, GotoDefinitionParams,
+    GotoDefinitionResponse, HoverParams, InitializeParams, InitializedParams,
+    PublishDiagnosticsParams, ReferenceParams, ServerCapabilities, TextDocumentClientCapabilities,
+    TextDocumentSyncClientCapabilities, Url, WindowClientCapabilities, WorkspaceFolder,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -60,12 +66,16 @@ struct ServerClient {
 ///
 /// Cloneable handle parts (`socket`) let the registry drive the server; the
 /// supervisor task owns the child and reports liveness through `alive`.
+/// `capabilities` holds the `ServerCapabilities` from the `InitializeResult`,
+/// used by the navigation layer to check capability before dispatching.
 #[derive(Debug)]
 pub struct Server {
     id: ServerId,
     language: LanguageId,
     name: ServerName,
     socket: ServerSocket,
+    /// The capabilities the server reported in its `InitializeResult`.
+    capabilities: ServerCapabilities,
     /// `true` while the main loop runs; flipped to `false` by the supervisor the
     /// moment the server exits. The registry reads this to decide a restart.
     alive: watch::Receiver<bool>,
@@ -91,6 +101,40 @@ impl Server {
     /// and the registry should restart it on the next matching change.
     pub fn is_alive(&self) -> bool {
         *self.alive.borrow()
+    }
+
+    /// The `ServerCapabilities` this server reported in its `InitializeResult`.
+    ///
+    /// Used by [`crate::nav`] for a capability check before dispatching a
+    /// navigation request. The capabilities are set once during initialization
+    /// and never change for the lifetime of this server instance.
+    pub fn capabilities(&self) -> &ServerCapabilities {
+        &self.capabilities
+    }
+
+    /// Issue a `textDocument/hover` request and await the response.
+    ///
+    /// The socket `.hover()` method is `async_lsp`'s typed request path. Errors
+    /// indicate a transport failure (the server exited); the caller logs and
+    /// treats the request as no-result.
+    pub async fn request_hover(&self, params: HoverParams) -> Result<Option<lsp_types::Hover>> {
+        Ok(self.socket.clone().hover(params).await?)
+    }
+
+    /// Issue a `textDocument/definition` request and await the response.
+    pub async fn request_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        Ok(self.socket.clone().definition(params).await?)
+    }
+
+    /// Issue a `textDocument/references` request and await the response.
+    pub async fn request_references(
+        &self,
+        params: ReferenceParams,
+    ) -> Result<Option<Vec<lsp_types::Location>>> {
+        Ok(self.socket.clone().references(params).await?)
     }
 
     /// A handle to send notifications to this server (e.g. `did_open`,
@@ -239,6 +283,7 @@ impl Server {
             language,
             name,
             socket,
+            capabilities: ServerCapabilities::default(),
             alive: alive_rx,
         };
 
@@ -247,12 +292,18 @@ impl Server {
     }
 
     /// Run the LSP handshake (`initialize` → `initialized`) at the worktree
-    /// root. Capabilities are the minimal set the v1 diagnostics path needs:
-    /// work-done progress (servers that gate work on it), plus declaring
-    /// `textDocument/didSave` so a server honors the save notifications the
-    /// disk-backed sync sends and re-runs its save-triggered checks (#272).
+    /// root. Capabilities are the minimal set the v1 diagnostics + navigation
+    /// paths need: work-done progress (servers that gate work on it), declaring
+    /// `textDocument/didSave` so a server honors save notifications and re-runs
+    /// its save-triggered checks (#272), and declaring hover/definition/
+    /// references support so servers that need explicit client capability
+    /// declaration enable those features.
+    ///
+    /// The server's `ServerCapabilities` from `InitializeResult` are stored so
+    /// the navigation layer can check them before dispatching requests.
     async fn initialize(&mut self, root_uri: Url) -> Result<()> {
-        self.socket
+        let result = self
+            .socket
             .initialize(InitializeParams {
                 workspace_folders: Some(vec![WorkspaceFolder {
                     uri: root_uri,
@@ -263,6 +314,13 @@ impl Server {
                         synchronization: Some(TextDocumentSyncClientCapabilities {
                             did_save: Some(true),
                             ..TextDocumentSyncClientCapabilities::default()
+                        }),
+                        hover: Some(lsp_types::HoverClientCapabilities {
+                            content_format: Some(vec![
+                                lsp_types::MarkupKind::Markdown,
+                                lsp_types::MarkupKind::PlainText,
+                            ]),
+                            ..lsp_types::HoverClientCapabilities::default()
                         }),
                         ..TextDocumentClientCapabilities::default()
                     }),
@@ -275,6 +333,7 @@ impl Server {
                 ..InitializeParams::default()
             })
             .await?;
+        self.capabilities = result.capabilities;
         self.socket.initialized(InitializedParams {})?;
         info!(
             server = self.name,

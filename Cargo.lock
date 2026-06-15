@@ -6271,6 +6271,7 @@ dependencies = [
  "async-lsp",
  "futures",
  "lsp-types 0.95.1",
+ "rift-protocol",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
