@@ -19,6 +19,7 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/skrischer/rift"
 
 [workspace.dependencies]
+rift-protocol = { path = "crates/protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
