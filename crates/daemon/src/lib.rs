@@ -673,9 +673,18 @@ where
                         // off that single loop (one document model + servers for the
                         // daemon), not per connection. Push-only — no reply here;
                         // diagnostics return on the shared broadcast bus.
+                        //
+                        // Navigation requests (hover/definition/references, #193)
+                        // are likewise routed to the shared dispatch loop pending
+                        // the LSP request-path wiring (a follow-on issue); the
+                        // dispatch loop's defensive no-op arm absorbs them until
+                        // then.
                         ClientMessage::Hello { .. }
                         | ClientMessage::BufferChanged { .. }
-                        | ClientMessage::BufferClosed { .. } => {
+                        | ClientMessage::BufferClosed { .. }
+                        | ClientMessage::HoverRequest { .. }
+                        | ClientMessage::DefinitionRequest { .. }
+                        | ClientMessage::ReferencesRequest { .. } => {
                             if inbound.send(msg).await.is_err() {
                                 // Dispatch loop gone; nothing left to serve.
                                 break 'serve;
@@ -1084,7 +1093,10 @@ impl Core {
             // `terminal_task` (per-client attach). The buffer-channel requests
             // (`OpenFile`/`SaveFile`) likewise never reach it — they are answered
             // per connection by `buffer_reply`, request/response back to that
-            // socket, not on the broadcast bus. The arm stays as a defensive
+            // socket, not on the broadcast bus. Navigation requests
+            // (hover/definition/references, #193) will be routed here once the
+            // LSP request path is wired (the protocol types are defined in #193;
+            // daemon routing is a follow-on issue). The arm stays as a defensive
             // no-op in case a caller drives the loop directly.
             ClientMessage::Attach { .. }
             | ClientMessage::Input { .. }
@@ -1092,7 +1104,10 @@ impl Core {
             | ClientMessage::TmuxCommand { .. }
             | ClientMessage::CapturePane { .. }
             | ClientMessage::OpenFile { .. }
-            | ClientMessage::SaveFile { .. } => {}
+            | ClientMessage::SaveFile { .. }
+            | ClientMessage::HoverRequest { .. }
+            | ClientMessage::DefinitionRequest { .. }
+            | ClientMessage::ReferencesRequest { .. } => {}
         }
     }
 

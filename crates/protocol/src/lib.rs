@@ -108,6 +108,32 @@ pub enum ClientMessage {
     BufferClosed {
         path: String,
     },
+    /// Hover request: ask the daemon what the language server knows about the
+    /// symbol at `position` in `path`. `path` is relative to the worktree root.
+    /// `id` is a client-assigned [`NavRequestId`] that correlates the response;
+    /// a stale or superseded response carrying a different id must be dropped.
+    /// The daemon answers with exactly one [`DaemonMessage::HoverResponse`].
+    HoverRequest {
+        id: NavRequestId,
+        path: String,
+        position: Position,
+    },
+    /// Go-to-definition request: ask the daemon where `position` in `path` is
+    /// defined. `path` is relative to the worktree root. `id` correlates the
+    /// [`DaemonMessage::DefinitionResponse`] reply.
+    DefinitionRequest {
+        id: NavRequestId,
+        path: String,
+        position: Position,
+    },
+    /// Find-references request: ask the daemon for all references to the symbol
+    /// at `position` in `path`. `path` is relative to the worktree root. `id`
+    /// correlates the [`DaemonMessage::ReferencesResponse`] reply.
+    ReferencesRequest {
+        id: NavRequestId,
+        path: String,
+        position: Position,
+    },
     Hello {
         version: u32,
     },
@@ -284,6 +310,35 @@ pub enum DaemonMessage {
         path: String,
         disk_mtime: SystemTime,
     },
+    /// Reply to [`ClientMessage::HoverRequest`]. `id` echoes the request's
+    /// [`NavRequestId`] so the client can match and drop superseded responses.
+    /// `content` is the server's markdown-rendered hover text; `None` when the
+    /// server has nothing to say about that position (silent no-op for the UI).
+    /// `content` serializes as `null` on the wire — **not omitted** — so the
+    /// client can distinguish "server responded with nothing" from "response not
+    /// yet received". This is deliberate and differs from the other optional
+    /// fields on navigation types (`line_preview`, `range`) which are omitted
+    /// when absent.
+    HoverResponse {
+        id: NavRequestId,
+        content: Option<HoverContent>,
+    },
+    /// Reply to [`ClientMessage::DefinitionRequest`]. `id` echoes the request's
+    /// [`NavRequestId`]. `targets` is empty when the server found no definition
+    /// (silent no-op); more than one target (e.g. trait method impls in Rust)
+    /// is surfaced in the same jump-list the references path uses.
+    DefinitionResponse {
+        id: NavRequestId,
+        targets: Vec<NavLocation>,
+    },
+    /// Reply to [`ClientMessage::ReferencesRequest`]. `id` echoes the request's
+    /// [`NavRequestId`]. `locations` is empty when the server found no
+    /// references (silent no-op). Each entry carries path, range, and a
+    /// one-line preview for the jump-list.
+    ReferencesResponse {
+        id: NavRequestId,
+        locations: Vec<NavLocation>,
+    },
     Welcome {
         version: u32,
     },
@@ -441,6 +496,69 @@ pub struct Range {
 pub struct Position {
     pub line: u32,
     pub character: u32,
+}
+
+/// An opaque monotonically-increasing request identifier for the navigation
+/// request/response family (hover, go-to-definition, find-references).
+///
+/// Every navigation [`ClientMessage`] variant carries one `NavRequestId`; the
+/// matching [`DaemonMessage`] reply echoes it unchanged so the client can:
+///
+/// 1. **Correlate** the response to the inflight request that issued it.
+/// 2. **Drop stale responses** — when the user has moved on (new file, new
+///    cursor position, or the request was superseded by a later one), the client
+///    compares the echoed `id` against its current inflight id and silently
+///    discards the response if they differ, so a slow server can never land its
+///    result on the wrong file or position.
+///
+/// The buffer channel correlates by `path`, which is insufficient here because
+/// concurrent requests can target the **same file at different positions**;
+/// this explicit id is the minimal correct mechanism. The client is responsible
+/// for generating ids; a `u64` counter starting at `0` is the canonical choice.
+///
+/// This is the protocol's **request-id correlation convention**, established by
+/// the navigation family (Phase 5 `spec-lsp-navigation.md`). Whether the buffer
+/// channel retroactively adopts it is evaluated separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NavRequestId(pub u64);
+
+/// One navigation target (a definition or reference location) returned by the
+/// daemon in response to a navigation request.
+///
+/// `path` is relative to the worktree root — the same key space as
+/// [`WorktreeEntry::path`] — unless the target lives **outside the worktree
+/// root** (e.g. a stdlib or registry dependency), in which case `path` is the
+/// absolute daemon-side path and `out_of_root` is `true`. The client opens
+/// out-of-root targets read-only (no save path). `line_preview` is the
+/// zero-indexed source line at `range.start.line`, trimmed, used for jump-list
+/// display; it is `None` when the daemon cannot read the file (e.g. permissions
+/// or the file does not exist on disk — a degenerate server response, never a
+/// crash).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NavLocation {
+    pub path: String,
+    pub range: Range,
+    /// `true` when `path` is absolute and lives outside the worktree root; the
+    /// client must open this target read-only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub out_of_root: bool,
+    /// One trimmed source line at `range.start.line`, for jump-list previews.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_preview: Option<String>,
+}
+
+/// Hover content returned by the daemon in response to a
+/// [`ClientMessage::HoverRequest`].
+///
+/// `markdown` is the server's hover text in markdown format (LSP
+/// `MarkupContent` with kind `markdown` or `plaintext`, both forwarded as-is
+/// for the client's markdown renderer). `range` is the symbol span the hover
+/// covers; when present the client may highlight it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoverContent {
+    pub markdown: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<Range>,
 }
 
 #[cfg(test)]
@@ -1340,5 +1458,442 @@ mod tests {
                 "structure-path message must carry no file content: {json}"
             );
         }
+    }
+
+    // ---- Navigation request/response round-trip tests ----------------------
+
+    #[test]
+    fn test_nav_request_id_roundtrip_preserves_value() {
+        // NavRequestId is the correlation key for navigation requests; the wire
+        // value must survive serialization unchanged so stale-response detection
+        // works.
+        let id = NavRequestId(42);
+        let json = serde_json::to_string(&id).expect("serialize NavRequestId");
+        assert_eq!(json, "42");
+        let parsed: NavRequestId = serde_json::from_str(&json).expect("deserialize NavRequestId");
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn test_hover_request_roundtrip_preserves_id_path_position() {
+        let msg = ClientMessage::HoverRequest {
+            id: NavRequestId(1),
+            path: "src/main.rs".to_owned(),
+            position: Position {
+                line: 5,
+                character: 10,
+            },
+        };
+        let json = serde_json::to_string(&msg).expect("serialize HoverRequest");
+        assert!(json.contains(r#""type":"hover_request""#));
+        assert!(json.contains(r#""path":"src/main.rs""#));
+        assert!(json.contains(r#""line":5"#));
+        assert!(json.contains(r#""character":10"#));
+        let parsed: ClientMessage = serde_json::from_str(&json).expect("deserialize HoverRequest");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_definition_request_roundtrip_preserves_id_path_position() {
+        let msg = ClientMessage::DefinitionRequest {
+            id: NavRequestId(2),
+            path: "src/lib.rs".to_owned(),
+            position: Position {
+                line: 0,
+                character: 0,
+            },
+        };
+        let json = serde_json::to_string(&msg).expect("serialize DefinitionRequest");
+        assert!(json.contains(r#""type":"definition_request""#));
+        assert!(json.contains(r#""path":"src/lib.rs""#));
+        let parsed: ClientMessage =
+            serde_json::from_str(&json).expect("deserialize DefinitionRequest");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_references_request_roundtrip_preserves_id_path_position() {
+        let msg = ClientMessage::ReferencesRequest {
+            id: NavRequestId(3),
+            path: "src/lib.rs".to_owned(),
+            position: Position {
+                line: 20,
+                character: 4,
+            },
+        };
+        let json = serde_json::to_string(&msg).expect("serialize ReferencesRequest");
+        assert!(json.contains(r#""type":"references_request""#));
+        let parsed: ClientMessage =
+            serde_json::from_str(&json).expect("deserialize ReferencesRequest");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_hover_response_with_content_roundtrip_preserves_id_and_markdown() {
+        let msg = DaemonMessage::HoverResponse {
+            id: NavRequestId(1),
+            content: Some(HoverContent {
+                markdown: "**fn main()** — entry point".to_owned(),
+                range: Some(Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 7,
+                    },
+                }),
+            }),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize HoverResponse");
+        assert!(json.contains(r#""type":"hover_response""#));
+        assert!(json.contains(r#""markdown":"**fn main()** — entry point""#));
+        assert!(json.contains(r#""range""#));
+        let parsed: DaemonMessage = serde_json::from_str(&json).expect("deserialize HoverResponse");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_hover_response_no_content_is_none_not_absent() {
+        // A position with no hover result: `content` is `None`; the client shows
+        // nothing (silent no-op, no error surface). The field must survive
+        // round-trip as `None`, never disappear or default to something.
+        let msg = DaemonMessage::HoverResponse {
+            id: NavRequestId(7),
+            content: None,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize HoverResponse none");
+        assert!(json.contains(r#""content":null"#));
+        let parsed: DaemonMessage =
+            serde_json::from_str(&json).expect("deserialize HoverResponse none");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_hover_content_omits_range_when_absent() {
+        // When the server does not supply a symbol range with the hover, the
+        // `range` field must be absent on the wire (skip_serializing_if None).
+        let content = HoverContent {
+            markdown: "i32".to_owned(),
+            range: None,
+        };
+        let json = serde_json::to_string(&content).expect("serialize HoverContent");
+        assert!(
+            !json.contains("range"),
+            "range must be absent when None: {json}"
+        );
+        let parsed: HoverContent = serde_json::from_str(&json).expect("deserialize HoverContent");
+        assert_eq!(parsed, content);
+    }
+
+    #[test]
+    fn test_definition_response_single_target_roundtrip() {
+        let msg = DaemonMessage::DefinitionResponse {
+            id: NavRequestId(2),
+            targets: vec![NavLocation {
+                path: "src/lib.rs".to_owned(),
+                range: Range {
+                    start: Position {
+                        line: 10,
+                        character: 4,
+                    },
+                    end: Position {
+                        line: 10,
+                        character: 12,
+                    },
+                },
+                out_of_root: false,
+                line_preview: Some("pub fn foo() {}".to_owned()),
+            }],
+        };
+        let json = serde_json::to_string(&msg).expect("serialize DefinitionResponse");
+        assert!(json.contains(r#""type":"definition_response""#));
+        assert!(json.contains(r#""path":"src/lib.rs""#));
+        assert!(json.contains(r#""line_preview":"pub fn foo() {}""#));
+        let parsed: DaemonMessage =
+            serde_json::from_str(&json).expect("deserialize DefinitionResponse");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_definition_response_empty_targets_is_silent_no_op() {
+        // An empty `targets` means the server found no definition — the client
+        // shows nothing. Must round-trip as an empty list, not as an error.
+        let msg = DaemonMessage::DefinitionResponse {
+            id: NavRequestId(5),
+            targets: vec![],
+        };
+        let json = serde_json::to_string(&msg).expect("serialize empty DefinitionResponse");
+        assert!(json.contains(r#""targets":[]"#));
+        let parsed: DaemonMessage =
+            serde_json::from_str(&json).expect("deserialize empty DefinitionResponse");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_definition_response_multiple_targets_roundtrip() {
+        // Rust trait method impls: multiple definition targets land in the
+        // jump-list picker. The protocol must carry all of them.
+        let msg = DaemonMessage::DefinitionResponse {
+            id: NavRequestId(3),
+            targets: vec![
+                NavLocation {
+                    path: "src/a.rs".to_owned(),
+                    range: Range {
+                        start: Position {
+                            line: 1,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 1,
+                            character: 5,
+                        },
+                    },
+                    out_of_root: false,
+                    line_preview: Some("impl Foo for A {}".to_owned()),
+                },
+                NavLocation {
+                    path: "src/b.rs".to_owned(),
+                    range: Range {
+                        start: Position {
+                            line: 3,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 3,
+                            character: 5,
+                        },
+                    },
+                    out_of_root: false,
+                    line_preview: Some("impl Foo for B {}".to_owned()),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&msg).expect("serialize multi-target DefinitionResponse");
+        assert!(json.contains(r#""path":"src/a.rs""#));
+        assert!(json.contains(r#""path":"src/b.rs""#));
+        let parsed: DaemonMessage =
+            serde_json::from_str(&json).expect("deserialize multi-target DefinitionResponse");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_references_response_roundtrip_preserves_locations() {
+        let msg = DaemonMessage::ReferencesResponse {
+            id: NavRequestId(4),
+            locations: vec![
+                NavLocation {
+                    path: "src/main.rs".to_owned(),
+                    range: Range {
+                        start: Position {
+                            line: 5,
+                            character: 4,
+                        },
+                        end: Position {
+                            line: 5,
+                            character: 7,
+                        },
+                    },
+                    out_of_root: false,
+                    line_preview: Some("    foo(x)".to_owned()),
+                },
+                NavLocation {
+                    path: "tests/integration.rs".to_owned(),
+                    range: Range {
+                        start: Position {
+                            line: 20,
+                            character: 12,
+                        },
+                        end: Position {
+                            line: 20,
+                            character: 15,
+                        },
+                    },
+                    out_of_root: false,
+                    line_preview: Some("    assert!(foo(y))".to_owned()),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&msg).expect("serialize ReferencesResponse");
+        assert!(json.contains(r#""type":"references_response""#));
+        assert!(json.contains(r#""path":"tests/integration.rs""#));
+        let parsed: DaemonMessage =
+            serde_json::from_str(&json).expect("deserialize ReferencesResponse");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_references_response_empty_locations_is_silent_no_op() {
+        let msg = DaemonMessage::ReferencesResponse {
+            id: NavRequestId(9),
+            locations: vec![],
+        };
+        let json = serde_json::to_string(&msg).expect("serialize empty ReferencesResponse");
+        assert!(json.contains(r#""locations":[]"#));
+        let parsed: DaemonMessage =
+            serde_json::from_str(&json).expect("deserialize empty ReferencesResponse");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_nav_location_out_of_root_carries_flag_and_absolute_path() {
+        // A stdlib / registry dependency target: `out_of_root` is true, `path`
+        // is absolute. The client opens it read-only. The flag must be present
+        // on the wire when true (it is absent/false-defaulting when in-root).
+        let loc = NavLocation {
+            path: "/home/user/.cargo/registry/src/foo/src/lib.rs".to_owned(),
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 1,
+                },
+            },
+            out_of_root: true,
+            line_preview: None,
+        };
+        let json = serde_json::to_string(&loc).expect("serialize out-of-root NavLocation");
+        assert!(json.contains(r#""out_of_root":true"#));
+        // No line_preview: the field must be absent, not null.
+        assert!(
+            !json.contains("line_preview"),
+            "line_preview must be absent when None: {json}"
+        );
+        let parsed: NavLocation =
+            serde_json::from_str(&json).expect("deserialize out-of-root NavLocation");
+        assert_eq!(parsed, loc);
+    }
+
+    #[test]
+    fn test_nav_location_in_root_omits_out_of_root_flag() {
+        // An in-root location: `out_of_root` defaults to `false` and must be
+        // absent from the wire (skip_serializing_if false), so existing consumers
+        // that do not know the flag keep working.
+        let loc = NavLocation {
+            path: "src/main.rs".to_owned(),
+            range: Range {
+                start: Position {
+                    line: 1,
+                    character: 0,
+                },
+                end: Position {
+                    line: 1,
+                    character: 4,
+                },
+            },
+            out_of_root: false,
+            line_preview: Some("fn main() {}".to_owned()),
+        };
+        let json = serde_json::to_string(&loc).expect("serialize in-root NavLocation");
+        assert!(
+            !json.contains("out_of_root"),
+            "out_of_root must be absent when false: {json}"
+        );
+        let parsed: NavLocation =
+            serde_json::from_str(&json).expect("deserialize in-root NavLocation");
+        assert_eq!(parsed, loc);
+    }
+
+    #[test]
+    fn test_nav_request_id_correlation_echoed_in_responses() {
+        // The explicit id must survive the full request → response round-trip so
+        // the client can match and drop stale responses. Verify that the echoed
+        // id in each response type equals what was sent in the request.
+        let id = NavRequestId(99);
+        let hover_req = ClientMessage::HoverRequest {
+            id,
+            path: "src/main.rs".to_owned(),
+            position: Position {
+                line: 0,
+                character: 0,
+            },
+        };
+        let def_req = ClientMessage::DefinitionRequest {
+            id,
+            path: "src/main.rs".to_owned(),
+            position: Position {
+                line: 0,
+                character: 0,
+            },
+        };
+        let ref_req = ClientMessage::ReferencesRequest {
+            id,
+            path: "src/main.rs".to_owned(),
+            position: Position {
+                line: 0,
+                character: 0,
+            },
+        };
+
+        // Daemon echoes the same id in every response variant.
+        let hover_resp = DaemonMessage::HoverResponse { id, content: None };
+        let def_resp = DaemonMessage::DefinitionResponse {
+            id,
+            targets: vec![],
+        };
+        let ref_resp = DaemonMessage::ReferencesResponse {
+            id,
+            locations: vec![],
+        };
+
+        for req in [
+            serde_json::to_string(&hover_req).expect("serialize hover req"),
+            serde_json::to_string(&def_req).expect("serialize def req"),
+            serde_json::to_string(&ref_req).expect("serialize ref req"),
+        ] {
+            assert!(
+                req.contains(r#""id":99"#),
+                "request must carry id 99: {req}"
+            );
+        }
+        for resp in [
+            serde_json::to_string(&hover_resp).expect("serialize hover resp"),
+            serde_json::to_string(&def_resp).expect("serialize def resp"),
+            serde_json::to_string(&ref_resp).expect("serialize ref resp"),
+        ] {
+            assert!(
+                resp.contains(r#""id":99"#),
+                "response must echo id 99: {resp}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nav_request_types_share_position_type_with_diagnostics() {
+        // Navigation requests use the same `Position` and `Range` types as the
+        // Diagnostics message (#176) — one position convention in the protocol,
+        // never two. Verify the wire shape is identical.
+        let pos = Position {
+            line: 10,
+            character: 4,
+        };
+        let nav_req = ClientMessage::HoverRequest {
+            id: NavRequestId(0),
+            path: "src/main.rs".to_owned(),
+            position: pos,
+        };
+        let diag = DaemonMessage::Diagnostics {
+            path: "src/main.rs".to_owned(),
+            server: "rust-analyzer".to_owned(),
+            items: vec![Diagnostic {
+                range: Range {
+                    start: pos,
+                    end: pos,
+                },
+                severity: DiagnosticSeverity::Error,
+                message: "test".to_owned(),
+                source: None,
+                code: None,
+            }],
+        };
+        let req_json = serde_json::to_string(&nav_req).expect("serialize HoverRequest");
+        let diag_json = serde_json::to_string(&diag).expect("serialize Diagnostics");
+        // Both must use the same wire shape for the position fields.
+        assert!(req_json.contains(r#""line":10,"character":4"#));
+        assert!(diag_json.contains(r#""line":10,"character":4"#));
     }
 }
