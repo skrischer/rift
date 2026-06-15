@@ -314,6 +314,11 @@ pub enum DaemonMessage {
     /// [`NavRequestId`] so the client can match and drop superseded responses.
     /// `content` is the server's markdown-rendered hover text; `None` when the
     /// server has nothing to say about that position (silent no-op for the UI).
+    /// `content` serializes as `null` on the wire — **not omitted** — so the
+    /// client can distinguish "server responded with nothing" from "response not
+    /// yet received". This is deliberate and differs from the other optional
+    /// fields on navigation types (`line_preview`, `range`) which are omitted
+    /// when absent.
     HoverResponse {
         id: NavRequestId,
         content: Option<HoverContent>,
