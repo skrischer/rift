@@ -18,8 +18,6 @@
 //!   `async-lsp`. Translation from `lsp-types` response types to rift's own
 //!   protocol types happens here; `crates/protocol` never sees `lsp-types`.
 //!
-//! - **`first_capable_server`**: first-capable-server routing helper used by
-//!   the daemon's dispatch layer.
 //!
 //! # Offset encoding
 //!
@@ -267,20 +265,24 @@ fn location_to_nav(
     // Attempt disk read for range translation and line preview.
     let text_opt = read_text_from_disk(&abs_path);
 
-    let (path_str, range) = match text_opt.as_deref() {
-        Some(text) => {
-            let rift_range = lsp_range_to_rift(loc.range, text, encoding);
-            let p = if out_of_root {
-                abs_path.display().to_string()
-            } else {
-                abs_path.strip_prefix(root_dir).ok()?.display().to_string()
-            };
-            (p, rift_range)
-        }
+    // Compute the path string once — same logic regardless of whether we have text.
+    let path_str = if out_of_root {
+        abs_path.display().to_string()
+    } else {
+        abs_path.strip_prefix(root_dir).ok()?.display().to_string()
+    };
+
+    let range = match text_opt.as_deref() {
+        Some(text) => lsp_range_to_rift(loc.range, text, encoding),
         None => {
-            // Unreadable file: use LSP range as-is (assume UTF-16 offset 0 on
-            // line N is good enough; the disk fallback failed).
-            let rift_range = Range {
+            // File is unreadable (permissions, not found, binary). The LSP
+            // character values are passed through as-is into `Position::character`
+            // (UTF-8 char offset fields). For UTF-16 servers this is technically
+            // wrong on non-ASCII lines, but there is no text to translate against;
+            // line and character are still useful for navigation even if the
+            // column highlight may be off. The caller surfaces this location
+            // without a line preview, signalling the imprecision.
+            Range {
                 start: Position {
                     line: loc.range.start.line,
                     character: loc.range.start.character,
@@ -289,13 +291,7 @@ fn location_to_nav(
                     line: loc.range.end.line,
                     character: loc.range.end.character,
                 },
-            };
-            let p = if out_of_root {
-                abs_path.display().to_string()
-            } else {
-                abs_path.strip_prefix(root_dir).ok()?.display().to_string()
-            };
-            (p, rift_range)
+            }
         }
     };
 
@@ -318,8 +314,8 @@ fn location_to_nav(
 /// Wraps a `Server` handle with capability-checked navigation requests.
 ///
 /// Constructed from a `&Server` reference once the server is confirmed live;
-/// the daemon's dispatch layer uses [`first_capable_server`] to locate the
-/// right server before constructing this.
+/// the daemon's dispatch layer selects the first capable server before
+/// constructing this.
 pub struct NavRequester<'a> {
     server: &'a Server,
     encoding: PositionEncoding,
