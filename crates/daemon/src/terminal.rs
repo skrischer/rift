@@ -334,9 +334,17 @@ impl Attach {
                         .await
                         .map_err(|_| Closed)?;
                 }
+                // Structural changes and focus changes both re-query the layout:
+                // the `list-panes` query carries window_active/pane_active, so a
+                // `select-window` (tab) or `select-pane` is reflected to the client
+                // as a LayoutUpdate with refreshed active flags. tmux signals focus
+                // moves out-of-band (`%session-window-changed`, `%window-pane-changed`)
+                // with no geometry, so they would otherwise leave the UI stale.
                 Event::LayoutChange { .. }
                 | Event::WindowAdd { .. }
-                | Event::WindowClose { .. } => {
+                | Event::WindowClose { .. }
+                | Event::SessionWindowChanged { .. }
+                | Event::WindowPaneChanged { .. } => {
                     self.request_layout().await;
                 }
                 Event::CommandReply { id, error, output } => {
@@ -900,6 +908,158 @@ mod tests {
         })
         .await;
         assert!(panes.is_some(), "split must produce a 2-pane layout update");
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_layout_update_after_select_pane() {
+        let server = TmuxServer::new("selpane");
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+        recv_until(&mut out_rx, 10, |m| {
+            matches!(m, DaemonMessage::LayoutSnapshot { .. }).then_some(())
+        })
+        .await
+        .expect("snapshot");
+
+        // Two panes so focus can move; record the active pane after the split (the
+        // new pane becomes active).
+        in_tx
+            .send(ClientMessage::TmuxCommand {
+                cmd: "split-window -h".to_owned(),
+            })
+            .await
+            .expect("split");
+        let (active_after_split, pane_ids) = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::LayoutUpdate { windows, .. } => {
+                let panes: Vec<u32> = windows
+                    .iter()
+                    .flat_map(|w| w.panes.iter())
+                    .map(|p| p.pane_id)
+                    .collect();
+                if panes.len() < 2 {
+                    return None;
+                }
+                let active = windows
+                    .iter()
+                    .flat_map(|w| w.panes.iter())
+                    .find(|p| p.active)
+                    .map(|p| p.pane_id)?;
+                Some((active, panes))
+            }
+            _ => None,
+        })
+        .await
+        .expect("2-pane layout update with an active pane");
+
+        // Select a different pane. tmux emits %window-pane-changed (no geometry),
+        // which must re-query the layout and surface a LayoutUpdate whose active
+        // flag has moved to the selected pane — the focus regression this guards.
+        let target = *pane_ids
+            .iter()
+            .find(|&&p| p != active_after_split)
+            .expect("a non-active pane");
+        in_tx
+            .send(ClientMessage::TmuxCommand {
+                cmd: format!("select-pane -t %{target}"),
+            })
+            .await
+            .expect("select-pane");
+
+        let moved = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::LayoutUpdate { windows, .. } => {
+                let active = windows
+                    .iter()
+                    .flat_map(|w| w.panes.iter())
+                    .find(|p| p.active)
+                    .map(|p| p.pane_id)?;
+                (active == target).then_some(active)
+            }
+            _ => None,
+        })
+        .await;
+        assert!(
+            moved.is_some(),
+            "select-pane must emit a LayoutUpdate with the active flag on the selected pane"
+        );
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_layout_update_after_select_window() {
+        let server = TmuxServer::new("selwin");
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+        recv_until(&mut out_rx, 10, |m| {
+            matches!(m, DaemonMessage::LayoutSnapshot { .. }).then_some(())
+        })
+        .await
+        .expect("snapshot");
+
+        // A second window so the active window can move; the new window becomes
+        // active.
+        in_tx
+            .send(ClientMessage::TmuxCommand {
+                cmd: "new-window".to_owned(),
+            })
+            .await
+            .expect("new-window");
+        let (active_after_new, window_ids) = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::LayoutUpdate { windows, .. } => {
+                if windows.len() < 2 {
+                    return None;
+                }
+                let ids: Vec<u32> = windows.iter().map(|w| w.window_id).collect();
+                let active = windows.iter().find(|w| w.active).map(|w| w.window_id)?;
+                Some((active, ids))
+            }
+            _ => None,
+        })
+        .await
+        .expect("2-window layout update with an active window");
+
+        // Switch back to the other window. tmux emits %session-window-changed,
+        // which must re-query and surface a LayoutUpdate with the active flag on
+        // the selected window (the tab-switch half of the focus regression).
+        let target = *window_ids
+            .iter()
+            .find(|&&w| w != active_after_new)
+            .expect("a non-active window");
+        in_tx
+            .send(ClientMessage::TmuxCommand {
+                cmd: format!("select-window -t @{target}"),
+            })
+            .await
+            .expect("select-window");
+
+        let moved = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::LayoutUpdate { windows, .. } => {
+                let active = windows.iter().find(|w| w.active).map(|w| w.window_id)?;
+                (active == target).then_some(active)
+            }
+            _ => None,
+        })
+        .await;
+        assert!(
+            moved.is_some(),
+            "select-window must emit a LayoutUpdate with the active flag on the selected window"
+        );
 
         drop(in_tx);
         let _ = task.await;
