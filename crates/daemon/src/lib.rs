@@ -6,7 +6,7 @@ mod buffer;
 pub mod lsp;
 mod terminal;
 
-use lsp::{document_changes, BufferEvent, LspDiagnostics, LspWorker};
+use lsp::{document_changes, BufferEvent, LspDiagnostics, LspWorker, NavRequest};
 use rift_explorer::{Change, Entry, GitStatus, Snapshot, Watcher};
 use rift_lsp::{DocumentChange, DocumentSelector};
 use rift_protocol::{
@@ -78,6 +78,9 @@ pub struct Daemon {
     /// then pends forever (never fires) so the loop is unaffected when LSP is
     /// off.
     lsp_diagnostics: Option<mpsc::Receiver<LspDiagnostics>>,
+    /// Navigation responses from the off-loop LSP worker (#195), polled as a
+    /// dispatch branch. `None` until [`Daemon::watch_lsp`] arms the worker.
+    nav_responses: Option<mpsc::Receiver<DaemonMessage>>,
     core: Core,
 }
 
@@ -95,6 +98,10 @@ struct Core {
     /// #189) to the off-loop LSP worker — the disk→buffer source-of-truth shift.
     /// `None` when LSP is not armed; the dispatch loop then drops buffer events.
     buffer_events: Option<mpsc::Sender<BufferEvent>>,
+    /// Forwards navigation requests (hover/definition/references, #195) to the
+    /// off-loop LSP worker. `None` when LSP is not armed; nav messages are then
+    /// silently dropped (no server to route them to).
+    nav_requests: Option<mpsc::Sender<NavRequest>>,
 }
 
 /// Sender handles for driving a [`Daemon`].
@@ -129,11 +136,13 @@ pub fn channels(event_capacity: usize, inbound_capacity: usize) -> (Daemon, Hand
         inbound: inbound_rx,
         worktree: None,
         lsp_diagnostics: None,
+        nav_responses: None,
         core: Core {
             events: events_tx.clone(),
             state: state_tx,
             doc_changes: None,
             buffer_events: None,
+            nav_requests: None,
         },
     };
     let handles = Handles {
@@ -329,6 +338,17 @@ async fn next_worktree_event(
 async fn next_lsp_diagnostics(
     rx: &mut Option<mpsc::Receiver<LspDiagnostics>>,
 ) -> Option<LspDiagnostics> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Receive the next navigation response from the off-loop LSP worker, or pend
+/// forever when LSP is not armed (so the `select!` branch never fires).
+async fn next_nav_response(
+    rx: &mut Option<mpsc::Receiver<DaemonMessage>>,
+) -> Option<DaemonMessage> {
     match rx {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
@@ -1007,11 +1027,23 @@ impl Daemon {
         let (doc_tx, doc_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
         let (buffer_tx, buffer_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
         let (diag_tx, diag_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
-        let worker = LspWorker::new(root, selector, doc_rx, buffer_rx, diag_tx);
+        let (nav_req_tx, nav_req_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
+        let (nav_resp_tx, nav_resp_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
+        let worker = LspWorker::new(
+            root,
+            selector,
+            doc_rx,
+            buffer_rx,
+            diag_tx,
+            nav_req_rx,
+            nav_resp_tx,
+        );
         tokio::spawn(worker.run());
         self.core.doc_changes = Some(doc_tx);
         self.core.buffer_events = Some(buffer_tx);
+        self.core.nav_requests = Some(nav_req_tx);
         self.lsp_diagnostics = Some(diag_rx);
+        self.nav_responses = Some(nav_resp_rx);
     }
 
     /// Run the flat dispatch loop until the inbound channel closes.
@@ -1024,6 +1056,7 @@ impl Daemon {
             mut inbound,
             mut worktree,
             mut lsp_diagnostics,
+            mut nav_responses,
             mut core,
         } = self;
         loop {
@@ -1042,6 +1075,22 @@ impl Daemon {
                     Some(diagnostics) => core.apply_diagnostics(diagnostics),
                     // The LSP worker ended; stop polling the closed channel.
                     None => lsp_diagnostics = None,
+                },
+                nav = next_nav_response(&mut nav_responses) => match nav {
+                    Some(msg) => {
+                        // Broadcast the nav response on the shared event bus.
+                        // A closed receiver (no subscribers) is not an error:
+                        // the client may have disconnected before the slow LSP
+                        // round-trip finished.
+                        let _ = core.events.send(msg);
+                    }
+                    // The LSP worker ended; stop polling both sides so
+                    // subsequent nav requests are dropped cleanly (no noise
+                    // from try_send on a closed channel).
+                    None => {
+                        nav_responses = None;
+                        core.nav_requests = None;
+                    }
                 },
             }
         }
@@ -1088,26 +1137,44 @@ impl Core {
             ClientMessage::BufferClosed { path } => {
                 self.forward_buffer_event(BufferEvent::Closed { path });
             }
+            // Navigation requests (#195): routed to the off-loop LSP worker via
+            // `nav_requests`. The worker finds the first capable server, spawns
+            // a task for the LSP round-trip, and sends the translated response
+            // back on `nav_responses`, which the dispatch loop then broadcasts.
+            // When LSP is not armed, `nav_requests` is `None` and the request
+            // is silently dropped — no server to route to.
+            ClientMessage::HoverRequest { id, path, position } => {
+                self.forward_nav_request(NavRequest::Hover { id, path, position });
+            }
+            ClientMessage::DefinitionRequest { id, path, position } => {
+                self.forward_nav_request(NavRequest::Definition { id, path, position });
+            }
+            ClientMessage::ReferencesRequest { id, path, position } => {
+                self.forward_nav_request(NavRequest::References { id, path, position });
+            }
             // Terminal/tmux messages never reach the shared dispatch loop:
             // `serve_connection` routes them to this connection's own
             // `terminal_task` (per-client attach). The buffer-channel requests
             // (`OpenFile`/`SaveFile`) likewise never reach it — they are answered
             // per connection by `buffer_reply`, request/response back to that
-            // socket, not on the broadcast bus. Navigation requests
-            // (hover/definition/references, #193) will be routed here once the
-            // LSP request path is wired (the protocol types are defined in #193;
-            // daemon routing is a follow-on issue). The arm stays as a defensive
-            // no-op in case a caller drives the loop directly.
+            // socket, not on the broadcast bus.
             ClientMessage::Attach { .. }
             | ClientMessage::Input { .. }
             | ClientMessage::ResizePane { .. }
             | ClientMessage::TmuxCommand { .. }
             | ClientMessage::CapturePane { .. }
             | ClientMessage::OpenFile { .. }
-            | ClientMessage::SaveFile { .. }
-            | ClientMessage::HoverRequest { .. }
-            | ClientMessage::DefinitionRequest { .. }
-            | ClientMessage::ReferencesRequest { .. } => {}
+            | ClientMessage::SaveFile { .. } => {}
+        }
+    }
+
+    /// Forward a nav request to the off-loop LSP worker, dropping it (with a
+    /// log) if LSP is not armed or the worker's queue is full.
+    fn forward_nav_request(&self, req: NavRequest) {
+        if let Some(nav_requests) = &self.nav_requests {
+            if let Err(err) = nav_requests.try_send(req) {
+                eprintln!("rift-daemon: dropped navigation request: {err}");
+            }
         }
     }
 

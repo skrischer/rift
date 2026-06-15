@@ -595,4 +595,44 @@ mod tests {
             "read-back mtime matches the save's reported mtime"
         );
     }
+
+    /// Out-of-root carve-out: a `SaveFile` with an absolute path (the wire
+    /// representation for out-of-root definition targets) is refused daemon-side.
+    /// This is the acceptance-level test for the spec's "out-of-root `SaveFile`
+    /// is refused daemon-side" item (issue #195).
+    #[tokio::test]
+    async fn test_out_of_root_save_file_is_refused_with_absolute_path() {
+        let tmp = TempDir::new("out-of-root-save");
+        // An absolute path simulates what the editor would send when the user
+        // attempts to save a buffer opened from an out-of-root definition jump
+        // (e.g. a stdlib or registry file at an absolute path).
+        let err = write_file(
+            &tmp.path,
+            "/etc/rift-absolutely-should-not-write-here.txt",
+            "should not land",
+            SystemTime::UNIX_EPOCH,
+        )
+        .await
+        .expect_err("out-of-root absolute-path save must be refused");
+        assert!(
+            matches!(err, BufferError::PathEscape(_)),
+            "expected PathEscape, got {err:?}"
+        );
+    }
+
+    /// Out-of-root reads are served: `read_file` with a path that looks like a
+    /// relative out-of-root path via `..` is refused (path escape guard), but
+    /// the read path for navigation targets uses the absolute path which is also
+    /// caught — this test confirms the coverage for the absolute-path read case.
+    #[tokio::test]
+    async fn test_out_of_root_read_file_absolute_path_is_refused() {
+        let tmp = TempDir::new("out-of-root-read");
+        let err = read_file(&tmp.path, "/etc/passwd")
+            .await
+            .expect_err("out-of-root absolute-path read must be refused by buffer service");
+        assert!(
+            matches!(err, BufferError::PathEscape(_)),
+            "expected PathEscape, got {err:?}"
+        );
+    }
 }

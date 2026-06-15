@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use async_lsp::ServerSocket;
 use lsp_types::PublishDiagnosticsParams;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -116,6 +117,37 @@ impl Registry {
     /// A live server by id, if it exists and has not exited.
     pub fn server(&self, id: ServerId) -> Option<&Server> {
         self.servers.get(&id).filter(|s| s.is_alive())
+    }
+
+    /// Find the first live server in the registry that serves `path` (by the
+    /// selector's extension matching) and passes the `check` predicate on its
+    /// `ServerCapabilities`. Returns a cloned [`ServerSocket`] and
+    /// [`ServerCapabilities`] that a spawned task can use independently.
+    ///
+    /// Used by the navigation dispatch layer (issue #195) to route a request to
+    /// the first capable server without blocking on server I/O: the socket and
+    /// capabilities are cloned synchronously before the task is spawned.
+    pub fn first_capable_for_path(
+        &self,
+        path: &Path,
+        check: impl Fn(&lsp_types::ServerCapabilities) -> bool,
+    ) -> Option<(ServerSocket, lsp_types::ServerCapabilities)> {
+        for spec in self.selector.matching(path) {
+            for &id in self
+                .by_language
+                .get(spec.language)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+            {
+                if let Some(server) = self.servers.get(&id).filter(|s| s.is_alive()) {
+                    let caps = server.capabilities().clone();
+                    if check(&caps) {
+                        return Some((server.socket(), caps));
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// The number of servers in the store, alive or pending-prune. Primarily for
