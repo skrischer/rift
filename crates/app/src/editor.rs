@@ -906,11 +906,10 @@ impl Render for EditorView {
                 .top(px(0.0))
                 .left(px(0.0))
                 .right(px(0.0))
-                .bg(cx.theme().card)
+                .bg(cx.theme().popover)
                 .border_b_1()
                 .border_color(cx.theme().border)
                 .shadow_md()
-                .z_index(10)
                 .child(
                     div()
                         .px(px(8.0))
