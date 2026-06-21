@@ -374,6 +374,104 @@ async fn test_write_to_ignored_path_emits_no_diagnostics() {
     loop_handle.await.expect("dispatch loop joins");
 }
 
+/// A stub that publishes under the *canonical* document path — modelling a real
+/// server (rust-analyzer) that canonicalizes paths internally. Used by the #308
+/// regression test to surface the daemon's root-canonicalization requirement
+/// without a real server.
+#[cfg(unix)]
+const CANONICALIZING_SERVER: &[ServerSpec] = &[ServerSpec {
+    language: "rust",
+    binary: "stub_lsp_server",
+    args: &[
+        "--marker",
+        ERROR_MARKER,
+        "--message",
+        "type-checker error",
+        "--canonicalize-uri",
+    ],
+    extensions: &["rs"],
+}];
+
+#[cfg(unix)]
+static SYMLINK_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_diagnostics_keyed_under_canonical_relative_path_for_a_symlinked_root() {
+    // Regression for #308: the LSP worker must key diagnostics in the same path
+    // space as the worktree snapshot — relative to the *canonical* root. The
+    // worktree scan canonicalizes its root (so entry paths, and thus the editor's
+    // open path, are canonical-relative), but `watch_lsp` was handed the raw root.
+    // When the raw root differs from its canonical form (here: a symlink) AND the
+    // server publishes under the canonical path (as rust-analyzer does — modelled
+    // by the `--canonicalize-uri` stub), the worker's `strip_prefix(symlink_root)`
+    // on the canonical publish URI failed, dropping the diagnostic entirely. No
+    // `Diagnostics` ever reached the client, so no inline marker rendered. The
+    // other tests pass an already-canonical temp root, hiding this — so this one
+    // deliberately drives a NON-canonical (symlinked) root against a canonicalizing
+    // server. The earlier #189 stub test echoed the opened URI verbatim, which is
+    // exactly why the bug slipped through.
+    //
+    // With the fix, `watch_lsp` canonicalizes its root, so the strip succeeds and
+    // the diagnostic keys under the plain relative path (`app.rs`) — the same key
+    // the editor's canonical-relative open path looks up by.
+    let _bin = stage_stub_on_path();
+    let real = TempDir::new("symlink-real");
+    // A sibling symlink pointing at the real (canonical) root. Passing the symlink
+    // as the daemon root makes the raw root differ from its canonical form.
+    let link = std::env::temp_dir().join(format!(
+        "rift-lsp-it-symlink-{}-{}",
+        std::process::id(),
+        SYMLINK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&real.path, &link).expect("create root symlink");
+    struct LinkGuard(PathBuf);
+    impl Drop for LinkGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _link_guard = LinkGuard(link.clone());
+    // Sanity: the symlink path really differs from its canonical target, so the
+    // test is exercising the mismatch and not a no-op.
+    assert_ne!(
+        link.canonicalize().expect("canonicalize symlink"),
+        link,
+        "the symlink root must differ from its canonical form"
+    );
+
+    let (mut daemon, handles) = channels(256, 16);
+    daemon.watch_worktree(link.clone());
+    daemon.watch_lsp(
+        link.clone(),
+        DocumentSelector::with_table(CANONICALIZING_SERVER),
+    );
+    let mut events = handles.subscribe();
+    let loop_handle = tokio::spawn(daemon.run());
+    wait_for_scan(&handles).await;
+
+    // Write through the real path; the watcher observes it under the canonical root.
+    write_file(
+        &real.path,
+        "app.rs",
+        &format!("fn main() {{}} // {ERROR_MARKER}"),
+    );
+    // The key must be the plain canonical-relative path — the same key the editor's
+    // open path (also canonical-relative) looks up by. Before the fix this timed
+    // out: the canonical publish URI failed to strip the symlink root, so the
+    // diagnostic was dropped at the daemon and never broadcast.
+    let items = recv_diagnostics_until(&mut events, |path, server, items| {
+        (path == "app.rs" && server == "0" && !items.is_empty()).then_some(items)
+    })
+    .await;
+    assert_eq!(items.len(), 1, "the marker yields exactly one diagnostic");
+
+    drop(handles);
+    drop(events);
+    loop_handle.await.expect("dispatch loop joins");
+}
+
 #[tokio::test]
 async fn test_live_buffer_surfaces_unsaved_error_without_a_disk_write() {
     // The cut-C acceptance (#189): an UNSAVED edit's error surfaces without a save

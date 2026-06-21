@@ -137,4 +137,4 @@ For protocol message types, read `docs/protocol.md` before adding or modifying m
 
 ## Open source
 
-Always free, always open source. No telemetry, no analytics. License headers on every source file. Dependencies must pass `cargo deny check licenses`. Code must be understandable to outside contributors — clear module boundaries, documented public APIs.
+Always free, always open source. No telemetry, no analytics. License declared once via the workspace `license` field (`license.workspace = true`); no per-file headers. Dependencies must pass `cargo deny check licenses`. Code must be understandable to outside contributors — clear module boundaries, documented public APIs.
