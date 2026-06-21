@@ -1,10 +1,15 @@
 mod colors;
 pub mod error;
 pub mod keyboard;
+pub mod keytable;
 pub mod layout;
 pub mod pane_view;
 mod session_view;
 
+pub use keytable::{
+    keystroke_to_tmux_key, normalize_tmux_key, parse_list_keys, parse_options, Binding, KeyTable,
+    PrefixOptions,
+};
 pub use pane_view::PaneView;
 pub use session_view::{SessionView, TerminalHandle};
 pub use termy_terminal_ui::TerminalUiRenderMetricsSnapshot;
