@@ -178,6 +178,22 @@ fn main() {
                 rift_app::editor::GoBack,
                 Some(rift_app::editor::EDITOR_KEY_CONTEXT),
             ),
+            // Hover popover (#197): Shift+K mirrors VS Code / Neovim (`K` in Normal mode)
+            // muscle memory. Fires `ShowHover` at the cursor position; the result
+            // renders as a markdown popover anchored to the bottom of the editor area.
+            // Mouse-rest (500 ms debounce) also triggers hover automatically.
+            KeyBinding::new(
+                "shift-k",
+                rift_app::editor::ShowHover,
+                Some(rift_app::editor::EDITOR_KEY_CONTEXT),
+            ),
+            // Find references (#198): Shift+F12 mirrors VS Code muscle memory.
+            // Also available via the context-menu "Find References" entry.
+            KeyBinding::new(
+                "shift-f12",
+                rift_app::editor::FindReferences,
+                Some(rift_app::editor::EDITOR_KEY_CONTEXT),
+            ),
         ]);
         let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
         // Per-channel window title (matching the per-channel taskbar icons), so the
@@ -869,10 +885,12 @@ async fn consume_daemon_messages(
                 let _ = editor.buffer_tx.send(msg);
             }
             // --- nav replies -> editor (every mode) ---
-            // Definition (and future hover / references) responses route to the
-            // editor's nav reply channel, which the workspace's `nav_rx` loop
-            // forwards to `apply_definition_response` on the GPUI side (#196).
-            msg @ DaemonMessage::DefinitionResponse { .. } => {
+            // Definition, hover, and references responses route to the editor's
+            // nav reply channel; the workspace's `nav_rx` loop dispatches each
+            // to the correct `apply_*` method on the GPUI side (#196, #197, #198).
+            msg @ (DaemonMessage::DefinitionResponse { .. }
+            | DaemonMessage::HoverResponse { .. }
+            | DaemonMessage::ReferencesResponse { .. }) => {
                 let _ = editor.nav_tx.send(msg);
             }
             other => debug!(?other, "daemon message without a consumer yet"),
@@ -954,22 +972,30 @@ fn spawn_buffer_change_bridge(
     });
 }
 
-/// Forward the editor's navigation requests onto the protocol (#196): each
-/// `DefinitionRequest` the editor emits after ctrl+click or the context-menu
-/// action is sent verbatim; the daemon answers with a `DefinitionResponse` that
-/// returns through [`consume_daemon_messages`] on `editor.nav_tx`. Ends when
-/// either channel closes.
+/// Forward the editor's navigation requests onto the protocol (#196, #197, #198):
+/// `DefinitionRequest` (ctrl+click / context-menu / F12), `HoverRequest`
+/// (Shift+K / context-menu "Show Hover" / mouse-rest debounce), and
+/// `ReferencesRequest` (Shift+F12 / context-menu "Find References") are sent
+/// verbatim; the daemon answers with `DefinitionResponse` / `HoverResponse` /
+/// `ReferencesResponse` that return through [`consume_daemon_messages`] on
+/// `editor.nav_tx`. Ends when either channel closes.
 fn spawn_nav_bridge(
     client: std::sync::Arc<rift_ssh::DaemonClient>,
     nav_request_rx: flume::Receiver<rift_protocol::ClientMessage>,
 ) {
     tokio::spawn(async move {
         while let Ok(msg) = nav_request_rx.recv_async().await {
-            if let rift_protocol::ClientMessage::DefinitionRequest {
-                ref id, ref path, ..
-            } = msg
-            {
-                debug!(?id, %path, "sending definition request");
+            match &msg {
+                rift_protocol::ClientMessage::DefinitionRequest { id, path, .. } => {
+                    debug!(?id, %path, "sending definition request");
+                }
+                rift_protocol::ClientMessage::HoverRequest { id, path, .. } => {
+                    debug!(?id, %path, "sending hover request");
+                }
+                rift_protocol::ClientMessage::ReferencesRequest { id, path, .. } => {
+                    debug!(?id, %path, "sending references request");
+                }
+                _ => {}
             }
             if client.send(msg).await.is_err() {
                 break;
