@@ -175,6 +175,7 @@ rift/
 │   ├── daemon/             # Remote daemon binary
 │   ├── tmux-core/          # tmux control mode parser + state (currently using termy's TmuxClient directly)
 │   ├── explorer/           # File watcher, git status — library used by daemon
+│   ├── logging/            # Shared logging sink (size rotation, filter chain, panic hook) — library used by app + daemon, gpui-free + musl-clean
 │   ├── lsp/                # Daemon-side LSP client (async-lsp) — library used by daemon, gpui-free + musl-clean
 │   ├── protocol/           # Shared message types. Serializable with serde
 │   └── plugin-api/         # Plugin trait for pane awareness (Phase 3+)

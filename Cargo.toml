@@ -6,6 +6,7 @@ members = [
     "crates/tmux-core",
     "crates/terminal",
     "crates/explorer",
+    "crates/logging",
     "crates/lsp",
     "crates/protocol",
     "crates/plugin-api",
