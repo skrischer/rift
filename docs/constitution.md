@@ -42,7 +42,7 @@
   named `test_<what>_<condition>_<expected>`. Every public API function has at
   least one test; parsers are tested with valid and malformed input. Prefer
   real fixtures over mocks.
-- License header on every source file. Everything in English.
+- License declared once via the workspace `license` field (`license.workspace = true`); no per-file SPDX headers. Everything in English.
 
 ## Quality gates
 
