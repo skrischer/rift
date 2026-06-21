@@ -882,6 +882,41 @@ where
     result
 }
 
+/// Derive the pidfile path for a daemon socket: the socket path with a `.pid`
+/// suffix appended (`/run/rift.sock` -> `/run/rift.sock.pid`).
+///
+/// The suffix is appended, not substituted — `Path::with_extension` would turn
+/// `rift.sock` into `rift.pid` and collide across sockets that differ only by
+/// extension. Appending keeps the pidfile uniquely paired with its socket so the
+/// app can stop the running daemon by PID when redeploying a changed binary (spec
+/// `docs/spec-daemon-redeploy.md`, Family A restart).
+fn pidfile_path(socket_path: &Path) -> PathBuf {
+    let mut raw = socket_path.as_os_str().to_owned();
+    raw.push(".pid");
+    PathBuf::from(raw)
+}
+
+/// Removes the daemon's pidfile when the serve loop ends.
+///
+/// Best-effort: a failed unlink is logged, never propagated — the daemon's exit
+/// must not hinge on cleanup, and a leftover pidfile is harmless (the next start
+/// overwrites it). A kill by signal bypasses `Drop`; the stale pidfile is then
+/// reclaimed on the next start, so cleanup here covers only the clean-return path.
+struct PidfileGuard {
+    path: PathBuf,
+}
+
+impl Drop for PidfileGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            eprintln!(
+                "rift-daemon: failed to remove pidfile {}: {e}",
+                self.path.display()
+            );
+        }
+    }
+}
+
 /// Run a long-lived daemon that listens on a Unix-domain socket and survives
 /// client disconnects — the reattach contract behind issue #62.
 ///
@@ -900,6 +935,11 @@ where
 /// crashed daemon is removed and rebound. Transient per-accept errors are logged
 /// and retried (the daemon must not die on FD pressure and leave nothing to
 /// reattach to); the function returns only on a bind failure or process signal.
+///
+/// Once bound, the daemon writes its PID to `<socket_path>.pid` so the app can
+/// stop it by PID when redeploying a changed binary (spec
+/// `docs/spec-daemon-redeploy.md`, Family A restart). The pidfile is best-effort:
+/// a write failure is logged and serving continues; it is removed on clean exit.
 pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> anyhow::Result<()> {
     if socket_path.exists() {
         // Distinguish a live daemon from a stale socket: a successful connect
@@ -916,6 +956,21 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
     }
 
     let listener = UnixListener::bind(socket_path)?;
+
+    // Write the pidfile only after a successful bind, so a refused second start
+    // never overwrites the live daemon's pidfile. Best-effort: log and carry on
+    // if the write fails. The guard removes it when this function returns.
+    let pidfile = pidfile_path(socket_path);
+    let _pidfile_guard = match tokio::fs::write(&pidfile, std::process::id().to_string()).await {
+        Ok(()) => Some(PidfileGuard { path: pidfile }),
+        Err(e) => {
+            eprintln!(
+                "rift-daemon: failed to write pidfile {}: {e}",
+                pidfile.display()
+            );
+            None
+        }
+    };
 
     let (mut daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
     if let Some(root) = worktree_root {
@@ -1368,6 +1423,48 @@ mod tests {
         // drop all senders so run() observes channel closure and returns
         drop(handles);
         loop_handle.await.expect("dispatch loop joins cleanly");
+    }
+
+    #[test]
+    fn test_pidfile_path_appends_pid_suffix_to_socket() {
+        assert_eq!(
+            pidfile_path(Path::new("/run/rift/rift.sock")),
+            PathBuf::from("/run/rift/rift.sock.pid")
+        );
+    }
+
+    #[test]
+    fn test_pidfile_path_appends_rather_than_replaces_extension() {
+        // `with_extension` would yield `/run/rift.pid`; appending keeps the
+        // socket name intact so each socket maps to a distinct pidfile.
+        assert_eq!(
+            pidfile_path(Path::new("/run/rift.sock")),
+            PathBuf::from("/run/rift.sock.pid")
+        );
+        assert_eq!(
+            pidfile_path(Path::new("/run/rift")),
+            PathBuf::from("/run/rift.pid")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serve_uds_writes_pidfile_with_daemon_pid() {
+        let sock = unique_socket_path();
+        let server = tokio::spawn({
+            let sock = sock.clone();
+            async move { serve_uds(&sock, None).await }
+        });
+        wait_for_socket(&sock).await;
+
+        let pidfile = pidfile_path(&sock);
+        let contents = tokio::fs::read_to_string(&pidfile)
+            .await
+            .expect("pidfile written");
+        assert_eq!(contents, std::process::id().to_string());
+
+        server.abort();
+        let _ = tokio::fs::remove_file(&sock).await;
+        let _ = tokio::fs::remove_file(&pidfile).await;
     }
 
     #[tokio::test]
