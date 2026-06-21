@@ -110,10 +110,13 @@ impl SshConnection {
         Ok(String::from_utf8_lossy(&stdout).into_owned())
     }
 
-    /// Upload `bytes` to `remote_path` and mark it executable, streaming the
-    /// payload over an exec channel into `cat > '<path>' && chmod +x '<path>'`.
-    /// No SFTP/SCP dependency — the existing `russh` exec channel carries the
-    /// bytes directly. The path is single-quote escaped.
+    /// Upload `bytes` to `remote_path` and mark it executable. The payload is
+    /// streamed over an exec channel into a temporary sibling path, made
+    /// executable, then atomically renamed over `remote_path`. The rename
+    /// succeeds even while a process is executing the old `remote_path` (it
+    /// keeps its inode), so a re-deploy never fails with `ETXTBSY`. No SFTP/SCP
+    /// dependency — the existing `russh` exec channel carries the bytes
+    /// directly. Both paths are single-quote escaped.
     ///
     /// Returns [`SshError::Exec`] if the remote command exits with a non-zero
     /// status (e.g. unwritable target directory).
@@ -142,12 +145,17 @@ pub(crate) mod exec {
 
     use crate::error::SshError;
 
-    /// `sh` command body that writes stdin to `path` and makes it executable.
-    /// The path is single-quote escaped so spaces and shell metacharacters in
-    /// the remote path cannot break out of the quoting.
+    /// `sh` command body that writes stdin to a temporary sibling of `path`,
+    /// makes it executable, then atomically renames it over `path`. Writing to
+    /// `<path>.tmp` and `mv -f`-ing into place avoids `ETXTBSY`: a running
+    /// process executing the old `path` keeps its inode while the new binary
+    /// takes the name. Both the temp path and the target are single-quote
+    /// escaped so spaces and shell metacharacters cannot break out of the
+    /// quoting.
     pub(crate) fn cat_to_executable_command(path: &str) -> String {
         let quoted = shell_single_quote(path);
-        format!("cat > {quoted} && chmod +x {quoted}")
+        let quoted_tmp = shell_single_quote(&format!("{path}.tmp"));
+        format!("cat > {quoted_tmp} && chmod +x {quoted_tmp} && mv -f {quoted_tmp} {quoted}")
     }
 
     /// Single-quote a string for safe embedding in a POSIX `sh` command line,
@@ -242,11 +250,23 @@ pub(crate) mod exec {
         }
 
         #[test]
-        fn test_cat_to_executable_command_quotes_path_in_both_places() {
+        fn test_cat_to_executable_command_writes_temp_then_renames_over_target() {
             let cmd = cat_to_executable_command("/tmp/rift daemon");
             assert_eq!(
                 cmd,
-                "cat > '/tmp/rift daemon' && chmod +x '/tmp/rift daemon'"
+                "cat > '/tmp/rift daemon.tmp' && chmod +x '/tmp/rift daemon.tmp' \
+                 && mv -f '/tmp/rift daemon.tmp' '/tmp/rift daemon'"
+            );
+        }
+
+        #[test]
+        fn test_cat_to_executable_command_neutralizes_injection() {
+            // A crafted path must be inert in both the temp and target positions.
+            let cmd = cat_to_executable_command("/tmp/$(touch pwned)");
+            assert_eq!(
+                cmd,
+                "cat > '/tmp/$(touch pwned).tmp' && chmod +x '/tmp/$(touch pwned).tmp' \
+                 && mv -f '/tmp/$(touch pwned).tmp' '/tmp/$(touch pwned)'"
             );
         }
     }
