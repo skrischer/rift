@@ -1026,7 +1026,22 @@ impl Daemon {
     /// Language servers are external child processes the worker spawns and
     /// drives; the dispatch loop only forwards changes and folds the resulting
     /// diagnostics, never blocking on server I/O.
+    ///
+    /// `root` is canonicalized first so the worker keys diagnostics in the same
+    /// path space as the worktree snapshot: [`Snapshot::scan`] canonicalizes its
+    /// root, so every worktree entry path (and thus the editor's open path) is
+    /// relative to the canonical root. The worker derives a diagnostic's relative
+    /// path by stripping its own root prefix from the server's publish URI; if
+    /// that root is the raw (non-canonical) one, a symlinked or `..`-containing
+    /// path yields a key the client never matches (`push_open_file_diagnostics`
+    /// looks up by the canonical-relative open path → no inline marker, #308).
+    /// Canonicalizing here also makes the daemon's own `didOpen`/`didChange` URIs
+    /// canonical, so they round-trip cleanly with a server (rust-analyzer) that
+    /// canonicalizes paths internally before publishing. A canonicalize failure
+    /// (root gone) falls back to the raw root — the worktree worker would have
+    /// failed the same way and stopped, so no diagnostics flow regardless.
     pub fn watch_lsp(&mut self, root: PathBuf, selector: DocumentSelector) {
+        let root = root.canonicalize().unwrap_or(root);
         let (doc_tx, doc_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
         let (buffer_tx, buffer_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
         let (diag_tx, diag_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
