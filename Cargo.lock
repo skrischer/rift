@@ -7739,17 +7739,70 @@ dependencies = [
 ]
 
 [[package]]
-name = "termy_terminal_ui"
+name = "termy_config_core"
 version = "0.1.0"
-source = "git+https://github.com/skrischer/termy?rev=49d3928570c8b50fabb4f7d3d5f6322d3296fafa#49d3928570c8b50fabb4f7d3d5f6322d3296fafa"
+source = "git+https://github.com/skrischer/termy?rev=2c2bd091e4acedfe6799ad77a7f24bf4e19ece70#2c2bd091e4acedfe6799ad77a7f24bf4e19ece70"
+dependencies = [
+ "termy_theme_core",
+]
+
+[[package]]
+name = "termy_core"
+version = "0.1.0"
+source = "git+https://github.com/skrischer/termy?rev=2c2bd091e4acedfe6799ad77a7f24bf4e19ece70#2c2bd091e4acedfe6799ad77a7f24bf4e19ece70"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
  "dirs",
  "flume",
- "gpui",
+ "fontdb",
  "polling",
  "rustix-openpty",
+ "termy_config_core",
+ "termy_search",
+ "termy_themes",
+ "ttf-parser",
+ "winreg",
+]
+
+[[package]]
+name = "termy_search"
+version = "0.1.0"
+source = "git+https://github.com/skrischer/termy?rev=2c2bd091e4acedfe6799ad77a7f24bf4e19ece70#2c2bd091e4acedfe6799ad77a7f24bf4e19ece70"
+dependencies = [
+ "regex",
+ "unicode-width",
+]
+
+[[package]]
+name = "termy_terminal_ui"
+version = "0.1.0"
+source = "git+https://github.com/skrischer/termy?rev=2c2bd091e4acedfe6799ad77a7f24bf4e19ece70#2c2bd091e4acedfe6799ad77a7f24bf4e19ece70"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "flume",
+ "gpui",
+ "rustix-openpty",
+ "termy_core",
+ "tmux_control_core",
+]
+
+[[package]]
+name = "termy_theme_core"
+version = "0.1.0"
+source = "git+https://github.com/skrischer/termy?rev=2c2bd091e4acedfe6799ad77a7f24bf4e19ece70#2c2bd091e4acedfe6799ad77a7f24bf4e19ece70"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "termy_themes"
+version = "0.1.0"
+source = "git+https://github.com/skrischer/termy?rev=2c2bd091e4acedfe6799ad77a7f24bf4e19ece70#2c2bd091e4acedfe6799ad77a7f24bf4e19ece70"
+dependencies = [
+ "termy_theme_core",
 ]
 
 [[package]]
@@ -7865,6 +7918,16 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
+
+[[package]]
+name = "tmux_control_core"
+version = "0.1.0"
+source = "git+https://github.com/skrischer/termy?rev=2c2bd091e4acedfe6799ad77a7f24bf4e19ece70#2c2bd091e4acedfe6799ad77a7f24bf4e19ece70"
+dependencies = [
+ "flume",
+ "rustix 1.1.4",
+ "rustix-openpty",
+]
 
 [[package]]
 name = "tokio"
