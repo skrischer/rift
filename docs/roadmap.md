@@ -26,9 +26,40 @@
 | 7 | tmux key-table mirroring | [spec-tmux-keytable-mirroring.md](spec-tmux-keytable-mirroring.md) | [Key-table mirroring](https://github.com/skrischer/rift/milestone/17) |
 | 8 | tmux status-line mirroring | [spec-tmux-statusline-mirroring.md](spec-tmux-statusline-mirroring.md) | [Status-line mirroring](https://github.com/skrischer/rift/milestone/18) |
 | 9 | Window-state persistence | [spec-window-state-persistence.md](spec-window-state-persistence.md) | [Window-state persistence](https://github.com/skrischer/rift/milestone/19) |
+| 10 | IDE shell — dock + resizable panels | — | — |
+| 11 | Explorer panel — tree decoration, file ops, reveal, keyboard nav | — | — |
+| 12 | Source-control panel + visual diff | — | — |
+| 13 | Problems panel — project-wide diagnostics | — | — |
+| 14 | Status bar — branch, ahead/behind, diagnostic counts | — | — |
+| 15 | Editor tabs — multiple open files | — | — |
+| 16 | Command palette | — | — |
+| 17 | Theme & settings | — | — |
 
 A phase gets a Spec link once `/loopkit:plan` drafts it, and a Milestone link once
 it is `READY`. The milestone (open/closed + issue progress) is where status lives.
+
+## v1.0.0 — Agent cockpit (phases 10–17)
+
+The v1.0.0 milestone group. Today rift's process + data layers are complete — the
+daemon streams worktree, git status, repo state, LSP diagnostics, and LSP
+navigation — but most of those reactive signals are folded into the client model
+without ever being **visualised**: git status, repo/branch, and project-wide
+diagnostics have no UI surface; only inline editor diagnostics and LSP navigation
+are rendered. Phases 10–17 close that gap and replace the fixed three-column flex
+layout with a real dockable IDE shell built on `gpui-component` (the library is
+already vendored — the gallery exercises Dock/Resizable/Tab, the product does not).
+This is the "compete with Zed" cut along rift's own axis ([vision.md](vision.md)):
+the reactive **agent cockpit**, not generic-editor feature parity.
+
+- **In v1.0.0:** surface the reactive signals (11–14); ship the IDE shell (10, 15–17).
+- **Out (post-v1.0.0):** multi-worktree UI (Scenario 2), project-wide search,
+  outline/symbols, LSP completion / code-actions / format / rename, fuzzy
+  quick-open — generic-editor depth that `vision.md` deliberately scopes out of v1.
+
+Sequence: phase 10 (dock shell) is the foundation panels 12–13 dock into. Phase
+11's git/diagnostic tree decoration and phase 14's status bar read the existing
+client model directly (no dock dependency) and are the low-risk quick wins. Phase
+12 is the only one needing a new daemon capability (file diffs).
 
 ## Tracks (tooling/DX, not product phases)
 
@@ -44,4 +75,6 @@ it is `READY`. The milestone (open/closed + issue progress) is where status live
 Scenario 1 from [vision.md](vision.md): connect to a VPS, run Claude Code in a
 pane, watch the file explorer light up as it edits, diagnostics update in
 real-time, review the clean diff, approve, move on. The Phase 3 data layers and
-the editor surface deliver exactly that.
+the editor surface deliver the edit + inline-diagnostics half; the v1.0.0 cockpit
+phases (10–17) deliver the remaining half — the visual diff review and the
+diagnostics / git surfaces — which is what v1.0.0 ships.

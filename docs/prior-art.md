@@ -439,6 +439,28 @@ How the reference projects solve debug logging for GUI apps (console vs file, ro
 
 ---
 
+## v1.0.0 cockpit phases — prior-art index (Phases 10–17)
+
+Per-phase prior-art for the v1.0.0 "agent cockpit" roadmap block
+([roadmap.md](roadmap.md)), so `/loopkit:plan` can resolve "prior art for phase N"
+directly. Most entries point into the categories above; the three marked **(new)**
+are added here.
+
+| Phase | Concern | Reference (repo + path) | License | Verdict |
+|---|---|---|---|---|
+| 10 | Dock + resizable panel shell | `longbridge/gpui-component` `crates/ui/src/dock/`; `zed` `crates/workspace/src/dock.rs` | Apache-2.0 / GPL-3.0 | reuse (gpui-component Dock) / reference (Zed dock+pane tree) |
+| 11 | Explorer panel (decoration, file ops, reveal, keyboard nav) | `zed` `crates/project_panel/src/project_panel.rs` | GPL-3.0 | reference — mirror the precomputed `EntryDetails` cache (one pass per data update, not per frame), the action set, and the git/diagnostic severity roll-up onto ancestor dirs |
+| 12 | Source-control panel + visual diff | `Auto-Explore/GitComet`; `smolcars/hunk` `crates/hunk-git`; `zed` `crates/git` | mixed / GPL-3.0 / GPL-3.0 | reference — diff virtualization on large files; needs a new daemon diff capability |
+| 13 | Problems panel (project-wide diagnostics) **(new)** | `zed` `crates/diagnostics/src/diagnostics.rs` | GPL-3.0 | reference — grouped-by-file diagnostics list, jump-to-location, severity sort; rift's data already streams via `Diagnostics` |
+| 14 | Status bar (branch, ahead/behind, counts) **(new)** | `zed` `crates/status_bar`; `zellij` status-bar plugin (`default-plugins/status-bar`) | GPL-3.0 / MIT | reference — status-item registration slots (left/right), discoverability hints; reads the existing `RepoState` + diagnostics model |
+| 15 | Editor tabs (multiple open files) | `zed` `crates/workspace` (`Item`/`Pane`); `longbridge/gpui-component` `Tab`/`TabBar` | GPL-3.0 / Apache-2.0 | reuse (gpui-component Tab — already used for terminal windows) / reference (Item open/close/dirty lifecycle) |
+| 16 | Command palette **(new)** | `zed` `crates/command_palette/src/command_palette.rs` | GPL-3.0 | reference — fuzzy picker over registered GPUI actions; pairs with `nucleo` (already listed) for the matcher |
+| 17 | Theme & settings | `longbridge/gpui-component` Theme/ThemeRegistry; `zed` `crates/settings` | Apache-2.0 / GPL-3.0 | reuse (gpui-component theming — already vendored) / reference (hierarchical settings store) |
+
+All licenses are GPL-3.0-compatible (rift is GPL-3.0-or-later). The Zed crates are
+study-only (tightly coupled to Zed's `Project`/`Workspace`); gpui-component Dock,
+Tab, and theming are direct dependencies already vendored.
+
 ## Priority reference projects (top 10)
 
 1. **penso/arbor** — Closest existing implementation of rift's exact concept (Rust + GPUI + daemon + SSH outposts + agent state). Read end-to-end before writing any architecture docs.
