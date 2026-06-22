@@ -379,9 +379,26 @@ impl LspWorker {
 
     /// The publish URI as a path relative to the watched root, or `None` when the
     /// URI is not a file under the root.
+    ///
+    /// A dropped publish (non-`file://` URI, or a file outside the root) is logged
+    /// with the offending URI so a server publishing for an out-of-root header
+    /// does not vanish without a trace — the drop itself is correct (there is no
+    /// relative key for such a URI), only the silence was the bug.
     fn relative_path(&self, params: &PublishDiagnosticsParams) -> Option<String> {
-        let absolute = params.uri.to_file_path().ok()?;
-        let relative = absolute.strip_prefix(&self.root).ok()?;
+        let Ok(absolute) = params.uri.to_file_path() else {
+            eprintln!(
+                "rift-daemon: dropped diagnostics publish for non-file:// URI {}",
+                params.uri
+            );
+            return None;
+        };
+        let Ok(relative) = absolute.strip_prefix(&self.root) else {
+            eprintln!(
+                "rift-daemon: dropped diagnostics publish for out-of-root URI {}",
+                params.uri
+            );
+            return None;
+        };
         Some(relative.to_string_lossy().into_owned())
     }
 
