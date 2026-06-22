@@ -30,29 +30,63 @@ use std::io::{self, Read, Write};
 struct Config {
     marker: String,
     message: String,
+    /// When set, resolve the document URI's path to its canonical form before
+    /// publishing — modelling a real server (rust-analyzer) that canonicalizes
+    /// paths internally and publishes under the resolved real path rather than
+    /// echoing the URI it was opened with. Used by the #308 regression test to
+    /// exercise the daemon's root-canonicalization without a real server.
+    canonicalize_uri: bool,
 }
 
-/// Parse `--marker <m>` and `--message <m>` from the process args. Defaults: the
-/// marker is `LSP_STUB_ERROR`; the message echoes the marker so a single stub is
-/// self-describing.
+/// Parse `--marker <m>` / `--message <m>` / `--canonicalize-uri` from the process
+/// args. Defaults: the marker is `LSP_STUB_ERROR`; the message echoes the marker
+/// so a single stub is self-describing; URIs are echoed verbatim.
 fn config() -> Config {
     let mut marker = None;
     let mut message = None;
+    let mut canonicalize_uri = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--marker" => marker = args.next(),
             "--message" => message = args.next(),
+            "--canonicalize-uri" => canonicalize_uri = true,
             _ => {}
         }
     }
     let marker = marker.unwrap_or_else(|| "LSP_STUB_ERROR".to_string());
     let message = message.unwrap_or_else(|| format!("stub error: {marker}"));
-    Config { marker, message }
+    Config {
+        marker,
+        message,
+        canonicalize_uri,
+    }
+}
+
+/// Resolve a `file://` URI's path to its canonical form, returning a `file://`
+/// URI for the canonical path. A non-`file` URI, an unresolvable path, or a
+/// failure to round-trip falls back to the original URI — the stub never blocks
+/// on a canonicalize failure. Hand-rolled to keep the stub dependency-free.
+fn canonicalize_file_uri(uri: &str) -> String {
+    let Some(encoded) = uri.strip_prefix("file://") else {
+        return uri.to_string();
+    };
+    // The test only emits ASCII paths, so percent-decoding is unnecessary here.
+    let Ok(canonical) = std::path::Path::new(encoded).canonicalize() else {
+        return uri.to_string();
+    };
+    match canonical.to_str() {
+        Some(path) => format!("file://{path}"),
+        None => uri.to_string(),
+    }
 }
 
 fn main() -> io::Result<()> {
-    let Config { marker, message } = config();
+    let Config {
+        marker,
+        message,
+        canonicalize_uri,
+    } = config();
     let mut stdin = io::stdin().lock();
     let stdout = io::stdout();
 
@@ -86,7 +120,14 @@ fn main() -> io::Result<()> {
             "textDocument/didOpen" | "textDocument/didChange" => {
                 if let Some(uri) = scan_field(&body, "uri") {
                     let has_error = body.contains(&marker);
-                    let notification = publish_diagnostics(&uri, has_error, &message);
+                    // Model a real server that publishes under the canonical path
+                    // (rust-analyzer) when asked; otherwise echo the URI verbatim.
+                    let publish_uri = if canonicalize_uri {
+                        canonicalize_file_uri(&uri)
+                    } else {
+                        uri
+                    };
+                    let notification = publish_diagnostics(&publish_uri, has_error, &message);
                     write_message(&stdout, &notification)?;
                 }
             }
