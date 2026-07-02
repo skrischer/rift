@@ -27,7 +27,7 @@ What is true when this work is done? Observable, end-to-end criteria — not act
 - **Ignored-files display + daemon scan fix (#309)** — spans three modules, because two documented invariants elsewhere rely on ignored paths never reaching them:
   - `crates/explorer/src/snapshot.rs` (`ignore::WalkBuilder`): **include** ignored entries marked `ignored = true`, excluding only a small explicit perf set (`target/`, `.git/`, `node_modules/`); **stop honoring ripgrep `.ignore`** (so `*.md`/`*.json`/configs become normal visible entries, not dimmed — they were never a git concern).
   - `crates/explorer/src/watcher.rs` (`reconcile`): add an explicit `!ignored` filter so **only non-ignored directories are OS-watched** — preserving the existing invariant (module doc: "Only non-ignored directories are watched, so a large ignored tree like `target/` never consumes an OS watch") now that ignored dirs appear in the snapshot. Ignored entries are shown from the scan and refreshed on the next debounced full rescan, but consume no dedicated watch.
-  - `crates/daemon/src/lsp.rs` (`document_changes`): add an `!ignored` filter at the explorer→LSP sync boundary so an ignored file **never drives a language server** — preserving the invariant its module doc states ("an ignored path never reaches here and never drives a server").
+  - `crates/daemon/src/lsp.rs` (`document_changes`): add an `!ignored` filter at the explorer→LSP sync boundary so an ignored file **never drives a language server** — preserving the invariant its module doc states ("an ignored path never reaches here and never drives a server"). The guard applies to `Added`/`Changed` (which carry the `Entry`); `Removed` carries no entry, so a removed previously-visible ignored file still emits a `DocumentChange::Removed`, which is a harmless no-op `didClose` against a never-opened document (the codebase's established "unknown path → tolerate, don't error" pattern).
   - The client dims `ignored` rows. No protocol change — the `ignored` field already exists on `WorktreeEntry`.
 - **Reveal active file**: expand ancestors, select, and scroll the row into view via the existing `VirtualListScrollHandle`; triggered for the currently open editor file.
 - **Keyboard navigation + focus**: a focusable tree with the arrow/Enter/Home/End action set above; selection state already exists, this adds movement and expand/collapse by key.
@@ -43,7 +43,7 @@ What is true when this work is done? Observable, end-to-end criteria — not act
 
 ## Human prerequisites
 
-None. Client-side rendering + a self-contained daemon scan-behavior change; no new dependency, no secrets, no provisioning, no protocol addition.
+None. Client-side rendering + a daemon scan-behavior change (with two invariant-preserving `!ignored` filter guards in the watcher and the LSP sync); no new dependency, no secrets, no provisioning, no protocol addition.
 
 ## Constraints
 
