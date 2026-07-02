@@ -1,6 +1,6 @@
 # Spec: Phase 14 — Status bar (branch, ahead/behind, diagnostic counts)
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-07-02
 > Completed: —
 
@@ -103,5 +103,6 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 
 Decisions made during implementation. Added as work progresses.
 
+- 2026-07-02: Spec-acceptance gate. Human prerequisites confirmed none; no genuinely-open decisions (click-to-focus deferred, everything else constraint/precedent-determined). Developer accepted; spec flipped `DRAFT → READY` and accepted for merge.
 - 2026-07-02: Review gate (fresh-context Agent review) — `REQUEST_CHANGES`, two blocking findings addressed. (1) Click-to-focus-problems was not implementable while Phase 13's panel is absent (no graceful no-op against a non-existent panel — `DockArea::find_panel` needs a constructed `Arc<dyn PanelView>`); **removed from Phase 14 scope and deferred to a follow-on** once both panels are in-tree, keeping Phase 14 a self-contained read-only strip with no cross-panel coupling. (2) The "shared per-severity helper" framing asserted a cross-phase contract neither phase enforces; **reworded to local computation** with a shared helper as an optional future refactor. Non-blocking folded in: the bar is a **bottom** row (deliberately superseding Phase 10's passing "top strip" mention, which was the titlebar/menu extension point); an explicit "**not** a dock `Panel`" constraint so it is not over-engineered into the dock system. Reviewer verified: the model accessors and flat `diagnostic_count()`, `DiagnosticSeverity` has no `Ord`, `gpui-component` has no status-bar component, and the Phase-10 `flex_col` attach point is a correct forward reference (Phase 10 not yet in code).
 - 2026-07-02: Spec created from `/loopkit:plan` (roadmap Phase 14). Grounded on `WorktreeModel::branch()`/`ahead_behind()` (`AheadBehind{ahead,behind}`) and `all_diagnostics()`/`diagnostic_count()` (flat total), and the absence of a `gpui-component` status-bar component (only `title_bar.rs`). All decisions constraint/precedent-determined (reads existing model, fixed two-group layout not a framework, custom themed strip, per-severity counts computed, click-to-focus-problems); no genuinely-open decisions — the gate is acceptance + human-prerequisites (none) only.
