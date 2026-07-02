@@ -17,8 +17,8 @@ use rift_logging::{
     LogTarget, RotatingMakeWriter, SizedWriter, DEFAULT_MAX_BYTES, FORCE_CONSOLE_ENV,
 };
 use rift_terminal::{
-    CaptureRequest, CaptureResult, ConnectionStatus, PaneInput, PaneOutput, SelectWindow,
-    SessionView, SubscriptionUpdate, TermSize, TERMINAL_KEY_CONTEXT,
+    CaptureRequest, CaptureResult, ConnectionStatus, KeyTableQueryResult, PaneInput, PaneOutput,
+    SelectWindow, SessionView, SubscriptionUpdate, TermSize, TERMINAL_KEY_CONTEXT,
 };
 use tracing::{debug, error, info, warn};
 
@@ -39,6 +39,15 @@ struct PtyChannels {
     capture_request_rx: flume::Receiver<CaptureRequest>,
     capture_result_tx: flume::Sender<CaptureResult>,
     connection_status_tx: flume::Sender<ConnectionStatus>,
+    /// A key-table refresh request from the render layer (explicit trigger, or
+    /// a dispatched binding-mutating command); forwarded onto the protocol as
+    /// `ClientMessage::QueryKeyTable` in daemon mode. Unused in the legacy
+    /// tmux path (`docs/spec-tmux-keytable-mirroring.md` scopes the live
+    /// refresh to the daemon seam) — a request there is a harmless no-op once
+    /// its receiver drops.
+    key_table_request_rx: flume::Receiver<()>,
+    /// The parsed-ready reply to a key-table refresh, routed to `SessionView`.
+    key_table_result_tx: flume::Sender<KeyTableQueryResult>,
 }
 
 /// The daemon-side endpoints of the editor surface's buffer-channel and worktree
@@ -307,6 +316,8 @@ fn main() {
                         capture_request_rx: handle.capture_request_rx,
                         capture_result_tx: handle.capture_result_tx,
                         connection_status_tx: handle.connection_status_tx,
+                        key_table_request_rx: handle.key_table_request_rx,
+                        key_table_result_tx: handle.key_table_result_tx,
                     };
 
                     let editor_channels = EditorChannels {
@@ -490,6 +501,12 @@ async fn run_daemon_terminal(
     spawn_resize_bridge(client.clone(), ch.size_changed_rx);
     spawn_command_bridge(client.clone(), ch.tmux_command_rx);
     spawn_capture_bridge(client.clone(), ch.capture_request_rx);
+    // Key-table refresh reverse path (tmux key-table mirroring, #212): each
+    // request becomes a `QueryKeyTable`; the daemon also issues one unprompted
+    // on attach, so this bridge only carries the explicit/dispatch-triggered
+    // refreshes. The reply returns via `consume_daemon_messages` on
+    // `sinks.key_table_result_tx`.
+    spawn_key_table_bridge(client.clone(), ch.key_table_request_rx);
     // Buffer channel reverse path: the editor's open requests become `OpenFile`
     // reads (#187) and its save requests `SaveFile` writes (#188). The forward
     // replies (`FileContent` / `SaveResult` / `SaveConflict`) return via
@@ -511,6 +528,7 @@ async fn run_daemon_terminal(
         pane_output_tx: ch.pane_output_tx,
         snapshot_tx: ch.snapshot_tx,
         capture_result_tx: ch.capture_result_tx,
+        key_table_result_tx: ch.key_table_result_tx,
     };
     consume_daemon_messages(client, Some(sinks), editor).await;
     Ok(())
@@ -879,6 +897,16 @@ async fn consume_daemon_messages(
                     });
                 }
             }
+            // The reply to a key-table refresh (the daemon's own unprompted
+            // attach-time query, or one this client requested): route the raw
+            // `list-keys`/`show-options` text to `SessionView` to re-parse.
+            DaemonMessage::KeyTableReply { list_keys, options } => {
+                if let Some(sinks) = &terminal {
+                    let _ = sinks
+                        .key_table_result_tx
+                        .send(KeyTableQueryResult { list_keys, options });
+                }
+            }
             // Snapshot and update both carry the full latest layout (replace
             // semantics), which is exactly what the render layer's `apply_snapshot`
             // expects — so both fold into one synthesized `TmuxSnapshot`.
@@ -1045,6 +1073,7 @@ struct TerminalSinks {
     pane_output_tx: flume::Sender<PaneOutput>,
     snapshot_tx: flume::Sender<termy_terminal_ui::TmuxSnapshot>,
     capture_result_tx: flume::Sender<CaptureResult>,
+    key_table_result_tx: flume::Sender<KeyTableQueryResult>,
 }
 
 /// Forward typed input from the render layer onto the protocol as
@@ -1138,6 +1167,26 @@ fn spawn_capture_bridge(
                 join: req.join_wraps,
             };
             if client.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Forward key-table refresh requests (tmux key-table mirroring, #212) onto
+/// the protocol as [`rift_protocol::ClientMessage::QueryKeyTable`]; the daemon
+/// answers with a `KeyTableReply` that returns through
+/// [`consume_daemon_messages`] on `sinks.key_table_result_tx`. The daemon also
+/// issues this query unprompted on attach, so this bridge only carries the
+/// explicit-trigger and binding-mutating-dispatch refreshes.
+fn spawn_key_table_bridge(
+    client: std::sync::Arc<rift_ssh::DaemonClient>,
+    key_table_request_rx: flume::Receiver<()>,
+) {
+    use rift_protocol::ClientMessage;
+    tokio::spawn(async move {
+        while key_table_request_rx.recv_async().await.is_ok() {
+            if client.send(ClientMessage::QueryKeyTable).await.is_err() {
                 break;
             }
         }
