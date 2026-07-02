@@ -116,31 +116,44 @@ async fn wait_for_scan(handles: &Handles) {
 }
 
 /// Put the stub binary on `$PATH` under the two names the tables reference, so
-/// the registry's `Command::new(binary)` resolves them. Returns the temp dir
-/// holding the copies (kept alive for the test). `set_var` mutates the test
-/// process env once; the copies' unique names avoid clashing with anything else.
-fn stage_stub_on_path() -> TempDir {
-    let bin = TempDir::new("bin");
-    let source = Path::new(env!("CARGO_BIN_EXE_stub_lsp_server"));
-    for name in ["stub_lsp_server", "stub_lsp_server_two"] {
-        let dest = bin.path.join(name);
-        std::fs::copy(source, &dest).expect("copy stub binary");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&dest).expect("stat copy").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&dest, perms).expect("chmod copy");
+/// the registry's `Command::new(binary)` resolves them. Runs its env mutation
+/// **exactly once** for the whole test process, guarded by a `OnceLock`: the
+/// single `set_var("PATH")` completes before any test spawns a stub child, so the
+/// process env is never mutated concurrently with a child spawn. That race — the
+/// parallel tests each rewriting `PATH` (line by line via `set_var`) while other
+/// tests' daemons were spawning stub children that read `environ` — intermittently
+/// left a spawn unable to resolve the stub, starving the pipeline until the tests'
+/// timeouts and flaking CI (issue #363). Every test calls this at its start; only
+/// the first performs the copy + `set_var`, the rest observe the completed state.
+///
+/// The staging dir lives for the whole process (a static is never dropped); it is
+/// two small binary copies under the OS temp dir, reclaimed by the temp reaper —
+/// deliberately not self-cleaning, since it must outlive every parallel test.
+fn stage_stub_on_path() {
+    static STAGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    STAGED.get_or_init(|| {
+        let bin = std::env::temp_dir().join(format!("rift-lsp-it-stub-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&bin).expect("create stub bin dir");
+        let source = Path::new(env!("CARGO_BIN_EXE_stub_lsp_server"));
+        for name in ["stub_lsp_server", "stub_lsp_server_two"] {
+            let dest = bin.join(name);
+            std::fs::copy(source, &dest).expect("copy stub binary");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&dest).expect("stat copy").permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&dest, perms).expect("chmod copy");
+            }
         }
-    }
-    let existing = std::env::var_os("PATH").unwrap_or_default();
-    let mut paths = vec![bin.path.clone()];
-    paths.extend(std::env::split_paths(&existing));
-    let joined = std::env::join_paths(paths).expect("join PATH");
-    // SAFETY: the test process is single-purpose; the registry's child spawns
-    // inherit this PATH so they can resolve the staged stubs.
-    std::env::set_var("PATH", joined);
-    bin
+        let existing = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(&existing));
+        let joined = std::env::join_paths(paths).expect("join PATH");
+        // The registry's child spawns inherit this PATH so they can resolve the
+        // staged stubs. This is the only env mutation, and it runs once.
+        std::env::set_var("PATH", joined);
+    });
 }
 
 /// Receive `Diagnostics` events until `pick` yields, with a generous ceiling for
@@ -173,7 +186,7 @@ async fn recv_diagnostics_until<T>(
 
 #[tokio::test]
 async fn test_error_introduced_then_fixed_converges() {
-    let _bin = stage_stub_on_path();
+    stage_stub_on_path();
     let tmp = TempDir::new("converge");
 
     let (mut daemon, handles) = channels(256, 16);
@@ -216,7 +229,7 @@ async fn test_error_introduced_then_fixed_converges() {
 
 #[tokio::test]
 async fn test_two_servers_aggregate_and_clear_independently() {
-    let _bin = stage_stub_on_path();
+    stage_stub_on_path();
     let tmp = TempDir::new("aggregate");
 
     let (mut daemon, handles) = channels(256, 16);
@@ -315,7 +328,7 @@ async fn test_two_servers_aggregate_and_clear_independently() {
 
 #[tokio::test]
 async fn test_write_to_ignored_path_emits_no_diagnostics() {
-    let _bin = stage_stub_on_path();
+    stage_stub_on_path();
     let tmp = TempDir::new("ignored");
     // A tracked file establishes the worktree and proves the pipeline is live;
     // the ignored write must produce nothing despite carrying the marker.
@@ -415,7 +428,7 @@ async fn test_diagnostics_keyed_under_canonical_relative_path_for_a_symlinked_ro
     // With the fix, `watch_lsp` canonicalizes its root, so the strip succeeds and
     // the diagnostic keys under the plain relative path (`app.rs`) — the same key
     // the editor's canonical-relative open path looks up by.
-    let _bin = stage_stub_on_path();
+    stage_stub_on_path();
     let real = TempDir::new("symlink-real");
     // A sibling symlink pointing at the real (canonical) root. Passing the symlink
     // as the daemon root makes the raw root differ from its canonical form.
@@ -479,7 +492,7 @@ async fn test_live_buffer_surfaces_unsaved_error_without_a_disk_write() {
     // (`BufferChanged`) does — yet the stub publishes a diagnostic for it, proving
     // the buffer, not disk, is the LSP's source of truth. Fixing the buffer clears
     // it; closing the buffer reverts to disk (also clean) coherently.
-    let _bin = stage_stub_on_path();
+    stage_stub_on_path();
     let tmp = TempDir::new("live-buffer");
     // The disk file is clean — no marker. If the LSP read disk, no diagnostic.
     write_file(&tmp.path, "buf.rs", "fn main() {}");
