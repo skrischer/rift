@@ -454,7 +454,7 @@ are added here.
 | 13 | Problems panel (project-wide diagnostics) **(new)** | `zed` `crates/diagnostics/src/diagnostics.rs` | GPL-3.0 | reference — grouped-by-file diagnostics list, jump-to-location, severity sort; rift's data already streams via `Diagnostics` |
 | 14 | Status bar (branch, ahead/behind, counts) **(new)** | `zed` `crates/status_bar`; `zellij` status-bar plugin (`default-plugins/status-bar`) | GPL-3.0 / MIT | reference — status-item registration slots (left/right), discoverability hints; reads the existing `RepoState` + diagnostics model |
 | 15 | Editor tabs (multiple open files) | `zed` `crates/workspace` (`Item`/`Pane`); `longbridge/gpui-component` `Tab`/`TabBar` | GPL-3.0 / Apache-2.0 | reuse (gpui-component Tab — already used for terminal windows) / reference (Item open/close/dirty lifecycle) |
-| 16 | Command palette **(new)** | `zed` `crates/command_palette/src/command_palette.rs` | GPL-3.0 | reference — fuzzy picker over registered GPUI actions; pairs with `nucleo` (already listed) for the matcher |
+| 16 | Command palette **(new)** | `zed` `crates/command_palette/src/command_palette.rs` | GPL-3.0 | reference — fuzzy picker over registered GPUI actions. `nucleo` pairs with a *file* quick-open (post-v1.0.0); the v1 command palette uses a small subsequence match over a curated registry (no new dependency) — see `spec-command-palette.md` |
 | 17 | Theme & settings | `longbridge/gpui-component` Theme/ThemeRegistry; `zed` `crates/settings` | Apache-2.0 / GPL-3.0 | reuse (gpui-component theming — already vendored) / reference (hierarchical settings store) |
 
 All licenses are GPL-3.0-compatible (rift is GPL-3.0-or-later). The Zed crates are
