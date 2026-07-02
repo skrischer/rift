@@ -27,7 +27,7 @@
 | 8 | tmux status-line mirroring | [spec-tmux-statusline-mirroring.md](spec-tmux-statusline-mirroring.md) | [Status-line mirroring](https://github.com/skrischer/rift/milestone/18) |
 | 9 | Window-state persistence | [spec-window-state-persistence.md](spec-window-state-persistence.md) | [Window-state persistence](https://github.com/skrischer/rift/milestone/19) |
 | 10 | IDE shell — dock + resizable panels | [spec-ide-shell.md](spec-ide-shell.md) | [Phase 100](https://github.com/skrischer/rift/milestone/24) |
-| 11 | Explorer panel — tree decoration, file ops, reveal, keyboard nav | — | — |
+| 11 | Explorer panel — decoration, reveal, keyboard nav | [spec-explorer-panel.md](spec-explorer-panel.md) | [Phase 110](https://github.com/skrischer/rift/milestone/25) |
 | 12 | Source-control panel + visual diff | — | — |
 | 13 | Problems panel — project-wide diagnostics | — | — |
 | 14 | Status bar — branch, ahead/behind, diagnostic counts | — | — |
@@ -59,7 +59,11 @@ the reactive **agent cockpit**, not generic-editor feature parity.
 Sequence: phase 10 (dock shell) is the foundation panels 12–13 dock into. Phase
 11's git/diagnostic tree decoration and phase 14's status bar read the existing
 client model directly (no dock dependency) and are the low-risk quick wins. Phase
-12 is the only one needing a new daemon capability (file diffs).
+12 is the only numbered phase needing a new daemon capability (file diffs).
+Explorer **file operations** (create/rename/delete/move) were split out of Phase
+11 at planning into a separate daemon-write phase (a write capability needing new
+protocol variants, unlike Phase 11's read-only decoration/navigation); it is not
+yet sequenced.
 
 ## Tracks (tooling/DX, not product phases)
 
