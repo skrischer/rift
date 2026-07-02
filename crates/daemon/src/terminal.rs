@@ -26,6 +26,7 @@ use rift_tmux_core::{Client, CommandId, Event};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
+use tracing::{error, warn};
 
 /// Seconds of buffered pane output tmux tolerates before pausing that pane
 /// (`refresh-client -f pause-after=N`). Small, so a flood is bounded tightly.
@@ -174,7 +175,7 @@ async fn open_attach(
     match Attach::spawn(session.clone(), server_socket).await {
         Ok(attach) => Some(attach),
         Err(err) => {
-            eprintln!("rift-daemon: tmux attach for session {session} failed: {err}");
+            error!(%session, %err, "tmux attach failed");
             let _ = outbound
                 .send(DaemonMessage::TerminalExit {
                     session,
@@ -500,7 +501,7 @@ impl Attach {
         }
         match self.send_command(LAYOUT_QUERY).await {
             Ok(id) => self.layout_query = Some(id),
-            Err(err) => eprintln!("rift-daemon: layout query failed: {err}"),
+            Err(err) => warn!(%err, "layout query failed"),
         }
     }
 
@@ -516,7 +517,7 @@ impl Attach {
                 .send_command(&format!("refresh-client -A '%{pane}:continue'"))
                 .await
             {
-                eprintln!("rift-daemon: resume pane %{pane} failed: {err}");
+                warn!(pane, %err, "resume pane failed");
             }
         }
     }

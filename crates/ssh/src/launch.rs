@@ -104,6 +104,43 @@ fn relay_command(binary_path: &str, socket_path: &str) -> String {
     format!("{bin} --connect {sock}")
 }
 
+/// Derive the pidfile path from `socket_path`: the socket path with a `.pid`
+/// suffix appended, mirroring `crates/daemon`'s own `pidfile_path` (issue
+/// #281) so both sides agree on where the running daemon's PID is written.
+fn pidfile_path(socket_path: &str) -> String {
+    format!("{socket_path}.pid")
+}
+
+/// Build the remote stop command: if the pidfile beside `socket_path` exists,
+/// `kill` the PID it holds. Tolerant of an absent pidfile (no daemon ever
+/// started) and of a stale one (the process is already gone) — `2>/dev/null
+/// || true` absorbs `kill`'s failure in that case — so the command always
+/// exits zero and a missing/dead daemon never surfaces as a failed remote
+/// command (`exec_capture` would otherwise turn a non-zero exit into
+/// `SshError::Exec`, aborting the caller's best-effort restart). The pidfile
+/// path is single-quoted; the PID substituted by `$(cat …)` is data the
+/// remote shell itself produced, not a client-side string, so no separate
+/// quoting of the PID is needed.
+fn stop_command(socket_path: &str) -> String {
+    let pidfile = shell_single_quote(&pidfile_path(socket_path));
+    format!("if [ -f {pidfile} ]; then kill \"$(cat {pidfile})\" 2>/dev/null || true; fi")
+}
+
+/// Stop a daemon running at `socket_path` via its pidfile (#281), so a
+/// following [`connect_or_spawn_daemon`] spawns the fresh binary instead of
+/// reattaching the stale one — the restart half of the changed-binary
+/// re-deploy (issue #283). Call only when the deploy actually re-uploaded the
+/// binary ([`crate::DeployOutcome::uploaded`]); an unchanged deploy must not
+/// bounce a healthy daemon.
+///
+/// Best-effort by construction: [`stop_command`] itself always exits zero, so
+/// an `Err` here means the exec channel failed outright (e.g. a dropped SSH
+/// connection), not that the daemon was already stopped or never running.
+pub async fn stop_daemon(conn: &mut SshConnection, socket_path: &str) -> Result<(), SshError> {
+    conn.exec_capture(&stop_command(socket_path)).await?;
+    Ok(())
+}
+
 /// Attach to a running daemon at `socket_path`, or spawn one detached and then
 /// attach — returning a [`DaemonChannel`] that carries the `rift-protocol`
 /// framing to the persistent daemon.
@@ -238,5 +275,68 @@ mod tests {
             relay_command("/h/rift-daemon-0.1.0", "/h/d.sock"),
             "'/h/rift-daemon-0.1.0' --connect '/h/d.sock'"
         );
+    }
+
+    #[test]
+    fn test_pidfile_path_appends_pid_suffix_to_socket() {
+        assert_eq!(pidfile_path("/h/d.sock"), "/h/d.sock.pid");
+    }
+
+    #[test]
+    fn test_stop_command_single_quotes_pidfile_path() {
+        assert_eq!(
+            stop_command("/h/d.sock"),
+            "if [ -f '/h/d.sock.pid' ]; then kill \"$(cat '/h/d.sock.pid')\" 2>/dev/null || true; fi"
+        );
+    }
+
+    #[test]
+    fn test_stop_command_neutralizes_injection() {
+        let cmd = stop_command("/h/$(touch pwned).sock");
+        assert!(cmd.contains("'/h/$(touch pwned).sock.pid'"));
+        assert!(!cmd.contains("$(touch pwned)`"));
+    }
+
+    #[test]
+    fn test_stop_command_exits_zero_when_pidfile_absent() {
+        assert!(run_stop_command("/nonexistent/does-not-exist.sock"));
+    }
+
+    /// Runs the generated command through a real `sh` against a temp pidfile
+    /// holding a PID no live process can occupy, covering the case a
+    /// string-only assertion cannot: `kill` on that PID fails, and only
+    /// executing the command reveals whether that failure leaks through the
+    /// `if`/`fi` wrapper as a non-zero exit (which `exec_capture` would turn
+    /// into `SshError::Exec`, aborting `stop_daemon` instead of degrading).
+    /// Unix-only: `kill` and PID semantics do not apply on Windows, which is
+    /// not the CI/build target for this exec-command coverage.
+    #[cfg(unix)]
+    #[test]
+    fn test_stop_command_exits_zero_when_pid_is_stale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("d.sock");
+        let pidfile = dir.path().join("d.sock.pid");
+        // An implausibly high PID no live process occupies (safe under any
+        // test runner, including one running as root — unlike a real PID such
+        // as 1, which `kill` run as root would actually signal).
+        std::fs::write(&pidfile, "999999").expect("write stale pidfile");
+
+        assert!(run_stop_command(sock.to_str().expect("utf8 temp path")));
+    }
+
+    #[cfg(unix)]
+    fn run_stop_command(socket_path: &str) -> bool {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(stop_command(socket_path))
+            .output()
+            .expect("run stop command")
+            .status
+            .success()
+    }
+
+    #[cfg(not(unix))]
+    fn run_stop_command(_socket_path: &str) -> bool {
+        true
     }
 }

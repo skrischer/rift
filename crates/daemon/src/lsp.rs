@@ -41,6 +41,7 @@ use rift_lsp::nav::PositionEncoding;
 use rift_lsp::{DocumentChange, DocumentSelector, DocumentSink, DocumentSync, Registry, ServerId};
 use rift_protocol::{DaemonMessage, Diagnostic, DiagnosticSeverity, NavRequestId, Position, Range};
 use tokio::sync::mpsc;
+use tracing::warn;
 
 /// One server's full current diagnostic set for one file, ready to fold into the
 /// daemon `State` and broadcast. `path` is worktree-relative (the protocol key
@@ -148,7 +149,7 @@ impl<'a> ServerSink<'a> {
         for id in &self.ids {
             if let Some(server) = self.registry.server(*id) {
                 if let Err(error) = notify(server) {
-                    eprintln!("rift-daemon: {action} to a language server failed: {error}");
+                    warn!(action, %error, "notification to a language server failed");
                 }
             }
         }
@@ -322,10 +323,7 @@ impl LspWorker {
         if let Err(error) = result {
             // A read failure on close (file gone) or a URI error is not fatal:
             // log and move on, exactly as the disk path does.
-            eprintln!(
-                "rift-daemon: live-buffer sync failed for {}: {error}",
-                path.display()
-            );
+            warn!(path = %path.display(), %error, "live-buffer sync failed");
         }
     }
 
@@ -346,10 +344,7 @@ impl LspWorker {
             if let Err(error) = self.sync.apply(&change, &mut sink) {
                 // A read failure (file removed mid-flight) or a URI error is not
                 // fatal: log and move on, the next change re-syncs from disk.
-                eprintln!(
-                    "rift-daemon: document sync failed for {}: {error}",
-                    change.path().display()
-                );
+                warn!(path = %change.path().display(), %error, "document sync failed");
             }
         }
     }
@@ -386,17 +381,11 @@ impl LspWorker {
     /// relative key for such a URI), only the silence was the bug.
     fn relative_path(&self, params: &PublishDiagnosticsParams) -> Option<String> {
         let Ok(absolute) = params.uri.to_file_path() else {
-            eprintln!(
-                "rift-daemon: dropped diagnostics publish for non-file:// URI {}",
-                params.uri
-            );
+            warn!(uri = %params.uri, "dropped diagnostics publish for non-file:// URI");
             return None;
         };
         let Ok(relative) = absolute.strip_prefix(&self.root) else {
-            eprintln!(
-                "rift-daemon: dropped diagnostics publish for out-of-root URI {}",
-                params.uri
-            );
+            warn!(uri = %params.uri, "dropped diagnostics publish for out-of-root URI");
             return None;
         };
         Some(relative.to_string_lossy().into_owned())
@@ -443,7 +432,7 @@ impl LspWorker {
                             let _ = tx.send((id, DaemonMessage::HoverResponse { id, content }));
                         }
                         Err(err) => {
-                            eprintln!("rift-daemon: hover request failed: {err}");
+                            warn!(%err, "hover request failed");
                         }
                     }
                 });
@@ -467,7 +456,7 @@ impl LspWorker {
                                 tx.send((id, DaemonMessage::DefinitionResponse { id, targets }));
                         }
                         Err(err) => {
-                            eprintln!("rift-daemon: definition request failed: {err}");
+                            warn!(%err, "definition request failed");
                         }
                     }
                 });
@@ -491,7 +480,7 @@ impl LspWorker {
                                 tx.send((id, DaemonMessage::ReferencesResponse { id, locations }));
                         }
                         Err(err) => {
-                            eprintln!("rift-daemon: references request failed: {err}");
+                            warn!(%err, "references request failed");
                         }
                     }
                 });
@@ -516,9 +505,7 @@ impl LspWorker {
                 // This response is still current: forward to the dispatch loop.
                 // A closed receiver means the loop is gone; dropping is correct.
                 if let Err(err) = self.nav_responses.try_send(msg) {
-                    eprintln!(
-                        "rift-daemon: dropped nav response (dispatch loop full or closed): {err}"
-                    );
+                    warn!(%err, "dropped nav response (dispatch loop full or closed)");
                 }
             }
             _ => {

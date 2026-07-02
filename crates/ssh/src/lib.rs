@@ -13,5 +13,5 @@ pub use deploy::{
     DeployOutcome,
 };
 pub use error::SshError;
-pub use launch::connect_or_spawn_daemon;
+pub use launch::{connect_or_spawn_daemon, stop_daemon};
 pub use pty::{PtyStream, PtySyncReader, PtySyncWriter, PtyWriter};
