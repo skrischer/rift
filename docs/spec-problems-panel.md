@@ -39,9 +39,9 @@ None. Pure client-side rendering of an already-streamed model; no new dependency
 
 ## Constraints
 
-- **Reads the existing model, no new protocol**: `WorktreeModel::all_diagnostics()` and the diagnostics count accessor already exist and are exercised by tests; the panel is a new consumer, not a new data path.
-- **Reuses the editor open + go-to-position path** for jump-to-location: no new navigation mechanism — the same open-file/scroll-to-range the tree open and LSP definition already drive.
-- **Severity order is the enum order** (`DiagnosticSeverity`: `Error, Warning, Information, Hint`) — the same ordering Phase 11's roll-up uses; no ambiguity.
+- **Reads the existing model, no new protocol**: `WorktreeModel::all_diagnostics()` already exists (plus a flat total-count accessor `diagnostic_count()`); the **per-severity ("N errors, M warnings") and per-file counts are computed by the panel** from that map (no per-severity accessor exists). The panel is a new consumer, not a new data path.
+- **Jump-to-location wraps the existing editor jump machinery via one small new `pub` method on `EditorView`**: the scroll-to-range internals exist (`jump_to_location` / `apply_jump_range`, today private and driven by LSP nav responses), but the only public open (`begin_open`) takes no position — so the panel needs a thin public wrapper (open the file + the existing pending-jump mechanism to scroll to a range), not a new navigation mechanism. This is the single sensible way to do it; folded into the jump-to-location issue.
+- **Severity order is the enum order** (`DiagnosticSeverity`: `Error, Warning, Information, Hint`) — the same ordering Phase 11's roll-up uses. The shared type derives no `Ord` (adding one would be a protocol change); the panel maps severity to an ordinal locally for sorting.
 - **Virtualized rendering** if the list can be long (`gpui-component` virtual list) — consistent with the tree and diff views; a project with thousands of diagnostics must not materialize thousands of elements per frame.
 - **Depends on Phase 10 (dock shell)**: the panel docks into the bottom zone Phase 10 established. Milestone depends on Phase 100.
 - **Agent-agnostic, read-only** (constitution): derives only from the diagnostics model; no agent detection, no authoring.
@@ -52,7 +52,7 @@ None. Pure client-side rendering of an already-streamed model; no new dependency
 Consulted [prior-art.md](prior-art.md); the Phase-13 index row anchors this spec.
 
 - **`zed` `crates/diagnostics/src/diagnostics.rs` — reference** (GPL-3.0, study-only): the grouped-by-file diagnostics list, jump-to-location, and severity sort. rift mirrors the shape; its data already streams via `Diagnostics` and folds onto `WorktreeModel`, so no store to build.
-- rift-local grounding: `WorktreeModel::all_diagnostics()` (project-wide `path -> server -> Vec<Diagnostic>`) and the diagnostics count accessor already exist (`crates/app/src/worktree.rs`); the daemon streams `Diagnostics { path, server, items }` (`spec-daemon-lsp.md`, #177); inline editor diagnostics (#189) already consume the same model. LSP servers publish project-wide (e.g. rust-analyzer checks the whole crate), so "project-wide" is real, bounded by what servers publish.
+- rift-local grounding: `WorktreeModel::all_diagnostics()` (project-wide `path -> server -> Vec<Diagnostic>`) and a flat `diagnostic_count()` total already exist (`crates/app/src/worktree.rs`) — per-severity/per-file counts are computed by the panel; the daemon streams `Diagnostics { path, server, items }` (`spec-daemon-lsp.md`, #177); inline editor diagnostics (#189) already consume the same model. The editor's jump internals (`jump_to_location`/`apply_jump_range`) are private, so jump-to-location adds one small `pub` wrapper on `EditorView`. LSP servers publish project-wide (e.g. rust-analyzer checks the whole crate), so "project-wide" is real, bounded by what servers publish.
 
 ## Prior decisions
 
@@ -62,7 +62,7 @@ Decisions already made that the implementor must respect. Rationale included so 
 |---|---|---|
 | **Reads `all_diagnostics()`; no new protocol or daemon change** | Constraint: the project-wide diagnostics map already streams and folds onto the model; the panel is a new consumer. The roadmap frames Phase 13 as reading the existing model. | 2026-07-02 |
 | **Grouped by file, sorted by severity then location; per-file + aggregate counts** | Precedent (zed diagnostics): the standard problems-panel shape; severity order is the `DiagnosticSeverity` enum order (no ambiguity). | 2026-07-02 |
-| **Jump-to-location reuses the editor open + go-to-position path** | Constraint: opening a file and scrolling to a range already exists (tree open, LSP go-to-definition); the panel emits the same signal, no new navigation mechanism. | 2026-07-02 |
+| **Jump-to-location wraps the existing editor jump machinery via one small new `pub` method on `EditorView`** | The scroll-to-range internals exist (`jump_to_location`/`apply_jump_range`, driven by LSP nav) but are private, and the only public open (`begin_open`) takes no position; the panel needs a thin public wrapper (open + pending-jump), not a new mechanism. | 2026-07-02 |
 | **Docks in the bottom zone** | Phase 10 reserved bottom for exactly this; problems panels are conventionally bottom (VS Code/Zed), leaving the right dock to source-control (Phase 12). | 2026-07-02 |
 | **Read-only aggregate view; no quick-fixes, no filtering in v1** | Minimal-solution: acting on diagnostics (codeAction) is editor-track depth; filtering is a later refinement. v1 is the sorted project-wide list. | 2026-07-02 |
 
@@ -95,10 +95,11 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 | Jump-to-location races the file load (open then scroll) | Reuse the existing open+scroll path (tree open / go-to-definition already sequence this); a range past the loaded content clamps, no panic. |
 | Diagnostics for a path with no tree entry (e.g. a generated or out-of-tree file the server reports) | The panel lists diagnostics independent of tree membership (the model keys them separately); opening such a path degrades gracefully if unreadable. |
 | Duplicate diagnostics across servers for one file | The model keys by server; the panel flattens per file — if two servers report the same line, both show (matching inline behavior); dedup is not a v1 goal. |
-| PR size | Small phase; decompose: (1) panel + grouped/sorted list + counts from the model; (2) jump-to-location wiring; (3) live-update + virtualization polish. ~200-400-line issues. |
+| PR size | Small phase; decompose: (1) panel + grouped/sorted list + per-severity/per-file counts computed from the model; (2) jump-to-location wiring (incl. the small new `pub` open-at-range method on `EditorView`); (3) live-update + virtualization polish. ~200-400-line issues. |
 
 ## Decision log
 
 Decisions made during implementation. Added as work progresses.
 
+- 2026-07-02: Review gate (fresh-context Agent review) — `APPROVE`, no blocking findings. Three accuracy nits folded in: jump-to-location wraps the existing (private) editor jump machinery via one small new `pub` method on `EditorView` (the only public open, `begin_open`, takes no position) — not literally "no new mechanism"; per-severity/per-file counts are computed by the panel (`diagnostic_count()` is a flat total only); `DiagnosticSeverity` derives no `Ord`, so the panel maps severity to a local ordinal (deriving `Ord` on the protocol type would be a protocol change). Reviewer verified: `all_diagnostics()` is project-wide and independently keyed from tree entries, the protocol shapes match, no new protocol/daemon capability is needed, and the bottom-dock decision is consistent with `spec-source-control.md` reserving bottom for Phase 13.
 - 2026-07-02: Spec created from `/loopkit:plan` (roadmap Phase 13). Grounded on `WorktreeModel::all_diagnostics()` (project-wide map, already streamed), the `Diagnostic` type (`range/severity/message/source/code`), and the existing inline-diagnostics consumer (#189). All decisions constraint/precedent-determined (reads existing model, zed problems-panel shape, reuse editor open+goto, bottom dock, read-only); no genuinely-open decisions — the gate is acceptance + human-prerequisites (none) only.
