@@ -461,6 +461,31 @@ All licenses are GPL-3.0-compatible (rift is GPL-3.0-or-later). The Zed crates a
 study-only (tightly coupled to Zed's `Project`/`Workspace`); gpui-component Dock,
 Tab, and theming are direct dependencies already vendored.
 
+## Pane activity state on window tabs (Phase 18)
+
+> Concern: per window tab, show how many panes run a long-lived process and their
+> aggregated state (busy / idle / needs-attention), derived using ONLY rift's two
+> sanctioned signals — PTY bytes and the terminal bell — never by parsing agent
+> output. Backs roadmap Phase 18. Research: 2026-07 (websearch).
+
+The idea arrives phrased as "how many panes run a Claude Code session", which would
+require agent detection — forbidden by the constitution (`No agent detection`) and
+vision (*"grepping the non-doc codebase for agent names returns nothing"*). The
+agnostic reframe is "how many panes are actively producing output / bell", which
+works identically for any agent (Claude Code, Codex, Gemini CLI) or a `cargo watch`.
+
+| Concern | Reference (repo + path) | License | Verdict |
+|---|---|---|---|
+| Agnostic activity / idle / bell alerts | tmux `monitor-activity` / `monitor-silence` / `monitor-bell` options + control-mode notifications and `alert-activity`/`alert-silence`/`alert-bell` hooks ([Control Mode wiki](https://github.com/tmux/tmux/wiki/Control-Mode), man page "MONITORING") | ISC | **reuse** — tmux itself derives activity/silence/bell purely from PTY bytes (BEL for bell); consume them over the control-mode stream rift already parses. This is the agnostic substitute for content inspection. |
+| Per-pane agent-state UX (color-coded dots + aggregate) | `penso/arbor` working/waiting indicators; `smtg-ai/claude-squad` `session/tmux/` `Instance` state machine; `zellij` status-bar plugin | MIT / AGPL-3.0 / MIT | **reference (UX only)** — adopt the color-coded dot + per-window aggregate roll-up. Explicitly AVOID Arbor's hardcoded agent detection and Claude-Squad's `capture-pane` content hashing. |
+| What to AVOID (agent-specific detection) | `samleeney/tmux-agent-status` (spinner-glyph + "waiting"-prompt parsing of `capture-pane -p`); Claude-Code hooks stamping a `@claude_state` tmux option | — | **avoid** — both are agent-specific: parsing spinner/prompt glyphs out of pane content, or requiring the agent's own hook config. Violates `No agent detection` and the vanilla-agents principle. |
+
+Open design decision, deferred to Phase 18's `/loopkit:plan` spec: cleanly separating
+"waiting for input / needs attention" from "idle at a shell prompt" purely
+agnostically. tmux exposes activity/silence/bell, not "blocked on stdin" — the bell
+is the cleanest agnostic attention proxy; whether it suffices, or a silence-after-
+activity heuristic is added, is a spec-time call, not a roadmap guess.
+
 ## Priority reference projects (top 10)
 
 1. **penso/arbor** — Closest existing implementation of rift's exact concept (Rust + GPUI + daemon + SSH outposts + agent state). Read end-to-end before writing any architecture docs.
