@@ -303,19 +303,20 @@ mod tests {
     /// the `if`/`fi` wrapper as a non-zero exit (which `exec_capture` — see
     /// `crate::connection::exec::drain_channel` — turns into `SshError::Exec`,
     /// aborting the whole deploy instead of correctly deciding "needs upload").
+    /// Unix-only: `chmod`-ing the stub executable needs `PermissionsExt`, and
+    /// `sh` itself is not the CI/build target on Windows.
+    #[cfg(unix)]
     #[test]
     fn test_presence_probe_command_exits_zero_when_binary_present_but_marker_absent() {
-        let dir = std::env::temp_dir().join(format!(
-            "rift-ssh-probe-test-{:?}",
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let bin = dir.join("rift-daemon-0.1.0");
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("rift-daemon-0.1.0");
         std::fs::write(&bin, b"stub").expect("write stub binary");
         let mut perms = std::fs::metadata(&bin)
             .expect("stat stub binary")
             .permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).expect("chmod stub binary");
 
         let cmd = presence_probe_command(bin.to_str().expect("utf8 temp path"));
@@ -324,8 +325,6 @@ mod tests {
             .arg(&cmd)
             .output()
             .expect("run probe command");
-
-        std::fs::remove_dir_all(&dir).expect("clean up temp dir");
 
         assert!(
             output.status.success(),
