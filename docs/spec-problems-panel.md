@@ -1,6 +1,6 @@
 # Spec: Phase 13 — Problems panel (project-wide diagnostics)
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-07-02
 > Completed: —
 
@@ -101,5 +101,6 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 
 Decisions made during implementation. Added as work progresses.
 
+- 2026-07-02: Spec-acceptance gate. Human prerequisites confirmed none; no genuinely-open decisions (all constraint/precedent-determined). Developer accepted; spec flipped `DRAFT → READY` and accepted for merge.
 - 2026-07-02: Review gate (fresh-context Agent review) — `APPROVE`, no blocking findings. Three accuracy nits folded in: jump-to-location wraps the existing (private) editor jump machinery via one small new `pub` method on `EditorView` (the only public open, `begin_open`, takes no position) — not literally "no new mechanism"; per-severity/per-file counts are computed by the panel (`diagnostic_count()` is a flat total only); `DiagnosticSeverity` derives no `Ord`, so the panel maps severity to a local ordinal (deriving `Ord` on the protocol type would be a protocol change). Reviewer verified: `all_diagnostics()` is project-wide and independently keyed from tree entries, the protocol shapes match, no new protocol/daemon capability is needed, and the bottom-dock decision is consistent with `spec-source-control.md` reserving bottom for Phase 13.
 - 2026-07-02: Spec created from `/loopkit:plan` (roadmap Phase 13). Grounded on `WorktreeModel::all_diagnostics()` (project-wide map, already streamed), the `Diagnostic` type (`range/severity/message/source/code`), and the existing inline-diagnostics consumer (#189). All decisions constraint/precedent-determined (reads existing model, zed problems-panel shape, reuse editor open+goto, bottom dock, read-only); no genuinely-open decisions — the gate is acceptance + human-prerequisites (none) only.
