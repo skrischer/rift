@@ -30,7 +30,7 @@
 | 11 | Explorer panel — decoration, reveal, keyboard nav | [spec-explorer-panel.md](spec-explorer-panel.md) | [Phase 110](https://github.com/skrischer/rift/milestone/25) |
 | 12 | Source-control panel + visual diff | [spec-source-control.md](spec-source-control.md) | [Phase 120](https://github.com/skrischer/rift/milestone/26) |
 | 13 | Problems panel — project-wide diagnostics | [spec-problems-panel.md](spec-problems-panel.md) | [Phase 130](https://github.com/skrischer/rift/milestone/27) |
-| 14 | Status bar — branch, ahead/behind, diagnostic counts | — | — |
+| 14 | Status bar — branch, ahead/behind, diagnostic counts | [spec-status-bar.md](spec-status-bar.md) | [Phase 140](https://github.com/skrischer/rift/milestone/28) |
 | 15 | Editor tabs — multiple open files | — | — |
 | 16 | Command palette | — | — |
 | 17 | Theme & settings | — | — |
