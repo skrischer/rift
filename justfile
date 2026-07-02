@@ -350,7 +350,12 @@ _launch-windows exe session detach="":
     # RIFT_TERMINAL_LEGACY (the #205 fallback switch) crosses verbatim too — any
     # non-empty value selects the legacy direct `tmux -CC` path; unset/empty leaves
     # the daemon terminal as the default.
-    export WSLENV="RUST_LOG:RIFT_SSH_HOST:RIFT_SSH_USER:RIFT_SSH_PORT:RIFT_SSH_KEY:RIFT_SESSION:RIFT_PROJECT_ROOT:RIFT_TERMINAL_LEGACY:RIFT_DAEMON_BINARY/p"
+    # RIFT_LOG_CONSOLE crosses verbatim too — the app's TTY-based sink selection
+    # (crates/logging) forces the console sink when set truthy; unset/empty leaves
+    # the live TTY check to decide. dev-windows[-watch] pins it (see below): the
+    # WSL binfmt interop relay is a pipe, not a TTY, so without the override the
+    # dev console would silently divert to the rotated file sink.
+    export WSLENV="RUST_LOG:RIFT_SSH_HOST:RIFT_SSH_USER:RIFT_SSH_PORT:RIFT_SSH_KEY:RIFT_SESSION:RIFT_PROJECT_ROOT:RIFT_TERMINAL_LEGACY:RIFT_LOG_CONSOLE:RIFT_DAEMON_BINARY/p"
     export RUST_LOG=rift=debug,rift_ssh=debug
     export RIFT_SSH_HOST="{{RIFT_SSH_HOST}}"
     export RIFT_SSH_USER="{{RIFT_SSH_USER}}"
@@ -359,6 +364,7 @@ _launch-windows exe session detach="":
     export RIFT_SESSION="{{session}}"
     export RIFT_PROJECT_ROOT="{{RIFT_PROJECT_ROOT}}"
     export RIFT_TERMINAL_LEGACY="${RIFT_TERMINAL_LEGACY:-}"
+    export RIFT_LOG_CONSOLE="${RIFT_LOG_CONSOLE:-}"
     export RIFT_DAEMON_BINARY="{{RIFT_DAEMON_BINARY}}"
     if [ -n "{{detach}}" ]; then
       # Direct binfmt exec in its own session with detached stdio: the recipe (and
@@ -371,10 +377,13 @@ _launch-windows exe session detach="":
     fi
 
 # Build and run native Windows .exe (cross-compiled via MinGW)
+# RIFT_LOG_CONSOLE=1 pins the console sink over the WSL binfmt interop relay,
+# whose stdio is a pipe rather than a TTY — without it the runtime TTY check
+# would silently divert dev's logs to the file sink.
 dev-windows: release-daemon
     cargo build -p rift-app --target x86_64-pc-windows-gnu
     -{{windows_system32}}/taskkill.exe /F /IM rift.exe 2>/dev/null
-    just _launch-windows {{windows_exe}} {{rift_session}}
+    RIFT_LOG_CONSOLE=1 just _launch-windows {{windows_exe}} {{rift_session}}
 
 # Watch for changes and rebuild+run Windows .exe (requires cargo-watch)
 dev-windows-watch:
