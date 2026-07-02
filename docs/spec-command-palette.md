@@ -4,14 +4,14 @@
 > Created: 2026-07-02
 > Completed: —
 
-A keyboard-driven command palette — a modal fuzzy-filter list of rift's commands, opened with a shortcut, that dispatches the selected action. Built on `gpui-component`'s `searchable_list` inside a `Root` dialog; commands come from a small in-app registry over rift's registered GPUI actions. Part of the v1.0.0 agent cockpit ([roadmap.md](roadmap.md)).
+A keyboard-driven command palette — a modal subsequence-filter list of rift's commands, opened with a shortcut, that dispatches the selected action. Built on `gpui-component`'s public `list` + `input` primitives in the `Root` overlay; commands come from a small in-app registry over rift's registered GPUI actions. Part of the v1.0.0 agent cockpit ([roadmap.md](roadmap.md)).
 
 ## Outcome
 
 What is true when this work is done? Observable, end-to-end criteria — not activities.
 
 - [ ] A shortcut (`Ctrl+Shift+P` / `Cmd+Shift+P`) opens a **command palette**: a modal overlay with a filter input and a list of commands, each showing its display name and (where bound) its keybinding.
-- [ ] Typing **filters** the list (subsequence/fuzzy match via `searchable_list`'s delegate); the top match is selectable with Enter, the list navigable with arrows; Escape dismisses.
+- [ ] Typing **filters** the list (a small subsequence match); the top match is selectable with Enter, the list navigable with arrows; Escape dismisses.
 - [ ] Selecting a command **dispatches its action** (e.g. Save, Go to Definition, Find References, and — if in scope, see the gate — the shell panel/dock toggles) into the focused context, then closes the palette.
 - [ ] The palette lists commands from a **single in-app command registry** (display name → dispatchable parameterless action), seeded with rift's existing `rift`-namespace editor/nav actions (plus, per the gate, the shell command actions this phase defines) — adding a command later is one registry entry.
 - [ ] Opening, filtering, and dismissing the palette never disturb terminal/editor state; it is a transient overlay.
@@ -30,7 +30,7 @@ What is true when this work is done? Observable, end-to-end criteria — not act
 ### Out of scope
 
 - **Fuzzy file quick-open** (`Ctrl+P`-style open-any-file) — explicitly post-v1.0.0 per `roadmap.md` / `vision.md` (generic-editor depth scoped out of v1). This phase is a **command** palette (actions), not a file finder.
-- **`nucleo` or any new fuzzy-matching dependency** — the command set is small (dozens of entries); `searchable_list`'s built-in delegate filtering suffices. `nucleo` is only justified by the deferred large-scale quick-open, which is out of scope ("as few dependencies as possible").
+- **`nucleo` or any new fuzzy-matching dependency** — the command set is small (dozens of entries); a small subsequence match over the `list` suffices. `nucleo` is only justified by the deferred large-scale file quick-open, which is out of scope ("as few dependencies as possible").
 - **Command arguments / multi-step palettes** (a command that then prompts for input) — v1 dispatches parameterless actions.
 - **Recently-used / frecency ordering, command categories/grouping** — a later refinement; v1 is a flat filtered list.
 - **A settings/keybinding editor** — Phase 17 (theme & settings) territory.
@@ -55,8 +55,8 @@ None. Client-side UI over existing actions; no new dependency, no protocol chang
 Consulted [prior-art.md](prior-art.md); the Phase-16 index row anchors this spec.
 
 - **`zed` `crates/command_palette/src/command_palette.rs` — reference** (GPL-3.0, study-only): the fuzzy picker over registered actions, keybinding display, and dispatch-into-focused-context. rift takes the shape; instead of Zed's action registry it uses a small in-app command registry over `rift`-namespace actions.
-- **`gpui-component` `searchable_list` — reuse** (already vendored): `SearchableListDelegate`/`SearchableListState` provide the filter-list-in-a-box the palette needs; the `Root` dialog layer hosts the modal (already used by the gallery). No `nucleo` (prior-art lists it, but for large-scale quick-open, which is out of scope here).
-- rift-local grounding: rift's actions are `#[action(namespace = rift, no_json)]` (`crates/app/src/editor.rs`, `crates/terminal/src/lib.rs`); `Root` wraps the app (`crates/app/src/main.rs`); `gpui-component` ships `searchable_list` + `dialog`.
+- **`gpui-component` `list` (`List`/`ListState`/`ListDelegate`) + `input` — reuse** (already vendored, fully public with their own `Render` impls): these compose the palette modal directly. `searchable_list` is deliberately **not** used — its `SearchableListState` is `pub(crate)` and only reachable through `Select`/`ComboBox`'s dropdown trigger chrome, the wrong UX for a keyboard-summoned modal. The `Root` overlay layer hosts the modal (its layers are demoed in the gallery but must be wired into `WorkspaceView`). No `nucleo` (prior-art lists it, but it pairs with the deferred large-scale file quick-open, out of scope here).
+- rift-local grounding: rift's actions are `#[action(namespace = rift, no_json)]` (`crates/app/src/editor.rs`, `crates/terminal/src/lib.rs`); `Root` wraps the app (`crates/app/src/main.rs`) but its overlay layers render only in the gallery today; `gpui-component` ships public `list` + `input` + `dialog`.
 
 ## Prior decisions
 
