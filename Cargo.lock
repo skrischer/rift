@@ -6247,10 +6247,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rift-explorer",
+ "rift-logging",
  "rift-lsp",
  "rift-protocol",
  "rift-tmux-core",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
