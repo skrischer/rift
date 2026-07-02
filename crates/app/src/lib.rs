@@ -7,6 +7,7 @@ pub mod gallery;
 
 pub mod editor;
 pub mod file_tree;
+pub mod terminal_panel;
 pub mod workspace;
 pub mod worktree;
 
@@ -36,4 +37,31 @@ pub fn apply_theme(cx: &mut App) {
     };
     Theme::global_mut(cx).dark_theme = theme;
     Theme::change(ThemeMode::Dark, None, cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::editor::EDITOR_PANEL_NAME;
+    use crate::file_tree::FILE_TREE_PANEL_NAME;
+    use crate::terminal_panel::TERMINAL_PANEL_NAME;
+
+    /// Each dock panel's `Panel::panel_name` is a fixed `&'static str` chosen
+    /// once at the trait impl (`crates/app/src/{file_tree,editor,terminal_panel}.rs`)
+    /// and never derived from instance state — so asserting the module
+    /// constants that back those impls is equivalent to asserting the trait
+    /// method's return value, without needing a GPUI `App`/`Window` to
+    /// construct an `EditorView` or `TerminalPanel` instance.
+    #[test]
+    fn test_panel_names_are_stable_and_distinct() {
+        assert_eq!(FILE_TREE_PANEL_NAME, "explorer");
+        assert_eq!(EDITOR_PANEL_NAME, "editor");
+        assert_eq!(TERMINAL_PANEL_NAME, "terminal");
+
+        let names = [FILE_TREE_PANEL_NAME, EDITOR_PANEL_NAME, TERMINAL_PANEL_NAME];
+        for (i, a) in names.iter().enumerate() {
+            for b in &names[i + 1..] {
+                assert_ne!(a, b, "panel names must be distinct");
+            }
+        }
+    }
 }
