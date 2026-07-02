@@ -1,6 +1,6 @@
 # Spec: Phase 15 — Editor tabs (multiple open files)
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-07-02
 > Completed: —
 
@@ -32,7 +32,7 @@ What is true when this work is done? Observable, end-to-end criteria — not act
 
 - **Split editors / multiple editor panes side by side** — post-v1.0.0; v1 is one tabbed editor panel.
 - **Persisting open tabs across restarts** — deferred with the rest of workspace-layout persistence (Phase 9 / Phase 10 reserved it behind a versioned schema); a fresh launch opens no tabs.
-- **Preview tabs vs. persistent tabs** *(OPEN — resolved at the spec-acceptance gate; recommended: every open is a persistent tab)*: whether single-click opens a transient "preview" tab (VS Code-style, replaced until pinned by edit/double-click) or every open is a persistent tab is the one genuinely-open product choice.
+- **Preview tabs** (VS Code-style transient tabs) — **not in v1** (gate decision, 2026-07-02: **every open is a persistent tab**, no pin/replace state machine). A preview-tab mode can be a later refinement.
 - **Tab drag-reorder / drag-to-split** — a later refinement; v1 tabs are fixed-order (open order), closable, switchable.
 - **Editor gutter change-bars, minimap, breadcrumbs** — separate editor-track items.
 - **New protocol / daemon change** — tabs are client-side over the existing buffer channel (`OpenFile`/`SaveFile`/`BufferChanged`/`BufferClosed`).
@@ -75,7 +75,7 @@ Decisions already made that the implementor must respect. Rationale included so 
 | **Closing the active tab activates the right neighbor (else the left)** | A concrete, predictable rule (not left to the implementer); simplest deterministic behavior. | 2026-07-02 |
 | **Closing a dirty tab confirms before discarding; closing activates a neighbor; last close → empty** | Safe default (no silent data loss); `gpui-component`'s dialog via `Root` provides the confirm. | 2026-07-02 |
 | **Open tabs are not persisted across restarts** | Deferred with workspace-layout persistence (Phase 9/10 reserved it behind a versioned schema); minimal-solution. | 2026-07-02 |
-| **Preview tabs vs persistent tabs** | **OPEN — resolved at the spec-acceptance gate.** Recommended: every open is a persistent tab (simplest; preview tabs add a pin/replace state machine). The user's product call. | OPEN |
+| **Every open is a persistent tab (no preview tabs in v1)** | Gate decision: simplest model, no pin/replace state machine; a preview-tab mode is a later refinement. | 2026-07-02 |
 
 ## Tracking
 
@@ -114,5 +114,6 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 
 Decisions made during implementation. Added as work progresses.
 
+- 2026-07-02: Spec-acceptance gate. Human prerequisites confirmed none. The one genuinely-open item resolved by the developer: **every open is a persistent tab** (no preview tabs in v1). Spec flipped `DRAFT → READY` and accepted for merge.
 - 2026-07-02: Review gate (fresh-context Agent review) — `REQUEST_CHANGES`, two blocking findings addressed. (1) The live-buffer feed was wrongly specified to "follow the active buffer" (carried over from single-buffer `begin_open`), which would close a background dirty tab's live buffer on switch and re-sync its diagnostics from stale disk text — a regression. Corrected: the daemon already holds N live buffers keyed by path (`crates/lsp/src/document.rs`), so **each dirty tab drives its own live-buffer feed**; `BufferClosed` fires only on close/save, never on switch. (2) Nav routing across tabs was unaddressed: nav responses carry only an id, no path, so per-tab id counters could coincide and misroute. Corrected: a **single editor-scoped monotonic nav-id counter**, each request records its issuing tab, responses apply to the id-owning tab. Also named the dropped `read_only` (#195/#301) per-tab bit, pinned right-neighbor activation on close, added concurrent-live-buffer + nav-routing verification, and noted the open-set/state refactor likely needs 2 PRs. Reviewer verified: the daemon is genuinely multi-buffer-capable; `TabBar` reuse is real (`SessionView`); no new protocol; the `Root` confirm-dialog is available; Phase-10 dependency consistent.
 - 2026-07-02: Spec created from `/loopkit:plan` (roadmap Phase 15). Grounded on `EditorView` (single-buffer: one `InputState` + per-file bookkeeping), the `SessionView` `TabBar` pattern, and the `workspace.rs` per-open-file daemon wiring (mtime/diagnostics/live-buffer) that must fan out. Constraint/precedent-determined: multi-buffer with one `InputState` per tab; reuse `gpui-component` `TabBar`; open-or-switch semantics; wiring fan-out with no new protocol; dirty-close confirm; tabs not persisted. One genuinely-open item carried to the gate: preview tabs vs persistent tabs.
