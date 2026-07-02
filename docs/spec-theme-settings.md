@@ -1,6 +1,6 @@
 # Spec: Phase 17 — Theme & settings
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-07-02
 > Completed: —
 
@@ -104,5 +104,6 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 
 Decisions made during implementation. Added as work progresses.
 
+- 2026-07-02: Spec-acceptance gate. Human prerequisites confirmed none; no genuinely-open decisions (the config-file layer is flatly out per the standing decision, not re-opened; "follow-system" is a best-effort non-gated conditional). Developer accepted; spec flipped `DRAFT → READY` and accepted for merge — the last of the eight v1.0.0 cockpit phases (10–17).
 - 2026-07-02: Review gate (fresh-context Agent review) — `REQUEST_CHANGES`, three blocking findings addressed. (1) The config-file-layer was wrongly framed as an `OPEN` gate item despite the standing "no new config layer" decision being cited three times in the same spec as settled — **moved to a flat out-of-scope/constraint exclusion**, not gated (re-opening a merged architectural decision at every adjacent spec is exactly the risk the standing decision closed off). (2) The settings surface now **reuses `gpui-component`'s `setting::Settings`** widget (`SettingPage`/`SettingGroup`/`SettingItem` + dropdown/switch/number fields) instead of a hand-rolled form (don't-rebuild-primitives). (3) The dependency coverage now names **all three** unimplemented prerequisites (Phase 9 store, Phase 10 shell, Phase 16 registry) with mitigations and explicit ordering; Phase 16 added to milestone depends-on; runtime theme switching decoupled from the palette issue. Non-blocking folded in: softened the Phase-9 "reserved for exactly such preferences" citation; right-sized the theme set (~3: bundled Light/Dark + rift's Catppuccin Mocha); "follow-system" demoted to a best-effort non-committed mode (`ThemeMode` has no `System` variant); aligned the `Theme::change` mechanism wording. Result: **no genuinely-open decisions** remain — the gate is acceptance + human-prerequisites (none) only.
 - 2026-07-02: Spec created from `/loopkit:plan` (roadmap Phase 17, the last v1.0.0 cockpit phase). Grounded on `gpui-component`'s `ThemeRegistry`/`Theme::change` (already used to hardcode dark in `crates/app/src/lib.rs`), Phase 9's versioned window-state store (the persistence mechanism), and the standing "no new config layer" decision. Constraint/precedent-determined: preferences persist as state (not a config file); reuse the vendored theme system + settings widget; runtime mode + named theme with live restyle; surface via the palette + a minimal settings view; extends the Phase 9 store (depends on Phase 9 + Phase 10 + Phase 16).
