@@ -6230,6 +6230,7 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "gpui_platform",
+ "rift-logging",
  "rift-protocol",
  "rift-ssh",
  "rift-terminal",

@@ -16,18 +16,29 @@
 //! sub-spec. Selecting changes no tmux pane/window state — this is a pure GUI
 //! surface, agent-agnostic by construction (it only ever reads file paths and
 //! kinds; it never inspects pane processes or file contents).
+//!
+//! Implements `gpui-component`'s `Panel` trait directly (`docs/spec-ide-shell.md`,
+//! issue #323), so it can be mounted as a dock panel once the shell adopts
+//! `DockArea` (#324).
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
 use gpui::{
-    div, px, Context, EventEmitter, InteractiveElement as _, IntoElement, ParentElement as _,
-    Pixels, Render, Size, StatefulInteractiveElement as _, Styled as _, Window,
+    div, px, App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
+    IntoElement, ParentElement as _, Pixels, Render, SharedString, Size,
+    StatefulInteractiveElement as _, Styled as _, Window,
 };
+use gpui_component::dock::{Panel, PanelEvent};
 use gpui_component::{v_virtual_list, ActiveTheme as _, VirtualListScrollHandle};
 use rift_protocol::EntryKind;
 
 use crate::worktree::WorktreeModel;
+
+/// Stable, distinct dock-panel identity for the file tree (`Panel::panel_name`).
+/// Once shipped this must not change — it is the persisted panel identifier.
+pub const FILE_TREE_PANEL_NAME: &str = "explorer";
 
 /// Fixed row height for every tree entry. The virtual list needs a height per
 /// item; a uniform row keeps the size vector trivial to build and the scroll
@@ -73,6 +84,10 @@ pub struct FileTree {
     /// The currently selected entry's path, or `None` when nothing is selected.
     selected: Option<String>,
     scroll_handle: VirtualListScrollHandle,
+    /// Lazily created on first [`Focusable::focus_handle`] call (needs an `App`
+    /// the plain [`FileTree::new`] does not take, so the tree stays constructible
+    /// without a GPUI context for the headless model tests below).
+    focus_handle: RefCell<Option<FocusHandle>>,
 }
 
 impl FileTree {
@@ -84,6 +99,7 @@ impl FileTree {
             collapsed: HashSet::new(),
             selected: None,
             scroll_handle: VirtualListScrollHandle::new(),
+            focus_handle: RefCell::new(None),
         }
     }
 
@@ -236,6 +252,27 @@ impl Default for FileTree {
 }
 
 impl EventEmitter<FileTreeEvent> for FileTree {}
+
+impl Focusable for FileTree {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.focus_handle
+            .borrow_mut()
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone()
+    }
+}
+
+impl EventEmitter<PanelEvent> for FileTree {}
+
+impl Panel for FileTree {
+    fn panel_name(&self) -> &'static str {
+        FILE_TREE_PANEL_NAME
+    }
+
+    fn title(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        SharedString::from("Explorer")
+    }
+}
 
 impl Render for FileTree {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
