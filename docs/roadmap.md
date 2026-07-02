@@ -32,7 +32,7 @@
 | 13 | Problems panel — project-wide diagnostics | [spec-problems-panel.md](spec-problems-panel.md) | [Phase 130](https://github.com/skrischer/rift/milestone/27) |
 | 14 | Status bar — branch, ahead/behind, diagnostic counts | [spec-status-bar.md](spec-status-bar.md) | [Phase 140](https://github.com/skrischer/rift/milestone/28) |
 | 15 | Editor tabs — multiple open files | [spec-editor-tabs.md](spec-editor-tabs.md) | [Phase 150](https://github.com/skrischer/rift/milestone/29) |
-| 16 | Command palette | — | — |
+| 16 | Command palette | [spec-command-palette.md](spec-command-palette.md) | [Phase 160](https://github.com/skrischer/rift/milestone/30) |
 | 17 | Theme & settings | — | — |
 
 A phase gets a Spec link once `/loopkit:plan` drafts it, and a Milestone link once
