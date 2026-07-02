@@ -8,6 +8,9 @@ license.workspace = true
 rift-protocol = { path = "../protocol" }
 rift-explorer = { path = "../explorer" }
 rift-lsp = { path = "../lsp" }
+rift-logging = { path = "../logging" }
 rift-tmux-core = { path = "../tmux-core" }
 tokio.workspace = true
 anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
