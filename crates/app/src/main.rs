@@ -681,9 +681,12 @@ async fn run_legacy_terminal(
 /// Reads the locally-built musl binary from `RIFT_DAEMON_BINARY` (or the
 /// `just promote` compile-time bake `RIFT_DEFAULT_DAEMON_BINARY`; remote target
 /// dir `RIFT_DAEMON_REMOTE_DIR`, default `$HOME/.rift/bin`), deploys the
-/// versioned binary via [`rift_ssh::ensure_daemon_deployed`], then attaches to
-/// the remote daemon — spawning it detached if none is running — via
-/// [`rift_ssh::connect_or_spawn_daemon`] and confirms the transport with a
+/// versioned binary via [`rift_ssh::ensure_daemon_deployed`]. When that
+/// re-uploaded a changed binary, [`rift_ssh::stop_daemon`] stops the running
+/// daemon via its pidfile so the redeploy actually takes effect (#283) — an
+/// unchanged deploy skips this and never bounces a healthy daemon. Then
+/// attaches to the remote daemon — spawning it detached if none is running —
+/// via [`rift_ssh::connect_or_spawn_daemon`] and confirms the transport with a
 /// `Hello`/`Welcome` handshake. The detached daemon outlives the SSH connection,
 /// so a later reconnect reattaches to it instead of spawning a second one (#62).
 ///
@@ -721,7 +724,7 @@ async fn provision_daemon(conn: &mut rift_ssh::SshConnection) -> Option<rift_ssh
     let remote_dir =
         env::var("RIFT_DAEMON_REMOTE_DIR").unwrap_or_else(|_| "$HOME/.rift/bin".to_string());
 
-    let remote_path = match rift_ssh::ensure_daemon_deployed(
+    let outcome = match rift_ssh::ensure_daemon_deployed(
         conn,
         &bytes,
         &remote_dir,
@@ -735,18 +738,31 @@ async fn provision_daemon(conn: &mut rift_ssh::SshConnection) -> Option<rift_ssh
                 uploaded = outcome.uploaded,
                 "daemon auto-deploy complete"
             );
-            outcome.remote_path
+            outcome
         }
         Err(e) => {
             warn!(%e, "daemon auto-deploy failed, continuing with tmux only");
             return None;
         }
     };
+    let remote_path = outcome.remote_path;
 
     // Socket and log sit beside the versioned binary, inheriting its already
     // resolved absolute path and version (no second $HOME resolution needed).
     let socket_path = format!("{remote_path}.sock");
     let log_path = format!("{remote_path}.log");
+
+    // The binary changed under a still-running daemon (#282's signal): stop it
+    // via its pidfile (#281) so the spawn below starts the fresh binary
+    // instead of `connect_or_spawn_daemon` reattaching the stale one (#283).
+    // An unchanged deploy skips this so a healthy daemon is never bounced.
+    // Best-effort like every other step here: a failed stop just means the
+    // spawn below reattaches to the still-running old binary instead.
+    if outcome.uploaded {
+        if let Err(e) = rift_ssh::stop_daemon(conn, &socket_path).await {
+            warn!(%e, "daemon stop failed, continuing with existing daemon");
+        }
+    }
 
     // Project root the daemon should watch: RIFT_PROJECT_ROOT (runtime) wins over
     // a `just promote` compile-time bake (RIFT_DEFAULT_PROJECT_ROOT), mirroring the
