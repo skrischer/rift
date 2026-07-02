@@ -1,6 +1,6 @@
 # Spec: Phase 12 — Source-control panel + visual diff
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-07-02
 > Completed: —
 
@@ -30,7 +30,7 @@ What is true when this work is done? Observable, end-to-end criteria — not act
 ### Out of scope
 
 - **Git write operations — stage / unstage / commit / discard / stash / branch** — Phase 12 is **read-only review**. The agent runs git in the terminal (agent-first); rift surfaces the result (vision Scenario 1: "review visually, approve, and move on"). A GUI git-write surface, if ever wanted, is a separate deliberate phase.
-- **Side-by-side diff layout** *(OPEN — resolved at the spec-acceptance gate; recommended: unified/inline)*: the presentation style (unified single-column vs. two-column side-by-side) is the one genuinely-open product choice.
+- **Side-by-side (two-column) diff layout** — **deferred** (gate decision, 2026-07-02: the diff renders **unified/inline**, single-column, space-efficient). Side-by-side can be a later option if the review flow wants it.
 - **Diff for the staged-vs-unstaged split as separate views** — v1 shows the working-tree change against HEAD as one review diff; the existing status codes still distinguish index vs worktree in the file list. A VS Code-style staged/unstaged two-group SCM is out (it pairs with staging ops, which are out).
 - **Commit history / log / blame / graph** — post-v1.0.0; this phase is the *current* change set, not history.
 - **Inline diff decoration in the editor gutter** — the editor already handles inline diagnostics; gutter change-bars are a later editor-track item, not this panel.
@@ -72,7 +72,7 @@ Decisions already made that the implementor must respect. Rationale included so 
 | **Diff via gix `blob` feature (gix-imara-diff), not a new crate; `similar` named fallback** | Minimal-dependency: `gix-imara-diff` is already transitively present; a feature flag beats a new top-level crate. `similar` is named only as a spec-sanctioned fallback if gix's API is insufficient at `0.84`. | 2026-07-02 |
 | **Working-tree-vs-HEAD as one review diff; no separate staged/unstaged views** | The staged/unstaged split pairs with staging ops (out of scope); v1 reviews "what changed since HEAD" as one diff, with the status codes still labeling index vs worktree in the list. | 2026-07-02 |
 | **Virtualized diff + binary/too-large sentinels** | Prior-art (GitComet/Hunk): naive full-diff rendering OOMs on large files; both the daemon (cap/sentinel) and client (virtual list) bound the work. | 2026-07-02 |
-| **Diff presentation: unified/inline vs side-by-side** | **OPEN — resolved at the spec-acceptance gate.** Recommended: unified/inline (space-efficient — the shell already splits explorer/editor/terminal; side-by-side doubles the diff's width demand). The user's product call. | OPEN |
+| **Diff presentation: unified/inline (single-column)** | Gate decision: space-efficient — the shell already splits explorer/editor/terminal and the panel sits in the right dock; side-by-side doubles the width demand. Standard for review panels (GitHub, lazygit). Side-by-side deferred as a possible later option. | 2026-07-02 |
 
 ## Tracking
 
@@ -109,5 +109,6 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 
 Decisions made during implementation. Added as work progresses.
 
+- 2026-07-02: Spec-acceptance gate. Human prerequisites confirmed none (the gix blob-diff feature is a spec-named dependency flag, autonomously sanctioned). The one genuinely-open item resolved by the developer: diff presentation is **unified/inline** (single-column, space-efficient); side-by-side deferred. Spec flipped `DRAFT → READY` and accepted for merge.
 - 2026-07-02: Review gate (fresh-context Agent review) — `APPROVE`, no blocking findings. Non-blocking folded in: diff-baseline wording tightened (always current on-disk worktree vs HEAD, never the index blob); the gix feature-flag name qualified (`blob`/`blob-diff` confirmed at the spike); a concrete oversized-diff ceiling added (~20k changed lines / ~2 MB, pinned in the compute issue); dock placement decided (right dock, opposite the explorer; problems takes bottom); issue 1 split into 1a (protocol + compute + tests) / 1b (daemon handler) since compute alone approaches the size ceiling. Reviewer independently verified: `git.rs` computes status only (no diffs); the protocol has no diff message and `OpenFile→FileContent` is the mirrored request/reply precedent; `gix 0.84` has no blob feature enabled and `gix-imara-diff` is already transitively present (no new crate); the spec-named-dependency mechanism is correctly applied.
 - 2026-07-02: Spec created from `/loopkit:plan` (roadmap Phase 12). Grounded on `crates/explorer/src/git.rs` (gix status, no diffs), the protocol git types (`UpdateGitStatus`/`RepoState`, no diff), and `gix 0.84` (no `blob` feature yet, `gix-imara-diff` already in `Cargo.lock`). Constraint/precedent-determined: read-only review (agent-first/vision); daemon-computed diff streamed on request; file list from the existing status stream; gix `blob` diff (fallback `similar`); working-tree-vs-HEAD as one review diff; virtualized rendering + binary/too-large sentinels; depends on Phase 10 for a dock zone. One genuinely-open item carried to the gate: unified/inline vs side-by-side diff presentation.
