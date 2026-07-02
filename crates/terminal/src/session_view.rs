@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -7,6 +8,7 @@ use gpui_component::{h_flex, v_flex, ActiveTheme, Sizable};
 use termy_terminal_ui::TmuxSnapshot;
 use tracing::debug;
 
+use crate::keytable::{KeyTable, PrefixOptions};
 use crate::layout::{self, LayoutNode};
 use crate::pane_view::{measure_cell_size, statusbar_height, PaneView};
 use crate::{
@@ -126,6 +128,12 @@ pub struct SessionView {
     session_name: SharedString,
     working_directory: Option<String>,
     connection_status: ConnectionStatus,
+    /// The mirrored tmux key-table lookup and prefix/repeat options, pushed
+    /// down to every pane. Default (empty table, stock `C-b` prefix) until a
+    /// later issue wires the live `list-keys`/`show-options` refresh
+    /// (`docs/spec-tmux-keytable-mirroring.md`).
+    key_table: Arc<KeyTable>,
+    prefix_options: PrefixOptions,
 }
 
 impl SessionView {
@@ -297,6 +305,8 @@ impl SessionView {
             session_name: SharedString::default(),
             working_directory: None,
             connection_status: ConnectionStatus::Connecting,
+            key_table: Arc::new(KeyTable::default()),
+            prefix_options: PrefixOptions::default(),
         };
 
         let handle = TerminalHandle {
@@ -378,6 +388,9 @@ impl SessionView {
                     let size_changed_tx = self.size_changed_tx.clone();
                     let capture_request_tx = self.capture_request_tx.clone();
                     let font_zoom_tx = self.font_zoom_tx.clone();
+                    let tmux_command_tx = self.tmux_command_tx.clone();
+                    let key_table = self.key_table.clone();
+                    let prefix_options = self.prefix_options.clone();
                     let pane_id = pane_state.id.clone();
                     let font_size = self.font_size;
 
@@ -389,6 +402,9 @@ impl SessionView {
                             size_changed_tx,
                             capture_request_tx,
                             font_zoom_tx,
+                            tmux_command_tx,
+                            key_table,
+                            prefix_options,
                         );
                         pv.set_pane_id(pane_id.clone());
                         pv.set_font_size(font_size);
@@ -857,7 +873,7 @@ impl Render for SessionView {
             let _ = self.size_changed_tx.try_send(window_size);
         }
 
-        let (grid_size, pane_cwd, pane_command) = self
+        let (grid_size, pane_cwd, pane_command, prefix_pending) = self
             .active_pane_id
             .as_ref()
             .and_then(|id| self.panes.get(id))
@@ -867,9 +883,10 @@ impl Render for SessionView {
                     pane.grid_size(),
                     pane.working_directory().map(String::from),
                     pane.current_command().map(String::from),
+                    pane.prefix_pending(),
                 )
             })
-            .unwrap_or((TermSize { cols: 0, rows: 0 }, None, None));
+            .unwrap_or((TermSize { cols: 0, rows: 0 }, None, None, false));
 
         let cwd = pane_cwd
             .or_else(|| self.working_directory.clone())
@@ -1033,6 +1050,14 @@ impl Render for SessionView {
             .child(
                 h_flex()
                     .gap(px(16.0))
+                    // Pending-prefix indicator (tmux key-table mirroring): shown
+                    // while the focused pane is capturing the chord key after the
+                    // configured prefix; clears on dispatch/cancel (Escape or any
+                    // unbound chord key falls through the state machine back to
+                    // idle — see `crate::prefix`).
+                    .children(
+                        prefix_pending.then(|| div().text_color(rgb(0xf9e2af)).child("PREFIX")),
+                    )
                     .children((!command.is_empty()).then(|| SharedString::from(command.clone())))
                     .child(SharedString::from(size_label)),
             );

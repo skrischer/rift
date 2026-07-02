@@ -5,6 +5,7 @@
 #![cfg_attr(feature = "windowed", windows_subsystem = "windows")]
 
 use std::env;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::thread;
 
@@ -12,12 +13,14 @@ use anyhow::{Context as _, Result};
 use gpui::*;
 use gpui_component::Root;
 use rift_app::{apply_theme, workspace};
+use rift_logging::{
+    LogTarget, RotatingMakeWriter, SizedWriter, DEFAULT_MAX_BYTES, FORCE_CONSOLE_ENV,
+};
 use rift_terminal::{
     CaptureRequest, CaptureResult, ConnectionStatus, PaneInput, PaneOutput, SelectWindow,
     SessionView, SubscriptionUpdate, TermSize, TERMINAL_KEY_CONTEXT,
 };
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::EnvFilter;
 
 struct SshConfig {
     host: String,
@@ -67,44 +70,71 @@ struct EditorChannels {
     nav_request_rx: flume::Receiver<rift_protocol::ClientMessage>,
 }
 
-// Console builds log to stdout (the dev loop's RUST_LOG console). Windowed builds
-// have no console, so a failed launch dies invisibly — they write a per-run log
-// file next to the pinned exe instead (`%LOCALAPPDATA%\rift\rift-stable.log`,
-// truncated each start) and route panics there too, since panics bypass tracing.
-// Without RUST_LOG the dev-loop filter applies, so the file is useful by default.
+/// Per-channel log-pair basename, keyed off the same `windowed` feature that
+/// selects the stable build (`docs/spec-dogfooding-channels.md`) — so the
+/// side-by-side stable and dev dogfooding instances never share a rotation pair.
+fn log_channel() -> &'static str {
+    if cfg!(feature = "windowed") {
+        "rift-stable"
+    } else {
+        "rift-dev"
+    }
+}
+
+/// `%LOCALAPPDATA%\rift\<channel>.log` — the file sink's target path. `None` when
+/// `LOCALAPPDATA` is unset (off Windows), in which case the file sink falls back
+/// to console.
+fn log_file_path() -> Option<PathBuf> {
+    let base = env::var_os("LOCALAPPDATA")?;
+    Some(
+        PathBuf::from(base)
+            .join("rift")
+            .join(format!("{}.log", log_channel())),
+    )
+}
+
+// Sink selection is a runtime TTY check (rift_logging::log_target_from), not the
+// old compile-time `windowed` gate — one mechanism covers the dev console, the
+// windowed stable build, and a redirected/piped launch (e.g. dev-windows over the
+// WSL binfmt pipe relay), with RIFT_LOG_CONSOLE forcing either direction. The
+// app's console is stdout (the writer below), so the TTY check keys off stdout —
+// `log_target()`'s default checks stderr, which fits the daemon's sink instead.
+// A console launch logs to stdout (the dev loop's RUST_LOG console); everything
+// else logs to a rotated `.log`/`.log.old` append pair keyed by channel, so a
+// restart's previous run survives instead of being truncated. The panic hook
+// installs in every profile, since panics bypass tracing's normal call sites.
 fn init_logging() {
-    let filter = || {
-        EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("rift=debug,rift_ssh=debug"))
+    let filter = rift_logging::build_filter();
+    let target = rift_logging::log_target_from(
+        env::var(FORCE_CONSOLE_ENV).ok().as_deref(),
+        std::io::stdout().is_terminal(),
+    );
+
+    let file_writer = match target {
+        LogTarget::Console => None,
+        LogTarget::File => log_file_path()
+            .and_then(|path| SizedWriter::new(path, DEFAULT_MAX_BYTES).ok())
+            .map(RotatingMakeWriter::new),
     };
 
-    #[cfg(feature = "windowed")]
-    {
-        let log_file = env::var_os("LOCALAPPDATA").and_then(|base| {
-            let dir = PathBuf::from(base).join("rift");
-            std::fs::create_dir_all(&dir).ok()?;
-            std::fs::File::create(dir.join("rift-stable.log")).ok()
-        });
-        if let Some(file) = log_file {
+    match file_writer {
+        Some(writer) => {
             tracing_subscriber::fmt()
-                .with_env_filter(filter())
+                .with_env_filter(filter)
                 .with_target(true)
                 .with_ansi(false)
-                .with_writer(std::sync::Arc::new(file))
+                .with_writer(writer)
                 .init();
-            let default_hook = std::panic::take_hook();
-            std::panic::set_hook(Box::new(move |info| {
-                error!("panic: {info}");
-                default_hook(info);
-            }));
-            return;
+        }
+        None => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(true)
+                .init();
         }
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter())
-        .with_target(true)
-        .init();
+    rift_logging::install_panic_hook();
 }
 
 fn main() {
@@ -729,9 +759,13 @@ async fn provision_daemon(conn: &mut rift_ssh::SshConnection) -> Option<rift_ssh
     )
     .await
     {
-        Ok(remote_path) => {
-            info!(remote_path, "daemon auto-deploy complete");
-            remote_path
+        Ok(outcome) => {
+            info!(
+                remote_path = outcome.remote_path,
+                uploaded = outcome.uploaded,
+                "daemon auto-deploy complete"
+            );
+            outcome.remote_path
         }
         Err(e) => {
             warn!(%e, "daemon auto-deploy failed, continuing with tmux only");

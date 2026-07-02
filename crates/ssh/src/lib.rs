@@ -10,6 +10,7 @@ pub use connection::SshConnection;
 pub use daemon_channel::{DaemonChannel, DaemonClient};
 pub use deploy::{
     ensure_daemon_deployed, needs_upload, remote_binary_name, target_triple_from_uname,
+    DeployOutcome,
 };
 pub use error::SshError;
 pub use launch::connect_or_spawn_daemon;

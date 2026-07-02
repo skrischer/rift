@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
@@ -19,6 +19,8 @@ use tracing::{debug, error};
 use crate::colors;
 use crate::error::TerminalError;
 use crate::keyboard;
+use crate::keytable::{self, KeyTable, PrefixOptions};
+use crate::prefix::{PrefixAction, PrefixEngine};
 use crate::{CaptureRequest, PaneInput, TermSize};
 
 pub fn statusbar_height() -> Pixels {
@@ -129,9 +131,24 @@ pub struct PaneView {
     /// Reports a font-zoom delta (`+1`/`-1`) to `SessionView` when the focused
     /// pane intercepts a zoom shortcut.
     font_zoom_tx: flume::Sender<i32>,
+    /// Dispatches a resolved tmux key-table binding through the single
+    /// command seam (the same channel `SessionView`'s chrome uses).
+    tmux_command_tx: flume::Sender<String>,
+    /// The mirrored `list-keys`/`show-options` lookup, pushed down from
+    /// `SessionView`. Empty/default until a later issue wires the live
+    /// refresh (`docs/spec-tmux-keytable-mirroring.md`).
+    key_table: Arc<KeyTable>,
+    prefix_options: PrefixOptions,
+    /// Prefix chord capture/repeat state for this pane's `on_key_down`.
+    prefix_engine: PrefixEngine,
 }
 
 impl PaneView {
+    /// - `tmux_command_tx` — dispatches resolved tmux key-table bindings
+    ///   through the single command seam (`SessionView`'s chrome channel).
+    /// - `key_table`/`prefix_options` — the mirrored `list-keys`/
+    ///   `show-options` lookup, pushed down from `SessionView`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cx: &mut Context<Self>,
         pty_rx: flume::Receiver<Vec<u8>>,
@@ -139,6 +156,9 @@ impl PaneView {
         size_changed_tx: flume::Sender<TermSize>,
         capture_request_tx: flume::Sender<CaptureRequest>,
         font_zoom_tx: flume::Sender<i32>,
+        tmux_command_tx: flume::Sender<String>,
+        key_table: Arc<KeyTable>,
+        prefix_options: PrefixOptions,
     ) -> Self {
         let grid_size = TermSize { cols: 80, rows: 24 };
         let config = Config::default();
@@ -268,6 +288,10 @@ impl PaneView {
             content_origin: Point::default(),
             font_size: px(14.0),
             font_zoom_tx,
+            tmux_command_tx,
+            key_table,
+            prefix_options,
+            prefix_engine: PrefixEngine::new(),
         }
     }
 
@@ -289,6 +313,12 @@ impl PaneView {
 
     pub fn current_command(&self) -> Option<&str> {
         self.current_command.as_deref()
+    }
+
+    /// Whether this pane is mid-capture of a tmux prefix chord — drives the
+    /// statusbar pending-prefix indicator in `SessionView`.
+    pub fn prefix_pending(&self) -> bool {
+        self.prefix_engine.pending()
     }
 
     pub fn set_current_command(&mut self, command: String) {
@@ -1031,6 +1061,32 @@ impl Render for PaneView {
                     if delta != 0 {
                         let _ = this.font_zoom_tx.try_send(delta);
                         return;
+                    }
+                }
+
+                // tmux key-table mirroring: after the rift-native early
+                // returns above, before PTY fallthrough below (constitution
+                // precedence: rift-native -> tmux tables -> typing). Keys
+                // with no tmux representation (bare modifiers, unmapped
+                // names) skip the engine entirely and fall through unchanged.
+                if let Some(tmux_key) = keytable::keystroke_to_tmux_key(ks) {
+                    let action = this.prefix_engine.handle_key(
+                        &tmux_key,
+                        &this.key_table,
+                        &this.prefix_options,
+                        Instant::now(),
+                    );
+                    match action {
+                        PrefixAction::Dispatch(command) => {
+                            let _ = this.tmux_command_tx.try_send(command);
+                            cx.notify();
+                            return;
+                        }
+                        PrefixAction::Consume => {
+                            cx.notify();
+                            return;
+                        }
+                        PrefixAction::PassThrough => {}
                     }
                 }
 

@@ -40,6 +40,7 @@ windowed = []
 rift-terminal = { path = "../terminal" }
 rift-ssh = { path = "../ssh" }
 rift-protocol = { path = "../protocol" }
+rift-logging = { path = "../logging" }
 gpui.workspace = true
 gpui_platform.workspace = true
 # `tree-sitter-languages` enables the umbrella set of Tree-sitter grammars so the
