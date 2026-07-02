@@ -67,3 +67,10 @@ termy_terminal_ui.workspace = true
 
 [build-dependencies]
 embed-resource = "3"
+
+# `test-support` unlocks `#[gpui::test]` / `TestAppContext` for a headless
+# window in the dock panel-tree test (`workspace.rs`) — mirrors how
+# gpui-component's own `crates/ui` tests itself. Dev-only: never reaches the
+# `rift` / `gallery` binaries, which build without `--tests`.
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
