@@ -26,7 +26,7 @@
 | 7 | tmux key-table mirroring | [spec-tmux-keytable-mirroring.md](spec-tmux-keytable-mirroring.md) | [Key-table mirroring](https://github.com/skrischer/rift/milestone/17) |
 | 8 | tmux status-line mirroring | [spec-tmux-statusline-mirroring.md](spec-tmux-statusline-mirroring.md) | [Status-line mirroring](https://github.com/skrischer/rift/milestone/18) |
 | 9 | Window-state persistence | [spec-window-state-persistence.md](spec-window-state-persistence.md) | [Window-state persistence](https://github.com/skrischer/rift/milestone/19) |
-| 10 | IDE shell — dock + resizable panels | — | — |
+| 10 | IDE shell — dock + resizable panels | [spec-ide-shell.md](spec-ide-shell.md) | [Phase 100](https://github.com/skrischer/rift/milestone/24) |
 | 11 | Explorer panel — tree decoration, file ops, reveal, keyboard nav | — | — |
 | 12 | Source-control panel + visual diff | — | — |
 | 13 | Problems panel — project-wide diagnostics | — | — |
