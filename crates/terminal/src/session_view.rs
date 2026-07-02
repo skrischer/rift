@@ -35,9 +35,10 @@ pub struct TerminalHandle {
     pub capture_request_rx: flume::Receiver<CaptureRequest>,
     pub capture_result_tx: flume::Sender<CaptureResult>,
     pub connection_status_tx: flume::Sender<ConnectionStatus>,
-    /// A key-table refresh request (explicit trigger, or a dispatched
-    /// binding-mutating command) — forwarded onto the protocol as
-    /// `ClientMessage::QueryKeyTable`.
+    /// An explicit key-table refresh request from the statusbar affordance —
+    /// forwarded onto the protocol as `ClientMessage::QueryKeyTable`. A
+    /// dispatched binding-mutating command's refresh is issued server-side
+    /// instead (`spawn_command_bridge` in `crates/app`), not carried here.
     pub key_table_request_rx: flume::Receiver<()>,
     /// The parsed-ready `list-keys`/`show-options` reply for a refresh request
     /// (including the daemon's own unprompted attach-time query).
@@ -143,9 +144,10 @@ pub struct SessionView {
     key_table: Arc<KeyTable>,
     prefix_options: PrefixOptions,
     /// Requests a key-table refresh (forwarded to `TerminalHandle`'s
-    /// `key_table_request_rx`); cloned into every pane so a dispatched
-    /// binding-mutating command can trigger one, and into the statusbar's
-    /// explicit refresh affordance.
+    /// `key_table_request_rx`), driven by the statusbar's explicit refresh
+    /// affordance. A dispatched binding-mutating command's refresh is issued
+    /// server-side instead, ordered after the mutation on the same seam
+    /// (`spawn_command_bridge` in `crates/app`) — not carried on this channel.
     key_table_request_tx: flume::Sender<()>,
 }
 
@@ -442,7 +444,6 @@ impl SessionView {
                     let capture_request_tx = self.capture_request_tx.clone();
                     let font_zoom_tx = self.font_zoom_tx.clone();
                     let tmux_command_tx = self.tmux_command_tx.clone();
-                    let key_table_request_tx = self.key_table_request_tx.clone();
                     let key_table = self.key_table.clone();
                     let prefix_options = self.prefix_options.clone();
                     let pane_id = pane_state.id.clone();
@@ -457,7 +458,6 @@ impl SessionView {
                             capture_request_tx,
                             font_zoom_tx,
                             tmux_command_tx,
-                            key_table_request_tx,
                             key_table,
                             prefix_options,
                         );

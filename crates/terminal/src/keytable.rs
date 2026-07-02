@@ -987,6 +987,25 @@ repeat-time not-a-number
     }
 
     #[test]
+    fn test_classify_command_confirm_before_wrapped_pane_mode_reclassifies_to_hint() {
+        // A user binding can wrap a pane-mode command in `confirm-before`
+        // (e.g. `bind X confirm-before -p "copy?" copy-mode`). On confirm the
+        // GUI must re-run `wrapped` through `classify_command` rather than
+        // dispatch it unconditionally — dispatching `copy-mode` would shove
+        // the shared pane into it, breaking co-attached native clients
+        // (`docs/spec-tmux-keytable-mirroring.md`).
+        let confirm = match classify_command(r#"confirm-before -p "copy?" copy-mode"#) {
+            DispatchDecision::Confirm { wrapped, .. } => wrapped,
+            other => panic!("expected Confirm, got {other:?}"),
+        };
+        assert_eq!(confirm, "copy-mode");
+        assert!(matches!(
+            classify_command(&confirm),
+            DispatchDecision::Hint(_)
+        ));
+    }
+
+    #[test]
     fn test_classify_command_switch_client_unmirrored_table_hints() {
         assert!(matches!(
             classify_command("switch-client -T mytable"),

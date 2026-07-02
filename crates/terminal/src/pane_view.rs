@@ -137,10 +137,6 @@ pub struct PaneView {
     /// Dispatches a resolved tmux key-table binding through the single
     /// command seam (the same channel `SessionView`'s chrome uses).
     tmux_command_tx: flume::Sender<String>,
-    /// Requests a `list-keys`/`show-options` refresh from `SessionView` — sent
-    /// after dispatching a command that could mutate the mirrored table or the
-    /// prefix/repeat options (`keytable::mutates_bindings`).
-    key_table_request_tx: flume::Sender<()>,
     /// The mirrored `list-keys`/`show-options` lookup, pushed down from
     /// `SessionView` and refreshed in place via [`Self::set_key_table`]
     /// (`docs/spec-tmux-keytable-mirroring.md`).
@@ -152,9 +148,10 @@ pub struct PaneView {
 
 impl PaneView {
     /// - `tmux_command_tx` — dispatches resolved tmux key-table bindings
-    ///   through the single command seam (`SessionView`'s chrome channel).
-    /// - `key_table_request_tx` — requests a `list-keys`/`show-options`
-    ///   refresh from `SessionView`.
+    ///   through the single command seam (`SessionView`'s chrome channel). A
+    ///   binding-mutating dispatch's follow-up key-table refresh is issued
+    ///   server-side, on the same seam, after the mutating command lands —
+    ///   not requested from here (`spawn_command_bridge` in `crates/app`).
     /// - `key_table`/`prefix_options` — the mirrored `list-keys`/
     ///   `show-options` lookup, pushed down from `SessionView`.
     #[allow(clippy::too_many_arguments)]
@@ -166,7 +163,6 @@ impl PaneView {
         capture_request_tx: flume::Sender<CaptureRequest>,
         font_zoom_tx: flume::Sender<i32>,
         tmux_command_tx: flume::Sender<String>,
-        key_table_request_tx: flume::Sender<()>,
         key_table: Arc<KeyTable>,
         prefix_options: PrefixOptions,
     ) -> Self {
@@ -299,7 +295,6 @@ impl PaneView {
             font_size: px(14.0),
             font_zoom_tx,
             tmux_command_tx,
-            key_table_request_tx,
             key_table,
             prefix_options,
             prefix_engine: PrefixEngine::new(),
@@ -359,13 +354,13 @@ impl PaneView {
         }
     }
 
-    /// Send a resolved command through the single command seam, requesting a
-    /// key-table refresh first if the command could have mutated the mirrored
-    /// table or the prefix/repeat options.
+    /// Send a resolved command through the single command seam. A binding-
+    /// mutating dispatch's key-table refresh is issued server-side, on the
+    /// same seam, strictly after the mutating command lands
+    /// (`spawn_command_bridge` in `crates/app`) — requesting it from here
+    /// instead would race the mutation across two independent
+    /// channels/tasks with no ordering guarantee between them.
     fn dispatch_tmux_command(&self, command: String) {
-        if keytable::mutates_bindings(&command) {
-            let _ = self.key_table_request_tx.try_send(());
-        }
         let _ = self.tmux_command_tx.try_send(command);
     }
 
@@ -373,7 +368,12 @@ impl PaneView {
     /// `wrapped` dispatches only if the user confirms — a control client
     /// cannot render tmux's own confirmation, so this is what makes stock
     /// chords like `prefix x` (kill-pane) actually work instead of silently
-    /// no-opping.
+    /// no-opping. On confirm, `wrapped` is routed back through
+    /// `handle_dispatch` for re-classification rather than dispatched
+    /// unconditionally — a bound `confirm-before` can itself wrap a
+    /// pane-mode or other intercepted command (e.g. `confirm-before -p
+    /// "copy?" copy-mode`), which must still resolve to a hint instead of
+    /// being shoved onto the shared pane.
     fn open_confirm_dialog(
         &self,
         prompt: String,
@@ -381,21 +381,18 @@ impl PaneView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let tmux_command_tx = self.tmux_command_tx.clone();
-        let key_table_request_tx = self.key_table_request_tx.clone();
+        let entity = cx.entity();
         window.open_alert_dialog(cx, move |alert: AlertDialog, _, _| {
             let wrapped = wrapped.clone();
-            let tmux_command_tx = tmux_command_tx.clone();
-            let key_table_request_tx = key_table_request_tx.clone();
+            let entity = entity.clone();
             alert
                 .title("tmux confirmation")
                 .description(SharedString::from(prompt.clone()))
                 .show_cancel(true)
-                .on_ok(move |_, _, _| {
-                    if keytable::mutates_bindings(&wrapped) {
-                        let _ = key_table_request_tx.try_send(());
-                    }
-                    let _ = tmux_command_tx.try_send(wrapped.clone());
+                .on_ok(move |_, window, cx| {
+                    entity.update(cx, |view, cx| {
+                        view.handle_dispatch(wrapped.clone(), window, cx);
+                    });
                     true
                 })
         });
