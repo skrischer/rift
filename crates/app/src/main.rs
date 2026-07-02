@@ -729,9 +729,13 @@ async fn provision_daemon(conn: &mut rift_ssh::SshConnection) -> Option<rift_ssh
     )
     .await
     {
-        Ok(remote_path) => {
-            info!(remote_path, "daemon auto-deploy complete");
-            remote_path
+        Ok(outcome) => {
+            info!(
+                remote_path = outcome.remote_path,
+                uploaded = outcome.uploaded,
+                "daemon auto-deploy complete"
+            );
+            outcome.remote_path
         }
         Err(e) => {
             warn!(%e, "daemon auto-deploy failed, continuing with tmux only");
