@@ -16,6 +16,10 @@
 //! sub-spec. Selecting changes no tmux pane/window state — this is a pure GUI
 //! surface, agent-agnostic by construction (it only ever reads file paths and
 //! kinds; it never inspects pane processes or file contents).
+//!
+//! Implements `gpui-component`'s `Panel` trait directly (`docs/spec-ide-shell.md`,
+//! issue #323), so it can be mounted as a dock panel once the shell adopts
+//! `DockArea` (#324).
 
 use std::cell::RefCell;
 use std::collections::HashSet;

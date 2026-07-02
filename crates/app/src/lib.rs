@@ -41,18 +41,21 @@ pub fn apply_theme(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    use gpui_component::dock::Panel as _;
+
     use crate::editor::EDITOR_PANEL_NAME;
-    use crate::file_tree::FILE_TREE_PANEL_NAME;
+    use crate::file_tree::{FileTree, FILE_TREE_PANEL_NAME};
     use crate::terminal_panel::TERMINAL_PANEL_NAME;
 
-    /// Each dock panel's `Panel::panel_name` is a fixed `&'static str` chosen
-    /// once at the trait impl (`crates/app/src/{file_tree,editor,terminal_panel}.rs`)
-    /// and never derived from instance state — so asserting the module
-    /// constants that back those impls is equivalent to asserting the trait
-    /// method's return value, without needing a GPUI `App`/`Window` to
-    /// construct an `EditorView` or `TerminalPanel` instance.
+    /// `EditorView` and `TerminalPanel` need a live GPUI `Window`/`Context` to
+    /// construct, so their `panel_name()` is asserted against the constant that
+    /// backs the trait impl (the impl body is `EDITOR_PANEL_NAME` /
+    /// `TERMINAL_PANEL_NAME` verbatim — see `editor.rs` / `terminal_panel.rs`).
+    /// `FileTree::new()` stays cx-free, so its call goes through the real
+    /// `Panel::panel_name()` trait method.
     #[test]
     fn test_panel_names_are_stable_and_distinct() {
+        assert_eq!(FileTree::new().panel_name(), FILE_TREE_PANEL_NAME);
         assert_eq!(FILE_TREE_PANEL_NAME, "explorer");
         assert_eq!(EDITOR_PANEL_NAME, "editor");
         assert_eq!(TERMINAL_PANEL_NAME, "terminal");
