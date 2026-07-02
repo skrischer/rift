@@ -49,6 +49,7 @@ use gpui::{
     div, px, AppContext as _, Context, Entity, FocusHandle, Focusable, IntoElement,
     ParentElement as _, Render, Styled as _, Window,
 };
+use gpui_component::dock::{DockArea, DockItem};
 use gpui_component::ActiveTheme as _;
 use rift_protocol::{ClientMessage, DaemonMessage};
 use rift_terminal::SessionView;
@@ -56,10 +57,18 @@ use tracing::debug;
 
 use crate::editor::EditorView;
 use crate::file_tree::{FileTree, FileTreeEvent};
+use crate::terminal_panel::TerminalPanel;
 
-/// Fixed width of the file-tree explorer column. The editor and terminal share
-/// the remaining width.
-const EXPLORER_WIDTH: f32 = 240.0;
+/// Initial width of the left (explorer) dock, in pixels. Purely a starting
+/// point for the user's first resize — `DockArea` owns the size afterward,
+/// replacing the old fixed explorer column (`docs/spec-ide-shell.md`, #324).
+const LEFT_DOCK_WIDTH: f32 = 240.0;
+
+/// Initial width of the (collapsed) right dock.
+const RIGHT_DOCK_WIDTH: f32 = 240.0;
+
+/// Initial height of the (collapsed) bottom dock.
+const BOTTOM_DOCK_HEIGHT: f32 = 200.0;
 
 /// The flume endpoints the workspace consumes to bridge the daemon stream (run
 /// by the tokio side) onto its GPUI surfaces, plus the request endpoints it emits
@@ -97,6 +106,12 @@ pub struct WorkspaceView {
     /// Read-request sender: a tree open turns into a path on this channel, which
     /// the tokio side emits as `ClientMessage::OpenFile`.
     open_file_tx: Sender<String>,
+    /// The dock shell (`docs/spec-ide-shell.md`, issue #324): explorer in the
+    /// left dock, editor|terminal split in the center, right/bottom collapsed.
+    /// Holds its own strong references to the panel entities; this view keeps
+    /// its own handles too (`file_tree`, `editor` above) so the daemon-stream
+    /// bridges keep working unchanged after the layout refactor.
+    dock_area: Entity<DockArea>,
 }
 
 impl WorkspaceView {
@@ -267,11 +282,44 @@ impl WorkspaceView {
             .detach();
         }
 
+        // Dock shell (`docs/spec-ide-shell.md`, issue #324): explorer (left) +
+        // editor|terminal (center split) + right/bottom docks present but
+        // collapsed, for phases 12 (source control) and 13 (problems) to dock
+        // into later with no layout rewrite. Built after the daemon-stream
+        // bridges above so the panel entities they close over already exist.
+        let dock_area = cx.new(|cx| DockArea::new("rift-dock", Some(1), window, cx));
+        let weak_dock_area = dock_area.downgrade();
+
+        let terminal_panel = cx.new(|_| TerminalPanel::new(session_view.clone()));
+
+        let left_item = DockItem::tab(file_tree.clone(), &weak_dock_area, window, cx);
+        let center_item = DockItem::h_split(
+            vec![
+                DockItem::tab(editor.clone(), &weak_dock_area, window, cx),
+                DockItem::tab(terminal_panel, &weak_dock_area, window, cx),
+            ],
+            &weak_dock_area,
+            window,
+            cx,
+        );
+        // Real, collapsed docks (not placeholder views) — an empty `TabPanel`
+        // with zero panels, matching `Dock::new`'s own empty-dock shape.
+        let right_item = DockItem::tabs(Vec::new(), &weak_dock_area, window, cx);
+        let bottom_item = DockItem::tabs(Vec::new(), &weak_dock_area, window, cx);
+
+        dock_area.update(cx, |dock, cx| {
+            dock.set_center(center_item, window, cx);
+            dock.set_left_dock(left_item, Some(px(LEFT_DOCK_WIDTH)), true, window, cx);
+            dock.set_right_dock(right_item, Some(px(RIGHT_DOCK_WIDTH)), false, window, cx);
+            dock.set_bottom_dock(bottom_item, Some(px(BOTTOM_DOCK_HEIGHT)), false, window, cx);
+        });
+
         Self {
             file_tree,
             editor,
             session_view,
             open_file_tx,
+            dock_area,
         }
     }
 
@@ -385,38 +433,104 @@ impl Focusable for WorkspaceView {
 
 impl Render for WorkspaceView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Explorer | editor | terminal, left to right. The explorer is a fixed
-        // column; the editor and terminal split the rest. The terminal keeps its
-        // own internal tab/pane/status chrome.
+        // The dock shell fills the window under the current OS chrome; the
+        // `flex_col` mirrors `examples/dock.rs` at the pinned gpui-component
+        // rev so future top chrome (status bar, palette) can stack above the
+        // dock without another layout rewrite (both deferred, `docs/spec-ide-shell.md`).
         div()
             .flex()
-            .flex_row()
+            .flex_col()
             .size_full()
             .bg(cx.theme().background)
-            .child(
-                div()
-                    .w(px(EXPLORER_WIDTH))
-                    .h_full()
-                    .flex_shrink_0()
-                    .border_r_1()
-                    .border_color(cx.theme().border)
-                    .child(self.file_tree.clone()),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .border_r_1()
-                    .border_color(cx.theme().border)
-                    .child(self.editor.clone()),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .child(self.session_view.clone()),
-            )
+            .child(self.dock_area.clone())
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Axis, TestAppContext};
+    use gpui_component::dock::DockPlacement;
+    use gpui_component::Root;
+
+    /// A `WorkspaceChannels` wired to throwaway flume endpoints — no daemon is
+    /// attached in this test, only the dock's panel tree is under test.
+    fn test_channels() -> WorkspaceChannels {
+        let (_worktree_tx, worktree_rx) = flume::unbounded();
+        let (_buffer_tx, buffer_rx) = flume::unbounded();
+        let (_nav_reply_tx, nav_rx) = flume::unbounded();
+        let (open_file_tx, _open_file_rx) = flume::unbounded();
+        let (save_file_tx, _save_file_rx) = flume::unbounded();
+        let (buffer_change_tx, _buffer_change_rx) = flume::unbounded();
+        let (nav_tx, _nav_request_rx) = flume::unbounded();
+        WorkspaceChannels {
+            worktree_rx,
+            buffer_rx,
+            nav_rx,
+            open_file_tx,
+            save_file_tx,
+            buffer_change_tx,
+            nav_tx,
+        }
+    }
+
+    /// Panel-tree construction (`docs/spec-ide-shell.md`, issue #324): the
+    /// default layout must put the explorer in an open left dock, an
+    /// editor|terminal horizontal split in the center, and collapsed (but
+    /// real) right/bottom docks — the gate decision the spec pins.
+    #[gpui::test]
+    fn test_default_layout_has_left_explorer_center_split_and_collapsed_right_bottom(
+        cx: &mut TestAppContext,
+    ) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let session_view = cx.new(|cx| SessionView::new(cx).0);
+                workspace = Some(
+                    cx.new(|cx| WorkspaceView::new(session_view, test_channels(), window, cx)),
+                );
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap();
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+
+        cx.update(|cx| {
+            let view = workspace.read(cx);
+            let dock_area = view.dock_area.read(cx);
+
+            assert!(dock_area.left_dock().is_some(), "left dock must exist");
+            assert!(
+                dock_area.is_dock_open(DockPlacement::Left, cx),
+                "explorer dock starts open"
+            );
+
+            assert!(dock_area.right_dock().is_some(), "right dock must exist");
+            assert!(
+                !dock_area.is_dock_open(DockPlacement::Right, cx),
+                "right dock starts collapsed"
+            );
+
+            assert!(dock_area.bottom_dock().is_some(), "bottom dock must exist");
+            assert!(
+                !dock_area.is_dock_open(DockPlacement::Bottom, cx),
+                "bottom dock starts collapsed"
+            );
+
+            match dock_area.center() {
+                DockItem::Split { axis, items, .. } => {
+                    assert_eq!(
+                        *axis,
+                        Axis::Horizontal,
+                        "editor|terminal split is horizontal"
+                    );
+                    assert_eq!(items.len(), 2, "center split holds editor + terminal");
+                }
+                other => panic!("expected the center to be a horizontal split, got {other:?}"),
+            }
+        });
     }
 }
