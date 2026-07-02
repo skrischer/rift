@@ -1,6 +1,6 @@
 # Spec: Phase 10 — IDE shell (dock + resizable panels)
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-07-02
 > Completed: —
 
@@ -31,7 +31,7 @@ What is true when this work is done? Observable, end-to-end criteria — not act
 
 ### Out of scope
 
-- **Layout persistence across restarts** — remembering open panels, zone sizes, and the active tab. *(OPEN — resolved at the spec-acceptance gate; recommended: defer.)* The `DockArea` makes this cheap (`dump()`/`load()` + `DockEvent::LayoutChanged`), and Phase 9 (`spec-window-state-persistence.md`) explicitly reserved panel-layout persistence for "the editor track's own spec once the surfaces exist" behind a versioned schema. If deferred, Phase 10 rebuilds the default layout each launch; persistence becomes a follow-on that reuses the window-state pattern (per-channel keyed file, debounced atomic save) against `DockAreaState`.
+- **Layout persistence across restarts** — remembering open panels, zone sizes, and the active tab — is **deferred** (gate decision, 2026-07-02). The `DockArea` makes this cheap (`dump()`/`load()` + `DockEvent::LayoutChanged`), and Phase 9 (`spec-window-state-persistence.md`) explicitly reserved panel-layout persistence for a follow-on behind a versioned schema. Phase 10 rebuilds the default layout each launch; persistence is a follow-on micro-step that reuses the window-state pattern (per-channel keyed file, debounced atomic save) against `DockAreaState`.
 - **Explorer tree decoration + file operations** (Phase 11) — the file tree becomes *a dock panel* here with no behavior change; git/diagnostic decoration on the tree, create/rename/delete/move, reveal, and keyboard nav are Phase 11.
 - **The signal panels themselves** — source-control + diff (Phase 12), problems (Phase 13), status bar (Phase 14): Phase 10 only establishes the zones they dock into.
 - **Editor tabs / multiple open files** (Phase 15) — the editor stays single-buffer; it becomes *a* panel, its multi-file tab model is a later phase.
@@ -48,7 +48,7 @@ None. Pure client-side GPUI composition against an already-vendored dependency (
 
 - **Reuse, don't rebuild**: the constitution mandates `gpui-component` for dock/splits/tabs ("don't rebuild primitives"). Phase 10 uses `DockArea`/`Panel`/`DockItem`/`Dock`/`TabPanel`/`StackPanel` as-is; no hand-rolled resizable layout, no custom split tree.
 - **Pinned rev**: `gpui-component` @ `9ad30e631e15f9bbba049717767bf4cd98e4f179` (already in `Cargo.toml`); the dock API in this spec is verified against that exact checkout. No dependency bump — the shell must work on the vendored rev.
-- **Agent-first layout** ([vision.md](vision.md), [constitution.md](constitution.md)): the terminal (where the agent runs) is the primary actor and stays a prominent, first-class surface — it is **not** demoted to a thin bottom strip. The default arrangement keeps the terminal at full center prominence beside the editor. *(The exact default arrangement is OPEN — resolved at the gate.)*
+- **Agent-first layout** ([vision.md](vision.md), [constitution.md](constitution.md)): the terminal (where the agent runs) is the primary actor and stays a prominent, first-class surface — it is **not** demoted to a thin bottom strip. **Default arrangement (gate decision, 2026-07-02): explorer in the left dock, editor and terminal as a horizontal split in the center (terminal at full prominence, preserving today's side-by-side UX), right + bottom docks collapsed.**
 - **Agent-agnostic**: the shell composes surfaces; no code path inspects agent output or special-cases an agent. Terminal keystroke delivery to the active tmux pane must be byte-identical to today.
 - **Crate boundaries**: `rift-terminal` must not learn about the dock. The `Panel` impl for the terminal lives in `crates/app` as a newtype wrapper around `Entity<SessionView>`; `rift-terminal` already depends on `gpui-component` but gains no new public dock surface.
 - **Behavior preservation is the bar**: this is a layout refactor, not a feature change to the surfaces. Every daemon-driven behavior (`docs/spec-editor.md`, `docs/spec-lsp-navigation.md` outcomes) works identically after the refactor — the app-check build and the milestone QA gate validate this.
@@ -74,8 +74,8 @@ Decisions already made that the implementor must respect. Rationale included so 
 | **tmux windows/panes are NOT mapped to dock panels/tabs; the terminal is a single dock panel with its own internal tmux chrome** | Vision (tmux is the engine): multiplexing structure belongs to tmux and is rendered by `SessionView`; the dock composes IDE surfaces. Mapping tmux panes to dock nodes would duplicate/fight tmux's own layout. | 2026-07-02 |
 | **Right + bottom docks are established as real (collapsed) zones in Phase 10, before their panels exist** | Roadmap sequence: Phase 10 is the foundation "panels 12–13 dock into"; creating the zones now (as empty collapsed `Dock`s, not placeholder views) means phases 12–14 add a panel, not re-architect the shell. No `todo!()` placeholder views. | 2026-07-02 |
 | **Custom CSD window titlebar deferred; `DockArea` fills the window under current OS chrome** | Minimal-solution: cross-platform client-side decorations (Windows caption buttons, X11) are real work with no Phase-10 payoff. A top strip is introduced when Phase 14 (status) / Phase 16 (palette) need it. | 2026-07-02 |
-| **Default layout arrangement (terminal placement)** | **OPEN — resolved at the spec-acceptance gate.** Vision fixes the principle (terminal stays prominent, agent-first); the specific default (recommended: explorer left, editor\|terminal horizontal split in center, right/bottom collapsed) is the user's product call. | OPEN |
-| **Layout persistence across restarts** | **OPEN — resolved at the spec-acceptance gate.** Recommended: defer (Phase 9 reserved panel-layout persistence behind a versioned schema; minimal Phase 10 rebuilds the default layout each launch). In-scope only if the user wants the shell to remember its layout for v1.0.0. | OPEN |
+| **Default layout: explorer (left) + editor\|terminal horizontal split (center) + right/bottom collapsed** | Gate decision: vision fixes the terminal-prominent principle (agent-first); the user chose the center editor\|terminal split — it preserves today's side-by-side UX and keeps the terminal at full prominence — over a traditional bottom-strip terminal or a terminal-hero arrangement. | 2026-07-02 |
+| **Layout persistence deferred to a follow-on micro-step** | Gate decision: Phase 10 rebuilds the default layout each launch; persistence follows in its own step reusing the window-state pattern (per-channel file, debounced atomic save against `DockAreaState`). Keeps Phase 10 minimal; Phase 9 reserved layout persistence behind a versioned schema. | 2026-07-02 |
 
 ## Tracking
 
@@ -113,5 +113,6 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 
 Decisions made during implementation. Added as work progresses.
 
+- 2026-07-02: Spec-acceptance gate. Human prerequisites confirmed none. Both genuinely-open items resolved by the developer: (1) default layout = explorer left + editor|terminal center split + right/bottom collapsed (agent-first, preserves today's side-by-side UX); (2) layout persistence deferred to a follow-on micro-step (Phase 10 rebuilds the default each launch). Spec flipped `DRAFT → READY` and accepted for merge.
 - 2026-07-02: Review gate (fresh-context Agent review) — `APPROVE`, no blocking findings. Non-blocking fixes folded in: Phase 11 added to the out-of-scope enumeration (the tree becomes a panel here, its decoration/file-ops are Phase 11); the in-scope terminal-wrapper bullet tightened to "no *new public dock surface*" (rift-terminal already depends on gpui-component, never on the dock); the newtype crate-boundary citation repointed from "CLAUDE.md rule 5" (which is specifically about `protocol`) to the constitution's general "crate boundaries are contracts." Template path `crates/story/examples/dock.rs` confirmed against the pinned checkout.
 - 2026-07-02: Spec created from `/loopkit:plan` (roadmap Phase 10, the first of the v1.0.0 cockpit block). The dock API was resolved against a read-only clone of `gpui-component` at the pinned rev `9ad30e63` (`crates/ui/src/dock/`, `crates/story/examples/dock.rs`); findings recorded in Prior art. Constraint/precedent-determined: adopt `DockArea`/`Panel`; tree/editor impl `Panel` directly + terminal newtype wrapper; tmux structure stays inside the terminal panel; right/bottom zones established now as collapsed docks; custom CSD titlebar deferred. Two genuinely-open items carried to the gate: the default layout arrangement (terminal placement) and whether layout persistence is in Phase 10.
