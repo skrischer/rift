@@ -89,14 +89,17 @@ fn fingerprint_path(remote_path: &str) -> String {
 /// fingerprinting existed — `cat` of the missing marker is silenced). Both paths
 /// are single-quoted so they cannot be expanded or break out of quoting.
 ///
-/// The `if`/`then`/`fi` wrapper makes the command exit zero whether or not the
-/// binary is present — a bare `test -x … && cat …` would exit non-zero on the
-/// (expected) first-deploy case, which `exec_capture` reports as a failed remote
-/// command. Absence is signalled by empty output, not by the exit status.
+/// The whole command must exit zero regardless of presence: the outer
+/// `if`/`then`/`fi` covers an absent *binary* (the `then` body never runs), but
+/// `cat`'s own exit status still surfaces when the binary exists and only the
+/// `.fnv` marker is missing (the pre-fingerprint-upgrade case) — redirecting its
+/// stderr does not change that. `|| true` absorbs that failure so a missing
+/// marker reads as empty output, not a failed remote command that would abort
+/// `exec_capture`.
 fn presence_probe_command(remote_path: &str) -> String {
     let bin = shell_single_quote(remote_path);
     let marker = shell_single_quote(&fingerprint_path(remote_path));
-    format!("if test -x {bin}; then cat {marker} 2>/dev/null; fi")
+    format!("if test -x {bin}; then cat {marker} 2>/dev/null || true; fi")
 }
 
 /// Build the command that writes the fingerprint marker beside the uploaded
@@ -279,7 +282,7 @@ mod tests {
         let cmd = presence_probe_command("/tmp/rift-daemon-0.1.0");
         assert_eq!(
             cmd,
-            "if test -x '/tmp/rift-daemon-0.1.0'; then cat '/tmp/rift-daemon-0.1.0.fnv' 2>/dev/null; fi"
+            "if test -x '/tmp/rift-daemon-0.1.0'; then cat '/tmp/rift-daemon-0.1.0.fnv' 2>/dev/null || true; fi"
         );
     }
 
@@ -289,8 +292,47 @@ mod tests {
         let cmd = presence_probe_command("/tmp/$(touch pwned)");
         assert_eq!(
             cmd,
-            "if test -x '/tmp/$(touch pwned)'; then cat '/tmp/$(touch pwned).fnv' 2>/dev/null; fi"
+            "if test -x '/tmp/$(touch pwned)'; then cat '/tmp/$(touch pwned).fnv' 2>/dev/null || true; fi"
         );
+    }
+
+    /// Runs the generated probe through a real `sh` against a temp directory,
+    /// covering the case a string-only assertion cannot: a binary deployed
+    /// before fingerprinting existed has no `.fnv` marker, so `cat` fails, and
+    /// only executing the command reveals whether that failure leaks through
+    /// the `if`/`fi` wrapper as a non-zero exit (which `exec_capture` — see
+    /// `crate::connection::exec::drain_channel` — turns into `SshError::Exec`,
+    /// aborting the whole deploy instead of correctly deciding "needs upload").
+    #[test]
+    fn test_presence_probe_command_exits_zero_when_binary_present_but_marker_absent() {
+        let dir = std::env::temp_dir().join(format!(
+            "rift-ssh-probe-test-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let bin = dir.join("rift-daemon-0.1.0");
+        std::fs::write(&bin, b"stub").expect("write stub binary");
+        let mut perms = std::fs::metadata(&bin)
+            .expect("stat stub binary")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&bin, perms).expect("chmod stub binary");
+
+        let cmd = presence_probe_command(bin.to_str().expect("utf8 temp path"));
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .output()
+            .expect("run probe command");
+
+        std::fs::remove_dir_all(&dir).expect("clean up temp dir");
+
+        assert!(
+            output.status.success(),
+            "probe must exit zero even when the marker is missing, got {:?}",
+            output.status
+        );
+        assert!(output.stdout.is_empty());
     }
 
     #[test]
