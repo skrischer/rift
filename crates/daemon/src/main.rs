@@ -15,7 +15,10 @@ const LOG_FILE_ENV: &str = "RIFT_DAEMON_LOG_FILE";
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Panics must land in whatever sink ends up active, in every mode, so this
-    // is installed before mode dispatch decides what that sink is.
+    // is installed before mode dispatch decides what that sink is. In `--ping`
+    // and `--connect`, where no subscriber is ever installed, the hook's
+    // `tracing::error!` is a harmless no-op and the default hook's backtrace
+    // still runs.
     install_panic_hook();
 
     // Stdout is reserved for protocol frames in stdio mode; nothing else may
@@ -36,10 +39,15 @@ async fn main() -> anyhow::Result<()> {
         }
         // Relay mode: connect the process's stdio to a running daemon's socket.
         // The SSH host wires its channel to this so the channel reaches the
-        // persistent daemon without interpreting the protocol.
+        // persistent daemon without interpreting the protocol. No logging setup
+        // here, matching `--ping`: `connect_relay`/`relay` have no call sites
+        // worth logging, and every real launch (`crates/ssh/src/launch.rs`)
+        // drives `--connect` against the *same* socket path as its `--serve-uds`
+        // daemon — a default log path keyed on that socket would collide with
+        // the daemon's own rotated file, and `SizedWriter`'s rotation is not
+        // safe across independent OS processes sharing one file.
         Some("--connect") => {
             let path = args.next().context("--connect requires a socket path")?;
-            init_logging(default_log_path(&path), None)?;
             connect_relay(Path::new(&path)).await
         }
         // Probe mode: exit 0 if a daemon is listening on the socket, 1 otherwise.
@@ -95,10 +103,12 @@ fn init_logging(default_path: PathBuf, log_file_flag: Option<PathBuf>) -> anyhow
     }
 }
 
-/// Default rotated-log path for a socket-keyed daemon mode (`--serve-uds`,
-/// `--connect`): the socket path with a `.log` suffix appended — the
-/// `pidfile_path` naming precedent (`crates/daemon/src/lib.rs`), so the daemon's
-/// own log, its pidfile, and its socket all key off one path without colliding.
+/// Default rotated-log path for the `--serve-uds` daemon: the socket path with
+/// a `.log` suffix appended — the `pidfile_path` naming precedent
+/// (`crates/daemon/src/lib.rs`), so the daemon's own log, its pidfile, and its
+/// socket all key off one path without colliding. Not reused by `--connect`
+/// (see its match arm): every real launch drives both modes against the same
+/// socket path, so a socket-keyed default there would collide with this one.
 fn default_log_path(socket_path: &str) -> PathBuf {
     let mut raw = std::ffi::OsString::from(socket_path);
     raw.push(".log");

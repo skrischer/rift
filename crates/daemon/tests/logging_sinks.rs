@@ -6,9 +6,12 @@
 //! launch line, `crates/ssh/src/launch.rs`) must write only to its own rotated
 //! file, leaving the launch redirect empty; `RIFT_LOG_CONSOLE` (the runtime
 //! override for "no real TTY available", needed since a test harness has none)
-//! forces the stderr sink instead; and `--connect` relay mode's stdout must
-//! carry only protocol frames even while logging is demonstrably active
-//! elsewhere in the system (the #60 framing invariant).
+//! forces the stderr sink instead; `--connect` relay mode's stdout must carry
+//! only protocol frames even while logging is demonstrably active elsewhere in
+//! the system (the #60 framing invariant), and `--connect` must never install
+//! its own file sink (it would collide with its daemon's, since every real
+//! launch drives both against the same socket path); and `--log-file`/
+//! `RIFT_DAEMON_LOG_FILE` resolve with the right precedence.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -262,7 +265,81 @@ fn test_connect_relay_stdout_is_frame_only_with_logging_active() {
         "stdout must carry exactly the Welcome frame"
     );
 
+    // Regression guard: `--connect` must never install its own file sink. Every
+    // real launch (`crates/ssh/src/launch.rs`) drives `--connect` against the
+    // *same* socket path as its `--serve-uds` daemon, so a socket-keyed default
+    // there would collide with the daemon's own rotated file — two independent
+    // processes rotating one file is exactly what `SizedWriter` is not safe
+    // against.
+    let connect_default_log = PathBuf::from(format!("{}.log", sock.display()));
+    assert!(
+        !connect_default_log.exists(),
+        "--connect must not create its own socket-keyed log file"
+    );
+
     drop(stdin);
     let _ = connect.kill();
     let _ = connect.wait();
+}
+
+#[test]
+fn test_serve_uds_env_var_sets_log_file_when_flag_absent() {
+    let scratch = Scratch::new("env-log-file");
+    let sock = scratch.path("rift.sock");
+    let env_log_file = scratch.path("from-env.log");
+
+    let child = Command::new(daemon_bin())
+        .arg("--serve-uds")
+        .arg(&sock)
+        .arg("--root")
+        .arg(scratch.path("missing-root"))
+        .env("RIFT_DAEMON_LOG_FILE", &env_log_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn daemon --serve-uds");
+    let _child = ChildGuard(child);
+
+    wait_for_path(&sock);
+    wait_for_content(&env_log_file, "rift-daemon listening");
+
+    // The env var is a fallback for the *default*, not an addition to it: the
+    // socket-keyed default path must never also be created.
+    let default_log = PathBuf::from(format!("{}.log", sock.display()));
+    assert!(
+        !default_log.exists(),
+        "RIFT_DAEMON_LOG_FILE must replace the default path, not sit alongside it"
+    );
+}
+
+#[test]
+fn test_serve_uds_log_file_flag_beats_env_var() {
+    let scratch = Scratch::new("flag-beats-env");
+    let sock = scratch.path("rift.sock");
+    let flag_log_file = scratch.path("from-flag.log");
+    let env_log_file = scratch.path("from-env.log");
+
+    let child = Command::new(daemon_bin())
+        .arg("--serve-uds")
+        .arg(&sock)
+        .arg("--root")
+        .arg(scratch.path("missing-root"))
+        .arg("--log-file")
+        .arg(&flag_log_file)
+        .env("RIFT_DAEMON_LOG_FILE", &env_log_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn daemon --serve-uds");
+    let _child = ChildGuard(child);
+
+    wait_for_path(&sock);
+    wait_for_content(&flag_log_file, "rift-daemon listening");
+
+    assert!(
+        read_to_string(&env_log_file).is_empty(),
+        "the --log-file flag must win over RIFT_DAEMON_LOG_FILE, not merely also write"
+    );
 }
