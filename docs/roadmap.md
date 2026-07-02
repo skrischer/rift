@@ -28,7 +28,7 @@
 | 9 | Window-state persistence | [spec-window-state-persistence.md](spec-window-state-persistence.md) | [Window-state persistence](https://github.com/skrischer/rift/milestone/19) |
 | 10 | IDE shell — dock + resizable panels | [spec-ide-shell.md](spec-ide-shell.md) | [Phase 100](https://github.com/skrischer/rift/milestone/24) |
 | 11 | Explorer panel — decoration, reveal, keyboard nav | [spec-explorer-panel.md](spec-explorer-panel.md) | [Phase 110](https://github.com/skrischer/rift/milestone/25) |
-| 12 | Source-control panel + visual diff | — | — |
+| 12 | Source-control panel + visual diff | [spec-source-control.md](spec-source-control.md) | [Phase 120](https://github.com/skrischer/rift/milestone/26) |
 | 13 | Problems panel — project-wide diagnostics | — | — |
 | 14 | Status bar — branch, ahead/behind, diagnostic counts | — | — |
 | 15 | Editor tabs — multiple open files | — | — |
