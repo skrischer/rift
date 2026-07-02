@@ -106,9 +106,11 @@ use std::time::{Duration, SystemTime};
 
 use flume::Sender;
 use gpui::{
-    div, px, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ParentElement as _, Render, Styled as _, Subscription, Window,
+    div, px, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    ParentElement as _, Render, SharedString, Styled as _, Subscription, Window,
 };
+use gpui_component::dock::{Panel, PanelEvent};
 use gpui_component::highlighter::{
     Diagnostic as EditorDiagnostic, DiagnosticSeverity as EditorSeverity,
 };
@@ -120,6 +122,10 @@ use rift_protocol::{
     ClientMessage, Diagnostic, DiagnosticSeverity, HoverContent, NavLocation, NavRequestId,
     Position, Range,
 };
+
+/// Stable, distinct dock-panel identity for the editor (`Panel::panel_name`).
+/// Once shipped this must not change — it is the persisted panel identifier.
+pub const EDITOR_PANEL_NAME: &str = "editor";
 
 // ── Actions ───────────────────────────────────────────────────────────────────
 
@@ -1111,6 +1117,32 @@ impl EditorView {
             self.push_back_position(cx);
             self.jump_to_location(entry.location, window, cx);
         }
+    }
+}
+
+// ── Panel adapter ─────────────────────────────────────────────────────────────
+
+impl Focusable for EditorView {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        // Delegate to the current input entity's own handle — `begin_open`
+        // rebuilds `input` per file, so this always reflects the live buffer.
+        self.input.focus_handle(cx)
+    }
+}
+
+impl EventEmitter<PanelEvent> for EditorView {}
+
+impl Panel for EditorView {
+    fn panel_name(&self) -> &'static str {
+        EDITOR_PANEL_NAME
+    }
+
+    fn title(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let title = self
+            .open_path()
+            .map(|path| path.rsplit('/').next().unwrap_or(path).to_owned())
+            .unwrap_or_else(|| "Editor".to_owned());
+        SharedString::from(title)
     }
 }
 
