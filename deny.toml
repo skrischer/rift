@@ -26,3 +26,28 @@ allow = [
 ]
 unused-allowed-license = "allow"
 confidence-threshold = 0.8
+
+# The termy fork (github.com/skrischer/termy) ships an MIT LICENSE at the repo
+# root, but these member crates omit the per-crate `license` field, so cargo-deny
+# scanning each crate directory reports them as unlicensed. Clarify the known
+# license until the field is added upstream (then bump the pinned rev and drop
+# these). Sibling termy crates that declare `license` need no entry here.
+[[licenses.clarify]]
+crate = "termy_config_core"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+crate = "termy_search"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+crate = "termy_theme_core"
+expression = "MIT"
+license-files = []
+
+[[licenses.clarify]]
+crate = "termy_themes"
+expression = "MIT"
+license-files = []
