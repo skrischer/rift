@@ -7,6 +7,7 @@ pub mod gallery;
 
 pub mod editor;
 pub mod file_tree;
+pub mod status_bar;
 pub mod terminal_panel;
 pub mod workspace;
 pub mod worktree;
