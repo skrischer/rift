@@ -452,7 +452,7 @@ impl Render for WorkspaceView {
 mod tests {
     use super::*;
     use gpui::{Axis, TestAppContext};
-    use gpui_component::dock::DockPlacement;
+    use gpui_component::dock::{DockPlacement, Panel};
     use gpui_component::Root;
 
     /// A `WorkspaceChannels` wired to throwaway flume endpoints — no daemon is
@@ -531,6 +531,135 @@ mod tests {
                 }
                 other => panic!("expected the center to be a horizontal split, got {other:?}"),
             }
+        });
+    }
+
+    /// Dock interaction (`docs/spec-ide-shell.md`, issue #325): the explorer
+    /// dock toggles hidden/shown via the native `DockArea::toggle_dock` — this
+    /// exercises that wiring end-to-end against the app's own panel tree rather
+    /// than trusting the vendored dock's own test suite.
+    #[gpui::test]
+    fn test_toggle_left_dock_flips_open_state(cx: &mut TestAppContext) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let session_view = cx.new(|cx| SessionView::new(cx).0);
+                workspace = Some(
+                    cx.new(|cx| WorkspaceView::new(session_view, test_channels(), window, cx)),
+                );
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+
+        window
+            .update(cx, |_, window, cx| {
+                let dock_area = workspace.read(cx).dock_area.clone();
+
+                assert!(
+                    dock_area.read(cx).is_dock_open(DockPlacement::Left, cx),
+                    "explorer dock starts open"
+                );
+
+                dock_area.update(cx, |dock_area, cx| {
+                    dock_area.toggle_dock(DockPlacement::Left, window, cx);
+                });
+                assert!(
+                    !dock_area.read(cx).is_dock_open(DockPlacement::Left, cx),
+                    "toggling the left dock once hides the explorer"
+                );
+
+                dock_area.update(cx, |dock_area, cx| {
+                    dock_area.toggle_dock(DockPlacement::Left, window, cx);
+                });
+                assert!(
+                    dock_area.read(cx).is_dock_open(DockPlacement::Left, cx),
+                    "toggling the left dock again restores the explorer"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Dock interaction (`docs/spec-ide-shell.md`, issue #325): every surface
+    /// stays zoomable to fill the shell and restore. None of `FileTree`,
+    /// `EditorView`, or `TerminalPanel` override `Panel::zoomable`, so the
+    /// default reaches the dock's native zoom-in/zoom-out control for all
+    /// three — this locks that invariant against an accidental future override.
+    #[gpui::test]
+    fn test_all_dock_surfaces_stay_zoomable(cx: &mut TestAppContext) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let session_view = cx.new(|cx| SessionView::new(cx).0);
+                workspace = Some(
+                    cx.new(|cx| WorkspaceView::new(session_view, test_channels(), window, cx)),
+                );
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap();
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+
+        cx.update(|cx| {
+            let (file_tree, editor, session_view) = {
+                let view = workspace.read(cx);
+                (
+                    view.file_tree.clone(),
+                    view.editor.clone(),
+                    view.session_view.clone(),
+                )
+            };
+
+            assert!(
+                file_tree.read(cx).zoomable(cx).is_some(),
+                "the explorer stays zoomable"
+            );
+            assert!(
+                editor.read(cx).zoomable(cx).is_some(),
+                "the editor stays zoomable"
+            );
+
+            let terminal_panel = cx.new(|_| TerminalPanel::new(session_view));
+            assert!(
+                terminal_panel.read(cx).zoomable(cx).is_some(),
+                "the terminal stays zoomable"
+            );
+        });
+    }
+
+    /// Dock interaction (`docs/spec-ide-shell.md`, issue #325): focus keeps
+    /// delegating to the terminal so agent keystrokes reach the tmux pane
+    /// byte-identically to pre-refactor — the dock's own focus-follows-active-
+    /// panel handling (native `TabPanel`) must not change where the workspace's
+    /// own handed-off focus lands.
+    #[gpui::test]
+    fn test_workspace_focus_delegates_to_the_terminal(cx: &mut TestAppContext) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let mut session_view: Option<Entity<SessionView>> = None;
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let view = cx.new(|cx| SessionView::new(cx).0);
+                session_view = Some(view.clone());
+                workspace =
+                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), window, cx)));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap();
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+        let session_view =
+            session_view.expect("session view constructed inside the window callback");
+
+        cx.update(|cx| {
+            assert_eq!(
+                workspace.read(cx).focus_handle(cx),
+                session_view.read(cx).focus_handle(cx),
+                "workspace focus delegates to the terminal so keystrokes keep reaching the tmux pane"
+            );
         });
     }
 }
