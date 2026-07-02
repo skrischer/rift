@@ -1,6 +1,6 @@
 # Spec: Phase 11 — Explorer panel (decoration, reveal, keyboard nav)
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-07-02
 > Completed: —
 
@@ -34,7 +34,7 @@ What is true when this work is done? Observable, end-to-end criteria — not act
 
 ### Out of scope
 
-- **File operations — create / rename / delete / move** *(OPEN — resolved at the spec-acceptance gate; recommended: defer to a dedicated daemon-file-ops concern.)* These are a **write capability**: the protocol has only `OpenFile` (read) and `SaveFile` (write-content) — create/rename/delete/move need new `ClientMessage`/`DaemonMessage` variants + daemon handlers, qualitatively different from this phase's read-only decoration/navigation. The roadmap prose frames Phase 11 as the low-risk client-side quick win reading the existing model; bundling a protocol change would break that and make the phase unreviewable.
+- **File operations — create / rename / delete / move** — **deferred to a dedicated daemon-file-ops concern** (gate decision, 2026-07-02). These are a **write capability**: the protocol has only `OpenFile` (read) and `SaveFile` (write-content) — create/rename/delete/move need new `ClientMessage`/`DaemonMessage` variants + daemon handlers, qualitatively different from this phase's read-only decoration/navigation. Phase 11 stays the low-risk client-side quick win reading the existing model; file-ops become their own phase (a natural sibling to Phase 12's daemon work). The roadmap Phase 11 name drops "file ops" accordingly.
 - **Drag-and-drop** move/reorder in the tree.
 - **Multi-select / marked-entries** and batch operations.
 - **Fuzzy filter / search within the tree** — post-v1.0.0 (search) / Phase 16 (command palette) territory.
@@ -79,7 +79,7 @@ Decisions already made that the implementor must respect. Rationale included so 
 | **Perf-exclusion set hardcoded (`target/`, `.git/`, `node_modules/`); no configurability in v1** | Minimal-solution: #309 asks for configurability "eventually"; v1 hardcodes the minimal set. A settings surface is Phase 17. | 2026-07-02 |
 | **Git-status roll-up precedence `conflicted > changed > untracked > clean`; severity by enum order** | Otherwise "strongest git status" is an undefined implementer fork (unlike `DiagnosticSeverity`, whose declaration order settles severity). Within-"changed" tie-breaks render the same affordance, so they are implementation judgment. | 2026-07-02 |
 | **Decoration reads the existing client model — no new protocol** | Constraint: git status / diagnostics / ignored / mtime are already streamed and folded onto `WorktreeModel`. Decoration is pure client rendering; the daemon change is a `WalkBuilder` reconfig + two `!ignored` filter guards in `crates/explorer` / `crates/daemon`, not a protocol addition. | 2026-07-02 |
-| **File operations (create/rename/delete/move)** | **OPEN — resolved at the spec-acceptance gate.** Recommended: defer to a dedicated daemon-file-ops concern (needs new protocol write variants + daemon handlers). In-scope only if the user wants write operations in this phase, which adds a protocol change to an otherwise read-only rendering/navigation phase. | OPEN |
+| **File operations (create/rename/delete/move) deferred to their own phase** | Gate decision: they are a write capability (new protocol variants + daemon handlers), qualitatively different from this phase's read-only decoration/navigation. Keeping them out preserves Phase 11 as the low-risk client quick win with no protocol change; file-ops become a dedicated daemon-write phase (sibling to Phase 12). | 2026-07-02 |
 
 ## Tracking
 
@@ -121,5 +121,6 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 
 Decisions made during implementation. Added as work progresses.
 
+- 2026-07-02: Spec-acceptance gate. Human prerequisites confirmed none. The one genuinely-open item resolved by the developer: file operations (create/rename/delete/move) are **deferred** to a dedicated daemon-file-ops phase (a write capability needing new protocol variants; kept out to preserve Phase 11 as the read-only client quick win). Roadmap Phase 11 name to drop "file ops." Spec flipped `DRAFT → READY` and accepted for merge.
 - 2026-07-02: Review gate (fresh-context Agent review) — `REQUEST_CHANGES`, one blocking finding addressed: the #309 scan change is **not** self-contained to `snapshot.rs` — it breaks two documented invariants (`crates/explorer/src/watcher.rs` OS-watches every dir; `crates/daemon/src/lsp.rs` drives LSP for every file change), both of which assume ignored paths never appear in the snapshot. Scope + Constraints + Verification widened to add explicit `!ignored` guards at both boundaries (watch budget + LSP preserved). Non-blocking folded in: git-status roll-up precedence defined (`conflicted > changed > untracked > clean`); cache-invalidation-can't-be-forgotten constraint (wrap the `model_mut()` fold sites); generalized ignored-dir perf risk documented as accepted/bounded (walked-not-watched, lazy-expand is the future fix); PR-sizing risk row with a 5-issue split. Verified by the reviewer: freeze-fix claim (double per-frame `visible_rows()`), #309 fidelity (`WalkBuilder` honors this repo's `.ignore`), and the no-new-protocol claim (only `OpenFile`/`SaveFile` exist).
 - 2026-07-02: Spec created from `/loopkit:plan` (roadmap Phase 11). Grounded on the current `file_tree.rs` (double per-frame `visible_rows()` = the freeze), `worktree.rs` (model already carries git/diagnostics/ignored/mtime), the scanner in `crates/explorer/src/snapshot.rs` (`ignore::WalkBuilder`), and issue #309. Constraint/precedent-determined: precomputed decorated-row cache (zed `EntryDetails`) as freeze-fix + decoration substrate; ancestor roll-up; #309 ignored-files fix (show dimmed, explicit perf-exclusion set, drop `.ignore`) with the perf set hardcoded for v1; reveal + keyboard nav; reads the existing model with no new protocol. One genuinely-open item carried to the gate: whether file operations (create/rename/delete/move — a new daemon write capability) belong in this phase or a dedicated deferred concern.
