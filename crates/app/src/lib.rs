@@ -7,6 +7,7 @@ pub mod gallery;
 
 pub mod editor;
 pub mod file_tree;
+pub mod terminal_panel;
 pub mod workspace;
 pub mod worktree;
 
@@ -36,4 +37,34 @@ pub fn apply_theme(cx: &mut App) {
     };
     Theme::global_mut(cx).dark_theme = theme;
     Theme::change(ThemeMode::Dark, None, cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_component::dock::Panel as _;
+
+    use crate::editor::EDITOR_PANEL_NAME;
+    use crate::file_tree::{FileTree, FILE_TREE_PANEL_NAME};
+    use crate::terminal_panel::TERMINAL_PANEL_NAME;
+
+    /// `EditorView` and `TerminalPanel` need a live GPUI `Window`/`Context` to
+    /// construct, so their `panel_name()` is asserted against the constant that
+    /// backs the trait impl (the impl body is `EDITOR_PANEL_NAME` /
+    /// `TERMINAL_PANEL_NAME` verbatim — see `editor.rs` / `terminal_panel.rs`).
+    /// `FileTree::new()` stays cx-free, so its call goes through the real
+    /// `Panel::panel_name()` trait method.
+    #[test]
+    fn test_panel_names_are_stable_and_distinct() {
+        assert_eq!(FileTree::new().panel_name(), FILE_TREE_PANEL_NAME);
+        assert_eq!(FILE_TREE_PANEL_NAME, "explorer");
+        assert_eq!(EDITOR_PANEL_NAME, "editor");
+        assert_eq!(TERMINAL_PANEL_NAME, "terminal");
+
+        let names = [FILE_TREE_PANEL_NAME, EDITOR_PANEL_NAME, TERMINAL_PANEL_NAME];
+        for (i, a) in names.iter().enumerate() {
+            for b in &names[i + 1..] {
+                assert_ne!(a, b, "panel names must be distinct");
+            }
+        }
+    }
 }

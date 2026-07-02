@@ -6230,6 +6230,7 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "gpui_platform",
+ "rift-logging",
  "rift-protocol",
  "rift-ssh",
  "rift-terminal",
@@ -6247,10 +6248,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rift-explorer",
+ "rift-logging",
  "rift-lsp",
  "rift-protocol",
  "rift-tmux-core",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

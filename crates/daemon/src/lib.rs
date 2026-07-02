@@ -16,6 +16,7 @@ use rift_protocol::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, watch};
+use tracing::{error, info, warn};
 
 /// Single source of truth for the daemon's observable worktree/git state.
 ///
@@ -200,10 +201,7 @@ fn worktree_worker(root: PathBuf, events: mpsc::Sender<WorktreeEvent>) {
     let snapshot = match Snapshot::scan(&root) {
         Ok(snapshot) => snapshot,
         Err(err) => {
-            eprintln!(
-                "rift-daemon worktree scan of {} failed: {err}",
-                root.display()
-            );
+            error!(root = %root.display(), %err, "worktree scan failed");
             return;
         }
     };
@@ -227,7 +225,7 @@ fn worktree_worker(root: PathBuf, events: mpsc::Sender<WorktreeEvent>) {
             let (_watcher, changes, git_rx) = match Watcher::with_git_status(snapshot.clone()) {
                 Ok(triple) => triple,
                 Err(err) => {
-                    eprintln!("rift-daemon worktree watch failed: {err}");
+                    error!(%err, "worktree watch failed");
                     return;
                 }
             };
@@ -243,14 +241,11 @@ fn worktree_worker(root: PathBuf, events: mpsc::Sender<WorktreeEvent>) {
             relay_events(&changes, Some(&git_rx), &events);
         }
         Err(err) => {
-            eprintln!(
-                "rift-daemon: no git status for {} ({err}); worktree-only",
-                root.display()
-            );
+            info!(root = %root.display(), %err, "no git status; watching worktree only");
             let (_watcher, changes) = match Watcher::new(snapshot.clone()) {
                 Ok(pair) => pair,
                 Err(err) => {
-                    eprintln!("rift-daemon worktree watch failed: {err}");
+                    error!(%err, "worktree watch failed");
                     return;
                 }
             };
@@ -553,7 +548,7 @@ async fn buffer_reply(state: &watch::Receiver<State>, msg: ClientMessage) -> Opt
             // No worktree scanned yet: there is no root to confine to, so the
             // request cannot be served. Drop it.
             None => {
-                eprintln!("rift-daemon: buffer request before the worktree is ready, dropping");
+                warn!("buffer request before the worktree is ready, dropping");
                 return None;
             }
         }
@@ -567,7 +562,7 @@ async fn buffer_reply(state: &watch::Receiver<State>, msg: ClientMessage) -> Opt
                 mtime,
             }),
             Err(err) => {
-                eprintln!("rift-daemon: open_file {path:?} refused: {err}");
+                warn!(?path, %err, "open_file refused");
                 None
             }
         },
@@ -583,7 +578,7 @@ async fn buffer_reply(state: &watch::Receiver<State>, msg: ClientMessage) -> Opt
                 Some(DaemonMessage::SaveConflict { path, disk_mtime })
             }
             Err(err) => {
-                eprintln!("rift-daemon: save_file {path:?} refused: {err}");
+                warn!(?path, %err, "save_file refused");
                 None
             }
         },
@@ -739,9 +734,7 @@ where
                     // divergence is observable. The snapshot itself is loss-free,
                     // delivered off-bus above.
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        eprintln!(
-                            "rift-daemon connection lagged: dropped {skipped} worktree update(s)"
-                        );
+                        warn!(skipped, "connection lagged, dropped worktree update(s)");
                     }
                     Err(broadcast::error::RecvError::Closed) => break 'serve,
                 }
@@ -909,10 +902,7 @@ struct PidfileGuard {
 impl Drop for PidfileGuard {
     fn drop(&mut self) {
         if let Err(e) = std::fs::remove_file(&self.path) {
-            eprintln!(
-                "rift-daemon: failed to remove pidfile {}: {e}",
-                self.path.display()
-            );
+            warn!(path = %self.path.display(), err = %e, "failed to remove pidfile");
         }
     }
 }
@@ -964,10 +954,7 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
     let _pidfile_guard = match tokio::fs::write(&pidfile, std::process::id().to_string()).await {
         Ok(()) => Some(PidfileGuard { path: pidfile }),
         Err(e) => {
-            eprintln!(
-                "rift-daemon: failed to write pidfile {}: {e}",
-                pidfile.display()
-            );
+            warn!(path = %pidfile.display(), err = %e, "failed to write pidfile");
             None
         }
     };
@@ -989,7 +976,7 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
                 // (ECONNABORTED, or EMFILE/ENFILE under FD pressure) — that would
                 // leave nothing to reattach to. Log, back off briefly so a
                 // persistent failure cannot hot-spin, and keep accepting.
-                eprintln!("rift-daemon accept error: {e}");
+                warn!(err = %e, "accept error");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
@@ -1000,9 +987,9 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
         let state = handles.state.clone();
         tokio::spawn(async move {
             if let Err(e) = serve_connection(reader, writer, inbound, events, state, None).await {
-                // Stderr is the daemon's log sink (stdout carries protocol frames
-                // in stdio mode); one failed connection must not stop the daemon.
-                eprintln!("rift-daemon connection ended with error: {e}");
+                // The active sink (stderr or the rotated file) is the daemon's
+                // log; one failed connection must not stop the daemon.
+                warn!(err = %e, "connection ended with error");
             }
         });
     }
@@ -1246,7 +1233,7 @@ impl Core {
     fn forward_nav_request(&self, req: NavRequest) {
         if let Some(nav_requests) = &self.nav_requests {
             if let Err(err) = nav_requests.try_send(req) {
-                eprintln!("rift-daemon: dropped navigation request: {err}");
+                warn!(%err, "dropped navigation request");
             }
         }
     }
@@ -1257,7 +1244,7 @@ impl Core {
     fn forward_buffer_event(&self, event: BufferEvent) {
         if let Some(buffer_events) = &self.buffer_events {
             if let Err(err) = buffer_events.try_send(event) {
-                eprintln!("rift-daemon: dropped live-buffer event: {err}");
+                warn!(%err, "dropped live-buffer event");
             }
         }
     }
@@ -1289,7 +1276,7 @@ impl Core {
                         // change re-syncs from disk, so a dropped batch only
                         // delays diagnostics, never corrupts the model.
                         if let Err(err) = doc_changes.try_send(changes) {
-                            eprintln!("rift-daemon: dropped document-sync batch: {err}");
+                            warn!(%err, "dropped document-sync batch");
                         }
                     }
                 }

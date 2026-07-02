@@ -4,6 +4,7 @@ pub mod keyboard;
 pub mod keytable;
 pub mod layout;
 pub mod pane_view;
+pub mod prefix;
 mod session_view;
 
 pub use keytable::{
