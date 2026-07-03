@@ -3,8 +3,10 @@
 //!
 //! Events are used only as a *trigger*: on each quiet point the watcher rescans the
 //! tree and diffs the fresh [`Snapshot`] against the held one, so a move falls out as
-//! remove + add and an ignored path never appears (it is absent from both scans).
-//! Only non-ignored directories are watched, so a large ignored tree like `target/`
+//! remove + add. Gitignored entries appear in the snapshot (#309) but
+//! [`WatchSet::reconcile`] excludes them from the OS-watched set, so only
+//! non-ignored directories are watched — a large ignored tree like `target/`
+//! (excluded from the scan entirely) or `dist/`/`.venv/` (scanned, but unwatched)
 //! never consumes an OS watch; if the watch limit is still hit the watcher logs once
 //! and degrades rather than panicking.
 
@@ -213,11 +215,17 @@ impl WatchSet {
     /// Reconcile the watched set to exactly the non-ignored directories of `snapshot`
     /// (its root plus every directory entry), adding new watches and dropping stale
     /// ones.
+    ///
+    /// The `!entry.ignored` filter preserves this module's invariant now that
+    /// the scan includes gitignored entries (#309): an ignored directory (e.g. a
+    /// large `dist/` or `.venv/` outside the hardcoded perf set) is shown from
+    /// the scan and refreshed on the next debounced full rescan, but never
+    /// consumes a dedicated OS watch.
     fn reconcile(&mut self, snapshot: &Snapshot) {
         let mut desired = BTreeSet::new();
         desired.insert(snapshot.root().to_path_buf());
         for (relative, entry) in snapshot.entries() {
-            if entry.kind == EntryKind::Dir {
+            if entry.kind == EntryKind::Dir && !entry.ignored {
                 desired.insert(snapshot.root().join(relative));
             }
         }
@@ -475,6 +483,52 @@ mod tests {
             .iter()
             .any(|c| matches!(c, Change::Added { path, .. } if path == Path::new("src/lib.rs"))));
         assert!(batch.iter().all(|c| !change_path(c).starts_with("target")));
+    }
+
+    /// Invariant guard (#309): once ignored entries appear in the snapshot, a
+    /// gitignored directory outside the hardcoded perf set (e.g. `dist/`) must
+    /// still never consume an OS watch — only the perf set is excluded from the
+    /// scan outright; everything else ignored is scanned but unwatched. Tests
+    /// `reconcile` directly against a seeded snapshot rather than through real
+    /// filesystem events, since the watch *set*, not event delivery, is what's
+    /// under test.
+    #[test]
+    fn test_reconcile_excludes_ignored_directories_from_watch_set() {
+        let tmp = TempDir::new("reconcile-ignored");
+        let root = &tmp.path;
+        write_file(&root.join(".gitignore"), "dist/\n");
+        write_file(&root.join("src/main.rs"), "fn main() {}");
+        write_file(&root.join("dist/bundle.js"), "console.log(1)");
+
+        let snapshot = Snapshot::scan(root).expect("scan");
+        assert_eq!(
+            snapshot.get(Path::new("dist")).map(|e| e.ignored),
+            Some(true),
+            "fixture assumption: dist/ is gitignored"
+        );
+        assert_eq!(
+            snapshot.get(Path::new("src")).map(|e| e.ignored),
+            Some(false)
+        );
+
+        let (event_tx, _event_rx) = mpsc::channel();
+        let watcher = RecommendedWatcher::new(
+            move |result: notify::Result<Event>| {
+                let _ = event_tx.send(result);
+            },
+            Config::default(),
+        )
+        .expect("create watcher");
+        let mut watches = WatchSet::new(watcher);
+        watches.reconcile(&snapshot);
+
+        let root = snapshot.root().to_path_buf();
+        assert!(watches.dirs.contains(&root));
+        assert!(watches.dirs.contains(&root.join("src")));
+        assert!(
+            !watches.dirs.contains(&root.join("dist")),
+            "an ignored directory must never be OS-watched"
+        );
     }
 
     #[test]

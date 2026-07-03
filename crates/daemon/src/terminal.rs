@@ -402,6 +402,9 @@ impl Attach {
             // the per-connection buffer service or the shared LSP loop, not here.
             // Navigation requests (hover/definition/references, #193) are handled
             // by the shared dispatch loop and LSP worker — never the terminal task.
+            // `RequestDiff` (source-control diff, #335) is likewise not a
+            // terminal message; its daemon-side handler lands in a follow-on
+            // issue — until then it is silently dropped here too.
             ClientMessage::Input { .. }
             | ClientMessage::Attach { .. }
             | ClientMessage::OpenFile { .. }
@@ -411,6 +414,7 @@ impl Attach {
             | ClientMessage::HoverRequest { .. }
             | ClientMessage::DefinitionRequest { .. }
             | ClientMessage::ReferencesRequest { .. }
+            | ClientMessage::RequestDiff { .. }
             | ClientMessage::Hello { .. } => {}
         }
         Ok(())
