@@ -201,6 +201,14 @@ fn main() {
                 None,
             ),
         ]);
+        // Settings surface (#366, `docs/spec-theme-settings.md`): Ctrl+, /
+        // Cmd+, opens it, mirroring the editor-convention shortcut. Unscoped
+        // (`None`), like the command palette above, so it reaches the
+        // shortcut regardless of which surface is focused.
+        cx.bind_keys([
+            KeyBinding::new("ctrl-,", rift_app::settings::OpenSettings, None),
+            KeyBinding::new("cmd-,", rift_app::settings::OpenSettings, None),
+        ]);
         // gpui-component's `Root` view binds `tab`/`shift-tab` to focus navigation
         // in the "Root" context. Root is an ancestor of every pane, so that action
         // consumes the keystroke before it reaches the pane's `on_key_down`, and the
@@ -363,11 +371,12 @@ fn main() {
 
                 let session_view = cx.new(|cx| {
                     let (mut view, handle) = SessionView::new(cx);
-                    // Font-size restore (#225): seed before the first tmux
+                    // Font-size restore (#225): set before the first tmux
                     // snapshot creates any panes, so every pane picks up the
                     // restored size from the start rather than flashing the
-                    // default and then resizing.
-                    view.seed_font_size(restored.font_size_px);
+                    // default and then resizing. `apply_font_size` no-ops
+                    // safely against the still-empty panes map at this point.
+                    view.set_font_size(px(restored.font_size_px), cx);
 
                     let ssh = SshConfig {
                         host: env::var("RIFT_SSH_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
@@ -481,7 +490,7 @@ fn main() {
                             nav_tx: nav_request_tx,
                             request_diff_tx,
                         },
-                        state_path.clone(),
+                        state_path,
                         window,
                         cx,
                     )

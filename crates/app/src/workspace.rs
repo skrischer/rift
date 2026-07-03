@@ -29,6 +29,10 @@
 //!   re-pushed to the editor as **inline markers** (#189, #353) — consuming the
 //!   existing client diagnostics model (#178), so a fixed error clears its
 //!   marker on the tab that owns it, even while that tab sits in the background.
+//!   After an `UpdateGitStatus` fold, the diff view's open path (if any) is
+//!   checked against `changed`/`cleared` — **live diff refresh** (#339): a tick
+//!   marking it still changed re-requests its diff, one dropping it from the
+//!   changed set (e.g. a commit) closes the view.
 //! - **Buffer reply** (`buffer_rx`): a `FileContent { path, content, mtime }`
 //!   loads into the [`EditorView`] (and that tab's inline diagnostics are
 //!   re-applied, since opening rebuilt its input); a `SaveResult` / `SaveConflict`
@@ -73,10 +77,15 @@ use crate::diff_view::DiffView;
 use crate::editor::EditorView;
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::problems_panel::{ProblemsPanel, ProblemsPanelEvent};
+use crate::settings::{OpenSettings, SettingsView};
 use crate::source_control::{SourceControlEvent, SourceControlPanel};
 use crate::status_bar;
 use crate::terminal_panel::TerminalPanel;
 use crate::window_state;
+use crate::{
+    SelectCatppuccinMochaTheme, SelectDefaultDarkTheme, SelectDefaultLightTheme, ToggleThemeMode,
+    CATPPUCCIN_MOCHA_THEME_NAME, DEFAULT_DARK_THEME_NAME, DEFAULT_LIGHT_THEME_NAME,
+};
 
 /// Debounce cadence for the window-state save timer — move/resize/maximize
 /// (`observe_window_bounds`) and font-size changes
@@ -234,6 +243,10 @@ pub struct WorkspaceView {
     /// arm bumps it, so an in-flight timer from an earlier move/resize sees
     /// the mismatch and no-ops instead of writing stale-but-superseded state.
     window_state_save_generation: u64,
+    /// The settings surface (`docs/spec-theme-settings.md`, issue #366):
+    /// theme mode, named theme, and font scale, hosted as a `Root` dialog
+    /// like `command_palette` above.
+    settings_view: SettingsView,
 }
 
 impl WorkspaceView {
@@ -309,6 +322,19 @@ impl WorkspaceView {
                 let result = this.update_in(cx, |view, window, cx| {
                     let is_diagnostics = matches!(msg, DaemonMessage::Diagnostics { .. });
                     let is_repo_state = matches!(msg, DaemonMessage::RepoState { .. });
+                    // Live diff refresh (#339): pull the changed/cleared paths out
+                    // before `msg` moves into the fold below, so the diff view can
+                    // be reacted to afterward without a second pass over the model.
+                    let git_status_update = match &msg {
+                        DaemonMessage::UpdateGitStatus { changed, cleared } => Some((
+                            changed
+                                .iter()
+                                .map(|entry| entry.path.clone())
+                                .collect::<Vec<String>>(),
+                            cleared.clone(),
+                        )),
+                        _ => None,
+                    };
                     view.file_tree.update(cx, |tree, cx| {
                         apply_worktree_message(tree, msg);
                         cx.notify();
@@ -340,6 +366,14 @@ impl WorkspaceView {
                     // the diagnostics map.
                     if is_diagnostics {
                         view.push_diagnostics_for_open_tabs(cx);
+                    }
+                    // Live diff refresh (#339): a status tick that marks the open
+                    // diff's path changed re-requests it; one that drops it from
+                    // the changed set (e.g. a commit) closes the view instead.
+                    if let Some((changed, cleared)) = git_status_update {
+                        view.diff_view.update(cx, |diff_view, cx| {
+                            diff_view.apply_git_update(&changed, &cleared, cx);
+                        });
                     }
                 });
                 if result.is_err() {
@@ -577,6 +611,7 @@ impl WorkspaceView {
         });
 
         let command_palette = CommandPalette::new(window, cx);
+        let settings_view = SettingsView::new(session_view.clone());
 
         // Window-state capture (#225, docs/spec-window-state-persistence.md):
         // observe move/resize/maximize and the terminal's font-size changes,
@@ -620,6 +655,7 @@ impl WorkspaceView {
             command_palette,
             window_state_path,
             window_state_save_generation: 0,
+            settings_view,
         }
     }
 
@@ -768,6 +804,23 @@ impl WorkspaceView {
     fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.command_palette.open(window, cx);
     }
+
+    /// Open the settings surface (issue #366) as a `Root` dialog.
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_view.open(window, cx);
+    }
+
+    /// Toggle light/dark mode (issue #367), keeping whichever named theme is
+    /// currently assigned to each slot.
+    fn toggle_theme_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        crate::toggle_theme_mode(Some(window), cx);
+    }
+
+    /// Switch the active theme by name (issue #367), restyling the running UI
+    /// live.
+    fn select_theme(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        crate::set_theme(name, Some(window), cx);
+    }
 }
 
 /// Build the persisted [`window_state::WindowState`] from the window's
@@ -791,7 +844,7 @@ fn capture_window_state(
             height: f64::from(bounds.size.height),
         },
         maximized: window.is_maximized(),
-        font_size_px: session_view.read(cx).font_size_px(),
+        font_size_px: f32::from(session_view.read(cx).font_size()),
     }
 }
 
@@ -967,6 +1020,25 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
                 this.open_command_palette(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                this.open_settings(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleThemeMode, window, cx| {
+                this.toggle_theme_mode(window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &SelectDefaultLightTheme, window, cx| {
+                    this.select_theme(DEFAULT_LIGHT_THEME_NAME, window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &SelectDefaultDarkTheme, window, cx| {
+                this.select_theme(DEFAULT_DARK_THEME_NAME, window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &SelectCatppuccinMochaTheme, window, cx| {
+                    this.select_theme(CATPPUCCIN_MOCHA_THEME_NAME, window, cx);
+                }),
+            )
             .child(self.dock_area.clone())
             .child(status_bar)
             .children(sheet_layer)
@@ -1598,6 +1670,62 @@ mod tests {
                 workspace.read(cx).focus_handle(cx),
                 session_view.read(cx).focus_handle(cx),
                 "dismissing the palette leaves the terminal focus delegation untouched"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Settings surface (`docs/spec-theme-settings.md`, issue #366): opening
+    /// sets an active `Root` dialog, mirroring the command palette above, and
+    /// closing it clears that state without disturbing the workspace's own
+    /// focus delegation to the terminal.
+    #[gpui::test]
+    fn test_open_settings_opens_a_dialog_and_close_clears_it(cx: &mut TestAppContext) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let mut session_view: Option<Entity<SessionView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let view = cx.new(|cx| SessionView::new(cx).0);
+                session_view = Some(view.clone());
+                workspace =
+                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+        let session_view =
+            session_view.expect("session view constructed inside the window callback");
+
+        cx.update_window(window.into(), |_, window, cx| {
+            assert!(
+                !window.has_active_dialog(cx),
+                "no dialog is open before the shortcut fires"
+            );
+
+            workspace.update(cx, |view, cx| {
+                view.open_settings(window, cx);
+            });
+            assert!(
+                window.has_active_dialog(cx),
+                "OpenSettings opens a Root dialog"
+            );
+            assert_eq!(
+                workspace.read(cx).focus_handle(cx),
+                session_view.read(cx).focus_handle(cx),
+                "opening settings does not move the workspace's terminal focus delegation"
+            );
+
+            window.close_dialog(cx);
+            assert!(
+                !window.has_active_dialog(cx),
+                "closing the dialog clears the active-dialog state"
+            );
+            assert_eq!(
+                workspace.read(cx).focus_handle(cx),
+                session_view.read(cx).focus_handle(cx),
+                "dismissing settings leaves the terminal focus delegation untouched"
             );
         })
         .unwrap();

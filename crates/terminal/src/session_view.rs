@@ -18,8 +18,11 @@ use crate::{
 };
 
 const DEFAULT_FONT_SIZE: f32 = 14.0;
-const MIN_FONT_SIZE: f32 = 8.0;
-const MAX_FONT_SIZE: f32 = 40.0;
+/// Lower bound of the whole-client font size, shared by the `Ctrl+=`/`Ctrl+-`
+/// zoom path and the settings surface's font-scale field (#366).
+pub const MIN_FONT_SIZE: f32 = 8.0;
+/// Upper bound of the whole-client font size (see [`MIN_FONT_SIZE`]).
+pub const MAX_FONT_SIZE: f32 = 40.0;
 const FONT_SIZE_STEP: f32 = 1.0;
 /// Width of the always-visible pane sidebar. Shared between the sidebar render
 /// and the tmux client-width compute so the reported column count never
@@ -126,14 +129,6 @@ fn select_pane_command(pane: &str) -> String {
 /// tmux `kill-pane` command closing the given pane.
 fn kill_pane_command(pane: &str) -> String {
     format!("kill-pane -t {}", pane)
-}
-
-/// Clamp a font size (px) to rift's supported zoom range. Shared by
-/// interactive zoom ([`SessionView::apply_font_zoom`]) and window-state
-/// restore ([`SessionView::seed_font_size`], #225), so a stale or
-/// hand-edited persisted value can never seed a degenerate size.
-fn clamp_font_size(font_size_px: f32) -> f32 {
-    font_size_px.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
 }
 
 /// Precedence rank of a [`PaneActivity`] for the per-window aggregate:
@@ -461,9 +456,32 @@ impl SessionView {
     /// `render` recomputes cols/rows and pushes the new client size to tmux,
     /// which reflows every pane.
     fn apply_font_zoom(&mut self, delta: i32, cx: &mut Context<Self>) {
-        let new_size = px(clamp_font_size(
-            f32::from(self.font_size) + delta as f32 * FONT_SIZE_STEP,
-        ));
+        let new_size = px((f32::from(self.font_size) + delta as f32 * FONT_SIZE_STEP)
+            .clamp(MIN_FONT_SIZE, MAX_FONT_SIZE));
+        self.apply_font_size(new_size, cx);
+    }
+
+    /// The whole-client font size (`docs/spec-window-state-persistence.md`'s
+    /// "font scale"), read by the settings surface (#366) to seed its field.
+    pub fn font_size(&self) -> Pixels {
+        self.font_size
+    }
+
+    /// Set the whole-client font size directly, clamped to the same
+    /// [`MIN_FONT_SIZE`]/[`MAX_FONT_SIZE`] bounds as the `Ctrl+=`/`Ctrl+-` zoom
+    /// path. An absolute counterpart to [`Self::apply_font_zoom`]'s relative
+    /// delta, for the settings surface's font-scale field (#366).
+    pub fn set_font_size(&mut self, size: Pixels, cx: &mut Context<Self>) {
+        let clamped = px(f32::from(size).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE));
+        self.apply_font_size(clamped, cx);
+    }
+
+    /// Apply an absolute font size, notifying every live pane and arming the
+    /// debounced window-state capture (#225) — the shared choke point for
+    /// both the `Ctrl+=`/`Ctrl+-` zoom and the settings surface's font-scale
+    /// field (#366), so either path emits [`SessionViewEvent::FontSizeChanged`]
+    /// exactly once.
+    fn apply_font_size(&mut self, new_size: Pixels, cx: &mut Context<Self>) {
         if new_size == self.font_size {
             return;
         }
@@ -478,22 +496,6 @@ impl SessionView {
             font_size_px: f32::from(new_size),
         });
         cx.notify();
-    }
-
-    /// The current whole-client font size in px (window-state capture, #225,
-    /// `docs/spec-window-state-persistence.md`).
-    pub fn font_size_px(&self) -> f32 {
-        f32::from(self.font_size)
-    }
-
-    /// Seed the whole-client font size before any panes exist (window-state
-    /// restore, #225) — call once at startup, before the first tmux snapshot
-    /// creates panes, so every pane picks up the restored size from
-    /// [`Self::apply_snapshot`]'s own `self.font_size` read. Clamped like an
-    /// interactive zoom, so a stale or hand-edited state file can never seed
-    /// a degenerate size.
-    pub fn seed_font_size(&mut self, font_size_px: f32) {
-        self.font_size = px(clamp_font_size(font_size_px));
     }
 
     /// Apply a refreshed `list-keys`/`show-options` reply: re-parse into the
@@ -1424,11 +1426,11 @@ impl Render for SessionView {
 #[cfg(test)]
 mod tests {
     use super::{
-        activity_dot_color, aggregate_activity, clamp_font_size, kill_pane_command,
-        quote_tmux_name, resize_direction, select_pane_command, split_command, PaneActivity,
-        MAX_FONT_SIZE, MIN_FONT_SIZE,
+        activity_dot_color, aggregate_activity, kill_pane_command, quote_tmux_name,
+        resize_direction, select_pane_command, split_command, PaneActivity, SessionView,
+        DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE,
     };
-    use gpui::rgb;
+    use gpui::{px, rgb, AppContext as _, TestAppContext};
 
     #[test]
     fn test_quote_tmux_name_plain_wraps_in_single_quotes() {
@@ -1552,14 +1554,49 @@ mod tests {
         assert_ne!(busy, attention);
     }
 
-    #[test]
-    fn test_clamp_font_size_leaves_in_range_values_unchanged() {
-        assert_eq!(clamp_font_size(14.0), 14.0);
+    /// `font_size()` starts at the same default `apply_font_zoom`'s delta path
+    /// has always used — the settings surface's font-scale field (#366) seeds
+    /// from this getter.
+    #[gpui::test]
+    fn test_font_size_defaults_to_the_starting_client_font_size(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let session = cx.new(|cx| SessionView::new(cx).0);
+            assert_eq!(session.read(cx).font_size(), px(DEFAULT_FONT_SIZE));
+        });
     }
 
-    #[test]
-    fn test_clamp_font_size_clamps_to_the_supported_range() {
-        assert_eq!(clamp_font_size(MIN_FONT_SIZE - 5.0), MIN_FONT_SIZE);
-        assert_eq!(clamp_font_size(MAX_FONT_SIZE + 5.0), MAX_FONT_SIZE);
+    /// `set_font_size` is the absolute counterpart to the `Ctrl+=`/`Ctrl+-`
+    /// delta path (`apply_font_zoom`): an in-range value applies directly.
+    #[gpui::test]
+    fn test_set_font_size_applies_an_in_range_value(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let session = cx.new(|cx| SessionView::new(cx).0);
+
+            session.update(cx, |session, cx| {
+                session.set_font_size(px(20.0), cx);
+            });
+
+            assert_eq!(session.read(cx).font_size(), px(20.0));
+        });
+    }
+
+    /// A value outside `[MIN_FONT_SIZE, MAX_FONT_SIZE]` clamps rather than
+    /// applying verbatim — the same bounds `apply_font_zoom` enforces, so the
+    /// settings surface's field can never push the client font out of range.
+    #[gpui::test]
+    fn test_set_font_size_clamps_to_the_zoom_bounds(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let session = cx.new(|cx| SessionView::new(cx).0);
+
+            session.update(cx, |session, cx| {
+                session.set_font_size(px(MIN_FONT_SIZE - 5.0), cx);
+            });
+            assert_eq!(session.read(cx).font_size(), px(MIN_FONT_SIZE));
+
+            session.update(cx, |session, cx| {
+                session.set_font_size(px(MAX_FONT_SIZE + 5.0), cx);
+            });
+            assert_eq!(session.read(cx).font_size(), px(MAX_FONT_SIZE));
+        });
     }
 }
