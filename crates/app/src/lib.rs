@@ -7,6 +7,7 @@ pub mod gallery;
 
 pub mod editor;
 pub mod file_tree;
+pub mod problems_panel;
 pub mod status_bar;
 pub mod terminal_panel;
 pub mod workspace;
@@ -46,12 +47,14 @@ mod tests {
 
     use crate::editor::EDITOR_PANEL_NAME;
     use crate::file_tree::{FileTree, FILE_TREE_PANEL_NAME};
+    use crate::problems_panel::PROBLEMS_PANEL_NAME;
     use crate::terminal_panel::TERMINAL_PANEL_NAME;
 
-    /// `EditorView` and `TerminalPanel` need a live GPUI `Window`/`Context` to
-    /// construct, so their `panel_name()` is asserted against the constant that
-    /// backs the trait impl (the impl body is `EDITOR_PANEL_NAME` /
-    /// `TERMINAL_PANEL_NAME` verbatim — see `editor.rs` / `terminal_panel.rs`).
+    /// `EditorView`, `TerminalPanel`, and `ProblemsPanel` need a live GPUI
+    /// `Window`/`Context` to construct, so their `panel_name()` is asserted
+    /// against the constant that backs the trait impl (the impl body is
+    /// `EDITOR_PANEL_NAME` / `TERMINAL_PANEL_NAME` / `PROBLEMS_PANEL_NAME`
+    /// verbatim — see `editor.rs` / `terminal_panel.rs` / `problems_panel.rs`).
     /// `FileTree::new()` stays cx-free, so its call goes through the real
     /// `Panel::panel_name()` trait method.
     #[test]
@@ -60,8 +63,14 @@ mod tests {
         assert_eq!(FILE_TREE_PANEL_NAME, "explorer");
         assert_eq!(EDITOR_PANEL_NAME, "editor");
         assert_eq!(TERMINAL_PANEL_NAME, "terminal");
+        assert_eq!(PROBLEMS_PANEL_NAME, "problems");
 
-        let names = [FILE_TREE_PANEL_NAME, EDITOR_PANEL_NAME, TERMINAL_PANEL_NAME];
+        let names = [
+            FILE_TREE_PANEL_NAME,
+            EDITOR_PANEL_NAME,
+            TERMINAL_PANEL_NAME,
+            PROBLEMS_PANEL_NAME,
+        ];
         for (i, a) in names.iter().enumerate() {
             for b in &names[i + 1..] {
                 assert_ne!(a, b, "panel names must be distinct");

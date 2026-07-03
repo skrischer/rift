@@ -57,6 +57,7 @@ use tracing::debug;
 
 use crate::editor::EditorView;
 use crate::file_tree::{FileTree, FileTreeEvent};
+use crate::problems_panel::ProblemsPanel;
 use crate::status_bar;
 use crate::terminal_panel::TerminalPanel;
 
@@ -104,14 +105,24 @@ pub struct WorkspaceView {
     file_tree: Entity<FileTree>,
     editor: Entity<EditorView>,
     session_view: Entity<SessionView>,
+    /// The problems panel (`docs/spec-problems-panel.md`, #342): a read-only
+    /// mirror of `file_tree`'s model, docked in the bottom zone. Kept as its
+    /// own field (mirroring `file_tree`/`editor`) so tests can reach it
+    /// directly rather than reaching into the dock's private panel tree.
+    // Read only by tests until #343 wires jump-to-location into production; use
+    // `allow` (not `expect`) since the field IS read under `cfg(test)`, which
+    // would make an `expect(dead_code)` unfulfilled on the `--all-targets` build.
+    #[allow(dead_code)]
+    problems_panel: Entity<ProblemsPanel>,
     /// Read-request sender: a tree open turns into a path on this channel, which
     /// the tokio side emits as `ClientMessage::OpenFile`.
     open_file_tx: Sender<String>,
     /// The dock shell (`docs/spec-ide-shell.md`, issue #324): explorer in the
-    /// left dock, editor|terminal split in the center, right/bottom collapsed.
-    /// Holds its own strong references to the panel entities; this view keeps
-    /// its own handles too (`file_tree`, `editor` above) so the daemon-stream
-    /// bridges keep working unchanged after the layout refactor.
+    /// left dock, editor|terminal split in the center, problems panel in the
+    /// (collapsed by default) bottom dock, right collapsed. Holds its own
+    /// strong references to the panel entities; this view keeps its own
+    /// handles too (`file_tree`, `editor`, `problems_panel` above) so the
+    /// daemon-stream bridges keep working unchanged after the layout refactor.
     dock_area: Entity<DockArea>,
 }
 
@@ -293,14 +304,15 @@ impl WorkspaceView {
         }
 
         // Dock shell (`docs/spec-ide-shell.md`, issue #324): explorer (left) +
-        // editor|terminal (center split) + right/bottom docks present but
-        // collapsed, for phases 12 (source control) and 13 (problems) to dock
-        // into later with no layout rewrite. Built after the daemon-stream
+        // editor|terminal (center split) + problems panel (bottom, #342) +
+        // right dock present but collapsed, for phase 12 (source control) to
+        // dock into later with no layout rewrite. Built after the daemon-stream
         // bridges above so the panel entities they close over already exist.
         let dock_area = cx.new(|cx| DockArea::new("rift-dock", Some(1), window, cx));
         let weak_dock_area = dock_area.downgrade();
 
         let terminal_panel = cx.new(|_| TerminalPanel::new(session_view.clone()));
+        let problems_panel = cx.new(|cx| ProblemsPanel::new(file_tree.clone(), cx));
 
         let left_item = DockItem::tab(file_tree.clone(), &weak_dock_area, window, cx);
         let center_item = DockItem::h_split(
@@ -312,10 +324,12 @@ impl WorkspaceView {
             window,
             cx,
         );
-        // Real, collapsed docks (not placeholder views) — an empty `TabPanel`
-        // with zero panels, matching `Dock::new`'s own empty-dock shape.
+        // Real, collapsed dock (not a placeholder view) — an empty `TabPanel`
+        // with zero panels, matching `Dock::new`'s own empty-dock shape. The
+        // bottom dock, in contrast, now carries the problems panel — real
+        // content, but still collapsed by default until the user opens it.
         let right_item = DockItem::tabs(Vec::new(), &weak_dock_area, window, cx);
-        let bottom_item = DockItem::tabs(Vec::new(), &weak_dock_area, window, cx);
+        let bottom_item = DockItem::tab(problems_panel.clone(), &weak_dock_area, window, cx);
 
         dock_area.update(cx, |dock, cx| {
             dock.set_center(center_item, window, cx);
@@ -328,6 +342,7 @@ impl WorkspaceView {
             file_tree,
             editor,
             session_view,
+            problems_panel,
             open_file_tx,
             dock_area,
         }
@@ -600,9 +615,10 @@ mod tests {
 
     /// Dock interaction (`docs/spec-ide-shell.md`, issue #325): every surface
     /// stays zoomable to fill the shell and restore. None of `FileTree`,
-    /// `EditorView`, or `TerminalPanel` override `Panel::zoomable`, so the
-    /// default reaches the dock's native zoom-in/zoom-out control for all
-    /// three — this locks that invariant against an accidental future override.
+    /// `EditorView`, `TerminalPanel`, or `ProblemsPanel` override
+    /// `Panel::zoomable`, so the default reaches the dock's native
+    /// zoom-in/zoom-out control for all four — this locks that invariant
+    /// against an accidental future override.
     #[gpui::test]
     fn test_all_dock_surfaces_stay_zoomable(cx: &mut TestAppContext) {
         let mut workspace: Option<Entity<WorkspaceView>> = None;
@@ -620,12 +636,13 @@ mod tests {
         let workspace = workspace.expect("workspace constructed inside the window callback");
 
         cx.update(|cx| {
-            let (file_tree, editor, session_view) = {
+            let (file_tree, editor, session_view, problems_panel) = {
                 let view = workspace.read(cx);
                 (
                     view.file_tree.clone(),
                     view.editor.clone(),
                     view.session_view.clone(),
+                    view.problems_panel.clone(),
                 )
             };
 
@@ -637,12 +654,99 @@ mod tests {
                 editor.read(cx).zoomable(cx).is_some(),
                 "the editor stays zoomable"
             );
+            assert!(
+                problems_panel.read(cx).zoomable(cx).is_some(),
+                "the problems panel stays zoomable"
+            );
 
             let terminal_panel = cx.new(|_| TerminalPanel::new(session_view));
             assert!(
                 terminal_panel.read(cx).zoomable(cx).is_some(),
                 "the terminal stays zoomable"
             );
+        });
+    }
+
+    /// Problems panel (`docs/spec-problems-panel.md`, #342): the panel docks in
+    /// the bottom zone and reads the *same* `WorktreeModel` the file tree
+    /// mirrors — so a `Diagnostics` fold onto `file_tree`'s model (exactly what
+    /// the daemon-stream bridge above performs) is immediately visible through
+    /// the panel's summary, with no separate wiring. Live repaint-on-notify
+    /// itself is a GPUI rendering concern verified visually at the milestone QA
+    /// gate; this test locks the shared-model wiring the render depends on.
+    #[gpui::test]
+    fn test_problems_panel_docks_bottom_and_shares_the_file_tree_model(cx: &mut TestAppContext) {
+        use crate::problems_panel::PROBLEMS_PANEL_NAME;
+        use rift_protocol::{Diagnostic, DiagnosticSeverity, Position, Range};
+
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let session_view = cx.new(|cx| SessionView::new(cx).0);
+                workspace = Some(
+                    cx.new(|cx| WorkspaceView::new(session_view, test_channels(), window, cx)),
+                );
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap();
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+
+        cx.update(|cx| {
+            let (file_tree, problems_panel, dock_area) = {
+                let view = workspace.read(cx);
+                (
+                    view.file_tree.clone(),
+                    view.problems_panel.clone(),
+                    view.dock_area.clone(),
+                )
+            };
+
+            assert_eq!(problems_panel.read(cx).panel_name(), PROBLEMS_PANEL_NAME);
+            assert!(
+                dock_area.read(cx).bottom_dock().is_some(),
+                "the bottom dock exists and now carries the problems panel"
+            );
+            assert!(
+                !dock_area.read(cx).is_dock_open(DockPlacement::Bottom, cx),
+                "the bottom dock starts collapsed, matching the other reserved docks"
+            );
+            assert!(
+                problems_panel.read(cx).summary(cx).groups.is_empty(),
+                "no diagnostics folded yet"
+            );
+
+            file_tree.update(cx, |tree, cx| {
+                tree.model_mut()
+                    .apply_snapshot_chunk("/proj".into(), Vec::new(), true);
+                tree.model_mut().apply_diagnostics(
+                    "a.rs".into(),
+                    "rust-analyzer".into(),
+                    vec![Diagnostic {
+                        range: Range {
+                            start: Position {
+                                line: 0,
+                                character: 0,
+                            },
+                            end: Position {
+                                line: 0,
+                                character: 1,
+                            },
+                        },
+                        severity: DiagnosticSeverity::Error,
+                        message: "mismatched types".into(),
+                        source: None,
+                        code: None,
+                    }],
+                );
+                cx.notify();
+            });
+
+            let summary = problems_panel.read(cx).summary(cx);
+            assert_eq!(summary.totals.errors, 1);
+            assert_eq!(summary.groups.len(), 1);
+            assert_eq!(summary.groups[0].path, "a.rs");
         });
     }
 
