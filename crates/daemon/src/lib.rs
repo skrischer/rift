@@ -663,7 +663,8 @@ where
                         | ClientMessage::Input { .. }
                         | ClientMessage::ResizePane { .. }
                         | ClientMessage::TmuxCommand { .. }
-                        | ClientMessage::CapturePane { .. } => {
+                        | ClientMessage::CapturePane { .. }
+                        | ClientMessage::QueryKeyTable => {
                             if terminal_in_tx.send(msg).await.is_err() {
                                 // Terminal task gone; the terminal path is dead,
                                 // but the worktree path can keep serving.
@@ -1230,6 +1231,7 @@ impl Core {
             | ClientMessage::ResizePane { .. }
             | ClientMessage::TmuxCommand { .. }
             | ClientMessage::CapturePane { .. }
+            | ClientMessage::QueryKeyTable
             | ClientMessage::OpenFile { .. }
             | ClientMessage::SaveFile { .. }
             | ClientMessage::RequestDiff { .. } => {}

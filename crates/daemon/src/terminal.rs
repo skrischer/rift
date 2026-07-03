@@ -210,6 +210,23 @@ struct Attach {
     /// [`DaemonMessage::PaneCapture`] for that pane. Several may be in flight at
     /// once (one per pane); each is removed when its reply arrives.
     captures: HashMap<CommandId, u32>,
+    /// The in-flight `list-keys` + `show-options` query pair (at most one),
+    /// for the tmux key-table mirror (`docs/spec-tmux-keytable-mirroring.md`).
+    /// A newer request simply replaces this — a reply whose id no longer
+    /// matches is dropped, which is fine since a fresher query is already
+    /// in flight.
+    key_table_query: Option<KeyTableQuery>,
+}
+
+/// One in-flight `list-keys` + `show-options` round trip: both commands are
+/// queued together, and each reply is stashed here until both have arrived, so
+/// [`DaemonMessage::KeyTableReply`] always carries a coherent pair rather than
+/// racing two separate messages.
+struct KeyTableQuery {
+    list_keys_id: CommandId,
+    show_options_id: CommandId,
+    list_keys_output: Option<Vec<String>>,
+    show_options_output: Option<Vec<String>>,
 }
 
 impl Attach {
@@ -243,6 +260,7 @@ impl Attach {
             layout_dirty: false,
             paused: HashSet::new(),
             captures: HashMap::new(),
+            key_table_query: None,
         };
         // Enable tmux's per-pane flow control for this attach (tmux→daemon leg).
         attach
@@ -253,6 +271,9 @@ impl Attach {
         // the current state, updates replace wholesale, so no duplicate either.
         let id = attach.send_command(LAYOUT_QUERY).await?;
         attach.layout_query = Some(id);
+        // Key-table mirror: queried unprompted on attach/reconnect (the spec's
+        // "on attach/reconnect" refresh trigger), same as the layout query above.
+        attach.request_key_table().await?;
         Ok(attach)
     }
 
@@ -301,6 +322,9 @@ impl Attach {
                     format!("capture-pane -p -e{join_flag} -S {start} -E {end} -t %{pane_id}");
                 let id = self.send_command(&command).await?;
                 self.captures.insert(id, pane_id);
+            }
+            ClientMessage::QueryKeyTable => {
+                self.request_key_table().await?;
             }
             // Empty input is a no-op; Attach is handled by the task; Hello never
             // reaches the terminal task. The buffer-channel requests
@@ -397,6 +421,8 @@ impl Attach {
                             })
                             .await
                             .map_err(|_| Closed)?;
+                    } else if let Some(message) = self.apply_key_table_reply(id, error, output) {
+                        outbound.send(message).await.map_err(|_| Closed)?;
                     }
                     // Other replies are acks for input/resize/raw commands — the
                     // Client already consumed their guards; nothing to forward.
@@ -418,6 +444,57 @@ impl Attach {
             }
         }
         Ok(Flow::Continue)
+    }
+
+    /// Feed one `CommandReply` into the in-flight key-table query, if it
+    /// matches. Stashes the reply's output (empty on error — a partial table
+    /// beats a failed one, same convention as the client-side parser) and
+    /// returns the combined [`DaemonMessage::KeyTableReply`] once both the
+    /// `list-keys` and `show-options` legs have arrived; `None` while the pair
+    /// is still incomplete or `id` matches neither.
+    fn apply_key_table_reply(
+        &mut self,
+        id: Option<CommandId>,
+        error: bool,
+        output: Vec<String>,
+    ) -> Option<DaemonMessage> {
+        let query = self.key_table_query.as_mut()?;
+        let id = id?;
+        if id == query.list_keys_id {
+            query.list_keys_output = Some(if error { Vec::new() } else { output });
+        } else if id == query.show_options_id {
+            query.show_options_output = Some(if error { Vec::new() } else { output });
+        } else {
+            return None;
+        }
+        let query = self.key_table_query.as_ref()?;
+        let (list_keys, options) = (
+            query.list_keys_output.as_ref()?,
+            query.show_options_output.as_ref()?,
+        );
+        let message = DaemonMessage::KeyTableReply {
+            list_keys: list_keys.join("\n"),
+            options: options.join("\n"),
+        };
+        self.key_table_query = None;
+        Some(message)
+    }
+
+    /// Issue the `list-keys` + `show-options` query pair for the tmux key-table
+    /// mirror. A request while one is already in flight simply replaces the
+    /// tracked pair; the superseded reply (if it ever arrives) will not match
+    /// either tracked id and is silently dropped — acceptable since a fresher
+    /// query is already running and its reply supersedes it anyway.
+    async fn request_key_table(&mut self) -> std::io::Result<()> {
+        let list_keys_id = self.send_command("list-keys").await?;
+        let show_options_id = self.send_command("show-options").await?;
+        self.key_table_query = Some(KeyTableQuery {
+            list_keys_id,
+            show_options_id,
+            list_keys_output: None,
+            show_options_output: None,
+        });
+        Ok(())
     }
 
     /// Issue a layout query, coalescing so at most one is in flight.
@@ -879,6 +956,68 @@ mod tests {
                 .windows(b"RIFTCAPTURE777".len())
                 .any(|w| w == b"RIFTCAPTURE777"),
             "captured scrollback must contain the printed marker"
+        );
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_attach_issues_key_table_reply_unprompted() {
+        let server = TmuxServer::new("keytable-attach");
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+
+        // No client request needed: the attach itself issues `list-keys` +
+        // `show-options`, mirroring the unprompted layout query.
+        let list_keys = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::KeyTableReply { list_keys, .. } => Some(list_keys.clone()),
+            _ => None,
+        })
+        .await
+        .expect("key-table reply after attach");
+        // `list-keys` always reports tmux's compiled-in default bindings, so
+        // this is non-empty regardless of the test environment's config.
+        assert!(!list_keys.is_empty());
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_query_key_table_reissues_reply() {
+        let server = TmuxServer::new("keytable-query");
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+        recv_until(&mut out_rx, 10, |m| {
+            matches!(m, DaemonMessage::KeyTableReply { .. }).then_some(())
+        })
+        .await
+        .expect("attach-time key-table reply");
+
+        in_tx
+            .send(ClientMessage::QueryKeyTable)
+            .await
+            .expect("query key table");
+        let second = recv_until(&mut out_rx, 10, |m| {
+            matches!(m, DaemonMessage::KeyTableReply { .. }).then_some(())
+        })
+        .await;
+        assert!(
+            second.is_some(),
+            "an explicit QueryKeyTable must produce another KeyTableReply"
         );
 
         drop(in_tx);

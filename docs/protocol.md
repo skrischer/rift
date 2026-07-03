@@ -32,6 +32,7 @@ streams pane bytes and layout state back.
 { "type": "resize_pane",  "pane_id": 3, "cols": 120, "rows": 40 }
 { "type": "tmux_command", "cmd": "split-window -h" }
 { "type": "capture_pane", "pane_id": 3, "start": "-", "end": "-128", "join": false }
+{ "type": "query_key_table" }
 ```
 
 - `attach` carries the **session name end-to-end**, so the `RIFT_SESSION` knob
@@ -47,6 +48,14 @@ streams pane bytes and layout state back.
   negative number for a history offset), `join` is `-J`. The daemon answers with
   exactly one `pane_capture` for this pane — a **request/response** exchange,
   separate from the live `%output` stream.
+- `query_key_table` asks the daemon to (re-)run `list-keys` and `show-options`
+  for the tmux key-table mirror (`docs/spec-tmux-keytable-mirroring.md`). The
+  daemon answers with exactly one `key_table_reply` — a **request/response**
+  exchange. The daemon also issues this query unprompted on `attach`/reconnect
+  (mirroring the layout query), so the client only sends `query_key_table`
+  explicitly: on a user-triggered refresh, or after dispatching a
+  binding-mutating bound command (`bind-key`/`unbind-key`/`source-file`, or
+  `set-option` touching `prefix`/`prefix2`/`repeat-time`).
 
 ### Daemon → client
 
@@ -56,6 +65,7 @@ streams pane bytes and layout state back.
 { "type": "layout_snapshot", "session": "rift", "windows": [ <window>, ... ] }
 { "type": "layout_update",   "session": "rift", "windows": [ <window>, ... ] }
 { "type": "terminal_exit",   "session": "rift", "reason": "server exited" }
+{ "type": "key_table_reply", "list_keys": "bind-key -T prefix c new-window\n...", "options": "prefix C-b\nrepeat-time 500\n..." }
 ```
 
 ```jsonc
@@ -89,6 +99,12 @@ streams pane bytes and layout state back.
   daemon failure: the daemon keeps serving its other clients, and the client may
   re-`attach` to resume against a still-live session (`reason` is tmux's `%exit`
   text when present, else `null`).
+- `key_table_reply` is the reply to `query_key_table` (and the unprompted
+  attach-time query): the raw `list-keys` and `show-options` output,
+  newline-joined and tmux-decoded but otherwise **uninterpreted by the
+  daemon** — the client parses both with `rift_terminal::keytable` into the
+  mirrored key-table lookup and prefix/repeat options. This is tmux's own
+  config text, not pane content.
 
 ### Snapshot ↔ live-stream consistency contract
 
@@ -270,7 +286,7 @@ already syncs — the client and protocol never see UTF-16.
 
 ## Source-control diff channel
 
-The diff channel is the **fourth request/response family in the protocol**,
+The diff channel is the **fifth request/response family in the protocol**,
 pulling a structured line diff for the source-control panel's review view.
 Specified by `docs/spec-source-control.md`.
 
@@ -328,9 +344,10 @@ deliberate API change — both daemon and client must be updated. Keep additions
 **additive**: existing consumers must keep compiling and deserializing.
 
 Most paths are **push-only** (structure and decoration: worktree, git,
-diagnostics — "push is the source of truth"). The four request/response
+diagnostics — "push is the source of truth"). The five request/response
 exceptions are deliberate and scoped: `capture_pane` / `pane_capture` for
-pre-attach scrollback; the **buffer channel** (`open_file` → `file_content`,
+pre-attach scrollback; `query_key_table` / `key_table_reply` for the tmux
+key-table mirror; the **buffer channel** (`open_file` → `file_content`,
 `save_file` → `save_result` / `save_conflict`) for file content; the
 **navigation channel** (`hover_request` → `hover_response`,
 `definition_request` → `definition_response`,
