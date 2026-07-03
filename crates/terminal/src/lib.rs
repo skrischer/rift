@@ -13,7 +13,7 @@ pub use keytable::{
     Binding, DispatchDecision, KeyTable, PrefixOptions,
 };
 pub use pane_view::{PaneActivity, PaneView};
-pub use session_view::{SessionView, TerminalHandle};
+pub use session_view::{SessionView, SessionViewEvent, TerminalHandle};
 pub use statusline::{
     mutates_status_options, parse_status_options, parse_style, parse_style_runs, truncate_runs,
     ResolvedColor, StatusOptions, StatusStyle, StyleAttrs, StyleRun,

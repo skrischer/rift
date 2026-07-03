@@ -53,16 +53,20 @@
 //! #351) — never the merely-active tab, so a stale response for a superseded
 //! request can never land on the wrong tab.
 
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
 use flume::{Receiver, Sender};
 use gpui::{
-    div, px, AppContext as _, Axis, Context, Entity, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _, Window,
+    div, point, px, size, App, AppContext as _, Axis, Bounds, Context, Entity, FocusHandle,
+    Focusable, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
+    Styled as _, Window, WindowBounds,
 };
 use gpui_component::dock::{DockArea, DockItem, DockPlacement};
 use gpui_component::{ActiveTheme as _, Root};
 use rift_protocol::{ClientMessage, DaemonMessage};
-use rift_terminal::SessionView;
-use tracing::debug;
+use rift_terminal::{SessionView, SessionViewEvent};
+use tracing::{debug, warn};
 
 use crate::command_palette::{CommandPalette, OpenCommandPalette};
 use crate::diff_view::DiffView;
@@ -72,6 +76,14 @@ use crate::problems_panel::{ProblemsPanel, ProblemsPanelEvent};
 use crate::source_control::{SourceControlEvent, SourceControlPanel};
 use crate::status_bar;
 use crate::terminal_panel::TerminalPanel;
+use crate::window_state;
+
+/// Debounce cadence for the window-state save timer — move/resize/maximize
+/// (`observe_window_bounds`) and font-size changes
+/// ([`SessionViewEvent::FontSizeChanged`]) all arm it (#225,
+/// `docs/spec-window-state-persistence.md`). Zed's own precedent order
+/// (~100-250ms), matching `editor::BUFFER_FEED_DEBOUNCE`'s scale.
+const WINDOW_STATE_SAVE_DEBOUNCE: Duration = Duration::from_millis(200);
 
 // ── Actions ───────────────────────────────────────────────────────────────────
 //
@@ -212,6 +224,16 @@ pub struct WorkspaceView {
     /// (`Ctrl+Shift+P` / `Cmd+Shift+P`) reuses the same list rather than
     /// rebuilding the registry each time.
     command_palette: CommandPalette,
+    /// Where this instance's channel-keyed window-state file lives (#225).
+    /// `None` when no platform state directory could be resolved
+    /// (`window_state::state_path`'s failure mode) — capture then silently
+    /// no-ops rather than crashing, matching the store's own contract.
+    window_state_path: Option<PathBuf>,
+    /// Monotonic generation fencing the debounced window-state save timer
+    /// (mirrors `EditorView::arm_buffer_feed`'s `buffer_generation`): each
+    /// arm bumps it, so an in-flight timer from an earlier move/resize sees
+    /// the mismatch and no-ops instead of writing stale-but-superseded state.
+    window_state_save_generation: u64,
 }
 
 impl WorkspaceView {
@@ -222,6 +244,7 @@ impl WorkspaceView {
     pub fn new(
         session_view: Entity<SessionView>,
         channels: WorkspaceChannels,
+        window_state_path: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -555,6 +578,35 @@ impl WorkspaceView {
 
         let command_palette = CommandPalette::new(window, cx);
 
+        // Window-state capture (#225, docs/spec-window-state-persistence.md):
+        // observe move/resize/maximize and the terminal's font-size changes,
+        // and flush on a clean close. Registered unconditionally;
+        // `arm_window_state_save` and the close handler both no-op when
+        // `window_state_path` is `None`, so persistence degrades to silently
+        // doing nothing rather than crashing (the store's own contract).
+        cx.observe_window_bounds(window, |this, window, cx| {
+            this.arm_window_state_save(window, cx);
+        })
+        .detach();
+        cx.subscribe_in(
+            &session_view,
+            window,
+            |this, _session_view, _event: &SessionViewEvent, window, cx| {
+                this.arm_window_state_save(window, cx);
+            },
+        )
+        .detach();
+        {
+            let session_view = session_view.clone();
+            let window_state_path = window_state_path.clone();
+            window.on_window_should_close(cx, move |window, cx| {
+                if let Some(path) = &window_state_path {
+                    save_window_state(path, window, &session_view, cx);
+                }
+                true
+            });
+        }
+
         Self {
             file_tree,
             editor,
@@ -566,7 +618,35 @@ impl WorkspaceView {
             open_file_tx,
             dock_area,
             command_palette,
+            window_state_path,
+            window_state_save_generation: 0,
         }
+    }
+
+    /// Arm (or re-arm) the debounced window-state save (#225): bumps the
+    /// fencing generation so an in-flight timer from an earlier move/resize
+    /// sees the mismatch and no-ops instead of writing stale-but-superseded
+    /// state (mirrors `EditorView::arm_buffer_feed`). A no-op when no state
+    /// path was resolved at startup.
+    fn arm_window_state_save(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.window_state_path.is_none() {
+            return;
+        }
+        self.window_state_save_generation = self.window_state_save_generation.wrapping_add(1);
+        let generation = self.window_state_save_generation;
+        cx.spawn_in(window, async move |this, cx| {
+            smol::Timer::after(WINDOW_STATE_SAVE_DEBOUNCE).await;
+            let _ = this.update_in(cx, |view, window, cx| {
+                if view.window_state_save_generation != generation {
+                    return;
+                }
+                let Some(path) = view.window_state_path.as_deref() else {
+                    return;
+                };
+                save_window_state(path, window, &view.session_view, cx);
+            });
+        })
+        .detach();
     }
 
     /// Feed every open tab its path's current snapshot `mtime` as the
@@ -687,6 +767,88 @@ impl WorkspaceView {
     /// Open the command palette (issue #359) as a `Root` dialog.
     fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.command_palette.open(window, cx);
+    }
+}
+
+/// Build the persisted [`window_state::WindowState`] from the window's
+/// current restore bounds/maximized flag and the terminal's live font size
+/// (#225). `window.window_bounds()` — not `window.bounds()` — is deliberate:
+/// it carries the *restore* size for a maximized/fullscreen window, so
+/// persisting it never overwrites the saved size with the full-display
+/// dimensions on every maximized capture.
+fn capture_window_state(
+    window: &Window,
+    session_view: &Entity<SessionView>,
+    cx: &App,
+) -> window_state::WindowState {
+    let bounds = window.window_bounds().get_bounds();
+    window_state::WindowState {
+        version: window_state::SCHEMA_VERSION,
+        bounds: window_state::Rect {
+            x: f64::from(bounds.origin.x),
+            y: f64::from(bounds.origin.y),
+            width: f64::from(bounds.size.width),
+            height: f64::from(bounds.size.height),
+        },
+        maximized: window.is_maximized(),
+        font_size_px: session_view.read(cx).font_size_px(),
+    }
+}
+
+/// Capture the live window/font state and write it to `path` (#225) — the
+/// single write call both the debounced save (`arm_window_state_save`) and
+/// the close-flush (`WorkspaceView::new`'s `on_window_should_close`) funnel
+/// through.
+fn save_window_state(path: &Path, window: &Window, session_view: &Entity<SessionView>, cx: &App) {
+    let state = capture_window_state(window, session_view, cx);
+    if let Err(e) = window_state::save(path, &state) {
+        warn!(%e, "failed to save window state");
+    }
+}
+
+/// Convert the platform's active displays into the store's plain `Rect`s for
+/// [`window_state::clamp_bounds`] — `window_state` is deliberately GPUI-free
+/// (its own module doc), so this seam does the one conversion GPUI-side
+/// (#225). Called from `main.rs` before the window is created.
+pub fn display_rects(cx: &App) -> Vec<window_state::Rect> {
+    cx.displays()
+        .iter()
+        .map(|display| {
+            let bounds = display.bounds();
+            window_state::Rect {
+                x: f64::from(bounds.origin.x),
+                y: f64::from(bounds.origin.y),
+                width: f64::from(bounds.size.width),
+                height: f64::from(bounds.size.height),
+            }
+        })
+        .collect()
+}
+
+/// Convert a clamped store `Rect` into GPUI's `Bounds<Pixels>`.
+fn gpui_bounds(rect: window_state::Rect) -> Bounds<Pixels> {
+    Bounds {
+        origin: point(px(rect.x as f32), px(rect.y as f32)),
+        size: size(px(rect.width as f32), px(rect.height as f32)),
+    }
+}
+
+/// Decide the `WindowOptions.window_bounds` to open with from restored state
+/// (#225): clamp the persisted bounds against the live display topology, then
+/// carry the maximized flag through as the matching `WindowBounds` variant —
+/// `Maximized` wraps the *restore* bounds, mirroring how
+/// [`capture_window_state`] itself reads `window.window_bounds()`, so a
+/// maximized restart reopens maximized instead of at the un-maximized size.
+/// Called from `main.rs` before the window is created.
+pub fn initial_window_bounds(
+    state: &window_state::WindowState,
+    displays: &[window_state::Rect],
+) -> WindowBounds {
+    let bounds = gpui_bounds(window_state::clamp_bounds(state.bounds, displays));
+    if state.maximized {
+        WindowBounds::Maximized(bounds)
+    } else {
+        WindowBounds::Windowed(bounds)
     }
 }
 
@@ -822,6 +984,72 @@ mod tests {
     use gpui_component::dock::{DockPlacement, Panel};
     use gpui_component::WindowExt as _;
 
+    // --- window-state restore decision (#225) --------------------------------
+    // Headless: `initial_window_bounds` and the types it returns
+    // (`WindowBounds`/`Bounds<Pixels>`) are plain data, so these run as
+    // ordinary `#[test]`s — no GPUI test harness needed.
+
+    fn display(x: f64, y: f64, width: f64, height: f64) -> window_state::Rect {
+        window_state::Rect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn test_initial_window_bounds_windowed_state_restores_windowed() {
+        let state = window_state::WindowState {
+            maximized: false,
+            bounds: window_state::Rect {
+                x: 100.0,
+                y: 100.0,
+                width: 900.0,
+                height: 600.0,
+            },
+            ..window_state::WindowState::default()
+        };
+        let displays = [display(0.0, 0.0, 1920.0, 1080.0)];
+
+        let bounds = initial_window_bounds(&state, &displays);
+
+        assert!(matches!(bounds, WindowBounds::Windowed(_)));
+    }
+
+    #[test]
+    fn test_initial_window_bounds_maximized_state_restores_maximized() {
+        let state = window_state::WindowState {
+            maximized: true,
+            ..window_state::WindowState::default()
+        };
+        let displays = [display(0.0, 0.0, 1920.0, 1080.0)];
+
+        let bounds = initial_window_bounds(&state, &displays);
+
+        assert!(matches!(bounds, WindowBounds::Maximized(_)));
+    }
+
+    #[test]
+    fn test_initial_window_bounds_clamps_off_screen_state_onto_the_display() {
+        let state = window_state::WindowState {
+            maximized: false,
+            bounds: window_state::Rect {
+                x: -5000.0,
+                y: -5000.0,
+                width: 800.0,
+                height: 600.0,
+            },
+            ..window_state::WindowState::default()
+        };
+        let displays = [display(0.0, 0.0, 1920.0, 1080.0)];
+
+        let bounds = initial_window_bounds(&state, &displays).get_bounds();
+
+        assert!(f32::from(bounds.origin.x) >= 0.0);
+        assert!(f32::from(bounds.origin.y) >= 0.0);
+    }
+
     /// A `WorkspaceChannels` wired to throwaway flume endpoints — no daemon is
     /// attached in this test, only the dock's panel tree is under test.
     fn test_channels() -> WorkspaceChannels {
@@ -862,9 +1090,10 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace = Some(
-                    cx.new(|cx| WorkspaceView::new(session_view, test_channels(), window, cx)),
-                );
+                workspace =
+                    Some(cx.new(|cx| {
+                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
+                    }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap();
@@ -950,9 +1179,10 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace = Some(
-                    cx.new(|cx| WorkspaceView::new(session_view, test_channels(), window, cx)),
-                );
+                workspace =
+                    Some(cx.new(|cx| {
+                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
+                    }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -1000,9 +1230,10 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace = Some(
-                    cx.new(|cx| WorkspaceView::new(session_view, test_channels(), window, cx)),
-                );
+                workspace =
+                    Some(cx.new(|cx| {
+                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
+                    }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap();
@@ -1058,9 +1289,10 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace = Some(
-                    cx.new(|cx| WorkspaceView::new(session_view, test_channels(), window, cx)),
-                );
+                workspace =
+                    Some(cx.new(|cx| {
+                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
+                    }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap();
@@ -1139,7 +1371,7 @@ mod tests {
                 let view = cx.new(|cx| SessionView::new(cx).0);
                 session_view = Some(view.clone());
                 workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), window, cx)));
+                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap();
@@ -1168,9 +1400,10 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace = Some(
-                    cx.new(|cx| WorkspaceView::new(session_view, test_channels(), window, cx)),
-                );
+                workspace =
+                    Some(cx.new(|cx| {
+                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
+                    }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -1205,9 +1438,10 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace = Some(
-                    cx.new(|cx| WorkspaceView::new(session_view, test_channels(), window, cx)),
-                );
+                workspace =
+                    Some(cx.new(|cx| {
+                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
+                    }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -1243,9 +1477,10 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace = Some(
-                    cx.new(|cx| WorkspaceView::new(session_view, test_channels(), window, cx)),
-                );
+                workspace =
+                    Some(cx.new(|cx| {
+                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
+                    }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -1283,7 +1518,7 @@ mod tests {
                 let view = cx.new(|cx| SessionView::new(cx).0);
                 session_view = Some(view.clone());
                 workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), window, cx)));
+                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -1320,7 +1555,7 @@ mod tests {
                 let view = cx.new(|cx| SessionView::new(cx).0);
                 session_view = Some(view.clone());
                 workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), window, cx)));
+                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()

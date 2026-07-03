@@ -128,6 +128,14 @@ fn kill_pane_command(pane: &str) -> String {
     format!("kill-pane -t {}", pane)
 }
 
+/// Clamp a font size (px) to rift's supported zoom range. Shared by
+/// interactive zoom ([`SessionView::apply_font_zoom`]) and window-state
+/// restore ([`SessionView::seed_font_size`], #225), so a stale or
+/// hand-edited persisted value can never seed a degenerate size.
+fn clamp_font_size(font_size_px: f32) -> f32 {
+    font_size_px.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+}
+
 /// Precedence rank of a [`PaneActivity`] for the per-window aggregate:
 /// attention > busy > free.
 fn activity_rank(activity: PaneActivity) -> u8 {
@@ -170,6 +178,16 @@ fn activity_dot_color(activity: PaneActivity) -> Option<Hsla> {
         PaneActivity::Attention => Some(rgb(0xfab387).into()),
     }
 }
+
+/// Emitted for whole-client state that window-state persistence needs to
+/// observe but that lives inside `SessionView` (#225,
+/// `docs/spec-window-state-persistence.md`): today, only a font-size zoom.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SessionViewEvent {
+    FontSizeChanged { font_size_px: f32 },
+}
+
+impl EventEmitter<SessionViewEvent> for SessionView {}
 
 pub struct SessionView {
     panes: HashMap<String, PaneEntry>,
@@ -443,8 +461,9 @@ impl SessionView {
     /// `render` recomputes cols/rows and pushes the new client size to tmux,
     /// which reflows every pane.
     fn apply_font_zoom(&mut self, delta: i32, cx: &mut Context<Self>) {
-        let new_size = px((f32::from(self.font_size) + delta as f32 * FONT_SIZE_STEP)
-            .clamp(MIN_FONT_SIZE, MAX_FONT_SIZE));
+        let new_size = px(clamp_font_size(
+            f32::from(self.font_size) + delta as f32 * FONT_SIZE_STEP,
+        ));
         if new_size == self.font_size {
             return;
         }
@@ -455,7 +474,26 @@ impl SessionView {
                 cx.notify();
             });
         }
+        cx.emit(SessionViewEvent::FontSizeChanged {
+            font_size_px: f32::from(new_size),
+        });
         cx.notify();
+    }
+
+    /// The current whole-client font size in px (window-state capture, #225,
+    /// `docs/spec-window-state-persistence.md`).
+    pub fn font_size_px(&self) -> f32 {
+        f32::from(self.font_size)
+    }
+
+    /// Seed the whole-client font size before any panes exist (window-state
+    /// restore, #225) — call once at startup, before the first tmux snapshot
+    /// creates panes, so every pane picks up the restored size from
+    /// [`Self::apply_snapshot`]'s own `self.font_size` read. Clamped like an
+    /// interactive zoom, so a stale or hand-edited state file can never seed
+    /// a degenerate size.
+    pub fn seed_font_size(&mut self, font_size_px: f32) {
+        self.font_size = px(clamp_font_size(font_size_px));
     }
 
     /// Apply a refreshed `list-keys`/`show-options` reply: re-parse into the
@@ -1386,8 +1424,9 @@ impl Render for SessionView {
 #[cfg(test)]
 mod tests {
     use super::{
-        activity_dot_color, aggregate_activity, kill_pane_command, quote_tmux_name,
-        resize_direction, select_pane_command, split_command, PaneActivity,
+        activity_dot_color, aggregate_activity, clamp_font_size, kill_pane_command,
+        quote_tmux_name, resize_direction, select_pane_command, split_command, PaneActivity,
+        MAX_FONT_SIZE, MIN_FONT_SIZE,
     };
     use gpui::rgb;
 
@@ -1511,5 +1550,16 @@ mod tests {
         assert_eq!(busy, Some(rgb(0xa6e3a1).into()));
         assert_eq!(attention, Some(rgb(0xfab387).into()));
         assert_ne!(busy, attention);
+    }
+
+    #[test]
+    fn test_clamp_font_size_leaves_in_range_values_unchanged() {
+        assert_eq!(clamp_font_size(14.0), 14.0);
+    }
+
+    #[test]
+    fn test_clamp_font_size_clamps_to_the_supported_range() {
+        assert_eq!(clamp_font_size(MIN_FONT_SIZE - 5.0), MIN_FONT_SIZE);
+        assert_eq!(clamp_font_size(MAX_FONT_SIZE + 5.0), MAX_FONT_SIZE);
     }
 }
