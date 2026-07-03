@@ -182,6 +182,22 @@ fn main() {
         cx.bind_keys(
             (1..=9usize).map(|n| KeyBinding::new(&format!("alt-{n}"), SelectWindow(n), None)),
         );
+        // Command palette (#359, `docs/spec-command-palette.md`): Ctrl+Shift+P /
+        // Cmd+Shift+P opens the palette. Unscoped (`None`), like `SelectWindow`
+        // above, so it reaches the shortcut regardless of which surface is
+        // focused, including the terminal.
+        cx.bind_keys([
+            KeyBinding::new(
+                "ctrl-shift-p",
+                rift_app::command_palette::OpenCommandPalette,
+                None,
+            ),
+            KeyBinding::new(
+                "cmd-shift-p",
+                rift_app::command_palette::OpenCommandPalette,
+                None,
+            ),
+        ]);
         // gpui-component's `Root` view binds `tab`/`shift-tab` to focus navigation
         // in the "Root" context. Root is an ancestor of every pane, so that action
         // consumes the keystroke before it reaches the pane's `on_key_down`, and the
