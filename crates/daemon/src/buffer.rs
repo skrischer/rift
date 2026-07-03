@@ -270,7 +270,12 @@ fn temp_path(target: &Path) -> PathBuf {
 /// `root` is assumed already canonicalized (it is `Snapshot::root()`); the
 /// confinement compares canonical prefixes, so a symlinked root is handled
 /// consistently.
-fn resolve(root: &Path, rel_path: &str) -> Result<PathBuf, BufferError> {
+///
+/// `pub(crate)` beyond this module: the diff service ([`crate::diff`]) reuses
+/// it to confine a `RequestDiff` path exactly as a buffer write is confined —
+/// the diff channel has no out-of-root carve-out, so the plain (non-read)
+/// resolver is the right one to share.
+pub(crate) fn resolve(root: &Path, rel_path: &str) -> Result<PathBuf, BufferError> {
     let rel = Path::new(rel_path);
     let escape = || BufferError::PathEscape(rel_path.to_owned());
 
