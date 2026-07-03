@@ -55,19 +55,21 @@
 
 use flume::{Receiver, Sender};
 use gpui::{
-    div, px, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, Styled as _, Window,
+    div, px, AppContext as _, Axis, Context, Entity, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _, Window,
 };
 use gpui_component::dock::{DockArea, DockItem, DockPlacement};
-use gpui_component::ActiveTheme as _;
+use gpui_component::{ActiveTheme as _, Root};
 use rift_protocol::{ClientMessage, DaemonMessage};
 use rift_terminal::SessionView;
 use tracing::debug;
 
+use crate::command_palette::{CommandPalette, OpenCommandPalette};
+use crate::diff_view::DiffView;
 use crate::editor::EditorView;
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::problems_panel::{ProblemsPanel, ProblemsPanelEvent};
-use crate::source_control::SourceControlPanel;
+use crate::source_control::{SourceControlEvent, SourceControlPanel};
 use crate::status_bar;
 use crate::terminal_panel::TerminalPanel;
 
@@ -121,6 +123,11 @@ const RIGHT_DOCK_WIDTH: f32 = 240.0;
 /// Initial height of the (collapsed) bottom dock.
 const BOTTOM_DOCK_HEIGHT: f32 = 200.0;
 
+/// Initial height of the source-control panel within the right dock's
+/// top/bottom split (#338) — a compact changed-file list, leaving the
+/// remaining right-dock height to the diff view below it.
+const SOURCE_CONTROL_SPLIT_HEIGHT: f32 = 180.0;
+
 /// The flume endpoints the workspace consumes to bridge the daemon stream (run
 /// by the tokio side) onto its GPUI surfaces, plus the request endpoints it emits
 /// `OpenFile` / `SaveFile` on. Handed in at construction so `main.rs` owns the
@@ -135,6 +142,11 @@ pub struct WorkspaceChannels {
     /// Nav replies to route to the editor: `DefinitionResponse` (#196),
     /// `HoverResponse` (#197), `ReferencesResponse` (#198).
     pub nav_rx: Receiver<DaemonMessage>,
+    /// `StatusLineReply` replies to fold into the mirrored tmux status line's
+    /// render model (#221, `docs/spec-tmux-statusline-mirroring.md`).
+    pub status_line_rx: Receiver<DaemonMessage>,
+    /// `FileDiff` replies to route to the diff view (#338).
+    pub diff_rx: Receiver<DaemonMessage>,
     /// Read requests: the root-relative path of a file to open. The tokio side
     /// turns each into a `ClientMessage::OpenFile`.
     pub open_file_tx: Sender<String>,
@@ -147,6 +159,9 @@ pub struct WorkspaceChannels {
     pub buffer_change_tx: Sender<ClientMessage>,
     /// Navigation requests: `DefinitionRequest` (#196).
     pub nav_tx: Sender<ClientMessage>,
+    /// Diff pull requests: the root-relative path of a changed file to diff
+    /// (#338). The tokio side turns each into a `ClientMessage::RequestDiff`.
+    pub request_diff_tx: Sender<String>,
 }
 
 /// The composed app root.
@@ -166,17 +181,37 @@ pub struct WorkspaceView {
     // `--all-targets` build.
     #[allow(dead_code)]
     problems_panel: Entity<ProblemsPanel>,
+    /// Which status-bar render mode is active (#221): resolved once at
+    /// startup from `RIFT_STATUSLINE_MIRROR` and never changed at runtime —
+    /// the spec's v1 opt-in toggle, mutually exclusive with the native fields.
+    status_bar_mode: status_bar::StatusBarMode,
+    /// The mirrored tmux status line's current render model (#221), folded
+    /// from the daemon's `StatusLineReply` stream. Read only when
+    /// `status_bar_mode` is `Mirrored`; kept at its default (empty, no
+    /// leftover state) otherwise.
+    mirrored_status_line: status_bar::MirroredStatusLine,
+    /// The diff view (`docs/spec-source-control.md`, #338): renders the
+    /// `FileDiff` streamed for the source-control panel's selection. Kept as
+    /// its own field for the same reason as `problems_panel` above; the
+    /// open-diff subscription below reaches it through this field.
+    #[allow(dead_code)]
+    diff_view: Entity<DiffView>,
     /// Read-request sender: a tree open turns into a path on this channel, which
     /// the tokio side emits as `ClientMessage::OpenFile`.
     open_file_tx: Sender<String>,
     /// The dock shell (`docs/spec-ide-shell.md`, issue #324): explorer in the
-    /// left dock, editor|terminal split in the center, source control in the
-    /// (collapsed by default) right dock, problems panel in the (collapsed by
-    /// default) bottom dock. Holds its own strong references to the panel
-    /// entities; this view keeps its own handles too (`file_tree`, `editor`,
-    /// `problems_panel` above) so the daemon-stream bridges keep working
-    /// unchanged after the layout refactor.
+    /// left dock, editor|terminal split in the center, source control + diff
+    /// view (#338) split in the (collapsed by default) right dock, problems
+    /// panel in the (collapsed by default) bottom dock. Holds its own strong
+    /// references to the panel entities; this view keeps its own handles too
+    /// (`file_tree`, `editor`, `problems_panel`, `diff_view` above) so the
+    /// daemon-stream bridges keep working unchanged after the layout refactor.
     dock_area: Entity<DockArea>,
+    /// The command palette (`docs/spec-command-palette.md`, issue #359): owns
+    /// its `ListState` entity for the workspace's lifetime, so reopening it
+    /// (`Ctrl+Shift+P` / `Cmd+Shift+P`) reuses the same list rather than
+    /// rebuilding the registry each time.
+    command_palette: CommandPalette,
 }
 
 impl WorkspaceView {
@@ -194,10 +229,13 @@ impl WorkspaceView {
             worktree_rx,
             buffer_rx,
             nav_rx,
+            status_line_rx,
+            diff_rx,
             open_file_tx,
             save_file_tx,
             buffer_change_tx,
             nav_tx,
+            request_diff_tx,
         } = channels;
 
         let file_tree = cx.new(|_| FileTree::new());
@@ -368,10 +406,71 @@ impl WorkspaceView {
             .detach();
         }
 
+        // Mirrored status line stream -> render model (#221): each
+        // `StatusLineReply` rebuilds the parsed left/right runs and the
+        // resolved base style, then a notify repaints the status bar (folded
+        // regardless of `status_bar_mode`, mirroring the nav/buffer loops
+        // above — the render branch, not this fold, is what makes the two
+        // modes exclusive). Routed through this view's weak handle so a
+        // closed window ends the loop gracefully.
+        {
+            cx.spawn(async move |this, cx| loop {
+                let Ok(msg) = status_line_rx.recv_async().await else {
+                    break;
+                };
+                let result = this.update(cx, |view, cx| {
+                    let DaemonMessage::StatusLineReply {
+                        options,
+                        status_left,
+                        status_right,
+                    } = msg
+                    else {
+                        return;
+                    };
+                    view.mirrored_status_line = status_bar::build_mirrored_status_line(
+                        &options,
+                        &status_left,
+                        &status_right,
+                    );
+                    cx.notify();
+                });
+                if result.is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
+
+        // Diff reply stream -> diff view (#338): `FileDiff` routes to
+        // `apply_file_diff`, which drops a reply for a path no longer open (the
+        // user moved on before it arrived). Routed through this view's weak
+        // handle so a closed window ends the loop gracefully, mirroring the nav
+        // reply bridge above.
+        {
+            cx.spawn_in(window, async move |this, cx| loop {
+                let Ok(msg) = diff_rx.recv_async().await else {
+                    break;
+                };
+                let result = this.update_in(cx, |view, _window, cx| {
+                    let DaemonMessage::FileDiff { path, diff } = msg else {
+                        return;
+                    };
+                    view.diff_view.update(cx, |diff_view, cx| {
+                        diff_view.apply_file_diff(path, diff, cx);
+                    });
+                });
+                if result.is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
+
         // Dock shell (`docs/spec-ide-shell.md`, issue #324): explorer (left) +
-        // editor|terminal (center split) + source control (right, #337) +
-        // problems panel (bottom, #342). Built after the daemon-stream
-        // bridges above so the panel entities they close over already exist.
+        // editor|terminal (center split) + source control + diff view split
+        // (right, #337, #338) + problems panel (bottom, #342). Built after the
+        // daemon-stream bridges above so the panel entities they close over
+        // already exist.
         let dock_area = cx.new(|cx| DockArea::new("rift-dock", Some(1), window, cx));
         let weak_dock_area = dock_area.downgrade();
 
@@ -380,7 +479,25 @@ impl WorkspaceView {
         // git status — the existing client git-status model, not a re-derived
         // copy (`docs/spec-source-control.md`).
         let source_control = cx.new(|cx| SourceControlPanel::new(file_tree.clone(), cx));
+        let diff_view = cx.new(|cx| DiffView::new(request_diff_tx, cx));
         let problems_panel = cx.new(|cx| ProblemsPanel::new(file_tree.clone(), cx));
+
+        // Open-diff wiring (#338): selecting a changed file in the
+        // source-control panel opens its diff in the diff view — the clean
+        // signal the panel emits (`SourceControlEvent::OpenDiff`), routed here
+        // so the diff view issues the `RequestDiff` and renders the reply.
+        // Mirrors the file tree's `OpenFile` subscription above.
+        cx.subscribe_in(
+            &source_control,
+            window,
+            |this, _panel, event: &SourceControlEvent, _window, cx| {
+                let SourceControlEvent::OpenDiff { path } = event;
+                this.diff_view.update(cx, |diff_view, cx| {
+                    diff_view.open_diff(path.clone(), cx);
+                });
+            },
+        )
+        .detach();
 
         // Jump-to-location (#343): selecting a diagnostic emits `OpenLocation`,
         // routed to the editor's thin `open_at_range` wrapper around the same
@@ -411,8 +528,22 @@ impl WorkspaceView {
             cx,
         );
         // Both real, collapsed docks (not placeholder views) — a single-tab
-        // `TabPanel`, collapsed by default until the user opens it.
-        let right_item = DockItem::tab(source_control, &weak_dock_area, window, cx);
+        // `TabPanel`, collapsed by default until the user opens it. The right
+        // dock is a vertical split (#338): the changed-file list stays compact
+        // on top, the diff view takes the remaining height below it — both
+        // signal panels visible together, matching the review flow (select a
+        // file, read its diff, without switching tabs).
+        let right_item = DockItem::split_with_sizes(
+            Axis::Vertical,
+            vec![
+                DockItem::tab(source_control, &weak_dock_area, window, cx),
+                DockItem::tab(diff_view.clone(), &weak_dock_area, window, cx),
+            ],
+            vec![Some(px(SOURCE_CONTROL_SPLIT_HEIGHT)), None],
+            &weak_dock_area,
+            window,
+            cx,
+        );
         let bottom_item = DockItem::tab(problems_panel.clone(), &weak_dock_area, window, cx);
 
         dock_area.update(cx, |dock, cx| {
@@ -422,13 +553,19 @@ impl WorkspaceView {
             dock.set_bottom_dock(bottom_item, Some(px(BOTTOM_DOCK_HEIGHT)), false, window, cx);
         });
 
+        let command_palette = CommandPalette::new(window, cx);
+
         Self {
             file_tree,
             editor,
             session_view,
             problems_panel,
+            status_bar_mode: status_bar::StatusBarMode::from_env(),
+            mirrored_status_line: status_bar::MirroredStatusLine::default(),
+            diff_view,
             open_file_tx,
             dock_area,
+            command_palette,
         }
     }
 
@@ -546,6 +683,11 @@ impl WorkspaceView {
     fn zoom_active_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.dispatch_action(Box::new(gpui_component::dock::ToggleZoom), cx);
     }
+
+    /// Open the command palette (issue #359) as a `Root` dialog.
+    fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.command_palette.open(window, cx);
+    }
 }
 
 /// Fold one worktree-family daemon message into the file tree's model. Only the
@@ -597,7 +739,7 @@ impl Focusable for WorkspaceView {
 }
 
 impl Render for WorkspaceView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The dock shell fills the window under the current OS chrome; the
         // `flex_col` mirrors `examples/dock.rs` at the pinned gpui-component rev.
         // The status bar (#347, #348, `docs/spec-status-bar.md`) is a plain
@@ -609,13 +751,36 @@ impl Render for WorkspaceView {
         // workspace root, rather than scoped to a key context: they are
         // global commands the command palette dispatches regardless of which
         // panel currently has focus.
-        let model = self.file_tree.read(cx).model();
-        let status_bar = status_bar::render(
-            model.branch(),
-            model.ahead_behind(),
-            model.all_diagnostics(),
-            cx,
-        );
+        //
+        // Render mode (#221, `docs/spec-tmux-statusline-mirroring.md`): the
+        // native fields and the mirrored tmux status line are mutually
+        // exclusive branches, never composed. `status_bar_mode` is fixed for
+        // the process's lifetime (resolved once from an env var at
+        // construction), so this never toggles mid-session.
+        let status_bar = match self.status_bar_mode {
+            status_bar::StatusBarMode::Native => {
+                let model = self.file_tree.read(cx).model();
+                status_bar::render(
+                    model.branch(),
+                    model.ahead_behind(),
+                    model.all_diagnostics(),
+                    cx,
+                )
+                .into_any_element()
+            }
+            status_bar::StatusBarMode::Mirrored => {
+                status_bar::render_mirrored(&self.mirrored_status_line, cx).into_any_element()
+            }
+        };
+
+        // `Root`'s overlay layers (issue #359, `docs/spec-command-palette.md`):
+        // only the gallery rendered these before this issue, so no modal —
+        // including the command palette below — ever appeared in the shipped
+        // app. Read here, at the workspace root, mirroring `examples/dock.rs`
+        // at the pinned gpui-component rev.
+        let sheet_layer = Root::render_sheet_layer(window, cx);
+        let dialog_layer = Root::render_dialog_layer(window, cx);
+        let notification_layer = Root::render_notification_layer(window, cx);
 
         div()
             .flex()
@@ -637,8 +802,14 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &ZoomActivePanel, window, cx| {
                 this.zoom_active_panel(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
+                this.open_command_palette(window, cx);
+            }))
             .child(self.dock_area.clone())
             .child(status_bar)
+            .children(sheet_layer)
+            .children(dialog_layer)
+            .children(notification_layer)
     }
 }
 
@@ -649,7 +820,7 @@ mod tests {
     use super::*;
     use gpui::{Axis, TestAppContext};
     use gpui_component::dock::{DockPlacement, Panel};
-    use gpui_component::Root;
+    use gpui_component::WindowExt as _;
 
     /// A `WorkspaceChannels` wired to throwaway flume endpoints — no daemon is
     /// attached in this test, only the dock's panel tree is under test.
@@ -657,18 +828,24 @@ mod tests {
         let (_worktree_tx, worktree_rx) = flume::unbounded();
         let (_buffer_tx, buffer_rx) = flume::unbounded();
         let (_nav_reply_tx, nav_rx) = flume::unbounded();
+        let (_status_line_tx, status_line_rx) = flume::unbounded();
+        let (_diff_reply_tx, diff_rx) = flume::unbounded();
         let (open_file_tx, _open_file_rx) = flume::unbounded();
         let (save_file_tx, _save_file_rx) = flume::unbounded();
         let (buffer_change_tx, _buffer_change_rx) = flume::unbounded();
         let (nav_tx, _nav_request_rx) = flume::unbounded();
+        let (request_diff_tx, _request_diff_rx) = flume::unbounded();
         WorkspaceChannels {
             worktree_rx,
             buffer_rx,
             nav_rx,
+            status_line_rx,
+            diff_rx,
             open_file_tx,
             save_file_tx,
             buffer_change_tx,
             nav_tx,
+            request_diff_tx,
         }
     }
 
@@ -710,15 +887,36 @@ mod tests {
                 "right dock starts collapsed"
             );
             match right_dock.read(cx).panel() {
-                DockItem::Tabs { items, .. } => {
-                    assert_eq!(items.len(), 1, "right dock holds the source-control panel");
+                DockItem::Split { axis, items, .. } => {
                     assert_eq!(
-                        items[0].panel_name(cx),
-                        crate::source_control::SOURCE_CONTROL_PANEL_NAME,
-                        "right dock's sole tab is the source-control panel"
+                        *axis,
+                        Axis::Vertical,
+                        "source-control/diff split is vertical (#338)"
                     );
+                    assert_eq!(
+                        items.len(),
+                        2,
+                        "right dock holds source-control + diff view"
+                    );
+
+                    match &items[0] {
+                        DockItem::Tabs { items, .. } => assert_eq!(
+                            items[0].panel_name(cx),
+                            crate::source_control::SOURCE_CONTROL_PANEL_NAME,
+                            "right dock's top split is the source-control panel"
+                        ),
+                        other => panic!("expected a tabs item, got {other:?}"),
+                    }
+                    match &items[1] {
+                        DockItem::Tabs { items, .. } => assert_eq!(
+                            items[0].panel_name(cx),
+                            crate::diff_view::DIFF_VIEW_PANEL_NAME,
+                            "right dock's bottom split is the diff view"
+                        ),
+                        other => panic!("expected a tabs item, got {other:?}"),
+                    }
                 }
-                other => panic!("expected the right dock to hold a tabs item, got {other:?}"),
+                other => panic!("expected the right dock to hold a split, got {other:?}"),
             }
 
             assert!(dock_area.bottom_dock().is_some(), "bottom dock must exist");
@@ -1105,5 +1303,68 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    /// Command palette (`docs/spec-command-palette.md`, issue #359): opening
+    /// sets an active `Root` dialog (the modal wired via `render_dialog_layer`
+    /// actually appears) and closing it clears that state, without disturbing
+    /// the workspace's own focus delegation to the terminal — "dismissing the
+    /// palette leaves terminal/editor state untouched" from the spec.
+    #[gpui::test]
+    fn test_open_command_palette_opens_a_dialog_and_close_clears_it(cx: &mut TestAppContext) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let mut session_view: Option<Entity<SessionView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let view = cx.new(|cx| SessionView::new(cx).0);
+                session_view = Some(view.clone());
+                workspace =
+                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), window, cx)));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+        let session_view =
+            session_view.expect("session view constructed inside the window callback");
+
+        // `window.update` (`WindowHandle<Root>::update`) itself leases the
+        // `Root` entity for the closure's duration — but `has_active_dialog` /
+        // `open_dialog` / `close_dialog` all read or update that same `Root`
+        // entity internally, which double-leases and panics. `update_window`
+        // (`AppContext`, imported above via `super::*`) hands back the raw
+        // window state without leasing `Root`, so those calls nest safely.
+        cx.update_window(window.into(), |_, window, cx| {
+            assert!(
+                !window.has_active_dialog(cx),
+                "no dialog is open before the shortcut fires"
+            );
+
+            workspace.update(cx, |view, cx| {
+                view.open_command_palette(window, cx);
+            });
+            assert!(
+                window.has_active_dialog(cx),
+                "OpenCommandPalette opens a Root dialog"
+            );
+            assert_eq!(
+                workspace.read(cx).focus_handle(cx),
+                session_view.read(cx).focus_handle(cx),
+                "opening the palette does not move the workspace's terminal focus delegation"
+            );
+
+            window.close_dialog(cx);
+            assert!(
+                !window.has_active_dialog(cx),
+                "closing the dialog clears the active-dialog state"
+            );
+            assert_eq!(
+                workspace.read(cx).focus_handle(cx),
+                session_view.read(cx).focus_handle(cx),
+                "dismissing the palette leaves the terminal focus delegation untouched"
+            );
+        })
+        .unwrap();
     }
 }
