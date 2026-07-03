@@ -199,12 +199,13 @@ impl WorkspaceView {
                         apply_worktree_message(tree, msg);
                         cx.notify();
                     });
-                    // Status bar (#347): a `RepoState` fold changes the branch /
-                    // ahead-behind segment the status bar reads inline in
+                    // Status bar (#347, #348): a `RepoState` fold changes the
+                    // branch/ahead-behind segment and a `Diagnostics` fold changes
+                    // the error/warning counts segment, both read inline in
                     // `WorkspaceView::render`, so the workspace view itself must
                     // notify too — the file tree's own notify above only repaints
                     // the tree.
-                    if is_repo_state {
+                    if is_repo_state || is_diagnostics {
                         cx.notify();
                     }
                     // Concurrent-write signal (#188): after folding the structure
@@ -460,12 +461,17 @@ impl Render for WorkspaceView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The dock shell fills the window under the current OS chrome; the
         // `flex_col` mirrors `examples/dock.rs` at the pinned gpui-component rev.
-        // The status bar (#347, `docs/spec-status-bar.md`) is a plain `flex_col`
-        // sibling below the dock — bottom chrome, not a dock `Panel` — reading
-        // the file tree's mirrored `WorktreeModel` inline (repainted by the
-        // `RepoState`-fold `cx.notify()` above).
+        // The status bar (#347, #348, `docs/spec-status-bar.md`) is a plain
+        // `flex_col` sibling below the dock — bottom chrome, not a dock `Panel` —
+        // reading the file tree's mirrored `WorktreeModel` inline (repainted by
+        // the `RepoState`/`Diagnostics`-fold `cx.notify()` above).
         let model = self.file_tree.read(cx).model();
-        let status_bar = status_bar::render(model.branch(), model.ahead_behind(), cx);
+        let status_bar = status_bar::render(
+            model.branch(),
+            model.ahead_behind(),
+            model.all_diagnostics(),
+            cx,
+        );
 
         div()
             .flex()
