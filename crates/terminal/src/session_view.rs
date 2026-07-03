@@ -8,12 +8,12 @@ use gpui_component::{h_flex, v_flex, ActiveTheme, Sizable};
 use termy_terminal_ui::TmuxSnapshot;
 use tracing::debug;
 
-use crate::keytable::{KeyTable, PrefixOptions};
+use crate::keytable::{self, KeyTable, PrefixOptions};
 use crate::layout::{self, LayoutNode};
 use crate::pane_view::{measure_cell_size, statusbar_height, PaneView};
 use crate::{
-    CaptureRequest, CaptureResult, ConnectionStatus, PaneInput, PaneOutput, SelectWindow,
-    SubscriptionUpdate, TermSize,
+    CaptureRequest, CaptureResult, ConnectionStatus, KeyTableQueryResult, PaneInput, PaneOutput,
+    SelectWindow, SubscriptionUpdate, TermSize,
 };
 
 const DEFAULT_FONT_SIZE: f32 = 14.0;
@@ -35,6 +35,14 @@ pub struct TerminalHandle {
     pub capture_request_rx: flume::Receiver<CaptureRequest>,
     pub capture_result_tx: flume::Sender<CaptureResult>,
     pub connection_status_tx: flume::Sender<ConnectionStatus>,
+    /// An explicit key-table refresh request from the statusbar affordance —
+    /// forwarded onto the protocol as `ClientMessage::QueryKeyTable`. A
+    /// dispatched binding-mutating command's refresh is issued server-side
+    /// instead (`spawn_command_bridge` in `crates/app`), not carried here.
+    pub key_table_request_rx: flume::Receiver<()>,
+    /// The parsed-ready `list-keys`/`show-options` reply for a refresh request
+    /// (including the daemon's own unprompted attach-time query).
+    pub key_table_result_tx: flume::Sender<KeyTableQueryResult>,
 }
 
 struct PaneEntry {
@@ -129,11 +137,18 @@ pub struct SessionView {
     working_directory: Option<String>,
     connection_status: ConnectionStatus,
     /// The mirrored tmux key-table lookup and prefix/repeat options, pushed
-    /// down to every pane. Default (empty table, stock `C-b` prefix) until a
-    /// later issue wires the live `list-keys`/`show-options` refresh
-    /// (`docs/spec-tmux-keytable-mirroring.md`).
+    /// down to every pane and refreshed in place via
+    /// [`Self::apply_key_table_result`] (`docs/spec-tmux-keytable-mirroring.md`).
+    /// Default (empty table, stock `C-b` prefix) until the first reply lands —
+    /// the daemon issues that query unprompted on attach.
     key_table: Arc<KeyTable>,
     prefix_options: PrefixOptions,
+    /// Requests a key-table refresh (forwarded to `TerminalHandle`'s
+    /// `key_table_request_rx`), driven by the statusbar's explicit refresh
+    /// affordance. A dispatched binding-mutating command's refresh is issued
+    /// server-side instead, ordered after the mutation on the same seam
+    /// (`spawn_command_bridge` in `crates/app`) — not carried on this channel.
+    key_table_request_tx: flume::Sender<()>,
 }
 
 impl SessionView {
@@ -148,6 +163,8 @@ impl SessionView {
         let (capture_result_tx, capture_result_rx) = flume::unbounded::<CaptureResult>();
         let (connection_status_tx, connection_status_rx) = flume::unbounded::<ConnectionStatus>();
         let (font_zoom_tx, font_zoom_rx) = flume::unbounded::<i32>();
+        let (key_table_request_tx, key_table_request_rx) = flume::unbounded::<()>();
+        let (key_table_result_tx, key_table_result_rx) = flume::unbounded::<KeyTableQueryResult>();
 
         {
             cx.spawn(async move |this, cx| loop {
@@ -276,6 +293,23 @@ impl SessionView {
             .detach();
         }
 
+        {
+            cx.spawn(async move |this, cx| loop {
+                let Ok(result) = key_table_result_rx.recv_async().await else {
+                    break;
+                };
+                let updated = cx.update(|cx| {
+                    this.update(cx, |view, cx| {
+                        view.apply_key_table_result(result, cx);
+                    })
+                });
+                if updated.is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
+
         let ssh_user = std::env::var("RIFT_SSH_USER").unwrap_or_default();
         let ssh_host = std::env::var("RIFT_SSH_HOST").unwrap_or_else(|_| "localhost".into());
         let ssh_label: SharedString = if ssh_user.is_empty() {
@@ -307,6 +341,7 @@ impl SessionView {
             connection_status: ConnectionStatus::Connecting,
             key_table: Arc::new(KeyTable::default()),
             prefix_options: PrefixOptions::default(),
+            key_table_request_tx,
         };
 
         let handle = TerminalHandle {
@@ -319,6 +354,8 @@ impl SessionView {
             capture_request_rx,
             capture_result_tx,
             connection_status_tx,
+            key_table_request_rx,
+            key_table_result_tx,
         };
 
         (view, handle)
@@ -338,6 +375,24 @@ impl SessionView {
         for entry in self.panes.values() {
             entry.entity.update(cx, |pane, cx| {
                 pane.set_font_size(new_size);
+                cx.notify();
+            });
+        }
+        cx.notify();
+    }
+
+    /// Apply a refreshed `list-keys`/`show-options` reply: re-parse into the
+    /// mirrored `KeyTable`/`PrefixOptions` and push the result down to every
+    /// live pane (`apply_snapshot` only seeds new panes at creation — an
+    /// already-open pane needs this to pick up a later refresh).
+    fn apply_key_table_result(&mut self, result: KeyTableQueryResult, cx: &mut Context<Self>) {
+        let key_table = Arc::new(keytable::parse_list_keys(&result.list_keys));
+        let prefix_options = keytable::parse_options(&result.options);
+        self.key_table = key_table.clone();
+        self.prefix_options = prefix_options.clone();
+        for entry in self.panes.values() {
+            entry.entity.update(cx, |pane, cx| {
+                pane.set_key_table(key_table.clone(), prefix_options.clone());
                 cx.notify();
             });
         }
@@ -1057,6 +1112,23 @@ impl Render for SessionView {
                     // idle — see `crate::prefix`).
                     .children(
                         prefix_pending.then(|| div().text_color(rgb(0xf9e2af)).child("PREFIX")),
+                    )
+                    // Explicit key-table refresh trigger (tmux key-table
+                    // mirroring): re-queries `list-keys`/`show-options` on
+                    // click — the manual escape hatch alongside the automatic
+                    // attach and binding-mutating-dispatch triggers.
+                    .child(
+                        div()
+                            .id("refresh-key-table")
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(new_hover))
+                            .child("refresh keys")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _event: &MouseDownEvent, _window, _cx| {
+                                    let _ = this.key_table_request_tx.try_send(());
+                                }),
+                            ),
                     )
                     .children((!command.is_empty()).then(|| SharedString::from(command.clone())))
                     .child(SharedString::from(size_label)),

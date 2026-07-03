@@ -8,8 +8,8 @@ pub mod prefix;
 mod session_view;
 
 pub use keytable::{
-    keystroke_to_tmux_key, normalize_tmux_key, parse_list_keys, parse_options, Binding, KeyTable,
-    PrefixOptions,
+    classify_command, keystroke_to_tmux_key, normalize_tmux_key, parse_list_keys, parse_options,
+    Binding, DispatchDecision, KeyTable, PrefixOptions,
 };
 pub use pane_view::PaneView;
 pub use session_view::{SessionView, TerminalHandle};
@@ -52,6 +52,17 @@ pub struct CaptureRequest {
 pub struct CaptureResult {
     pub pane_id: String,
     pub bytes: Vec<u8>,
+}
+
+/// The reply to a key-table refresh request: the raw `list-keys` and
+/// `show-options` output (newline-joined text, as carried by
+/// [`rift_protocol::DaemonMessage::KeyTableReply`]), routed to `SessionView` to
+/// parse with [`keytable::parse_list_keys`]/[`keytable::parse_options`] and
+/// rebuild the mirrored key-table lookup
+/// (`docs/spec-tmux-keytable-mirroring.md`).
+pub struct KeyTableQueryResult {
+    pub list_keys: String,
+    pub options: String,
 }
 
 /// A tmux format-subscription update (`%subscription-changed`). `name` is the

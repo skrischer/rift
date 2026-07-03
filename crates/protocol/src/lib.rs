@@ -55,6 +55,16 @@ pub enum ClientMessage {
         end: String,
         join: bool,
     },
+    /// Ask the daemon to (re-)query `list-keys` and `show-options` for the
+    /// mirrored tmux key-table lookup (`docs/spec-tmux-keytable-mirroring.md`).
+    /// The daemon answers with exactly one [`DaemonMessage::KeyTableReply`].
+    /// Sent automatically by the daemon's own attach (no client request
+    /// needed there — mirroring how the layout query is issued unprompted);
+    /// the client sends this explicitly to refresh on an explicit user
+    /// trigger, or after dispatching a binding-mutating bound command
+    /// (`bind-key`/`unbind-key`/`source-file`, or `set-option` touching
+    /// `prefix`/`prefix2`/`repeat-time`).
+    QueryKeyTable,
     /// Read request on the buffer channel: pull the current content of the file
     /// at `path` (relative to the worktree root, the same key space as
     /// [`WorktreeEntry::path`]). The daemon answers with exactly one
@@ -191,6 +201,18 @@ pub enum DaemonMessage {
     PaneCapture {
         pane_id: u32,
         bytes: Vec<u8>,
+    },
+    /// The reply to a [`ClientMessage::QueryKeyTable`]: the raw `list-keys` and
+    /// `show-options` output (newline-joined, tmux-decoded — the control-mode
+    /// decode already run by the daemon's command-reply path), for the client
+    /// to parse with `rift_terminal::keytable::{parse_list_keys, parse_options}`
+    /// into the mirrored key-table lookup. The daemon never interprets this
+    /// text itself — it is tmux's own config, not pane content. Sent once per
+    /// attach (issued unprompted by the daemon's `Attach`, mirroring the
+    /// layout query) and again for every later [`ClientMessage::QueryKeyTable`].
+    KeyTableReply {
+        list_keys: String,
+        options: String,
     },
     /// The complete window/pane layout for `session`, sent once per attach as the
     /// baseline of the consistency contract (see the type-level docs). The client
