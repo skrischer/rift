@@ -2125,6 +2125,7 @@ mod tests {
 
     // --- stale positional index across close_tab (PR #401 review) ---
 
+    #[allow(clippy::type_complexity)] // test-only bundle of the editor's channel senders/receiver
     fn test_channels() -> (
         Sender<String>,
         Sender<ClientMessage>,
