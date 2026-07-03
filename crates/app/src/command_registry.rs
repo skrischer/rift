@@ -1,9 +1,10 @@
 //! The command palette's registry (`docs/spec-command-palette.md`): a single,
 //! curated list mapping a human display name (and, where bound, a keybinding
 //! hint) to a dispatchable parameterless action. Seeded with rift's existing
-//! editor/nav actions (`crate::editor`) and the shell command actions Phase 16
-//! defines (`crate::workspace`); argument-taking actions like the terminal's
-//! `SelectWindow(usize)` are deliberately excluded.
+//! editor/nav actions (`crate::editor`), the shell command actions Phase 16
+//! defines (`crate::workspace`), and the Phase 17 theme commands (`crate`,
+//! `docs/spec-theme-settings.md`, issue #367); argument-taking actions like
+//! the terminal's `SelectWindow(usize)` are deliberately excluded.
 //!
 //! Curated, not auto-discovered (constitution: no premature abstraction) —
 //! a new command is added here, one entry at a time, not by scattering
@@ -14,6 +15,9 @@ use gpui::Action;
 use crate::editor::{FindReferences, GoToDefinition, Save, ShowHover};
 use crate::workspace::{
     FocusTerminal, ToggleExplorer, ToggleProblems, ToggleSourceControl, ZoomActivePanel,
+};
+use crate::{
+    SelectCatppuccinMochaTheme, SelectDefaultDarkTheme, SelectDefaultLightTheme, ToggleThemeMode,
 };
 
 /// One command palette entry: a unique display name, an optional keybinding
@@ -61,6 +65,18 @@ pub const COMMANDS: &[Command] = &[
     }),
     Command::new("Focus Terminal", None, || Box::new(FocusTerminal)),
     Command::new("Zoom Active Panel", None, || Box::new(ZoomActivePanel)),
+    Command::new("Toggle Light/Dark Theme", None, || {
+        Box::new(ToggleThemeMode)
+    }),
+    Command::new("Select Theme: Default Light", None, || {
+        Box::new(SelectDefaultLightTheme)
+    }),
+    Command::new("Select Theme: Default Dark", None, || {
+        Box::new(SelectDefaultDarkTheme)
+    }),
+    Command::new("Select Theme: Catppuccin Mocha", None, || {
+        Box::new(SelectCatppuccinMochaTheme)
+    }),
 ];
 
 /// Look up a command by its exact display name.
@@ -85,7 +101,7 @@ mod tests {
     /// terminal's `SelectWindow(usize)`) sneaking in would show up as an
     /// unexpected entry here.
     #[test]
-    fn test_registry_is_seeded_with_the_curated_editor_and_shell_commands() {
+    fn test_registry_is_seeded_with_the_curated_editor_shell_and_theme_commands() {
         let names: Vec<&str> = COMMANDS.iter().map(|command| command.name).collect();
         assert_eq!(
             names,
@@ -99,6 +115,10 @@ mod tests {
                 "Toggle Source Control",
                 "Focus Terminal",
                 "Zoom Active Panel",
+                "Toggle Light/Dark Theme",
+                "Select Theme: Default Light",
+                "Select Theme: Default Dark",
+                "Select Theme: Catppuccin Mocha",
             ]
         );
     }
@@ -110,6 +130,24 @@ mod tests {
         assert_eq!(save.keybinding_hint, Some("Ctrl+S"));
 
         assert!(find("does not exist").is_none());
+    }
+
+    /// Theme commands (issue #367): registered under the display names the
+    /// palette renders, each dispatching the expected parameterless action —
+    /// `set_theme`/`set_theme_mode` wiring is unit-tested directly in `lib.rs`.
+    #[test]
+    fn test_theme_commands_are_registered_and_dispatch_the_expected_actions() {
+        let toggle = find("Toggle Light/Dark Theme").expect("theme toggle is registered");
+        assert!(toggle.action().partial_eq(&ToggleThemeMode));
+
+        let light = find("Select Theme: Default Light").expect("default light is registered");
+        assert!(light.action().partial_eq(&SelectDefaultLightTheme));
+
+        let dark = find("Select Theme: Default Dark").expect("default dark is registered");
+        assert!(dark.action().partial_eq(&SelectDefaultDarkTheme));
+
+        let mocha = find("Select Theme: Catppuccin Mocha").expect("catppuccin mocha is registered");
+        assert!(mocha.action().partial_eq(&SelectCatppuccinMochaTheme));
     }
 
     /// "Dispatch shape": every entry builds a distinct, rift-namespaced

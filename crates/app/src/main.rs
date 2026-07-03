@@ -211,6 +211,14 @@ fn main() {
                 None,
             ),
         ]);
+        // Settings surface (#366, `docs/spec-theme-settings.md`): Ctrl+, /
+        // Cmd+, opens it, mirroring the editor-convention shortcut. Unscoped
+        // (`None`), like the command palette above, so it reaches the
+        // shortcut regardless of which surface is focused.
+        cx.bind_keys([
+            KeyBinding::new("ctrl-,", rift_app::settings::OpenSettings, None),
+            KeyBinding::new("cmd-,", rift_app::settings::OpenSettings, None),
+        ]);
         // gpui-component's `Root` view binds `tab`/`shift-tab` to focus navigation
         // in the "Root" context. Root is an ancestor of every pane, so that action
         // consumes the keystroke before it reaches the pane's `on_key_down`, and the

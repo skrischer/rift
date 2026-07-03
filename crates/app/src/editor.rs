@@ -20,7 +20,10 @@
 //! affordance: clicking a tab activates it and moves focus to its buffer;
 //! closing one removes it, activating the right neighbor (or the left if it
 //! was rightmost) — closing the last tab returns the editor to its empty
-//! state (#352). Dirty-close confirmation is a later step.
+//! state (#352). Closing a **dirty** tab prompts a `gpui-component`
+//! `AlertDialog` confirm/discard first; confirming discards the unsaved
+//! edits and closes it, cancelling leaves it open untouched. A clean tab
+//! still closes immediately (#354).
 //!
 //! # Workspace wiring fan-out (#353)
 //!
@@ -143,6 +146,7 @@ use gpui::{
     Focusable, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
     ParentElement as _, Render, SharedString, Styled as _, Subscription, Window,
 };
+use gpui_component::dialog::AlertDialog;
 use gpui_component::dock::{Panel, PanelEvent};
 use gpui_component::highlighter::{
     Diagnostic as EditorDiagnostic, DiagnosticSeverity as EditorSeverity,
@@ -152,6 +156,7 @@ use gpui_component::menu::PopupMenu;
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::text::markdown;
 use gpui_component::ActiveTheme as _;
+use gpui_component::WindowExt as _;
 use rift_protocol::{
     ClientMessage, Diagnostic, DiagnosticSeverity, HoverContent, NavLocation, NavRequestId,
     Position, Range,
@@ -1358,7 +1363,7 @@ impl EditorView {
         }
     }
 
-    // ── Tab bar: switch / close (#352) ────────────────────────────────────
+    // ── Tab bar: switch / close (#352, #354) ──────────────────────────────
 
     /// Activate the tab at `index` (tab-bar click) and move focus to its
     /// buffer. A no-op if `index` is out of range or already active.
@@ -1373,14 +1378,64 @@ impl EditorView {
         cx.notify();
     }
 
-    /// Close the tab at `index` (tab-bar close affordance): reverts its live
-    /// buffer to disk-backed (mirrors the save-success discard, #189) and
-    /// removes it from the open set. Closing the active tab activates the
-    /// right neighbor (or the left if it was rightmost, via
-    /// [`next_active_after_close`]); closing the last tab returns the editor
-    /// to its empty state. Dirty-close confirmation is a later step
-    /// (`docs/spec-editor-tabs.md`) — for now every close is immediate.
+    /// Close the tab at `index` (tab-bar close affordance). A clean tab
+    /// closes immediately, as before (#352); a dirty tab prompts for
+    /// confirmation before discarding its unsaved edits
+    /// (`docs/spec-editor-tabs.md`, #354). A no-op if `index` is out of
+    /// range.
     pub fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        if close_needs_confirm(tab.dirty) {
+            self.confirm_close_tab(index, window, cx);
+        } else {
+            self.close_tab_now(index, window, cx);
+        }
+    }
+
+    /// Open the dirty-close confirm dialog (`gpui-component` `AlertDialog`
+    /// via `Root`, mirroring `pane_view.rs`'s `open_confirm_dialog`, #212):
+    /// confirming discards the tab's unsaved edits and closes it; cancelling
+    /// (or dismissing) leaves it open, untouched.
+    ///
+    /// The confirm callback re-resolves the tab by path instead of closing
+    /// over `index`: a tab close or reorder between opening the dialog and
+    /// the user's answer can shift indices, so trusting the stale position
+    /// risks closing the wrong tab (or silently missing an out-of-range one)
+    /// — the same discipline the async timers in this file already follow.
+    fn confirm_close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self.tabs[index].path.clone();
+        let name = path.rsplit('/').next().unwrap_or(&path).to_owned();
+        let entity = cx.entity();
+
+        window.open_alert_dialog(cx, move |alert: AlertDialog, _, _| {
+            let entity = entity.clone();
+            let path = path.clone();
+            alert
+                .title("Unsaved Changes")
+                .description(SharedString::from(format!(
+                    "\"{name}\" has unsaved changes. Discard them and close the tab?"
+                )))
+                .show_cancel(true)
+                .on_ok(move |_, window, cx| {
+                    entity.update(cx, |view, cx| {
+                        if let Some(index) = view.tab_index_for_path(&path) {
+                            view.close_tab_now(index, window, cx);
+                        }
+                    });
+                    true
+                })
+        });
+    }
+
+    /// Actually remove the tab at `index` from the open set: reverts its
+    /// live buffer to disk-backed (mirrors the save-success discard, #189).
+    /// Closing the active tab activates the right neighbor (or the left if
+    /// it was rightmost, via [`next_active_after_close`]); closing the last
+    /// tab returns the editor to its empty state. Shared by an immediate
+    /// clean-tab close and a confirmed dirty-tab discard (#354).
+    fn close_tab_now(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(active) = self.active else {
             return;
         };
@@ -1623,11 +1678,11 @@ impl Render for EditorView {
 
         let read_only = tab.read_only;
 
-        // Tab bar (#352): one Tab per open file, showing its name, a dirty
-        // dot, and a close "x" — the same TabBar/Tab pattern `SessionView`
-        // uses for tmux windows. Clicking a tab activates it (moves focus to
-        // its buffer); the close affordance removes it immediately
-        // (dirty-close confirmation is a later step).
+        // Tab bar (#352, #354): one Tab per open file, showing its name, a
+        // dirty dot, and a close "x" — the same TabBar/Tab pattern
+        // `SessionView` uses for tmux windows. Clicking a tab activates it
+        // (moves focus to its buffer); the close affordance closes it —
+        // immediately when clean, after a confirm dialog when dirty.
         let selected_index = self.active.unwrap_or(0);
         let close_idle = cx.theme().muted_foreground;
         let close_hover = cx.theme().danger;
@@ -1834,6 +1889,14 @@ fn find_open_tab_index<'a>(
     path: &str,
 ) -> Option<usize> {
     open_paths.position(|p| p == path)
+}
+
+/// Decide whether closing a tab must prompt for confirmation before
+/// discarding unsaved edits. Pure and GPUI-free — the decision half of the
+/// dirty-close contract (`docs/spec-editor-tabs.md`, #354 acceptance: "a
+/// dirty tab prompts confirm/discard; closing a clean tab is immediate").
+fn close_needs_confirm(dirty: bool) -> bool {
+    dirty
 }
 
 /// Decide the new active index after closing the tab at `closed`, given the
@@ -2154,6 +2217,18 @@ mod tests {
         assert_eq!(next_active_after_close(0, 0, 1), None);
     }
 
+    // --- dirty-close confirmation decision (#354) ---
+
+    #[test]
+    fn test_close_needs_confirm_is_true_for_a_dirty_tab() {
+        assert!(close_needs_confirm(true));
+    }
+
+    #[test]
+    fn test_close_needs_confirm_is_false_for_a_clean_tab() {
+        assert!(!close_needs_confirm(false));
+    }
+
     // --- stale positional index across close_tab (PR #401 review) ---
 
     #[allow(clippy::type_complexity)] // test-only bundle of the editor's channel senders/receiver
@@ -2299,6 +2374,70 @@ mod tests {
         });
         let editor = editor.expect("editor constructed inside the window callback");
         (editor, window, open_file_rx)
+    }
+
+    /// Acceptance (#354): "closing a clean tab is immediate" — no confirm
+    /// dialog appears and the tab is gone right away.
+    ///
+    /// Uses `cx.update_window` rather than `window.update`: the latter
+    /// (`WindowHandle<Root>::update`) leases the `Root` entity for the whole
+    /// closure, and `has_active_dialog` reads that same `Root` internally —
+    /// nesting the two double-leases and panics (mirrors the pattern
+    /// `workspace.rs`'s command-palette dialog test documents).
+    #[gpui::test]
+    fn test_closing_a_clean_tab_closes_immediately_without_a_confirm_dialog(
+        cx: &mut TestAppContext,
+    ) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let a = editor.push_tab("a.rs".into(), false, window, cx);
+                editor.tabs[a].load_state = TabLoadState::Loaded;
+                editor.active = Some(a);
+                editor.close_tab(a, window, cx);
+            });
+
+            assert!(
+                !window.has_active_dialog(cx),
+                "a clean tab must close without prompting a confirm dialog"
+            );
+            assert!(
+                editor.read(cx).tabs.is_empty(),
+                "the clean tab closes immediately"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Acceptance (#354): "closing a dirty tab prompts to confirm" — the tab
+    /// stays open until the user answers the dialog; discarding it
+    /// unconfirmed would be exactly the silent data loss the confirm exists
+    /// to prevent.
+    #[gpui::test]
+    fn test_closing_a_dirty_tab_opens_a_confirm_dialog_and_leaves_it_open(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let a = editor.push_tab("a.rs".into(), false, window, cx);
+                editor.tabs[a].load_state = TabLoadState::Loaded;
+                editor.tabs[a].dirty = true;
+                editor.active = Some(a);
+                editor.close_tab(a, window, cx);
+            });
+
+            assert!(
+                window.has_active_dialog(cx),
+                "a dirty tab must prompt a confirm dialog before discarding its edits"
+            );
+            assert_eq!(
+                editor.read(cx).tabs.len(),
+                1,
+                "the dirty tab stays open until the user confirms"
+            );
+        })
+        .unwrap();
     }
 
     /// Acceptance (#353): "mtime/diagnostics for a path route to the tab
