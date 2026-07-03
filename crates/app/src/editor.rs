@@ -1118,6 +1118,32 @@ impl EditorView {
             self.jump_to_location(entry.location, window, cx);
         }
     }
+
+    /// Open `path` at `range`, scrolling/selecting it once loaded — the thin
+    /// public wrapper `docs/spec-problems-panel.md` calls for so the problems
+    /// panel (#343) can reach the existing LSP-nav jump machinery
+    /// ([`EditorView::jump_to_location`]) without a `NavLocation` round-trip.
+    /// Problems-panel diagnostics are always in-worktree, so `out_of_root` is
+    /// always `false`.
+    pub fn open_at_range(
+        &mut self,
+        path: String,
+        range: Range,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.push_back_position(cx);
+        self.jump_to_location(
+            NavLocation {
+                path,
+                range,
+                out_of_root: false,
+                line_preview: None,
+            },
+            window,
+            cx,
+        );
+    }
 }
 
 // ── Panel adapter ─────────────────────────────────────────────────────────────
