@@ -17,6 +17,7 @@ pub mod problems_panel;
 pub mod source_control;
 pub mod status_bar;
 pub mod terminal_panel;
+pub mod window_state;
 pub mod workspace;
 pub mod worktree;
 
