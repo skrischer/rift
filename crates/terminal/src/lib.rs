@@ -11,7 +11,7 @@ pub use keytable::{
     classify_command, keystroke_to_tmux_key, normalize_tmux_key, parse_list_keys, parse_options,
     Binding, DispatchDecision, KeyTable, PrefixOptions,
 };
-pub use pane_view::PaneView;
+pub use pane_view::{PaneActivity, PaneView};
 pub use session_view::{SessionView, TerminalHandle};
 pub use termy_terminal_ui::TerminalUiRenderMetricsSnapshot;
 
