@@ -81,6 +81,11 @@ struct EditorChannels {
     buffer_change_rx: flume::Receiver<rift_protocol::ClientMessage>,
     /// Navigation requests: `DefinitionRequest` (#196).
     nav_request_rx: flume::Receiver<rift_protocol::ClientMessage>,
+    /// `FileDiff` replies routed to the diff view (#338).
+    diff_tx: flume::Sender<rift_protocol::DaemonMessage>,
+    /// Root-relative paths to diff, emitted by the source-control panel on
+    /// selection; each becomes a `RequestDiff` request.
+    request_diff_rx: flume::Receiver<String>,
 }
 
 /// Per-channel log-pair basename, keyed off the same `windowed` feature that
@@ -180,6 +185,22 @@ fn main() {
         cx.bind_keys(
             (1..=9usize).map(|n| KeyBinding::new(&format!("alt-{n}"), SelectWindow(n), None)),
         );
+        // Command palette (#359, `docs/spec-command-palette.md`): Ctrl+Shift+P /
+        // Cmd+Shift+P opens the palette. Unscoped (`None`), like `SelectWindow`
+        // above, so it reaches the shortcut regardless of which surface is
+        // focused, including the terminal.
+        cx.bind_keys([
+            KeyBinding::new(
+                "ctrl-shift-p",
+                rift_app::command_palette::OpenCommandPalette,
+                None,
+            ),
+            KeyBinding::new(
+                "cmd-shift-p",
+                rift_app::command_palette::OpenCommandPalette,
+                None,
+            ),
+        ]);
         // gpui-component's `Root` view binds `tab`/`shift-tab` to focus navigation
         // in the "Root" context. Root is an ancestor of every pane, so that action
         // consumes the keystroke before it reaches the pane's `on_key_down`, and the
@@ -316,6 +337,8 @@ fn main() {
                     flume::unbounded::<rift_protocol::ClientMessage>();
                 let (nav_request_tx, nav_request_rx) =
                     flume::unbounded::<rift_protocol::ClientMessage>();
+                let (diff_tx, diff_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
+                let (request_diff_tx, request_diff_rx) = flume::unbounded::<String>();
 
                 let session_view = cx.new(|cx| {
                     let (view, handle) = SessionView::new(cx);
@@ -377,6 +400,8 @@ fn main() {
                         save_file_rx,
                         buffer_change_rx,
                         nav_request_rx,
+                        diff_tx,
+                        request_diff_rx,
                     };
 
                     let key_exists = ssh.key.exists();
@@ -423,10 +448,12 @@ fn main() {
                             buffer_rx,
                             nav_rx,
                             status_line_rx,
+                            diff_rx,
                             open_file_tx,
                             save_file_tx,
                             buffer_change_tx,
                             nav_tx: nav_request_tx,
+                            request_diff_tx,
                         },
                         window,
                         cx,
@@ -494,6 +521,7 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels, editor: EditorChannel
         spawn_save_file_bridge(client.clone(), editor.save_file_rx.clone());
         spawn_buffer_change_bridge(client.clone(), editor.buffer_change_rx.clone());
         spawn_nav_bridge(client.clone(), editor.nav_request_rx.clone());
+        spawn_request_diff_bridge(client.clone(), editor.request_diff_rx.clone());
         tokio::spawn(consume_daemon_messages(client, None, editor));
     } else {
         info!("terminal source: legacy tmux (no daemon configured)");
@@ -572,6 +600,10 @@ async fn run_daemon_terminal(
     // Navigation request reverse path (#196): `DefinitionRequest` forwards verbatim.
     // The `DefinitionResponse` returns via `consume_daemon_messages` on `editor.nav_tx`.
     spawn_nav_bridge(client.clone(), editor.nav_request_rx.clone());
+    // Diff pull reverse path (#338): the source-control panel's selection becomes
+    // a `RequestDiff`. The `FileDiff` reply returns via `consume_daemon_messages`
+    // on `editor.diff_tx`.
+    spawn_request_diff_bridge(client.clone(), editor.request_diff_rx.clone());
 
     // Forward path: fold the daemon stream into the render channels (pane output,
     // layout snapshots, capture replies), the file tree, and the editor. Blocks
@@ -1032,6 +1064,12 @@ async fn consume_daemon_messages(
             msg @ DaemonMessage::StatusLineReply { .. } => {
                 let _ = editor.status_line_tx.send(msg);
             }
+            // --- diff reply -> diff view (every mode) ---
+            // The reply to a `RequestDiff`: forward to the diff view, which
+            // routes it by path against the currently open selection (#338).
+            msg @ DaemonMessage::FileDiff { .. } => {
+                let _ = editor.diff_tx.send(msg);
+            }
             other => debug!(?other, "daemon message without a consumer yet"),
         }
     }
@@ -1054,6 +1092,30 @@ fn spawn_open_file_bridge(
         while let Ok(path) = open_file_rx.recv_async().await {
             debug!(%path, "sending open-file request");
             if client.send(ClientMessage::OpenFile { path }).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Forward the source-control panel's selections onto the protocol as
+/// [`rift_protocol::ClientMessage::RequestDiff`] pulls (#338). Each selected
+/// path becomes one diff request; the daemon answers with a `FileDiff` reply
+/// that returns through [`consume_daemon_messages`] on `editor.diff_tx`. Ends
+/// when either channel closes.
+fn spawn_request_diff_bridge(
+    client: std::sync::Arc<rift_ssh::DaemonClient>,
+    request_diff_rx: flume::Receiver<String>,
+) {
+    use rift_protocol::ClientMessage;
+    tokio::spawn(async move {
+        while let Ok(path) = request_diff_rx.recv_async().await {
+            debug!(%path, "sending diff request");
+            if client
+                .send(ClientMessage::RequestDiff { path })
+                .await
+                .is_err()
+            {
                 break;
             }
         }
