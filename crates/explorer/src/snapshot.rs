@@ -7,13 +7,30 @@
 //! [`Snapshot::diff`] turns an old and new snapshot into the [`Change`] deltas the
 //! [`crate::Watcher`] streams as the tree evolves.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use ignore::WalkBuilder;
+use ignore::{DirEntry, WalkBuilder};
 
 use crate::{ExplorerError, Result};
+
+/// Directory names excluded from every scan (and, via [`crate::Watcher`], every
+/// OS watch) regardless of ignore status — a small, hardcoded performance floor
+/// (#309). `target/` alone can reach tens of GB on a Rust workspace; walking or
+/// watching it, or `.git/`'s object store, or `node_modules/`, would tank scan
+/// and watch performance for no explorer value. Matched by file name at any
+/// depth, not by full path — configurability is deferred (spec: Phase 17).
+const PERF_EXCLUDED_NAMES: [&str; 3] = ["target", ".git", "node_modules"];
+
+/// Whether `entry` is one of the hardcoded performance exclusions, which must
+/// never be walked (see [`PERF_EXCLUDED_NAMES`]).
+fn is_perf_excluded(entry: &DirEntry) -> bool {
+    entry
+        .file_name()
+        .to_str()
+        .is_some_and(|name| PERF_EXCLUDED_NAMES.contains(&name))
+}
 
 /// Whether a [`Snapshot`] entry is a regular file or a directory.
 ///
@@ -35,10 +52,12 @@ pub enum EntryKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub kind: EntryKind,
-    /// Whether VCS ignore rules cover this entry. Ignored paths are excluded from
-    /// the scan in v1, so every entry a snapshot holds is currently `false`; the
-    /// field mirrors the protocol entry and leaves room to surface greyed-out
-    /// ignored entries later without reshaping the model.
+    /// Whether `.gitignore` (or `.git/info/exclude`) covers this entry (#309).
+    /// Ignored entries are still scanned and included — only the hardcoded
+    /// performance set ([`PERF_EXCLUDED_NAMES`]) is excluded outright — so the
+    /// client can render them dimmed instead of hiding them. Ripgrep `.ignore`
+    /// files are not consulted for this classification; they are a search
+    /// convention, not a VCS one.
     pub ignored: bool,
     pub mtime: SystemTime,
 }
@@ -66,14 +85,19 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Walk `root` once and build a snapshot, honoring VCS ignore rules.
+    /// Walk `root` once and build a snapshot (#309: shows ignored files like an
+    /// IDE explorer, instead of hiding them).
     ///
-    /// `.git/` and anything a `.gitignore` matches (e.g. `target/`) are excluded;
-    /// dotfiles that are not ignored (`.gitignore`, `.github/`) are kept. The walk
-    /// does not follow symlinks — a symlink is recorded as a leaf [`EntryKind::File`]
-    /// and never traversed, so symlink loops cannot arise. A directory that cannot be
-    /// read (permission denied) or any other per-entry error is skipped and logged,
-    /// never fatal to the scan; the only error this returns is an inaccessible `root`.
+    /// Only the hardcoded performance set ([`PERF_EXCLUDED_NAMES`] — `target/`,
+    /// `.git/`, `node_modules/`) is excluded outright. Everything else is
+    /// included, with [`Entry::ignored`] set for paths a `.gitignore` (or
+    /// `.git/info/exclude`) covers; ripgrep `.ignore` files are not consulted, so
+    /// e.g. `*.md`/`*.json` stay normal, non-ignored entries even under an
+    /// `.ignore`. The walk does not follow symlinks — a symlink is recorded as a
+    /// leaf [`EntryKind::File`] and never traversed, so symlink loops cannot
+    /// arise. A directory that cannot be read (permission denied) or any other
+    /// per-entry error is skipped and logged, never fatal to the scan; the only
+    /// error this returns is an inaccessible `root`.
     ///
     /// If a *directory's* own metadata cannot be read it is skipped while the walk
     /// still descends into it, so a child entry may exist in the map without its
@@ -87,12 +111,14 @@ impl Snapshot {
             }
         })?;
 
+        let visible = Self::gitignore_visible_paths(&root);
+
+        // Standard filters off: this walk must yield ignored entries too, not
+        // just the ones `visible` kept. The hardcoded perf set is still never
+        // descended into (`target/` alone can be tens of GB).
         let walker = WalkBuilder::new(&root)
-            .hidden(false) // keep unignored dotfiles like .gitignore / .github
-            .require_git(false) // honor .gitignore even outside a checked-out repo
-            .git_global(false) // self-contained: ignore the host's global gitignore
-            .parents(false) // do not climb above the project root for ignore files
-            .filter_entry(|entry| entry.file_name() != ".git") // never descend into .git/
+            .standard_filters(false)
+            .filter_entry(|entry| !is_perf_excluded(entry))
             .build();
 
         let mut entries = BTreeMap::new();
@@ -134,17 +160,43 @@ impl Snapshot {
                 .strip_prefix(&root)
                 .expect("walker yields paths under the scanned root");
 
+            let ignored = !visible.contains(relative);
+
             entries.insert(
                 relative.to_path_buf(),
                 Entry {
                     kind,
-                    ignored: false,
+                    ignored,
                     mtime,
                 },
             );
         }
 
         Ok(Self { root, entries })
+    }
+
+    /// The paths (relative to `root`) that standard `.gitignore`/`.git/info/exclude`
+    /// rules keep visible — used only to classify [`Entry::ignored`] in
+    /// [`Snapshot::scan`], never to exclude anything itself. Ripgrep `.ignore`
+    /// files are deliberately not consulted (#309): they are a search
+    /// convention, not a VCS one, and hid this repo's `*.md`/`*.json`/configs
+    /// from the tree entirely. Per-entry errors are dropped silently — the main
+    /// walk in `scan` logs them once already.
+    fn gitignore_visible_paths(root: &Path) -> HashSet<PathBuf> {
+        let walker = WalkBuilder::new(root)
+            .hidden(false) // keep unignored dotfiles like .gitignore / .github
+            .ignore(false) // ripgrep .ignore is not a VCS concept; do not honor it
+            .require_git(false) // honor .gitignore even outside a checked-out repo
+            .git_global(false) // self-contained: ignore the host's global gitignore
+            .parents(false) // do not climb above the project root for ignore files
+            .filter_entry(|entry| !is_perf_excluded(entry))
+            .build();
+
+        walker
+            .filter_map(|result| result.ok())
+            .filter(|entry| entry.depth() > 0)
+            .filter_map(|entry| entry.path().strip_prefix(root).map(Path::to_path_buf).ok())
+            .collect()
     }
 
     /// The absolute, canonicalized root this snapshot was scanned from.
@@ -326,34 +378,103 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_excludes_git_target_and_gitignored_paths_but_keeps_unignored_dotfiles() {
+    fn test_scan_excludes_perf_set_but_keeps_unignored_dotfiles() {
         let tmp = TempDir::new("ignore");
         let root = &tmp.path;
-        write_file(&root.join(".gitignore"), "target/\nbuild/\n");
+        write_file(&root.join(".gitignore"), "build/\n");
         write_file(&root.join("src/main.rs"), "fn main() {}");
         write_file(&root.join("target/debug/app"), "binary");
+        write_file(
+            &root.join("node_modules/pkg/index.js"),
+            "module.exports = {};",
+        );
         write_file(&root.join("build/out.o"), "obj");
         write_file(&root.join(".git/HEAD"), "ref: refs/heads/main");
         write_file(&root.join(".github/workflows/ci.yml"), "name: ci");
 
         let snapshot = Snapshot::scan(root).expect("scan succeeds");
 
-        // Tracked content and unignored dotfiles are kept.
-        assert!(snapshot.get(Path::new("src/main.rs")).is_some());
-        assert!(snapshot.get(Path::new(".gitignore")).is_some());
-        assert!(snapshot
-            .get(Path::new(".github/workflows/ci.yml"))
-            .is_some());
+        // Tracked content and unignored dotfiles are kept, not ignored.
+        assert_eq!(
+            snapshot.get(Path::new("src/main.rs")).map(|e| e.ignored),
+            Some(false)
+        );
+        assert_eq!(
+            snapshot.get(Path::new(".gitignore")).map(|e| e.ignored),
+            Some(false)
+        );
+        assert_eq!(
+            snapshot
+                .get(Path::new(".github/workflows/ci.yml"))
+                .map(|e| e.ignored),
+            Some(false)
+        );
 
-        // Ignored paths are excluded entirely.
+        // The hardcoded perf set (#309) is excluded entirely, not merely marked.
         assert!(snapshot.get(Path::new("target")).is_none());
         assert!(snapshot.get(Path::new("target/debug/app")).is_none());
-        assert!(snapshot.get(Path::new("build")).is_none());
+        assert!(snapshot.get(Path::new("node_modules")).is_none());
+        assert!(snapshot
+            .get(Path::new("node_modules/pkg/index.js"))
+            .is_none());
         assert!(snapshot.get(Path::new(".git")).is_none());
         assert!(snapshot.get(Path::new(".git/HEAD")).is_none());
         assert!(snapshot.entries().keys().all(|p| {
-            !p.starts_with("target") && !p.starts_with("build") && !p.starts_with(".git")
+            !p.starts_with("target") && !p.starts_with("node_modules") && !p.starts_with(".git")
         }));
+    }
+
+    #[test]
+    fn test_scan_marks_gitignored_paths_ignored_but_keeps_them_openable() {
+        let tmp = TempDir::new("gitignore-visible");
+        let root = &tmp.path;
+        write_file(&root.join(".gitignore"), "build/\n*.log\n");
+        write_file(&root.join("build/out.o"), "obj");
+        write_file(&root.join("debug.log"), "trace");
+        write_file(&root.join("src/main.rs"), "fn main() {}");
+
+        let snapshot = Snapshot::scan(root).expect("scan succeeds");
+
+        // Gitignored paths appear (openable — present with their real kind) but
+        // are flagged, not hidden.
+        assert_eq!(
+            snapshot.get(Path::new("build")).map(|e| e.ignored),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot.get(Path::new("build/out.o")).map(|e| e.ignored),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot.get(Path::new("debug.log")).map(|e| e.ignored),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot.get(Path::new("src/main.rs")).map(|e| e.ignored),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_scan_does_not_honor_ripgrep_ignore_file() {
+        let tmp = TempDir::new("rgignore");
+        let root = &tmp.path;
+        // A ripgrep-style `.ignore` file, as this repo actually ships (#309):
+        // it must no longer hide docs/configs from the explorer tree.
+        write_file(&root.join(".ignore"), "*.md\n*.json\n");
+        write_file(&root.join("README.md"), "# readme");
+        write_file(&root.join("config.json"), "{}");
+
+        let snapshot = Snapshot::scan(root).expect("scan succeeds");
+
+        assert_eq!(
+            snapshot.get(Path::new("README.md")).map(|e| e.ignored),
+            Some(false)
+        );
+        assert_eq!(
+            snapshot.get(Path::new("config.json")).map(|e| e.ignored),
+            Some(false)
+        );
     }
 
     #[cfg(unix)]

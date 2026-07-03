@@ -8,9 +8,12 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape, Processor};
 use gpui::*;
+use gpui_component::dialog::AlertDialog;
+use gpui_component::notification::Notification;
+use gpui_component::WindowExt;
 use termy_terminal_ui::{
     add_span_damage_compute_us, encode_mouse_report, find_link_in_line, CellRenderInfo,
-    CommandLifecycle, OscEvent, OscInterceptor, TerminalCursorStyle, TerminalGrid,
+    CommandLifecycle, CommandPhase, OscEvent, OscInterceptor, TerminalCursorStyle, TerminalGrid,
     TerminalGridPaintCacheHandle, TerminalGridPaintDamage, TerminalMouseButton,
     TerminalMouseEventKind, TerminalMouseMode, TerminalMouseModifiers, TerminalMousePosition,
 };
@@ -34,8 +37,86 @@ struct Listener {
 
 impl EventListener for Listener {
     fn send_event(&self, event: Event) {
-        if matches!(event, Event::ClipboardStore(..)) {
+        if matches!(event, Event::ClipboardStore(..) | Event::Bell) {
             let _ = self.event_tx.try_send(event);
+        }
+    }
+}
+
+/// Output-recency idle window for the activity fallback: a pane that has never
+/// emitted an OSC-133 marker reads [`PaneActivity::Busy`] while it produced
+/// output within this window, then ages back to [`PaneActivity::Free`]. When
+/// OSC-133 is present it wins and this fallback is bypassed
+/// (`docs/spec-pane-activity-indicators.md`).
+const ACTIVITY_IDLE_WINDOW: Duration = Duration::from_millis(1500);
+
+/// Per-pane activity classification derived agent-agnostically from the pane
+/// byte stream. Precedence: attention > busy > free
+/// (`docs/spec-pane-activity-indicators.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneActivity {
+    /// At a shell prompt or otherwise not working.
+    Free,
+    /// A foreground command is running (OSC-133 `Executing`, or recent output
+    /// via the fallback) — stays busy while the process is silent.
+    Busy,
+    /// The pane rang the terminal bell and the user has not acknowledged it.
+    Attention,
+}
+
+/// Mutable per-pane activity signals folded into a [`PaneActivity`]. Kept free
+/// of GPUI so the state machine is unit-testable in isolation. Busy/free is read
+/// from the pane's OSC-133 [`CommandPhase`] once any marker is seen, otherwise
+/// from the output-recency fallback; the terminal bell overlays attention.
+#[derive(Debug, Default)]
+struct ActivityTracker {
+    /// Set on the first OSC-133 marker. Until then the output-recency fallback
+    /// carries busy/free; afterwards OSC-133 is authoritative.
+    saw_osc133: bool,
+    /// Unacknowledged terminal-bell attention. Set by [`Self::on_bell`], cleared
+    /// by [`Self::acknowledge`].
+    attention: bool,
+    /// Timestamp of the most recent PTY output, for the recency fallback.
+    last_output: Option<Instant>,
+}
+
+impl ActivityTracker {
+    /// Record that the pane emitted output (feeds the recency fallback).
+    fn on_output(&mut self, now: Instant) {
+        self.last_output = Some(now);
+    }
+
+    /// Record that an OSC-133 marker was observed; OSC-133 is authoritative for
+    /// busy/free from here on.
+    fn on_osc133(&mut self) {
+        self.saw_osc133 = true;
+    }
+
+    /// Raise unacknowledged attention (the pane rang the terminal bell).
+    fn on_bell(&mut self) {
+        self.attention = true;
+    }
+
+    /// Clear attention back to the underlying busy/free state.
+    fn acknowledge(&mut self) {
+        self.attention = false;
+    }
+
+    /// Classify the pane's activity for the given command `phase` and clock.
+    fn state(&self, phase: CommandPhase, now: Instant) -> PaneActivity {
+        if self.attention {
+            return PaneActivity::Attention;
+        }
+        let busy = if self.saw_osc133 {
+            matches!(phase, CommandPhase::Executing)
+        } else {
+            self.last_output
+                .is_some_and(|last| now.saturating_duration_since(last) < ACTIVITY_IDLE_WINDOW)
+        };
+        if busy {
+            PaneActivity::Busy
+        } else {
+            PaneActivity::Free
         }
     }
 }
@@ -135,17 +216,23 @@ pub struct PaneView {
     /// command seam (the same channel `SessionView`'s chrome uses).
     tmux_command_tx: flume::Sender<String>,
     /// The mirrored `list-keys`/`show-options` lookup, pushed down from
-    /// `SessionView`. Empty/default until a later issue wires the live
-    /// refresh (`docs/spec-tmux-keytable-mirroring.md`).
+    /// `SessionView` and refreshed in place via [`Self::set_key_table`]
+    /// (`docs/spec-tmux-keytable-mirroring.md`).
     key_table: Arc<KeyTable>,
     prefix_options: PrefixOptions,
     /// Prefix chord capture/repeat state for this pane's `on_key_down`.
     prefix_engine: PrefixEngine,
+    /// Agent-agnostic activity signals (OSC-133 lifecycle, terminal bell, output
+    /// recency) folded into a [`PaneActivity`] via [`Self::activity`].
+    activity: ActivityTracker,
 }
 
 impl PaneView {
     /// - `tmux_command_tx` — dispatches resolved tmux key-table bindings
-    ///   through the single command seam (`SessionView`'s chrome channel).
+    ///   through the single command seam (`SessionView`'s chrome channel). A
+    ///   binding-mutating dispatch's follow-up key-table refresh is issued
+    ///   server-side, on the same seam, after the mutating command lands —
+    ///   not requested from here (`spawn_command_bridge` in `crates/app`).
     /// - `key_table`/`prefix_options` — the mirrored `list-keys`/
     ///   `show-options` lookup, pushed down from `SessionView`.
     #[allow(clippy::too_many_arguments)]
@@ -220,6 +307,10 @@ impl PaneView {
                             for event in term_events {
                                 view.handle_term_event(event, cx);
                             }
+                            // A processed PTY batch means the pane produced
+                            // output; feeds the recency fallback for panes
+                            // without OSC-133 shell integration.
+                            view.activity.on_output(Instant::now());
                             cx.notify();
                         })
                     });
@@ -292,6 +383,7 @@ impl PaneView {
             key_table,
             prefix_options,
             prefix_engine: PrefixEngine::new(),
+            activity: ActivityTracker::default(),
         }
     }
 
@@ -323,6 +415,73 @@ impl PaneView {
 
     pub fn set_current_command(&mut self, command: String) {
         self.current_command = Some(command);
+    }
+
+    /// Apply a refreshed mirrored key-table lookup and prefix/repeat options
+    /// (`SessionView` re-parsed a `list-keys`/`show-options` reply). The
+    /// caller is responsible for `cx.notify()`.
+    pub fn set_key_table(&mut self, key_table: Arc<KeyTable>, prefix_options: PrefixOptions) {
+        self.key_table = key_table;
+        self.prefix_options = prefix_options;
+    }
+
+    /// Handle a resolved bound command from the prefix engine: classify it
+    /// (`keytable::classify_command`) and dispatch, hint, or confirm per the
+    /// command-interception taxonomy (`docs/spec-tmux-keytable-mirroring.md`).
+    fn handle_dispatch(&mut self, command: String, window: &mut Window, cx: &mut Context<Self>) {
+        match keytable::classify_command(&command) {
+            keytable::DispatchDecision::Dispatch(cmd) => self.dispatch_tmux_command(cmd),
+            keytable::DispatchDecision::Hint(hint) => {
+                window.push_notification(Notification::info(hint), cx);
+            }
+            keytable::DispatchDecision::Confirm { prompt, wrapped } => {
+                self.open_confirm_dialog(prompt, wrapped, window, cx);
+            }
+        }
+    }
+
+    /// Send a resolved command through the single command seam. A binding-
+    /// mutating dispatch's key-table refresh is issued server-side, on the
+    /// same seam, strictly after the mutating command lands
+    /// (`spawn_command_bridge` in `crates/app`) — requesting it from here
+    /// instead would race the mutation across two independent
+    /// channels/tasks with no ordering guarantee between them.
+    fn dispatch_tmux_command(&self, command: String) {
+        let _ = self.tmux_command_tx.try_send(command);
+    }
+
+    /// Render a native confirm dialog for a bound `confirm-before` command:
+    /// `wrapped` dispatches only if the user confirms — a control client
+    /// cannot render tmux's own confirmation, so this is what makes stock
+    /// chords like `prefix x` (kill-pane) actually work instead of silently
+    /// no-opping. On confirm, `wrapped` is routed back through
+    /// `handle_dispatch` for re-classification rather than dispatched
+    /// unconditionally — a bound `confirm-before` can itself wrap a
+    /// pane-mode or other intercepted command (e.g. `confirm-before -p
+    /// "copy?" copy-mode`), which must still resolve to a hint instead of
+    /// being shoved onto the shared pane.
+    fn open_confirm_dialog(
+        &self,
+        prompt: String,
+        wrapped: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.entity();
+        window.open_alert_dialog(cx, move |alert: AlertDialog, _, _| {
+            let wrapped = wrapped.clone();
+            let entity = entity.clone();
+            alert
+                .title("tmux confirmation")
+                .description(SharedString::from(prompt.clone()))
+                .show_cancel(true)
+                .on_ok(move |_, window, cx| {
+                    entity.update(cx, |view, cx| {
+                        view.handle_dispatch(wrapped.clone(), window, cx);
+                    });
+                    true
+                })
+        });
     }
 
     /// Apply a new whole-client font size. The caller is responsible for
@@ -479,6 +638,21 @@ impl PaneView {
         &self.command_lifecycle
     }
 
+    /// This pane's current activity state (attention > busy > free), derived
+    /// agent-agnostically from OSC-133 lifecycle, the terminal bell, and output
+    /// recency (`docs/spec-pane-activity-indicators.md`).
+    pub fn activity(&self) -> PaneActivity {
+        self.activity
+            .state(self.command_lifecycle.phase, Instant::now())
+    }
+
+    /// Clear this pane's unacknowledged bell attention back to its underlying
+    /// busy/free state. Called by the window layer on the active-window
+    /// transition (`docs/spec-pane-activity-indicators.md`).
+    pub fn acknowledge_attention(&mut self) {
+        self.activity.acknowledge();
+    }
+
     fn pixel_to_grid(&self, pos: Point<Pixels>) -> (usize, usize) {
         if self.cell_size.width <= px(0.0) || self.cell_size.height <= px(0.0) {
             return (0, 0);
@@ -550,27 +724,38 @@ impl PaneView {
             OscEvent::ShellPromptStart => {
                 debug!("OSC 133;A: shell prompt start");
                 self.command_lifecycle.prompt_start();
+                self.activity.on_osc133();
             }
             OscEvent::ShellCommandStart => {
                 debug!("OSC 133;B: command input start");
                 self.command_lifecycle.command_start();
+                self.activity.on_osc133();
             }
             OscEvent::ShellCommandExecuting => {
                 debug!("OSC 133;C: command executing");
                 self.command_lifecycle.command_executing();
+                self.activity.on_osc133();
             }
             OscEvent::ShellCommandFinished(code) => {
                 debug!(?code, "OSC 133;D: command finished");
                 self.command_lifecycle.command_finished(code);
+                self.activity.on_osc133();
             }
             _ => {}
         }
     }
 
     fn handle_term_event(&mut self, event: Event, cx: &mut Context<Self>) {
-        if let Event::ClipboardStore(_, text) = event {
-            debug!(len = text.len(), "OSC 52: clipboard store");
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        match event {
+            Event::ClipboardStore(_, text) => {
+                debug!(len = text.len(), "OSC 52: clipboard store");
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            Event::Bell => {
+                debug!("terminal bell: raising pane attention");
+                self.activity.on_bell();
+            }
+            _ => {}
         }
     }
 
@@ -1030,7 +1215,7 @@ impl Render for PaneView {
         }
 
         terminal_area
-            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _window, cx| {
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                 let ks = &event.keystroke;
 
                 if ks.modifiers.control && ks.modifiers.shift && ks.key.as_str() == "c" {
@@ -1078,7 +1263,7 @@ impl Render for PaneView {
                     );
                     match action {
                         PrefixAction::Dispatch(command) => {
-                            let _ = this.tmux_command_tx.try_send(command);
+                            this.handle_dispatch(command, window, cx);
                             cx.notify();
                             return;
                         }
@@ -1466,5 +1651,117 @@ mod tests {
             end_col: 2,
         };
         assert_eq!(same_row.normalize(), (3, 2, 3, 10));
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_activity_default_is_free() {
+        // No OSC-133, no output yet: the recency fallback reports free.
+        let tracker = ActivityTracker::default();
+        assert_eq!(
+            tracker.state(CommandPhase::Idle, Instant::now()),
+            PaneActivity::Free
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_activity_osc133_phase_map() {
+        // With OSC-133 present, only `Executing` is busy; every other phase is
+        // free (`match phase { Executing => Busy, _ => Free }`).
+        let mut tracker = ActivityTracker::default();
+        tracker.on_osc133();
+        let now = Instant::now();
+        assert_eq!(tracker.state(CommandPhase::Idle, now), PaneActivity::Free);
+        assert_eq!(
+            tracker.state(CommandPhase::PromptShown, now),
+            PaneActivity::Free
+        );
+        assert_eq!(
+            tracker.state(CommandPhase::CommandInput, now),
+            PaneActivity::Free
+        );
+        assert_eq!(
+            tracker.state(CommandPhase::Executing, now),
+            PaneActivity::Busy
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_activity_bell_raises_attention_and_acknowledge_clears() {
+        let mut tracker = ActivityTracker::default();
+        tracker.on_osc133();
+        let now = Instant::now();
+
+        tracker.on_bell();
+        // Attention overlays both the free and busy underlying phases.
+        assert_eq!(
+            tracker.state(CommandPhase::Idle, now),
+            PaneActivity::Attention
+        );
+        assert_eq!(
+            tracker.state(CommandPhase::Executing, now),
+            PaneActivity::Attention
+        );
+
+        tracker.acknowledge();
+        // Cleared back to the underlying phase-derived state.
+        assert_eq!(tracker.state(CommandPhase::Idle, now), PaneActivity::Free);
+        assert_eq!(
+            tracker.state(CommandPhase::Executing, now),
+            PaneActivity::Busy
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_activity_recency_fallback_busy_within_window_free_after() {
+        // No OSC-133 marker: busy while output is within the idle window, then
+        // ages back to free once the window elapses.
+        let mut tracker = ActivityTracker::default();
+        let base = Instant::now();
+        tracker.on_output(base);
+
+        assert_eq!(tracker.state(CommandPhase::Idle, base), PaneActivity::Busy);
+        assert_eq!(
+            tracker.state(
+                CommandPhase::Idle,
+                base + ACTIVITY_IDLE_WINDOW - Duration::from_millis(1)
+            ),
+            PaneActivity::Busy
+        );
+        assert_eq!(
+            tracker.state(CommandPhase::Idle, base + ACTIVITY_IDLE_WINDOW),
+            PaneActivity::Free
+        );
+        assert_eq!(
+            tracker.state(
+                CommandPhase::Idle,
+                base + ACTIVITY_IDLE_WINDOW + Duration::from_secs(1)
+            ),
+            PaneActivity::Free
+        );
+
+        // New output after the window has elapsed re-arms busy.
+        let later = base + ACTIVITY_IDLE_WINDOW + Duration::from_secs(1);
+        tracker.on_output(later);
+        assert_eq!(tracker.state(CommandPhase::Idle, later), PaneActivity::Busy);
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_activity_osc133_overrides_recency() {
+        // Once OSC-133 is seen it is authoritative: recent output no longer
+        // forces busy, and a silent `Executing` command stays busy past the
+        // recency window (the "busy while thinking" outcome).
+        let mut tracker = ActivityTracker::default();
+        let base = Instant::now();
+        tracker.on_output(base);
+        tracker.on_osc133();
+
+        assert_eq!(tracker.state(CommandPhase::Idle, base), PaneActivity::Free);
+        assert_eq!(
+            tracker.state(
+                CommandPhase::Executing,
+                base + ACTIVITY_IDLE_WINDOW + Duration::from_secs(5)
+            ),
+            PaneActivity::Busy
+        );
     }
 }

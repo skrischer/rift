@@ -55,6 +55,29 @@ pub enum ClientMessage {
         end: String,
         join: bool,
     },
+    /// Ask the daemon to (re-)query `list-keys` and `show-options` for the
+    /// mirrored tmux key-table lookup (`docs/spec-tmux-keytable-mirroring.md`).
+    /// The daemon answers with exactly one [`DaemonMessage::KeyTableReply`].
+    /// Sent automatically by the daemon's own attach (no client request
+    /// needed there — mirroring how the layout query is issued unprompted);
+    /// the client sends this explicitly to refresh on an explicit user
+    /// trigger, or after dispatching a binding-mutating bound command
+    /// (`bind-key`/`unbind-key`/`source-file`, or `set-option` touching
+    /// `prefix`/`prefix2`/`repeat-time`).
+    QueryKeyTable,
+    /// Ask the daemon to (re-)query the mirrored tmux status-line: the
+    /// `status-*` option set via `show-options -A` (session-resolved —
+    /// includes values inherited from the global scope, e.g. a `.tmux.conf`
+    /// `set -g status-style ...`) and the server-side expanded
+    /// `status-left`/`status-right` segments via `display-message -p
+    /// '#{T:...}'` (`docs/spec-tmux-statusline-mirroring.md`). The daemon
+    /// answers with exactly one [`DaemonMessage::StatusLineReply`]. Sent
+    /// automatically by the daemon's own attach (no client request needed
+    /// there — mirroring [`ClientMessage::QueryKeyTable`]) and again on the
+    /// daemon's own `status-interval` timer; the client sends this
+    /// explicitly to refresh on an explicit user trigger, or after
+    /// dispatching a bound command that sets a mirrored `status-*` option.
+    QueryStatusLine,
     /// Read request on the buffer channel: pull the current content of the file
     /// at `path` (relative to the worktree root, the same key space as
     /// [`WorktreeEntry::path`]). The daemon answers with exactly one
@@ -134,6 +157,19 @@ pub enum ClientMessage {
         path: String,
         position: Position,
     },
+    /// Source-control diff request (`docs/spec-source-control.md`): pull a
+    /// structured diff of `path`'s current on-disk content against its blob at
+    /// HEAD — always worktree-vs-HEAD, regardless of staging state. `path` is
+    /// relative to the worktree root (the same key space as
+    /// [`WorktreeEntry::path`]). Computed on request, like
+    /// [`ClientMessage::OpenFile`], not pushed: a diff is only needed for the
+    /// file currently under review. The daemon answers with exactly one
+    /// [`DaemonMessage::FileDiff`] for this path — path-keyed request/response,
+    /// like the buffer channel (no [`NavRequestId`]: at most one diff is ever
+    /// inflight per path).
+    RequestDiff {
+        path: String,
+    },
     Hello {
         version: u32,
     },
@@ -191,6 +227,38 @@ pub enum DaemonMessage {
     PaneCapture {
         pane_id: u32,
         bytes: Vec<u8>,
+    },
+    /// The reply to a [`ClientMessage::QueryKeyTable`]: the raw `list-keys` and
+    /// `show-options` output (newline-joined, tmux-decoded — the control-mode
+    /// decode already run by the daemon's command-reply path), for the client
+    /// to parse with `rift_terminal::keytable::{parse_list_keys, parse_options}`
+    /// into the mirrored key-table lookup. The daemon never interprets this
+    /// text itself — it is tmux's own config, not pane content. Sent once per
+    /// attach (issued unprompted by the daemon's `Attach`, mirroring the
+    /// layout query) and again for every later [`ClientMessage::QueryKeyTable`].
+    KeyTableReply {
+        list_keys: String,
+        options: String,
+    },
+    /// The reply to a [`ClientMessage::QueryStatusLine`]: the raw
+    /// `show-options -A` output for the discovered `status-*` option set
+    /// (newline-joined, tmux-decoded), for the client to parse with
+    /// `rift_terminal::statusline::parse_status_options`, plus the two
+    /// already-expanded segments from `display-message -p
+    /// '#{T:status-left}'` / `'#{T:status-right}'` — tmux's own format
+    /// evaluation, never re-implemented client-side. `status_left`/
+    /// `status_right` still carry their `#[...]` style runs unparsed
+    /// (parsing them is a later step); the daemon never interprets any of
+    /// this text itself — it is tmux's own config, not pane content. Sent
+    /// once per attach (issued unprompted, mirroring [`KeyTableReply`]),
+    /// again for every later [`ClientMessage::QueryStatusLine`], and on the
+    /// daemon's own `status-interval` cadence.
+    ///
+    /// [`KeyTableReply`]: DaemonMessage::KeyTableReply
+    StatusLineReply {
+        options: String,
+        status_left: String,
+        status_right: String,
     },
     /// The complete window/pane layout for `session`, sent once per attach as the
     /// baseline of the consistency contract (see the type-level docs). The client
@@ -338,6 +406,15 @@ pub enum DaemonMessage {
     ReferencesResponse {
         id: NavRequestId,
         locations: Vec<NavLocation>,
+    },
+    /// The reply to a [`ClientMessage::RequestDiff`]: `path`'s structured diff
+    /// against HEAD, or a [`FileDiffPayload`] sentinel when the daemon cannot
+    /// produce one (binary content on either side, or a diff exceeding the
+    /// size ceiling — see [`FileDiffPayload::TooLarge`]). `path` is relative to
+    /// the worktree root (the same key space as [`WorktreeEntry::path`]).
+    FileDiff {
+        path: String,
+        diff: FileDiffPayload,
     },
     Welcome {
         version: u32,
@@ -563,6 +640,59 @@ pub struct HoverContent {
     pub markdown: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<Range>,
+}
+
+/// The payload of a [`DaemonMessage::FileDiff`]: either a structured line diff
+/// against HEAD, or a sentinel for content the daemon cannot diff structurally
+/// (`docs/spec-source-control.md`). Tagged by `kind` on the wire so the client
+/// can match on the payload shape without probing for field presence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileDiffPayload {
+    /// A unified-diff-style line diff against HEAD. Empty `hunks` means the
+    /// worktree content is identical to HEAD.
+    Hunks { hunks: Vec<DiffHunk> },
+    /// Either side (the HEAD blob or the worktree content) is binary — no
+    /// line diff is produced.
+    Binary,
+    /// The diff exceeds the daemon's size ceiling (~20k changed lines or
+    /// ~2MB per side, pinned in the diff-compute implementation) — too large
+    /// to stream as a structured diff.
+    TooLarge,
+}
+
+/// A contiguous run of unified-diff lines within a [`FileDiffPayload::Hunks`],
+/// addressed against both the old (HEAD) and new (worktree) line numbering.
+/// `old_start`/`new_start` are 1-based, matching unified-diff / `git diff`
+/// hunk headers (`@@ -old_start,old_len +new_start,new_len @@`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffHunk {
+    pub old_start: u32,
+    pub old_len: u32,
+    pub new_start: u32,
+    pub new_len: u32,
+    pub lines: Vec<DiffLine>,
+}
+
+/// One line of a [`DiffHunk`]: its role plus content, with the line
+/// terminator stripped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffLine {
+    pub kind: DiffLineKind,
+    pub content: String,
+}
+
+/// A [`DiffLine`]'s role within its hunk, mirroring unified-diff's
+/// context/add/remove line prefixes (` `/`+`/`-`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffLineKind {
+    /// Present on both sides, shown for surrounding context.
+    Context,
+    /// Present only on the new (worktree) side.
+    Add,
+    /// Present only on the old (HEAD) side.
+    Remove,
 }
 
 #[cfg(test)]
@@ -1899,5 +2029,181 @@ mod tests {
         // Both must use the same wire shape for the position fields.
         assert!(req_json.contains(r#""line":10,"character":4"#));
         assert!(diag_json.contains(r#""line":10,"character":4"#));
+    }
+
+    #[test]
+    fn test_query_status_line_roundtrips() {
+        let msg = ClientMessage::QueryStatusLine;
+        let json = serde_json::to_string(&msg).expect("serialize QueryStatusLine");
+        assert_eq!(json, r#"{"type":"query_status_line"}"#);
+        let parsed: ClientMessage =
+            serde_json::from_str(&json).expect("deserialize QueryStatusLine");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_status_line_reply_roundtrip_preserves_options_and_segments() {
+        let msg = DaemonMessage::StatusLineReply {
+            options: "status-interval 15\nstatus-left-length 10".to_owned(),
+            status_left: "no-myhost-80-".to_owned(),
+            status_right: "#[fg=green]01:49#[default]".to_owned(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize StatusLineReply");
+        assert!(json.contains(r#""type":"status_line_reply""#));
+        assert!(json.contains(r#""status_left":"no-myhost-80-""#));
+        let parsed: DaemonMessage =
+            serde_json::from_str(&json).expect("deserialize StatusLineReply");
+        assert_eq!(parsed, msg);
+        match parsed {
+            DaemonMessage::StatusLineReply {
+                options,
+                status_left,
+                status_right,
+            } => {
+                assert!(options.contains("status-interval 15"));
+                assert_eq!(status_left, "no-myhost-80-");
+                assert_eq!(status_right, "#[fg=green]01:49#[default]");
+            }
+            other => panic!("expected StatusLineReply, got {other:?}"),
+        }
+    }
+
+    // ---- Source-control diff round-trip tests -------------------------------
+
+    #[test]
+    fn test_request_diff_roundtrip_preserves_path() {
+        // The diff pull request carries only the path, no id — at most one
+        // diff is ever inflight per path, so path-keying (like the buffer
+        // channel) is sufficient correlation.
+        let msg = ClientMessage::RequestDiff {
+            path: "src/main.rs".to_owned(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize RequestDiff");
+        assert_eq!(json, r#"{"type":"request_diff","path":"src/main.rs"}"#);
+
+        let parsed: ClientMessage = serde_json::from_str(&json).expect("deserialize RequestDiff");
+        assert_eq!(parsed, msg);
+        match parsed {
+            ClientMessage::RequestDiff { path } => assert_eq!(path, "src/main.rs"),
+            other => panic!("expected RequestDiff, got {other:?}"),
+        }
+    }
+
+    fn sample_hunk() -> DiffHunk {
+        DiffHunk {
+            old_start: 1,
+            old_len: 3,
+            new_start: 1,
+            new_len: 3,
+            lines: vec![
+                DiffLine {
+                    kind: DiffLineKind::Context,
+                    content: "one".to_owned(),
+                },
+                DiffLine {
+                    kind: DiffLineKind::Remove,
+                    content: "two".to_owned(),
+                },
+                DiffLine {
+                    kind: DiffLineKind::Add,
+                    content: "TWO".to_owned(),
+                },
+                DiffLine {
+                    kind: DiffLineKind::Context,
+                    content: "three".to_owned(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_status_line_reply_empty_segments_roundtrip() {
+        // A blank status-left/status-right (e.g. status off) must round-trip as
+        // an empty string, not vanish or become null.
+        let msg = DaemonMessage::StatusLineReply {
+            options: String::new(),
+            status_left: String::new(),
+            status_right: String::new(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize empty StatusLineReply");
+        assert!(json.contains(r#""status_left":"""#));
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize StatusLineReply"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_file_diff_hunks_roundtrip_preserves_lines_and_ranges() {
+        let msg = DaemonMessage::FileDiff {
+            path: "src/main.rs".to_owned(),
+            diff: FileDiffPayload::Hunks {
+                hunks: vec![sample_hunk()],
+            },
+        };
+        let json = serde_json::to_string(&msg).expect("serialize FileDiff");
+        assert!(json.contains(r#""type":"file_diff""#));
+        assert!(json.contains(r#""kind":"hunks""#));
+        assert!(json.contains(r#""kind":"remove""#));
+        assert!(json.contains(r#""kind":"add""#));
+        assert!(json.contains(r#""kind":"context""#));
+
+        let parsed: DaemonMessage = serde_json::from_str(&json).expect("deserialize FileDiff");
+        assert_eq!(parsed, msg);
+        match parsed {
+            DaemonMessage::FileDiff { path, diff } => {
+                assert_eq!(path, "src/main.rs");
+                match diff {
+                    FileDiffPayload::Hunks { hunks } => {
+                        assert_eq!(hunks.len(), 1);
+                        assert_eq!(hunks[0].lines.len(), 4);
+                    }
+                    other => panic!("expected Hunks, got {other:?}"),
+                }
+            }
+            other => panic!("expected FileDiff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_file_diff_empty_hunks_roundtrips_as_identical_content() {
+        // No hunks means the worktree content matches HEAD exactly — must
+        // round-trip as an empty list, not vanish or collapse to a sentinel.
+        let msg = DaemonMessage::FileDiff {
+            path: "src/lib.rs".to_owned(),
+            diff: FileDiffPayload::Hunks { hunks: vec![] },
+        };
+        let json = serde_json::to_string(&msg).expect("serialize empty FileDiff");
+        assert!(json.contains(r#""hunks":[]"#));
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize empty FileDiff"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_file_diff_binary_and_too_large_sentinels_roundtrip() {
+        for payload in [FileDiffPayload::Binary, FileDiffPayload::TooLarge] {
+            let msg = DaemonMessage::FileDiff {
+                path: "assets/logo.png".to_owned(),
+                diff: payload.clone(),
+            };
+            let json = serde_json::to_string(&msg).expect("serialize FileDiff sentinel");
+            assert!(!json.contains("hunks"), "a sentinel must carry no hunks");
+            assert_eq!(
+                serde_json::from_str::<DaemonMessage>(&json)
+                    .expect("deserialize FileDiff sentinel"),
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_file_diff_payload_kind_tag_is_rejected_when_unknown() {
+        let err = serde_json::from_str::<FileDiffPayload>(r#"{"kind":"frobnicate"}"#);
+        assert!(
+            err.is_err(),
+            "unknown diff payload kind must not deserialize"
+        );
     }
 }

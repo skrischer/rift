@@ -32,6 +32,8 @@ streams pane bytes and layout state back.
 { "type": "resize_pane",  "pane_id": 3, "cols": 120, "rows": 40 }
 { "type": "tmux_command", "cmd": "split-window -h" }
 { "type": "capture_pane", "pane_id": 3, "start": "-", "end": "-128", "join": false }
+{ "type": "query_key_table" }
+{ "type": "query_status_line" }
 ```
 
 - `attach` carries the **session name end-to-end**, so the `RIFT_SESSION` knob
@@ -47,6 +49,27 @@ streams pane bytes and layout state back.
   negative number for a history offset), `join` is `-J`. The daemon answers with
   exactly one `pane_capture` for this pane — a **request/response** exchange,
   separate from the live `%output` stream.
+- `query_key_table` asks the daemon to (re-)run `list-keys` and `show-options`
+  for the tmux key-table mirror (`docs/spec-tmux-keytable-mirroring.md`). The
+  daemon answers with exactly one `key_table_reply` — a **request/response**
+  exchange. The daemon also issues this query unprompted on `attach`/reconnect
+  (mirroring the layout query), so the client only sends `query_key_table`
+  explicitly: on a user-triggered refresh, or after dispatching a
+  binding-mutating bound command (`bind-key`/`unbind-key`/`source-file`, or
+  `set-option` touching `prefix`/`prefix2`/`repeat-time`).
+- `query_status_line` asks the daemon to (re-)query the tmux status-line
+  mirror (`docs/spec-tmux-statusline-mirroring.md`): the `status-*` option set
+  via `show-options -A` (session-resolved — includes values inherited from
+  the global scope) plus the server-side-expanded `status-left`/`status-right`
+  segments via `display-message -p '#{T:...}'` (tmux's own format engine,
+  never re-implemented client-side; the raw option value is never
+  interpolated into a command line). The daemon answers with exactly one
+  `status_line_reply` — a **request/response** exchange, same sibling
+  convention as `query_key_table`. The daemon also issues this query
+  unprompted on `attach`/reconnect and again on its own `status-interval`
+  cadence, so the client only sends `query_status_line` explicitly: on a
+  user-triggered refresh, or after dispatching a bound command that sets a
+  mirrored `status-*` option.
 
 ### Daemon → client
 
@@ -56,6 +79,8 @@ streams pane bytes and layout state back.
 { "type": "layout_snapshot", "session": "rift", "windows": [ <window>, ... ] }
 { "type": "layout_update",   "session": "rift", "windows": [ <window>, ... ] }
 { "type": "terminal_exit",   "session": "rift", "reason": "server exited" }
+{ "type": "key_table_reply", "list_keys": "bind-key -T prefix c new-window\n...", "options": "prefix C-b\nrepeat-time 500\n..." }
+{ "type": "status_line_reply", "options": "status-interval 15\nstatus-left-length 10\n...", "status_left": "no-myhost-80-", "status_right": "#[fg=green]01:49#[default]" }
 ```
 
 ```jsonc
@@ -89,6 +114,21 @@ streams pane bytes and layout state back.
   daemon failure: the daemon keeps serving its other clients, and the client may
   re-`attach` to resume against a still-live session (`reason` is tmux's `%exit`
   text when present, else `null`).
+- `key_table_reply` is the reply to `query_key_table` (and the unprompted
+  attach-time query): the raw `list-keys` and `show-options` output,
+  newline-joined and tmux-decoded but otherwise **uninterpreted by the
+  daemon** — the client parses both with `rift_terminal::keytable` into the
+  mirrored key-table lookup and prefix/repeat options. This is tmux's own
+  config text, not pane content.
+- `status_line_reply` is the reply to `query_status_line` (and the unprompted
+  attach-time/`status-interval` queries): `options` is the raw `show-options
+  -A` output, newline-joined and tmux-decoded, for the client to parse with
+  `rift_terminal::statusline::parse_status_options`; `status_left`/
+  `status_right` are the already-expanded segments from the two
+  `display-message -p '#{T:...}'` fetches — tmux's own format evaluation,
+  never re-implemented client-side, and still carrying their `#[...]` style
+  runs unparsed. None of this is interpreted by the daemon — it is tmux's
+  own config, not pane content.
 
 ### Snapshot ↔ live-stream consistency contract
 
@@ -268,6 +308,59 @@ offsets; `crates/protocol`'s `Position` speaks rift's own position (UTF-8
 character offset), and `crates/lsp` translates against the document text it
 already syncs — the client and protocol never see UTF-16.
 
+## Source-control diff channel
+
+The diff channel is the **fifth request/response family in the protocol**,
+pulling a structured line diff for the source-control panel's review view.
+Specified by `docs/spec-source-control.md`.
+
+```json
+// client → daemon
+{ "type": "request_diff", "path": "src/main.rs" }
+// daemon → client
+{ "type": "file_diff", "path": "src/main.rs", "diff": { "kind": "hunks", "hunks": [ <hunk>, ... ] } }
+{ "type": "file_diff", "path": "assets/logo.png", "diff": { "kind": "binary" } }
+{ "type": "file_diff", "path": "big.bin", "diff": { "kind": "too_large" } }
+```
+
+```jsonc
+// <hunk>  (DiffHunk) — old_start/new_start are 1-based, matching unified-diff hunk headers
+{
+  "old_start": 1, "old_len": 3,
+  "new_start": 1, "new_len": 3,
+  "lines": [
+    { "kind": "context", "content": "one" },
+    { "kind": "remove",  "content": "two" },
+    { "kind": "add",     "content": "TWO" },
+    { "kind": "context", "content": "three" }
+  ]
+}
+```
+
+- `request_diff` carries only `path` (relative to the worktree root, the same
+  key space as [`WorktreeEntry::path`]). The daemon computes the diff of the
+  current on-disk content against `path`'s blob at HEAD — always
+  worktree-vs-HEAD, regardless of staging state — and answers with exactly one
+  `file_diff` for that path. Computed on request, like `open_file`, not
+  pushed: a diff is only needed for the file currently under review. No
+  `NavRequestId`: at most one diff is ever inflight per path, so path-keyed
+  correlation (like the buffer channel) is sufficient.
+- `diff` is tagged by `kind`: `"hunks"` carries the structured line diff
+  (`hunks` is `[]` when the worktree content is identical to HEAD — not
+  omitted, not a sentinel); `"binary"` means either side is binary content;
+  `"too_large"` means the diff exceeds the daemon's size ceiling (~20k changed
+  lines or ~2MB per side). Both sentinels carry no `hunks` field.
+- Each line's `kind` mirrors unified-diff's context/add/remove roles; `content`
+  has its line terminator stripped.
+
+### Daemon-side implementation notes (follow-on issue)
+
+The diff types and the `gix`-based blob-diff compute (`crates/explorer`) are
+implemented in #335. The daemon-side `request_diff` → `file_diff` handler
+lands in a follow-on issue; until then, requests received by the daemon are
+absorbed by the shared dispatch loop's defensive no-op arm, same as the
+navigation channel above.
+
 ## Rules
 
 All message types live in `crates/protocol/`. Adding a new message type is a
@@ -275,14 +368,18 @@ deliberate API change — both daemon and client must be updated. Keep additions
 **additive**: existing consumers must keep compiling and deserializing.
 
 Most paths are **push-only** (structure and decoration: worktree, git,
-diagnostics — "push is the source of truth"). The three request/response
+diagnostics — "push is the source of truth"). The six request/response
 exceptions are deliberate and scoped: `capture_pane` / `pane_capture` for
-pre-attach scrollback; the **buffer channel** (`open_file` → `file_content`,
-`save_file` → `save_result` / `save_conflict`) for file content; and the
-**navigation channel** (`hover_request` → `hover_response`,
-`definition_request` → `definition_response`,
-`references_request` → `references_response`) for LSP pull queries. The
-push-only rule governs structure and decoration, never request/response pairs.
+pre-attach scrollback; `query_key_table` / `key_table_reply` for the tmux
+key-table mirror; `query_status_line` / `status_line_reply` for the tmux
+status-line mirror (sibling pattern to the key-table one); the **buffer
+channel** (`open_file` → `file_content`, `save_file` → `save_result` /
+`save_conflict`) for file content; the **navigation channel**
+(`hover_request` → `hover_response`, `definition_request` →
+`definition_response`, `references_request` → `references_response`) for LSP
+pull queries; and the **diff channel** (`request_diff` → `file_diff`) for the
+source-control panel's review diff. The push-only rule governs structure and
+decoration, never request/response pairs.
 
 The protocol may migrate to MessagePack if JSON serialization becomes a bottleneck.
 Keep message types serialization-agnostic (derive `serde::Serialize` +

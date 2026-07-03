@@ -5,9 +5,9 @@
 //!
 //! - **explorer → lsp**: [`document_changes`] maps an explorer `Change` batch
 //!   onto the [`rift_lsp::DocumentChange`] vocabulary the disk-backed document
-//!   sync consumes. The explorer snapshot already excludes ignored paths
-//!   (`target/`, `.git/`, `.gitignore`d), so an ignored path never reaches here
-//!   and never drives a server.
+//!   sync consumes. The explorer snapshot includes gitignored paths (#309), so
+//!   [`document_changes`] filters `entry.ignored` itself — an ignored path never
+//!   drives a server, even though it now reaches this boundary.
 //! - **lsp → servers**: the [`LspWorker`] owns the [`Registry`] and the
 //!   [`DocumentSync`]. On each change it ensures the matching servers are
 //!   running, then dispatches the sync action to exactly those servers through a
@@ -97,22 +97,28 @@ pub enum NavRequest {
 }
 
 /// Map an explorer change batch onto the [`DocumentChange`] stream document sync
-/// consumes. `Added` / `Changed` carry a full entry; only file entries drive a
-/// document (a directory carries no text), so directory changes are dropped
-/// here. `Removed` carries no entry, so its kind is unknown — it is always
-/// forwarded, and document sync no-ops it when no document was open for the path
-/// (e.g. a removed directory).
+/// consumes. `Added` / `Changed` carry a full entry; only non-ignored file
+/// entries drive a document — a directory carries no text, and an ignored file
+/// (#309: now present in the snapshot) must never drive a server — so both are
+/// dropped here. `Removed` carries no entry, so its kind and ignored status are
+/// unknown — it is always forwarded, and document sync no-ops it when no
+/// document was open for the path (e.g. a removed directory, or a removed
+/// ignored file that was never opened).
 pub fn document_changes(batch: &[Change]) -> Vec<DocumentChange> {
     let mut changes = Vec::new();
     for change in batch {
         match change {
-            Change::Added { path, entry } if entry.kind == rift_explorer::EntryKind::File => {
+            Change::Added { path, entry }
+                if entry.kind == rift_explorer::EntryKind::File && !entry.ignored =>
+            {
                 changes.push(DocumentChange::Created { path: path.clone() });
             }
-            Change::Changed { path, entry } if entry.kind == rift_explorer::EntryKind::File => {
+            Change::Changed { path, entry }
+                if entry.kind == rift_explorer::EntryKind::File && !entry.ignored =>
+            {
                 changes.push(DocumentChange::Modified { path: path.clone() });
             }
-            // A directory add/change carries no document.
+            // A directory add/change, or an ignored file, carries no document.
             Change::Added { .. } | Change::Changed { .. } => {}
             Change::Removed { path } => {
                 changes.push(DocumentChange::Removed { path: path.clone() });
@@ -635,6 +641,14 @@ mod tests {
         }
     }
 
+    fn ignored_file_entry() -> Entry {
+        Entry {
+            kind: EntryKind::File,
+            ignored: true,
+            mtime: SystemTime::UNIX_EPOCH,
+        }
+    }
+
     #[test]
     fn test_document_changes_maps_file_adds_and_changes_drops_dirs() {
         let batch = vec![
@@ -666,6 +680,44 @@ mod tests {
                 },
                 DocumentChange::Removed {
                     path: PathBuf::from("old.rs"),
+                },
+            ]
+        );
+    }
+
+    /// Invariant guard (#309): an ignored file's `Added`/`Changed` must never
+    /// drive a document change, now that the explorer snapshot includes
+    /// gitignored entries. A `Removed` for an ignored path still forwards (its
+    /// kind and ignored status are unknown at removal time) — document sync
+    /// no-ops it as a harmless `didClose` against a never-opened document.
+    #[test]
+    fn test_document_changes_filters_ignored_files_but_still_forwards_removed() {
+        let batch = vec![
+            Change::Added {
+                path: PathBuf::from("dist/bundle.js"),
+                entry: ignored_file_entry(),
+            },
+            Change::Changed {
+                path: PathBuf::from("dist/other.js"),
+                entry: ignored_file_entry(),
+            },
+            Change::Added {
+                path: PathBuf::from("src/main.rs"),
+                entry: file_entry(),
+            },
+            Change::Removed {
+                path: PathBuf::from("dist/gone.js"),
+            },
+        ];
+        let changes = document_changes(&batch);
+        assert_eq!(
+            changes,
+            vec![
+                DocumentChange::Created {
+                    path: PathBuf::from("src/main.rs"),
+                },
+                DocumentChange::Removed {
+                    path: PathBuf::from("dist/gone.js"),
                 },
             ]
         );
