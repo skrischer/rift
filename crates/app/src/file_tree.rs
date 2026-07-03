@@ -32,9 +32,10 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, px, App, Context, EventEmitter, FluentBuilder as _, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, SharedString, Size,
+    div, px, App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
+    IntoElement, ParentElement as _, Pixels, Render, SharedString, Size,
     StatefulInteractiveElement as _, Styled as _, Window,
 };
 use gpui_component::dock::{Panel, PanelEvent};
@@ -197,26 +198,31 @@ impl Rollup {
 /// collapse-filtered visible set, since a collapsed directory must still
 /// surface a hidden descendant's status.
 ///
-/// Relies on the same contiguous-subtree property of the sorted path map that
-/// [`FileTree::visible_rows`] does: because entries are keyed in a
-/// `BTreeMap`, a directory's descendants are exactly the run of paths sharing
-/// its `dir/` prefix that immediately follows it. That lets a stack of
-/// currently open ancestor directories be maintained by depth alone — an
-/// entry no deeper than the shallowest open ancestor means that ancestor's
-/// subtree has ended — and each entry's own decoration folds into every
-/// still-open ancestor as it is visited, with no per-row descendant walk.
+/// Tracks currently open ancestor directories by their `dir/` prefix, mirroring
+/// [`FileTree::visible_rows`]'s `skip_prefix` — *not* by depth. Depth alone is
+/// unsound: because entries are keyed by raw path string in a `BTreeMap`, a
+/// same-depth sibling whose name is the directory's name plus a byte less than
+/// `/` (0x2F) — most commonly a `.ext` sibling, e.g. `src.rs` next to `src` —
+/// sorts *between* the directory and its own children (`"src" < "src.rs" <
+/// "src/main.rs"`), so a pop keyed on depth drops the directory off the stack
+/// before its real descendants arrive. Popping is instead deferred until the
+/// current path has moved lexically *past* the ancestor's whole prefix range
+/// (`path > prefix` as well as failing `starts_with`) — a path that merely
+/// sorts before the range (like `src.rs`) does not evict its ancestor, and
+/// each entry only folds into an ancestor whose prefix it actually
+/// `starts_with`, so a non-descendant seen while an ancestor is still open
+/// (again, `src.rs`) is not mistakenly merged into it.
 fn compute_rollup(model: &WorktreeModel) -> HashMap<String, Rollup> {
     let mut result: HashMap<String, Rollup> = HashMap::new();
-    // Shallowest-first stack of ancestor directories whose subtree is still
-    // being iterated, paired with their depth.
-    let mut open_dirs: Vec<(usize, String)> = Vec::new();
+    // Shallowest-first stack of ancestor directories whose subtree may still
+    // contain upcoming entries, paired with their `dir/` prefix.
+    let mut open_dirs: Vec<(String, String)> = Vec::new();
 
     for (path, entry) in model.entries() {
-        let depth = path.bytes().filter(|&b| b == b'/').count();
-        while open_dirs
-            .last()
-            .is_some_and(|(open_depth, _)| *open_depth >= depth)
-        {
+        while let Some((prefix, _)) = open_dirs.last() {
+            if path.starts_with(prefix.as_str()) || path.as_str() < prefix.as_str() {
+                break;
+            }
             open_dirs.pop();
         }
 
@@ -227,13 +233,15 @@ fn compute_rollup(model: &WorktreeModel) -> HashMap<String, Rollup> {
             severity: own_severity(model, path),
         };
 
-        for (_, ancestor) in &open_dirs {
-            result.entry(ancestor.clone()).or_default().merge(own);
+        for (prefix, ancestor) in &open_dirs {
+            if path.starts_with(prefix.as_str()) {
+                result.entry(ancestor.clone()).or_default().merge(own);
+            }
         }
         result.entry(path.clone()).or_default().merge(own);
 
         if entry.kind == EntryKind::Dir {
-            open_dirs.push((depth, path.clone()));
+            open_dirs.push((format!("{path}/"), path.clone()));
         }
     }
 
@@ -1004,6 +1012,52 @@ mod tests {
                 git_status: Some(GitRollupStatus::Conflicted),
                 severity: None,
             }
+        );
+    }
+
+    #[test]
+    fn test_compute_rollup_not_confused_by_a_lexically_interleaved_sibling_file() {
+        // BTreeMap order is by raw path string, and `.` (0x2E) sorts below `/`
+        // (0x2F), so `src.rs` sorts *between* `src` and `src/main.rs`:
+        // "src" < "src.rs" < "src/main.rs". A depth-only open-ancestor stack
+        // mistakes `src.rs` (a same-depth sibling, not a descendant) for the
+        // end of `src`'s subtree and pops it prematurely, so `src/main.rs`'s
+        // error never rolls up to `src` (#329's regression).
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk(
+            "/proj".into(),
+            vec![dir("src"), file("src.rs"), file("src/main.rs")],
+            true,
+        );
+        model.apply_git_update(
+            vec![git_entry(
+                "src/main.rs",
+                GitStatusCode::Unmodified,
+                GitStatusCode::Modified,
+            )],
+            vec![],
+        );
+        model.apply_diagnostics(
+            "src/main.rs".into(),
+            "rust-analyzer".into(),
+            vec![diag(DiagnosticSeverity::Error)],
+        );
+
+        let rollup = compute_rollup(&model);
+
+        assert_eq!(
+            rollup.get("src").copied().unwrap_or_default(),
+            Rollup {
+                git_status: Some(GitRollupStatus::Changed),
+                severity: Some(DiagnosticSeverity::Error),
+            },
+            "src/main.rs's status and severity must roll up to its parent `src`, \
+             even with the lexically-interleaved sibling `src.rs` in between"
+        );
+        // The sibling file itself must stay uninvolved in `src`'s subtree.
+        assert_eq!(
+            rollup.get("src.rs").copied().unwrap_or_default(),
+            Rollup::default()
         );
     }
 
