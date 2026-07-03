@@ -149,6 +149,36 @@ impl DiffViewState {
     }
 }
 
+/// The action to take when a git-status tick's `changed`/`cleared` paths
+/// (`docs/spec-source-control.md`'s refresh semantics, issue #339) are checked
+/// against the diff view's currently open path: `Refresh` re-requests the
+/// diff (the open file is still in the changed set, so its on-disk content
+/// may have moved since the last reply); `Close` empties the view (the open
+/// file left the changed set entirely — e.g. a commit landed); `None` when
+/// neither list mentions the open path. Pure and GPUI-free so the decision is
+/// unit-testable headless, mirroring [`flatten_hunks`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitUpdateAction {
+    None,
+    Refresh,
+    Close,
+}
+
+/// Decide [`GitUpdateAction`] for `open_path` given one `UpdateGitStatus`
+/// tick's `changed`/`cleared` path lists. `Close` takes priority over
+/// `Refresh` if a path were ever listed in both (the daemon's
+/// `git_delta_messages` never does this — `changed` and `cleared` are
+/// disjoint by construction — but `Close` is the safer default if it did).
+fn git_update_action(open_path: &str, changed: &[String], cleared: &[String]) -> GitUpdateAction {
+    if cleared.iter().any(|path| path == open_path) {
+        GitUpdateAction::Close
+    } else if changed.iter().any(|path| path == open_path) {
+        GitUpdateAction::Refresh
+    } else {
+        GitUpdateAction::None
+    }
+}
+
 /// The diff view: a virtualized, read-only unified diff of the currently
 /// selected changed file, streamed from the daemon on request.
 pub struct DiffView {
@@ -194,6 +224,41 @@ impl DiffView {
             return;
         }
         self.state = DiffViewState::from_payload(diff);
+        cx.notify();
+    }
+
+    /// React to an `UpdateGitStatus` tick for the currently open diff's path
+    /// (`docs/spec-source-control.md`'s refresh semantics, #339): re-requests
+    /// the diff when the open path is still in `changed` (its content may
+    /// have moved since the last reply), closes the view when the open path
+    /// left the changed set entirely (`cleared` — e.g. a commit landed), and
+    /// is a no-op otherwise — including when no diff is open. Called by the
+    /// workspace after it folds an `UpdateGitStatus` onto the file tree's
+    /// model, alongside the existing re-request-on-reselection path
+    /// (`open_diff`, driven by `SourceControlEvent::OpenDiff`).
+    pub fn apply_git_update(
+        &mut self,
+        changed: &[String],
+        cleared: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        match git_update_action(&path, changed, cleared) {
+            GitUpdateAction::Refresh => self.open_diff(path, cx),
+            GitUpdateAction::Close => self.close(cx),
+            GitUpdateAction::None => {}
+        }
+    }
+
+    /// Empty the view and forget the open path: the file it was showing left
+    /// the changed set (e.g. a commit landed), so there is nothing left to
+    /// review. No request is sent — mirrors `open_diff`'s state assignment in
+    /// reverse, with no diff left to pull.
+    pub fn close(&mut self, cx: &mut Context<Self>) {
+        self.path = None;
+        self.state = DiffViewState::Empty;
         cx.notify();
     }
 
@@ -373,6 +438,7 @@ impl Render for DiffView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{AppContext as _, TestAppContext};
     use rift_protocol::DiffLine;
 
     fn line(kind: DiffLineKind, content: &str) -> DiffLine {
@@ -551,5 +617,152 @@ mod tests {
             DiffViewState::from_payload(FileDiffPayload::TooLarge),
             DiffViewState::TooLarge
         );
+    }
+
+    // --- git_update_action ---
+
+    #[test]
+    fn test_git_update_action_refreshes_when_open_path_is_still_changed() {
+        assert_eq!(
+            git_update_action("a.rs", &["a.rs".to_owned(), "b.rs".to_owned()], &[]),
+            GitUpdateAction::Refresh
+        );
+    }
+
+    #[test]
+    fn test_git_update_action_closes_when_open_path_left_the_changed_set() {
+        assert_eq!(
+            git_update_action("a.rs", &[], &["a.rs".to_owned()]),
+            GitUpdateAction::Close
+        );
+    }
+
+    #[test]
+    fn test_git_update_action_close_wins_when_open_path_is_in_both_lists() {
+        // Not a shape the daemon actually produces (`changed`/`cleared` are
+        // disjoint by construction), but `Close` is the safer default if it
+        // ever happened.
+        assert_eq!(
+            git_update_action("a.rs", &["a.rs".to_owned()], &["a.rs".to_owned()]),
+            GitUpdateAction::Close
+        );
+    }
+
+    #[test]
+    fn test_git_update_action_none_when_open_path_is_not_mentioned() {
+        assert_eq!(
+            git_update_action("a.rs", &["b.rs".to_owned()], &["c.rs".to_owned()]),
+            GitUpdateAction::None
+        );
+    }
+
+    #[test]
+    fn test_git_update_action_none_when_both_lists_are_empty() {
+        assert_eq!(git_update_action("a.rs", &[], &[]), GitUpdateAction::None);
+    }
+
+    // --- DiffView::apply_git_update / close ---
+
+    #[gpui::test]
+    fn test_apply_git_update_refreshes_the_still_open_path(cx: &mut TestAppContext) {
+        let (tx, rx) = flume::unbounded();
+        let diff_view = cx.update(|cx| cx.new(|cx| DiffView::new(tx, cx)));
+
+        cx.update(|cx| {
+            diff_view.update(cx, |view, cx| view.open_diff("a.rs".to_owned(), cx));
+        });
+        assert_eq!(
+            rx.try_recv().expect("open_diff sends the initial request"),
+            "a.rs"
+        );
+
+        cx.update(|cx| {
+            diff_view.update(cx, |view, cx| {
+                view.apply_git_update(&["a.rs".to_owned()], &[], cx);
+            });
+        });
+
+        assert_eq!(
+            rx.try_recv()
+                .expect("a change tick for the open path re-requests its diff"),
+            "a.rs"
+        );
+        cx.update(|cx| {
+            assert_eq!(diff_view.read(cx).path.as_deref(), Some("a.rs"));
+        });
+    }
+
+    #[gpui::test]
+    fn test_apply_git_update_closes_the_path_that_left_the_changed_set(cx: &mut TestAppContext) {
+        let (tx, rx) = flume::unbounded();
+        let diff_view = cx.update(|cx| cx.new(|cx| DiffView::new(tx, cx)));
+
+        cx.update(|cx| {
+            diff_view.update(cx, |view, cx| view.open_diff("a.rs".to_owned(), cx));
+        });
+        rx.try_recv().expect("open_diff sends the initial request");
+
+        cx.update(|cx| {
+            diff_view.update(cx, |view, cx| {
+                view.apply_git_update(&[], &["a.rs".to_owned()], cx);
+            });
+        });
+
+        assert!(
+            rx.try_recv().is_err(),
+            "leaving the changed set sends no new diff request"
+        );
+        cx.update(|cx| {
+            let view = diff_view.read(cx);
+            assert!(view.path.is_none());
+            assert_eq!(view.state, DiffViewState::Empty);
+        });
+    }
+
+    #[gpui::test]
+    fn test_apply_git_update_is_a_no_op_when_no_diff_is_open(cx: &mut TestAppContext) {
+        let (tx, rx) = flume::unbounded();
+        let diff_view = cx.update(|cx| cx.new(|cx| DiffView::new(tx, cx)));
+
+        cx.update(|cx| {
+            diff_view.update(cx, |view, cx| {
+                view.apply_git_update(&["a.rs".to_owned()], &["b.rs".to_owned()], cx);
+            });
+        });
+
+        assert!(
+            rx.try_recv().is_err(),
+            "no diff open means no request is sent"
+        );
+        cx.update(|cx| {
+            assert!(diff_view.read(cx).path.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn test_apply_git_update_ignores_a_tick_that_does_not_mention_the_open_path(
+        cx: &mut TestAppContext,
+    ) {
+        let (tx, rx) = flume::unbounded();
+        let diff_view = cx.update(|cx| cx.new(|cx| DiffView::new(tx, cx)));
+
+        cx.update(|cx| {
+            diff_view.update(cx, |view, cx| view.open_diff("a.rs".to_owned(), cx));
+        });
+        rx.try_recv().expect("open_diff sends the initial request");
+
+        cx.update(|cx| {
+            diff_view.update(cx, |view, cx| {
+                view.apply_git_update(&["other.rs".to_owned()], &["another.rs".to_owned()], cx);
+            });
+        });
+
+        assert!(
+            rx.try_recv().is_err(),
+            "an update naming unrelated paths sends no new request"
+        );
+        cx.update(|cx| {
+            assert_eq!(diff_view.read(cx).path.as_deref(), Some("a.rs"));
+        });
     }
 }

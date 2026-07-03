@@ -29,6 +29,10 @@
 //!   re-pushed to the editor as **inline markers** (#189, #353) — consuming the
 //!   existing client diagnostics model (#178), so a fixed error clears its
 //!   marker on the tab that owns it, even while that tab sits in the background.
+//!   After an `UpdateGitStatus` fold, the diff view's open path (if any) is
+//!   checked against `changed`/`cleared` — **live diff refresh** (#339): a tick
+//!   marking it still changed re-requests its diff, one dropping it from the
+//!   changed set (e.g. a commit) closes the view.
 //! - **Buffer reply** (`buffer_rx`): a `FileContent { path, content, mtime }`
 //!   loads into the [`EditorView`] (and that tab's inline diagnostics are
 //!   re-applied, since opening rebuilt its input); a `SaveResult` / `SaveConflict`
@@ -290,6 +294,19 @@ impl WorkspaceView {
                 let result = this.update_in(cx, |view, window, cx| {
                     let is_diagnostics = matches!(msg, DaemonMessage::Diagnostics { .. });
                     let is_repo_state = matches!(msg, DaemonMessage::RepoState { .. });
+                    // Live diff refresh (#339): pull the changed/cleared paths out
+                    // before `msg` moves into the fold below, so the diff view can
+                    // be reacted to afterward without a second pass over the model.
+                    let git_status_update = match &msg {
+                        DaemonMessage::UpdateGitStatus { changed, cleared } => Some((
+                            changed
+                                .iter()
+                                .map(|entry| entry.path.clone())
+                                .collect::<Vec<String>>(),
+                            cleared.clone(),
+                        )),
+                        _ => None,
+                    };
                     view.file_tree.update(cx, |tree, cx| {
                         apply_worktree_message(tree, msg);
                         cx.notify();
@@ -321,6 +338,14 @@ impl WorkspaceView {
                     // the diagnostics map.
                     if is_diagnostics {
                         view.push_diagnostics_for_open_tabs(cx);
+                    }
+                    // Live diff refresh (#339): a status tick that marks the open
+                    // diff's path changed re-requests it; one that drops it from
+                    // the changed set (e.g. a commit) closes the view instead.
+                    if let Some((changed, cleared)) = git_status_update {
+                        view.diff_view.update(cx, |diff_view, cx| {
+                            diff_view.apply_git_update(&changed, &cleared, cx);
+                        });
                     }
                 });
                 if result.is_err() {
