@@ -314,6 +314,12 @@ impl WorkspaceView {
                     // (#189) from the model the tree mirrors.
                     if loaded {
                         view.push_open_file_diagnostics(cx);
+                        // Reveal active file (#331): a `FileContent` load means
+                        // the editor just finished opening or switching to a
+                        // file — whether the open originated from a tree click
+                        // or a cross-file go-to-definition jump, both request
+                        // it over `open_file_tx` and land here.
+                        view.reveal_open_file_in_tree(cx);
                     }
                 });
                 if result.is_err() {
@@ -477,6 +483,28 @@ impl WorkspaceView {
             .unwrap_or_default();
         self.editor.update(cx, |editor, cx| {
             editor.set_diagnostics(&items, cx);
+        });
+    }
+
+    /// Reveal the editor's currently open file in the explorer tree (#331):
+    /// expand its ancestor directories, select its row, and scroll it into
+    /// view. Reads the open path the same way [`Self::push_open_file_diagnostics`]
+    /// does, rather than from the triggering daemon message, so it always
+    /// reflects the tab that is actually active once the load lands. A no-op
+    /// (via [`FileTree::reveal`]) when no file is open or the path is not
+    /// (yet) present in the tree's mirrored model.
+    fn reveal_open_file_in_tree(&self, cx: &mut Context<Self>) {
+        let Some(open_path) = self
+            .editor
+            .read(cx)
+            .open_path()
+            .map(std::borrow::ToOwned::to_owned)
+        else {
+            return;
+        };
+        self.file_tree.update(cx, |tree, cx| {
+            tree.reveal(&open_path);
+            cx.notify();
         });
     }
 

@@ -251,6 +251,48 @@ fn main() {
                 Some(rift_app::editor::EDITOR_KEY_CONTEXT),
             ),
         ]);
+        // Explorer keyboard navigation (#332): up/down move the selection,
+        // left/right collapse/expand (stepping to parent/first-child at the
+        // edges), Enter opens/toggles, Home/End jump to the first/last visible
+        // row. Scoped to the tree's own key context, so a focused terminal
+        // pane's keystrokes are never intercepted (agent-first).
+        cx.bind_keys([
+            KeyBinding::new(
+                "up",
+                rift_app::file_tree::SelectUp,
+                Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
+            ),
+            KeyBinding::new(
+                "down",
+                rift_app::file_tree::SelectDown,
+                Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
+            ),
+            KeyBinding::new(
+                "left",
+                rift_app::file_tree::CollapseOrSelectParent,
+                Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
+            ),
+            KeyBinding::new(
+                "right",
+                rift_app::file_tree::ExpandOrSelectChild,
+                Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
+            ),
+            KeyBinding::new(
+                "enter",
+                rift_app::file_tree::OpenSelected,
+                Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
+            ),
+            KeyBinding::new(
+                "home",
+                rift_app::file_tree::SelectFirst,
+                Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
+            ),
+            KeyBinding::new(
+                "end",
+                rift_app::file_tree::SelectLast,
+                Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
+            ),
+        ]);
         let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
         // Per-channel window title (matching the per-channel taskbar icons), so the
         // mirrored stable and dev instances are distinguishable in alt-tab and
