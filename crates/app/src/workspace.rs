@@ -58,6 +58,7 @@ use tracing::debug;
 use crate::editor::EditorView;
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::problems_panel::ProblemsPanel;
+use crate::source_control::SourceControlPanel;
 use crate::status_bar;
 use crate::terminal_panel::TerminalPanel;
 
@@ -118,11 +119,12 @@ pub struct WorkspaceView {
     /// the tokio side emits as `ClientMessage::OpenFile`.
     open_file_tx: Sender<String>,
     /// The dock shell (`docs/spec-ide-shell.md`, issue #324): explorer in the
-    /// left dock, editor|terminal split in the center, problems panel in the
-    /// (collapsed by default) bottom dock, right collapsed. Holds its own
-    /// strong references to the panel entities; this view keeps its own
-    /// handles too (`file_tree`, `editor`, `problems_panel` above) so the
-    /// daemon-stream bridges keep working unchanged after the layout refactor.
+    /// left dock, editor|terminal split in the center, source control in the
+    /// (collapsed by default) right dock, problems panel in the (collapsed by
+    /// default) bottom dock. Holds its own strong references to the panel
+    /// entities; this view keeps its own handles too (`file_tree`, `editor`,
+    /// `problems_panel` above) so the daemon-stream bridges keep working
+    /// unchanged after the layout refactor.
     dock_area: Entity<DockArea>,
 }
 
@@ -304,14 +306,17 @@ impl WorkspaceView {
         }
 
         // Dock shell (`docs/spec-ide-shell.md`, issue #324): explorer (left) +
-        // editor|terminal (center split) + problems panel (bottom, #342) +
-        // right dock present but collapsed, for phase 12 (source control) to
-        // dock into later with no layout rewrite. Built after the daemon-stream
+        // editor|terminal (center split) + source control (right, #337) +
+        // problems panel (bottom, #342). Built after the daemon-stream
         // bridges above so the panel entities they close over already exist.
         let dock_area = cx.new(|cx| DockArea::new("rift-dock", Some(1), window, cx));
         let weak_dock_area = dock_area.downgrade();
 
         let terminal_panel = cx.new(|_| TerminalPanel::new(session_view.clone()));
+        // Reads (never mutates) the file tree's mirrored `WorktreeModel` for its
+        // git status — the existing client git-status model, not a re-derived
+        // copy (`docs/spec-source-control.md`).
+        let source_control = cx.new(|cx| SourceControlPanel::new(file_tree.clone(), cx));
         let problems_panel = cx.new(|cx| ProblemsPanel::new(file_tree.clone(), cx));
 
         let left_item = DockItem::tab(file_tree.clone(), &weak_dock_area, window, cx);
@@ -324,11 +329,9 @@ impl WorkspaceView {
             window,
             cx,
         );
-        // Real, collapsed dock (not a placeholder view) — an empty `TabPanel`
-        // with zero panels, matching `Dock::new`'s own empty-dock shape. The
-        // bottom dock, in contrast, now carries the problems panel — real
-        // content, but still collapsed by default until the user opens it.
-        let right_item = DockItem::tabs(Vec::new(), &weak_dock_area, window, cx);
+        // Both real, collapsed docks (not placeholder views) — a single-tab
+        // `TabPanel`, collapsed by default until the user opens it.
+        let right_item = DockItem::tab(source_control, &weak_dock_area, window, cx);
         let bottom_item = DockItem::tab(problems_panel.clone(), &weak_dock_area, window, cx);
 
         dock_area.update(cx, |dock, cx| {
@@ -539,11 +542,22 @@ mod tests {
                 "explorer dock starts open"
             );
 
-            assert!(dock_area.right_dock().is_some(), "right dock must exist");
+            let right_dock = dock_area.right_dock().expect("right dock must exist");
             assert!(
                 !dock_area.is_dock_open(DockPlacement::Right, cx),
                 "right dock starts collapsed"
             );
+            match right_dock.read(cx).panel() {
+                DockItem::Tabs { items, .. } => {
+                    assert_eq!(items.len(), 1, "right dock holds the source-control panel");
+                    assert_eq!(
+                        items[0].panel_name(cx),
+                        crate::source_control::SOURCE_CONTROL_PANEL_NAME,
+                        "right dock's sole tab is the source-control panel"
+                    );
+                }
+                other => panic!("expected the right dock to hold a tabs item, got {other:?}"),
+            }
 
             assert!(dock_area.bottom_dock().is_some(), "bottom dock must exist");
             assert!(
