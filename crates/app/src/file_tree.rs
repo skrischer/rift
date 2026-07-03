@@ -326,7 +326,7 @@ fn first_child_path(rows: &[Row], index: usize) -> Option<&str> {
         return None;
     }
     let next = rows.get(index + 1)?;
-    (next.depth == row.depth + 1).then(|| next.path.as_str())
+    (next.depth == row.depth + 1).then_some(next.path.as_str())
 }
 
 /// The row selected after moving down one from `selected` (or the first row
