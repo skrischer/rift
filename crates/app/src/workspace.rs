@@ -21,33 +21,42 @@
 //!   diagnostics messages fold into the [`FileTree`]'s [`WorktreeModel`] so the
 //!   tree appears and updates live. (The tree only renders structure today;
 //!   git/diagnostics decoration on the tree is a later explorer-panel sub-spec,
-//!   but the model carries them already.) After each fold, the open path's new
-//!   snapshot `mtime` is handed to the editor as the **concurrent-write signal**
-//!   (#188): a clean buffer auto-reloads, a dirty one surfaces a conflict. After a
-//!   `Diagnostics` fold the open file's set is re-pushed to the editor as **inline
-//!   markers** (#189) — consuming the existing client diagnostics model (#178), so
-//!   a fixed error clears its marker.
+//!   but the model carries them already.) After each fold, every **open tab's**
+//!   path is checked against the fresh snapshot `mtime` and handed to the editor
+//!   as the **concurrent-write signal** (#188, fanned out per tab — #353): a
+//!   clean tab auto-reloads, a dirty one surfaces a conflict, independent of
+//!   which tab is active. After a `Diagnostics` fold every open tab's set is
+//!   re-pushed to the editor as **inline markers** (#189, #353) — consuming the
+//!   existing client diagnostics model (#178), so a fixed error clears its
+//!   marker on the tab that owns it, even while that tab sits in the background.
 //! - **Buffer reply** (`buffer_rx`): a `FileContent { path, content, mtime }`
-//!   loads into the [`EditorView`] (and its inline diagnostics are re-applied,
-//!   since opening rebuilt the input); a `SaveResult` / `SaveConflict` resolves a
-//!   save (commit the new base `mtime`, or surface the conflict without losing
-//!   the buffer).
+//!   loads into the [`EditorView`] (and that tab's inline diagnostics are
+//!   re-applied, since opening rebuilt its input); a `SaveResult` / `SaveConflict`
+//!   resolves a save on whichever tab holds `path` (commit the new base `mtime`,
+//!   or surface the conflict without losing the buffer) — not necessarily the
+//!   active tab, since a background dirty tab can save concurrently.
 //!
 //! The reverse path runs through three request channels. `open_file_tx` issues an
 //! `OpenFile` read: when the tree emits [`FileTreeEvent::OpenFile`] (or the editor
 //! auto-reloads), this view tells the editor to begin opening (arming its timeout)
 //! and sends the path to the tokio side. `save_file_tx` carries a `SaveFile` the
-//! editor builds from the open buffer on a [`crate::editor::Save`]. `buffer_change_tx`
-//! carries the **live-buffer feed** (#189): the editor sends `BufferChanged` on a
-//! debounced edit and `BufferClosed` on close / switch / save, so the daemon feeds
-//! the LSP the live buffer and an unsaved error surfaces without a save first. The
-//! daemon's read/write replies return on `buffer_rx`; diagnostics return on
-//! `worktree_rx` as `Diagnostics`.
+//! editor builds from the active tab's buffer on a [`crate::editor::Save`].
+//! `buffer_change_tx` carries the **live-buffer feed** (#189), driven **per dirty
+//! tab** (#353) — the daemon holds one live buffer per path
+//! (`crates/lsp/src/document.rs`), so several tabs can be live at once: the
+//! editor sends `BufferChanged` on a debounced edit and `BufferClosed` only on an
+//! actual tab close or a successful save, never on a mere tab switch, so the
+//! daemon feeds the LSP the live buffer and an unsaved error surfaces without a
+//! save first. The daemon's read/write replies return on `buffer_rx`; diagnostics
+//! return on `worktree_rx` as `Diagnostics`. Nav replies return on `nav_rx` and
+//! are routed to whichever tab's request `id` they answer (#196/#197/#198,
+//! #351) — never the merely-active tab, so a stale response for a superseded
+//! request can never land on the wrong tab.
 
 use flume::{Receiver, Sender};
 use gpui::{
-    div, px, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, Styled as _, Window,
+    div, px, AppContext as _, Axis, Context, Entity, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _, Window,
 };
 use gpui_component::dock::{DockArea, DockItem, DockPlacement};
 use gpui_component::{ActiveTheme as _, Root};
@@ -56,10 +65,11 @@ use rift_terminal::SessionView;
 use tracing::debug;
 
 use crate::command_palette::{CommandPalette, OpenCommandPalette};
+use crate::diff_view::DiffView;
 use crate::editor::EditorView;
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::problems_panel::{ProblemsPanel, ProblemsPanelEvent};
-use crate::source_control::SourceControlPanel;
+use crate::source_control::{SourceControlEvent, SourceControlPanel};
 use crate::status_bar;
 use crate::terminal_panel::TerminalPanel;
 
@@ -113,6 +123,11 @@ const RIGHT_DOCK_WIDTH: f32 = 240.0;
 /// Initial height of the (collapsed) bottom dock.
 const BOTTOM_DOCK_HEIGHT: f32 = 200.0;
 
+/// Initial height of the source-control panel within the right dock's
+/// top/bottom split (#338) — a compact changed-file list, leaving the
+/// remaining right-dock height to the diff view below it.
+const SOURCE_CONTROL_SPLIT_HEIGHT: f32 = 180.0;
+
 /// The flume endpoints the workspace consumes to bridge the daemon stream (run
 /// by the tokio side) onto its GPUI surfaces, plus the request endpoints it emits
 /// `OpenFile` / `SaveFile` on. Handed in at construction so `main.rs` owns the
@@ -127,6 +142,11 @@ pub struct WorkspaceChannels {
     /// Nav replies to route to the editor: `DefinitionResponse` (#196),
     /// `HoverResponse` (#197), `ReferencesResponse` (#198).
     pub nav_rx: Receiver<DaemonMessage>,
+    /// `StatusLineReply` replies to fold into the mirrored tmux status line's
+    /// render model (#221, `docs/spec-tmux-statusline-mirroring.md`).
+    pub status_line_rx: Receiver<DaemonMessage>,
+    /// `FileDiff` replies to route to the diff view (#338).
+    pub diff_rx: Receiver<DaemonMessage>,
     /// Read requests: the root-relative path of a file to open. The tokio side
     /// turns each into a `ClientMessage::OpenFile`.
     pub open_file_tx: Sender<String>,
@@ -139,6 +159,9 @@ pub struct WorkspaceChannels {
     pub buffer_change_tx: Sender<ClientMessage>,
     /// Navigation requests: `DefinitionRequest` (#196).
     pub nav_tx: Sender<ClientMessage>,
+    /// Diff pull requests: the root-relative path of a changed file to diff
+    /// (#338). The tokio side turns each into a `ClientMessage::RequestDiff`.
+    pub request_diff_tx: Sender<String>,
 }
 
 /// The composed app root.
@@ -158,16 +181,31 @@ pub struct WorkspaceView {
     // `--all-targets` build.
     #[allow(dead_code)]
     problems_panel: Entity<ProblemsPanel>,
+    /// Which status-bar render mode is active (#221): resolved once at
+    /// startup from `RIFT_STATUSLINE_MIRROR` and never changed at runtime —
+    /// the spec's v1 opt-in toggle, mutually exclusive with the native fields.
+    status_bar_mode: status_bar::StatusBarMode,
+    /// The mirrored tmux status line's current render model (#221), folded
+    /// from the daemon's `StatusLineReply` stream. Read only when
+    /// `status_bar_mode` is `Mirrored`; kept at its default (empty, no
+    /// leftover state) otherwise.
+    mirrored_status_line: status_bar::MirroredStatusLine,
+    /// The diff view (`docs/spec-source-control.md`, #338): renders the
+    /// `FileDiff` streamed for the source-control panel's selection. Kept as
+    /// its own field for the same reason as `problems_panel` above; the
+    /// open-diff subscription below reaches it through this field.
+    #[allow(dead_code)]
+    diff_view: Entity<DiffView>,
     /// Read-request sender: a tree open turns into a path on this channel, which
     /// the tokio side emits as `ClientMessage::OpenFile`.
     open_file_tx: Sender<String>,
     /// The dock shell (`docs/spec-ide-shell.md`, issue #324): explorer in the
-    /// left dock, editor|terminal split in the center, source control in the
-    /// (collapsed by default) right dock, problems panel in the (collapsed by
-    /// default) bottom dock. Holds its own strong references to the panel
-    /// entities; this view keeps its own handles too (`file_tree`, `editor`,
-    /// `problems_panel` above) so the daemon-stream bridges keep working
-    /// unchanged after the layout refactor.
+    /// left dock, editor|terminal split in the center, source control + diff
+    /// view (#338) split in the (collapsed by default) right dock, problems
+    /// panel in the (collapsed by default) bottom dock. Holds its own strong
+    /// references to the panel entities; this view keeps its own handles too
+    /// (`file_tree`, `editor`, `problems_panel`, `diff_view` above) so the
+    /// daemon-stream bridges keep working unchanged after the layout refactor.
     dock_area: Entity<DockArea>,
     /// The command palette (`docs/spec-command-palette.md`, issue #359): owns
     /// its `ListState` entity for the workspace's lifetime, so reopening it
@@ -191,10 +229,13 @@ impl WorkspaceView {
             worktree_rx,
             buffer_rx,
             nav_rx,
+            status_line_rx,
+            diff_rx,
             open_file_tx,
             save_file_tx,
             buffer_change_tx,
             nav_tx,
+            request_diff_tx,
         } = channels;
 
         let file_tree = cx.new(|_| FileTree::new());
@@ -258,20 +299,24 @@ impl WorkspaceView {
                     if is_repo_state || is_diagnostics {
                         cx.notify();
                     }
-                    // Concurrent-write signal (#188): after folding the structure
-                    // update, hand the editor the open path's new snapshot `mtime`.
-                    // The editor compares it against the buffer's base `mtime` and
-                    // auto-reloads (clean) or surfaces a conflict (dirty). Tapping
-                    // the model the tree already mirrors keeps the comparison
-                    // base-vs-snapshot — never an independent stat.
-                    view.notify_editor_of_open_path_mtime(window, cx);
-                    // Inline diagnostics (#189): after a diagnostics fold, re-push
-                    // the open file's full set to the editor so its inline markers
-                    // converge with the model (fixing an error clears the marker).
-                    // Only on a diagnostics message — the structure folds do not
-                    // touch the diagnostics map.
+                    // Concurrent-write signal (#188), fanned out per open tab
+                    // (#353): after folding the structure update, hand every open
+                    // tab its own path's new snapshot `mtime`. Each tab compares it
+                    // against its own buffer's base `mtime` and auto-reloads
+                    // (clean) or surfaces a conflict (dirty), independent of which
+                    // tab is active. Tapping the model the tree already mirrors
+                    // keeps the comparison base-vs-snapshot — never an independent
+                    // stat.
+                    view.notify_editor_of_open_paths_mtime(window, cx);
+                    // Inline diagnostics (#189), fanned out per open tab (#353):
+                    // after a diagnostics fold, re-push every open tab's full set
+                    // to the editor so each tab's inline markers converge with the
+                    // model (fixing an error clears the marker on the tab that
+                    // owns it, even while that tab sits in the background). Only
+                    // on a diagnostics message — the structure folds do not touch
+                    // the diagnostics map.
                     if is_diagnostics {
-                        view.push_open_file_diagnostics(cx);
+                        view.push_diagnostics_for_open_tabs(cx);
                     }
                 });
                 if result.is_err() {
@@ -309,11 +354,12 @@ impl WorkspaceView {
                         }
                         _ => {}
                     });
-                    // After a load the editor rebuilt its input with an empty
-                    // `DiagnosticSet`, so re-apply the open file's inline markers
-                    // (#189) from the model the tree mirrors.
+                    // After a load the editor rebuilt that tab's input with an
+                    // empty `DiagnosticSet`, so re-apply every open tab's inline
+                    // markers (#189, #353) from the model the tree mirrors — a
+                    // no-op for tabs whose diagnostics did not change.
                     if loaded {
-                        view.push_open_file_diagnostics(cx);
+                        view.push_diagnostics_for_open_tabs(cx);
                         // Reveal active file (#331): a `FileContent` load means
                         // the editor just finished opening or switching to a
                         // file — whether the open originated from a tree click
@@ -360,10 +406,71 @@ impl WorkspaceView {
             .detach();
         }
 
+        // Mirrored status line stream -> render model (#221): each
+        // `StatusLineReply` rebuilds the parsed left/right runs and the
+        // resolved base style, then a notify repaints the status bar (folded
+        // regardless of `status_bar_mode`, mirroring the nav/buffer loops
+        // above — the render branch, not this fold, is what makes the two
+        // modes exclusive). Routed through this view's weak handle so a
+        // closed window ends the loop gracefully.
+        {
+            cx.spawn(async move |this, cx| loop {
+                let Ok(msg) = status_line_rx.recv_async().await else {
+                    break;
+                };
+                let result = this.update(cx, |view, cx| {
+                    let DaemonMessage::StatusLineReply {
+                        options,
+                        status_left,
+                        status_right,
+                    } = msg
+                    else {
+                        return;
+                    };
+                    view.mirrored_status_line = status_bar::build_mirrored_status_line(
+                        &options,
+                        &status_left,
+                        &status_right,
+                    );
+                    cx.notify();
+                });
+                if result.is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
+
+        // Diff reply stream -> diff view (#338): `FileDiff` routes to
+        // `apply_file_diff`, which drops a reply for a path no longer open (the
+        // user moved on before it arrived). Routed through this view's weak
+        // handle so a closed window ends the loop gracefully, mirroring the nav
+        // reply bridge above.
+        {
+            cx.spawn_in(window, async move |this, cx| loop {
+                let Ok(msg) = diff_rx.recv_async().await else {
+                    break;
+                };
+                let result = this.update_in(cx, |view, _window, cx| {
+                    let DaemonMessage::FileDiff { path, diff } = msg else {
+                        return;
+                    };
+                    view.diff_view.update(cx, |diff_view, cx| {
+                        diff_view.apply_file_diff(path, diff, cx);
+                    });
+                });
+                if result.is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
+
         // Dock shell (`docs/spec-ide-shell.md`, issue #324): explorer (left) +
-        // editor|terminal (center split) + source control (right, #337) +
-        // problems panel (bottom, #342). Built after the daemon-stream
-        // bridges above so the panel entities they close over already exist.
+        // editor|terminal (center split) + source control + diff view split
+        // (right, #337, #338) + problems panel (bottom, #342). Built after the
+        // daemon-stream bridges above so the panel entities they close over
+        // already exist.
         let dock_area = cx.new(|cx| DockArea::new("rift-dock", Some(1), window, cx));
         let weak_dock_area = dock_area.downgrade();
 
@@ -372,7 +479,25 @@ impl WorkspaceView {
         // git status — the existing client git-status model, not a re-derived
         // copy (`docs/spec-source-control.md`).
         let source_control = cx.new(|cx| SourceControlPanel::new(file_tree.clone(), cx));
+        let diff_view = cx.new(|cx| DiffView::new(request_diff_tx, cx));
         let problems_panel = cx.new(|cx| ProblemsPanel::new(file_tree.clone(), cx));
+
+        // Open-diff wiring (#338): selecting a changed file in the
+        // source-control panel opens its diff in the diff view — the clean
+        // signal the panel emits (`SourceControlEvent::OpenDiff`), routed here
+        // so the diff view issues the `RequestDiff` and renders the reply.
+        // Mirrors the file tree's `OpenFile` subscription above.
+        cx.subscribe_in(
+            &source_control,
+            window,
+            |this, _panel, event: &SourceControlEvent, _window, cx| {
+                let SourceControlEvent::OpenDiff { path } = event;
+                this.diff_view.update(cx, |diff_view, cx| {
+                    diff_view.open_diff(path.clone(), cx);
+                });
+            },
+        )
+        .detach();
 
         // Jump-to-location (#343): selecting a diagnostic emits `OpenLocation`,
         // routed to the editor's thin `open_at_range` wrapper around the same
@@ -403,8 +528,22 @@ impl WorkspaceView {
             cx,
         );
         // Both real, collapsed docks (not placeholder views) — a single-tab
-        // `TabPanel`, collapsed by default until the user opens it.
-        let right_item = DockItem::tab(source_control, &weak_dock_area, window, cx);
+        // `TabPanel`, collapsed by default until the user opens it. The right
+        // dock is a vertical split (#338): the changed-file list stays compact
+        // on top, the diff view takes the remaining height below it — both
+        // signal panels visible together, matching the review flow (select a
+        // file, read its diff, without switching tabs).
+        let right_item = DockItem::split_with_sizes(
+            Axis::Vertical,
+            vec![
+                DockItem::tab(source_control, &weak_dock_area, window, cx),
+                DockItem::tab(diff_view.clone(), &weak_dock_area, window, cx),
+            ],
+            vec![Some(px(SOURCE_CONTROL_SPLIT_HEIGHT)), None],
+            &weak_dock_area,
+            window,
+            cx,
+        );
         let bottom_item = DockItem::tab(problems_panel.clone(), &weak_dock_area, window, cx);
 
         dock_area.update(cx, |dock, cx| {
@@ -421,78 +560,80 @@ impl WorkspaceView {
             editor,
             session_view,
             problems_panel,
+            status_bar_mode: status_bar::StatusBarMode::from_env(),
+            mirrored_status_line: status_bar::MirroredStatusLine::default(),
+            diff_view,
             open_file_tx,
             dock_area,
             command_palette,
         }
     }
 
-    /// Feed the editor the open path's current snapshot `mtime` as the
-    /// concurrent-write signal (#188). Looks the open path up in the file tree's
-    /// mirrored model — the same `mtime` the buffer's base is compared against —
-    /// and, when present, hands it to [`EditorView::note_external_change`]. A no-op
-    /// when no file is open or the open path is not (yet) in the tree.
-    fn notify_editor_of_open_path_mtime(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(open_path) = self
+    /// Feed every open tab its path's current snapshot `mtime` as the
+    /// concurrent-write signal (#188), fanned out per tab (#353): each open
+    /// path is looked up independently in the file tree's mirrored model —
+    /// the same `mtime` that tab's buffer base is compared against — and,
+    /// when present, handed to [`EditorView::note_external_change_for_path`].
+    /// A path not (yet) in the tree is left untouched; the editor itself
+    /// ignores a path with no open tab.
+    fn notify_editor_of_open_paths_mtime(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let open_paths: Vec<String> = self
             .editor
             .read(cx)
-            .open_path()
-            .map(std::borrow::ToOwned::to_owned)
-        else {
-            return;
-        };
-        let Some(mtime) = self
-            .file_tree
-            .read(cx)
-            .model()
-            .get(&open_path)
-            .map(|entry| entry.mtime)
-        else {
-            return;
-        };
-        self.editor.update(cx, |editor, cx| {
-            editor.note_external_change(mtime, window, cx);
-        });
+            .open_paths()
+            .map(str::to_owned)
+            .collect();
+        for path in open_paths {
+            let Some(mtime) = self.file_tree.read(cx).model().get(&path).map(|e| e.mtime) else {
+                continue;
+            };
+            self.editor.update(cx, |editor, cx| {
+                editor.note_external_change_for_path(&path, mtime, window, cx);
+            });
+        }
     }
 
-    /// Push the open file's full diagnostic set (aggregated across servers) from
-    /// the file tree's model onto the editor's inline markers (#189). Looks the
-    /// open path up in the same model the tree mirrors — the existing client
-    /// diagnostics layer (#178), consumed, not redesigned — and hands a flattened
-    /// `Vec<Diagnostic>` to [`EditorView::set_diagnostics`]. An open path with no
-    /// diagnostics applies an empty set, which clears every inline marker (so a
-    /// fixed error clears). A no-op when no file is open.
-    fn push_open_file_diagnostics(&self, cx: &mut Context<Self>) {
-        let Some(open_path) = self
+    /// Push every open tab's full diagnostic set (aggregated across servers)
+    /// from the file tree's model onto its inline markers (#189), fanned out
+    /// per tab (#353). Looks each open tab's path up in the same model the
+    /// tree mirrors — the existing client diagnostics layer (#178), consumed,
+    /// not redesigned — and hands a flattened `Vec<Diagnostic>` to
+    /// [`EditorView::set_diagnostics_for_path`]. An open tab with no
+    /// diagnostics applies an empty set, which clears its inline markers (so
+    /// a fixed error clears on the tab that owns it).
+    fn push_diagnostics_for_open_tabs(&self, cx: &mut Context<Self>) {
+        let open_paths: Vec<String> = self
             .editor
             .read(cx)
-            .open_path()
-            .map(std::borrow::ToOwned::to_owned)
-        else {
-            return;
-        };
-        // Flatten the per-server sets into one list — the editor renders all
-        // servers' diagnostics for the file together (a linter + a type-checker
-        // aggregate), mirroring the model's per-`(file, server)` keying.
-        let items: Vec<rift_protocol::Diagnostic> = self
-            .file_tree
-            .read(cx)
-            .model()
-            .diagnostics(&open_path)
-            .map(|by_server| by_server.values().flatten().cloned().collect())
-            .unwrap_or_default();
-        self.editor.update(cx, |editor, cx| {
-            editor.set_diagnostics(&items, cx);
-        });
+            .open_paths()
+            .map(str::to_owned)
+            .collect();
+        for path in open_paths {
+            // Flatten the per-server sets into one list — the editor renders
+            // all servers' diagnostics for the file together (a linter + a
+            // type-checker aggregate), mirroring the model's
+            // per-`(file, server)` keying.
+            let items: Vec<rift_protocol::Diagnostic> = self
+                .file_tree
+                .read(cx)
+                .model()
+                .diagnostics(&path)
+                .map(|by_server| by_server.values().flatten().cloned().collect())
+                .unwrap_or_default();
+            self.editor.update(cx, |editor, cx| {
+                editor.set_diagnostics_for_path(&path, &items, cx);
+            });
+        }
     }
 
     /// Reveal the editor's currently open file in the explorer tree (#331):
     /// expand its ancestor directories, select its row, and scroll it into
-    /// view. Reads the open path the same way [`Self::push_open_file_diagnostics`]
-    /// does, rather than from the triggering daemon message, so it always
-    /// reflects the tab that is actually active once the load lands. A no-op
-    /// (via [`FileTree::reveal`]) when no file is open or the path is not
-    /// (yet) present in the tree's mirrored model.
+    /// view. Reads the *active* tab's path (unlike the per-tab fan-out above,
+    /// this is a single-target UI concern — which file to reveal), rather
+    /// than from the triggering daemon message, so it always reflects the tab
+    /// that is actually active once the load lands. A no-op (via
+    /// [`FileTree::reveal`]) when no file is open or the path is not (yet)
+    /// present in the tree's mirrored model.
     fn reveal_open_file_in_tree(&self, cx: &mut Context<Self>) {
         let Some(open_path) = self
             .editor
@@ -610,13 +751,27 @@ impl Render for WorkspaceView {
         // workspace root, rather than scoped to a key context: they are
         // global commands the command palette dispatches regardless of which
         // panel currently has focus.
-        let model = self.file_tree.read(cx).model();
-        let status_bar = status_bar::render(
-            model.branch(),
-            model.ahead_behind(),
-            model.all_diagnostics(),
-            cx,
-        );
+        //
+        // Render mode (#221, `docs/spec-tmux-statusline-mirroring.md`): the
+        // native fields and the mirrored tmux status line are mutually
+        // exclusive branches, never composed. `status_bar_mode` is fixed for
+        // the process's lifetime (resolved once from an env var at
+        // construction), so this never toggles mid-session.
+        let status_bar = match self.status_bar_mode {
+            status_bar::StatusBarMode::Native => {
+                let model = self.file_tree.read(cx).model();
+                status_bar::render(
+                    model.branch(),
+                    model.ahead_behind(),
+                    model.all_diagnostics(),
+                    cx,
+                )
+                .into_any_element()
+            }
+            status_bar::StatusBarMode::Mirrored => {
+                status_bar::render_mirrored(&self.mirrored_status_line, cx).into_any_element()
+            }
+        };
 
         // `Root`'s overlay layers (issue #359, `docs/spec-command-palette.md`):
         // only the gallery rendered these before this issue, so no modal —
@@ -673,18 +828,24 @@ mod tests {
         let (_worktree_tx, worktree_rx) = flume::unbounded();
         let (_buffer_tx, buffer_rx) = flume::unbounded();
         let (_nav_reply_tx, nav_rx) = flume::unbounded();
+        let (_status_line_tx, status_line_rx) = flume::unbounded();
+        let (_diff_reply_tx, diff_rx) = flume::unbounded();
         let (open_file_tx, _open_file_rx) = flume::unbounded();
         let (save_file_tx, _save_file_rx) = flume::unbounded();
         let (buffer_change_tx, _buffer_change_rx) = flume::unbounded();
         let (nav_tx, _nav_request_rx) = flume::unbounded();
+        let (request_diff_tx, _request_diff_rx) = flume::unbounded();
         WorkspaceChannels {
             worktree_rx,
             buffer_rx,
             nav_rx,
+            status_line_rx,
+            diff_rx,
             open_file_tx,
             save_file_tx,
             buffer_change_tx,
             nav_tx,
+            request_diff_tx,
         }
     }
 
@@ -726,15 +887,36 @@ mod tests {
                 "right dock starts collapsed"
             );
             match right_dock.read(cx).panel() {
-                DockItem::Tabs { items, .. } => {
-                    assert_eq!(items.len(), 1, "right dock holds the source-control panel");
+                DockItem::Split { axis, items, .. } => {
                     assert_eq!(
-                        items[0].panel_name(cx),
-                        crate::source_control::SOURCE_CONTROL_PANEL_NAME,
-                        "right dock's sole tab is the source-control panel"
+                        *axis,
+                        Axis::Vertical,
+                        "source-control/diff split is vertical (#338)"
                     );
+                    assert_eq!(
+                        items.len(),
+                        2,
+                        "right dock holds source-control + diff view"
+                    );
+
+                    match &items[0] {
+                        DockItem::Tabs { items, .. } => assert_eq!(
+                            items[0].panel_name(cx),
+                            crate::source_control::SOURCE_CONTROL_PANEL_NAME,
+                            "right dock's top split is the source-control panel"
+                        ),
+                        other => panic!("expected a tabs item, got {other:?}"),
+                    }
+                    match &items[1] {
+                        DockItem::Tabs { items, .. } => assert_eq!(
+                            items[0].panel_name(cx),
+                            crate::diff_view::DIFF_VIEW_PANEL_NAME,
+                            "right dock's bottom split is the diff view"
+                        ),
+                        other => panic!("expected a tabs item, got {other:?}"),
+                    }
                 }
-                other => panic!("expected the right dock to hold a tabs item, got {other:?}"),
+                other => panic!("expected the right dock to hold a split, got {other:?}"),
             }
 
             assert!(dock_area.bottom_dock().is_some(), "bottom dock must exist");

@@ -20,11 +20,23 @@
 //! affordance: clicking a tab activates it and moves focus to its buffer;
 //! closing one removes it, activating the right neighbor (or the left if it
 //! was rightmost) — closing the last tab returns the editor to its empty
-//! state (#352). Dirty-close confirmation and the workspace-level signal
-//! fan-out across multiple open tabs (mtime / diagnostics routed by path)
-//! land in later steps; until then those two signals still resolve "the open
-//! file" as the active tab, preserving the single-buffer behavior as tabs'
-//! one-tab subset.
+//! state (#352). Dirty-close confirmation is a later step.
+//!
+//! # Workspace wiring fan-out (#353)
+//!
+//! [`crate::workspace::WorkspaceView`] fans the per-open-path daemon signals
+//! out across every open tab instead of a single assumed buffer: the mtime
+//! concurrent-write signal ([`EditorView::note_external_change_for_path`])
+//! and the inline diagnostics push
+//! ([`EditorView::set_diagnostics_for_path`]) both resolve the tab by path
+//! ([`EditorView::open_paths`] enumerates every open one), ignoring a signal
+//! for a path with no open tab. The live-buffer feed is already per-tab
+//! (`arm_buffer_feed` runs per index) and `BufferClosed` already fires only
+//! on `close_tab` / a successful save, never on `activate_tab` — so a
+//! background dirty tab's live buffer, and its diagnostics, survive a switch
+//! away from it. Nav responses already route by the id-owning tab
+//! (`latest_def_id` / `latest_hover_id` / `latest_ref_id`, #351) regardless
+//! of which tab is active when the reply lands.
 //!
 //! # Buffer channel (#187, #188)
 //!
@@ -42,9 +54,9 @@
 //!
 //! # Concurrent external change (#188)
 //!
-//! [`EditorView::note_external_change`] runs the pure [`decide_external_change`]
-//! decision on the active tab's snapshot `mtime`: a clean buffer auto-reloads;
-//! a dirty buffer surfaces a conflict.
+//! [`EditorView::note_external_change_for_path`] runs the pure
+//! [`decide_external_change`] decision on the addressed tab's snapshot
+//! `mtime`: a clean buffer auto-reloads; a dirty buffer surfaces a conflict.
 //!
 //! # Live-buffer feed (#189)
 //!
@@ -700,10 +712,17 @@ impl EditorView {
 
     // ── Diagnostics ───────────────────────────────────────────────────────
 
-    /// Replace the active tab's inline diagnostics with `items` (#189). A
-    /// no-op when no tab is open.
-    pub fn set_diagnostics(&mut self, items: &[Diagnostic], cx: &mut Context<Self>) {
-        let Some(index) = self.active else {
+    /// Replace the inline diagnostics for whichever tab holds `path` (#189),
+    /// fanned out per open path (`docs/spec-editor-tabs.md`, #353) rather
+    /// than only the active tab — so a background dirty tab's diagnostics
+    /// stay current too. A no-op when no tab holds `path`.
+    pub fn set_diagnostics_for_path(
+        &mut self,
+        path: &str,
+        items: &[Diagnostic],
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.tab_index_for_path(path) else {
             return;
         };
         let editor_items: Vec<EditorDiagnostic> = items.iter().map(to_editor_diagnostic).collect();
@@ -722,6 +741,14 @@ impl EditorView {
     /// The path of the active tab, if any is open.
     pub fn open_path(&self) -> Option<&str> {
         self.active_tab().map(|t| t.path.as_str())
+    }
+
+    /// The root-relative paths of every currently open tab, in open order.
+    /// Used by `WorkspaceView` to fan the per-path daemon signals (mtime,
+    /// diagnostics) out across every open tab instead of just the active one
+    /// (`docs/spec-editor-tabs.md`, #353).
+    pub fn open_paths(&self) -> impl Iterator<Item = &str> {
+        self.tabs.iter().map(|t| t.path.as_str())
     }
 
     /// The base `mtime` of the active tab's buffer.
@@ -875,9 +902,12 @@ impl EditorView {
 
     // ── Concurrent external change ────────────────────────────────────────
 
-    /// React to the worktree snapshot reporting a new `mtime` for the active
-    /// tab's path. Runs the pure [`decide_external_change`] decision and acts
-    /// on it. A no-op when no tab is open or loading.
+    /// React to the worktree snapshot reporting a new `mtime` for `path`.
+    /// Fanned out per open path (`docs/spec-editor-tabs.md`, #353): routed to
+    /// whichever tab holds `path`, not just the active one, so a background
+    /// tab auto-reloads or surfaces its own conflict independently. Runs the
+    /// pure [`decide_external_change`] decision and acts on it. A no-op when
+    /// no tab holds `path`, or that tab is not loaded.
     ///
     /// While a save is in flight (`SaveState::Saving`) the decision is
     /// suppressed: the save's own atomic write bumps the on-disk `mtime`, and
@@ -889,13 +919,14 @@ impl EditorView {
     /// authoritative reconciliation: it commits the new base `mtime` (so the
     /// now-stale worktree bump becomes `snapshot <= base` → `None`) or surfaces
     /// the genuine conflict itself.
-    pub fn note_external_change(
+    pub fn note_external_change_for_path(
         &mut self,
+        path: &str,
         snapshot_mtime: SystemTime,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self.active else {
+        let Some(index) = self.tab_index_for_path(path) else {
             return;
         };
         if !matches!(self.tabs[index].load_state, TabLoadState::Loaded) {
@@ -2225,6 +2256,256 @@ mod tests {
             ClientMessage::BufferChanged { path, .. } => assert_eq!(path, "b.rs"),
             other => panic!("expected BufferChanged for b.rs, got {other:?}"),
         }
+    }
+
+    // --- workspace wiring fan-out: mtime/diagnostics route by path (#353) ---
+
+    /// Build an `EditorView` inside a fresh window for the wiring-fan-out
+    /// tests below, returning the entity and the window handle so the caller
+    /// can drive further `editor.update` calls that need `window`. Channel
+    /// receivers the caller does not need are dropped inline at each call
+    /// site (mirroring `test_channels`, but exposing `open_file_rx` too,
+    /// which the mtime-reload tests below need to assert on).
+    #[allow(clippy::type_complexity)] // test-only channel bundle
+    fn build_test_editor(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<EditorView>,
+        gpui::WindowHandle<gpui_component::Root>,
+        flume::Receiver<String>,
+    ) {
+        let (open_file_tx, open_file_rx) = flume::unbounded();
+        let (save_file_tx, _save_file_rx) = flume::unbounded();
+        let (buffer_change_tx, _buffer_change_rx) = flume::unbounded();
+        let (nav_tx, _nav_rx) = flume::unbounded();
+
+        let mut editor: Option<Entity<EditorView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                editor = Some(cx.new(|cx| {
+                    EditorView::new(
+                        open_file_tx,
+                        save_file_tx,
+                        buffer_change_tx,
+                        nav_tx,
+                        window,
+                        cx,
+                    )
+                }));
+                cx.new(|cx| gpui_component::Root::new(editor.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let editor = editor.expect("editor constructed inside the window callback");
+        (editor, window, open_file_rx)
+    }
+
+    /// Acceptance (#353): "mtime/diagnostics for a path route to the tab
+    /// holding it (asserted with several tabs open)". A clean background
+    /// tab's path getting a newer snapshot `mtime` must auto-reload *that*
+    /// tab, re-issuing its `OpenFile` — the active tab (a different path)
+    /// must stay untouched, proving the signal is routed by path, not by
+    /// "whichever tab happens to be active" (the pre-fan-out behavior).
+    #[gpui::test]
+    fn test_note_external_change_for_path_reloads_the_tab_holding_the_path_not_the_active_one(
+        cx: &mut TestAppContext,
+    ) {
+        let (editor, window, open_file_rx) = build_test_editor(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    let b = editor.push_tab("b.rs".into(), false, window, cx);
+                    editor.tabs[a].load_state = TabLoadState::Loaded;
+                    editor.tabs[a].base_mtime = Some(at(100));
+                    editor.tabs[b].load_state = TabLoadState::Loaded;
+                    editor.tabs[b].base_mtime = Some(at(100));
+                    // b.rs is active; the signal below addresses a.rs, a
+                    // background tab.
+                    editor.active = Some(b);
+
+                    editor.note_external_change_for_path("a.rs", at(200), window, cx);
+
+                    assert!(
+                        matches!(editor.tabs[a].load_state, TabLoadState::Loading),
+                        "a.rs (clean, newer snapshot) must auto-reload"
+                    );
+                    assert!(
+                        matches!(editor.tabs[b].load_state, TabLoadState::Loaded),
+                        "b.rs, the active tab but an untouched path, must not reload"
+                    );
+                });
+            })
+            .unwrap();
+
+        let path = open_file_rx
+            .try_recv()
+            .expect("the reload must re-issue an OpenFile for a.rs");
+        assert_eq!(path, "a.rs");
+    }
+
+    /// Acceptance (#353): the same routing, but for the dirty (conflict)
+    /// branch of the mtime signal — a background dirty tab surfaces its own
+    /// conflict without disturbing the active tab's save state.
+    #[gpui::test]
+    fn test_note_external_change_for_path_conflicts_the_dirty_tab_holding_the_path_leaving_others_untouched(
+        cx: &mut TestAppContext,
+    ) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    let b = editor.push_tab("b.rs".into(), false, window, cx);
+                    editor.tabs[a].load_state = TabLoadState::Loaded;
+                    editor.tabs[a].base_mtime = Some(at(100));
+                    editor.tabs[a].dirty = true;
+                    editor.tabs[b].load_state = TabLoadState::Loaded;
+                    editor.tabs[b].base_mtime = Some(at(100));
+                    editor.active = Some(b);
+
+                    editor.note_external_change_for_path("a.rs", at(200), window, cx);
+
+                    assert!(
+                        matches!(editor.tabs[a].save_state, SaveState::Conflict),
+                        "dirty a.rs with a newer snapshot must surface a conflict"
+                    );
+                    assert!(
+                        matches!(editor.tabs[a].load_state, TabLoadState::Loaded),
+                        "a conflict keeps the buffer — it must not reload over unsaved edits"
+                    );
+                    assert!(
+                        matches!(editor.tabs[b].save_state, SaveState::Idle),
+                        "b.rs, an untouched path, must not surface a conflict"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// Acceptance (#353): "a signal for a path with no open tab is ignored,
+    /// not an error" (constitution: no `.unwrap()` panics on absent state).
+    #[gpui::test]
+    fn test_note_external_change_for_path_ignores_a_path_with_no_open_tab(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    editor.tabs[a].load_state = TabLoadState::Loaded;
+                    editor.tabs[a].base_mtime = Some(at(100));
+                    editor.active = Some(a);
+
+                    editor.note_external_change_for_path("missing.rs", at(200), window, cx);
+
+                    assert!(
+                        matches!(editor.tabs[a].load_state, TabLoadState::Loaded),
+                        "a signal for an unopened path must not touch a.rs"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// Acceptance (#353): diagnostics for a path route to the tab holding it,
+    /// not the active tab — the same routing discipline as the mtime signal,
+    /// so a background tab's inline markers converge with the model even
+    /// while another tab is active.
+    #[gpui::test]
+    fn test_set_diagnostics_for_path_routes_to_the_tab_holding_the_path_not_the_active_one(
+        cx: &mut TestAppContext,
+    ) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    let b = editor.push_tab("b.rs".into(), false, window, cx);
+                    editor.tabs[a].load_state = TabLoadState::Loaded;
+                    editor.tabs[b].load_state = TabLoadState::Loaded;
+                    editor.active = Some(b);
+
+                    let items = vec![proto_diag(DiagnosticSeverity::Error, None, None)];
+                    editor.set_diagnostics_for_path("a.rs", &items, cx);
+
+                    let a_len = editor.tabs[a]
+                        .input
+                        .read(cx)
+                        .diagnostics()
+                        .map(gpui_component::highlighter::DiagnosticSet::len)
+                        .unwrap_or(0);
+                    let b_len = editor.tabs[b]
+                        .input
+                        .read(cx)
+                        .diagnostics()
+                        .map(gpui_component::highlighter::DiagnosticSet::len)
+                        .unwrap_or(0);
+                    assert_eq!(a_len, 1, "a.rs must receive its own diagnostic");
+                    assert_eq!(
+                        b_len, 0,
+                        "b.rs, the active tab but an untouched path, must not receive it"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// Acceptance (#353): a diagnostics push for a path with no open tab is
+    /// silently ignored.
+    #[gpui::test]
+    fn test_set_diagnostics_for_path_ignores_a_path_with_no_open_tab(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    editor.tabs[a].load_state = TabLoadState::Loaded;
+                    editor.active = Some(a);
+
+                    let items = vec![proto_diag(DiagnosticSeverity::Error, None, None)];
+                    editor.set_diagnostics_for_path("missing.rs", &items, cx);
+
+                    let a_len = editor.tabs[a]
+                        .input
+                        .read(cx)
+                        .diagnostics()
+                        .map(gpui_component::highlighter::DiagnosticSet::len)
+                        .unwrap_or(0);
+                    assert_eq!(
+                        a_len, 0,
+                        "a signal for an unopened path must not touch a.rs"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// `open_paths` is what `WorkspaceView` iterates to fan mtime/diagnostics
+    /// out — it must list every open tab, in open order, regardless of which
+    /// is active.
+    #[gpui::test]
+    fn test_open_paths_lists_every_open_tab_in_open_order(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.push_tab("a.rs".into(), false, window, cx);
+                    editor.push_tab("b.rs".into(), false, window, cx);
+                    editor.push_tab("c.rs".into(), false, window, cx);
+                    editor.active = Some(0);
+
+                    let paths: Vec<&str> = editor.open_paths().collect();
+                    assert_eq!(paths, vec!["a.rs", "b.rs", "c.rs"]);
+                });
+            })
+            .unwrap();
     }
 
     // --- inline-diagnostic translation (#189) ---

@@ -8,12 +8,22 @@
 //! folds) — the shared `DiagnosticSeverity` derives no `Ord`, so the counting
 //! (unlike `problems_panel`'s sorted grouping) needs no ordinal, just a match
 //! per item.
+//!
+//! [`render`] is one of the two exclusive render modes
+//! (`docs/spec-tmux-statusline-mirroring.md`, #221); [`StatusBarMode`] selects
+//! between it and [`render_mirrored`], the mirrored tmux status line built
+//! from [`MirroredStatusLine`]. The two never compose.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 
-use gpui::{div, px, App, IntoElement, ParentElement as _, Styled as _};
+use gpui::{div, px, App, FontWeight, Hsla, IntoElement, ParentElement as _, Styled as _};
 use gpui_component::ActiveTheme as _;
 use rift_protocol::{AheadBehind, Diagnostic, DiagnosticSeverity};
+use rift_terminal::{
+    parse_status_options, parse_style, parse_style_runs, truncate_runs, ResolvedColor, StatusStyle,
+    StyleRun,
+};
 
 /// Fixed height of the status bar strip, in pixels — a thin single row, never
 /// competing with the dock area for vertical space.
@@ -132,6 +142,194 @@ pub fn render(
         Some(text) => bar.child(div().text_color(counts_color).child(text)),
         None => bar,
     }
+}
+
+/// Env var enabling the mirrored tmux status line (the spec's `RIFT_*`
+/// opt-in toggle, `docs/spec-tmux-statusline-mirroring.md`).
+const MIRROR_ENV_VAR: &str = "RIFT_STATUSLINE_MIRROR";
+
+/// Which render mode the status bar uses: the native Phase 2d fields (this
+/// module's default `render`) or the mirrored tmux status line
+/// ([`render_mirrored`]) — mutually exclusive, resolved once at startup; the
+/// two never compose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusBarMode {
+    Native,
+    Mirrored,
+}
+
+impl StatusBarMode {
+    /// Resolve the mode from [`MIRROR_ENV_VAR`]: any non-empty value selects
+    /// the mirrored render, matching the `RIFT_TERMINAL_LEGACY` escape-hatch
+    /// convention elsewhere in the app. Read once at startup — a launch-time
+    /// mode switch, not a live UI toggle (the spec's v1 scope).
+    pub fn from_env() -> Self {
+        Self::resolve(std::env::var_os(MIRROR_ENV_VAR))
+    }
+
+    fn resolve(var: Option<OsString>) -> Self {
+        if var.is_some_and(|v| !v.is_empty()) {
+            Self::Mirrored
+        } else {
+            Self::Native
+        }
+    }
+}
+
+/// The mirrored tmux status line's render model (#221): the resolved
+/// `status-style` base plus the parsed, length-truncated runs for the left
+/// and right segments — everything [`render_mirrored`] needs. Carries no GPUI
+/// state, so building it from a raw `StatusLineReply` stays unit-testable
+/// without a GPUI context. The default (empty runs, the theme-deferring base
+/// style) is what renders before the first reply arrives — never a blanked
+/// bar, never a panic.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MirroredStatusLine {
+    pub base: StatusStyle,
+    pub left: Vec<StyleRun>,
+    pub right: Vec<StyleRun>,
+}
+
+/// Build the render model from a `StatusLineReply`'s three raw strings: the
+/// `show-options -A` output and the two server-side-expanded segments
+/// (`docs/spec-tmux-statusline-mirroring.md`). `status-style` resolves to the
+/// base every run starts from and `#[default]` resets to; each segment is
+/// then parsed and truncated to its own `status-*-length`.
+pub fn build_mirrored_status_line(
+    options: &str,
+    status_left: &str,
+    status_right: &str,
+) -> MirroredStatusLine {
+    let options = parse_status_options(options);
+    let base = parse_style(&options.status_style);
+    let left = truncate_runs(
+        parse_style_runs(status_left, base),
+        options.status_left_length,
+    );
+    let right = truncate_runs(
+        parse_style_runs(status_right, base),
+        options.status_right_length,
+    );
+    MirroredStatusLine { base, left, right }
+}
+
+/// Resolve a tmux color token against the active theme: `ResolvedColor::Theme`
+/// (tmux `default`/`terminal`, or a style option itself left at `default`)
+/// defers to `theme_color`; a concrete `ResolvedColor::Color` wins outright.
+/// Re-run on every render, so a theme switch re-resolves `default` colors
+/// live.
+fn resolve_color(color: ResolvedColor, theme_color: Hsla) -> Hsla {
+    match color {
+        ResolvedColor::Theme => theme_color,
+        ResolvedColor::Color(hsla) => hsla,
+    }
+}
+
+/// One status-line run's fully resolved render data: colors resolved against
+/// the theme, attributes mapped to their GPUI-facing form — before it becomes
+/// a `div`. Kept as its own step so the `StyleRun` -> render mapping is
+/// unit-testable without a GPUI context. `blink` and `overline` have no
+/// static-frame GPUI equivalent and are accepted no-ops here, mirroring how
+/// `acs` is a no-op in the parser.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ResolvedSpan {
+    fg: Hsla,
+    bg: Hsla,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
+    opacity: f32,
+}
+
+fn resolve_span(style: &StatusStyle, base_fg: Hsla, base_bg: Hsla) -> ResolvedSpan {
+    let fg = resolve_color(style.fg, base_fg);
+    let bg = resolve_color(style.bg, base_bg);
+    // tmux's `reverse` swaps the resolved fg/bg pair, not the tokens
+    // themselves — mirroring the terminal cell renderer's own inverse handling
+    // (`rift_terminal::pane_view::extract_row_cells`).
+    let (fg, bg) = if style.attrs.reverse {
+        (bg, fg)
+    } else {
+        (fg, bg)
+    };
+    let opacity = if style.attrs.hidden {
+        0.0
+    } else if style.attrs.dim {
+        0.6
+    } else {
+        1.0
+    };
+    ResolvedSpan {
+        fg,
+        bg,
+        bold: style.attrs.bold,
+        italic: style.attrs.italic,
+        underline: style.attrs.underline,
+        strikethrough: style.attrs.strikethrough,
+        opacity,
+    }
+}
+
+/// Turn one resolved run into a styled `div`, applying only the attributes it
+/// actually sets (leaving GPUI's defaults otherwise).
+fn styled_run(run: &StyleRun, base_fg: Hsla, base_bg: Hsla) -> impl IntoElement {
+    let span = resolve_span(&run.style, base_fg, base_bg);
+    let mut el = div()
+        .text_color(span.fg)
+        .bg(span.bg)
+        .opacity(span.opacity)
+        .child(run.text.clone());
+    if span.bold {
+        el = el.font_weight(FontWeight::BOLD);
+    }
+    if span.italic {
+        el = el.italic();
+    }
+    if span.underline {
+        el = el.underline();
+    }
+    if span.strikethrough {
+        el = el.line_through();
+    }
+    el
+}
+
+/// Render the mirrored tmux status line (#221): the left segment's runs, a
+/// flexible spacer, then the right segment's runs — the exclusive alternative
+/// to [`render`] selected by [`StatusBarMode::Mirrored`]. `status-style`
+/// paints the bar's own background/foreground; `default` colors (in the base
+/// or any run) resolve against `cx.theme()`, so a theme switch re-resolves
+/// them live on the next render.
+pub fn render_mirrored(mirrored: &MirroredStatusLine, cx: &App) -> impl IntoElement {
+    let base_fg = resolve_color(mirrored.base.fg, cx.theme().foreground);
+    let base_bg = resolve_color(mirrored.base.bg, cx.theme().background);
+
+    div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .w_full()
+        .h(px(HEIGHT))
+        .px(px(8.0))
+        .border_t_1()
+        .border_color(cx.theme().border)
+        .bg(base_bg)
+        .text_xs()
+        .text_color(base_fg)
+        .children(
+            mirrored
+                .left
+                .iter()
+                .map(|run| styled_run(run, base_fg, base_bg)),
+        )
+        .child(div().flex_1())
+        .children(
+            mirrored
+                .right
+                .iter()
+                .map(|run| styled_run(run, base_fg, base_bg)),
+        )
 }
 
 #[cfg(test)]
@@ -307,5 +505,131 @@ mod tests {
             diagnostics_text(2, 3),
             Some("2 errors, 3 warnings".to_owned())
         );
+    }
+
+    // --- mirrored status line toggle + render model (#221) ---
+
+    #[test]
+    fn test_status_bar_mode_resolve_absent_var_is_native() {
+        assert_eq!(StatusBarMode::resolve(None), StatusBarMode::Native);
+    }
+
+    #[test]
+    fn test_status_bar_mode_resolve_empty_var_is_native() {
+        assert_eq!(
+            StatusBarMode::resolve(Some(OsString::from(""))),
+            StatusBarMode::Native
+        );
+    }
+
+    #[test]
+    fn test_status_bar_mode_resolve_nonempty_var_is_mirrored() {
+        assert_eq!(
+            StatusBarMode::resolve(Some(OsString::from("1"))),
+            StatusBarMode::Mirrored
+        );
+    }
+
+    #[test]
+    fn test_build_mirrored_status_line_resolves_base_and_truncates_segments() {
+        let options = "\
+status-style bg=colour234,fg=colour253
+status-left-length 3
+status-right-length 40
+";
+        let mirrored = build_mirrored_status_line(options, "#[fg=green]hello", "#[fg=yellow]world");
+
+        assert_eq!(mirrored.base, parse_style("bg=colour234,fg=colour253"));
+        assert_eq!(mirrored.left.len(), 1);
+        assert_eq!(mirrored.left[0].text, "hel");
+        assert_eq!(mirrored.right.len(), 1);
+        assert_eq!(mirrored.right[0].text, "world");
+    }
+
+    #[test]
+    fn test_build_mirrored_status_line_defaults_on_empty_input() {
+        let mirrored = build_mirrored_status_line("", "", "");
+        assert_eq!(mirrored.base, StatusStyle::default());
+        assert!(mirrored.left.is_empty());
+        assert!(mirrored.right.is_empty());
+    }
+
+    fn hsla(l: f32) -> Hsla {
+        Hsla {
+            h: 0.0,
+            s: 0.0,
+            l,
+            a: 1.0,
+        }
+    }
+
+    #[test]
+    fn test_resolve_color_theme_defers_to_theme_color() {
+        let theme = hsla(0.5);
+        assert_eq!(resolve_color(ResolvedColor::Theme, theme), theme);
+    }
+
+    #[test]
+    fn test_resolve_color_concrete_color_wins_over_theme() {
+        let concrete = hsla(0.2);
+        assert_eq!(
+            resolve_color(ResolvedColor::Color(concrete), hsla(0.9)),
+            concrete
+        );
+    }
+
+    #[test]
+    fn test_resolve_span_reverse_swaps_fg_and_bg() {
+        let mut style = StatusStyle {
+            fg: ResolvedColor::Color(hsla(0.1)),
+            bg: ResolvedColor::Color(hsla(0.8)),
+            ..Default::default()
+        };
+        style.attrs.reverse = true;
+        let span = resolve_span(&style, hsla(0.0), hsla(1.0));
+        assert_eq!(span.fg, hsla(0.8));
+        assert_eq!(span.bg, hsla(0.1));
+    }
+
+    #[test]
+    fn test_resolve_span_hidden_overrides_dim_to_zero_opacity() {
+        let mut style = StatusStyle::default();
+        style.attrs.dim = true;
+        style.attrs.hidden = true;
+        let span = resolve_span(&style, hsla(0.0), hsla(1.0));
+        assert_eq!(span.opacity, 0.0);
+    }
+
+    #[test]
+    fn test_resolve_span_dim_alone_reduces_opacity() {
+        let mut style = StatusStyle::default();
+        style.attrs.dim = true;
+        let span = resolve_span(&style, hsla(0.0), hsla(1.0));
+        assert_eq!(span.opacity, 0.6);
+    }
+
+    #[test]
+    fn test_resolve_span_no_attrs_is_full_opacity_no_flags() {
+        let style = StatusStyle::default();
+        let span = resolve_span(&style, hsla(0.0), hsla(1.0));
+        assert_eq!(span.opacity, 1.0);
+        assert!(!span.bold);
+        assert!(!span.italic);
+        assert!(!span.underline);
+        assert!(!span.strikethrough);
+    }
+
+    #[test]
+    fn test_resolve_span_passes_through_bold_italic_underline_strikethrough() {
+        let mut style = StatusStyle::default();
+        style.attrs.bold = true;
+        style.attrs.italic = true;
+        style.attrs.underline = true;
+        style.attrs.strikethrough = true;
+        let span = resolve_span(&style, hsla(0.0), hsla(1.0));
+        assert!(span.bold);
+        assert!(span.italic);
+        assert!(span.underline);
+        assert!(span.strikethrough);
     }
 }
