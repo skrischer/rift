@@ -3,7 +3,12 @@
 //!
 //! The [`WorktreeModel`] is a flat `path -> entry` map (snapshot as source of
 //! truth). This view derives a depth-annotated, collapse-aware *visible row*
-//! list from it on demand, renders that list virtualized via `gpui-component`'s
+//! list from it and caches it (the zed `EntryDetails` pattern): a model fold
+//! (via [`FileTree::model_mut`]), a collapse toggle, or a selection change
+//! marks the cache dirty, and it is rebuilt once, on the next render — not on
+//! every paint, which used to run the derivation twice per frame (once for
+//! sizing, once inside the virtual list's row closure) and froze interaction.
+//! It renders that cached list virtualized via `gpui-component`'s
 //! [`v_virtual_list`] (so a directory with thousands of entries paints only the
 //! rows on screen), and lets the user expand/collapse directories and select a
 //! file.
@@ -60,9 +65,11 @@ pub enum FileTreeEvent {
     OpenFile { path: String },
 }
 
-/// One rendered row: an entry path, its kind, and its nesting depth. Derived
-/// fresh from the model each render — never stored, so it can never drift from
-/// the snapshot.
+/// One rendered row: an entry path, its kind, and its nesting depth. Built by
+/// [`FileTree::visible_rows`] and held in [`FileTree::row_cache`]; the cache is
+/// always a wholesale replacement of a fresh build (never mutated in place),
+/// so it can never drift from the snapshot.
+#[derive(Debug, PartialEq)]
 struct Row {
     path: String,
     kind: EntryKind,
@@ -88,6 +95,21 @@ pub struct FileTree {
     /// the plain [`FileTree::new`] does not take, so the tree stays constructible
     /// without a GPUI context for the headless model tests below).
     focus_handle: RefCell<Option<FocusHandle>>,
+    /// The precomputed decorated-row cache: the depth-annotated visible-row
+    /// list, rebuilt from the model by [`FileTree::refresh_row_cache`] only
+    /// when [`FileTree::cache_dirty`] is set. `render()` and the virtual
+    /// list's row closure both read this field directly — neither calls
+    /// [`FileTree::visible_rows`] itself, which is what running twice per
+    /// paint used to freeze interaction on.
+    row_cache: Vec<Row>,
+    /// Set whenever something that changes the visible-row list happens —
+    /// [`FileTree::model_mut`] (any model fold), [`FileTree::toggle_dir`], or a
+    /// selection change — and cleared by [`FileTree::refresh_row_cache`] once
+    /// it rebuilds [`FileTree::row_cache`] from the fresh state. Marking dirty
+    /// inside `model_mut` itself (rather than at each of its callers) means a
+    /// fold can never forget to invalidate the cache: there is no other way to
+    /// mutate the model.
+    cache_dirty: bool,
 }
 
 impl FileTree {
@@ -100,6 +122,8 @@ impl FileTree {
             selected: None,
             scroll_handle: VirtualListScrollHandle::new(),
             focus_handle: RefCell::new(None),
+            row_cache: Vec::new(),
+            cache_dirty: true,
         }
     }
 
@@ -112,7 +136,13 @@ impl FileTree {
     /// snapshots and updates into it. The caller must `cx.notify()` afterwards
     /// to repaint; pruning of collapse/selection state against the new tree
     /// happens lazily at render time, so no extra bookkeeping is needed here.
+    ///
+    /// Marks the row cache dirty unconditionally: this is the only way to
+    /// mutate the model, so every fold site (snapshot / update / git / repo /
+    /// diagnostics in `workspace.rs`) invalidates through this one seam
+    /// without having to remember to do so itself.
     pub fn model_mut(&mut self) -> &mut WorktreeModel {
+        self.cache_dirty = true;
         &mut self.model
     }
 
@@ -131,6 +161,20 @@ impl FileTree {
     fn toggle_dir(&mut self, path: &str) {
         if !self.collapsed.remove(path) {
             self.collapsed.insert(path.to_owned());
+        }
+        // Collapsing/expanding changes which paths are in the visible-row set.
+        self.cache_dirty = true;
+    }
+
+    /// Rebuild [`FileTree::row_cache`] from the model when [`FileTree::cache_dirty`]
+    /// is set; a no-op otherwise. The single path that calls
+    /// [`FileTree::visible_rows`] — `render()` calls this once per paint instead
+    /// of deriving the visible-row list itself, and the virtual list's row
+    /// closure only ever reads the resulting [`FileTree::row_cache`].
+    fn refresh_row_cache(&mut self) {
+        if self.cache_dirty {
+            self.row_cache = self.visible_rows();
+            self.cache_dirty = false;
         }
     }
 
@@ -235,6 +279,7 @@ impl FileTree {
                 this.toggle_dir(&path);
             } else {
                 this.selected = Some(path.clone());
+                this.cache_dirty = true;
                 // The open signal the editor surface consumes. Selecting a file
                 // is the only thing that touches anything outside this view — and
                 // it touches nothing but this event; no tmux pane/window state.
@@ -276,11 +321,17 @@ impl Panel for FileTree {
 
 impl Render for FileTree {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows = self.visible_rows();
+        // Rebuild the row cache once for this paint if the model, a collapse,
+        // or a selection changed since the last render (see `cache_dirty`'s
+        // doc); a no-op otherwise. Both the size vector below and the virtual
+        // list's row closure read `row_cache` from here on — the freeze fix:
+        // this used to run `visible_rows()` once here and again inside the
+        // closure, doubling the tree walk on every single paint.
+        self.refresh_row_cache();
 
         // Empty state: no snapshot yet (or an empty root). Keep it quiet — the
         // panel is a passive mirror, not an action surface.
-        if rows.is_empty() {
+        if self.row_cache.is_empty() {
             return div()
                 .size_full()
                 .p(px(8.0))
@@ -293,7 +344,8 @@ impl Render for FileTree {
         // One uniform row height per item — the size vector the virtual list
         // measures against. Width is ignored for a vertical list.
         let item_sizes: Rc<Vec<Size<Pixels>>> = Rc::new(
-            rows.iter()
+            self.row_cache
+                .iter()
                 .map(|_| Size::new(px(0.0), ROW_HEIGHT))
                 .collect(),
         );
@@ -306,13 +358,15 @@ impl Render for FileTree {
                     "file-tree",
                     item_sizes,
                     move |this, visible_range, _window, cx| {
-                        // Re-derive the visible rows for the painted range. The
-                        // virtual list only asks for the rows currently on
-                        // screen, so a huge tree paints a bounded number of
-                        // elements regardless of size.
-                        let rows = this.visible_rows();
+                        // Read the cache built above — the virtual list only
+                        // asks for the rows currently on screen, so a huge tree
+                        // still paints a bounded number of elements, but no
+                        // tree walk happens here: `row_cache` is already fresh.
+                        let this: &Self = this;
                         visible_range
-                            .filter_map(|ix| rows.get(ix).map(|row| this.render_row(row, cx)))
+                            .filter_map(|ix| {
+                                this.row_cache.get(ix).map(|row| this.render_row(row, cx))
+                            })
                             .map(IntoElement::into_any_element)
                             .collect::<Vec<_>>()
                     },
@@ -444,5 +498,88 @@ mod tests {
         assert_eq!(FileTree::display_name("src/net/tcp.rs"), "tcp.rs");
         assert_eq!(FileTree::display_name("README.md"), "README.md");
         assert_eq!(FileTree::display_name("src"), "src");
+    }
+
+    #[test]
+    fn test_new_tree_starts_with_a_dirty_cache() {
+        // Nothing has been rendered yet, so the very first `refresh_row_cache`
+        // must not be skipped as "already fresh".
+        let tree = FileTree::new();
+        assert!(tree.cache_dirty);
+        assert!(tree.row_cache.is_empty());
+    }
+
+    #[test]
+    fn test_refresh_row_cache_builds_rows_and_clears_dirty() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs"), file("README.md")]);
+        assert!(
+            tree.cache_dirty,
+            "seeding via model_mut marks the cache dirty"
+        );
+
+        tree.refresh_row_cache();
+
+        assert!(!tree.cache_dirty);
+        assert_eq!(tree.row_cache, tree.visible_rows());
+    }
+
+    #[test]
+    fn test_model_mut_marks_the_cache_dirty_even_with_no_visible_change() {
+        let mut tree = seed(vec![file("a.txt")]);
+        tree.refresh_row_cache();
+        assert!(!tree.cache_dirty);
+
+        // `model_mut` is the only seam that can mutate the model, so it marks
+        // dirty unconditionally — a fold behind it can never forget to.
+        tree.model_mut();
+        assert!(tree.cache_dirty);
+    }
+
+    #[test]
+    fn test_refresh_row_cache_after_incremental_update_matches_a_fresh_build_no_drift() {
+        let mut tree = seed(vec![file("a.txt"), file("stale.txt")]);
+        tree.refresh_row_cache();
+
+        // Fold an incremental update through the same seam `workspace.rs` uses.
+        tree.model_mut()
+            .apply_update(vec![file("fresh.txt")], vec![], vec!["stale.txt".into()]);
+        assert!(
+            tree.cache_dirty,
+            "the update must have marked the cache dirty"
+        );
+
+        tree.refresh_row_cache();
+
+        // The refreshed cache must equal an independently fresh build from the
+        // now-current model — no drift from the update.
+        assert_eq!(tree.row_cache, tree.visible_rows());
+        let paths: Vec<&str> = tree.row_cache.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, vec!["a.txt", "fresh.txt"]);
+    }
+
+    #[test]
+    fn test_refresh_row_cache_is_idempotent_while_clean() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs")]);
+        tree.refresh_row_cache();
+        let built = tree.visible_rows();
+
+        // A second refresh with nothing marked dirty in between must leave the
+        // cache exactly as it was.
+        tree.refresh_row_cache();
+        assert_eq!(tree.row_cache, built);
+    }
+
+    #[test]
+    fn test_toggle_dir_marks_the_cache_dirty_and_refresh_reflects_the_collapse() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs"), file("top.rs")]);
+        tree.refresh_row_cache();
+        assert!(!tree.cache_dirty);
+
+        tree.toggle_dir("src");
+        assert!(tree.cache_dirty);
+
+        tree.refresh_row_cache();
+        let visible: Vec<&str> = tree.row_cache.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(visible, vec!["src", "top.rs"]);
     }
 }
