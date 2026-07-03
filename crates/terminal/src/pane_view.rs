@@ -107,6 +107,13 @@ impl ActivityTracker {
         if self.attention {
             return PaneActivity::Attention;
         }
+        self.underlying(phase, now)
+    }
+
+    /// The pane's busy/free state ignoring any unacknowledged bell — the state
+    /// the active window surfaces, so a bell arriving there never flashes
+    /// attention (`docs/spec-pane-activity-indicators.md`).
+    fn underlying(&self, phase: CommandPhase, now: Instant) -> PaneActivity {
         let busy = if self.saw_osc133 {
             matches!(phase, CommandPhase::Executing)
         } else {
@@ -644,6 +651,14 @@ impl PaneView {
     pub fn activity(&self) -> PaneActivity {
         self.activity
             .state(self.command_lifecycle.phase, Instant::now())
+    }
+
+    /// This pane's underlying busy/free state with any unacknowledged bell
+    /// suppressed — what the active window surfaces, so a bell arriving between
+    /// snapshots never flashes its tab (`docs/spec-pane-activity-indicators.md`).
+    pub fn underlying_activity(&self) -> PaneActivity {
+        self.activity
+            .underlying(self.command_lifecycle.phase, Instant::now())
     }
 
     /// Clear this pane's unacknowledged bell attention back to its underlying
@@ -1707,6 +1722,30 @@ mod tests {
         assert_eq!(tracker.state(CommandPhase::Idle, now), PaneActivity::Free);
         assert_eq!(
             tracker.state(CommandPhase::Executing, now),
+            PaneActivity::Busy
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_activity_underlying_ignores_unacknowledged_bell() {
+        // The active window reads `underlying`: an unacknowledged bell still
+        // surfaces attention via `state`, but `underlying` reports the busy/free
+        // beneath it so a bell in the active window never flashes its tab.
+        let mut tracker = ActivityTracker::default();
+        tracker.on_osc133();
+        let now = Instant::now();
+        tracker.on_bell();
+
+        assert_eq!(
+            tracker.state(CommandPhase::Idle, now),
+            PaneActivity::Attention
+        );
+        assert_eq!(
+            tracker.underlying(CommandPhase::Idle, now),
+            PaneActivity::Free
+        );
+        assert_eq!(
+            tracker.underlying(CommandPhase::Executing, now),
             PaneActivity::Busy
         );
     }

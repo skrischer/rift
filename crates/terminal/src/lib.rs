@@ -14,7 +14,10 @@ pub use keytable::{
 };
 pub use pane_view::{PaneActivity, PaneView};
 pub use session_view::{SessionView, TerminalHandle};
-pub use statusline::{mutates_status_options, parse_status_options, StatusOptions};
+pub use statusline::{
+    mutates_status_options, parse_status_options, parse_style, parse_style_runs, truncate_runs,
+    ResolvedColor, StatusOptions, StatusStyle, StyleAttrs, StyleRun,
+};
 pub use termy_terminal_ui::TerminalUiRenderMetricsSnapshot;
 
 use alacritty_terminal::grid::Dimensions;

@@ -5,6 +5,7 @@ use tracing::error;
 #[cfg(feature = "gallery")]
 pub mod gallery;
 
+pub mod command_registry;
 pub mod diff_view;
 pub mod editor;
 pub mod file_tree;
