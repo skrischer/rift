@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -10,7 +11,7 @@ use tracing::debug;
 
 use crate::keytable::{self, KeyTable, PrefixOptions};
 use crate::layout::{self, LayoutNode};
-use crate::pane_view::{measure_cell_size, statusbar_height, PaneView};
+use crate::pane_view::{measure_cell_size, statusbar_height, PaneActivity, PaneView};
 use crate::{
     CaptureRequest, CaptureResult, ConnectionStatus, KeyTableQueryResult, PaneInput, PaneOutput,
     SelectWindow, SubscriptionUpdate, TermSize,
@@ -24,6 +25,11 @@ const FONT_SIZE_STEP: f32 = 1.0;
 /// and the tmux client-width compute so the reported column count never
 /// includes the space the sidebar occupies.
 const PANE_SIDEBAR_WIDTH: f32 = 160.0;
+/// Recurring re-render cadence that ages the per-pane output-recency fallback
+/// from busy back to free for the window-tab aggregate. Only the recency
+/// fallback needs it; OSC-133 and bell transitions stay event-driven (they
+/// re-render via the per-pane observation) (`docs/spec-pane-activity-indicators.md`).
+const ACTIVITY_IDLE_TICK: Duration = Duration::from_millis(1000);
 
 pub struct TerminalHandle {
     pub pane_output_tx: flume::Sender<PaneOutput>,
@@ -48,6 +54,13 @@ pub struct TerminalHandle {
 struct PaneEntry {
     entity: Entity<PaneView>,
     pty_tx: flume::Sender<Vec<u8>>,
+    /// Keeps `SessionView`'s observation of this pane's activity alive for the
+    /// pane's lifetime. A background pane's own `cx.notify()` re-renders only
+    /// its own subtree, so the parent must observe it to refresh the tab-bar
+    /// aggregate live off an OSC-133/bell transition. Dropped with the entry
+    /// when the pane leaves the snapshot, so observations never leak across
+    /// snapshots (`docs/spec-pane-activity-indicators.md`).
+    _activity_subscription: Subscription,
 }
 
 struct WindowState {
@@ -113,6 +126,35 @@ fn select_pane_command(pane: &str) -> String {
 /// tmux `kill-pane` command closing the given pane.
 fn kill_pane_command(pane: &str) -> String {
     format!("kill-pane -t {}", pane)
+}
+
+/// Precedence rank of a [`PaneActivity`] for the per-window aggregate:
+/// attention > busy > free.
+fn activity_rank(activity: PaneActivity) -> u8 {
+    match activity {
+        PaneActivity::Free => 0,
+        PaneActivity::Busy => 1,
+        PaneActivity::Attention => 2,
+    }
+}
+
+/// Fold a window's per-pane activities into `(dominant, active_count)`: the
+/// dominant state by precedence (attention > busy > free) and the number of
+/// panes that are busy or attention. GPUI-free so the precedence and count are
+/// unit-testable in isolation, mirroring the per-pane `ActivityTracker`
+/// (`docs/spec-pane-activity-indicators.md`).
+fn aggregate_activity(activities: impl Iterator<Item = PaneActivity>) -> (PaneActivity, usize) {
+    let mut dominant = PaneActivity::Free;
+    let mut active_count = 0;
+    for activity in activities {
+        if matches!(activity, PaneActivity::Busy | PaneActivity::Attention) {
+            active_count += 1;
+        }
+        if activity_rank(activity) > activity_rank(dominant) {
+            dominant = activity;
+        }
+    }
+    (dominant, active_count)
 }
 
 pub struct SessionView {
@@ -310,6 +352,27 @@ impl SessionView {
             .detach();
         }
 
+        {
+            // Idle tick: one recurring re-render so the per-window activity
+            // aggregate ages the output-recency fallback from busy back to free.
+            // OSC-133 and bell transitions stay event-driven — they re-render
+            // via the per-pane observation set up in `apply_snapshot`; this tick
+            // only drives the time-based recency decay
+            // (`docs/spec-pane-activity-indicators.md`).
+            cx.spawn(async move |this, cx| loop {
+                smol::Timer::after(ACTIVITY_IDLE_TICK).await;
+                let result = cx.update(|cx| {
+                    this.update(cx, |_view, cx| {
+                        cx.notify();
+                    })
+                });
+                if result.is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
+
         let ssh_user = std::env::var("RIFT_SSH_USER").unwrap_or_default();
         let ssh_host = std::env::var("RIFT_SSH_HOST").unwrap_or_else(|_| "localhost".into());
         let ssh_label: SharedString = if ssh_user.is_empty() {
@@ -417,8 +480,9 @@ impl SessionView {
 
         for window in &snapshot.windows {
             let pane_ids: Vec<String> = window.panes.iter().map(|p| p.id.clone()).collect();
+            let is_active_window = window.is_active;
 
-            if window.is_active {
+            if is_active_window {
                 active_pane_id = window.active_pane_id.clone();
                 if let Some(pane) = window.panes.iter().find(|p| p.is_active) {
                     if !pane.current_path.is_empty() {
@@ -432,6 +496,15 @@ impl SessionView {
                     if let Some(entry) = self.panes.get(&pane_state.id) {
                         entry.entity.update(cx, |pv, cx| {
                             pv.set_tmux_size(pane_state.width, pane_state.height);
+                            // The active window must never surface attention:
+                            // acknowledge every one of its panes on every snapshot
+                            // (not only on the is_active edge — a continuously
+                            // active window has no edge), so tab clicks, Alt+1..9,
+                            // and %output-confirmed selects clear it uniformly
+                            // (`docs/spec-pane-activity-indicators.md`).
+                            if is_active_window {
+                                pv.acknowledge_attention();
+                            }
                             // CWD is subscription-driven (rift_pane_path); the
                             // snapshot seeds it only at pane creation below.
                             cx.notify();
@@ -473,6 +546,13 @@ impl SessionView {
                         pv
                     });
 
+                    // Observe the pane so its own OSC-133/bell `cx.notify()` (which
+                    // re-renders only its own subtree) also re-renders this parent,
+                    // keeping a background window's tab aggregate live. The handle
+                    // lives in the entry and drops when the pane leaves the snapshot
+                    // (`docs/spec-pane-activity-indicators.md`).
+                    let activity_subscription = cx.observe(&entity, |_this, _pane, cx| cx.notify());
+
                     if let Some(buffered) = self.early_output_buffer.remove(&pane_id) {
                         for bytes in buffered {
                             let _ = pty_tx.send(bytes);
@@ -480,7 +560,14 @@ impl SessionView {
                     }
 
                     debug!(pane_id = %pane_id, "created pane");
-                    self.panes.insert(pane_id, PaneEntry { entity, pty_tx });
+                    self.panes.insert(
+                        pane_id,
+                        PaneEntry {
+                            entity,
+                            pty_tx,
+                            _activity_subscription: activity_subscription,
+                        },
+                    );
                     self.needs_focus = true;
                 }
             }
@@ -514,6 +601,31 @@ impl SessionView {
             .map(|w| layout::build_layout(&w.panes));
 
         cx.notify();
+    }
+
+    /// The folded activity of the window `window_id`: its dominant pane state
+    /// (attention > busy > free) and the count of busy-or-attention panes, for
+    /// the tab-bar indicator rendered by a later step. Read live at render so an
+    /// observed pane transition reflects immediately. The active window never
+    /// surfaces attention: its panes are acknowledged on every snapshot, and a
+    /// bell arriving between snapshots is read as the pane's underlying busy/free
+    /// (`docs/spec-pane-activity-indicators.md`).
+    pub fn window_activity(&self, window_id: &str, cx: &App) -> (PaneActivity, usize) {
+        let Some(window) = self.windows.iter().find(|w| w.id == window_id) else {
+            return (PaneActivity::Free, 0);
+        };
+        let suppress_attention = window.is_active;
+        let activities = window.pane_ids.iter().filter_map(|id| {
+            self.panes.get(id).map(|entry| {
+                let pane = entry.entity.read(cx);
+                if suppress_attention {
+                    pane.underlying_activity()
+                } else {
+                    pane.activity()
+                }
+            })
+        });
+        aggregate_activity(activities)
     }
 
     fn apply_subscription(&mut self, update: SubscriptionUpdate, cx: &mut Context<Self>) {
@@ -1225,7 +1337,8 @@ impl Render for SessionView {
 #[cfg(test)]
 mod tests {
     use super::{
-        kill_pane_command, quote_tmux_name, resize_direction, select_pane_command, split_command,
+        aggregate_activity, kill_pane_command, quote_tmux_name, resize_direction,
+        select_pane_command, split_command, PaneActivity,
     };
 
     #[test]
@@ -1273,5 +1386,66 @@ mod tests {
     #[test]
     fn test_kill_pane_command_targets_pane() {
         assert_eq!(kill_pane_command("%7"), "kill-pane -t %7");
+    }
+
+    #[test]
+    fn test_aggregate_activity_empty_window_is_free_and_zero() {
+        let (dominant, count) = aggregate_activity(std::iter::empty());
+        assert_eq!(dominant, PaneActivity::Free);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_aggregate_activity_single_pane_reports_its_own_state() {
+        assert_eq!(
+            aggregate_activity([PaneActivity::Free].into_iter()),
+            (PaneActivity::Free, 0)
+        );
+        assert_eq!(
+            aggregate_activity([PaneActivity::Busy].into_iter()),
+            (PaneActivity::Busy, 1)
+        );
+        assert_eq!(
+            aggregate_activity([PaneActivity::Attention].into_iter()),
+            (PaneActivity::Attention, 1)
+        );
+    }
+
+    #[test]
+    fn test_aggregate_activity_precedence_attention_over_busy_over_free() {
+        // Attention dominates regardless of order.
+        let (dominant, _) = aggregate_activity(
+            [
+                PaneActivity::Free,
+                PaneActivity::Busy,
+                PaneActivity::Attention,
+            ]
+            .into_iter(),
+        );
+        assert_eq!(dominant, PaneActivity::Attention);
+        // Busy dominates free.
+        let (dominant, _) = aggregate_activity(
+            [PaneActivity::Free, PaneActivity::Busy, PaneActivity::Free].into_iter(),
+        );
+        assert_eq!(dominant, PaneActivity::Busy);
+        // All free stays free.
+        let (dominant, _) =
+            aggregate_activity([PaneActivity::Free, PaneActivity::Free].into_iter());
+        assert_eq!(dominant, PaneActivity::Free);
+    }
+
+    #[test]
+    fn test_aggregate_activity_count_is_busy_or_attention_panes() {
+        let (_, count) = aggregate_activity(
+            [
+                PaneActivity::Free,
+                PaneActivity::Busy,
+                PaneActivity::Attention,
+                PaneActivity::Free,
+                PaneActivity::Busy,
+            ]
+            .into_iter(),
+        );
+        assert_eq!(count, 3);
     }
 }
