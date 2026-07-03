@@ -383,6 +383,153 @@ fn single_printable_char(text: &str) -> Option<char> {
     }
 }
 
+/// How a resolved bound command should be handled once the prefix engine
+/// decides to dispatch it — the command-interception taxonomy from
+/// `docs/spec-tmux-keytable-mirroring.md` (command interception step, #212).
+/// Classification runs on the command text alone (already parsed out of
+/// `list-keys`); nothing here touches pane content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchDecision {
+    /// Send the command through the single command seam unchanged.
+    Dispatch(String),
+    /// A pane-mode (`copy-mode`, `choose-*`, `clock-mode`, `customize-mode`), a
+    /// `switch-client -T` to an unmirrored table, or a client-interaction
+    /// command that renders on the issuing client (`command-prompt`,
+    /// `display-menu`, `display-panes`, `display-popup`): never dispatched —
+    /// dispatching a pane mode would shove the *shared* pane into it, breaking
+    /// co-attached native clients, and the others would silently no-op on a
+    /// control client. `hint` names the GUI affordance that replaces it.
+    Hint(&'static str),
+    /// A bound `confirm-before` command: render a native confirm dialog with
+    /// `prompt`, dispatching `wrapped` only if the user confirms.
+    Confirm { prompt: String, wrapped: String },
+}
+
+/// Classify a resolved bound command (verbatim `list-keys` text) into a
+/// [`DispatchDecision`]. `send-prefix` and every other bound command —
+/// including one that itself runs `bind-key`/`set-option`/`source-file` —
+/// dispatch unchanged; the refresh-trigger check on those is
+/// [`mutates_bindings`], a separate concern from this taxonomy.
+pub fn classify_command(command: &str) -> DispatchDecision {
+    let verb = command.split_whitespace().next().unwrap_or("");
+    match verb {
+        "copy-mode" => DispatchDecision::Hint("copy-mode: use the mouse-wheel scrollback instead"),
+        "clock-mode" => DispatchDecision::Hint("clock-mode is not available in rift"),
+        "customize-mode" => DispatchDecision::Hint("customize-mode is not available in rift"),
+        _ if verb.starts_with("choose-") => {
+            DispatchDecision::Hint("choose-mode has no GUI picker yet")
+        }
+        "command-prompt" => DispatchDecision::Hint("command-prompt has no GUI form yet"),
+        "display-menu" => DispatchDecision::Hint("display-menu has no GUI form yet"),
+        "display-panes" => DispatchDecision::Hint("display-panes has no GUI form yet"),
+        "display-popup" => DispatchDecision::Hint("display-popup has no GUI form yet"),
+        "confirm-before" => match parse_confirm_before(command) {
+            Some(confirm) => DispatchDecision::Confirm {
+                prompt: confirm.prompt,
+                wrapped: confirm.wrapped,
+            },
+            // Never silently no-op a bound confirm-before just because this
+            // one didn't parse — dispatch it verbatim instead.
+            None => DispatchDecision::Dispatch(command.to_string()),
+        },
+        "switch-client" => match switch_client_table(command) {
+            Some(table) if table != "prefix" && table != "root" => {
+                DispatchDecision::Hint("that key table is not mirrored")
+            }
+            _ => DispatchDecision::Dispatch(command.to_string()),
+        },
+        _ => DispatchDecision::Dispatch(command.to_string()),
+    }
+}
+
+/// A parsed `confirm-before` bound command: the `-p` prompt text and the
+/// wrapped command to dispatch on confirm, kept verbatim as `list-keys`
+/// printed it (the same raw convention as [`Binding::command`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmBefore {
+    pub prompt: String,
+    pub wrapped: String,
+}
+
+/// Parse a bound `confirm-before` command — tmux's shape is `confirm-before
+/// [-y] [-p prompt] command`. The wrapped command is kept raw (it may itself
+/// carry further tmux quoting the dispatch seam re-parses); `prompt` falls
+/// back to a placeholder when `-p` is absent, since tmux itself renders a
+/// default prompt in that case — a stock kill confirmation must never
+/// silently no-op just because a config bound `confirm-before` bare. `None`
+/// when the line is not a `confirm-before` or carries no wrapped command.
+pub fn parse_confirm_before(command: &str) -> Option<ConfirmBefore> {
+    let (first, mut pos) = lex_token(command, 0)?;
+    if first != "confirm-before" {
+        return None;
+    }
+    let mut prompt: Option<String> = None;
+    loop {
+        let token_start = pos;
+        let (token, after) = lex_token(command, pos)?;
+        match token.as_str() {
+            "-p" => {
+                let (value, after_value) = lex_token(command, after)?;
+                prompt = Some(value);
+                pos = after_value;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                pos = after;
+            }
+            _ => {
+                pos = token_start;
+                break;
+            }
+        }
+    }
+    let wrapped = command[pos..].trim().to_string();
+    if wrapped.is_empty() {
+        return None;
+    }
+    Some(ConfirmBefore {
+        prompt: prompt.unwrap_or_else(|| "confirm?".to_string()),
+        wrapped,
+    })
+}
+
+/// Extract the `-T <table>` target from a `switch-client` bound command, if
+/// present. `None` when the command is not `switch-client`, or carries no
+/// `-T` (a plain pane/window switch, not a key-table switch).
+fn switch_client_table(command: &str) -> Option<String> {
+    let (first, mut pos) = lex_token(command, 0)?;
+    if first != "switch-client" {
+        return None;
+    }
+    loop {
+        let (token, after) = lex_token(command, pos)?;
+        if token == "-T" {
+            let (table, _) = lex_token(command, after)?;
+            return Some(table);
+        }
+        pos = after;
+    }
+}
+
+/// Whether a dispatched command could change the mirrored key table or the
+/// prefix/repeat options — the refresh-trigger check from
+/// `docs/spec-tmux-keytable-mirroring.md` ("Table refresh/invalidation").
+/// `bind-key`/`unbind-key`/`source-file` always mutate bindings;
+/// `set-option`/`set` only matters when it targets `prefix`, `prefix2`, or
+/// `repeat-time` — an unrelated option (`set -g mouse on`) must not trigger a
+/// refresh. Matching is a plain token scan (not tmux-quote-aware): a false
+/// positive costs one harmless extra refresh, but a false negative would miss
+/// a real prefix change, so the scan errs toward matching.
+pub fn mutates_bindings(command: &str) -> bool {
+    let mut tokens = command.split_whitespace();
+    match tokens.next().unwrap_or("") {
+        "bind-key" | "unbind-key" | "source-file" => true,
+        "set-option" | "set" => {
+            tokens.any(|token| matches!(token, "prefix" | "prefix2" | "repeat-time"))
+        }
+        _ => false,
+    }
+}
+
 /// Lex one whitespace-delimited token of `list-keys`/`show-options` output
 /// starting at or after `start`, honoring tmux's escaping: single quotes are
 /// literal, double quotes allow backslash escapes, and a bare backslash escapes
@@ -757,5 +904,191 @@ repeat-time not-a-number
         let key = keystroke_to_tmux_key(&alt_left).expect("M-Left maps");
         assert!(table.get("root", &key).unwrap().repeat == false);
         assert_eq!(table.get("root", &key).unwrap().command, "select-pane -L");
+    }
+
+    // --- command classification (#212) ---
+
+    #[test]
+    fn test_classify_command_dispatches_plain_commands() {
+        for cmd in [
+            "new-window",
+            "split-window -h",
+            "select-pane -L",
+            "send-prefix",
+        ] {
+            assert_eq!(
+                classify_command(cmd),
+                DispatchDecision::Dispatch(cmd.to_string()),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_command_hints_pane_modes() {
+        for cmd in ["copy-mode", "copy-mode -u", "clock-mode", "customize-mode"] {
+            assert!(
+                matches!(classify_command(cmd), DispatchDecision::Hint(_)),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_command_hints_choose_mode_variants() {
+        for cmd in [
+            "choose-tree",
+            "choose-window",
+            "choose-client",
+            "choose-buffer",
+        ] {
+            assert!(
+                matches!(classify_command(cmd), DispatchDecision::Hint(_)),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_command_hints_client_interaction_display_forms() {
+        for cmd in [
+            "command-prompt",
+            "display-menu -T title",
+            "display-panes",
+            "display-popup",
+        ] {
+            assert!(
+                matches!(classify_command(cmd), DispatchDecision::Hint(_)),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_command_confirm_before_becomes_confirm_decision() {
+        let table = parse_list_keys(LIST_KEYS_FIXTURE);
+        let kill_window = &table.get("prefix", "&").unwrap().command;
+        match classify_command(kill_window) {
+            DispatchDecision::Confirm { prompt, wrapped } => {
+                assert_eq!(prompt, "kill-window #W? (y/n)");
+                assert_eq!(wrapped, "kill-window");
+            }
+            other => panic!("expected Confirm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_command_confirm_before_without_wrapped_command_dispatches_raw() {
+        // Never silently no-op: an unparseable confirm-before still dispatches.
+        assert_eq!(
+            classify_command("confirm-before -p prompt"),
+            DispatchDecision::Dispatch("confirm-before -p prompt".to_string())
+        );
+    }
+
+    #[test]
+    fn test_classify_command_confirm_before_wrapped_pane_mode_reclassifies_to_hint() {
+        // A user binding can wrap a pane-mode command in `confirm-before`
+        // (e.g. `bind X confirm-before -p "copy?" copy-mode`). On confirm the
+        // GUI must re-run `wrapped` through `classify_command` rather than
+        // dispatch it unconditionally — dispatching `copy-mode` would shove
+        // the shared pane into it, breaking co-attached native clients
+        // (`docs/spec-tmux-keytable-mirroring.md`).
+        let confirm = match classify_command(r#"confirm-before -p "copy?" copy-mode"#) {
+            DispatchDecision::Confirm { wrapped, .. } => wrapped,
+            other => panic!("expected Confirm, got {other:?}"),
+        };
+        assert_eq!(confirm, "copy-mode");
+        assert!(matches!(
+            classify_command(&confirm),
+            DispatchDecision::Hint(_)
+        ));
+    }
+
+    #[test]
+    fn test_classify_command_switch_client_unmirrored_table_hints() {
+        assert!(matches!(
+            classify_command("switch-client -T mytable"),
+            DispatchDecision::Hint(_)
+        ));
+    }
+
+    #[test]
+    fn test_classify_command_switch_client_mirrored_table_dispatches() {
+        for cmd in [
+            "switch-client -T prefix",
+            "switch-client -T root",
+            "switch-client -n",
+        ] {
+            assert_eq!(
+                classify_command(cmd),
+                DispatchDecision::Dispatch(cmd.to_string()),
+                "{cmd}"
+            );
+        }
+    }
+
+    // --- confirm-before parser ---
+
+    #[test]
+    fn test_parse_confirm_before_extracts_prompt_and_wrapped_command() {
+        let confirm =
+            parse_confirm_before(r#"confirm-before -p "kill-pane #P? (y/n)" kill-pane"#).unwrap();
+        assert_eq!(confirm.prompt, "kill-pane #P? (y/n)");
+        assert_eq!(confirm.wrapped, "kill-pane");
+    }
+
+    #[test]
+    fn test_parse_confirm_before_without_prompt_flag_falls_back() {
+        let confirm = parse_confirm_before("confirm-before kill-server").unwrap();
+        assert_eq!(confirm.prompt, "confirm?");
+        assert_eq!(confirm.wrapped, "kill-server");
+    }
+
+    #[test]
+    fn test_parse_confirm_before_preserves_wrapped_command_quoting_raw() {
+        let confirm = parse_confirm_before(
+            r#"confirm-before -p "detach? (y/n)" detach-client -P "some session""#,
+        )
+        .unwrap();
+        assert_eq!(confirm.wrapped, r#"detach-client -P "some session""#);
+    }
+
+    #[test]
+    fn test_parse_confirm_before_rejects_non_confirm_before_and_missing_command() {
+        assert_eq!(parse_confirm_before("kill-pane"), None);
+        assert_eq!(parse_confirm_before("confirm-before -p prompt"), None);
+        assert_eq!(parse_confirm_before(""), None);
+    }
+
+    // --- refresh-trigger detection ---
+
+    #[test]
+    fn test_mutates_bindings_true_for_binding_commands() {
+        for cmd in [
+            "bind-key -T prefix r source-file ~/.tmux.conf",
+            "unbind-key -T prefix r",
+            "source-file ~/.tmux.conf",
+        ] {
+            assert!(mutates_bindings(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn test_mutates_bindings_true_for_prefix_and_repeat_time_options() {
+        for cmd in [
+            "set-option -g prefix C-a",
+            "set -g prefix2 C-b",
+            "set-option -g repeat-time 300",
+        ] {
+            assert!(mutates_bindings(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn test_mutates_bindings_false_for_unrelated_option_and_other_commands() {
+        for cmd in ["set-option -g mouse on", "new-window", "select-pane -L", ""] {
+            assert!(!mutates_bindings(cmd), "{cmd}");
+        }
     }
 }
