@@ -50,9 +50,9 @@ None. Pure client-side derivation and rendering from signals rift already parses
 
 ## Prior art
 
-Consulted [prior-art.md](prior-art.md); the Phase-18 concern anchors this spec.
+Consulted [prior-art.md](../prior-art.md); the Phase-18 concern anchors this spec.
 
-- [Pane activity state on window tabs (Phase 18)](prior-art.md#pane-activity-state-on-window-tabs-phase-18) — the backing concern. **Adopt** the UX (color-coded dot + per-window aggregate) from Arbor / Claude-Squad / zellij; **avoid** their detection mechanisms (Arbor's hardcoded agent detection, Claude-Squad's `capture-pane` content hashing, agent `@claude_state` hooks). The entry leaned on tmux `monitor-*` alerts; this spec **refines** that to OSC-133 lifecycle + bell after code review showed rift already computes the finer, client-side signal (see Decision log).
+- [Pane activity state on window tabs (Phase 18)](../prior-art.md#pane-activity-state-on-window-tabs-phase-18) — the backing concern. **Adopt** the UX (color-coded dot + per-window aggregate) from Arbor / Claude-Squad / zellij; **avoid** their detection mechanisms (Arbor's hardcoded agent detection, Claude-Squad's `capture-pane` content hashing, agent `@claude_state` hooks). The entry leaned on tmux `monitor-*` alerts; this spec **refines** that to OSC-133 lifecycle + bell after code review showed rift already computes the finer, client-side signal (see Decision log).
 - Architecture pattern 9 in prior-art.md — *"Per-pane state machine with bell/activity awareness"* — is exactly this feature's shape (bell as an attention signal; per-pane state folded to an aggregate).
 - rift-local grounding: `PaneView::command_lifecycle` (OSC-133 `CommandPhase` `Idle`/`PromptShown`/`Executing`, `crates/terminal/src/pane_view.rs`), `SessionView::WindowState` (`session_view.rs:43-49`), the tab loop + status-dot idiom (`session_view.rs:904-974`, `:1025`, `:883-888`), and `gpui_component::tab::Tab` (`.child()`/`.suffix()`).
 
