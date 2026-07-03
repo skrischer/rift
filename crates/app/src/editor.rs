@@ -6,7 +6,7 @@
 //! back-navigation, and read-only out-of-root opens
 //! (`docs/spec-lsp-navigation.md`, #196, #197, #198).
 //!
-//! # Tabs (#351)
+//! # Tabs (#351, #352)
 //!
 //! `EditorView` holds an ordered set of open tabs (`Vec<EditorTab>`) plus an
 //! active index; each tab owns its own `gpui-component` `InputState` and all
@@ -14,12 +14,17 @@
 //! `read_only` bit, diagnostics, cursor/scroll, and nav-UI state (hover
 //! content, jump-list, back-stack). Opening an already-open path switches the
 //! active index to it instead of duplicating a tab; a new path opens and
-//! activates a new one (`docs/spec-editor-tabs.md`). Only the active tab
-//! renders — there is no tab bar yet (#352) — and the workspace-level signal
-//! fan-out across multiple open tabs (mtime / diagnostics / live-buffer /
-//! nav-response routing) lands in #353. Until then every method below still
-//! resolves "the open file" as the active tab, exactly preserving the
-//! single-buffer behavior as tabs' one-tab subset.
+//! activates a new one (`docs/spec-editor-tabs.md`). A `gpui-component`
+//! `TabBar` above the editor content (the same pattern `SessionView` uses for
+//! tmux windows) lists every open tab with a dirty dot and a close
+//! affordance: clicking a tab activates it and moves focus to its buffer;
+//! closing one removes it, activating the right neighbor (or the left if it
+//! was rightmost) — closing the last tab returns the editor to its empty
+//! state (#352). Dirty-close confirmation and the workspace-level signal
+//! fan-out across multiple open tabs (mtime / diagnostics routed by path)
+//! land in later steps; until then those two signals still resolve "the open
+//! file" as the active tab, preserving the single-buffer behavior as tabs'
+//! one-tab subset.
 //!
 //! # Buffer channel (#187, #188)
 //!
@@ -122,8 +127,8 @@ use std::time::{Duration, SystemTime};
 
 use flume::Sender;
 use gpui::{
-    div, px, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    div, px, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
     ParentElement as _, Render, SharedString, Styled as _, Subscription, Window,
 };
 use gpui_component::dock::{Panel, PanelEvent};
@@ -132,6 +137,7 @@ use gpui_component::highlighter::{
 };
 use gpui_component::input::{Input, InputEvent, InputState, Position as EditorPosition};
 use gpui_component::menu::PopupMenu;
+use gpui_component::tab::{Tab, TabBar};
 use gpui_component::text::markdown;
 use gpui_component::ActiveTheme as _;
 use rift_protocol::{
@@ -1300,6 +1306,49 @@ impl EditorView {
             self.jump_to_location(active, entry.location, window, cx);
         }
     }
+
+    // ── Tab bar: switch / close (#352) ────────────────────────────────────
+
+    /// Activate the tab at `index` (tab-bar click) and move focus to its
+    /// buffer. A no-op if `index` is out of range or already active.
+    pub fn activate_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() || self.active == Some(index) {
+            return;
+        }
+        self.active = Some(index);
+        self.tabs[index].input.update(cx, |input, cx| {
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Close the tab at `index` (tab-bar close affordance): reverts its live
+    /// buffer to disk-backed (mirrors the save-success discard, #189) and
+    /// removes it from the open set. Closing the active tab activates the
+    /// right neighbor (or the left if it was rightmost, via
+    /// [`next_active_after_close`]); closing the last tab returns the editor
+    /// to its empty state. Dirty-close confirmation is a later step
+    /// (`docs/spec-editor-tabs.md`) — for now every close is immediate.
+    pub fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active) = self.active else {
+            return;
+        };
+        if index >= self.tabs.len() {
+            return;
+        }
+        let len_before = self.tabs.len();
+
+        self.close_live_buffer(index);
+        self.tabs.remove(index);
+        self.active = next_active_after_close(active, index, len_before);
+
+        if let Some(new_active) = self.active {
+            self.tabs[new_active].input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+        }
+        cx.notify();
+    }
 }
 
 // ── Panel adapter ─────────────────────────────────────────────────────────────
@@ -1480,6 +1529,55 @@ impl Render for EditorView {
 
         let read_only = tab.read_only;
 
+        // Tab bar (#352): one Tab per open file, showing its name, a dirty
+        // dot, and a close "x" — the same TabBar/Tab pattern `SessionView`
+        // uses for tmux windows. Clicking a tab activates it (moves focus to
+        // its buffer); the close affordance removes it immediately
+        // (dirty-close confirmation is a later step).
+        let selected_index = self.active.unwrap_or(0);
+        let close_idle = cx.theme().muted_foreground;
+        let close_hover = cx.theme().danger;
+        let dirty_color = cx.theme().warning;
+
+        let tab_items: Vec<Tab> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(ix, t)| {
+                let name = t.path.rsplit('/').next().unwrap_or(&t.path).to_owned();
+                let close = div()
+                    .id(("editor-tab-close", ix))
+                    .px(px(4.0))
+                    .text_color(close_idle)
+                    .hover(move |this| this.text_color(close_hover))
+                    .child("x")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
+                            this.close_tab(ix, window, cx);
+                            cx.stop_propagation();
+                        }),
+                    );
+
+                let mut suffix = div().flex().items_center().gap(px(4.0));
+                if t.dirty {
+                    suffix = suffix.child(div().size(px(6.0)).rounded_full().bg(dirty_color));
+                }
+                suffix = suffix.child(close);
+
+                Tab::new()
+                    .label(SharedString::from(name))
+                    .suffix(suffix)
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                        this.activate_tab(ix, window, cx);
+                    }))
+            })
+            .collect();
+
+        let tab_bar = TabBar::new("editor-tab-bar")
+            .selected_index(selected_index)
+            .children(tab_items);
+
         // Outer div: the editor key context, action handlers, ctrl+click.
         //
         // The `on_mouse_down` for ctrl+click runs in the **bubble phase**: by
@@ -1547,7 +1645,8 @@ impl Render for EditorView {
                 // for HOVER_MOUSE_DEBOUNCE, `dispatch_hover_request` fires at
                 // the cursor position.
                 this.arm_hover_debounce(cx);
-            }));
+            }))
+            .child(tab_bar);
 
         if let Some((text, color)) = banner {
             root = root.child(
@@ -1641,6 +1740,27 @@ fn find_open_tab_index<'a>(
     path: &str,
 ) -> Option<usize> {
     open_paths.position(|p| p == path)
+}
+
+/// Decide the new active index after closing the tab at `closed`, given the
+/// previously active index and the tab count *before* removal. Pure and
+/// GPUI-free — the close-half of the tab-bar contract (`docs/spec-editor-tabs.md`,
+/// #352 acceptance: "closing the active tab activates the right neighbor
+/// (else the left); closing the last tab empties the editor"). Closing a
+/// background (non-active) tab never disturbs which tab is active, only
+/// shifting its index down when a tab before it is removed.
+fn next_active_after_close(active: usize, closed: usize, len_before: usize) -> Option<usize> {
+    if len_before <= 1 {
+        return None;
+    }
+    let len_after = len_before - 1;
+    if active == closed {
+        Some(closed.min(len_after - 1))
+    } else if active > closed {
+        Some(active - 1)
+    } else {
+        Some(active)
+    }
 }
 
 /// Translate a daemon protocol [`Diagnostic`] into the editor component's
@@ -1901,6 +2021,42 @@ mod tests {
             "no duplicate tab for an already-open path"
         );
         assert!(dirty[2], "switching must not clear the existing dirty flag");
+    }
+
+    // --- close-set model: next active after close (#352) ---
+
+    #[test]
+    fn test_closing_a_background_tab_before_active_shifts_active_down() {
+        // Closing a.rs (index 0) while b.rs (index 1) is active: b.rs slides
+        // down to index 0 and stays active.
+        assert_eq!(next_active_after_close(1, 0, 3), Some(0));
+    }
+
+    #[test]
+    fn test_closing_a_background_tab_after_active_leaves_active_untouched() {
+        // Closing c.rs (index 2) while a.rs (index 0) is active: a.rs's index
+        // is unaffected.
+        assert_eq!(next_active_after_close(0, 2, 3), Some(0));
+    }
+
+    #[test]
+    fn test_closing_the_active_middle_tab_activates_the_right_neighbor() {
+        // Closing b.rs (active, index 1) out of [a.rs, b.rs, c.rs]: c.rs
+        // slides into index 1 and becomes active (the right neighbor).
+        assert_eq!(next_active_after_close(1, 1, 3), Some(1));
+    }
+
+    #[test]
+    fn test_closing_the_active_rightmost_tab_activates_the_left_neighbor() {
+        // Closing c.rs (active, index 2), the rightmost tab: no right
+        // neighbor exists, so a.rs/b.rs's rightmost survivor (index 1)
+        // activates.
+        assert_eq!(next_active_after_close(2, 2, 3), Some(1));
+    }
+
+    #[test]
+    fn test_closing_the_last_tab_empties_the_editor() {
+        assert_eq!(next_active_after_close(0, 0, 1), None);
     }
 
     // --- inline-diagnostic translation (#189) ---
