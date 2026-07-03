@@ -57,6 +57,7 @@ use tracing::debug;
 
 use crate::editor::EditorView;
 use crate::file_tree::{FileTree, FileTreeEvent};
+use crate::status_bar;
 use crate::terminal_panel::TerminalPanel;
 
 /// Initial width of the left (explorer) dock, in pixels. Purely a starting
@@ -182,10 +183,19 @@ impl WorkspaceView {
                 };
                 let result = this.update_in(cx, |view, window, cx| {
                     let is_diagnostics = matches!(msg, DaemonMessage::Diagnostics { .. });
+                    let is_repo_state = matches!(msg, DaemonMessage::RepoState { .. });
                     view.file_tree.update(cx, |tree, cx| {
                         apply_worktree_message(tree, msg);
                         cx.notify();
                     });
+                    // Status bar (#347): a `RepoState` fold changes the branch /
+                    // ahead-behind segment the status bar reads inline in
+                    // `WorkspaceView::render`, so the workspace view itself must
+                    // notify too — the file tree's own notify above only repaints
+                    // the tree.
+                    if is_repo_state {
+                        cx.notify();
+                    }
                     // Concurrent-write signal (#188): after folding the structure
                     // update, hand the editor the open path's new snapshot `mtime`.
                     // The editor compares it against the buffer's base `mtime` and
@@ -434,15 +444,21 @@ impl Focusable for WorkspaceView {
 impl Render for WorkspaceView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The dock shell fills the window under the current OS chrome; the
-        // `flex_col` mirrors `examples/dock.rs` at the pinned gpui-component
-        // rev so future top chrome (status bar, palette) can stack above the
-        // dock without another layout rewrite (both deferred, `docs/spec-ide-shell.md`).
+        // `flex_col` mirrors `examples/dock.rs` at the pinned gpui-component rev.
+        // The status bar (#347, `docs/spec-status-bar.md`) is a plain `flex_col`
+        // sibling below the dock — bottom chrome, not a dock `Panel` — reading
+        // the file tree's mirrored `WorktreeModel` inline (repainted by the
+        // `RepoState`-fold `cx.notify()` above).
+        let model = self.file_tree.read(cx).model();
+        let status_bar = status_bar::render(model.branch(), model.ahead_behind(), cx);
+
         div()
             .flex()
             .flex_col()
             .size_full()
             .bg(cx.theme().background)
             .child(self.dock_area.clone())
+            .child(status_bar)
     }
 }
 
