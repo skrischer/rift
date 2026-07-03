@@ -157,6 +157,20 @@ fn aggregate_activity(activities: impl Iterator<Item = PaneActivity>) -> (PaneAc
     (dominant, active_count)
 }
 
+/// Catppuccin Mocha dot color for a window's dominant [`PaneActivity`], reusing
+/// the connection-indicator palette (hardcoded literals, not gpui-component theme
+/// tokens): busy is green, attention is peach. `Free` returns `None` so an idle
+/// window draws no dot and does not compete for attention. GPUI-free (`Hsla` is a
+/// plain value) so the mapping is unit-testable without an app context
+/// (`docs/spec-pane-activity-indicators.md`).
+fn activity_dot_color(activity: PaneActivity) -> Option<Hsla> {
+    match activity {
+        PaneActivity::Free => None,
+        PaneActivity::Busy => Some(rgb(0xa6e3a1).into()),
+        PaneActivity::Attention => Some(rgb(0xfab387).into()),
+    }
+}
+
 pub struct SessionView {
     panes: HashMap<String, PaneEntry>,
     early_output_buffer: HashMap<String, Vec<Vec<u8>>>,
@@ -1078,6 +1092,18 @@ impl Render for SessionView {
         let close_hover = cx.theme().danger;
         let new_idle = cx.theme().muted_foreground;
         let new_hover = cx.theme().foreground;
+        let activity_count_color = cx.theme().muted_foreground;
+
+        // Fold each window's panes to its `(dominant, active_count)` before the tab
+        // loop: `window_activity` reads `self.panes` while the loop below borrows
+        // `self.windows`, so pre-computing keeps the two shared borrows from
+        // overlapping. Read live here (not cached) so an observed pane transition
+        // reflects on the next render (`docs/spec-pane-activity-indicators.md`).
+        let mut window_activities: Vec<(PaneActivity, usize)> =
+            Vec::with_capacity(self.windows.len());
+        for w in &self.windows {
+            window_activities.push(self.window_activity(&w.id, cx));
+        }
 
         // One Tab per window. Single click selects the window, double click opens
         // an inline rename input in place of the label; this dispatch lives on the
@@ -1086,7 +1112,9 @@ impl Render for SessionView {
         // the window (own mouse-down + stop_propagation so they do not also
         // select); the editing tab shows the input instead and omits the "x".
         let mut tabs: Vec<Tab> = Vec::with_capacity(self.windows.len());
-        for (ix, w) in self.windows.iter().enumerate() {
+        for (ix, (w, &(dominant, active_count))) in
+            self.windows.iter().zip(&window_activities).enumerate()
+        {
             let window_id = w.id.clone();
             let editing = self
                 .renaming_window
@@ -1128,7 +1156,7 @@ impl Render for SessionView {
                                 cx.stop_propagation();
                             }),
                         );
-                    Tab::new().label(label).suffix(close).on_mouse_down(
+                    let mut tab = Tab::new().label(label).suffix(close).on_mouse_down(
                         MouseButton::Middle,
                         cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
                             if let Err(e) = this
@@ -1139,7 +1167,28 @@ impl Render for SessionView {
                             }
                             cx.stop_propagation();
                         }),
-                    )
+                    );
+                    // Activity indicator as a prefix (before the label, opposite the
+                    // close "x" suffix): a compact dot for the window's dominant
+                    // pane state, plus the busy-or-attention pane count when > 0. A
+                    // free window shows neither, so an idle single-pane window stays
+                    // clean (`docs/spec-pane-activity-indicators.md`).
+                    if let Some(dot_color) = activity_dot_color(dominant) {
+                        let mut indicator = h_flex()
+                            .gap(px(4.0))
+                            .items_center()
+                            .child(div().size(px(8.0)).rounded_full().bg(dot_color));
+                        if active_count > 0 {
+                            indicator = indicator.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(activity_count_color)
+                                    .child(SharedString::from(active_count.to_string())),
+                            );
+                        }
+                        tab = tab.prefix(indicator);
+                    }
+                    tab
                 }
             };
 
@@ -1337,9 +1386,10 @@ impl Render for SessionView {
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_activity, kill_pane_command, quote_tmux_name, resize_direction,
-        select_pane_command, split_command, PaneActivity,
+        activity_dot_color, aggregate_activity, kill_pane_command, quote_tmux_name,
+        resize_direction, select_pane_command, split_command, PaneActivity,
     };
+    use gpui::rgb;
 
     #[test]
     fn test_quote_tmux_name_plain_wraps_in_single_quotes() {
@@ -1447,5 +1497,19 @@ mod tests {
             .into_iter(),
         );
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_activity_dot_color_free_has_no_dot() {
+        assert_eq!(activity_dot_color(PaneActivity::Free), None);
+    }
+
+    #[test]
+    fn test_activity_dot_color_busy_and_attention_are_distinct_palette_literals() {
+        let busy = activity_dot_color(PaneActivity::Busy);
+        let attention = activity_dot_color(PaneActivity::Attention);
+        assert_eq!(busy, Some(rgb(0xa6e3a1).into()));
+        assert_eq!(attention, Some(rgb(0xfab387).into()));
+        assert_ne!(busy, attention);
     }
 }
