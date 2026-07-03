@@ -50,11 +50,12 @@ use gpui::{
     IntoElement, ParentElement as _, Render, Styled as _, Window,
 };
 use gpui_component::dock::{DockArea, DockItem, DockPlacement};
-use gpui_component::ActiveTheme as _;
+use gpui_component::{ActiveTheme as _, Root};
 use rift_protocol::{ClientMessage, DaemonMessage};
 use rift_terminal::SessionView;
 use tracing::debug;
 
+use crate::command_palette::{CommandPalette, OpenCommandPalette};
 use crate::editor::EditorView;
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::problems_panel::{ProblemsPanel, ProblemsPanelEvent};
@@ -168,6 +169,11 @@ pub struct WorkspaceView {
     /// `problems_panel` above) so the daemon-stream bridges keep working
     /// unchanged after the layout refactor.
     dock_area: Entity<DockArea>,
+    /// The command palette (`docs/spec-command-palette.md`, issue #359): owns
+    /// its `ListState` entity for the workspace's lifetime, so reopening it
+    /// (`Ctrl+Shift+P` / `Cmd+Shift+P`) reuses the same list rather than
+    /// rebuilding the registry each time.
+    command_palette: CommandPalette,
 }
 
 impl WorkspaceView {
@@ -402,6 +408,8 @@ impl WorkspaceView {
             dock.set_bottom_dock(bottom_item, Some(px(BOTTOM_DOCK_HEIGHT)), false, window, cx);
         });
 
+        let command_palette = CommandPalette::new(window, cx);
+
         Self {
             file_tree,
             editor,
@@ -409,6 +417,7 @@ impl WorkspaceView {
             problems_panel,
             open_file_tx,
             dock_area,
+            command_palette,
         }
     }
 
@@ -505,6 +514,11 @@ impl WorkspaceView {
     fn zoom_active_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.dispatch_action(Box::new(gpui_component::dock::ToggleZoom), cx);
     }
+
+    /// Open the command palette (issue #359) as a `Root` dialog.
+    fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.command_palette.open(window, cx);
+    }
 }
 
 /// Fold one worktree-family daemon message into the file tree's model. Only the
@@ -556,7 +570,7 @@ impl Focusable for WorkspaceView {
 }
 
 impl Render for WorkspaceView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The dock shell fills the window under the current OS chrome; the
         // `flex_col` mirrors `examples/dock.rs` at the pinned gpui-component rev.
         // The status bar (#347, #348, `docs/spec-status-bar.md`) is a plain
@@ -575,6 +589,15 @@ impl Render for WorkspaceView {
             model.all_diagnostics(),
             cx,
         );
+
+        // `Root`'s overlay layers (issue #359, `docs/spec-command-palette.md`):
+        // only the gallery rendered these before this issue, so no modal —
+        // including the command palette below — ever appeared in the shipped
+        // app. Read here, at the workspace root, mirroring `examples/dock.rs`
+        // at the pinned gpui-component rev.
+        let sheet_layer = Root::render_sheet_layer(window, cx);
+        let dialog_layer = Root::render_dialog_layer(window, cx);
+        let notification_layer = Root::render_notification_layer(window, cx);
 
         div()
             .flex()
@@ -596,8 +619,14 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &ZoomActivePanel, window, cx| {
                 this.zoom_active_panel(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
+                this.open_command_palette(window, cx);
+            }))
             .child(self.dock_area.clone())
             .child(status_bar)
+            .children(sheet_layer)
+            .children(dialog_layer)
+            .children(notification_layer)
     }
 }
 
@@ -608,7 +637,7 @@ mod tests {
     use super::*;
     use gpui::{Axis, TestAppContext};
     use gpui_component::dock::{DockPlacement, Panel};
-    use gpui_component::Root;
+    use gpui_component::WindowExt as _;
 
     /// A `WorkspaceChannels` wired to throwaway flume endpoints — no daemon is
     /// attached in this test, only the dock's panel tree is under test.
@@ -1064,5 +1093,68 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    /// Command palette (`docs/spec-command-palette.md`, issue #359): opening
+    /// sets an active `Root` dialog (the modal wired via `render_dialog_layer`
+    /// actually appears) and closing it clears that state, without disturbing
+    /// the workspace's own focus delegation to the terminal — "dismissing the
+    /// palette leaves terminal/editor state untouched" from the spec.
+    #[gpui::test]
+    fn test_open_command_palette_opens_a_dialog_and_close_clears_it(cx: &mut TestAppContext) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let mut session_view: Option<Entity<SessionView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let view = cx.new(|cx| SessionView::new(cx).0);
+                session_view = Some(view.clone());
+                workspace =
+                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), window, cx)));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+        let session_view =
+            session_view.expect("session view constructed inside the window callback");
+
+        // `window.update` (`WindowHandle<Root>::update`) itself leases the
+        // `Root` entity for the closure's duration — but `has_active_dialog` /
+        // `open_dialog` / `close_dialog` all read or update that same `Root`
+        // entity internally, which double-leases and panics. `update_window`
+        // (`AppContext`, imported above via `super::*`) hands back the raw
+        // window state without leasing `Root`, so those calls nest safely.
+        cx.update_window(window.into(), |_, window, cx| {
+            assert!(
+                !window.has_active_dialog(cx),
+                "no dialog is open before the shortcut fires"
+            );
+
+            workspace.update(cx, |view, cx| {
+                view.open_command_palette(window, cx);
+            });
+            assert!(
+                window.has_active_dialog(cx),
+                "OpenCommandPalette opens a Root dialog"
+            );
+            assert_eq!(
+                workspace.read(cx).focus_handle(cx),
+                session_view.read(cx).focus_handle(cx),
+                "opening the palette does not move the workspace's terminal focus delegation"
+            );
+
+            window.close_dialog(cx);
+            assert!(
+                !window.has_active_dialog(cx),
+                "closing the dialog clears the active-dialog state"
+            );
+            assert_eq!(
+                workspace.read(cx).focus_handle(cx),
+                session_view.read(cx).focus_handle(cx),
+                "dismissing the palette leaves the terminal focus delegation untouched"
+            );
+        })
+        .unwrap();
     }
 }
