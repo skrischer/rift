@@ -13,6 +13,7 @@ use std::fs::{self, File};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use gpui_component::ThemeMode;
 use serde::{Deserialize, Serialize};
 
 /// Schema version of the on-disk file. Bumped only if a future change breaks
@@ -64,21 +65,31 @@ impl Default for Rect {
     }
 }
 
-/// The persisted window state: bounds, maximized flag, and the whole-client
-/// font size (absolute px, not a ratio — spec decision log). `#[serde(default)]`
-/// at the container level means a field missing from the on-disk JSON (an
-/// older file, or a hand-edited one) takes its value from
+/// The persisted window state: bounds, maximized flag, the whole-client font
+/// size (absolute px, not a ratio — spec decision log), and the active theme
+/// choice (mode + named theme, `docs/spec-theme-settings.md`).
+/// `#[serde(default)]` at the container level means a field missing from the
+/// on-disk JSON (an older file, or a hand-edited one) takes its value from
 /// [`WindowState::default`] rather than failing to parse; a field present but
 /// unrecognized (a future schema version's addition) is silently ignored by
 /// `serde_json`. Together these make load forward- and backward-tolerant
 /// without migration code.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WindowState {
     pub version: u32,
     pub bounds: Rect,
     pub maximized: bool,
     pub font_size_px: f32,
+    /// Name of the last named theme activated via `crate::set_theme` (looked
+    /// up in `gpui-component`'s `ThemeRegistry` at restore time). An
+    /// arbitrary, unvalidated string as far as this module is concerned — an
+    /// unknown-to-the-registry name is `set_theme`'s fallback to tolerate, not
+    /// this store's.
+    pub theme_name: String,
+    /// Last active light/dark mode, which can diverge from `theme_name`'s own
+    /// mode when toggled independently via `crate::set_theme_mode`.
+    pub theme_mode: ThemeMode,
 }
 
 impl Default for WindowState {
@@ -88,8 +99,25 @@ impl Default for WindowState {
             bounds: Rect::default(),
             maximized: false,
             font_size_px: DEFAULT_FONT_SIZE_PX,
+            theme_name: crate::DEFAULT_THEME_NAME.to_string(),
+            // Matches `DEFAULT_THEME_NAME`'s own mode (dark Catppuccin Mocha) —
+            // the same "missing/corrupt/unknown falls back to dark" default the
+            // rest of the store's tolerant load already promises.
+            theme_mode: ThemeMode::Dark,
         }
     }
+}
+
+/// Persist a theme change into the store at `path`: a read-modify-write that
+/// updates only `theme_name`/`theme_mode`, leaving whatever bounds/maximized/
+/// font size are already on disk untouched — that half of the schema is
+/// #225's capture/restore concern, not this call's. The save-on-change
+/// counterpart to `load`'s startup restore.
+pub fn save_theme(path: &Path, name: &str, mode: ThemeMode) -> Result<(), StoreError> {
+    let mut state = load(path);
+    state.theme_name = name.to_string();
+    state.theme_mode = mode;
+    save(path, &state)
 }
 
 /// Failure modes for [`save`] and platform path resolution. [`load`] never
@@ -328,6 +356,8 @@ mod tests {
             },
             maximized: true,
             font_size_px: 16.5,
+            theme_name: "Default Light".to_string(),
+            theme_mode: ThemeMode::Light,
         }
     }
 
@@ -355,6 +385,8 @@ mod tests {
         assert_eq!(parsed.bounds, Rect::default());
         assert!(parsed.maximized);
         assert_eq!(parsed.font_size_px, DEFAULT_FONT_SIZE_PX);
+        assert_eq!(parsed.theme_name, crate::DEFAULT_THEME_NAME);
+        assert_eq!(parsed.theme_mode, ThemeMode::Dark);
     }
 
     #[test]
@@ -364,6 +396,8 @@ mod tests {
             "bounds": {"x": 5.0, "y": 6.0, "width": 640.0, "height": 480.0},
             "maximized": false,
             "font_size_px": 18.0,
+            "theme_name": "Default Light",
+            "theme_mode": "light",
             "panels": ["editor", "terminal"]
         }"#;
         let parsed: WindowState = serde_json::from_str(json).expect("parse despite unknown field");
@@ -378,6 +412,26 @@ mod tests {
         );
         assert!(!parsed.maximized);
         assert_eq!(parsed.font_size_px, 18.0);
+        assert_eq!(parsed.theme_name, "Default Light");
+        assert_eq!(parsed.theme_mode, ThemeMode::Light);
+    }
+
+    /// A pre-Phase-17 on-disk file (#224's original fields only, no theme
+    /// fields at all) still loads — the version-tolerance contract the schema
+    /// was designed for, not just a hand-built partial JSON object.
+    #[test]
+    fn test_pre_phase17_file_without_theme_fields_loads_with_dark_default() {
+        let json = r#"{
+            "version": 1,
+            "bounds": {"x": 12.0, "y": 34.0, "width": 1024.0, "height": 768.0},
+            "maximized": true,
+            "font_size_px": 16.5
+        }"#;
+        let parsed: WindowState = serde_json::from_str(json).expect("parse pre-Phase-17 file");
+        assert!(parsed.maximized);
+        assert_eq!(parsed.font_size_px, 16.5);
+        assert_eq!(parsed.theme_name, crate::DEFAULT_THEME_NAME);
+        assert_eq!(parsed.theme_mode, ThemeMode::Dark);
     }
 
     #[test]
@@ -455,11 +509,43 @@ mod tests {
 
         // A subsequent real save still completes normally — the leftover
         // garbage temp file is simply overwritten, not appended to.
-        let mut next_state = good_state;
+        let mut next_state = good_state.clone();
         next_state.maximized = !good_state.maximized;
         save(&path, &next_state).expect("save after interruption");
 
         assert_eq!(load(&path), next_state);
+    }
+
+    // --- theme persistence -----------------------------------------------
+
+    #[test]
+    fn test_save_theme_updates_only_theme_fields_and_preserves_the_rest() {
+        let scratch = Scratch::new("save_theme");
+        let path = scratch.path("state.json");
+        let initial = sample_state();
+        save(&path, &initial).expect("initial save");
+
+        save_theme(&path, "Catppuccin Mocha", ThemeMode::Dark).expect("save_theme");
+
+        let loaded = load(&path);
+        assert_eq!(loaded.theme_name, "Catppuccin Mocha");
+        assert_eq!(loaded.theme_mode, ThemeMode::Dark);
+        assert_eq!(loaded.bounds, initial.bounds);
+        assert_eq!(loaded.maximized, initial.maximized);
+        assert_eq!(loaded.font_size_px, initial.font_size_px);
+    }
+
+    #[test]
+    fn test_save_theme_on_missing_file_starts_from_defaults() {
+        let scratch = Scratch::new("save_theme_missing");
+        let path = scratch.path("does-not-exist.json");
+
+        save_theme(&path, "Default Light", ThemeMode::Light).expect("save_theme");
+
+        let loaded = load(&path);
+        assert_eq!(loaded.theme_name, "Default Light");
+        assert_eq!(loaded.theme_mode, ThemeMode::Light);
+        assert_eq!(loaded.bounds, Rect::default());
     }
 
     // --- platform path resolution -------------------------------------------

@@ -36,10 +36,22 @@ pub const DEFAULT_DARK_THEME_NAME: &str = "Default Dark";
 /// Display name of rift's own theme, loaded by `apply_theme`.
 pub const CATPPUCCIN_MOCHA_THEME_NAME: &str = "Catppuccin Mocha";
 
-/// The theme rift activates when no other selection is in effect. Today this is
-/// the sole entry point (startup); once Phase 17's persistence issue lands, a
-/// stored preference is read and passed to `set_theme` instead.
+/// The theme rift activates when no other selection is in effect: `apply_theme`'s
+/// hardcoded default, and `window_state::WindowState::default`'s theme_name when
+/// no preference is on disk yet.
 pub const DEFAULT_THEME_NAME: &str = CATPPUCCIN_MOCHA_THEME_NAME;
+
+/// Register rift's Catppuccin theme in the `ThemeRegistry` — the shared first
+/// half of both `apply_theme` (hardcoded default) and `apply_persisted_theme`
+/// (Phase 17 restore). Returns `false`, having already logged, when the
+/// registry rejected the theme; callers skip activating anything in that case.
+fn register_themes(cx: &mut App) -> bool {
+    if let Err(e) = ThemeRegistry::global_mut(cx).load_themes_from_str(CATPPUCCIN_MOCHA) {
+        error!(%e, "failed to load catppuccin theme");
+        return false;
+    }
+    true
+}
 
 /// Register the Catppuccin theme and activate rift's default, so all
 /// gpui-component widgets render in rift's palette instead of the default light
@@ -49,11 +61,22 @@ pub const DEFAULT_THEME_NAME: &str = CATPPUCCIN_MOCHA_THEME_NAME;
 /// theme — same-palette parity is a hard requirement (PR #34 lesson), and a copy
 /// would drift.
 pub fn apply_theme(cx: &mut App) {
-    if let Err(e) = ThemeRegistry::global_mut(cx).load_themes_from_str(CATPPUCCIN_MOCHA) {
-        error!(%e, "failed to load catppuccin theme");
-        return;
+    if register_themes(cx) {
+        set_theme(DEFAULT_THEME_NAME, None, cx);
     }
-    set_theme(DEFAULT_THEME_NAME, None, cx);
+}
+
+/// Register the Catppuccin theme and activate the persisted preference from
+/// `state` instead of the hardcoded default — the startup restore counterpart
+/// to `apply_theme` (`docs/spec-theme-settings.md`). `set_theme` already
+/// degrades an unknown persisted name to `DEFAULT_THEME_NAME`; `theme_mode` is
+/// re-applied afterward so a mode toggled independently of the named theme
+/// (`set_theme_mode`) survives a restart too.
+pub fn apply_persisted_theme(state: &window_state::WindowState, cx: &mut App) {
+    if register_themes(cx) {
+        set_theme(&state.theme_name, None, cx);
+        set_theme_mode(state.theme_mode, None, cx);
+    }
 }
 
 /// Look up `name` in the `ThemeRegistry`'s themes, falling back to
@@ -124,9 +147,10 @@ mod tests {
     use crate::problems_panel::PROBLEMS_PANEL_NAME;
     use crate::source_control::SOURCE_CONTROL_PANEL_NAME;
     use crate::terminal_panel::TERMINAL_PANEL_NAME;
+    use crate::window_state::WindowState;
     use crate::{
-        apply_theme, resolve_theme, set_theme, set_theme_mode, CATPPUCCIN_MOCHA_THEME_NAME,
-        DEFAULT_LIGHT_THEME_NAME, DEFAULT_THEME_NAME,
+        apply_persisted_theme, apply_theme, resolve_theme, set_theme, set_theme_mode,
+        CATPPUCCIN_MOCHA_THEME_NAME, DEFAULT_LIGHT_THEME_NAME, DEFAULT_THEME_NAME,
     };
 
     fn theme_config(name: &str, mode: ThemeMode) -> ThemeConfig {
@@ -184,6 +208,71 @@ mod tests {
                 cx.theme().theme_name().as_ref(),
                 CATPPUCCIN_MOCHA_THEME_NAME
             );
+        });
+    }
+
+    /// The startup restore path activates whatever named theme was persisted,
+    /// not the hardcoded `apply_theme` default.
+    #[gpui::test]
+    fn test_apply_persisted_theme_activates_the_stored_named_theme(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            let state = WindowState {
+                theme_name: DEFAULT_LIGHT_THEME_NAME.to_string(),
+                theme_mode: ThemeMode::Light,
+                ..WindowState::default()
+            };
+
+            apply_persisted_theme(&state, cx);
+
+            assert!(!cx.theme().is_dark());
+            assert_eq!(cx.theme().theme_name().as_ref(), DEFAULT_LIGHT_THEME_NAME);
+        });
+    }
+
+    /// An unknown persisted theme name degrades to `DEFAULT_THEME_NAME` via
+    /// `set_theme`'s existing fallback, mirroring #364's crash-avoidance
+    /// guarantee for the restore path too.
+    #[gpui::test]
+    fn test_apply_persisted_theme_unknown_name_falls_back_to_default(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            let state = WindowState {
+                theme_name: "does not exist".to_string(),
+                ..WindowState::default()
+            };
+
+            apply_persisted_theme(&state, cx);
+
+            assert!(cx.theme().is_dark());
+            assert_eq!(
+                cx.theme().theme_name().as_ref(),
+                CATPPUCCIN_MOCHA_THEME_NAME
+            );
+        });
+    }
+
+    /// `theme_mode` is re-applied after `theme_name`, so a mode persisted
+    /// independently of the named theme (via `set_theme_mode`) still wins on
+    /// restore instead of silently reverting to the named theme's own mode.
+    #[gpui::test]
+    fn test_apply_persisted_theme_reapplies_a_mode_independent_of_the_named_theme(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            // Catppuccin Mocha is a dark-mode theme; persisting it alongside an
+            // explicit light mode simulates a user who toggled mode after
+            // picking the named theme.
+            let state = WindowState {
+                theme_name: CATPPUCCIN_MOCHA_THEME_NAME.to_string(),
+                theme_mode: ThemeMode::Light,
+                ..WindowState::default()
+            };
+
+            apply_persisted_theme(&state, cx);
+
+            assert!(!cx.theme().is_dark());
         });
     }
 

@@ -12,7 +12,7 @@ use std::thread;
 use anyhow::{Context as _, Result};
 use gpui::*;
 use gpui_component::Root;
-use rift_app::{apply_theme, workspace};
+use rift_app::{apply_persisted_theme, window_state, workspace};
 use rift_logging::{
     LogTarget, RotatingMakeWriter, SizedWriter, DEFAULT_MAX_BYTES, FORCE_CONSOLE_ENV,
 };
@@ -178,7 +178,17 @@ fn main() {
 
     Application::with_platform(gpui_platform::current_platform(false)).run(|cx: &mut App| {
         gpui_component::init(cx);
-        apply_theme(cx);
+        // Restore the persisted theme choice (`docs/spec-theme-settings.md`); a
+        // missing platform state directory or a missing/corrupt state file both
+        // degrade to `WindowState::default`'s dark Catppuccin default.
+        let persisted_state = match window_state::state_path() {
+            Ok(path) => window_state::load(&path),
+            Err(e) => {
+                warn!(%e, "no platform state directory, using default preferences");
+                window_state::WindowState::default()
+            }
+        };
+        apply_persisted_theme(&persisted_state, cx);
         // Alt+1..9 -> switch to window N. Unshifted modifier+digit needs no
         // keyboard-layout mapping, so it matches identically on Windows and
         // Linux/X11 (where GPUI's keyboard mapper is a no-op).
