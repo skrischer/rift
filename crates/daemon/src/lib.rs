@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod buffer;
+mod diff;
 pub mod lsp;
 mod terminal;
 
@@ -415,6 +416,44 @@ fn wire_git_entry(
     }
 }
 
+/// Map an explorer diff outcome onto its wire payload.
+fn wire_diff(diff: rift_explorer::FileDiff) -> rift_protocol::FileDiffPayload {
+    match diff {
+        rift_explorer::FileDiff::Hunks(hunks) => rift_protocol::FileDiffPayload::Hunks {
+            hunks: hunks.into_iter().map(wire_diff_hunk).collect(),
+        },
+        rift_explorer::FileDiff::Binary => rift_protocol::FileDiffPayload::Binary,
+        rift_explorer::FileDiff::TooLarge => rift_protocol::FileDiffPayload::TooLarge,
+    }
+}
+
+/// Map one explorer diff hunk onto its wire representation.
+fn wire_diff_hunk(hunk: rift_explorer::DiffHunk) -> rift_protocol::DiffHunk {
+    rift_protocol::DiffHunk {
+        old_start: hunk.old_start,
+        old_len: hunk.old_len,
+        new_start: hunk.new_start,
+        new_len: hunk.new_len,
+        lines: hunk
+            .lines
+            .into_iter()
+            .map(|line| rift_protocol::DiffLine {
+                kind: wire_diff_line_kind(line.kind),
+                content: line.content,
+            })
+            .collect(),
+    }
+}
+
+/// Map an explorer diff line role onto its wire code (1:1).
+fn wire_diff_line_kind(kind: rift_explorer::DiffLineKind) -> rift_protocol::DiffLineKind {
+    match kind {
+        rift_explorer::DiffLineKind::Context => rift_protocol::DiffLineKind::Context,
+        rift_explorer::DiffLineKind::Add => rift_protocol::DiffLineKind::Add,
+        rift_explorer::DiffLineKind::Remove => rift_protocol::DiffLineKind::Remove,
+    }
+}
+
 /// Build the `RepoState` message from an explorer repo state.
 fn repo_state_message(repo: &rift_explorer::RepoState) -> DaemonMessage {
     DaemonMessage::RepoState {
@@ -523,22 +562,27 @@ fn snapshot_messages(root: &Path, entries: &BTreeMap<PathBuf, Entry>) -> Vec<Dae
     messages
 }
 
-/// Answer a buffer-channel request (`OpenFile` / `SaveFile`) against the watched
-/// worktree root, producing the reply `DaemonMessage` for the requesting
-/// connection.
+/// Answer a per-connection request/response message (`OpenFile` / `SaveFile`
+/// / `RequestDiff`) against the watched worktree root, producing the reply
+/// `DaemonMessage` for the requesting connection.
 ///
 /// The root is the canonicalized [`Snapshot::root`] held in `State` — the same
 /// root the worktree watcher uses, so a relative request path keys the same
 /// space as a worktree entry, and the buffer service confines **writes** to it.
 /// A relative read is confined too; an **absolute** read is the out-of-root
 /// carve-out (a navigation target outside the root, opened read-only) and is
-/// served by [`buffer::read_file`] — writes of an absolute path stay refused. A
-/// failure (a path escape, non-UTF-8 content, a missing file, or a write error)
-/// is logged to stderr (the daemon's log sink) and the request is dropped — v1
-/// has no buffer-error message in the protocol, so a refused request simply
-/// produces no reply, and the editor falls back to its own timeout. The two
-/// success/conflict outcomes map directly onto the protocol replies.
-async fn buffer_reply(state: &watch::Receiver<State>, msg: ClientMessage) -> Option<DaemonMessage> {
+/// served by [`buffer::read_file`] — writes of an absolute path stay refused.
+/// `RequestDiff` has no such carve-out: it is confined exactly like a write
+/// ([`diff::compute`]). A failure (a path escape, non-UTF-8 content, a missing
+/// file, a write error, or a diff compute error) is logged to stderr (the
+/// daemon's log sink) and the request is dropped — v1 has no buffer-error
+/// message in the protocol, so a refused request simply produces no reply,
+/// and the editor falls back to its own timeout. The success/conflict
+/// outcomes map directly onto the protocol replies.
+async fn request_reply(
+    state: &watch::Receiver<State>,
+    msg: ClientMessage,
+) -> Option<DaemonMessage> {
     // The borrow is released before any `await`: the root is cloned out up front
     // (the snapshot's canonical root), then the file I/O runs unborrowed.
     let root = {
@@ -582,9 +626,20 @@ async fn buffer_reply(state: &watch::Receiver<State>, msg: ClientMessage) -> Opt
                 None
             }
         },
-        // `buffer_reply` is only ever called with a buffer-channel message; any
-        // other variant is a caller bug, handled as a no-reply rather than a
-        // panic so a stray message can never take the connection down.
+        ClientMessage::RequestDiff { path } => match diff::compute(&root, &path).await {
+            Ok(file_diff) => Some(DaemonMessage::FileDiff {
+                path,
+                diff: wire_diff(file_diff),
+            }),
+            Err(err) => {
+                warn!(?path, %err, "request_diff refused");
+                None
+            }
+        },
+        // `request_reply` is only ever called with one of the messages matched
+        // above; any other variant is a caller bug, handled as a no-reply
+        // rather than a panic so a stray message can never take the
+        // connection down.
         _ => None,
     }
 }
@@ -664,24 +719,28 @@ where
                         | ClientMessage::ResizePane { .. }
                         | ClientMessage::TmuxCommand { .. }
                         | ClientMessage::CapturePane { .. }
-                        | ClientMessage::QueryKeyTable => {
+                        | ClientMessage::QueryKeyTable
+                        | ClientMessage::QueryStatusLine => {
                             if terminal_in_tx.send(msg).await.is_err() {
                                 // Terminal task gone; the terminal path is dead,
                                 // but the worktree path can keep serving.
                                 terminal_done = true;
                             }
                         }
-                        // The buffer channel is the protocol's request/response
-                        // path: the reply goes back to *this* connection's writer,
-                        // never onto the shared broadcast bus. The worktree root
-                        // the buffer service confines to is the canonicalized
-                        // `Snapshot::root()` held in `State` — the same root the
-                        // worktree watcher uses, so a buffer path keys the same
-                        // space as a worktree entry.
-                        ClientMessage::OpenFile { .. } | ClientMessage::SaveFile { .. } => {
-                            // A refused request (escape, non-UTF-8, I/O error)
-                            // yields no reply — logged in `buffer_reply`.
-                            if let Some(reply) = buffer_reply(&state, msg).await {
+                        // The buffer and diff channels are the protocol's
+                        // request/response paths: the reply goes back to *this*
+                        // connection's writer, never onto the shared broadcast
+                        // bus. The worktree root both confine to is the
+                        // canonicalized `Snapshot::root()` held in `State` — the
+                        // same root the worktree watcher uses, so a request path
+                        // keys the same space as a worktree entry.
+                        ClientMessage::OpenFile { .. }
+                        | ClientMessage::SaveFile { .. }
+                        | ClientMessage::RequestDiff { .. } => {
+                            // A refused request (escape, non-UTF-8, I/O error,
+                            // diff compute error) yields no reply — logged in
+                            // `request_reply`.
+                            if let Some(reply) = request_reply(&state, msg).await {
                                 let frame = encode_frame(&reply)?;
                                 writer.write_all(&frame).await?;
                                 writer.flush().await?;
@@ -697,17 +756,13 @@ where
                         // are likewise routed to the shared dispatch loop pending
                         // the LSP request-path wiring (a follow-on issue); the
                         // dispatch loop's defensive no-op arm absorbs them until
-                        // then. `RequestDiff` (source-control diff, #335) is
-                        // routed the same way pending its daemon-side handler
-                        // (a follow-on issue) — it will move to the per-connection
-                        // buffer-channel arm above once that lands.
+                        // then.
                         ClientMessage::Hello { .. }
                         | ClientMessage::BufferChanged { .. }
                         | ClientMessage::BufferClosed { .. }
                         | ClientMessage::HoverRequest { .. }
                         | ClientMessage::DefinitionRequest { .. }
-                        | ClientMessage::ReferencesRequest { .. }
-                        | ClientMessage::RequestDiff { .. } => {
+                        | ClientMessage::ReferencesRequest { .. } => {
                             if inbound.send(msg).await.is_err() {
                                 // Dispatch loop gone; nothing left to serve.
                                 break 'serve;
@@ -1219,19 +1274,18 @@ impl Core {
             }
             // Terminal/tmux messages never reach the shared dispatch loop:
             // `serve_connection` routes them to this connection's own
-            // `terminal_task` (per-client attach). The buffer-channel requests
-            // (`OpenFile`/`SaveFile`) likewise never reach it — they are answered
-            // per connection by `buffer_reply`, request/response back to that
-            // socket, not on the broadcast bus. `RequestDiff` (source-control
-            // diff, #335) is the same shape as `OpenFile`/`SaveFile` — its
-            // daemon-side handler lands in a follow-on issue and will answer
-            // per connection too, not on this loop.
+            // `terminal_task` (per-client attach). The request/response
+            // messages (`OpenFile`/`SaveFile`/`RequestDiff`) likewise never
+            // reach it — they are answered per connection by `request_reply`,
+            // request/response back to that socket, not on the broadcast bus.
+            // These arms are a defensive no-op should one arrive here anyway.
             ClientMessage::Attach { .. }
             | ClientMessage::Input { .. }
             | ClientMessage::ResizePane { .. }
             | ClientMessage::TmuxCommand { .. }
             | ClientMessage::CapturePane { .. }
             | ClientMessage::QueryKeyTable
+            | ClientMessage::QueryStatusLine
             | ClientMessage::OpenFile { .. }
             | ClientMessage::SaveFile { .. }
             | ClientMessage::RequestDiff { .. } => {}

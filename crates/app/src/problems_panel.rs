@@ -1,12 +1,12 @@
 //! Problems panel: a dockable, project-wide diagnostics list
-//! (`docs/spec-problems-panel.md`, issue #342).
+//! (`docs/spec-problems-panel.md`, issues #342, #343).
 //!
 //! Reads [`crate::worktree::WorktreeModel::all_diagnostics`] — the same
 //! project-wide `path -> server -> Vec<Diagnostic>` map the file tree already
 //! mirrors and the editor's inline markers already consume (#178, #189) — and
 //! renders it grouped by file, sorted by severity then location, with per-file
-//! and aggregate error/warning counts. A pure read: no new protocol, no new
-//! stream, no diagnostic authoring.
+//! and aggregate error/warning counts. A pure read: no new protocol, no
+//! diagnostic authoring.
 //!
 //! [`ProblemsSummary::from_diagnostics`] is the pure grouping/sorting/counting
 //! logic, independent of GPUI so it is unit-testable without a window. The
@@ -17,19 +17,39 @@
 //! observes the [`FileTree`] entity it is handed at construction, so every
 //! fold the workspace already performs (`Diagnostics` -> `apply_diagnostics`)
 //! repaints this panel too — no new bridge from the daemon stream.
+//!
+//! # Jump-to-location (#343)
+//!
+//! Clicking a diagnostic row emits [`ProblemsPanelEvent::OpenLocation`], the
+//! same shape as the file tree's `FileTreeEvent::OpenFile` — a clean signal
+//! the workspace subscribes to and routes to
+//! [`crate::editor::EditorView::open_at_range`], the thin public wrapper
+//! around the editor's existing LSP-nav jump machinery. No new navigation
+//! mechanism; file headers are not clickable, only individual diagnostics.
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use gpui::{
-    div, px, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla, IntoElement,
-    ParentElement as _, Pixels, Render, SharedString, Size, Styled as _, Subscription, Window,
+    div, px, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
+    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Pixels,
+    Render, SharedString, Size, Styled as _, Subscription, Window,
 };
 use gpui_component::dock::{Panel, PanelEvent};
 use gpui_component::{v_virtual_list, ActiveTheme as _, VirtualListScrollHandle};
-use rift_protocol::{Diagnostic, DiagnosticSeverity};
+use rift_protocol::{Diagnostic, DiagnosticSeverity, Range};
 
 use crate::file_tree::FileTree;
+
+/// Emitted when the user selects a diagnostic row — the open-file-at-position
+/// signal `docs/spec-problems-panel.md` calls for, routed by the workspace to
+/// [`crate::editor::EditorView::open_at_range`] (#343).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProblemsPanelEvent {
+    /// A diagnostic was selected; jump to its file + range. `path` is
+    /// root-relative, matching `FileTreeEvent::OpenFile`.
+    OpenLocation { path: String, range: Range },
+}
 
 /// Stable, distinct dock-panel identity for the problems panel
 /// (`Panel::panel_name`). Once shipped this must not change — it is the
@@ -190,13 +210,17 @@ fn counts_line(counts: &SeverityCounts) -> String {
 
 /// One flattened row of the virtualized list: either a file's header (path +
 /// per-file counts) or one of its diagnostics. Derived fresh from the model
-/// each render — never stored, mirroring the file tree's `Row`.
+/// each render — never stored, mirroring the file tree's `Row`. An `Entry`
+/// carries its owning file's path (not just the diagnostic) so a click can
+/// emit [`ProblemsPanelEvent::OpenLocation`] (#343).
+#[derive(Debug, PartialEq)]
 enum ProblemRow {
     Header {
         path: String,
         counts: SeverityCounts,
     },
     Entry {
+        path: String,
         diagnostic: Diagnostic,
     },
 }
@@ -242,13 +266,12 @@ impl ProblemsPanel {
                     path: group.path.clone(),
                     counts: group.counts,
                 })
-                .chain(
-                    group
-                        .diagnostics
-                        .iter()
-                        .cloned()
-                        .map(|diagnostic| ProblemRow::Entry { diagnostic }),
-                )
+                .chain(group.diagnostics.iter().cloned().map(|diagnostic| {
+                    ProblemRow::Entry {
+                        path: group.path.clone(),
+                        diagnostic,
+                    }
+                }))
             })
             .collect()
     }
@@ -283,7 +306,7 @@ impl ProblemsPanel {
                         .child(counts_line(counts)),
                 )
                 .into_any_element(),
-            ProblemRow::Entry { diagnostic } => {
+            ProblemRow::Entry { path, diagnostic } => {
                 let color = Self::severity_color(diagnostic.severity, cx);
                 let line = diagnostic.range.start.line + 1;
                 let character = diagnostic.range.start.character + 1;
@@ -297,6 +320,9 @@ impl ProblemsPanel {
                     label.push_str(&format!(" ({code})"));
                 }
 
+                let jump_path = path.clone();
+                let range = diagnostic.range;
+
                 div()
                     .h(ROW_HEIGHT)
                     .flex()
@@ -305,6 +331,17 @@ impl ProblemsPanel {
                     .pr(px(8.0))
                     .gap(px(6.0))
                     .text_sm()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().list_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |_this, _event: &MouseDownEvent, _window, cx| {
+                            cx.emit(ProblemsPanelEvent::OpenLocation {
+                                path: jump_path.clone(),
+                                range,
+                            });
+                        }),
+                    )
                     .child(
                         div()
                             .w(px(8.0))
@@ -332,6 +369,7 @@ impl Focusable for ProblemsPanel {
 }
 
 impl EventEmitter<PanelEvent> for ProblemsPanel {}
+impl EventEmitter<ProblemsPanelEvent> for ProblemsPanel {}
 
 impl Panel for ProblemsPanel {
     fn panel_name(&self) -> &'static str {
@@ -441,6 +479,29 @@ mod tests {
         let summary = ProblemsSummary::from_diagnostics(&BTreeMap::new());
         assert!(summary.groups.is_empty());
         assert_eq!(summary.totals, SeverityCounts::default());
+    }
+
+    #[test]
+    fn test_rows_threads_the_owning_file_path_onto_each_entry() {
+        // The jump-to-location click handler (#343) needs each entry row to
+        // carry its owning file's path (not just the diagnostic), since a
+        // `Diagnostic` alone carries no path. `rows()` must thread it through.
+        let map = map_of(vec![(
+            "a.rs",
+            "rust-analyzer",
+            vec![diag(1, 0, DiagnosticSeverity::Error, "e1")],
+        )]);
+        let summary = ProblemsSummary::from_diagnostics(&map);
+
+        let rows = ProblemsPanel::rows(&summary);
+        assert_eq!(rows.len(), 2, "one header row + one entry row");
+        match &rows[1] {
+            ProblemRow::Entry { path, diagnostic } => {
+                assert_eq!(path, "a.rs");
+                assert_eq!(diagnostic.message, "e1");
+            }
+            other => panic!("expected an entry row, got {other:?}"),
+        }
     }
 
     #[test]
