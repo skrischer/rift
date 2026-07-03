@@ -353,13 +353,15 @@ Specified by `docs/spec-source-control.md`.
 - Each line's `kind` mirrors unified-diff's context/add/remove roles; `content`
   has its line terminator stripped.
 
-### Daemon-side implementation notes (follow-on issue)
+### Daemon-side implementation notes
 
 The diff types and the `gix`-based blob-diff compute (`crates/explorer`) are
 implemented in #335. The daemon-side `request_diff` → `file_diff` handler
-lands in a follow-on issue; until then, requests received by the daemon are
-absorbed by the shared dispatch loop's defensive no-op arm, same as the
-navigation channel above.
+(#336, `crates/daemon/src/diff.rs`) is answered per connection, the same
+request/response shape as the buffer channel's `open_file` → `file_content`:
+the path is confined to the worktree root exactly like a buffer write (no
+out-of-root carve-out), and the compute runs off the async I/O path via
+`spawn_blocking`.
 
 ## Rules
 
