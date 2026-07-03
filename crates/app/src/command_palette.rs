@@ -223,7 +223,8 @@ mod tests {
             vec![
                 "Toggle Explorer",
                 "Toggle Problems",
-                "Toggle Source Control"
+                "Toggle Source Control",
+                "Toggle Light/Dark Theme"
             ]
         );
     }
