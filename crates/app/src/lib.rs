@@ -145,6 +145,63 @@ pub fn toggle_theme_mode(window: Option<&mut Window>, cx: &mut App) {
     set_theme_mode(mode, window, cx);
 }
 
+// ── Persisting variants ──────────────────────────────────────────────────────
+//
+// Issue #365: a theme change from either UI surface (the command palette's
+// theme actions, wired in `workspace.rs`, or the settings surface in
+// `settings.rs`) should survive a restart. These wrap the live-apply
+// functions above with a save into the window-state store, reading the
+// now-active theme back from `Theme::global` so the persisted name/mode
+// always match what was actually applied. Never called from
+// `apply_persisted_theme` (startup restore) — that would re-save unchanged
+// state on every launch.
+
+/// Save the currently active theme (name + mode, read from the live `Theme`
+/// global) into the window-state store at `path`. Split out from
+/// [`persist_theme`] so tests can exercise it against a scratch path instead
+/// of the live platform state directory.
+fn persist_theme_to(path: &std::path::Path, cx: &App) -> Result<(), window_state::StoreError> {
+    let theme = Theme::global(cx);
+    window_state::save_theme(path, theme.theme_name(), theme.mode)
+}
+
+/// Resolve the live platform state path — the same one `apply_persisted_theme`
+/// restores from — and persist the active theme there. Best-effort: a missing
+/// platform state directory or a write failure only logs; the live theme
+/// change already applied regardless.
+fn persist_theme(cx: &App) {
+    match window_state::state_path() {
+        Ok(path) => {
+            if let Err(e) = persist_theme_to(&path, cx) {
+                warn!(%e, "failed to persist theme change");
+            }
+        }
+        Err(e) => warn!(%e, "no platform state directory, theme change not persisted"),
+    }
+}
+
+/// [`set_theme`], then persists the result so it survives a restart.
+pub fn set_theme_persisted(name: &str, window: Option<&mut Window>, cx: &mut App) {
+    set_theme(name, window, cx);
+    persist_theme(cx);
+}
+
+/// [`set_theme_mode`], then persists the result so it survives a restart.
+pub fn set_theme_mode_persisted(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
+    set_theme_mode(mode, window, cx);
+    persist_theme(cx);
+}
+
+/// [`toggle_theme_mode`], then persists the result so it survives a restart.
+pub fn toggle_theme_mode_persisted(window: Option<&mut Window>, cx: &mut App) {
+    let mode = if Theme::global(cx).mode.is_dark() {
+        ThemeMode::Light
+    } else {
+        ThemeMode::Dark
+    };
+    set_theme_mode_persisted(mode, window, cx);
+}
+
 // ── Command-palette theme actions ────────────────────────────────────────────
 //
 // Dispatchable, parameterless actions (issue #367, `docs/spec-theme-settings.md`):
@@ -189,10 +246,10 @@ mod tests {
     use crate::problems_panel::PROBLEMS_PANEL_NAME;
     use crate::source_control::SOURCE_CONTROL_PANEL_NAME;
     use crate::terminal_panel::TERMINAL_PANEL_NAME;
-    use crate::window_state::WindowState;
+    use crate::window_state::{self, WindowState};
     use crate::{
-        apply_persisted_theme, apply_theme, resolve_theme, set_theme, set_theme_mode,
-        toggle_theme_mode, CATPPUCCIN_MOCHA_THEME_NAME, DEFAULT_LIGHT_THEME_NAME,
+        apply_persisted_theme, apply_theme, persist_theme_to, resolve_theme, set_theme,
+        set_theme_mode, toggle_theme_mode, CATPPUCCIN_MOCHA_THEME_NAME, DEFAULT_LIGHT_THEME_NAME,
         DEFAULT_THEME_NAME,
     };
 
@@ -409,6 +466,36 @@ mod tests {
                 CATPPUCCIN_MOCHA_THEME_NAME
             );
         });
+    }
+
+    /// The `_persisted` wrappers (issue #365) save the active theme via
+    /// `window_state::save_theme` after applying it. Exercised at the
+    /// `persist_theme_to` seam against a scratch path rather than through
+    /// `set_theme_persisted` directly, since the public wrapper resolves the
+    /// live platform state path (`window_state::state_path`) and a unit test
+    /// must never touch the real one.
+    #[gpui::test]
+    fn test_persist_theme_to_writes_the_active_name_and_mode(cx: &mut TestAppContext) {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "rift-app-lib-persist-theme-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            apply_theme(cx);
+            set_theme(DEFAULT_LIGHT_THEME_NAME, None, cx);
+
+            persist_theme_to(&path, cx).expect("persist_theme_to");
+        });
+
+        let loaded = window_state::load(&path);
+        assert_eq!(loaded.theme_name, DEFAULT_LIGHT_THEME_NAME);
+        assert_eq!(loaded.theme_mode, ThemeMode::Light);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// `EditorView`, `TerminalPanel`, `ProblemsPanel`, `SourceControlPanel`, and
