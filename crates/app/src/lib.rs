@@ -8,6 +8,7 @@ use tracing::{error, warn};
 #[cfg(feature = "gallery")]
 pub mod gallery;
 
+pub mod command_palette;
 pub mod command_registry;
 pub mod editor;
 pub mod file_tree;

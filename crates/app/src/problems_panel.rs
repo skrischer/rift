@@ -18,6 +18,16 @@
 //! fold the workspace already performs (`Diagnostics` -> `apply_diagnostics`)
 //! repaints this panel too — no new bridge from the daemon stream.
 //!
+//! # Virtualization polish (#344)
+//!
+//! The observer only marks [`ProblemsPanel::cache_dirty`]; the grouped,
+//! sorted, flattened row list is rebuilt by [`ProblemsPanel::refresh_cache`]
+//! at most once per paint, mirroring [`crate::file_tree::FileTree`]'s
+//! `row_cache`/`cache_dirty` pattern. Without it, `render` and the virtual
+//! list's visible-range closure would each re-group/sort/flatten the full
+//! diagnostics set independently — on every scroll frame, not just every
+//! model change — defeating the point of virtualizing a large set.
+//!
 //! # Jump-to-location (#343)
 //!
 //! Clicking a diagnostic row emits [`ProblemsPanelEvent::OpenLocation`], the
@@ -231,6 +241,21 @@ pub struct ProblemsPanel {
     file_tree: Entity<FileTree>,
     focus_handle: FocusHandle,
     scroll_handle: VirtualListScrollHandle,
+    /// Grouped/sorted/counted summary as of the last [`ProblemsPanel::refresh_cache`]
+    /// call; [`ProblemsPanel::row_cache`] is flattened from it. Stale whenever
+    /// [`ProblemsPanel::cache_dirty`] is set — `render` always refreshes
+    /// before reading either.
+    cached_summary: ProblemsSummary,
+    /// Flattened rows the virtual list's visible-range closure reads
+    /// directly, rebuilt by [`ProblemsPanel::refresh_cache`] only when
+    /// [`ProblemsPanel::cache_dirty`] is set (see the module-level
+    /// "Virtualization polish" doc).
+    row_cache: Vec<ProblemRow>,
+    /// Set by the file-tree observer on every notify (a `Diagnostics` fold
+    /// among them); cleared by [`ProblemsPanel::refresh_cache`] once it
+    /// rebuilds [`ProblemsPanel::cached_summary`] and
+    /// [`ProblemsPanel::row_cache`] from the fresh model state.
+    cache_dirty: bool,
     /// Repaints this panel whenever the observed file tree notifies (the
     /// workspace's daemon-stream bridge already calls `cx.notify()` on the
     /// tree after every `Diagnostics` fold) — the "live" requirement, with no
@@ -241,19 +266,42 @@ pub struct ProblemsPanel {
 impl ProblemsPanel {
     /// Build a problems panel that mirrors `file_tree`'s model.
     pub fn new(file_tree: Entity<FileTree>, cx: &mut Context<Self>) -> Self {
-        let observe = cx.observe(&file_tree, |_this, _tree, cx| cx.notify());
+        let observe = cx.observe(&file_tree, |this, _tree, cx| {
+            this.cache_dirty = true;
+            cx.notify();
+        });
         Self {
             file_tree,
             focus_handle: cx.focus_handle(),
             scroll_handle: VirtualListScrollHandle::new(),
+            cached_summary: ProblemsSummary::default(),
+            row_cache: Vec::new(),
+            cache_dirty: true,
             _observe_model: observe,
         }
     }
 
-    /// The current grouped/sorted/counted summary — the headless handle used
-    /// by tests and by `Render`.
+    /// The current grouped/sorted/counted summary, freshly computed from the
+    /// model — the headless handle used by tests. Always live (unlike
+    /// [`ProblemsPanel::cached_summary`]): callers that don't render a full
+    /// paint per check (e.g. tests) still see the latest model state.
     pub fn summary(&self, cx: &App) -> ProblemsSummary {
         ProblemsSummary::from_diagnostics(self.file_tree.read(cx).model().all_diagnostics())
+    }
+
+    /// Rebuild [`ProblemsPanel::cached_summary`] and
+    /// [`ProblemsPanel::row_cache`] from the model when
+    /// [`ProblemsPanel::cache_dirty`] is set; a no-op otherwise. `render`
+    /// calls this once per paint, before the item-size vector and the virtual
+    /// list's row closure both read the caches — so a large diagnostics set
+    /// is grouped/sorted/flattened once per model change, not once per
+    /// visible-range query during a scroll.
+    fn refresh_cache(&mut self, cx: &App) {
+        if self.cache_dirty {
+            self.cached_summary = self.summary(cx);
+            self.row_cache = Self::rows(&self.cached_summary);
+            self.cache_dirty = false;
+        }
     }
 
     /// Flatten a summary's groups into the virtual list's row sequence.
@@ -383,9 +431,13 @@ impl Panel for ProblemsPanel {
 
 impl Render for ProblemsPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let summary = self.summary(cx);
+        // Rebuild the caches once for this paint if the model changed since
+        // the last one; a no-op otherwise. Both the size vector below and the
+        // virtual list's row closure read `row_cache` from here on — see the
+        // module-level "Virtualization polish" doc.
+        self.refresh_cache(cx);
 
-        if summary.groups.is_empty() {
+        if self.cached_summary.groups.is_empty() {
             return div()
                 .size_full()
                 .p(px(8.0))
@@ -395,9 +447,9 @@ impl Render for ProblemsPanel {
                 .into_any_element();
         }
 
-        let rows = Self::rows(&summary);
         let item_sizes: Rc<Vec<Size<Pixels>>> = Rc::new(
-            rows.iter()
+            self.row_cache
+                .iter()
                 .map(|_| Size::new(px(0.0), ROW_HEIGHT))
                 .collect(),
         );
@@ -417,7 +469,7 @@ impl Render for ProblemsPanel {
                     .text_color(cx.theme().foreground)
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(counts_line(&summary.totals)),
+                    .child(counts_line(&self.cached_summary.totals)),
             )
             .child(
                 div().flex_1().min_h_0().child(
@@ -426,10 +478,17 @@ impl Render for ProblemsPanel {
                         "problems-list",
                         item_sizes,
                         move |this, visible_range, _window, cx| {
-                            let summary = this.summary(cx);
-                            let rows = Self::rows(&summary);
+                            // Read the cache built above — the virtual list
+                            // only asks for the rows currently on screen, so a
+                            // large diagnostics set still paints a bounded
+                            // number of elements, but no re-group/sort/
+                            // flatten happens here: `row_cache` is already
+                            // fresh.
+                            let this: &Self = this;
                             visible_range
-                                .filter_map(|ix| rows.get(ix).map(|row| Self::render_row(row, cx)))
+                                .filter_map(|ix| {
+                                    this.row_cache.get(ix).map(|row| Self::render_row(row, cx))
+                                })
                                 .map(IntoElement::into_any_element)
                                 .collect::<Vec<_>>()
                         },
@@ -444,6 +503,7 @@ impl Render for ProblemsPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{AppContext as _, TestAppContext};
     use rift_protocol::{Position, Range};
 
     fn diag(line: u32, character: u32, severity: DiagnosticSeverity, message: &str) -> Diagnostic {
@@ -675,5 +735,82 @@ mod tests {
             }),
             "2 errors, 1 warning"
         );
+    }
+
+    /// Live updates + cache polish (#344): a `Diagnostics` fold onto the
+    /// observed file tree marks [`ProblemsPanel::cache_dirty`], and
+    /// [`ProblemsPanel::refresh_cache`] then reflects the change in
+    /// [`ProblemsPanel::row_cache`] — an error introduced adds rows, and
+    /// clearing it drops the file's rows entirely. Headless: constructs the
+    /// panel directly against a `FileTree` entity, no window.
+    #[gpui::test]
+    fn test_refresh_cache_reflects_a_diagnostic_added_then_cleared(cx: &mut TestAppContext) {
+        // `cx.observe`'s callback runs on effect flush, which happens when the
+        // *outermost* `cx.update` call returns (`App::finish_update`) — not
+        // mid-closure on a nested `Entity::update`. So the notify-driven
+        // dirty flag is only observable from a separate top-level `cx.update`
+        // call after the one that triggered it.
+        let (file_tree, panel) = cx.update(|cx| {
+            let file_tree = cx.new(|_cx| FileTree::new());
+            let panel = cx.new(|cx| ProblemsPanel::new(file_tree.clone(), cx));
+            (file_tree, panel)
+        });
+
+        cx.update(|cx| {
+            assert!(
+                panel.read(cx).cache_dirty,
+                "a freshly constructed panel starts dirty"
+            );
+            panel.update(cx, |panel, cx| panel.refresh_cache(cx));
+            assert!(
+                panel.read(cx).row_cache.is_empty(),
+                "no diagnostics folded yet"
+            );
+        });
+
+        cx.update(|cx| {
+            file_tree.update(cx, |tree, cx| {
+                tree.model_mut()
+                    .apply_snapshot_chunk("/proj".into(), Vec::new(), true);
+                tree.model_mut().apply_diagnostics(
+                    "a.rs".into(),
+                    "rust-analyzer".into(),
+                    vec![diag(1, 0, DiagnosticSeverity::Error, "mismatched types")],
+                );
+                cx.notify();
+            });
+        });
+
+        cx.update(|cx| {
+            assert!(
+                panel.read(cx).cache_dirty,
+                "observing the file tree's notify marks the cache dirty"
+            );
+            panel.update(cx, |panel, cx| panel.refresh_cache(cx));
+            assert!(!panel.read(cx).cache_dirty);
+            assert_eq!(
+                panel.read(cx).row_cache.len(),
+                2,
+                "one header row + one entry row for a.rs"
+            );
+            assert_eq!(panel.read(cx).cached_summary.totals.errors, 1);
+        });
+
+        cx.update(|cx| {
+            file_tree.update(cx, |tree, cx| {
+                tree.model_mut()
+                    .apply_diagnostics("a.rs".into(), "rust-analyzer".into(), vec![]);
+                cx.notify();
+            });
+        });
+
+        cx.update(|cx| {
+            panel.update(cx, |panel, cx| panel.refresh_cache(cx));
+            assert!(
+                panel.read(cx).row_cache.is_empty(),
+                "a.rs cleared its only diagnostic and drops out of the cached rows"
+            );
+            assert_eq!(panel.read(cx).cached_summary.totals.errors, 0);
+        });
     }
 }
