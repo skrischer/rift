@@ -108,6 +108,47 @@ pub fn set_theme_mode(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App
     Theme::change(mode, window, cx);
 }
 
+/// Flip between light and dark mode, keeping whichever named theme is
+/// currently assigned to each slot — the command palette's "Toggle Light/Dark
+/// Theme" entry (`docs/spec-theme-settings.md`).
+pub fn toggle_theme_mode(window: Option<&mut Window>, cx: &mut App) {
+    let mode = if Theme::global(cx).mode.is_dark() {
+        ThemeMode::Light
+    } else {
+        ThemeMode::Dark
+    };
+    set_theme_mode(mode, window, cx);
+}
+
+// ── Command-palette theme actions ────────────────────────────────────────────
+//
+// Dispatchable, parameterless actions (issue #367, `docs/spec-theme-settings.md`):
+// registered in `command_registry::COMMANDS` (#358) so the palette can
+// discover and dispatch them, and wired to the functions above via
+// `on_action` handlers in `workspace::WorkspaceView::render` — mirroring how
+// the Phase 16 shell command actions in `workspace.rs` are defined beside
+// what they target and wired at the render root.
+
+/// Toggle between light and dark mode.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct ToggleThemeMode;
+
+/// Select `gpui-component`'s bundled light theme.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct SelectDefaultLightTheme;
+
+/// Select `gpui-component`'s bundled dark theme.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct SelectDefaultDarkTheme;
+
+/// Select rift's own Catppuccin Mocha theme.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct SelectCatppuccinMochaTheme;
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -124,8 +165,8 @@ mod tests {
     use crate::source_control::SOURCE_CONTROL_PANEL_NAME;
     use crate::terminal_panel::TERMINAL_PANEL_NAME;
     use crate::{
-        apply_theme, resolve_theme, set_theme, set_theme_mode, CATPPUCCIN_MOCHA_THEME_NAME,
-        DEFAULT_LIGHT_THEME_NAME, DEFAULT_THEME_NAME,
+        apply_theme, resolve_theme, set_theme, set_theme_mode, toggle_theme_mode,
+        CATPPUCCIN_MOCHA_THEME_NAME, DEFAULT_LIGHT_THEME_NAME, DEFAULT_THEME_NAME,
     };
 
     fn theme_config(name: &str, mode: ThemeMode) -> ThemeConfig {
@@ -248,6 +289,28 @@ mod tests {
 
             set_theme_mode(ThemeMode::Dark, None, cx);
 
+            assert!(cx.theme().is_dark());
+            assert_eq!(
+                cx.theme().theme_name().as_ref(),
+                CATPPUCCIN_MOCHA_THEME_NAME
+            );
+        });
+    }
+
+    /// The command palette's "Toggle Light/Dark Theme" entry flips dark to
+    /// light and back, keeping whichever named theme is assigned to each slot.
+    #[gpui::test]
+    fn test_toggle_theme_mode_flips_dark_to_light_and_back(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            apply_theme(cx);
+            assert!(cx.theme().is_dark());
+
+            toggle_theme_mode(None, cx);
+            assert!(!cx.theme().is_dark());
+            assert_eq!(cx.theme().theme_name().as_ref(), DEFAULT_LIGHT_THEME_NAME);
+
+            toggle_theme_mode(None, cx);
             assert!(cx.theme().is_dark());
             assert_eq!(
                 cx.theme().theme_name().as_ref(),

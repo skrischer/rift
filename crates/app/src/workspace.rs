@@ -72,6 +72,10 @@ use crate::problems_panel::{ProblemsPanel, ProblemsPanelEvent};
 use crate::source_control::{SourceControlEvent, SourceControlPanel};
 use crate::status_bar;
 use crate::terminal_panel::TerminalPanel;
+use crate::{
+    SelectCatppuccinMochaTheme, SelectDefaultDarkTheme, SelectDefaultLightTheme, ToggleThemeMode,
+    CATPPUCCIN_MOCHA_THEME_NAME, DEFAULT_DARK_THEME_NAME, DEFAULT_LIGHT_THEME_NAME,
+};
 
 // ── Actions ───────────────────────────────────────────────────────────────────
 //
@@ -688,6 +692,18 @@ impl WorkspaceView {
     fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.command_palette.open(window, cx);
     }
+
+    /// Toggle light/dark mode (issue #367), keeping whichever named theme is
+    /// currently assigned to each slot.
+    fn toggle_theme_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        crate::toggle_theme_mode(Some(window), cx);
+    }
+
+    /// Switch the active theme by name (issue #367), restyling the running UI
+    /// live.
+    fn select_theme(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        crate::set_theme(name, Some(window), cx);
+    }
 }
 
 /// Fold one worktree-family daemon message into the file tree's model. Only the
@@ -805,6 +821,22 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
                 this.open_command_palette(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleThemeMode, window, cx| {
+                this.toggle_theme_mode(window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &SelectDefaultLightTheme, window, cx| {
+                    this.select_theme(DEFAULT_LIGHT_THEME_NAME, window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &SelectDefaultDarkTheme, window, cx| {
+                this.select_theme(DEFAULT_DARK_THEME_NAME, window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &SelectCatppuccinMochaTheme, window, cx| {
+                    this.select_theme(CATPPUCCIN_MOCHA_THEME_NAME, window, cx);
+                }),
+            )
             .child(self.dock_area.clone())
             .child(status_bar)
             .children(sheet_layer)
