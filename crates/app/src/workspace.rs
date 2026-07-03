@@ -73,6 +73,7 @@ use crate::diff_view::DiffView;
 use crate::editor::EditorView;
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::problems_panel::{ProblemsPanel, ProblemsPanelEvent};
+use crate::settings::{OpenSettings, SettingsView};
 use crate::source_control::{SourceControlEvent, SourceControlPanel};
 use crate::status_bar;
 use crate::terminal_panel::TerminalPanel;
@@ -220,6 +221,10 @@ pub struct WorkspaceView {
     /// (`Ctrl+Shift+P` / `Cmd+Shift+P`) reuses the same list rather than
     /// rebuilding the registry each time.
     command_palette: CommandPalette,
+    /// The settings surface (`docs/spec-theme-settings.md`, issue #366):
+    /// theme mode, named theme, and font scale, hosted as a `Root` dialog
+    /// like `command_palette` above.
+    settings_view: SettingsView,
 }
 
 impl WorkspaceView {
@@ -583,6 +588,7 @@ impl WorkspaceView {
         });
 
         let command_palette = CommandPalette::new(window, cx);
+        let settings_view = SettingsView::new(session_view.clone());
 
         Self {
             file_tree,
@@ -595,6 +601,7 @@ impl WorkspaceView {
             open_file_tx,
             dock_area,
             command_palette,
+            settings_view,
         }
     }
 
@@ -716,6 +723,11 @@ impl WorkspaceView {
     /// Open the command palette (issue #359) as a `Root` dialog.
     fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.command_palette.open(window, cx);
+    }
+
+    /// Open the settings surface (issue #366) as a `Root` dialog.
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_view.open(window, cx);
     }
 
     /// Toggle light/dark mode (issue #367), keeping whichever named theme is
@@ -845,6 +857,9 @@ impl Render for WorkspaceView {
             }))
             .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
                 this.open_command_palette(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                this.open_settings(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleThemeMode, window, cx| {
                 this.toggle_theme_mode(window, cx);
@@ -1420,6 +1435,62 @@ mod tests {
                 workspace.read(cx).focus_handle(cx),
                 session_view.read(cx).focus_handle(cx),
                 "dismissing the palette leaves the terminal focus delegation untouched"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Settings surface (`docs/spec-theme-settings.md`, issue #366): opening
+    /// sets an active `Root` dialog, mirroring the command palette above, and
+    /// closing it clears that state without disturbing the workspace's own
+    /// focus delegation to the terminal.
+    #[gpui::test]
+    fn test_open_settings_opens_a_dialog_and_close_clears_it(cx: &mut TestAppContext) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let mut session_view: Option<Entity<SessionView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let view = cx.new(|cx| SessionView::new(cx).0);
+                session_view = Some(view.clone());
+                workspace =
+                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), window, cx)));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+        let session_view =
+            session_view.expect("session view constructed inside the window callback");
+
+        cx.update_window(window.into(), |_, window, cx| {
+            assert!(
+                !window.has_active_dialog(cx),
+                "no dialog is open before the shortcut fires"
+            );
+
+            workspace.update(cx, |view, cx| {
+                view.open_settings(window, cx);
+            });
+            assert!(
+                window.has_active_dialog(cx),
+                "OpenSettings opens a Root dialog"
+            );
+            assert_eq!(
+                workspace.read(cx).focus_handle(cx),
+                session_view.read(cx).focus_handle(cx),
+                "opening settings does not move the workspace's terminal focus delegation"
+            );
+
+            window.close_dialog(cx);
+            assert!(
+                !window.has_active_dialog(cx),
+                "closing the dialog clears the active-dialog state"
+            );
+            assert_eq!(
+                workspace.read(cx).focus_handle(cx),
+                session_view.read(cx).focus_handle(cx),
+                "dismissing settings leaves the terminal focus delegation untouched"
             );
         })
         .unwrap();

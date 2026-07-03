@@ -14,6 +14,7 @@ pub mod diff_view;
 pub mod editor;
 pub mod file_tree;
 pub mod problems_panel;
+pub mod settings;
 pub mod source_control;
 pub mod status_bar;
 pub mod terminal_panel;
