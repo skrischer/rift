@@ -6,6 +6,7 @@ pub mod layout;
 pub mod pane_view;
 pub mod prefix;
 mod session_view;
+pub mod statusline;
 
 pub use keytable::{
     classify_command, keystroke_to_tmux_key, normalize_tmux_key, parse_list_keys, parse_options,
@@ -13,6 +14,7 @@ pub use keytable::{
 };
 pub use pane_view::{PaneActivity, PaneView};
 pub use session_view::{SessionView, TerminalHandle};
+pub use statusline::{mutates_status_options, parse_status_options, StatusOptions};
 pub use termy_terminal_ui::TerminalUiRenderMetricsSnapshot;
 
 use alacritty_terminal::grid::Dimensions;

@@ -33,6 +33,7 @@ streams pane bytes and layout state back.
 { "type": "tmux_command", "cmd": "split-window -h" }
 { "type": "capture_pane", "pane_id": 3, "start": "-", "end": "-128", "join": false }
 { "type": "query_key_table" }
+{ "type": "query_status_line" }
 ```
 
 - `attach` carries the **session name end-to-end**, so the `RIFT_SESSION` knob
@@ -56,6 +57,19 @@ streams pane bytes and layout state back.
   explicitly: on a user-triggered refresh, or after dispatching a
   binding-mutating bound command (`bind-key`/`unbind-key`/`source-file`, or
   `set-option` touching `prefix`/`prefix2`/`repeat-time`).
+- `query_status_line` asks the daemon to (re-)query the tmux status-line
+  mirror (`docs/spec-tmux-statusline-mirroring.md`): the `status-*` option set
+  via `show-options -A` (session-resolved — includes values inherited from
+  the global scope) plus the server-side-expanded `status-left`/`status-right`
+  segments via `display-message -p '#{T:...}'` (tmux's own format engine,
+  never re-implemented client-side; the raw option value is never
+  interpolated into a command line). The daemon answers with exactly one
+  `status_line_reply` — a **request/response** exchange, same sibling
+  convention as `query_key_table`. The daemon also issues this query
+  unprompted on `attach`/reconnect and again on its own `status-interval`
+  cadence, so the client only sends `query_status_line` explicitly: on a
+  user-triggered refresh, or after dispatching a bound command that sets a
+  mirrored `status-*` option.
 
 ### Daemon → client
 
@@ -66,6 +80,7 @@ streams pane bytes and layout state back.
 { "type": "layout_update",   "session": "rift", "windows": [ <window>, ... ] }
 { "type": "terminal_exit",   "session": "rift", "reason": "server exited" }
 { "type": "key_table_reply", "list_keys": "bind-key -T prefix c new-window\n...", "options": "prefix C-b\nrepeat-time 500\n..." }
+{ "type": "status_line_reply", "options": "status-interval 15\nstatus-left-length 10\n...", "status_left": "no-myhost-80-", "status_right": "#[fg=green]01:49#[default]" }
 ```
 
 ```jsonc
@@ -105,6 +120,15 @@ streams pane bytes and layout state back.
   daemon** — the client parses both with `rift_terminal::keytable` into the
   mirrored key-table lookup and prefix/repeat options. This is tmux's own
   config text, not pane content.
+- `status_line_reply` is the reply to `query_status_line` (and the unprompted
+  attach-time/`status-interval` queries): `options` is the raw `show-options
+  -A` output, newline-joined and tmux-decoded, for the client to parse with
+  `rift_terminal::statusline::parse_status_options`; `status_left`/
+  `status_right` are the already-expanded segments from the two
+  `display-message -p '#{T:...}'` fetches — tmux's own format evaluation,
+  never re-implemented client-side, and still carrying their `#[...]` style
+  runs unparsed. None of this is interpreted by the daemon — it is tmux's
+  own config, not pane content.
 
 ### Snapshot ↔ live-stream consistency contract
 
@@ -344,17 +368,18 @@ deliberate API change — both daemon and client must be updated. Keep additions
 **additive**: existing consumers must keep compiling and deserializing.
 
 Most paths are **push-only** (structure and decoration: worktree, git,
-diagnostics — "push is the source of truth"). The five request/response
+diagnostics — "push is the source of truth"). The six request/response
 exceptions are deliberate and scoped: `capture_pane` / `pane_capture` for
 pre-attach scrollback; `query_key_table` / `key_table_reply` for the tmux
-key-table mirror; the **buffer channel** (`open_file` → `file_content`,
-`save_file` → `save_result` / `save_conflict`) for file content; the
-**navigation channel** (`hover_request` → `hover_response`,
-`definition_request` → `definition_response`,
-`references_request` → `references_response`) for LSP pull queries; and the
-**diff channel** (`request_diff` → `file_diff`) for the source-control panel's
-review diff. The push-only rule governs structure and decoration, never
-request/response pairs.
+key-table mirror; `query_status_line` / `status_line_reply` for the tmux
+status-line mirror (sibling pattern to the key-table one); the **buffer
+channel** (`open_file` → `file_content`, `save_file` → `save_result` /
+`save_conflict`) for file content; the **navigation channel**
+(`hover_request` → `hover_response`, `definition_request` →
+`definition_response`, `references_request` → `references_response`) for LSP
+pull queries; and the **diff channel** (`request_diff` → `file_diff`) for the
+source-control panel's review diff. The push-only rule governs structure and
+decoration, never request/response pairs.
 
 The protocol may migrate to MessagePack if JSON serialization becomes a bottleneck.
 Keep message types serialization-agnostic (derive `serde::Serialize` +

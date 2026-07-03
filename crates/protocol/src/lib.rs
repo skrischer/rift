@@ -65,6 +65,19 @@ pub enum ClientMessage {
     /// (`bind-key`/`unbind-key`/`source-file`, or `set-option` touching
     /// `prefix`/`prefix2`/`repeat-time`).
     QueryKeyTable,
+    /// Ask the daemon to (re-)query the mirrored tmux status-line: the
+    /// `status-*` option set via `show-options -A` (session-resolved —
+    /// includes values inherited from the global scope, e.g. a `.tmux.conf`
+    /// `set -g status-style ...`) and the server-side expanded
+    /// `status-left`/`status-right` segments via `display-message -p
+    /// '#{T:...}'` (`docs/spec-tmux-statusline-mirroring.md`). The daemon
+    /// answers with exactly one [`DaemonMessage::StatusLineReply`]. Sent
+    /// automatically by the daemon's own attach (no client request needed
+    /// there — mirroring [`ClientMessage::QueryKeyTable`]) and again on the
+    /// daemon's own `status-interval` timer; the client sends this
+    /// explicitly to refresh on an explicit user trigger, or after
+    /// dispatching a bound command that sets a mirrored `status-*` option.
+    QueryStatusLine,
     /// Read request on the buffer channel: pull the current content of the file
     /// at `path` (relative to the worktree root, the same key space as
     /// [`WorktreeEntry::path`]). The daemon answers with exactly one
@@ -226,6 +239,26 @@ pub enum DaemonMessage {
     KeyTableReply {
         list_keys: String,
         options: String,
+    },
+    /// The reply to a [`ClientMessage::QueryStatusLine`]: the raw
+    /// `show-options -A` output for the discovered `status-*` option set
+    /// (newline-joined, tmux-decoded), for the client to parse with
+    /// `rift_terminal::statusline::parse_status_options`, plus the two
+    /// already-expanded segments from `display-message -p
+    /// '#{T:status-left}'` / `'#{T:status-right}'` — tmux's own format
+    /// evaluation, never re-implemented client-side. `status_left`/
+    /// `status_right` still carry their `#[...]` style runs unparsed
+    /// (parsing them is a later step); the daemon never interprets any of
+    /// this text itself — it is tmux's own config, not pane content. Sent
+    /// once per attach (issued unprompted, mirroring [`KeyTableReply`]),
+    /// again for every later [`ClientMessage::QueryStatusLine`], and on the
+    /// daemon's own `status-interval` cadence.
+    ///
+    /// [`KeyTableReply`]: DaemonMessage::KeyTableReply
+    StatusLineReply {
+        options: String,
+        status_left: String,
+        status_right: String,
     },
     /// The complete window/pane layout for `session`, sent once per attach as the
     /// baseline of the consistency contract (see the type-level docs). The client
@@ -1998,6 +2031,43 @@ mod tests {
         assert!(diag_json.contains(r#""line":10,"character":4"#));
     }
 
+    #[test]
+    fn test_query_status_line_roundtrips() {
+        let msg = ClientMessage::QueryStatusLine;
+        let json = serde_json::to_string(&msg).expect("serialize QueryStatusLine");
+        assert_eq!(json, r#"{"type":"query_status_line"}"#);
+        let parsed: ClientMessage =
+            serde_json::from_str(&json).expect("deserialize QueryStatusLine");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_status_line_reply_roundtrip_preserves_options_and_segments() {
+        let msg = DaemonMessage::StatusLineReply {
+            options: "status-interval 15\nstatus-left-length 10".to_owned(),
+            status_left: "no-myhost-80-".to_owned(),
+            status_right: "#[fg=green]01:49#[default]".to_owned(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize StatusLineReply");
+        assert!(json.contains(r#""type":"status_line_reply""#));
+        assert!(json.contains(r#""status_left":"no-myhost-80-""#));
+        let parsed: DaemonMessage =
+            serde_json::from_str(&json).expect("deserialize StatusLineReply");
+        assert_eq!(parsed, msg);
+        match parsed {
+            DaemonMessage::StatusLineReply {
+                options,
+                status_left,
+                status_right,
+            } => {
+                assert!(options.contains("status-interval 15"));
+                assert_eq!(status_left, "no-myhost-80-");
+                assert_eq!(status_right, "#[fg=green]01:49#[default]");
+            }
+            other => panic!("expected StatusLineReply, got {other:?}"),
+        }
+    }
+
     // ---- Source-control diff round-trip tests -------------------------------
 
     #[test]
@@ -2044,6 +2114,23 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn test_status_line_reply_empty_segments_roundtrip() {
+        // A blank status-left/status-right (e.g. status off) must round-trip as
+        // an empty string, not vanish or become null.
+        let msg = DaemonMessage::StatusLineReply {
+            options: String::new(),
+            status_left: String::new(),
+            status_right: String::new(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize empty StatusLineReply");
+        assert!(json.contains(r#""status_left":"""#));
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize StatusLineReply"),
+            msg
+        );
     }
 
     #[test]
