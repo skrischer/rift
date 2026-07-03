@@ -56,6 +56,54 @@ const ROW_HEIGHT: Pixels = px(22.0);
 /// Horizontal indent applied per nesting level, so depth reads visually.
 const INDENT_PER_LEVEL: f32 = 14.0;
 
+// ── Actions ───────────────────────────────────────────────────────────────────
+
+/// Move the selection to the previous visible row. Bound to `Up` in
+/// `main.rs`, scoped to [`FILE_TREE_KEY_CONTEXT`].
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct SelectUp;
+
+/// Move the selection to the next visible row. Bound to `Down`.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct SelectDown;
+
+/// Collapse the selected directory if expanded, otherwise select its parent.
+/// Bound to `Left`.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct CollapseOrSelectParent;
+
+/// Expand the selected directory if collapsed, otherwise select its first
+/// child. Bound to `Right`.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct ExpandOrSelectChild;
+
+/// Open the selected file, or toggle the selected directory. Bound to
+/// `Enter`.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct OpenSelected;
+
+/// Select the first visible row. Bound to `Home`.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct SelectFirst;
+
+/// Select the last visible row. Bound to `End`.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct SelectLast;
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// The GPUI key context the tree establishes around its root, so the
+/// navigation actions above are scoped to the focused tree and never steal a
+/// keystroke from the terminal panel (agent-first).
+pub const FILE_TREE_KEY_CONTEXT: &str = "FileTree";
+
 /// The open signal the tree emits when the user selects a file — the clean
 /// interface the editor surface (#187) consumes via `cx.subscribe`. Carries the
 /// file's path relative to the worktree root (the same key space as
@@ -248,6 +296,65 @@ fn compute_rollup(model: &WorktreeModel) -> HashMap<String, Rollup> {
     result
 }
 
+/// Index of `path` within `rows`, or `None` if it is not currently visible
+/// (e.g. its parent was collapsed after it was selected).
+fn row_index(rows: &[Row], path: &str) -> Option<usize> {
+    rows.iter().position(|r| r.path == path)
+}
+
+/// The nearest ancestor directory of `rows[index]`: the closest preceding row
+/// with a strictly smaller depth. `None` at a top-level row (depth `0`).
+fn parent_path(rows: &[Row], index: usize) -> Option<&str> {
+    let depth = rows[index].depth;
+    if depth == 0 {
+        return None;
+    }
+    rows[..index]
+        .iter()
+        .rev()
+        .find(|r| r.depth < depth)
+        .map(|r| r.path.as_str())
+}
+
+/// The first child row of `rows[index]`, if it is an expanded, non-empty
+/// directory. Since [`FileTree::visible_rows`] lists an expanded directory's
+/// children immediately after it, the first child (if any) is simply the next
+/// row, one level deeper.
+fn first_child_path(rows: &[Row], index: usize) -> Option<&str> {
+    let row = &rows[index];
+    if row.kind != EntryKind::Dir {
+        return None;
+    }
+    let next = rows.get(index + 1)?;
+    (next.depth == row.depth + 1).then(|| next.path.as_str())
+}
+
+/// The row selected after moving down one from `selected` (or the first row
+/// when nothing was selected). Clamped at the last row.
+fn selection_after_down(rows: &[Row], selected: Option<&str>) -> Option<String> {
+    if rows.is_empty() {
+        return None;
+    }
+    let next = match selected.and_then(|p| row_index(rows, p)) {
+        Some(i) => (i + 1).min(rows.len() - 1),
+        None => 0,
+    };
+    Some(rows[next].path.clone())
+}
+
+/// The row selected after moving up one from `selected` (or the first row
+/// when nothing was selected). Clamped at the first row.
+fn selection_after_up(rows: &[Row], selected: Option<&str>) -> Option<String> {
+    if rows.is_empty() {
+        return None;
+    }
+    let next = match selected.and_then(|p| row_index(rows, p)) {
+        Some(i) => i.saturating_sub(1),
+        None => 0,
+    };
+    Some(rows[next].path.clone())
+}
+
 /// The navigable file-tree view.
 ///
 /// Owns the [`WorktreeModel`] (the client mirror it renders) plus the small
@@ -336,6 +443,92 @@ impl FileTree {
         }
         // Collapsing/expanding changes which paths are in the visible-row set.
         self.cache_dirty = true;
+    }
+
+    /// Move the selection to the previous visible row ([`SelectUp`]).
+    fn select_up(&mut self) {
+        self.refresh_row_cache();
+        self.selected = selection_after_up(&self.row_cache, self.selected.as_deref());
+    }
+
+    /// Move the selection to the next visible row ([`SelectDown`]).
+    fn select_down(&mut self) {
+        self.refresh_row_cache();
+        self.selected = selection_after_down(&self.row_cache, self.selected.as_deref());
+    }
+
+    /// Select the first visible row ([`SelectFirst`]).
+    fn select_first(&mut self) {
+        self.refresh_row_cache();
+        self.selected = self.row_cache.first().map(|row| row.path.clone());
+    }
+
+    /// Select the last visible row ([`SelectLast`]).
+    fn select_last(&mut self) {
+        self.refresh_row_cache();
+        self.selected = self.row_cache.last().map(|row| row.path.clone());
+    }
+
+    /// Collapse the selected directory if it is expanded; otherwise select
+    /// its parent ([`CollapseOrSelectParent`]). A no-op at a top-level row
+    /// with nothing to collapse. Selects the first row when nothing was
+    /// selected yet, matching [`FileTree::select_down`]/[`FileTree::select_up`].
+    fn collapse_or_select_parent(&mut self) {
+        self.refresh_row_cache();
+        let Some(selected) = self.selected.clone() else {
+            self.selected = self.row_cache.first().map(|row| row.path.clone());
+            return;
+        };
+        let Some(index) = row_index(&self.row_cache, &selected) else {
+            return;
+        };
+        let expanded =
+            self.row_cache[index].kind == EntryKind::Dir && !self.collapsed.contains(&selected);
+        if expanded {
+            self.toggle_dir(&selected);
+        } else if let Some(parent) = parent_path(&self.row_cache, index).map(str::to_owned) {
+            self.selected = Some(parent);
+        }
+    }
+
+    /// Expand the selected directory if it is collapsed; otherwise select its
+    /// first child ([`ExpandOrSelectChild`]). A no-op on a file or an empty,
+    /// already-expanded directory. Selects the first row when nothing was
+    /// selected yet, matching [`FileTree::select_down`]/[`FileTree::select_up`].
+    fn expand_or_select_child(&mut self) {
+        self.refresh_row_cache();
+        let Some(selected) = self.selected.clone() else {
+            self.selected = self.row_cache.first().map(|row| row.path.clone());
+            return;
+        };
+        let Some(index) = row_index(&self.row_cache, &selected) else {
+            return;
+        };
+        let collapsed =
+            self.row_cache[index].kind == EntryKind::Dir && self.collapsed.contains(&selected);
+        if collapsed {
+            self.toggle_dir(&selected);
+        } else if let Some(child) = first_child_path(&self.row_cache, index).map(str::to_owned) {
+            self.selected = Some(child);
+        }
+    }
+
+    /// Open the selected file, or toggle the selected directory
+    /// ([`OpenSelected`]) — the keyboard equivalent of [`FileTree::render_row`]'s
+    /// `on_click`.
+    fn open_selected(&mut self, cx: &mut Context<Self>) {
+        self.refresh_row_cache();
+        let Some(selected) = self.selected.clone() else {
+            return;
+        };
+        let Some(index) = row_index(&self.row_cache, &selected) else {
+            return;
+        };
+        if self.row_cache[index].kind == EntryKind::Dir {
+            self.toggle_dir(&selected);
+        } else {
+            cx.emit(FileTreeEvent::OpenFile { path: selected });
+        }
     }
 
     /// Rebuild [`FileTree::row_cache`] from the model when [`FileTree::cache_dirty`]
@@ -559,48 +752,92 @@ impl Render for FileTree {
 
         // Empty state: no snapshot yet (or an empty root). Keep it quiet — the
         // panel is a passive mirror, not an action surface.
-        if self.row_cache.is_empty() {
-            return div()
+        let content = if self.row_cache.is_empty() {
+            div()
                 .size_full()
                 .p(px(8.0))
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
                 .child("No files")
-                .into_any_element();
-        }
+                .into_any_element()
+        } else {
+            // One uniform row height per item — the size vector the virtual
+            // list measures against. Width is ignored for a vertical list.
+            let item_sizes: Rc<Vec<Size<Pixels>>> = Rc::new(
+                self.row_cache
+                    .iter()
+                    .map(|_| Size::new(px(0.0), ROW_HEIGHT))
+                    .collect(),
+            );
 
-        // One uniform row height per item — the size vector the virtual list
-        // measures against. Width is ignored for a vertical list.
-        let item_sizes: Rc<Vec<Size<Pixels>>> = Rc::new(
-            self.row_cache
-                .iter()
-                .map(|_| Size::new(px(0.0), ROW_HEIGHT))
-                .collect(),
-        );
+            div()
+                .size_full()
+                .child(
+                    v_virtual_list(
+                        cx.entity().clone(),
+                        "file-tree",
+                        item_sizes,
+                        move |this, visible_range, _window, cx| {
+                            // Read the cache built above — the virtual list only
+                            // asks for the rows currently on screen, so a huge tree
+                            // still paints a bounded number of elements, but no
+                            // tree walk happens here: `row_cache` is already fresh.
+                            let this: &Self = this;
+                            visible_range
+                                .filter_map(|ix| {
+                                    this.row_cache.get(ix).map(|row| this.render_row(row, cx))
+                                })
+                                .map(IntoElement::into_any_element)
+                                .collect::<Vec<_>>()
+                        },
+                    )
+                    .track_scroll(&self.scroll_handle),
+                )
+                .into_any_element()
+        };
 
+        // Root: establishes the tree's key context and focus tracking so the
+        // navigation actions below fire only while the tree is focused — the
+        // same scoping pattern as the editor's `EDITOR_KEY_CONTEXT` (never
+        // steals a keystroke the terminal panel would otherwise receive,
+        // since GPUI dispatches actions along the currently *focused*
+        // element's context chain, and the terminal panel is a focus-tracked
+        // sibling, not an ancestor, of this one).
         div()
             .size_full()
-            .child(
-                v_virtual_list(
-                    cx.entity().clone(),
-                    "file-tree",
-                    item_sizes,
-                    move |this, visible_range, _window, cx| {
-                        // Read the cache built above — the virtual list only
-                        // asks for the rows currently on screen, so a huge tree
-                        // still paints a bounded number of elements, but no
-                        // tree walk happens here: `row_cache` is already fresh.
-                        let this: &Self = this;
-                        visible_range
-                            .filter_map(|ix| {
-                                this.row_cache.get(ix).map(|row| this.render_row(row, cx))
-                            })
-                            .map(IntoElement::into_any_element)
-                            .collect::<Vec<_>>()
-                    },
-                )
-                .track_scroll(&self.scroll_handle),
+            .key_context(FILE_TREE_KEY_CONTEXT)
+            .track_focus(&self.focus_handle(cx))
+            .on_action(cx.listener(|this, _: &SelectUp, _window, cx| {
+                this.select_up();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SelectDown, _window, cx| {
+                this.select_down();
+                cx.notify();
+            }))
+            .on_action(
+                cx.listener(|this, _: &CollapseOrSelectParent, _window, cx| {
+                    this.collapse_or_select_parent();
+                    cx.notify();
+                }),
             )
+            .on_action(cx.listener(|this, _: &ExpandOrSelectChild, _window, cx| {
+                this.expand_or_select_child();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &OpenSelected, _window, cx| {
+                this.open_selected(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SelectFirst, _window, cx| {
+                this.select_first();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SelectLast, _window, cx| {
+                this.select_last();
+                cx.notify();
+            }))
+            .child(content)
             .into_any_element()
     }
 }
@@ -1147,5 +1384,289 @@ mod tests {
             .expect("ignored.rs");
         assert!(!kept.ignored);
         assert!(ignored.ignored);
+    }
+
+    // --- keyboard navigation: selection movement + expand/collapse-at-edge (#332) ---
+
+    /// A bare row for exercising the pure navigation helpers directly, without
+    /// seeding a whole model.
+    fn row_at(path: &str, kind: EntryKind, depth: usize) -> Row {
+        Row {
+            path: path.to_owned(),
+            kind,
+            depth,
+            ignored: false,
+            git_status: None,
+            severity: None,
+        }
+    }
+
+    /// Seeded visible-row set used by the plain-function navigation tests
+    /// below (mirrors `a/b/c.rs`, `a/d.rs`, `e.rs`):
+    /// ```text
+    /// a          depth 0, dir
+    /// a/b        depth 1, dir
+    /// a/b/c.rs   depth 2, file
+    /// a/d.rs     depth 1, file
+    /// e.rs       depth 0, file
+    /// ```
+    fn seeded_rows() -> Vec<Row> {
+        vec![
+            row_at("a", EntryKind::Dir, 0),
+            row_at("a/b", EntryKind::Dir, 1),
+            row_at("a/b/c.rs", EntryKind::File, 2),
+            row_at("a/d.rs", EntryKind::File, 1),
+            row_at("e.rs", EntryKind::File, 0),
+        ]
+    }
+
+    #[test]
+    fn test_selection_after_down_moves_to_the_next_row() {
+        let rows = seeded_rows();
+        assert_eq!(
+            selection_after_down(&rows, Some("a/b")).as_deref(),
+            Some("a/b/c.rs")
+        );
+    }
+
+    #[test]
+    fn test_selection_after_down_clamps_at_the_last_row() {
+        let rows = seeded_rows();
+        assert_eq!(
+            selection_after_down(&rows, Some("e.rs")).as_deref(),
+            Some("e.rs")
+        );
+    }
+
+    #[test]
+    fn test_selection_after_down_selects_the_first_row_when_nothing_was_selected() {
+        let rows = seeded_rows();
+        assert_eq!(selection_after_down(&rows, None).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn test_selection_after_down_falls_back_to_the_first_row_when_the_selection_is_no_longer_visible(
+    ) {
+        // Simulates the selected path having scrolled out of the visible set
+        // (e.g. an ancestor was collapsed after selection).
+        let rows = seeded_rows();
+        assert_eq!(
+            selection_after_down(&rows, Some("gone")).as_deref(),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn test_selection_after_up_moves_to_the_previous_row() {
+        let rows = seeded_rows();
+        assert_eq!(
+            selection_after_up(&rows, Some("a/d.rs")).as_deref(),
+            Some("a/b/c.rs")
+        );
+    }
+
+    #[test]
+    fn test_selection_after_up_clamps_at_the_first_row() {
+        let rows = seeded_rows();
+        assert_eq!(selection_after_up(&rows, Some("a")).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn test_selection_after_up_selects_the_first_row_when_nothing_was_selected() {
+        let rows = seeded_rows();
+        assert_eq!(selection_after_up(&rows, None).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn test_selection_after_down_and_up_on_an_empty_row_set_select_nothing() {
+        let rows: Vec<Row> = Vec::new();
+        assert_eq!(selection_after_down(&rows, None), None);
+        assert_eq!(selection_after_up(&rows, Some("a")), None);
+    }
+
+    #[test]
+    fn test_parent_path_is_none_at_a_top_level_row() {
+        let rows = seeded_rows();
+        assert_eq!(parent_path(&rows, 0), None); // "a"
+        assert_eq!(parent_path(&rows, 4), None); // "e.rs"
+    }
+
+    #[test]
+    fn test_parent_path_finds_the_nearest_ancestor_not_just_the_previous_row() {
+        let rows = seeded_rows();
+        // "a/b/c.rs" (index 2) sits directly under "a/b" (index 1).
+        assert_eq!(parent_path(&rows, 2), Some("a/b"));
+        // "a/d.rs" (index 3) is back up a level, its parent is "a" (index 0),
+        // skipping over the deeper "a/b" sibling that precedes it.
+        assert_eq!(parent_path(&rows, 3), Some("a"));
+    }
+
+    #[test]
+    fn test_first_child_path_finds_the_row_immediately_after_an_expanded_dir() {
+        let rows = seeded_rows();
+        assert_eq!(first_child_path(&rows, 0), Some("a/b")); // "a"'s first child
+        assert_eq!(first_child_path(&rows, 1), Some("a/b/c.rs")); // "a/b"'s first child
+    }
+
+    #[test]
+    fn test_first_child_path_is_none_for_a_file() {
+        let rows = seeded_rows();
+        assert_eq!(first_child_path(&rows, 2), None); // "a/b/c.rs" is a file
+        assert_eq!(first_child_path(&rows, 4), None); // "e.rs" is a file
+    }
+
+    #[test]
+    fn test_first_child_path_is_none_for_an_empty_or_already_collapsed_dir() {
+        // A dir whose next row is a sibling (same or shallower depth), not a
+        // child — the same shape as an empty dir or one hidden by collapse.
+        let rows = vec![
+            row_at("empty", EntryKind::Dir, 0),
+            row_at("sibling.rs", EntryKind::File, 0),
+        ];
+        assert_eq!(first_child_path(&rows, 0), None);
+    }
+
+    #[test]
+    fn test_first_child_path_is_none_for_the_last_row() {
+        let rows = seeded_rows();
+        assert_eq!(first_child_path(&rows, rows.len() - 1), None);
+    }
+
+    #[test]
+    fn test_select_down_and_up_move_the_tree_selection_through_visible_rows() {
+        let mut tree = seed(vec![dir("a"), file("a/b.rs"), file("top.rs")]);
+        // BTreeMap order: a, a/b.rs, top.rs.
+        tree.select_down();
+        assert_eq!(tree.selected(), Some("a"));
+        tree.select_down();
+        assert_eq!(tree.selected(), Some("a/b.rs"));
+        tree.select_down();
+        assert_eq!(tree.selected(), Some("top.rs"));
+        // Clamped at the last row.
+        tree.select_down();
+        assert_eq!(tree.selected(), Some("top.rs"));
+
+        tree.select_up();
+        assert_eq!(tree.selected(), Some("a/b.rs"));
+    }
+
+    #[test]
+    fn test_select_first_and_select_last_jump_to_the_row_set_edges() {
+        let mut tree = seed(vec![dir("a"), file("a/b.rs"), file("top.rs")]);
+        tree.selected = Some("a/b.rs".into());
+
+        tree.select_last();
+        assert_eq!(tree.selected(), Some("top.rs"));
+
+        tree.select_first();
+        assert_eq!(tree.selected(), Some("a"));
+    }
+
+    #[test]
+    fn test_collapse_or_select_parent_collapses_an_expanded_selected_dir() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs")]);
+        tree.selected = Some("src".into());
+
+        tree.collapse_or_select_parent();
+
+        assert!(tree.is_collapsed("src"));
+        // Collapsing keeps the selection on the directory itself.
+        assert_eq!(tree.selected(), Some("src"));
+    }
+
+    #[test]
+    fn test_collapse_or_select_parent_on_a_file_selects_its_parent() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs")]);
+        tree.selected = Some("src/main.rs".into());
+
+        tree.collapse_or_select_parent();
+
+        assert_eq!(tree.selected(), Some("src"));
+        assert!(
+            !tree.is_collapsed("src"),
+            "selecting the parent must not also collapse it"
+        );
+    }
+
+    #[test]
+    fn test_collapse_or_select_parent_on_an_already_collapsed_dir_selects_its_parent() {
+        let mut tree = seed(vec![dir("a"), dir("a/b"), file("a/b/c.rs")]);
+        tree.toggle_dir("a/b");
+        tree.selected = Some("a/b".into());
+
+        tree.collapse_or_select_parent();
+
+        assert_eq!(tree.selected(), Some("a"));
+    }
+
+    #[test]
+    fn test_collapse_or_select_parent_is_a_noop_at_a_top_level_row() {
+        let mut tree = seed(vec![file("top.rs")]);
+        tree.selected = Some("top.rs".into());
+
+        tree.collapse_or_select_parent();
+
+        // No parent to step to; selection is unchanged.
+        assert_eq!(tree.selected(), Some("top.rs"));
+    }
+
+    #[test]
+    fn test_collapse_or_select_parent_selects_the_first_row_when_nothing_was_selected() {
+        let mut tree = seed(vec![dir("a"), file("top.rs")]);
+
+        tree.collapse_or_select_parent();
+
+        assert_eq!(tree.selected(), Some("a"));
+    }
+
+    #[test]
+    fn test_expand_or_select_child_expands_a_collapsed_selected_dir() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs")]);
+        tree.toggle_dir("src");
+        tree.selected = Some("src".into());
+
+        tree.expand_or_select_child();
+
+        assert!(!tree.is_collapsed("src"));
+        assert_eq!(tree.selected(), Some("src"));
+    }
+
+    #[test]
+    fn test_expand_or_select_child_on_an_expanded_dir_selects_its_first_child() {
+        let mut tree = seed(vec![dir("a"), dir("a/b"), file("a/z.rs")]);
+        tree.selected = Some("a".into());
+
+        tree.expand_or_select_child();
+
+        assert_eq!(tree.selected(), Some("a/b"));
+    }
+
+    #[test]
+    fn test_expand_or_select_child_is_a_noop_on_a_file() {
+        let mut tree = seed(vec![file("top.rs")]);
+        tree.selected = Some("top.rs".into());
+
+        tree.expand_or_select_child();
+
+        assert_eq!(tree.selected(), Some("top.rs"));
+    }
+
+    #[test]
+    fn test_expand_or_select_child_is_a_noop_on_an_empty_expanded_dir() {
+        let mut tree = seed(vec![dir("empty"), file("top.rs")]);
+        tree.selected = Some("empty".into());
+
+        tree.expand_or_select_child();
+
+        assert_eq!(tree.selected(), Some("empty"));
+    }
+
+    #[test]
+    fn test_expand_or_select_child_selects_the_first_row_when_nothing_was_selected() {
+        let mut tree = seed(vec![dir("a"), file("top.rs")]);
+
+        tree.expand_or_select_child();
+
+        assert_eq!(tree.selected(), Some("a"));
     }
 }
