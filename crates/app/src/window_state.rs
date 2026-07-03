@@ -120,6 +120,25 @@ pub fn save_theme(path: &Path, name: &str, mode: ThemeMode) -> Result<(), StoreE
     save(path, &state)
 }
 
+/// Persist window geometry into the store at `path`: a read-modify-write that
+/// updates only `bounds`/`maximized`/`font_size_px`, leaving whatever theme is
+/// already on disk untouched — that half of the schema is `save_theme`'s
+/// concern, not this call's. The save-on-change counterpart to `load`'s
+/// startup restore, mirroring `save_theme`'s shape.
+pub fn save_geometry(
+    path: &Path,
+    bounds: Rect,
+    maximized: bool,
+    font_size_px: f32,
+) -> Result<(), StoreError> {
+    let mut state = load(path);
+    state.version = SCHEMA_VERSION;
+    state.bounds = bounds;
+    state.maximized = maximized;
+    state.font_size_px = font_size_px;
+    save(path, &state)
+}
+
 /// Failure modes for [`save`] and platform path resolution. [`load`] never
 /// returns an error — a missing, corrupt, or unreadable file degrades to
 /// [`WindowState::default`] instead (spec: "never a crash, never a refusal to
@@ -546,6 +565,31 @@ mod tests {
         assert_eq!(loaded.theme_name, "Default Light");
         assert_eq!(loaded.theme_mode, ThemeMode::Light);
         assert_eq!(loaded.bounds, Rect::default());
+    }
+
+    /// The regression `save_geometry` exists to prevent: a debounced
+    /// move/resize/font-change save must not clobber a theme the user picked
+    /// via `save_theme` back to the schema default.
+    #[test]
+    fn test_save_geometry_updates_only_geometry_fields_and_preserves_theme() {
+        let scratch = Scratch::new("save_geometry");
+        let path = scratch.path("state.json");
+        save_theme(&path, "Catppuccin Mocha", ThemeMode::Dark).expect("initial save_theme");
+
+        let new_bounds = Rect {
+            x: 12.0,
+            y: 34.0,
+            width: 1024.0,
+            height: 768.0,
+        };
+        save_geometry(&path, new_bounds, true, 18.0).expect("save_geometry");
+
+        let loaded = load(&path);
+        assert_eq!(loaded.bounds, new_bounds);
+        assert!(loaded.maximized);
+        assert_eq!(loaded.font_size_px, 18.0);
+        assert_eq!(loaded.theme_name, "Catppuccin Mocha");
+        assert_eq!(loaded.theme_mode, ThemeMode::Dark);
     }
 
     // --- platform path resolution -------------------------------------------

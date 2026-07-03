@@ -823,38 +823,27 @@ impl WorkspaceView {
     }
 }
 
-/// Build the persisted [`window_state::WindowState`] from the window's
-/// current restore bounds/maximized flag and the terminal's live font size
-/// (#225). `window.window_bounds()` — not `window.bounds()` — is deliberate:
-/// it carries the *restore* size for a maximized/fullscreen window, so
-/// persisting it never overwrites the saved size with the full-display
-/// dimensions on every maximized capture.
-fn capture_window_state(
-    window: &Window,
-    session_view: &Entity<SessionView>,
-    cx: &App,
-) -> window_state::WindowState {
-    let bounds = window.window_bounds().get_bounds();
-    window_state::WindowState {
-        version: window_state::SCHEMA_VERSION,
-        bounds: window_state::Rect {
-            x: f64::from(bounds.origin.x),
-            y: f64::from(bounds.origin.y),
-            width: f64::from(bounds.size.width),
-            height: f64::from(bounds.size.height),
-        },
-        maximized: window.is_maximized(),
-        font_size_px: f32::from(session_view.read(cx).font_size()),
-    }
-}
-
-/// Capture the live window/font state and write it to `path` (#225) — the
+/// Capture the live window/font geometry and write it to `path` (#225) — the
 /// single write call both the debounced save (`arm_window_state_save`) and
 /// the close-flush (`WorkspaceView::new`'s `on_window_should_close`) funnel
-/// through.
+/// through. Read-modify-write via [`window_state::save_geometry`]: the theme
+/// fields are a separate concern (`crate::set_theme_persisted` et al., via
+/// `window_state::save_theme`) and must survive an unrelated geometry save
+/// untouched. `window.window_bounds()` — not `window.bounds()` — is
+/// deliberate: it carries the *restore* size for a maximized/fullscreen
+/// window, so persisting it never overwrites the saved size with the
+/// full-display dimensions on every maximized capture.
 fn save_window_state(path: &Path, window: &Window, session_view: &Entity<SessionView>, cx: &App) {
-    let state = capture_window_state(window, session_view, cx);
-    if let Err(e) = window_state::save(path, &state) {
+    let bounds = window.window_bounds().get_bounds();
+    let rect = window_state::Rect {
+        x: f64::from(bounds.origin.x),
+        y: f64::from(bounds.origin.y),
+        width: f64::from(bounds.size.width),
+        height: f64::from(bounds.size.height),
+    };
+    let maximized = window.is_maximized();
+    let font_size_px = f32::from(session_view.read(cx).font_size());
+    if let Err(e) = window_state::save_geometry(path, rect, maximized, font_size_px) {
         warn!(%e, "failed to save window state");
     }
 }
@@ -890,7 +879,7 @@ fn gpui_bounds(rect: window_state::Rect) -> Bounds<Pixels> {
 /// (#225): clamp the persisted bounds against the live display topology, then
 /// carry the maximized flag through as the matching `WindowBounds` variant —
 /// `Maximized` wraps the *restore* bounds, mirroring how
-/// [`capture_window_state`] itself reads `window.window_bounds()`, so a
+/// [`save_window_state`] itself reads `window.window_bounds()`, so a
 /// maximized restart reopens maximized instead of at the un-maximized size.
 /// Called from `main.rs` before the window is created.
 pub fn initial_window_bounds(
