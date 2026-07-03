@@ -2,12 +2,14 @@
 //! `gpui-component::setting::Settings` panel exposing theme mode, named
 //! theme, and the whole-client font scale — hosted in the `Root` dialog
 //! overlay, the same pattern `command_palette` uses. A view over live app
-//! state (the `Theme` global via [`crate::set_theme`]/[`crate::set_theme_mode`],
-//! and `SessionView`'s font-zoom state — the "existing `Ctrl+=`/`Ctrl+-`" path
+//! state (the `Theme` global via
+//! [`crate::set_theme_persisted`]/[`crate::set_theme_mode_persisted`], and
+//! `SessionView`'s font-zoom state — the "existing `Ctrl+=`/`Ctrl+-`" path
 //! `docs/spec-window-state-persistence.md` refers to), not a config file
 //! (`docs/spec-dogfooding-channels.md`'s standing "no new config layer"
-//! decision). Persisting these choices across restarts is issue #365's job,
-//! gated on the window-state store (#224/#225) landing.
+//! decision). The theme dropdowns persist across a restart (issue #365); the
+//! font scale field does not yet — that capture/restore wiring is issue
+//! #225's scope.
 
 use gpui::{px, App, Entity, ParentElement as _, SharedString, Styled as _, Window};
 use gpui_component::setting::{
@@ -17,8 +19,8 @@ use gpui_component::{ActiveTheme as _, ThemeMode, WindowExt as _};
 use rift_terminal::{SessionView, MAX_FONT_SIZE, MIN_FONT_SIZE};
 
 use crate::{
-    set_theme, set_theme_mode, CATPPUCCIN_MOCHA_THEME_NAME, DEFAULT_DARK_THEME_NAME,
-    DEFAULT_LIGHT_THEME_NAME,
+    set_theme_mode_persisted, set_theme_persisted, CATPPUCCIN_MOCHA_THEME_NAME,
+    DEFAULT_DARK_THEME_NAME, DEFAULT_LIGHT_THEME_NAME,
 };
 
 /// Open the settings surface. Bound with no key-context scope in `main.rs`
@@ -90,7 +92,7 @@ fn appearance_page(session: Entity<SessionView>) -> SettingPage {
                             } else {
                                 ThemeMode::Light
                             };
-                            set_theme_mode(mode, None, cx);
+                            set_theme_mode_persisted(mode, None, cx);
                         },
                     ),
                 )
@@ -100,7 +102,9 @@ fn appearance_page(session: Entity<SessionView>) -> SettingPage {
                     SettingField::dropdown(
                         theme_options(),
                         |cx: &App| cx.theme().theme_name().clone(),
-                        |val: SharedString, cx: &mut App| set_theme(val.as_ref(), None, cx),
+                        |val: SharedString, cx: &mut App| {
+                            set_theme_persisted(val.as_ref(), None, cx)
+                        },
                     ),
                 )
                 .description("Pick a named theme."),
