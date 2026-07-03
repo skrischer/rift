@@ -1738,6 +1738,11 @@ mod tests {
             ),
             PaneActivity::Free
         );
+
+        // New output after the window has elapsed re-arms busy.
+        let later = base + ACTIVITY_IDLE_WINDOW + Duration::from_secs(1);
+        tracker.on_output(later);
+        assert_eq!(tracker.state(CommandPhase::Idle, later), PaneActivity::Busy);
     }
 
     #[::core::prelude::v1::test]
