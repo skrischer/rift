@@ -108,6 +108,10 @@ pub struct WorkspaceView {
     /// mirror of `file_tree`'s model, docked in the bottom zone. Kept as its
     /// own field (mirroring `file_tree`/`editor`) so tests can reach it
     /// directly rather than reaching into the dock's private panel tree.
+    // Read only by tests until #343 wires jump-to-location into production; use
+    // `allow` (not `expect`) since the field IS read under `cfg(test)`, which
+    // would make an `expect(dead_code)` unfulfilled on the `--all-targets` build.
+    #[allow(dead_code)]
     problems_panel: Entity<ProblemsPanel>,
     /// Read-request sender: a tree open turns into a path on this channel, which
     /// the tokio side emits as `ClientMessage::OpenFile`.
