@@ -78,10 +78,14 @@ pub(crate) async fn terminal_task(
 
     loop {
         tokio::select! {
-            // Only read stdout while attached; otherwise this branch never fires.
-            result = read_stdout(&mut attach, &mut buf), if attach.is_some() => match result {
-                Ok(0) | Err(_) => terminal_down(&mut attach, &outbound, None).await,
-                Ok(n) => {
+            // Only poll while attached; otherwise this branch never fires. Stdout
+            // reads and the status-line timer tick both need a mutable borrow of
+            // `attach`, so they share one branch (`read_stdout_or_status_tick`)
+            // rather than two separate `select!` arms, which the borrow checker
+            // would reject as two live `&mut attach` borrows at once.
+            event = read_stdout_or_status_tick(&mut attach, &mut buf), if attach.is_some() => match event {
+                StdoutEvent::Read(Ok(0)) | StdoutEvent::Read(Err(_)) => terminal_down(&mut attach, &outbound, None).await,
+                StdoutEvent::Read(Ok(n)) => {
                     let outcome = match attach.as_mut() {
                         Some(a) => a.process(&buf[..n], &outbound).await,
                         None => continue,
@@ -92,6 +96,13 @@ pub(crate) async fn terminal_task(
                         Err(Closed) => {
                             detach(&mut attach).await;
                             break;
+                        }
+                    }
+                }
+                StdoutEvent::StatusInterval => {
+                    if let Some(a) = attach.as_mut() {
+                        if let Err(err) = a.request_status_line().await {
+                            warn!(%err, "status-line refresh failed");
                         }
                     }
                 }
@@ -132,11 +143,32 @@ pub(crate) async fn terminal_task(
     }
 }
 
-/// Read into `buf` from the attach's stdout, or pend forever when not attached
-/// (the `select!` guard keeps this branch off, but pending is safe regardless).
-async fn read_stdout(attach: &mut Option<Attach>, buf: &mut [u8]) -> std::io::Result<usize> {
+/// The outcome of [`read_stdout_or_status_tick`]: either a stdout read
+/// completed, or the status-line mirror's `status-interval` timer ticked.
+enum StdoutEvent {
+    Read(std::io::Result<usize>),
+    StatusInterval,
+}
+
+/// Read into `buf` from the attach's stdout, racing the attach's
+/// `status-interval` re-fetch timer (if one is running) — combined into one
+/// function so the outer `select!` needs only a single mutable borrow of
+/// `attach` (`stdout` and `status_timer` are disjoint fields of the same
+/// `Attach`, so borrowing both here is fine). Pends forever when not attached;
+/// when the timer is disabled (`status-interval 0`) only the stdout read is
+/// awaited — no busy poll.
+async fn read_stdout_or_status_tick(attach: &mut Option<Attach>, buf: &mut [u8]) -> StdoutEvent {
     match attach {
-        Some(a) => a.stdout.read(buf).await,
+        Some(a) => {
+            let stdout = &mut a.stdout;
+            match a.status_timer.as_mut() {
+                Some(timer) => tokio::select! {
+                    result = stdout.read(buf) => StdoutEvent::Read(result),
+                    _ = timer.tick() => StdoutEvent::StatusInterval,
+                },
+                None => StdoutEvent::Read(stdout.read(buf).await),
+            }
+        }
         None => std::future::pending().await,
     }
 }
@@ -216,6 +248,20 @@ struct Attach {
     /// matches is dropped, which is fine since a fresher query is already
     /// in flight.
     key_table_query: Option<KeyTableQuery>,
+    /// The in-flight `show-options -A` + two `display-message -p` query
+    /// triple (at most one), for the tmux status-line mirror
+    /// (`docs/spec-tmux-statusline-mirroring.md`). Same replace-on-newer-request
+    /// convention as `key_table_query`.
+    status_line_query: Option<StatusLineQuery>,
+    /// The `status-interval` re-fetch timer, rebuilt whenever a fresh
+    /// [`DaemonMessage::StatusLineReply`] reports a changed interval; `None`
+    /// while the value is `0` (`status-interval 0` disables tmux's own draw
+    /// timer, so the mirror's re-fetch timer is disabled too — no busy poll).
+    status_timer: Option<tokio::time::Interval>,
+    /// The `status-interval` value [`Attach::status_timer`] was last built
+    /// from, so an unchanged value (the common case — most refreshes are not
+    /// interval edits) skips rebuilding the timer.
+    last_status_interval_secs: Option<u64>,
 }
 
 /// One in-flight `list-keys` + `show-options` round trip: both commands are
@@ -227,6 +273,19 @@ struct KeyTableQuery {
     show_options_id: CommandId,
     list_keys_output: Option<Vec<String>>,
     show_options_output: Option<Vec<String>>,
+}
+
+/// One in-flight `show-options -A` + two `display-message -p` round trip: all
+/// three commands are queued together, and each reply is stashed here until
+/// all three have arrived, so [`DaemonMessage::StatusLineReply`] always
+/// carries a coherent triple rather than racing separate messages.
+struct StatusLineQuery {
+    options_id: CommandId,
+    status_left_id: CommandId,
+    status_right_id: CommandId,
+    options_output: Option<Vec<String>>,
+    status_left_output: Option<Vec<String>>,
+    status_right_output: Option<Vec<String>>,
 }
 
 impl Attach {
@@ -261,6 +320,9 @@ impl Attach {
             paused: HashSet::new(),
             captures: HashMap::new(),
             key_table_query: None,
+            status_line_query: None,
+            status_timer: None,
+            last_status_interval_secs: None,
         };
         // Enable tmux's per-pane flow control for this attach (tmux→daemon leg).
         attach
@@ -274,6 +336,10 @@ impl Attach {
         // Key-table mirror: queried unprompted on attach/reconnect (the spec's
         // "on attach/reconnect" refresh trigger), same as the layout query above.
         attach.request_key_table().await?;
+        // Status-line mirror: same unprompted attach/reconnect trigger; the
+        // reply also seeds `status_timer` for the ongoing `status-interval`
+        // cadence.
+        attach.request_status_line().await?;
         Ok(attach)
     }
 
@@ -325,6 +391,9 @@ impl Attach {
             }
             ClientMessage::QueryKeyTable => {
                 self.request_key_table().await?;
+            }
+            ClientMessage::QueryStatusLine => {
+                self.request_status_line().await?;
             }
             // Empty input is a no-op; Attach is handled by the task; Hello never
             // reaches the terminal task. The buffer-channel requests
@@ -417,8 +486,14 @@ impl Attach {
                             })
                             .await
                             .map_err(|_| Closed)?;
-                    } else if let Some(message) = self.apply_key_table_reply(id, error, output) {
-                        outbound.send(message).await.map_err(|_| Closed)?;
+                    } else if self.key_table_reply_id_matches(id) {
+                        if let Some(message) = self.apply_key_table_reply(id, error, output) {
+                            outbound.send(message).await.map_err(|_| Closed)?;
+                        }
+                    } else if self.status_line_reply_id_matches(id) {
+                        if let Some(message) = self.apply_status_line_reply(id, error, output) {
+                            outbound.send(message).await.map_err(|_| Closed)?;
+                        }
                     }
                     // Other replies are acks for input/resize/raw commands — the
                     // Client already consumed their guards; nothing to forward.
@@ -493,6 +568,121 @@ impl Attach {
         Ok(())
     }
 
+    /// Whether `id` correlates to a leg of the in-flight key-table query.
+    /// Checked before consuming a `CommandReply`'s owned `output`, so the
+    /// dispatch in `process` can choose the right consumer without cloning.
+    fn key_table_reply_id_matches(&self, id: Option<CommandId>) -> bool {
+        let Some(id) = id else { return false };
+        self.key_table_query
+            .as_ref()
+            .is_some_and(|query| query.list_keys_id == id || query.show_options_id == id)
+    }
+
+    /// Whether `id` correlates to a leg of the in-flight status-line query.
+    /// Same purpose as [`Attach::key_table_reply_id_matches`].
+    fn status_line_reply_id_matches(&self, id: Option<CommandId>) -> bool {
+        let Some(id) = id else { return false };
+        self.status_line_query.as_ref().is_some_and(|query| {
+            query.options_id == id || query.status_left_id == id || query.status_right_id == id
+        })
+    }
+
+    /// Feed one `CommandReply` into the in-flight status-line query, if it
+    /// matches. Stashes the reply's output (empty on error — a partial result
+    /// beats a failed one, same convention as [`Attach::apply_key_table_reply`])
+    /// and returns the combined [`DaemonMessage::StatusLineReply`] once all
+    /// three legs (`show-options -A`, and the two `display-message -p`
+    /// expansions) have arrived; `None` while the triple is still incomplete
+    /// or `id` matches neither. Also reschedules the `status-interval` timer
+    /// off the freshly discovered options.
+    fn apply_status_line_reply(
+        &mut self,
+        id: Option<CommandId>,
+        error: bool,
+        output: Vec<String>,
+    ) -> Option<DaemonMessage> {
+        let query = self.status_line_query.as_mut()?;
+        let id = id?;
+        if id == query.options_id {
+            query.options_output = Some(if error { Vec::new() } else { output });
+        } else if id == query.status_left_id {
+            query.status_left_output = Some(if error { Vec::new() } else { output });
+        } else if id == query.status_right_id {
+            query.status_right_output = Some(if error { Vec::new() } else { output });
+        } else {
+            return None;
+        }
+        let complete = query.options_output.is_some()
+            && query.status_left_output.is_some()
+            && query.status_right_output.is_some();
+        if !complete {
+            return None;
+        }
+        // Move the completed triple out (ending the borrow above) before
+        // touching `self` again to reschedule the timer.
+        let query = self.status_line_query.take()?;
+        let options = query.options_output.unwrap_or_default();
+        let status_left = query.status_left_output.unwrap_or_default();
+        let status_right = query.status_right_output.unwrap_or_default();
+        self.reschedule_status_timer(extract_status_interval(&options));
+        Some(DaemonMessage::StatusLineReply {
+            options: options.join("\n"),
+            status_left: status_left.join("\n"),
+            status_right: status_right.join("\n"),
+        })
+    }
+
+    /// Issue the `show-options -A` + two `display-message -p '#{T:...}'`
+    /// query triple for the tmux status-line mirror
+    /// (`docs/spec-tmux-statusline-mirroring.md`). `-A` resolves options
+    /// inherited from the global scope (a `.tmux.conf` `set -g status-style
+    /// ...` shows up here, unlike the key-table mirror's plain
+    /// `show-options`, which lists only session-level overrides) —
+    /// "session-resolved" per the spec outcome. The `#{T:...}` fetches expand
+    /// **by option name only**: the option's own text is never read here and
+    /// spliced into a command line — the interpolation hazard the spec
+    /// forbids. A request while one is already in flight simply replaces the
+    /// tracked triple, mirroring [`Attach::request_key_table`]'s coalescing.
+    async fn request_status_line(&mut self) -> std::io::Result<()> {
+        let options_id = self.send_command("show-options -A").await?;
+        let status_left_id = self
+            .send_command("display-message -p '#{T:status-left}'")
+            .await?;
+        let status_right_id = self
+            .send_command("display-message -p '#{T:status-right}'")
+            .await?;
+        self.status_line_query = Some(StatusLineQuery {
+            options_id,
+            status_left_id,
+            status_right_id,
+            options_output: None,
+            status_left_output: None,
+            status_right_output: None,
+        });
+        Ok(())
+    }
+
+    /// Rebuild the `status-interval` re-fetch timer if the discovered
+    /// interval changed. `None` (the reply's `show-options -A` output had no
+    /// parseable `status-interval` line) leaves the current timer untouched —
+    /// a malformed reply must not kill a working timer; `Some(0)` disables it
+    /// entirely (tmux's own "no interval redraw" semantics, spec outcome).
+    fn reschedule_status_timer(&mut self, interval_secs: Option<u64>) {
+        let Some(secs) = interval_secs else {
+            return;
+        };
+        if self.last_status_interval_secs == Some(secs) {
+            return;
+        }
+        self.last_status_interval_secs = Some(secs);
+        self.status_timer = (secs > 0).then(|| {
+            let period = Duration::from_secs(secs);
+            let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            timer
+        });
+    }
+
     /// Issue a layout query, coalescing so at most one is in flight.
     async fn request_layout(&mut self) {
         if self.layout_query.is_some() {
@@ -559,6 +749,24 @@ fn hex_bytes(data: &[u8]) -> String {
 /// tmux-decoded by the [`Client`]'s command-block decode.
 fn join_capture(output: &[String]) -> Vec<u8> {
     output.join("\n").into_bytes()
+}
+
+/// Pull `status-interval`'s resolved value out of a `show-options -A` reply,
+/// for the daemon's own re-fetch timer. A plain integer, never tmux-quoted,
+/// so a whitespace split suffices — the full `status-*` option set is parsed
+/// client-side (`rift_terminal::statusline::parse_status_options`); the
+/// daemon extracts only the one field it needs to drive scheduling. A
+/// trailing `*` (an `-A` value inherited from a higher scope) is stripped
+/// before matching the option name.
+fn extract_status_interval(lines: &[String]) -> Option<u64> {
+    lines.iter().find_map(|line| {
+        let mut tokens = line.split_whitespace();
+        let name = tokens.next()?.trim_end_matches('*');
+        if name != "status-interval" {
+            return None;
+        }
+        tokens.next()?.parse().ok()
+    })
 }
 
 /// Pull the `%<pane>` id out of a `%pause`/`%continue` notification argument.
@@ -770,6 +978,40 @@ mod tests {
         let socket = server.name.clone();
         let handle = tokio::spawn(terminal_task(in_rx, out_tx, Some(socket)));
         (in_tx, out_rx, handle)
+    }
+
+    /// Set a global tmux option directly via the `tmux` CLI (outside the
+    /// control-mode attach under test), for status-line fixtures that need a
+    /// non-default `status-*` value in place before the daemon's own
+    /// attach-or-create runs. Unlike `new-session`/`attach-session`, plain
+    /// `set-option` never starts a fresh server on an unused socket — it
+    /// errors with "no such file or directory" against a socket nothing has
+    /// bound yet — so this first spins up a detached `rift` session (the
+    /// name every status-line test attaches to) to give the server something
+    /// to run against; `new-session -A` in `Attach::spawn` then attaches to
+    /// that same session instead of creating a second one.
+    fn set_global_status_option(server: &TmuxServer, name: &str, value: &str) {
+        let _ = std::process::Command::new("tmux")
+            .args(["-L", &server.name, "new-session", "-d", "-s", "rift"])
+            .stderr(std::process::Stdio::null())
+            .status();
+        let status = std::process::Command::new("tmux")
+            .args(["-L", &server.name, "set-option", "-g", name, value])
+            .status()
+            .expect("run tmux set-option");
+        assert!(status.success(), "tmux set-option -g {name} {value} failed");
+    }
+
+    /// Whether a `show-options -A` reply's `options` text reports
+    /// `status-interval` as `expected`, tolerating the trailing `*` `-A` adds
+    /// to a name whose value is inherited from a higher scope rather than set
+    /// at this exact level.
+    fn reports_status_interval(options: &str, expected: &str) -> bool {
+        options.lines().any(|line| {
+            let mut tokens = line.split_whitespace();
+            let name = tokens.next().unwrap_or("").trim_end_matches('*');
+            name == "status-interval" && tokens.next() == Some(expected)
+        })
     }
 
     /// Receive daemon messages until `pick` yields or the timeout elapses.
@@ -1014,6 +1256,298 @@ mod tests {
         assert!(
             second.is_some(),
             "an explicit QueryKeyTable must produce another KeyTableReply"
+        );
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    // --- status-line mirror (#219) ---
+
+    #[tokio::test]
+    async fn test_attach_issues_status_line_reply_unprompted() {
+        let server = TmuxServer::new("statusline-attach");
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+
+        // No client request needed: the attach itself issues the
+        // `show-options -A` + display-message triple, mirroring the
+        // unprompted key-table query.
+        let options = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::StatusLineReply { options, .. } => Some(options.clone()),
+            _ => None,
+        })
+        .await
+        .expect("status-line reply after attach");
+        assert!(
+            options.contains("status-interval"),
+            "show-options -A must report status-interval: {options}"
+        );
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_query_status_line_reissues_reply() {
+        let server = TmuxServer::new("statusline-query");
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+        recv_until(&mut out_rx, 10, |m| {
+            matches!(m, DaemonMessage::StatusLineReply { .. }).then_some(())
+        })
+        .await
+        .expect("attach-time status-line reply");
+
+        in_tx
+            .send(ClientMessage::QueryStatusLine)
+            .await
+            .expect("query status line");
+        let second = recv_until(&mut out_rx, 10, |m| {
+            matches!(m, DaemonMessage::StatusLineReply { .. }).then_some(())
+        })
+        .await;
+        assert!(
+            second.is_some(),
+            "an explicit QueryStatusLine must produce another StatusLineReply"
+        );
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_status_line_options_are_session_resolved_across_global_overrides() {
+        // `show-options -A` must resolve a value set only at the *global*
+        // scope (a `.tmux.conf` `set -g ...`), not just session-level
+        // overrides — the session-resolved discovery the spec requires.
+        let server = TmuxServer::new("statusline-resolved");
+        set_global_status_option(&server, "status-style", "bg=colour234,fg=colour253");
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+        let options = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::StatusLineReply { options, .. } => Some(options.clone()),
+            _ => None,
+        })
+        .await
+        .expect("status-line reply");
+        assert!(
+            options.contains("bg=colour234,fg=colour253"),
+            "a global-only status-style override must resolve: {options}"
+        );
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_status_line_expansion_validates_variable_conditional_client_var_and_shell_segment(
+    ) {
+        // The first-issue expansion-fidelity validation the spec pins: a
+        // variable (`#S`, the session name), a `#{?...}` conditional, a
+        // client-scoped variable (`#{client_width}`, resolved against rift's
+        // own control-mode client with no explicit `-c` targeting), and a
+        // `#()` shell segment (expected empty under one-shot expansion).
+        let server = TmuxServer::new("statusline-expand");
+        set_global_status_option(
+            &server,
+            "status-left",
+            "#{?#{==:#{host_short},nonexistenthost},yes,no}-#S-#{client_width}-#(echo shellout)",
+        );
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+        let status_left = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::StatusLineReply { status_left, .. } => Some(status_left.clone()),
+            _ => None,
+        })
+        .await
+        .expect("status-line reply");
+
+        // Expected shape: "<conditional>-<session name>-<client width>-"
+        // (the trailing `-` is what's left of the #() segment, which renders
+        // empty under one-shot expansion).
+        let parts: Vec<&str> = status_left.split('-').collect();
+        assert_eq!(
+            parts.as_slice(),
+            ["no", "rift", parts.get(2).copied().unwrap_or_default(), ""],
+            "unexpected expansion shape: {status_left}"
+        );
+        assert!(
+            !parts[2].is_empty() && parts[2].chars().all(|c| c.is_ascii_digit()),
+            "client_width must expand to a plain number: {status_left}"
+        );
+        assert!(
+            !status_left.contains("shellout"),
+            "a #() shell segment must never run under one-shot expansion: {status_left}"
+        );
+        assert!(
+            !status_left.contains("#("),
+            "the shell segment placeholder must not leak into the expanded text: {status_left}"
+        );
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_status_line_expansion_applies_strftime() {
+        // `#{T:...}` expands the option's format *and* runs the result
+        // through strftime, so a literal `%Y` in status-right must become a
+        // real (digits-only) year, not pass through unresolved.
+        let server = TmuxServer::new("statusline-strftime");
+        set_global_status_option(&server, "status-right", "%Y");
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+        let status_right = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::StatusLineReply { status_right, .. } => Some(status_right.clone()),
+            _ => None,
+        })
+        .await
+        .expect("status-line reply");
+
+        assert!(
+            !status_right.contains('%'),
+            "strftime must consume the %-code: {status_right}"
+        );
+        assert_eq!(
+            status_right.len(),
+            4,
+            "a %Y expansion is a 4-digit year: {status_right}"
+        );
+        assert!(
+            status_right.chars().all(|c| c.is_ascii_digit()),
+            "a %Y expansion must be all digits: {status_right}"
+        );
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_status_interval_timer_refetches_without_client_request() {
+        // The daemon's own `status-interval` cadence: a fast interval must
+        // produce a *second* StatusLineReply with no client message at all.
+        let server = TmuxServer::new("statusline-timer");
+        set_global_status_option(&server, "status-interval", "1");
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+        recv_until(&mut out_rx, 10, |m| {
+            matches!(m, DaemonMessage::StatusLineReply { .. }).then_some(())
+        })
+        .await
+        .expect("attach-time status-line reply");
+
+        let timer_driven = recv_until(&mut out_rx, 10, |m| {
+            matches!(m, DaemonMessage::StatusLineReply { .. }).then_some(())
+        })
+        .await;
+        assert!(
+            timer_driven.is_some(),
+            "status-interval 1 must drive an unprompted re-fetch"
+        );
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_status_interval_zero_disables_timer() {
+        // Prove the timer both works (fast interval) and stops (interval 0)
+        // in the same test, so a "no timer ever ran" false pass can't hide
+        // behind a naive negative wait.
+        let server = TmuxServer::new("statusline-notimer");
+        set_global_status_option(&server, "status-interval", "1");
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+        recv_until(&mut out_rx, 10, |m| {
+            matches!(m, DaemonMessage::StatusLineReply { .. }).then_some(())
+        })
+        .await
+        .expect("attach-time status-line reply");
+        recv_until(&mut out_rx, 10, |m| {
+            matches!(m, DaemonMessage::StatusLineReply { .. }).then_some(())
+        })
+        .await
+        .expect("the fast timer must fire at least once before being disabled");
+
+        // Disable the timer (the change-trigger path: dispatch the option
+        // change, then explicitly refresh — what the client-side
+        // `mutates_status_options` check drives in practice) and drain the
+        // reply that carries the new `status-interval 0`.
+        in_tx
+            .send(ClientMessage::TmuxCommand {
+                cmd: "set-option -g status-interval 0".to_owned(),
+            })
+            .await
+            .expect("dispatch status-interval 0");
+        in_tx
+            .send(ClientMessage::QueryStatusLine)
+            .await
+            .expect("query status line");
+        let disabled = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::StatusLineReply { options, .. }
+                if reports_status_interval(options, "0") =>
+            {
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+        assert!(
+            disabled.is_some(),
+            "expected a reply reporting status-interval 0"
+        );
+
+        // No further reply may arrive on its own — the timer is gone.
+        let stray = recv_until(&mut out_rx, 3, |m| {
+            matches!(m, DaemonMessage::StatusLineReply { .. }).then_some(())
+        })
+        .await;
+        assert!(
+            stray.is_none(),
+            "status-interval 0 must disable the re-fetch timer (no busy poll)"
         );
 
         drop(in_tx);
