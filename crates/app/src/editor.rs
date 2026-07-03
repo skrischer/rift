@@ -1300,6 +1300,49 @@ impl EditorView {
             self.jump_to_location(active, entry.location, window, cx);
         }
     }
+
+    /// Open `path` at `range`, scrolling/selecting it once loaded — the thin
+    /// public wrapper `docs/spec-problems-panel.md` calls for so the problems
+    /// panel (#343) can reach the existing LSP-nav jump machinery
+    /// ([`EditorView::jump_to_location`]) without a `NavLocation` round-trip.
+    /// Problems-panel diagnostics are always in-worktree, so `out_of_root` is
+    /// always `false`.
+    pub fn open_at_range(
+        &mut self,
+        path: String,
+        range: Range,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let location = NavLocation {
+            path,
+            range,
+            out_of_root: false,
+            line_preview: None,
+        };
+        match self.active {
+            Some(source_index) => self.jump_to_location(source_index, location, window, cx),
+            None => {
+                // No tab open yet — nothing to record as a back-entry; open-or-
+                // switch straight to the destination, mirroring the cross-file
+                // branch of `jump_to_location`.
+                let path = location.path.clone();
+                let is_new = self.open_or_switch(
+                    location.path,
+                    false,
+                    Some(location.range),
+                    None,
+                    window,
+                    cx,
+                );
+                if is_new {
+                    if let Err(e) = self.open_file_tx.try_send(path.clone()) {
+                        tracing::debug!(error = %e, %path, "failed to enqueue open_at_range open");
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ── Panel adapter ─────────────────────────────────────────────────────────────
