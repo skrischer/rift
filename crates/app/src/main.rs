@@ -66,6 +66,9 @@ struct EditorChannels {
     buffer_tx: flume::Sender<rift_protocol::DaemonMessage>,
     /// Nav replies routed to the editor: `DefinitionResponse` (#196).
     nav_tx: flume::Sender<rift_protocol::DaemonMessage>,
+    /// `StatusLineReply` routed to the workspace's mirrored-status-line render
+    /// model (#221, `docs/spec-tmux-statusline-mirroring.md`).
+    status_line_tx: flume::Sender<rift_protocol::DaemonMessage>,
     /// Root-relative paths to open, emitted by the tree (or the editor's
     /// auto-reload); each becomes an `OpenFile` request.
     open_file_rx: flume::Receiver<String>,
@@ -304,6 +307,8 @@ fn main() {
                 let (worktree_tx, worktree_rx) = flume::unbounded();
                 let (buffer_tx, buffer_rx) = flume::unbounded();
                 let (nav_daemon_tx, nav_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
+                let (status_line_tx, status_line_rx) =
+                    flume::unbounded::<rift_protocol::DaemonMessage>();
                 let (open_file_tx, open_file_rx) = flume::unbounded::<String>();
                 let (save_file_tx, save_file_rx) =
                     flume::unbounded::<rift_protocol::ClientMessage>();
@@ -367,6 +372,7 @@ fn main() {
                         worktree_tx,
                         buffer_tx,
                         nav_tx: nav_daemon_tx,
+                        status_line_tx,
                         open_file_rx,
                         save_file_rx,
                         buffer_change_rx,
@@ -416,6 +422,7 @@ fn main() {
                             worktree_rx,
                             buffer_rx,
                             nav_rx,
+                            status_line_rx,
                             open_file_tx,
                             save_file_tx,
                             buffer_change_tx,
@@ -1015,6 +1022,15 @@ async fn consume_daemon_messages(
             | DaemonMessage::HoverResponse { .. }
             | DaemonMessage::ReferencesResponse { .. }) => {
                 let _ = editor.nav_tx.send(msg);
+            }
+            // --- mirrored status line -> workspace render model (every mode) ---
+            // Sent unprompted on attach, again on the daemon's own
+            // `status-interval` cadence, and after a mirrored-option-mutating
+            // dispatch (#219); forwarded regardless of whether the app's
+            // `RIFT_STATUSLINE_MIRROR` toggle is on — the render layer decides
+            // whether to use it (#221).
+            msg @ DaemonMessage::StatusLineReply { .. } => {
+                let _ = editor.status_line_tx.send(msg);
             }
             other => debug!(?other, "daemon message without a consumer yet"),
         }
