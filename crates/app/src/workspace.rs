@@ -133,6 +133,9 @@ pub struct WorkspaceChannels {
     /// Nav replies to route to the editor: `DefinitionResponse` (#196),
     /// `HoverResponse` (#197), `ReferencesResponse` (#198).
     pub nav_rx: Receiver<DaemonMessage>,
+    /// `StatusLineReply` replies to fold into the mirrored tmux status line's
+    /// render model (#221, `docs/spec-tmux-statusline-mirroring.md`).
+    pub status_line_rx: Receiver<DaemonMessage>,
     /// `FileDiff` replies to route to the diff view (#338).
     pub diff_rx: Receiver<DaemonMessage>,
     /// Read requests: the root-relative path of a file to open. The tokio side
@@ -169,6 +172,15 @@ pub struct WorkspaceView {
     // `--all-targets` build.
     #[allow(dead_code)]
     problems_panel: Entity<ProblemsPanel>,
+    /// Which status-bar render mode is active (#221): resolved once at
+    /// startup from `RIFT_STATUSLINE_MIRROR` and never changed at runtime —
+    /// the spec's v1 opt-in toggle, mutually exclusive with the native fields.
+    status_bar_mode: status_bar::StatusBarMode,
+    /// The mirrored tmux status line's current render model (#221), folded
+    /// from the daemon's `StatusLineReply` stream. Read only when
+    /// `status_bar_mode` is `Mirrored`; kept at its default (empty, no
+    /// leftover state) otherwise.
+    mirrored_status_line: status_bar::MirroredStatusLine,
     /// The diff view (`docs/spec-source-control.md`, #338): renders the
     /// `FileDiff` streamed for the source-control panel's selection. Kept as
     /// its own field for the same reason as `problems_panel` above; the
@@ -208,6 +220,7 @@ impl WorkspaceView {
             worktree_rx,
             buffer_rx,
             nav_rx,
+            status_line_rx,
             diff_rx,
             open_file_tx,
             save_file_tx,
@@ -379,6 +392,41 @@ impl WorkspaceView {
             .detach();
         }
 
+        // Mirrored status line stream -> render model (#221): each
+        // `StatusLineReply` rebuilds the parsed left/right runs and the
+        // resolved base style, then a notify repaints the status bar (folded
+        // regardless of `status_bar_mode`, mirroring the nav/buffer loops
+        // above — the render branch, not this fold, is what makes the two
+        // modes exclusive). Routed through this view's weak handle so a
+        // closed window ends the loop gracefully.
+        {
+            cx.spawn(async move |this, cx| loop {
+                let Ok(msg) = status_line_rx.recv_async().await else {
+                    break;
+                };
+                let result = this.update(cx, |view, cx| {
+                    let DaemonMessage::StatusLineReply {
+                        options,
+                        status_left,
+                        status_right,
+                    } = msg
+                    else {
+                        return;
+                    };
+                    view.mirrored_status_line = status_bar::build_mirrored_status_line(
+                        &options,
+                        &status_left,
+                        &status_right,
+                    );
+                    cx.notify();
+                });
+                if result.is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
+
         // Diff reply stream -> diff view (#338): `FileDiff` routes to
         // `apply_file_diff`, which drops a reply for a path no longer open (the
         // user moved on before it arrived). Routed through this view's weak
@@ -498,6 +546,8 @@ impl WorkspaceView {
             editor,
             session_view,
             problems_panel,
+            status_bar_mode: status_bar::StatusBarMode::from_env(),
+            mirrored_status_line: status_bar::MirroredStatusLine::default(),
             diff_view,
             open_file_tx,
             dock_area,
@@ -688,13 +738,27 @@ impl Render for WorkspaceView {
         // workspace root, rather than scoped to a key context: they are
         // global commands the command palette dispatches regardless of which
         // panel currently has focus.
-        let model = self.file_tree.read(cx).model();
-        let status_bar = status_bar::render(
-            model.branch(),
-            model.ahead_behind(),
-            model.all_diagnostics(),
-            cx,
-        );
+        //
+        // Render mode (#221, `docs/spec-tmux-statusline-mirroring.md`): the
+        // native fields and the mirrored tmux status line are mutually
+        // exclusive branches, never composed. `status_bar_mode` is fixed for
+        // the process's lifetime (resolved once from an env var at
+        // construction), so this never toggles mid-session.
+        let status_bar = match self.status_bar_mode {
+            status_bar::StatusBarMode::Native => {
+                let model = self.file_tree.read(cx).model();
+                status_bar::render(
+                    model.branch(),
+                    model.ahead_behind(),
+                    model.all_diagnostics(),
+                    cx,
+                )
+                .into_any_element()
+            }
+            status_bar::StatusBarMode::Mirrored => {
+                status_bar::render_mirrored(&self.mirrored_status_line, cx).into_any_element()
+            }
+        };
 
         // `Root`'s overlay layers (issue #359, `docs/spec-command-palette.md`):
         // only the gallery rendered these before this issue, so no modal —
@@ -751,6 +815,7 @@ mod tests {
         let (_worktree_tx, worktree_rx) = flume::unbounded();
         let (_buffer_tx, buffer_rx) = flume::unbounded();
         let (_nav_reply_tx, nav_rx) = flume::unbounded();
+        let (_status_line_tx, status_line_rx) = flume::unbounded();
         let (_diff_reply_tx, diff_rx) = flume::unbounded();
         let (open_file_tx, _open_file_rx) = flume::unbounded();
         let (save_file_tx, _save_file_rx) = flume::unbounded();
@@ -761,6 +826,7 @@ mod tests {
             worktree_rx,
             buffer_rx,
             nav_rx,
+            status_line_rx,
             diff_rx,
             open_file_tx,
             save_file_tx,
