@@ -535,7 +535,10 @@ pub fn mutates_bindings(command: &str) -> bool {
 /// literal, double quotes allow backslash escapes, and a bare backslash escapes
 /// the next character. Returns the unescaped token and the byte offset just past
 /// it, or `None` at end of input.
-fn lex_token(line: &str, start: usize) -> Option<(String, usize)> {
+///
+/// `pub(crate)` so [`crate::statusline`]'s `show-options` parser shares one
+/// tmux-quoting-aware lexer instead of a second implementation.
+pub(crate) fn lex_token(line: &str, start: usize) -> Option<(String, usize)> {
     let bytes = line.as_bytes();
     let mut i = start;
     while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {

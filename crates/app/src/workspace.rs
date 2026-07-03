@@ -57,7 +57,7 @@ use tracing::debug;
 
 use crate::editor::EditorView;
 use crate::file_tree::{FileTree, FileTreeEvent};
-use crate::problems_panel::ProblemsPanel;
+use crate::problems_panel::{ProblemsPanel, ProblemsPanelEvent};
 use crate::source_control::SourceControlPanel;
 use crate::status_bar;
 use crate::terminal_panel::TerminalPanel;
@@ -109,10 +109,13 @@ pub struct WorkspaceView {
     /// The problems panel (`docs/spec-problems-panel.md`, #342): a read-only
     /// mirror of `file_tree`'s model, docked in the bottom zone. Kept as its
     /// own field (mirroring `file_tree`/`editor`) so tests can reach it
-    /// directly rather than reaching into the dock's private panel tree.
-    // Read only by tests until #343 wires jump-to-location into production; use
-    // `allow` (not `expect`) since the field IS read under `cfg(test)`, which
-    // would make an `expect(dead_code)` unfulfilled on the `--all-targets` build.
+    /// directly rather than reaching into the dock's private panel tree. The
+    /// jump-to-location wiring (#343) subscribes to the local `problems_panel`
+    /// value at construction time rather than through this field, so the
+    /// field itself is still read only by tests.
+    // Use `allow` (not `expect`) since the field IS read under `cfg(test)`,
+    // which would make an `expect(dead_code)` unfulfilled on the
+    // `--all-targets` build.
     #[allow(dead_code)]
     problems_panel: Entity<ProblemsPanel>,
     /// Read-request sender: a tree open turns into a path on this channel, which
@@ -201,12 +204,13 @@ impl WorkspaceView {
                         apply_worktree_message(tree, msg);
                         cx.notify();
                     });
-                    // Status bar (#347): a `RepoState` fold changes the branch /
-                    // ahead-behind segment the status bar reads inline in
+                    // Status bar (#347, #348): a `RepoState` fold changes the
+                    // branch/ahead-behind segment and a `Diagnostics` fold changes
+                    // the error/warning counts segment, both read inline in
                     // `WorkspaceView::render`, so the workspace view itself must
                     // notify too — the file tree's own notify above only repaints
                     // the tree.
-                    if is_repo_state {
+                    if is_repo_state || is_diagnostics {
                         cx.notify();
                     }
                     // Concurrent-write signal (#188): after folding the structure
@@ -318,6 +322,24 @@ impl WorkspaceView {
         // copy (`docs/spec-source-control.md`).
         let source_control = cx.new(|cx| SourceControlPanel::new(file_tree.clone(), cx));
         let problems_panel = cx.new(|cx| ProblemsPanel::new(file_tree.clone(), cx));
+
+        // Jump-to-location (#343): selecting a diagnostic emits `OpenLocation`,
+        // routed to the editor's thin `open_at_range` wrapper around the same
+        // LSP-nav jump machinery go-to-definition already drives. Mirrors the
+        // file tree's `OpenFile` subscription above, minus the `open_file_tx`
+        // send — `EditorView::open_at_range` already issues that itself
+        // (via `jump_to_location`) on a cross-file jump.
+        cx.subscribe_in(
+            &problems_panel,
+            window,
+            |this, _panel, event: &ProblemsPanelEvent, window, cx| {
+                let ProblemsPanelEvent::OpenLocation { path, range } = event;
+                this.editor.update(cx, |editor, cx| {
+                    editor.open_at_range(path.clone(), *range, window, cx);
+                });
+            },
+        )
+        .detach();
 
         let left_item = DockItem::tab(file_tree.clone(), &weak_dock_area, window, cx);
         let center_item = DockItem::h_split(
@@ -463,12 +485,17 @@ impl Render for WorkspaceView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The dock shell fills the window under the current OS chrome; the
         // `flex_col` mirrors `examples/dock.rs` at the pinned gpui-component rev.
-        // The status bar (#347, `docs/spec-status-bar.md`) is a plain `flex_col`
-        // sibling below the dock — bottom chrome, not a dock `Panel` — reading
-        // the file tree's mirrored `WorktreeModel` inline (repainted by the
-        // `RepoState`-fold `cx.notify()` above).
+        // The status bar (#347, #348, `docs/spec-status-bar.md`) is a plain
+        // `flex_col` sibling below the dock — bottom chrome, not a dock `Panel` —
+        // reading the file tree's mirrored `WorktreeModel` inline (repainted by
+        // the `RepoState`/`Diagnostics`-fold `cx.notify()` above).
         let model = self.file_tree.read(cx).model();
-        let status_bar = status_bar::render(model.branch(), model.ahead_behind(), cx);
+        let status_bar = status_bar::render(
+            model.branch(),
+            model.ahead_behind(),
+            model.all_diagnostics(),
+            cx,
+        );
 
         div()
             .flex()
