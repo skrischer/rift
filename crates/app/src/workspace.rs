@@ -21,28 +21,37 @@
 //!   diagnostics messages fold into the [`FileTree`]'s [`WorktreeModel`] so the
 //!   tree appears and updates live. (The tree only renders structure today;
 //!   git/diagnostics decoration on the tree is a later explorer-panel sub-spec,
-//!   but the model carries them already.) After each fold, the open path's new
-//!   snapshot `mtime` is handed to the editor as the **concurrent-write signal**
-//!   (#188): a clean buffer auto-reloads, a dirty one surfaces a conflict. After a
-//!   `Diagnostics` fold the open file's set is re-pushed to the editor as **inline
-//!   markers** (#189) — consuming the existing client diagnostics model (#178), so
-//!   a fixed error clears its marker.
+//!   but the model carries them already.) After each fold, every **open tab's**
+//!   path is checked against the fresh snapshot `mtime` and handed to the editor
+//!   as the **concurrent-write signal** (#188, fanned out per tab — #353): a
+//!   clean tab auto-reloads, a dirty one surfaces a conflict, independent of
+//!   which tab is active. After a `Diagnostics` fold every open tab's set is
+//!   re-pushed to the editor as **inline markers** (#189, #353) — consuming the
+//!   existing client diagnostics model (#178), so a fixed error clears its
+//!   marker on the tab that owns it, even while that tab sits in the background.
 //! - **Buffer reply** (`buffer_rx`): a `FileContent { path, content, mtime }`
-//!   loads into the [`EditorView`] (and its inline diagnostics are re-applied,
-//!   since opening rebuilt the input); a `SaveResult` / `SaveConflict` resolves a
-//!   save (commit the new base `mtime`, or surface the conflict without losing
-//!   the buffer).
+//!   loads into the [`EditorView`] (and that tab's inline diagnostics are
+//!   re-applied, since opening rebuilt its input); a `SaveResult` / `SaveConflict`
+//!   resolves a save on whichever tab holds `path` (commit the new base `mtime`,
+//!   or surface the conflict without losing the buffer) — not necessarily the
+//!   active tab, since a background dirty tab can save concurrently.
 //!
 //! The reverse path runs through three request channels. `open_file_tx` issues an
 //! `OpenFile` read: when the tree emits [`FileTreeEvent::OpenFile`] (or the editor
 //! auto-reloads), this view tells the editor to begin opening (arming its timeout)
 //! and sends the path to the tokio side. `save_file_tx` carries a `SaveFile` the
-//! editor builds from the open buffer on a [`crate::editor::Save`]. `buffer_change_tx`
-//! carries the **live-buffer feed** (#189): the editor sends `BufferChanged` on a
-//! debounced edit and `BufferClosed` on close / switch / save, so the daemon feeds
-//! the LSP the live buffer and an unsaved error surfaces without a save first. The
-//! daemon's read/write replies return on `buffer_rx`; diagnostics return on
-//! `worktree_rx` as `Diagnostics`.
+//! editor builds from the active tab's buffer on a [`crate::editor::Save`].
+//! `buffer_change_tx` carries the **live-buffer feed** (#189), driven **per dirty
+//! tab** (#353) — the daemon holds one live buffer per path
+//! (`crates/lsp/src/document.rs`), so several tabs can be live at once: the
+//! editor sends `BufferChanged` on a debounced edit and `BufferClosed` only on an
+//! actual tab close or a successful save, never on a mere tab switch, so the
+//! daemon feeds the LSP the live buffer and an unsaved error surfaces without a
+//! save first. The daemon's read/write replies return on `buffer_rx`; diagnostics
+//! return on `worktree_rx` as `Diagnostics`. Nav replies return on `nav_rx` and
+//! are routed to whichever tab's request `id` they answer (#196/#197/#198,
+//! #351) — never the merely-active tab, so a stale response for a superseded
+//! request can never land on the wrong tab.
 
 use flume::{Receiver, Sender};
 use gpui::{
@@ -252,20 +261,24 @@ impl WorkspaceView {
                     if is_repo_state || is_diagnostics {
                         cx.notify();
                     }
-                    // Concurrent-write signal (#188): after folding the structure
-                    // update, hand the editor the open path's new snapshot `mtime`.
-                    // The editor compares it against the buffer's base `mtime` and
-                    // auto-reloads (clean) or surfaces a conflict (dirty). Tapping
-                    // the model the tree already mirrors keeps the comparison
-                    // base-vs-snapshot — never an independent stat.
-                    view.notify_editor_of_open_path_mtime(window, cx);
-                    // Inline diagnostics (#189): after a diagnostics fold, re-push
-                    // the open file's full set to the editor so its inline markers
-                    // converge with the model (fixing an error clears the marker).
-                    // Only on a diagnostics message — the structure folds do not
-                    // touch the diagnostics map.
+                    // Concurrent-write signal (#188), fanned out per open tab
+                    // (#353): after folding the structure update, hand every open
+                    // tab its own path's new snapshot `mtime`. Each tab compares it
+                    // against its own buffer's base `mtime` and auto-reloads
+                    // (clean) or surfaces a conflict (dirty), independent of which
+                    // tab is active. Tapping the model the tree already mirrors
+                    // keeps the comparison base-vs-snapshot — never an independent
+                    // stat.
+                    view.notify_editor_of_open_paths_mtime(window, cx);
+                    // Inline diagnostics (#189), fanned out per open tab (#353):
+                    // after a diagnostics fold, re-push every open tab's full set
+                    // to the editor so each tab's inline markers converge with the
+                    // model (fixing an error clears the marker on the tab that
+                    // owns it, even while that tab sits in the background). Only
+                    // on a diagnostics message — the structure folds do not touch
+                    // the diagnostics map.
                     if is_diagnostics {
-                        view.push_open_file_diagnostics(cx);
+                        view.push_diagnostics_for_open_tabs(cx);
                     }
                 });
                 if result.is_err() {
@@ -303,11 +316,12 @@ impl WorkspaceView {
                         }
                         _ => {}
                     });
-                    // After a load the editor rebuilt its input with an empty
-                    // `DiagnosticSet`, so re-apply the open file's inline markers
-                    // (#189) from the model the tree mirrors.
+                    // After a load the editor rebuilt that tab's input with an
+                    // empty `DiagnosticSet`, so re-apply every open tab's inline
+                    // markers (#189, #353) from the model the tree mirrors — a
+                    // no-op for tabs whose diagnostics did not change.
                     if loaded {
-                        view.push_open_file_diagnostics(cx);
+                        view.push_diagnostics_for_open_tabs(cx);
                         // Reveal active file (#331): a `FileContent` load means
                         // the editor just finished opening or switching to a
                         // file — whether the open originated from a tree click
@@ -418,72 +432,71 @@ impl WorkspaceView {
         }
     }
 
-    /// Feed the editor the open path's current snapshot `mtime` as the
-    /// concurrent-write signal (#188). Looks the open path up in the file tree's
-    /// mirrored model — the same `mtime` the buffer's base is compared against —
-    /// and, when present, hands it to [`EditorView::note_external_change`]. A no-op
-    /// when no file is open or the open path is not (yet) in the tree.
-    fn notify_editor_of_open_path_mtime(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(open_path) = self
+    /// Feed every open tab its path's current snapshot `mtime` as the
+    /// concurrent-write signal (#188), fanned out per tab (#353): each open
+    /// path is looked up independently in the file tree's mirrored model —
+    /// the same `mtime` that tab's buffer base is compared against — and,
+    /// when present, handed to [`EditorView::note_external_change_for_path`].
+    /// A path not (yet) in the tree is left untouched; the editor itself
+    /// ignores a path with no open tab.
+    fn notify_editor_of_open_paths_mtime(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let open_paths: Vec<String> = self
             .editor
             .read(cx)
-            .open_path()
-            .map(std::borrow::ToOwned::to_owned)
-        else {
-            return;
-        };
-        let Some(mtime) = self
-            .file_tree
-            .read(cx)
-            .model()
-            .get(&open_path)
-            .map(|entry| entry.mtime)
-        else {
-            return;
-        };
-        self.editor.update(cx, |editor, cx| {
-            editor.note_external_change(mtime, window, cx);
-        });
+            .open_paths()
+            .map(str::to_owned)
+            .collect();
+        for path in open_paths {
+            let Some(mtime) = self.file_tree.read(cx).model().get(&path).map(|e| e.mtime) else {
+                continue;
+            };
+            self.editor.update(cx, |editor, cx| {
+                editor.note_external_change_for_path(&path, mtime, window, cx);
+            });
+        }
     }
 
-    /// Push the open file's full diagnostic set (aggregated across servers) from
-    /// the file tree's model onto the editor's inline markers (#189). Looks the
-    /// open path up in the same model the tree mirrors — the existing client
-    /// diagnostics layer (#178), consumed, not redesigned — and hands a flattened
-    /// `Vec<Diagnostic>` to [`EditorView::set_diagnostics`]. An open path with no
-    /// diagnostics applies an empty set, which clears every inline marker (so a
-    /// fixed error clears). A no-op when no file is open.
-    fn push_open_file_diagnostics(&self, cx: &mut Context<Self>) {
-        let Some(open_path) = self
+    /// Push every open tab's full diagnostic set (aggregated across servers)
+    /// from the file tree's model onto its inline markers (#189), fanned out
+    /// per tab (#353). Looks each open tab's path up in the same model the
+    /// tree mirrors — the existing client diagnostics layer (#178), consumed,
+    /// not redesigned — and hands a flattened `Vec<Diagnostic>` to
+    /// [`EditorView::set_diagnostics_for_path`]. An open tab with no
+    /// diagnostics applies an empty set, which clears its inline markers (so
+    /// a fixed error clears on the tab that owns it).
+    fn push_diagnostics_for_open_tabs(&self, cx: &mut Context<Self>) {
+        let open_paths: Vec<String> = self
             .editor
             .read(cx)
-            .open_path()
-            .map(std::borrow::ToOwned::to_owned)
-        else {
-            return;
-        };
-        // Flatten the per-server sets into one list — the editor renders all
-        // servers' diagnostics for the file together (a linter + a type-checker
-        // aggregate), mirroring the model's per-`(file, server)` keying.
-        let items: Vec<rift_protocol::Diagnostic> = self
-            .file_tree
-            .read(cx)
-            .model()
-            .diagnostics(&open_path)
-            .map(|by_server| by_server.values().flatten().cloned().collect())
-            .unwrap_or_default();
-        self.editor.update(cx, |editor, cx| {
-            editor.set_diagnostics(&items, cx);
-        });
+            .open_paths()
+            .map(str::to_owned)
+            .collect();
+        for path in open_paths {
+            // Flatten the per-server sets into one list — the editor renders
+            // all servers' diagnostics for the file together (a linter + a
+            // type-checker aggregate), mirroring the model's
+            // per-`(file, server)` keying.
+            let items: Vec<rift_protocol::Diagnostic> = self
+                .file_tree
+                .read(cx)
+                .model()
+                .diagnostics(&path)
+                .map(|by_server| by_server.values().flatten().cloned().collect())
+                .unwrap_or_default();
+            self.editor.update(cx, |editor, cx| {
+                editor.set_diagnostics_for_path(&path, &items, cx);
+            });
+        }
     }
 
     /// Reveal the editor's currently open file in the explorer tree (#331):
     /// expand its ancestor directories, select its row, and scroll it into
-    /// view. Reads the open path the same way [`Self::push_open_file_diagnostics`]
-    /// does, rather than from the triggering daemon message, so it always
-    /// reflects the tab that is actually active once the load lands. A no-op
-    /// (via [`FileTree::reveal`]) when no file is open or the path is not
-    /// (yet) present in the tree's mirrored model.
+    /// view. Reads the *active* tab's path (unlike the per-tab fan-out above,
+    /// this is a single-target UI concern — which file to reveal), rather
+    /// than from the triggering daemon message, so it always reflects the tab
+    /// that is actually active once the load lands. A no-op (via
+    /// [`FileTree::reveal`]) when no file is open or the path is not (yet)
+    /// present in the tree's mirrored model.
     fn reveal_open_file_in_tree(&self, cx: &mut Context<Self>) {
         let Some(open_path) = self
             .editor
