@@ -813,13 +813,13 @@ impl WorkspaceView {
     /// Toggle light/dark mode (issue #367), keeping whichever named theme is
     /// currently assigned to each slot.
     fn toggle_theme_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        crate::toggle_theme_mode(Some(window), cx);
+        crate::toggle_theme_mode_persisted(Some(window), cx);
     }
 
     /// Switch the active theme by name (issue #367), restyling the running UI
     /// live.
     fn select_theme(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        crate::set_theme(name, Some(window), cx);
+        crate::set_theme_persisted(name, Some(window), cx);
     }
 }
 
