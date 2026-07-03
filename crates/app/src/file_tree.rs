@@ -35,7 +35,7 @@ use std::rc::Rc;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     div, px, App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, ParentElement as _, Pixels, Render, SharedString, Size,
+    IntoElement, ParentElement as _, Pixels, Render, ScrollStrategy, SharedString, Size,
     StatefulInteractiveElement as _, Styled as _, Window,
 };
 use gpui_component::dock::{Panel, PanelEvent};
@@ -248,6 +248,13 @@ fn compute_rollup(model: &WorktreeModel) -> HashMap<String, Rollup> {
     result
 }
 
+/// Every ancestor directory of `path`, shallowest first — the directories a
+/// "reveal" must expand for `path`'s own row to become visible. `a/b/c.rs`
+/// yields `["a", "a/b"]`; a top-level path (no separator) yields none.
+fn ancestor_dirs(path: &str) -> impl Iterator<Item = &str> {
+    path.match_indices('/').map(|(i, _)| &path[..i])
+}
+
 /// The navigable file-tree view.
 ///
 /// Owns the [`WorktreeModel`] (the client mirror it renders) plus the small
@@ -336,6 +343,39 @@ impl FileTree {
         }
         // Collapsing/expanding changes which paths are in the visible-row set.
         self.cache_dirty = true;
+    }
+
+    /// Reveal `path` in the tree: expand every ancestor directory, select its
+    /// row, and scroll it into view. [`crate::workspace::WorkspaceView`] calls
+    /// this whenever the editor finishes opening or switching to a file
+    /// (`docs/spec-explorer-panel.md`, #331). A `path` absent from the model —
+    /// not (yet) streamed by the daemon, or a stale signal — is a no-op:
+    /// nothing to expand, select, or scroll to.
+    ///
+    /// Mirrors [`FileTree::toggle_dir`]'s dirty-marking discipline: expansion
+    /// or selection changes mark [`FileTree::cache_dirty`], same as a click.
+    /// The cache is then refreshed immediately (not deferred to the next
+    /// render) so the row index used to scroll is current.
+    pub fn reveal(&mut self, path: &str) {
+        if self.model.get(path).is_none() {
+            return;
+        }
+
+        for ancestor in ancestor_dirs(path) {
+            if self.collapsed.remove(ancestor) {
+                self.cache_dirty = true;
+            }
+        }
+        if self.selected.as_deref() != Some(path) {
+            self.selected = Some(path.to_owned());
+            self.cache_dirty = true;
+        }
+
+        self.refresh_row_cache();
+        if let Some(ix) = self.row_cache.iter().position(|row| row.path == path) {
+            self.scroll_handle
+                .scroll_to_item(ix, ScrollStrategy::Nearest);
+        }
     }
 
     /// Rebuild [`FileTree::row_cache`] from the model when [`FileTree::cache_dirty`]
@@ -1147,5 +1187,68 @@ mod tests {
             .expect("ignored.rs");
         assert!(!kept.ignored);
         assert!(ignored.ignored);
+    }
+
+    // --- reveal active file (#331) ---
+
+    #[test]
+    fn test_ancestor_dirs_of_a_nested_path() {
+        let ancestors: Vec<&str> = ancestor_dirs("src/net/tcp.rs").collect();
+        assert_eq!(ancestors, vec!["src", "src/net"]);
+    }
+
+    #[test]
+    fn test_ancestor_dirs_of_a_top_level_path_is_empty() {
+        let ancestors: Vec<&str> = ancestor_dirs("top.rs").collect();
+        assert!(ancestors.is_empty());
+    }
+
+    #[test]
+    fn test_reveal_expands_ancestors_selects_and_marks_the_cache_dirty() {
+        let mut tree = seed(vec![dir("a"), dir("a/b"), file("a/b/c.rs"), file("top.rs")]);
+        tree.toggle_dir("a");
+        tree.toggle_dir("a/b");
+        tree.refresh_row_cache();
+        assert!(tree.is_collapsed("a"));
+        assert!(tree.is_collapsed("a/b"));
+        assert!(!tree.cache_dirty);
+
+        tree.reveal("a/b/c.rs");
+
+        assert!(!tree.is_collapsed("a"));
+        assert!(!tree.is_collapsed("a/b"));
+        assert_eq!(tree.selected(), Some("a/b/c.rs"));
+        assert!(!tree.cache_dirty, "reveal refreshes the cache immediately");
+        let visible: Vec<&str> = tree.row_cache.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(visible, vec!["a", "a/b", "a/b/c.rs", "top.rs"]);
+    }
+
+    #[test]
+    fn test_reveal_of_a_path_absent_from_the_model_is_a_no_op() {
+        let mut tree = seed(vec![dir("a"), file("a/b.rs")]);
+        tree.toggle_dir("a");
+        tree.refresh_row_cache();
+
+        tree.reveal("does/not/exist.rs");
+
+        assert!(tree.is_collapsed("a"), "unrelated collapse state untouched");
+        assert_eq!(tree.selected(), None, "no selection for a missing path");
+        assert!(!tree.cache_dirty, "no spurious invalidation for a no-op");
+    }
+
+    #[test]
+    fn test_reveal_is_idempotent_when_already_expanded_and_selected() {
+        let mut tree = seed(vec![dir("a"), file("a/b.rs")]);
+        tree.reveal("a/b.rs");
+        tree.refresh_row_cache();
+        assert!(!tree.cache_dirty);
+
+        tree.reveal("a/b.rs");
+
+        assert_eq!(tree.selected(), Some("a/b.rs"));
+        assert!(
+            !tree.cache_dirty,
+            "revealing an already-expanded, already-selected path changes nothing"
+        );
     }
 }
