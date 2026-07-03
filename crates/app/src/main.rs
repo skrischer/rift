@@ -1145,11 +1145,12 @@ fn spawn_resize_bridge(
 /// Forward raw tmux commands (the session view's window/pane affordances) onto
 /// the protocol as [`rift_protocol::ClientMessage::TmuxCommand`]; the daemon runs
 /// them verbatim. A command that could mutate the mirrored key table or the
-/// prefix/repeat options (`keytable::mutates_bindings`) is followed, on this
-/// same task, by a `QueryKeyTable` refresh — sequential `send`s on one task
-/// land in program order on the shared write queue, so the refresh is
-/// guaranteed to reach the daemon after the mutation it is refreshing for.
-/// Issuing the refresh from a separate channel/task (as the render layer used
+/// prefix/repeat options (`keytable::mutates_bindings`), or a mirrored
+/// status-line option (`statusline::mutates_status_options`), is followed, on
+/// this same task, by the matching refresh request(s) — sequential `send`s on
+/// one task land in program order on the shared write queue, so each refresh
+/// is guaranteed to reach the daemon after the mutation it is refreshing for.
+/// Issuing a refresh from a separate channel/task (as the render layer used
 /// to) gave no such ordering guarantee.
 fn spawn_command_bridge(
     client: std::sync::Arc<rift_ssh::DaemonClient>,
@@ -1159,7 +1160,8 @@ fn spawn_command_bridge(
     tokio::spawn(async move {
         while let Ok(cmd) = cmd_rx.recv_async().await {
             debug!(cmd = %cmd, "sending tmux command (daemon)");
-            let refresh_after = rift_terminal::keytable::mutates_bindings(&cmd);
+            let refresh_key_table = rift_terminal::keytable::mutates_bindings(&cmd);
+            let refresh_status_line = rift_terminal::statusline::mutates_status_options(&cmd);
             if client
                 .send(ClientMessage::TmuxCommand { cmd })
                 .await
@@ -1167,7 +1169,10 @@ fn spawn_command_bridge(
             {
                 break;
             }
-            if refresh_after && client.send(ClientMessage::QueryKeyTable).await.is_err() {
+            if refresh_key_table && client.send(ClientMessage::QueryKeyTable).await.is_err() {
+                break;
+            }
+            if refresh_status_line && client.send(ClientMessage::QueryStatusLine).await.is_err() {
                 break;
             }
         }
