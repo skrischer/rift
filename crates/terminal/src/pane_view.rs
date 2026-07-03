@@ -8,6 +8,9 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape, Processor};
 use gpui::*;
+use gpui_component::dialog::AlertDialog;
+use gpui_component::notification::Notification;
+use gpui_component::WindowExt;
 use termy_terminal_ui::{
     add_span_damage_compute_us, encode_mouse_report, find_link_in_line, CellRenderInfo,
     CommandLifecycle, OscEvent, OscInterceptor, TerminalCursorStyle, TerminalGrid,
@@ -135,8 +138,8 @@ pub struct PaneView {
     /// command seam (the same channel `SessionView`'s chrome uses).
     tmux_command_tx: flume::Sender<String>,
     /// The mirrored `list-keys`/`show-options` lookup, pushed down from
-    /// `SessionView`. Empty/default until a later issue wires the live
-    /// refresh (`docs/spec-tmux-keytable-mirroring.md`).
+    /// `SessionView` and refreshed in place via [`Self::set_key_table`]
+    /// (`docs/spec-tmux-keytable-mirroring.md`).
     key_table: Arc<KeyTable>,
     prefix_options: PrefixOptions,
     /// Prefix chord capture/repeat state for this pane's `on_key_down`.
@@ -145,7 +148,10 @@ pub struct PaneView {
 
 impl PaneView {
     /// - `tmux_command_tx` — dispatches resolved tmux key-table bindings
-    ///   through the single command seam (`SessionView`'s chrome channel).
+    ///   through the single command seam (`SessionView`'s chrome channel). A
+    ///   binding-mutating dispatch's follow-up key-table refresh is issued
+    ///   server-side, on the same seam, after the mutating command lands —
+    ///   not requested from here (`spawn_command_bridge` in `crates/app`).
     /// - `key_table`/`prefix_options` — the mirrored `list-keys`/
     ///   `show-options` lookup, pushed down from `SessionView`.
     #[allow(clippy::too_many_arguments)]
@@ -323,6 +329,73 @@ impl PaneView {
 
     pub fn set_current_command(&mut self, command: String) {
         self.current_command = Some(command);
+    }
+
+    /// Apply a refreshed mirrored key-table lookup and prefix/repeat options
+    /// (`SessionView` re-parsed a `list-keys`/`show-options` reply). The
+    /// caller is responsible for `cx.notify()`.
+    pub fn set_key_table(&mut self, key_table: Arc<KeyTable>, prefix_options: PrefixOptions) {
+        self.key_table = key_table;
+        self.prefix_options = prefix_options;
+    }
+
+    /// Handle a resolved bound command from the prefix engine: classify it
+    /// (`keytable::classify_command`) and dispatch, hint, or confirm per the
+    /// command-interception taxonomy (`docs/spec-tmux-keytable-mirroring.md`).
+    fn handle_dispatch(&mut self, command: String, window: &mut Window, cx: &mut Context<Self>) {
+        match keytable::classify_command(&command) {
+            keytable::DispatchDecision::Dispatch(cmd) => self.dispatch_tmux_command(cmd),
+            keytable::DispatchDecision::Hint(hint) => {
+                window.push_notification(Notification::info(hint), cx);
+            }
+            keytable::DispatchDecision::Confirm { prompt, wrapped } => {
+                self.open_confirm_dialog(prompt, wrapped, window, cx);
+            }
+        }
+    }
+
+    /// Send a resolved command through the single command seam. A binding-
+    /// mutating dispatch's key-table refresh is issued server-side, on the
+    /// same seam, strictly after the mutating command lands
+    /// (`spawn_command_bridge` in `crates/app`) — requesting it from here
+    /// instead would race the mutation across two independent
+    /// channels/tasks with no ordering guarantee between them.
+    fn dispatch_tmux_command(&self, command: String) {
+        let _ = self.tmux_command_tx.try_send(command);
+    }
+
+    /// Render a native confirm dialog for a bound `confirm-before` command:
+    /// `wrapped` dispatches only if the user confirms — a control client
+    /// cannot render tmux's own confirmation, so this is what makes stock
+    /// chords like `prefix x` (kill-pane) actually work instead of silently
+    /// no-opping. On confirm, `wrapped` is routed back through
+    /// `handle_dispatch` for re-classification rather than dispatched
+    /// unconditionally — a bound `confirm-before` can itself wrap a
+    /// pane-mode or other intercepted command (e.g. `confirm-before -p
+    /// "copy?" copy-mode`), which must still resolve to a hint instead of
+    /// being shoved onto the shared pane.
+    fn open_confirm_dialog(
+        &self,
+        prompt: String,
+        wrapped: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.entity();
+        window.open_alert_dialog(cx, move |alert: AlertDialog, _, _| {
+            let wrapped = wrapped.clone();
+            let entity = entity.clone();
+            alert
+                .title("tmux confirmation")
+                .description(SharedString::from(prompt.clone()))
+                .show_cancel(true)
+                .on_ok(move |_, window, cx| {
+                    entity.update(cx, |view, cx| {
+                        view.handle_dispatch(wrapped.clone(), window, cx);
+                    });
+                    true
+                })
+        });
     }
 
     /// Apply a new whole-client font size. The caller is responsible for
@@ -1030,7 +1103,7 @@ impl Render for PaneView {
         }
 
         terminal_area
-            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _window, cx| {
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                 let ks = &event.keystroke;
 
                 if ks.modifiers.control && ks.modifiers.shift && ks.key.as_str() == "c" {
@@ -1078,7 +1151,7 @@ impl Render for PaneView {
                     );
                     match action {
                         PrefixAction::Dispatch(command) => {
-                            let _ = this.tmux_command_tx.try_send(command);
+                            this.handle_dispatch(command, window, cx);
                             cx.notify();
                             return;
                         }
