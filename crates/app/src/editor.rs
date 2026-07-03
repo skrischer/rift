@@ -487,11 +487,19 @@ impl EditorView {
 
         tab.generation = tab.generation.wrapping_add(1);
         let generation = tab.generation;
+        let path = tab.path.clone();
 
         cx.spawn(async move |this, cx| {
             smol::Timer::after(OPEN_TIMEOUT).await;
             cx.update(|cx| {
                 let _ = this.update(cx, |this, cx| {
+                    // Re-resolve by path, not the captured `index`: a
+                    // `close_tab` between arm and fire can shift indices, so
+                    // trusting the stale position risks acting on (or
+                    // reporting an out-of-range miss for) the wrong tab.
+                    let Some(index) = this.tab_index_for_path(&path) else {
+                        return;
+                    };
                     let Some(tab) = this.tabs.get_mut(index) else {
                         return;
                     };
@@ -610,6 +618,14 @@ impl EditorView {
             smol::Timer::after(BUFFER_FEED_DEBOUNCE).await;
             cx.update(|cx| {
                 let _ = this.update(cx, |this, cx| {
+                    // Re-resolve by path, not the captured `index`: a
+                    // `close_tab` between arm and fire can shift indices, so
+                    // trusting the stale position risks reading a different
+                    // tab's buffer entirely (or missing this one out of
+                    // range) instead of no-op'ing when this tab is gone.
+                    let Some(index) = this.tab_index_for_path(&path) else {
+                        return;
+                    };
                     let Some(tab) = this.tabs.get_mut(index) else {
                         return;
                     };
@@ -617,9 +633,6 @@ impl EditorView {
                         return;
                     }
                     if !matches!(tab.load_state, TabLoadState::Loaded) {
-                        return;
-                    }
-                    if tab.path != path {
                         return;
                     }
                     let content = tab.input.read(cx).value().to_string();
@@ -809,6 +822,13 @@ impl EditorView {
             smol::Timer::after(SAVE_TIMEOUT).await;
             cx.update(|cx| {
                 let _ = this.update(cx, |this, cx| {
+                    // Re-resolve by path, not the captured `index`: a
+                    // `close_tab` between arm and fire can shift indices, so
+                    // trusting the stale position risks acting on (or
+                    // reporting an out-of-range miss for) the wrong tab.
+                    let Some(index) = this.tab_index_for_path(&path) else {
+                        return;
+                    };
                     let Some(tab) = this.tabs.get_mut(index) else {
                         return;
                     };
@@ -1349,6 +1369,49 @@ impl EditorView {
         }
         cx.notify();
     }
+
+    /// Open `path` at `range`, scrolling/selecting it once loaded — the thin
+    /// public wrapper `docs/spec-problems-panel.md` calls for so the problems
+    /// panel (#343) can reach the existing LSP-nav jump machinery
+    /// ([`EditorView::jump_to_location`]) without a `NavLocation` round-trip.
+    /// Problems-panel diagnostics are always in-worktree, so `out_of_root` is
+    /// always `false`.
+    pub fn open_at_range(
+        &mut self,
+        path: String,
+        range: Range,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let location = NavLocation {
+            path,
+            range,
+            out_of_root: false,
+            line_preview: None,
+        };
+        match self.active {
+            Some(source_index) => self.jump_to_location(source_index, location, window, cx),
+            None => {
+                // No tab open yet — nothing to record as a back-entry; open-or-
+                // switch straight to the destination, mirroring the cross-file
+                // branch of `jump_to_location`.
+                let path = location.path.clone();
+                let is_new = self.open_or_switch(
+                    location.path,
+                    false,
+                    Some(location.range),
+                    None,
+                    window,
+                    cx,
+                );
+                if is_new {
+                    if let Err(e) = self.open_file_tx.try_send(path.clone()) {
+                        tracing::debug!(error = %e, %path, "failed to enqueue open_at_range open");
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ── Panel adapter ─────────────────────────────────────────────────────────────
@@ -1802,6 +1865,7 @@ fn language_for_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::TestAppContext;
 
     // --- language detection ---
 
@@ -2057,6 +2121,109 @@ mod tests {
     #[test]
     fn test_closing_the_last_tab_empties_the_editor() {
         assert_eq!(next_active_after_close(0, 0, 1), None);
+    }
+
+    // --- stale positional index across close_tab (PR #401 review) ---
+
+    fn test_channels() -> (
+        Sender<String>,
+        Sender<ClientMessage>,
+        Sender<ClientMessage>,
+        Sender<ClientMessage>,
+        flume::Receiver<ClientMessage>,
+    ) {
+        let (open_file_tx, _open_file_rx) = flume::unbounded();
+        let (save_file_tx, _save_file_rx) = flume::unbounded();
+        let (buffer_change_tx, buffer_change_rx) = flume::unbounded();
+        let (nav_tx, _nav_rx) = flume::unbounded();
+        (
+            open_file_tx,
+            save_file_tx,
+            buffer_change_tx,
+            nav_tx,
+            buffer_change_rx,
+        )
+    }
+
+    /// Regression test for the review finding on #401: `arm_buffer_feed`'s
+    /// debounce closure used to look the tab up by the raw positional
+    /// `index` it captured at arm time. Closing an *earlier* tab before the
+    /// debounce fires shifts every later tab's index down, so the stale
+    /// index either misses (out of range) or, worse, hits a different tab —
+    /// it now re-resolves via `tab_index_for_path` when the timer fires, so
+    /// the surviving tab's `BufferChanged` still lands on the right path.
+    #[gpui::test]
+    async fn test_closing_an_earlier_tab_before_the_debounce_fires_still_feeds_the_survivor(
+        cx: &mut TestAppContext,
+    ) {
+        let (open_file_tx, save_file_tx, buffer_change_tx, nav_tx, buffer_change_rx) =
+            test_channels();
+
+        let mut editor: Option<Entity<EditorView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                editor = Some(cx.new(|cx| {
+                    EditorView::new(
+                        open_file_tx,
+                        save_file_tx,
+                        buffer_change_tx,
+                        nav_tx,
+                        window,
+                        cx,
+                    )
+                }));
+                cx.new(|cx| gpui_component::Root::new(editor.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let editor = editor.expect("editor constructed inside the window callback");
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    // A at index 0, B at index 1 — mirror the post-`FileContent`
+                    // reply state `arm_buffer_feed` requires (`Loaded`).
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    let b = editor.push_tab("b.rs".into(), false, window, cx);
+                    editor.tabs[a].load_state = TabLoadState::Loaded;
+                    editor.tabs[b].load_state = TabLoadState::Loaded;
+                    editor.active = Some(b);
+
+                    // Edit B: arms its debounced feed while B still sits at
+                    // index 1.
+                    editor.arm_buffer_feed(b, cx);
+
+                    // Close A before the debounce fires — B shifts from
+                    // index 1 down to index 0.
+                    editor.close_tab(a, window, cx);
+                    assert_eq!(editor.tab_index_for_path("b.rs"), Some(0));
+                });
+            })
+            .unwrap();
+
+        // Closing A synchronously enqueues its own `BufferClosed`.
+        match buffer_change_rx
+            .try_recv()
+            .expect("closing A must send its BufferClosed")
+        {
+            ClientMessage::BufferClosed { path } => assert_eq!(path, "a.rs"),
+            other => panic!("expected BufferClosed for a.rs, got {other:?}"),
+        }
+
+        // `smol::Timer` (unlike gpui's own timers) isn't driven by the test
+        // executor's virtual clock, so the debounce needs a real sleep here.
+        cx.executor().allow_parking();
+        smol::Timer::after(BUFFER_FEED_DEBOUNCE + Duration::from_millis(100)).await;
+        cx.run_until_parked();
+
+        match buffer_change_rx
+            .try_recv()
+            .expect("B's live-buffer feed must still fire after A's close shifts its index")
+        {
+            ClientMessage::BufferChanged { path, .. } => assert_eq!(path, "b.rs"),
+            other => panic!("expected BufferChanged for b.rs, got {other:?}"),
+        }
     }
 
     // --- inline-diagnostic translation (#189) ---
