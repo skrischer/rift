@@ -10,6 +10,7 @@ pub mod gallery;
 
 pub mod command_palette;
 pub mod command_registry;
+pub mod diff_view;
 pub mod editor;
 pub mod file_tree;
 pub mod problems_panel;
@@ -116,6 +117,7 @@ mod tests {
     use gpui_component::dock::Panel as _;
     use gpui_component::{ActiveTheme as _, ThemeConfig, ThemeMode};
 
+    use crate::diff_view::DIFF_VIEW_PANEL_NAME;
     use crate::editor::EDITOR_PANEL_NAME;
     use crate::file_tree::{FileTree, FILE_TREE_PANEL_NAME};
     use crate::problems_panel::PROBLEMS_PANEL_NAME;
@@ -254,12 +256,13 @@ mod tests {
         });
     }
 
-    /// `EditorView`, `TerminalPanel`, `ProblemsPanel`, and `SourceControlPanel`
-    /// need a live GPUI `Window`/`Context` to construct, so their `panel_name()`
-    /// is asserted against the constant that backs the trait impl (the impl body
-    /// is `EDITOR_PANEL_NAME` / `TERMINAL_PANEL_NAME` / `PROBLEMS_PANEL_NAME` /
-    /// `SOURCE_CONTROL_PANEL_NAME` verbatim — see `editor.rs` / `terminal_panel.rs`
-    /// / `problems_panel.rs` / `source_control.rs`).
+    /// `EditorView`, `TerminalPanel`, `ProblemsPanel`, `SourceControlPanel`, and
+    /// `DiffView` need a live GPUI `Window`/`Context` to construct, so their
+    /// `panel_name()` is asserted against the constant that backs the trait impl
+    /// (the impl body is `EDITOR_PANEL_NAME` / `TERMINAL_PANEL_NAME` /
+    /// `PROBLEMS_PANEL_NAME` / `SOURCE_CONTROL_PANEL_NAME` / `DIFF_VIEW_PANEL_NAME`
+    /// verbatim — see `editor.rs` / `terminal_panel.rs` / `problems_panel.rs` /
+    /// `source_control.rs` / `diff_view.rs`).
     /// `FileTree::new()` stays cx-free, so its call goes through the real
     /// `Panel::panel_name()` trait method.
     #[test]
@@ -270,6 +273,7 @@ mod tests {
         assert_eq!(TERMINAL_PANEL_NAME, "terminal");
         assert_eq!(SOURCE_CONTROL_PANEL_NAME, "source-control");
         assert_eq!(PROBLEMS_PANEL_NAME, "problems");
+        assert_eq!(DIFF_VIEW_PANEL_NAME, "diff-view");
 
         let names = [
             FILE_TREE_PANEL_NAME,
@@ -277,6 +281,7 @@ mod tests {
             TERMINAL_PANEL_NAME,
             SOURCE_CONTROL_PANEL_NAME,
             PROBLEMS_PANEL_NAME,
+            DIFF_VIEW_PANEL_NAME,
         ];
         for (i, a) in names.iter().enumerate() {
             for b in &names[i + 1..] {

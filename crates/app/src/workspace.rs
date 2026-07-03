@@ -46,8 +46,8 @@
 
 use flume::{Receiver, Sender};
 use gpui::{
-    div, px, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, Styled as _, Window,
+    div, px, AppContext as _, Axis, Context, Entity, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _, Window,
 };
 use gpui_component::dock::{DockArea, DockItem, DockPlacement};
 use gpui_component::{ActiveTheme as _, Root};
@@ -56,10 +56,11 @@ use rift_terminal::SessionView;
 use tracing::debug;
 
 use crate::command_palette::{CommandPalette, OpenCommandPalette};
+use crate::diff_view::DiffView;
 use crate::editor::EditorView;
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::problems_panel::{ProblemsPanel, ProblemsPanelEvent};
-use crate::source_control::SourceControlPanel;
+use crate::source_control::{SourceControlEvent, SourceControlPanel};
 use crate::status_bar;
 use crate::terminal_panel::TerminalPanel;
 
@@ -113,6 +114,11 @@ const RIGHT_DOCK_WIDTH: f32 = 240.0;
 /// Initial height of the (collapsed) bottom dock.
 const BOTTOM_DOCK_HEIGHT: f32 = 200.0;
 
+/// Initial height of the source-control panel within the right dock's
+/// top/bottom split (#338) — a compact changed-file list, leaving the
+/// remaining right-dock height to the diff view below it.
+const SOURCE_CONTROL_SPLIT_HEIGHT: f32 = 180.0;
+
 /// The flume endpoints the workspace consumes to bridge the daemon stream (run
 /// by the tokio side) onto its GPUI surfaces, plus the request endpoints it emits
 /// `OpenFile` / `SaveFile` on. Handed in at construction so `main.rs` owns the
@@ -127,6 +133,8 @@ pub struct WorkspaceChannels {
     /// Nav replies to route to the editor: `DefinitionResponse` (#196),
     /// `HoverResponse` (#197), `ReferencesResponse` (#198).
     pub nav_rx: Receiver<DaemonMessage>,
+    /// `FileDiff` replies to route to the diff view (#338).
+    pub diff_rx: Receiver<DaemonMessage>,
     /// Read requests: the root-relative path of a file to open. The tokio side
     /// turns each into a `ClientMessage::OpenFile`.
     pub open_file_tx: Sender<String>,
@@ -139,6 +147,9 @@ pub struct WorkspaceChannels {
     pub buffer_change_tx: Sender<ClientMessage>,
     /// Navigation requests: `DefinitionRequest` (#196).
     pub nav_tx: Sender<ClientMessage>,
+    /// Diff pull requests: the root-relative path of a changed file to diff
+    /// (#338). The tokio side turns each into a `ClientMessage::RequestDiff`.
+    pub request_diff_tx: Sender<String>,
 }
 
 /// The composed app root.
@@ -158,16 +169,22 @@ pub struct WorkspaceView {
     // `--all-targets` build.
     #[allow(dead_code)]
     problems_panel: Entity<ProblemsPanel>,
+    /// The diff view (`docs/spec-source-control.md`, #338): renders the
+    /// `FileDiff` streamed for the source-control panel's selection. Kept as
+    /// its own field for the same reason as `problems_panel` above; the
+    /// open-diff subscription below reaches it through this field.
+    #[allow(dead_code)]
+    diff_view: Entity<DiffView>,
     /// Read-request sender: a tree open turns into a path on this channel, which
     /// the tokio side emits as `ClientMessage::OpenFile`.
     open_file_tx: Sender<String>,
     /// The dock shell (`docs/spec-ide-shell.md`, issue #324): explorer in the
-    /// left dock, editor|terminal split in the center, source control in the
-    /// (collapsed by default) right dock, problems panel in the (collapsed by
-    /// default) bottom dock. Holds its own strong references to the panel
-    /// entities; this view keeps its own handles too (`file_tree`, `editor`,
-    /// `problems_panel` above) so the daemon-stream bridges keep working
-    /// unchanged after the layout refactor.
+    /// left dock, editor|terminal split in the center, source control + diff
+    /// view (#338) split in the (collapsed by default) right dock, problems
+    /// panel in the (collapsed by default) bottom dock. Holds its own strong
+    /// references to the panel entities; this view keeps its own handles too
+    /// (`file_tree`, `editor`, `problems_panel`, `diff_view` above) so the
+    /// daemon-stream bridges keep working unchanged after the layout refactor.
     dock_area: Entity<DockArea>,
     /// The command palette (`docs/spec-command-palette.md`, issue #359): owns
     /// its `ListState` entity for the workspace's lifetime, so reopening it
@@ -191,10 +208,12 @@ impl WorkspaceView {
             worktree_rx,
             buffer_rx,
             nav_rx,
+            diff_rx,
             open_file_tx,
             save_file_tx,
             buffer_change_tx,
             nav_tx,
+            request_diff_tx,
         } = channels;
 
         let file_tree = cx.new(|_| FileTree::new());
@@ -360,10 +379,36 @@ impl WorkspaceView {
             .detach();
         }
 
+        // Diff reply stream -> diff view (#338): `FileDiff` routes to
+        // `apply_file_diff`, which drops a reply for a path no longer open (the
+        // user moved on before it arrived). Routed through this view's weak
+        // handle so a closed window ends the loop gracefully, mirroring the nav
+        // reply bridge above.
+        {
+            cx.spawn_in(window, async move |this, cx| loop {
+                let Ok(msg) = diff_rx.recv_async().await else {
+                    break;
+                };
+                let result = this.update_in(cx, |view, _window, cx| {
+                    let DaemonMessage::FileDiff { path, diff } = msg else {
+                        return;
+                    };
+                    view.diff_view.update(cx, |diff_view, cx| {
+                        diff_view.apply_file_diff(path, diff, cx);
+                    });
+                });
+                if result.is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
+
         // Dock shell (`docs/spec-ide-shell.md`, issue #324): explorer (left) +
-        // editor|terminal (center split) + source control (right, #337) +
-        // problems panel (bottom, #342). Built after the daemon-stream
-        // bridges above so the panel entities they close over already exist.
+        // editor|terminal (center split) + source control + diff view split
+        // (right, #337, #338) + problems panel (bottom, #342). Built after the
+        // daemon-stream bridges above so the panel entities they close over
+        // already exist.
         let dock_area = cx.new(|cx| DockArea::new("rift-dock", Some(1), window, cx));
         let weak_dock_area = dock_area.downgrade();
 
@@ -372,7 +417,25 @@ impl WorkspaceView {
         // git status — the existing client git-status model, not a re-derived
         // copy (`docs/spec-source-control.md`).
         let source_control = cx.new(|cx| SourceControlPanel::new(file_tree.clone(), cx));
+        let diff_view = cx.new(|cx| DiffView::new(request_diff_tx, cx));
         let problems_panel = cx.new(|cx| ProblemsPanel::new(file_tree.clone(), cx));
+
+        // Open-diff wiring (#338): selecting a changed file in the
+        // source-control panel opens its diff in the diff view — the clean
+        // signal the panel emits (`SourceControlEvent::OpenDiff`), routed here
+        // so the diff view issues the `RequestDiff` and renders the reply.
+        // Mirrors the file tree's `OpenFile` subscription above.
+        cx.subscribe_in(
+            &source_control,
+            window,
+            |this, _panel, event: &SourceControlEvent, _window, cx| {
+                let SourceControlEvent::OpenDiff { path } = event;
+                this.diff_view.update(cx, |diff_view, cx| {
+                    diff_view.open_diff(path.clone(), cx);
+                });
+            },
+        )
+        .detach();
 
         // Jump-to-location (#343): selecting a diagnostic emits `OpenLocation`,
         // routed to the editor's thin `open_at_range` wrapper around the same
@@ -403,8 +466,22 @@ impl WorkspaceView {
             cx,
         );
         // Both real, collapsed docks (not placeholder views) — a single-tab
-        // `TabPanel`, collapsed by default until the user opens it.
-        let right_item = DockItem::tab(source_control, &weak_dock_area, window, cx);
+        // `TabPanel`, collapsed by default until the user opens it. The right
+        // dock is a vertical split (#338): the changed-file list stays compact
+        // on top, the diff view takes the remaining height below it — both
+        // signal panels visible together, matching the review flow (select a
+        // file, read its diff, without switching tabs).
+        let right_item = DockItem::split_with_sizes(
+            Axis::Vertical,
+            vec![
+                DockItem::tab(source_control, &weak_dock_area, window, cx),
+                DockItem::tab(diff_view.clone(), &weak_dock_area, window, cx),
+            ],
+            vec![Some(px(SOURCE_CONTROL_SPLIT_HEIGHT)), None],
+            &weak_dock_area,
+            window,
+            cx,
+        );
         let bottom_item = DockItem::tab(problems_panel.clone(), &weak_dock_area, window, cx);
 
         dock_area.update(cx, |dock, cx| {
@@ -421,6 +498,7 @@ impl WorkspaceView {
             editor,
             session_view,
             problems_panel,
+            diff_view,
             open_file_tx,
             dock_area,
             command_palette,
@@ -673,18 +751,22 @@ mod tests {
         let (_worktree_tx, worktree_rx) = flume::unbounded();
         let (_buffer_tx, buffer_rx) = flume::unbounded();
         let (_nav_reply_tx, nav_rx) = flume::unbounded();
+        let (_diff_reply_tx, diff_rx) = flume::unbounded();
         let (open_file_tx, _open_file_rx) = flume::unbounded();
         let (save_file_tx, _save_file_rx) = flume::unbounded();
         let (buffer_change_tx, _buffer_change_rx) = flume::unbounded();
         let (nav_tx, _nav_request_rx) = flume::unbounded();
+        let (request_diff_tx, _request_diff_rx) = flume::unbounded();
         WorkspaceChannels {
             worktree_rx,
             buffer_rx,
             nav_rx,
+            diff_rx,
             open_file_tx,
             save_file_tx,
             buffer_change_tx,
             nav_tx,
+            request_diff_tx,
         }
     }
 
@@ -726,15 +808,36 @@ mod tests {
                 "right dock starts collapsed"
             );
             match right_dock.read(cx).panel() {
-                DockItem::Tabs { items, .. } => {
-                    assert_eq!(items.len(), 1, "right dock holds the source-control panel");
+                DockItem::Split { axis, items, .. } => {
                     assert_eq!(
-                        items[0].panel_name(cx),
-                        crate::source_control::SOURCE_CONTROL_PANEL_NAME,
-                        "right dock's sole tab is the source-control panel"
+                        *axis,
+                        Axis::Vertical,
+                        "source-control/diff split is vertical (#338)"
                     );
+                    assert_eq!(
+                        items.len(),
+                        2,
+                        "right dock holds source-control + diff view"
+                    );
+
+                    match &items[0] {
+                        DockItem::Tabs { items, .. } => assert_eq!(
+                            items[0].panel_name(cx),
+                            crate::source_control::SOURCE_CONTROL_PANEL_NAME,
+                            "right dock's top split is the source-control panel"
+                        ),
+                        other => panic!("expected a tabs item, got {other:?}"),
+                    }
+                    match &items[1] {
+                        DockItem::Tabs { items, .. } => assert_eq!(
+                            items[0].panel_name(cx),
+                            crate::diff_view::DIFF_VIEW_PANEL_NAME,
+                            "right dock's bottom split is the diff view"
+                        ),
+                        other => panic!("expected a tabs item, got {other:?}"),
+                    }
                 }
-                other => panic!("expected the right dock to hold a tabs item, got {other:?}"),
+                other => panic!("expected the right dock to hold a split, got {other:?}"),
             }
 
             assert!(dock_area.bottom_dock().is_some(), "bottom dock must exist");
