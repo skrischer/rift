@@ -46,10 +46,10 @@
 
 use flume::{Receiver, Sender};
 use gpui::{
-    div, px, AppContext as _, Context, Entity, FocusHandle, Focusable, IntoElement,
-    ParentElement as _, Render, Styled as _, Window,
+    div, px, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, Styled as _, Window,
 };
-use gpui_component::dock::{DockArea, DockItem};
+use gpui_component::dock::{DockArea, DockItem, DockPlacement};
 use gpui_component::ActiveTheme as _;
 use rift_protocol::{ClientMessage, DaemonMessage};
 use rift_terminal::SessionView;
@@ -58,6 +58,45 @@ use tracing::debug;
 use crate::editor::EditorView;
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::terminal_panel::TerminalPanel;
+
+// ── Actions ───────────────────────────────────────────────────────────────────
+//
+// Shell command actions (`docs/spec-command-palette.md`, issue #358): Phase 10
+// (`docs/spec-ide-shell.md`) delivers dock/panel toggling and zoom via the
+// `DockArea`'s own mouse-driven controls, not as dispatchable `#[action]`
+// types, so the command palette has nothing to bind these to. Defined here,
+// beside the `dock_area` they target, and wired to it in
+// [`WorkspaceView::render`]'s `on_action` handlers.
+
+/// Toggle the explorer (left) dock hidden/shown.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct ToggleExplorer;
+
+/// Toggle the problems dock (bottom, reserved for the Phase 13 problems panel)
+/// hidden/shown.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct ToggleProblems;
+
+/// Toggle the source control dock (right, reserved for the Phase 12 source
+/// control panel) hidden/shown.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct ToggleSourceControl;
+
+/// Move focus to the terminal, so keystrokes reach the active tmux pane.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct FocusTerminal;
+
+/// Toggle zoom on the currently focused panel. Forwards to `gpui_component`'s
+/// own `dock::ToggleZoom` — the action its built-in zoom button already
+/// dispatches — so there is exactly one zoom code path (no parallel
+/// execution mechanism).
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct ZoomActivePanel;
 
 /// Initial width of the left (explorer) dock, in pixels. Purely a starting
 /// point for the user's first resize — `DockArea` owns the size afterward,
@@ -381,6 +420,41 @@ impl WorkspaceView {
             editor.set_diagnostics(&items, cx);
         });
     }
+
+    /// Toggle the explorer (left) dock hidden/shown (issue #358).
+    fn toggle_explorer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dock_area.update(cx, |dock_area, cx| {
+            dock_area.toggle_dock(DockPlacement::Left, window, cx);
+        });
+    }
+
+    /// Toggle the problems dock (bottom) hidden/shown (issue #358).
+    fn toggle_problems(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dock_area.update(cx, |dock_area, cx| {
+            dock_area.toggle_dock(DockPlacement::Bottom, window, cx);
+        });
+    }
+
+    /// Toggle the source control dock (right) hidden/shown (issue #358).
+    fn toggle_source_control(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dock_area.update(cx, |dock_area, cx| {
+            dock_area.toggle_dock(DockPlacement::Right, window, cx);
+        });
+    }
+
+    /// Move focus to the terminal (issue #358), so keystrokes reach the tmux
+    /// pane exactly as they do when the terminal is clicked directly.
+    fn focus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.session_view.focus_handle(cx).focus(window, cx);
+    }
+
+    /// Toggle zoom on the currently focused panel (issue #358): re-dispatches
+    /// `gpui_component`'s own `ToggleZoom`, which bubbles from the focused
+    /// element up to whichever `TabPanel` contains it — the same path its
+    /// built-in zoom button already drives.
+    fn zoom_active_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.dispatch_action(Box::new(gpui_component::dock::ToggleZoom), cx);
+    }
 }
 
 /// Fold one worktree-family daemon message into the file tree's model. Only the
@@ -437,11 +511,31 @@ impl Render for WorkspaceView {
         // `flex_col` mirrors `examples/dock.rs` at the pinned gpui-component
         // rev so future top chrome (status bar, palette) can stack above the
         // dock without another layout rewrite (both deferred, `docs/spec-ide-shell.md`).
+        //
+        // The shell command actions (issue #358) are handled here, at the
+        // workspace root, rather than scoped to a key context: they are
+        // global commands the command palette dispatches regardless of which
+        // panel currently has focus.
         div()
             .flex()
             .flex_col()
             .size_full()
             .bg(cx.theme().background)
+            .on_action(cx.listener(|this, _: &ToggleExplorer, window, cx| {
+                this.toggle_explorer(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleProblems, window, cx| {
+                this.toggle_problems(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSourceControl, window, cx| {
+                this.toggle_source_control(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusTerminal, window, cx| {
+                this.focus_terminal(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ZoomActivePanel, window, cx| {
+                this.zoom_active_panel(window, cx);
+            }))
             .child(self.dock_area.clone())
     }
 }
@@ -661,5 +755,153 @@ mod tests {
                 "workspace focus delegates to the terminal so keystrokes keep reaching the tmux pane"
             );
         });
+    }
+
+    /// Shell command action (`docs/spec-command-palette.md`, issue #358): the
+    /// `ToggleExplorer` handler reaches the same `DockArea::toggle_dock` call
+    /// `test_toggle_left_dock_flips_open_state` already exercises directly —
+    /// this proves the action is wired to the dock, not just defined.
+    #[gpui::test]
+    fn test_toggle_explorer_flips_left_dock_open_state(cx: &mut TestAppContext) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let session_view = cx.new(|cx| SessionView::new(cx).0);
+                workspace = Some(
+                    cx.new(|cx| WorkspaceView::new(session_view, test_channels(), window, cx)),
+                );
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+
+        window
+            .update(cx, |_, window, cx| {
+                let dock_area = workspace.read(cx).dock_area.clone();
+                assert!(
+                    dock_area.read(cx).is_dock_open(DockPlacement::Left, cx),
+                    "explorer dock starts open"
+                );
+
+                workspace.update(cx, |view, cx| {
+                    view.toggle_explorer(window, cx);
+                });
+                assert!(
+                    !dock_area.read(cx).is_dock_open(DockPlacement::Left, cx),
+                    "ToggleExplorer hides the explorer dock"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Shell command action (issue #358): `ToggleProblems` reaches the bottom
+    /// dock (reserved for the Phase 13 problems panel), which starts collapsed.
+    #[gpui::test]
+    fn test_toggle_problems_flips_bottom_dock_open_state(cx: &mut TestAppContext) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let session_view = cx.new(|cx| SessionView::new(cx).0);
+                workspace = Some(
+                    cx.new(|cx| WorkspaceView::new(session_view, test_channels(), window, cx)),
+                );
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+
+        window
+            .update(cx, |_, window, cx| {
+                let dock_area = workspace.read(cx).dock_area.clone();
+                assert!(
+                    !dock_area.read(cx).is_dock_open(DockPlacement::Bottom, cx),
+                    "problems dock starts collapsed"
+                );
+
+                workspace.update(cx, |view, cx| {
+                    view.toggle_problems(window, cx);
+                });
+                assert!(
+                    dock_area.read(cx).is_dock_open(DockPlacement::Bottom, cx),
+                    "ToggleProblems opens the bottom dock"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Shell command action (issue #358): `ToggleSourceControl` reaches the
+    /// right dock (reserved for the Phase 12 source control panel), which
+    /// starts collapsed.
+    #[gpui::test]
+    fn test_toggle_source_control_flips_right_dock_open_state(cx: &mut TestAppContext) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let session_view = cx.new(|cx| SessionView::new(cx).0);
+                workspace = Some(
+                    cx.new(|cx| WorkspaceView::new(session_view, test_channels(), window, cx)),
+                );
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+
+        window
+            .update(cx, |_, window, cx| {
+                let dock_area = workspace.read(cx).dock_area.clone();
+                assert!(
+                    !dock_area.read(cx).is_dock_open(DockPlacement::Right, cx),
+                    "source control dock starts collapsed"
+                );
+
+                workspace.update(cx, |view, cx| {
+                    view.toggle_source_control(window, cx);
+                });
+                assert!(
+                    dock_area.read(cx).is_dock_open(DockPlacement::Right, cx),
+                    "ToggleSourceControl opens the right dock"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Shell command action (issue #358): `FocusTerminal` moves focus to the
+    /// terminal, exactly as `WorkspaceView`'s own handed-off focus does.
+    #[gpui::test]
+    fn test_focus_terminal_moves_focus_to_the_terminal(cx: &mut TestAppContext) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let mut session_view: Option<Entity<SessionView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let view = cx.new(|cx| SessionView::new(cx).0);
+                session_view = Some(view.clone());
+                workspace =
+                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), window, cx)));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+        let session_view =
+            session_view.expect("session view constructed inside the window callback");
+
+        window
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |view, cx| {
+                    view.focus_terminal(window, cx);
+                });
+                assert!(
+                    session_view.focus_handle(cx).is_focused(window),
+                    "FocusTerminal moves focus to the terminal"
+                );
+            })
+            .unwrap();
     }
 }
