@@ -697,13 +697,17 @@ where
                         // are likewise routed to the shared dispatch loop pending
                         // the LSP request-path wiring (a follow-on issue); the
                         // dispatch loop's defensive no-op arm absorbs them until
-                        // then.
+                        // then. `RequestDiff` (source-control diff, #335) is
+                        // routed the same way pending its daemon-side handler
+                        // (a follow-on issue) — it will move to the per-connection
+                        // buffer-channel arm above once that lands.
                         ClientMessage::Hello { .. }
                         | ClientMessage::BufferChanged { .. }
                         | ClientMessage::BufferClosed { .. }
                         | ClientMessage::HoverRequest { .. }
                         | ClientMessage::DefinitionRequest { .. }
-                        | ClientMessage::ReferencesRequest { .. } => {
+                        | ClientMessage::ReferencesRequest { .. }
+                        | ClientMessage::RequestDiff { .. } => {
                             if inbound.send(msg).await.is_err() {
                                 // Dispatch loop gone; nothing left to serve.
                                 break 'serve;
@@ -1218,7 +1222,10 @@ impl Core {
             // `terminal_task` (per-client attach). The buffer-channel requests
             // (`OpenFile`/`SaveFile`) likewise never reach it — they are answered
             // per connection by `buffer_reply`, request/response back to that
-            // socket, not on the broadcast bus.
+            // socket, not on the broadcast bus. `RequestDiff` (source-control
+            // diff, #335) is the same shape as `OpenFile`/`SaveFile` — its
+            // daemon-side handler lands in a follow-on issue and will answer
+            // per connection too, not on this loop.
             ClientMessage::Attach { .. }
             | ClientMessage::Input { .. }
             | ClientMessage::ResizePane { .. }
@@ -1226,7 +1233,8 @@ impl Core {
             | ClientMessage::CapturePane { .. }
             | ClientMessage::QueryKeyTable
             | ClientMessage::OpenFile { .. }
-            | ClientMessage::SaveFile { .. } => {}
+            | ClientMessage::SaveFile { .. }
+            | ClientMessage::RequestDiff { .. } => {}
         }
     }
 

@@ -144,6 +144,19 @@ pub enum ClientMessage {
         path: String,
         position: Position,
     },
+    /// Source-control diff request (`docs/spec-source-control.md`): pull a
+    /// structured diff of `path`'s current on-disk content against its blob at
+    /// HEAD — always worktree-vs-HEAD, regardless of staging state. `path` is
+    /// relative to the worktree root (the same key space as
+    /// [`WorktreeEntry::path`]). Computed on request, like
+    /// [`ClientMessage::OpenFile`], not pushed: a diff is only needed for the
+    /// file currently under review. The daemon answers with exactly one
+    /// [`DaemonMessage::FileDiff`] for this path — path-keyed request/response,
+    /// like the buffer channel (no [`NavRequestId`]: at most one diff is ever
+    /// inflight per path).
+    RequestDiff {
+        path: String,
+    },
     Hello {
         version: u32,
     },
@@ -360,6 +373,15 @@ pub enum DaemonMessage {
     ReferencesResponse {
         id: NavRequestId,
         locations: Vec<NavLocation>,
+    },
+    /// The reply to a [`ClientMessage::RequestDiff`]: `path`'s structured diff
+    /// against HEAD, or a [`FileDiffPayload`] sentinel when the daemon cannot
+    /// produce one (binary content on either side, or a diff exceeding the
+    /// size ceiling — see [`FileDiffPayload::TooLarge`]). `path` is relative to
+    /// the worktree root (the same key space as [`WorktreeEntry::path`]).
+    FileDiff {
+        path: String,
+        diff: FileDiffPayload,
     },
     Welcome {
         version: u32,
@@ -585,6 +607,59 @@ pub struct HoverContent {
     pub markdown: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<Range>,
+}
+
+/// The payload of a [`DaemonMessage::FileDiff`]: either a structured line diff
+/// against HEAD, or a sentinel for content the daemon cannot diff structurally
+/// (`docs/spec-source-control.md`). Tagged by `kind` on the wire so the client
+/// can match on the payload shape without probing for field presence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileDiffPayload {
+    /// A unified-diff-style line diff against HEAD. Empty `hunks` means the
+    /// worktree content is identical to HEAD.
+    Hunks { hunks: Vec<DiffHunk> },
+    /// Either side (the HEAD blob or the worktree content) is binary — no
+    /// line diff is produced.
+    Binary,
+    /// The diff exceeds the daemon's size ceiling (~20k changed lines or
+    /// ~2MB per side, pinned in the diff-compute implementation) — too large
+    /// to stream as a structured diff.
+    TooLarge,
+}
+
+/// A contiguous run of unified-diff lines within a [`FileDiffPayload::Hunks`],
+/// addressed against both the old (HEAD) and new (worktree) line numbering.
+/// `old_start`/`new_start` are 1-based, matching unified-diff / `git diff`
+/// hunk headers (`@@ -old_start,old_len +new_start,new_len @@`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffHunk {
+    pub old_start: u32,
+    pub old_len: u32,
+    pub new_start: u32,
+    pub new_len: u32,
+    pub lines: Vec<DiffLine>,
+}
+
+/// One line of a [`DiffHunk`]: its role plus content, with the line
+/// terminator stripped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffLine {
+    pub kind: DiffLineKind,
+    pub content: String,
+}
+
+/// A [`DiffLine`]'s role within its hunk, mirroring unified-diff's
+/// context/add/remove line prefixes (` `/`+`/`-`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffLineKind {
+    /// Present on both sides, shown for surrounding context.
+    Context,
+    /// Present only on the new (worktree) side.
+    Add,
+    /// Present only on the old (HEAD) side.
+    Remove,
 }
 
 #[cfg(test)]
@@ -1921,5 +1996,127 @@ mod tests {
         // Both must use the same wire shape for the position fields.
         assert!(req_json.contains(r#""line":10,"character":4"#));
         assert!(diag_json.contains(r#""line":10,"character":4"#));
+    }
+
+    // ---- Source-control diff round-trip tests -------------------------------
+
+    #[test]
+    fn test_request_diff_roundtrip_preserves_path() {
+        // The diff pull request carries only the path, no id — at most one
+        // diff is ever inflight per path, so path-keying (like the buffer
+        // channel) is sufficient correlation.
+        let msg = ClientMessage::RequestDiff {
+            path: "src/main.rs".to_owned(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize RequestDiff");
+        assert_eq!(json, r#"{"type":"request_diff","path":"src/main.rs"}"#);
+
+        let parsed: ClientMessage = serde_json::from_str(&json).expect("deserialize RequestDiff");
+        assert_eq!(parsed, msg);
+        match parsed {
+            ClientMessage::RequestDiff { path } => assert_eq!(path, "src/main.rs"),
+            other => panic!("expected RequestDiff, got {other:?}"),
+        }
+    }
+
+    fn sample_hunk() -> DiffHunk {
+        DiffHunk {
+            old_start: 1,
+            old_len: 3,
+            new_start: 1,
+            new_len: 3,
+            lines: vec![
+                DiffLine {
+                    kind: DiffLineKind::Context,
+                    content: "one".to_owned(),
+                },
+                DiffLine {
+                    kind: DiffLineKind::Remove,
+                    content: "two".to_owned(),
+                },
+                DiffLine {
+                    kind: DiffLineKind::Add,
+                    content: "TWO".to_owned(),
+                },
+                DiffLine {
+                    kind: DiffLineKind::Context,
+                    content: "three".to_owned(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_file_diff_hunks_roundtrip_preserves_lines_and_ranges() {
+        let msg = DaemonMessage::FileDiff {
+            path: "src/main.rs".to_owned(),
+            diff: FileDiffPayload::Hunks {
+                hunks: vec![sample_hunk()],
+            },
+        };
+        let json = serde_json::to_string(&msg).expect("serialize FileDiff");
+        assert!(json.contains(r#""type":"file_diff""#));
+        assert!(json.contains(r#""kind":"hunks""#));
+        assert!(json.contains(r#""kind":"remove""#));
+        assert!(json.contains(r#""kind":"add""#));
+        assert!(json.contains(r#""kind":"context""#));
+
+        let parsed: DaemonMessage = serde_json::from_str(&json).expect("deserialize FileDiff");
+        assert_eq!(parsed, msg);
+        match parsed {
+            DaemonMessage::FileDiff { path, diff } => {
+                assert_eq!(path, "src/main.rs");
+                match diff {
+                    FileDiffPayload::Hunks { hunks } => {
+                        assert_eq!(hunks.len(), 1);
+                        assert_eq!(hunks[0].lines.len(), 4);
+                    }
+                    other => panic!("expected Hunks, got {other:?}"),
+                }
+            }
+            other => panic!("expected FileDiff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_file_diff_empty_hunks_roundtrips_as_identical_content() {
+        // No hunks means the worktree content matches HEAD exactly — must
+        // round-trip as an empty list, not vanish or collapse to a sentinel.
+        let msg = DaemonMessage::FileDiff {
+            path: "src/lib.rs".to_owned(),
+            diff: FileDiffPayload::Hunks { hunks: vec![] },
+        };
+        let json = serde_json::to_string(&msg).expect("serialize empty FileDiff");
+        assert!(json.contains(r#""hunks":[]"#));
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize empty FileDiff"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_file_diff_binary_and_too_large_sentinels_roundtrip() {
+        for payload in [FileDiffPayload::Binary, FileDiffPayload::TooLarge] {
+            let msg = DaemonMessage::FileDiff {
+                path: "assets/logo.png".to_owned(),
+                diff: payload.clone(),
+            };
+            let json = serde_json::to_string(&msg).expect("serialize FileDiff sentinel");
+            assert!(!json.contains("hunks"), "a sentinel must carry no hunks");
+            assert_eq!(
+                serde_json::from_str::<DaemonMessage>(&json)
+                    .expect("deserialize FileDiff sentinel"),
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_file_diff_payload_kind_tag_is_rejected_when_unknown() {
+        let err = serde_json::from_str::<FileDiffPayload>(r#"{"kind":"frobnicate"}"#);
+        assert!(
+            err.is_err(),
+            "unknown diff payload kind must not deserialize"
+        );
     }
 }
