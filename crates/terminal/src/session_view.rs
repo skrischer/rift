@@ -174,6 +174,16 @@ fn activity_dot_color(activity: PaneActivity) -> Option<Hsla> {
     }
 }
 
+/// Emitted for whole-client state that window-state persistence needs to
+/// observe but that lives inside `SessionView` (#225,
+/// `docs/spec-window-state-persistence.md`): today, only a font-size zoom.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SessionViewEvent {
+    FontSizeChanged { font_size_px: f32 },
+}
+
+impl EventEmitter<SessionViewEvent> for SessionView {}
+
 pub struct SessionView {
     panes: HashMap<String, PaneEntry>,
     early_output_buffer: HashMap<String, Vec<Vec<u8>>>,
@@ -466,6 +476,11 @@ impl SessionView {
         self.apply_font_size(clamped, cx);
     }
 
+    /// Apply an absolute font size, notifying every live pane and arming the
+    /// debounced window-state capture (#225) — the shared choke point for
+    /// both the `Ctrl+=`/`Ctrl+-` zoom and the settings surface's font-scale
+    /// field (#366), so either path emits [`SessionViewEvent::FontSizeChanged`]
+    /// exactly once.
     fn apply_font_size(&mut self, new_size: Pixels, cx: &mut Context<Self>) {
         if new_size == self.font_size {
             return;
@@ -477,6 +492,9 @@ impl SessionView {
                 cx.notify();
             });
         }
+        cx.emit(SessionViewEvent::FontSizeChanged {
+            font_size_px: f32::from(new_size),
+        });
         cx.notify();
     }
 

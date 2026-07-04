@@ -319,7 +319,28 @@ fn main() {
                 Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
             ),
         ]);
-        let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
+        // Window-state restore (#225, docs/spec-window-state-persistence.md):
+        // resolve this instance's channel-keyed state file, load it (defaulting
+        // on any read/parse failure per `window_state::load`'s own tolerant
+        // contract), and clamp its bounds against the live display topology —
+        // all before the window is ever created, so the restore lands before
+        // first paint. `state_path` is `None` only when no platform state
+        // directory could be resolved at all (`LOCALAPPDATA`/`XDG_STATE_HOME`/
+        // `HOME` all unset); the window then opens at today's default and every
+        // save site below no-ops instead of crashing.
+        let state_path = match window_state::state_path() {
+            Ok(path) => Some(path),
+            Err(e) => {
+                warn!(%e, "window-state persistence disabled");
+                None
+            }
+        };
+        let restored = state_path
+            .as_deref()
+            .map(window_state::load)
+            .unwrap_or_default();
+        let window_bounds =
+            workspace::initial_window_bounds(&restored, &workspace::display_rects(cx));
         // Per-channel window title (matching the per-channel taskbar icons), so the
         // mirrored stable and dev instances are distinguishable in alt-tab and
         // taskbar hover. Lowercase `rift` per brand rules.
@@ -330,7 +351,7 @@ fn main() {
         };
         cx.open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::Maximized(bounds)),
+                window_bounds: Some(window_bounds),
                 titlebar: Some(TitlebarOptions {
                     title: Some(title.into()),
                     ..Default::default()
@@ -359,7 +380,13 @@ fn main() {
                 let (request_diff_tx, request_diff_rx) = flume::unbounded::<String>();
 
                 let session_view = cx.new(|cx| {
-                    let (view, handle) = SessionView::new(cx);
+                    let (mut view, handle) = SessionView::new(cx);
+                    // Font-size restore (#225): set before the first tmux
+                    // snapshot creates any panes, so every pane picks up the
+                    // restored size from the start rather than flashing the
+                    // default and then resizing. `apply_font_size` no-ops
+                    // safely against the still-empty panes map at this point.
+                    view.set_font_size(px(restored.font_size_px), cx);
 
                     let ssh = SshConfig {
                         host: env::var("RIFT_SSH_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
@@ -473,6 +500,7 @@ fn main() {
                             nav_tx: nav_request_tx,
                             request_diff_tx,
                         },
+                        state_path,
                         window,
                         cx,
                     )
