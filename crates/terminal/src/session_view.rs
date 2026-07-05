@@ -685,20 +685,8 @@ impl SessionView {
         let subscription = cx.subscribe_in(
             &input,
             window,
-            move |this, input, event: &InputEvent, _window, cx| match event {
-                InputEvent::PressEnter { .. } => {
-                    // A second Enter after the prompt already committed (or was
-                    // cancelled) must not re-submit.
-                    if this.new_session_prompt.take().is_none() {
-                        return;
-                    }
-                    let value = input.read(cx).value();
-                    let trimmed = value.trim().to_string();
-                    if !trimmed.is_empty() {
-                        this.switch_to_session(&trimmed, cx);
-                    }
-                    cx.notify();
-                }
+            move |this, _input, event: &InputEvent, _window, cx| match event {
+                InputEvent::PressEnter { .. } => this.submit_new_session_prompt(cx),
                 InputEvent::Blur => this.cancel_new_session_prompt(cx),
                 _ => {}
             },
@@ -708,6 +696,25 @@ impl SessionView {
             input,
             _subscription: subscription,
         });
+        cx.notify();
+    }
+
+    /// Commit the new-session prompt (Enter): a non-empty trimmed name switches
+    /// to it — the daemon child command is attach-or-create (`new-session -A`),
+    /// so a fresh name creates the session and a duplicate of an existing one
+    /// simply attaches (issue #467). An empty name sends nothing and dismisses
+    /// the prompt back to the footer row (the popover stays open). A second
+    /// submit after the prompt already committed (or was cancelled) must not
+    /// re-submit.
+    fn submit_new_session_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.new_session_prompt.take() else {
+            return;
+        };
+        let value = prompt.input.read(cx).value();
+        let trimmed = value.trim().to_string();
+        if !trimmed.is_empty() {
+            self.switch_to_session(&trimmed, cx);
+        }
         cx.notify();
     }
 
@@ -1826,7 +1833,10 @@ mod tests {
         resize_direction, select_pane_command, split_command, PaneActivity, SessionListItem,
         SessionView, TermSize, TerminalHandle, DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE,
     };
-    use gpui::{px, rgb, size, App, AppContext as _, Entity, SharedString, TestAppContext};
+    use gpui::{
+        px, rgb, size, AnyWindowHandle, App, AppContext as _, Entity, SharedString, TestAppContext,
+    };
+    use gpui_component::input::InputState;
 
     #[test]
     fn test_grid_size_for_exact_multiple_returns_full_grid() {
@@ -2108,10 +2118,12 @@ mod tests {
         });
     }
 
-    /// The palette's "New Session..." entry opens the switcher with the footer
-    /// prompt already active (and still triggers the on-open list refresh).
-    #[gpui::test]
-    fn test_open_new_session_prompt_opens_switcher_with_prompt_active(cx: &mut TestAppContext) {
+    /// A windowed [`session_and_handle`]: the new-session prompt needs a live
+    /// window for its `InputState`, so prompt tests build the view inside an
+    /// open test window.
+    fn windowed_session_and_handle(
+        cx: &mut TestAppContext,
+    ) -> (AnyWindowHandle, Entity<SessionView>, TerminalHandle) {
         let mut built = None;
         let window = cx.update(|cx| {
             gpui_component::init(cx);
@@ -2123,8 +2135,27 @@ mod tests {
             .unwrap()
         });
         let (session, handle) = built.expect("session constructed inside the window callback");
+        (window.into(), session, handle)
+    }
 
-        cx.update_window(window.into(), |_, window, cx| {
+    /// The active prompt's input entity, for driving its value in tests.
+    fn prompt_input(session: &Entity<SessionView>, cx: &App) -> Entity<InputState> {
+        session
+            .read(cx)
+            .new_session_prompt
+            .as_ref()
+            .expect("new-session prompt active")
+            .input
+            .clone()
+    }
+
+    /// The palette's "New Session..." entry opens the switcher with the footer
+    /// prompt already active (and still triggers the on-open list refresh).
+    #[gpui::test]
+    fn test_open_new_session_prompt_opens_switcher_with_prompt_active(cx: &mut TestAppContext) {
+        let (window, session, handle) = windowed_session_and_handle(cx);
+
+        cx.update_window(window, |_, window, cx| {
             session.update(cx, |view, cx| view.open_new_session_prompt(window, cx));
 
             assert!(session.read(cx).switcher_open, "switcher opened");
@@ -2146,6 +2177,163 @@ mod tests {
                 session.read(cx).switcher_open,
                 "cancelling the prompt keeps the switcher open"
             );
+        })
+        .unwrap();
+    }
+
+    /// Submitting a fresh name sends one switch request carrying the trimmed
+    /// name (the daemon's attach-or-create child creates the session) and
+    /// closes the switcher; a second submit after the commit must not
+    /// re-attach (issue #467).
+    #[gpui::test]
+    fn test_submit_new_session_prompt_fresh_name_sends_trimmed_switch_and_closes(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, session, handle) = windowed_session_and_handle(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            session.update(cx, |view, cx| {
+                view.session_name = SharedString::from("rift");
+                view.open_new_session_prompt(window, cx);
+            });
+            let input = prompt_input(&session, cx);
+            input.update(cx, |state, cx| state.set_value("  agent  ", window, cx));
+
+            session.update(cx, |view, cx| view.submit_new_session_prompt(cx));
+
+            let request = handle
+                .session_switch_rx
+                .try_recv()
+                .expect("switch request sent");
+            assert_eq!(request.session, "agent", "name is trimmed");
+            assert!(!session.read(cx).switcher_open, "switcher closed");
+            assert!(
+                session.read(cx).new_session_prompt.is_none(),
+                "prompt cleared"
+            );
+
+            session.update(cx, |view, cx| view.submit_new_session_prompt(cx));
+            assert!(
+                handle.session_switch_rx.try_recv().is_err(),
+                "a second submit after the commit sends nothing"
+            );
+        })
+        .unwrap();
+    }
+
+    /// An empty (or whitespace-only) name sends nothing across the seam: the
+    /// prompt dismisses back to the "+ New session..." footer and the popover
+    /// stays open — no dead state (issue #467).
+    #[gpui::test]
+    fn test_submit_new_session_prompt_empty_name_sends_nothing_and_keeps_popover_open(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, session, handle) = windowed_session_and_handle(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            session.update(cx, |view, cx| view.open_new_session_prompt(window, cx));
+            let input = prompt_input(&session, cx);
+            input.update(cx, |state, cx| state.set_value("   ", window, cx));
+
+            session.update(cx, |view, cx| view.submit_new_session_prompt(cx));
+
+            assert!(
+                handle.session_switch_rx.try_recv().is_err(),
+                "no switch request for an empty name"
+            );
+            assert!(
+                session.read(cx).new_session_prompt.is_none(),
+                "prompt dismissed back to the footer row"
+            );
+            assert!(
+                session.read(cx).switcher_open,
+                "popover stays open for another attempt"
+            );
+        })
+        .unwrap();
+    }
+
+    /// A name duplicating the already-attached session sends no pointless
+    /// re-attach — the switcher just closes; any other existing name takes the
+    /// same path as a fresh one (attach-or-create attaches instead of
+    /// creating), so duplicates can never error (issue #467).
+    #[gpui::test]
+    fn test_submit_new_session_prompt_attached_session_name_sends_nothing_and_closes(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, session, handle) = windowed_session_and_handle(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            session.update(cx, |view, cx| {
+                view.session_name = SharedString::from("rift");
+                view.apply_session_list(
+                    vec![SessionListItem {
+                        name: "rift".into(),
+                        windows: 2,
+                        attached: true,
+                    }],
+                    cx,
+                );
+                view.open_new_session_prompt(window, cx);
+            });
+            let input = prompt_input(&session, cx);
+            input.update(cx, |state, cx| state.set_value("rift", window, cx));
+
+            session.update(cx, |view, cx| view.submit_new_session_prompt(cx));
+
+            assert!(
+                handle.session_switch_rx.try_recv().is_err(),
+                "no re-attach for the already-attached session"
+            );
+            assert!(!session.read(cx).switcher_open, "switcher still closes");
+            assert!(
+                session.read(cx).new_session_prompt.is_none(),
+                "prompt cleared"
+            );
+        })
+        .unwrap();
+    }
+
+    /// A name duplicating another (non-attached) existing session switches to
+    /// it exactly like a fresh name — attach-or-create resolves the duplicate
+    /// by attaching (issue #467).
+    #[gpui::test]
+    fn test_submit_new_session_prompt_existing_other_session_name_switches_to_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, session, handle) = windowed_session_and_handle(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            session.update(cx, |view, cx| {
+                view.session_name = SharedString::from("rift");
+                view.apply_session_list(
+                    vec![
+                        SessionListItem {
+                            name: "rift".into(),
+                            windows: 2,
+                            attached: true,
+                        },
+                        SessionListItem {
+                            name: "agent".into(),
+                            windows: 1,
+                            attached: false,
+                        },
+                    ],
+                    cx,
+                );
+                view.open_new_session_prompt(window, cx);
+            });
+            let input = prompt_input(&session, cx);
+            input.update(cx, |state, cx| state.set_value("agent", window, cx));
+
+            session.update(cx, |view, cx| view.submit_new_session_prompt(cx));
+
+            let request = handle
+                .session_switch_rx
+                .try_recv()
+                .expect("duplicate of a non-attached session is a plain switch");
+            assert_eq!(request.session, "agent");
+            assert!(!session.read(cx).switcher_open, "switcher closed");
         })
         .unwrap();
     }
