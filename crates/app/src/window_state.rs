@@ -120,6 +120,18 @@ pub fn save_theme(path: &Path, name: &str, mode: ThemeMode) -> Result<(), StoreE
     save(path, &state)
 }
 
+/// Persist a mode-only change into the store at `path`: a read-modify-write
+/// that updates `theme_mode` alone, leaving `theme_name` — the last *named*
+/// theme selection — untouched. The persistence counterpart to
+/// `crate::set_theme_mode`'s "flip the mode, keep the named themes" semantics:
+/// saving the active slot's name on a mode flip (via `save_theme`) would
+/// overwrite the selection with the other mode's theme (issue #443).
+pub fn save_theme_mode(path: &Path, mode: ThemeMode) -> Result<(), StoreError> {
+    let mut state = load(path);
+    state.theme_mode = mode;
+    save(path, &state)
+}
+
 /// Persist window geometry into the store at `path`: a read-modify-write that
 /// updates only `bounds`/`maximized`/`font_size_px`, leaving whatever theme is
 /// already on disk untouched — that half of the schema is `save_theme`'s
@@ -564,6 +576,39 @@ mod tests {
         let loaded = load(&path);
         assert_eq!(loaded.theme_name, "Default Light");
         assert_eq!(loaded.theme_mode, ThemeMode::Light);
+        assert_eq!(loaded.bounds, Rect::default());
+    }
+
+    /// The regression `save_theme_mode` exists to prevent (issue #443): a
+    /// persisted mode flip must not overwrite the persisted named-theme
+    /// selection with the other slot's theme name.
+    #[test]
+    fn test_save_theme_mode_updates_only_mode_and_preserves_the_rest() {
+        let scratch = Scratch::new("save_theme_mode");
+        let path = scratch.path("state.json");
+        let initial = sample_state();
+        save(&path, &initial).expect("initial save");
+
+        save_theme_mode(&path, ThemeMode::Dark).expect("save_theme_mode");
+
+        let loaded = load(&path);
+        assert_eq!(loaded.theme_mode, ThemeMode::Dark);
+        assert_eq!(loaded.theme_name, initial.theme_name);
+        assert_eq!(loaded.bounds, initial.bounds);
+        assert_eq!(loaded.maximized, initial.maximized);
+        assert_eq!(loaded.font_size_px, initial.font_size_px);
+    }
+
+    #[test]
+    fn test_save_theme_mode_on_missing_file_starts_from_defaults() {
+        let scratch = Scratch::new("save_theme_mode_missing");
+        let path = scratch.path("does-not-exist.json");
+
+        save_theme_mode(&path, ThemeMode::Light).expect("save_theme_mode");
+
+        let loaded = load(&path);
+        assert_eq!(loaded.theme_mode, ThemeMode::Light);
+        assert_eq!(loaded.theme_name, crate::DEFAULT_THEME_NAME);
         assert_eq!(loaded.bounds, Rect::default());
     }
 

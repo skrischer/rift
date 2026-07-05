@@ -155,9 +155,16 @@ pub fn toggle_theme_mode(window: Option<&mut Window>, cx: &mut App) {
 // always match what was actually applied. Never called from
 // `apply_persisted_theme` (startup restore) — that would re-save unchanged
 // state on every launch.
+//
+// A named-theme selection persists name + mode; a mode flip persists the
+// mode alone. `Theme::change` only swaps which slot is active, and
+// `Theme::theme_name()` reports the now-active slot's theme — so saving
+// name + mode on a mode flip would overwrite the persisted named selection
+// with the other slot's theme (issue #443).
 
 /// Save the currently active theme (name + mode, read from the live `Theme`
-/// global) into the window-state store at `path`. Split out from
+/// global) into the window-state store at `path` — the persist half of a
+/// named-theme selection ([`set_theme_persisted`]). Split out from
 /// [`persist_theme`] so tests can exercise it against a scratch path instead
 /// of the live platform state directory.
 fn persist_theme_to(path: &std::path::Path, cx: &App) -> Result<(), window_state::StoreError> {
@@ -165,19 +172,41 @@ fn persist_theme_to(path: &std::path::Path, cx: &App) -> Result<(), window_state
     window_state::save_theme(path, theme.theme_name(), theme.mode)
 }
 
+/// Save only the currently active mode (read from the live `Theme` global)
+/// into the window-state store at `path`, leaving the persisted named-theme
+/// selection untouched — the persist half of a mode flip
+/// ([`set_theme_mode_persisted`], [`toggle_theme_mode_persisted`]; issue
+/// #443). Split out from [`persist_theme_mode`] so tests can exercise it
+/// against a scratch path, mirroring [`persist_theme_to`].
+fn persist_theme_mode_to(path: &std::path::Path, cx: &App) -> Result<(), window_state::StoreError> {
+    window_state::save_theme_mode(path, Theme::global(cx).mode)
+}
+
 /// Resolve the live platform state path — the same one `apply_persisted_theme`
-/// restores from — and persist the active theme there. Best-effort: a missing
+/// restores from — and run `save_to` against it. Best-effort: a missing
 /// platform state directory or a write failure only logs; the live theme
 /// change already applied regardless.
-fn persist_theme(cx: &App) {
+fn persist_best_effort(
+    save_to: impl FnOnce(&std::path::Path) -> Result<(), window_state::StoreError>,
+) {
     match window_state::state_path() {
         Ok(path) => {
-            if let Err(e) = persist_theme_to(&path, cx) {
+            if let Err(e) = save_to(path.as_path()) {
                 warn!(%e, "failed to persist theme change");
             }
         }
         Err(e) => warn!(%e, "no platform state directory, theme change not persisted"),
     }
+}
+
+/// Persist the active theme (name + mode) into the live platform state path.
+fn persist_theme(cx: &App) {
+    persist_best_effort(|path| persist_theme_to(path, cx));
+}
+
+/// Persist only the active mode into the live platform state path.
+fn persist_theme_mode(cx: &App) {
+    persist_best_effort(|path| persist_theme_mode_to(path, cx));
 }
 
 /// [`set_theme`], then persists the result so it survives a restart.
@@ -186,13 +215,16 @@ pub fn set_theme_persisted(name: &str, window: Option<&mut Window>, cx: &mut App
     persist_theme(cx);
 }
 
-/// [`set_theme_mode`], then persists the result so it survives a restart.
+/// [`set_theme_mode`], then persists the mode so the flip survives a restart —
+/// mode only, so the persisted named-theme selection is not overwritten with
+/// the other slot's theme (issue #443).
 pub fn set_theme_mode_persisted(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
     set_theme_mode(mode, window, cx);
-    persist_theme(cx);
+    persist_theme_mode(cx);
 }
 
-/// [`toggle_theme_mode`], then persists the result so it survives a restart.
+/// [`toggle_theme_mode`], then persists the mode so the flip survives a
+/// restart — mode only, like [`set_theme_mode_persisted`].
 pub fn toggle_theme_mode_persisted(window: Option<&mut Window>, cx: &mut App) {
     let mode = if Theme::global(cx).mode.is_dark() {
         ThemeMode::Light
@@ -248,9 +280,9 @@ mod tests {
     use crate::terminal_panel::TERMINAL_PANEL_NAME;
     use crate::window_state::{self, WindowState};
     use crate::{
-        apply_persisted_theme, apply_theme, persist_theme_to, resolve_theme, set_theme,
-        set_theme_mode, toggle_theme_mode, CATPPUCCIN_MOCHA_THEME_NAME, DEFAULT_LIGHT_THEME_NAME,
-        DEFAULT_THEME_NAME,
+        apply_persisted_theme, apply_theme, persist_theme_mode_to, persist_theme_to, resolve_theme,
+        set_theme, set_theme_mode, toggle_theme_mode, CATPPUCCIN_MOCHA_THEME_NAME,
+        DEFAULT_LIGHT_THEME_NAME, DEFAULT_THEME_NAME,
     };
 
     fn theme_config(name: &str, mode: ThemeMode) -> ThemeConfig {
@@ -493,6 +525,42 @@ mod tests {
 
         let loaded = window_state::load(&path);
         assert_eq!(loaded.theme_name, DEFAULT_LIGHT_THEME_NAME);
+        assert_eq!(loaded.theme_mode, ThemeMode::Light);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The regression #443 fixes, acceptance flow persist-side: select a named
+    /// theme, toggle light/dark — the persisted store must keep the named
+    /// selection and record only the flipped mode, not the other slot's theme
+    /// name. (Restore-side, `apply_persisted_theme` re-applying a divergent
+    /// mode is covered above.) Exercised at the `persist_*_to` seams for the
+    /// same scratch-path reason as the previous test.
+    #[gpui::test]
+    fn test_persist_theme_mode_to_after_a_toggle_preserves_the_named_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "rift-app-lib-persist-theme-mode-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            apply_theme(cx);
+            // The named selection: dark Catppuccin Mocha.
+            persist_theme_to(&path, cx).expect("persist named selection");
+
+            // Live mode flip: the active slot is now the light one
+            // ("Default Light"), but the selection stays Mocha.
+            toggle_theme_mode(None, cx);
+            persist_theme_mode_to(&path, cx).expect("persist mode flip");
+        });
+
+        let loaded = window_state::load(&path);
+        assert_eq!(loaded.theme_name, CATPPUCCIN_MOCHA_THEME_NAME);
         assert_eq!(loaded.theme_mode, ThemeMode::Light);
 
         let _ = std::fs::remove_file(&path);
