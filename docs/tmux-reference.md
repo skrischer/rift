@@ -19,7 +19,7 @@ All server messages are line-based, prefixed with `%`. Output encoding: characte
 | `%window-renamed` | `@<window_id> <name>` | Window title changed |
 | `%window-pane-changed` | `@<window_id> %<pane_id>` | Active pane switched |
 | `%session-changed` | `$<session_id> <name>` | Attached session changed |
-| `%session-renamed` | `$<session_id> <name>` | Session renamed (the man page omits the id field; tmux 3.4 sends it) |
+| `%session-renamed` | `$<session_id> <name>` | Session renamed (the man page omits the id field; tmux 3.4 sends it). Broadcast to every control client on the server regardless of its attached session — match the id before adopting the name |
 | `%sessions-changed` | (none) | Session list changed |
 | `%session-window-changed` | `$<session_id> @<window_id>` | Active window in session changed |
 | `%layout-change` | `@<window_id> <layout> [visible_layout] [flags]` | Pane layout changed |

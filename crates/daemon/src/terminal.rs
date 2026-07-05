@@ -222,6 +222,11 @@ async fn open_attach(
 /// One client's live tmux control-mode attach.
 struct Attach {
     session: String,
+    /// This attach's tmux session id, learned from the `%session-changed`
+    /// tmux sends on attach. tmux broadcasts `%session-renamed` for ANY
+    /// session on the server to every control client, so a rename is only
+    /// adopted when its id matches this one; `None` until attach delivers it.
+    session_id: Option<u32>,
     child: Child,
     stdin: ChildStdin,
     stdout: ChildStdout,
@@ -310,6 +315,7 @@ impl Attach {
 
         let mut attach = Attach {
             session,
+            session_id: None,
             child,
             stdin,
             stdout,
@@ -454,12 +460,23 @@ impl Attach {
                 | Event::WindowPaneChanged { .. } => {
                     self.request_layout().await;
                 }
-                Event::SessionRenamed { name, .. } => {
-                    // The layout messages echo this attach's session name; adopt
-                    // the new name and re-query so the client sees it now, not at
-                    // the next unrelated structural change.
+                Event::SessionChanged { session, name } => {
+                    // Sent on attach with this client's own session id and
+                    // name; remember the id so foreign `%session-renamed`
+                    // broadcasts can be told apart from this attach's own.
+                    self.session_id = Some(session);
                     self.session = name;
-                    self.request_layout().await;
+                }
+                Event::SessionRenamed { session, name } => {
+                    // tmux broadcasts %session-renamed for every session on
+                    // the server, not just the attached one. Only when the id
+                    // matches this attach does the layout echo change: adopt
+                    // the new name and re-query so the client sees it now, not
+                    // at the next unrelated structural change.
+                    if self.session_id == Some(session) {
+                        self.session = name;
+                        self.request_layout().await;
+                    }
                 }
                 Event::CommandReply { id, error, output } => {
                     if id.is_some() && id == self.layout_query {
@@ -524,9 +541,7 @@ impl Attach {
                         self.paused.remove(&pane);
                     }
                 }
-                Event::Other { .. }
-                | Event::SessionChanged { .. }
-                | Event::PaneModeChanged { .. } => {}
+                Event::Other { .. } | Event::PaneModeChanged { .. } => {}
             }
         }
         Ok(Flow::Continue)
@@ -1838,6 +1853,72 @@ mod tests {
         assert!(
             renamed.is_some(),
             "rename-session must surface a LayoutUpdate echoing the new session name"
+        );
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_layout_update_after_rename_other_session_keeps_own_name() {
+        // tmux broadcasts %session-renamed for ANY session on the server to
+        // every control client, not just clients attached to the renamed
+        // session. Renaming a *different* session on the same server must not
+        // change this attach's session echo (the cross-session name-poisoning
+        // regression this guards).
+        let server = TmuxServer::new("renameothersess");
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+        recv_until(&mut out_rx, 10, |m| {
+            matches!(m, DaemonMessage::LayoutSnapshot { .. }).then_some(())
+        })
+        .await
+        .expect("snapshot");
+
+        // A second session on the same server, renamed while this attach
+        // watches — the %session-renamed broadcast reaches this client too.
+        in_tx
+            .send(ClientMessage::TmuxCommand {
+                cmd: "new-session -d -s rift429other".to_owned(),
+            })
+            .await
+            .expect("new-session");
+        in_tx
+            .send(ClientMessage::TmuxCommand {
+                cmd: "rename-session -t rift429other rift429othernew".to_owned(),
+            })
+            .await
+            .expect("rename-session");
+
+        // Force a layout echo after the broadcast: the control stream is
+        // ordered, so the %window-renamed (and the LayoutUpdate it triggers)
+        // arrives after the foreign %session-renamed has been processed.
+        in_tx
+            .send(ClientMessage::TmuxCommand {
+                cmd: "rename-window rift429after".to_owned(),
+            })
+            .await
+            .expect("rename-window");
+
+        let session = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::LayoutUpdate { session, windows }
+                if windows.iter().any(|w| w.name == "rift429after") =>
+            {
+                Some(session.clone())
+            }
+            _ => None,
+        })
+        .await;
+        assert_eq!(
+            session.as_deref(),
+            Some("rift"),
+            "renaming another session must not change this attach's session echo"
         );
 
         drop(in_tx);

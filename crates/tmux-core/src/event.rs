@@ -35,8 +35,11 @@ pub enum Event {
     WindowRenamed { window: u32, name: String },
     /// `%session-changed $<session> <name>`.
     SessionChanged { session: u32, name: String },
-    /// `%session-renamed $<session> <name>` — the session was renamed. Like
-    /// [`Event::WindowRenamed`], no structural event accompanies it.
+    /// `%session-renamed $<session> <name>` — a session was renamed. Like
+    /// [`Event::WindowRenamed`], no structural event accompanies it. tmux
+    /// broadcasts this for ANY session on the server to every control client
+    /// (verified on tmux 3.4), so consumers must match `session` against
+    /// their own attached session id before adopting `name`.
     SessionRenamed { session: u32, name: String },
     /// `%session-window-changed $<session> @<window>` — the attached session's
     /// active window changed (a `select-window` / tab switch). Carries no
