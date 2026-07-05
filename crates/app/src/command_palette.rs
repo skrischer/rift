@@ -185,6 +185,14 @@ impl CommandPalette {
             // fires — rebuild the delegate's matches explicitly, otherwise
             // the previous query's match list survives under the now-empty
             // input (#434).
+            //
+            // Residual edge case, not fixable app-side: `ListState`'s query
+            // dedupe field (`last_query`, private) is only updated by its
+            // async search task, never by `set_query`, so it survives this
+            // reset. If the first input change after reopening exactly equals
+            // the previous session's final query, `ListState` skips
+            // `perform_search` and the full unfiltered list stays displayed
+            // under that query until the next keystroke self-heals it.
             list.set_query("", window, cx);
             list.delegate_mut().matches = filter_commands("");
             list.set_selected_index(Some(IndexPath::default()), window, cx);
@@ -211,7 +219,7 @@ mod tests {
     use super::*;
 
     use gpui::TestAppContext;
-    use gpui_component::{Root, WindowExt as _};
+    use gpui_component::Root;
 
     fn matched_names(query: &str) -> Vec<&'static str> {
         filter_commands(query)
