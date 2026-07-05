@@ -35,7 +35,7 @@
 | 16 | Command palette | [spec-command-palette.md](spec-command-palette.md) | [Phase 160](https://github.com/skrischer/rift/milestone/30) |
 | 17 | Theme & settings | [spec-theme-settings.md](spec-theme-settings.md) | [Phase 170](https://github.com/skrischer/rift/milestone/31) |
 | 18 | Window-tab pane-activity indicators — active-pane count + aggregate state (free / busy / attention) per window, derived agent-agnostically from per-pane OSC-133 shell integration + the terminal bell | [archive/spec-pane-activity-indicators.md](archive/spec-pane-activity-indicators.md) | [Phase 180](https://github.com/skrischer/rift/milestone/32) |
-| 19 | tmux session switch — daemon session list + live updates, title-bar switcher, re-attach / parallel attach | — | — |
+| 19 | tmux session switch — daemon session list + live updates, switcher UI (interim statusbar + palette; title-bar home lands with phase 21), re-attach; parallel sessions via second instance | [spec-session-switch.md](spec-session-switch.md) | [Phase 190](https://github.com/skrischer/rift/milestone/33) |
 | 20 | Protocol & connection robustness — message-set version negotiation, stale-daemon restart, stream-death resync, reconnect loop, connect screen | — | — |
 | 21 | Cockpit chrome — custom title bar (connection/session group), activity rail, window-tab redesign, pane headers | — | — |
 | 22 | Composite status line — window list + activity, branch ± counts, diagnostic counts, LSP health, Ln/Col, clock | — | — |
@@ -89,10 +89,12 @@ signals dead" reports — and 21–26 are per-surface design parity.
 Foundation impact (authored and ratified in each phase's `/loopkit:plan` spec
 PR, never edited from here):
 
-- Phase 19 — `architecture.md`: the connection model grows a multi-session
-  client dimension (one control child per (client, session)); `protocol` gains
-  session-list messages (deliberate API change). `%sessions-changed` handling
-  replaces today's discarded `Event::SessionChanged`.
+- Phase 19 — `protocol` gains session-list messages (deliberate API change);
+  `%sessions-changed`/`%client-session-changed` become typed events. The
+  multi-attach-map idea was resolved at planning: parallel sessions v1 = one
+  app instance per session (no architecture change); `%session-changed` is
+  already consumed since #448 — the remaining gap is a layout refresh on
+  external `switch-client` (see spec-session-switch.md).
 - Phase 20 — `architecture.md` "Connection lifecycle": a reconnect loop
   replaces quit-on-disconnect; Hello/Welcome carries a message-set version and
   the client restarts a stale running daemon via the pidfile mechanism

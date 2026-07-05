@@ -406,8 +406,8 @@ impl WorkspaceView {
                         DaemonMessage::SaveResult { path, mtime } => {
                             editor.apply_save_result(path, mtime, cx)
                         }
-                        DaemonMessage::SaveConflict { path, .. } => {
-                            editor.apply_save_conflict(path, cx)
+                        DaemonMessage::SaveConflict { path, disk_mtime } => {
+                            editor.apply_save_conflict(path, disk_mtime, cx)
                         }
                         _ => {}
                     });

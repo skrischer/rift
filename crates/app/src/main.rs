@@ -1426,8 +1426,8 @@ fn bytes_to_string(bytes: Vec<u8>) -> String {
 /// this, so a `LayoutSnapshot` and a `LayoutUpdate` map identically. Window and
 /// pane ids take tmux's native `@N` / `%N` form, matching the command targets the
 /// session view embeds and the `%N` pane ids on `PaneOutput`. Per-pane
-/// CWD/command are subscription-driven on the legacy path and absent from the
-/// daemon layout query, so they start empty here.
+/// CWD/command ride the daemon layout query (#442) and refresh on its coalesced
+/// re-query cadence; on the legacy path they stay subscription-driven.
 fn layout_to_snapshot(
     session: String,
     windows: Vec<rift_protocol::WindowLayout>,
@@ -1458,8 +1458,8 @@ fn layout_to_snapshot(
                     height: pane.height,
                     cursor_x: 0,
                     cursor_y: 0,
-                    current_path: String::new(),
-                    current_command: String::new(),
+                    current_path: pane.current_path,
+                    current_command: pane.current_command,
                 })
                 .collect();
             TmuxWindowState {

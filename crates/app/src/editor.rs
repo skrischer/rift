@@ -63,7 +63,11 @@
 //! The auto-reload keeps the tab's `InputState` entity and restores the
 //! pre-reload cursor once the fresh content lands ([`EditorTab::pending_restore`],
 //! #432), so watching an agent edit the open file does not yank the viewport
-//! to the top on every write.
+//! to the top on every write. The conflict banner offers two working
+//! remedies (#433): "Reload from disk" discards the buffer's edits via the
+//! auto-reload path, and "Keep mine" force-saves the buffer rebased onto the
+//! on-disk `mtime` observed when the conflict surfaced
+//! ([`EditorTab::conflict_disk_mtime`]).
 //!
 //! # Live-buffer feed (#189)
 //!
@@ -315,6 +319,13 @@ struct EditorTab {
     /// Whether this tab is read-only (out-of-root target, #195/#301). No
     /// edit, no save path, unwatched snapshot.
     read_only: bool,
+    /// The on-disk `mtime` observed when this tab's conflict surfaced —
+    /// the worktree snapshot's `mtime` or a `SaveConflict` reply's
+    /// `disk_mtime`. "Keep mine" (#433) adopts it as the forced save's
+    /// base so the daemon's stale-base check passes against exactly the
+    /// observed disk version; a *further* external write still conflicts.
+    /// `None` outside a conflict.
+    conflict_disk_mtime: Option<SystemTime>,
 
     /// Monotonic open-request generation; fences this tab's open timeout.
     generation: u64,
@@ -465,6 +476,7 @@ impl EditorView {
             dirty: false,
             base_mtime: None,
             read_only,
+            conflict_disk_mtime: None,
             generation: 0,
             save_generation: 0,
             buffer_generation: 0,
@@ -505,6 +517,7 @@ impl EditorView {
         tab.load_state = TabLoadState::Loading;
         tab.save_state = SaveState::Idle;
         tab.base_mtime = None;
+        tab.conflict_disk_mtime = None;
         tab.dirty = false;
         tab.jump_list = None;
         tab.jump_list_kind = None;
@@ -945,6 +958,7 @@ impl EditorView {
         self.tabs[index].base_mtime = Some(mtime);
         self.tabs[index].dirty = false;
         self.tabs[index].save_state = SaveState::Idle;
+        self.tabs[index].conflict_disk_mtime = None;
         self.tabs[index].save_generation = self.tabs[index].save_generation.wrapping_add(1);
         // Disk now matches the buffer: revert to the disk-backed baseline.
         self.close_live_buffer(index);
@@ -952,14 +966,69 @@ impl EditorView {
     }
 
     /// Apply a `SaveConflict` reply: the daemon refused the write. Routed to
-    /// whichever tab holds `path`; a no-op if no tab holds it.
-    pub fn apply_save_conflict(&mut self, path: String, cx: &mut Context<Self>) {
+    /// whichever tab holds `path`; a no-op if no tab holds it. `disk_mtime`
+    /// (the current on-disk value the daemon reported) is recorded so the
+    /// banner's "Keep mine" remedy can rebase a forced save onto it (#433).
+    pub fn apply_save_conflict(
+        &mut self,
+        path: String,
+        disk_mtime: SystemTime,
+        cx: &mut Context<Self>,
+    ) {
         let Some(index) = self.tab_index_for_path(&path) else {
             return;
         };
         self.tabs[index].save_state = SaveState::Conflict;
+        self.tabs[index].conflict_disk_mtime = Some(disk_mtime);
         self.tabs[index].save_generation = self.tabs[index].save_generation.wrapping_add(1);
         cx.notify();
+    }
+
+    // ── Conflict remedies (#433) ──────────────────────────────────────────
+
+    /// Resolve the active tab's conflict by re-reading the file from disk,
+    /// discarding the buffer's unsaved edits (banner action "Reload from
+    /// disk"). Reuses the auto-reload path: the input entity survives
+    /// (`rebuild_input: false`) and the cursor is restored once the fresh
+    /// content lands (#432). The live buffer reverts to disk-backed — the
+    /// discarded edits must not linger as the LSP's source of truth. A no-op
+    /// unless the active tab is in conflict.
+    fn reload_active_from_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.active else {
+            return;
+        };
+        if !matches!(self.tabs[index].save_state, SaveState::Conflict) {
+            return;
+        }
+        let path = self.tabs[index].path.clone();
+        let cursor = self.tabs[index].input.read(cx).cursor_position();
+        self.close_live_buffer(index);
+        self.arm_loading(index, false, window, cx);
+        self.tabs[index].pending_restore = Some(cursor);
+        if let Err(e) = self.open_file_tx.try_send(path.clone()) {
+            tracing::debug!(error = %e, %path, "failed to enqueue conflict-reload open");
+        }
+    }
+
+    /// Resolve the active tab's conflict by force-saving the buffer over the
+    /// on-disk version (banner action "Keep mine"). Rebases the tab's base
+    /// `mtime` onto the on-disk `mtime` observed when the conflict surfaced,
+    /// so the daemon's stale-base check passes — an explicit user decision,
+    /// never a silent clobber: if the file changed on disk *again* since the
+    /// conflict was recorded, the daemon still refuses and the conflict
+    /// re-surfaces with the fresh `disk_mtime`. A no-op unless the active
+    /// tab is in conflict.
+    fn keep_mine_active(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.active else {
+            return;
+        };
+        if !matches!(self.tabs[index].save_state, SaveState::Conflict) {
+            return;
+        }
+        if let Some(disk_mtime) = self.tabs[index].conflict_disk_mtime.take() {
+            self.tabs[index].base_mtime = Some(disk_mtime);
+        }
+        self.save(cx);
     }
 
     // ── Concurrent external change ────────────────────────────────────────
@@ -1018,6 +1087,7 @@ impl EditorView {
             }
             ExternalChange::Conflict => {
                 self.tabs[index].save_state = SaveState::Conflict;
+                self.tabs[index].conflict_disk_mtime = Some(snapshot_mtime);
                 cx.notify();
             }
         }
@@ -1633,18 +1703,15 @@ impl Render for EditorView {
                 .into_any_element();
         }
 
-        // One-line save-outcome banner.
+        // One-line save-outcome banner. The conflict case renders its own
+        // banner below with working remedies (#433) instead of a plain
+        // message.
         let banner: Option<(String, gpui::Hsla)> = match &tab.save_state {
-            SaveState::Idle => None,
+            SaveState::Idle | SaveState::Conflict => None,
             SaveState::Saving => Some(("Saving\u{2026}".to_owned(), cx.theme().muted_foreground)),
-            SaveState::Conflict => Some((
-                "Changed on disk since you opened it \u{2014} re-open to reload, \
-                 or save again to keep your version"
-                    .to_owned(),
-                cx.theme().danger,
-            )),
             SaveState::Failed => Some(("Save failed".to_owned(), cx.theme().danger)),
         };
+        let has_conflict = matches!(tab.save_state, SaveState::Conflict);
 
         // Inline jump-list for multi-target definition responses and find-references
         // results (#196, #198). The header label differs by kind; entries are
@@ -1873,6 +1940,58 @@ impl Render for EditorView {
                     .text_color(color)
                     .bg(cx.theme().muted)
                     .child(text),
+            );
+        }
+
+        // Conflict banner with working remedies (#433): "Reload from disk"
+        // replaces the buffer with the on-disk version; "Keep mine"
+        // force-saves the buffer over it (rebased onto the observed disk
+        // `mtime`).
+        if has_conflict {
+            let border = cx.theme().border;
+            let action_fg = cx.theme().foreground;
+            let action_hover_bg = cx.theme().list_hover;
+            let action = move |id: &'static str, label: &'static str| {
+                div()
+                    .id(id)
+                    .flex_shrink_0()
+                    .px(px(6.0))
+                    .border_1()
+                    .border_color(border)
+                    .rounded(px(3.0))
+                    .text_color(action_fg)
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(action_hover_bg))
+                    .child(label)
+            };
+            root = root.child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .text_xs()
+                    .bg(cx.theme().muted)
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(cx.theme().danger)
+                            .child("Changed on disk since you opened it"),
+                    )
+                    .child(action("conflict-reload", "Reload from disk").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _event: &MouseDownEvent, window, cx| {
+                            this.reload_active_from_disk(window, cx);
+                        }),
+                    ))
+                    .child(action("conflict-keep-mine", "Keep mine").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
+                            this.keep_mine_active(cx);
+                        }),
+                    )),
             );
         }
 
@@ -2401,23 +2520,23 @@ mod tests {
 
     // --- workspace wiring fan-out: mtime/diagnostics route by path (#353) ---
 
-    /// Build an `EditorView` inside a fresh window for the wiring-fan-out
-    /// tests below, returning the entity and the window handle so the caller
-    /// can drive further `editor.update` calls that need `window`. Channel
-    /// receivers the caller does not need are dropped inline at each call
-    /// site (mirroring `test_channels`, but exposing `open_file_rx` too,
-    /// which the mtime-reload tests below need to assert on).
+    /// Build an `EditorView` inside a fresh window, returning the entity, the
+    /// window handle (so the caller can drive further `editor.update` calls
+    /// that need `window`), and the receiving ends of the open, save, and
+    /// live-buffer channels for the tests that assert on outgoing messages.
     #[allow(clippy::type_complexity)] // test-only channel bundle
-    fn build_test_editor(
+    fn build_test_editor_full(
         cx: &mut TestAppContext,
     ) -> (
         Entity<EditorView>,
         gpui::WindowHandle<gpui_component::Root>,
         flume::Receiver<String>,
+        flume::Receiver<ClientMessage>,
+        flume::Receiver<ClientMessage>,
     ) {
         let (open_file_tx, open_file_rx) = flume::unbounded();
-        let (save_file_tx, _save_file_rx) = flume::unbounded();
-        let (buffer_change_tx, _buffer_change_rx) = flume::unbounded();
+        let (save_file_tx, save_file_rx) = flume::unbounded();
+        let (buffer_change_tx, buffer_change_rx) = flume::unbounded();
         let (nav_tx, _nav_rx) = flume::unbounded();
 
         let mut editor: Option<Entity<EditorView>> = None;
@@ -2439,6 +2558,21 @@ mod tests {
             .unwrap()
         });
         let editor = editor.expect("editor constructed inside the window callback");
+        (editor, window, open_file_rx, save_file_rx, buffer_change_rx)
+    }
+
+    /// [`build_test_editor_full`] for the tests that only assert on the open
+    /// channel — the save and live-buffer receivers are dropped.
+    #[allow(clippy::type_complexity)] // test-only channel bundle
+    fn build_test_editor(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<EditorView>,
+        gpui::WindowHandle<gpui_component::Root>,
+        flume::Receiver<String>,
+    ) {
+        let (editor, window, open_file_rx, _save_file_rx, _buffer_change_rx) =
+            build_test_editor_full(cx);
         (editor, window, open_file_rx)
     }
 
@@ -2765,6 +2899,196 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    // --- conflict banner remedies (#433) ---
+
+    /// Acceptance (#433): "Reload from disk" on a dirty buffer in conflict
+    /// re-reads the file — the buffer's edits are discarded, the conflict
+    /// clears, and the daemon's LSP source of truth reverts to disk-backed.
+    #[gpui::test]
+    fn test_reload_from_disk_on_conflict_replaces_content_and_clears_conflict(
+        cx: &mut TestAppContext,
+    ) {
+        let (editor, window, open_file_rx, _save_file_rx, buffer_change_rx) =
+            build_test_editor_full(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    editor.active = Some(a);
+                    editor.load("a.rs".into(), "disk v1".into(), at(100), window, cx);
+                    editor.tabs[a].dirty = true; // unsaved edits
+
+                    editor.note_external_change_for_path("a.rs", at(200), window, cx);
+                    assert!(matches!(editor.tabs[a].save_state, SaveState::Conflict));
+
+                    editor.reload_active_from_disk(window, cx);
+                    assert!(
+                        matches!(editor.tabs[a].load_state, TabLoadState::Loading),
+                        "the reload must re-arm the load"
+                    );
+
+                    editor.load("a.rs".into(), "disk v2".into(), at(200), window, cx);
+                    assert!(
+                        matches!(editor.tabs[a].save_state, SaveState::Idle),
+                        "the conflict must clear on reload"
+                    );
+                    assert!(!editor.tabs[a].dirty, "the reloaded buffer starts clean");
+                    assert!(editor.tabs[a].conflict_disk_mtime.is_none());
+                    assert_eq!(
+                        editor.tabs[a].input.read(cx).value().to_string(),
+                        "disk v2",
+                        "the buffer must hold the on-disk content"
+                    );
+                });
+            })
+            .unwrap();
+
+        assert_eq!(
+            open_file_rx
+                .try_recv()
+                .expect("the reload must re-issue an OpenFile"),
+            "a.rs"
+        );
+        match buffer_change_rx
+            .try_recv()
+            .expect("the reload must revert the live buffer to disk-backed")
+        {
+            ClientMessage::BufferClosed { path } => assert_eq!(path, "a.rs"),
+            other => panic!("expected BufferClosed for a.rs, got {other:?}"),
+        }
+    }
+
+    /// Acceptance (#433): "Keep mine" on a dirty buffer in conflict
+    /// force-saves the buffer rebased onto the on-disk `mtime` observed when
+    /// the conflict surfaced, so the daemon's stale-base check passes; the
+    /// `SaveResult` reply then clears the conflict and commits the new base.
+    #[gpui::test]
+    fn test_keep_mine_on_conflict_saves_with_observed_disk_mtime_and_clears_conflict(
+        cx: &mut TestAppContext,
+    ) {
+        let (editor, window, _open_file_rx, save_file_rx, _buffer_change_rx) =
+            build_test_editor_full(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    editor.active = Some(a);
+                    editor.load("a.rs".into(), "mine".into(), at(100), window, cx);
+                    editor.tabs[a].dirty = true;
+
+                    editor.note_external_change_for_path("a.rs", at(200), window, cx);
+                    assert!(matches!(editor.tabs[a].save_state, SaveState::Conflict));
+                    assert_eq!(editor.tabs[a].conflict_disk_mtime, Some(at(200)));
+
+                    editor.keep_mine_active(cx);
+                    assert!(
+                        matches!(editor.tabs[a].save_state, SaveState::Saving),
+                        "keep-mine must dispatch a save"
+                    );
+
+                    // The daemon accepts (base matches disk) and replies.
+                    editor.apply_save_result("a.rs".into(), at(300), cx);
+                    assert!(
+                        matches!(editor.tabs[a].save_state, SaveState::Idle),
+                        "the conflict is resolved once the forced save lands"
+                    );
+                    assert!(!editor.tabs[a].dirty);
+                    assert_eq!(editor.tabs[a].base_mtime, Some(at(300)));
+                    assert!(editor.tabs[a].conflict_disk_mtime.is_none());
+                });
+            })
+            .unwrap();
+
+        match save_file_rx
+            .try_recv()
+            .expect("keep-mine must dispatch a SaveFile")
+        {
+            ClientMessage::SaveFile {
+                path,
+                content,
+                base_mtime,
+            } => {
+                assert_eq!(path, "a.rs");
+                assert_eq!(content, "mine");
+                assert_eq!(
+                    base_mtime,
+                    at(200),
+                    "the forced save must be rebased onto the observed disk mtime"
+                );
+            }
+            other => panic!("expected SaveFile, got {other:?}"),
+        }
+    }
+
+    /// A daemon `SaveConflict` reply records its `disk_mtime` so "Keep mine"
+    /// can rebase onto it — including the re-conflict round when the file
+    /// changed on disk *again* between the conflict and the click.
+    #[gpui::test]
+    fn test_apply_save_conflict_records_disk_mtime_for_keep_mine(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    editor.active = Some(a);
+                    editor.load("a.rs".into(), "mine".into(), at(100), window, cx);
+                    editor.tabs[a].dirty = true;
+
+                    editor.apply_save_conflict("a.rs".into(), at(250), cx);
+
+                    assert!(matches!(editor.tabs[a].save_state, SaveState::Conflict));
+                    assert_eq!(
+                        editor.tabs[a].conflict_disk_mtime,
+                        Some(at(250)),
+                        "the reply's disk mtime must be recorded for keep-mine"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// The remedies only act on a tab that is actually in conflict — outside
+    /// one they are no-ops (no spurious reload, no spurious save).
+    #[gpui::test]
+    fn test_conflict_remedies_without_conflict_are_no_ops(cx: &mut TestAppContext) {
+        let (editor, window, open_file_rx, save_file_rx, _buffer_change_rx) =
+            build_test_editor_full(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    editor.active = Some(a);
+                    editor.load("a.rs".into(), "clean".into(), at(100), window, cx);
+
+                    editor.reload_active_from_disk(window, cx);
+                    assert!(
+                        matches!(editor.tabs[a].load_state, TabLoadState::Loaded),
+                        "no conflict — reload must not re-arm the load"
+                    );
+
+                    editor.keep_mine_active(cx);
+                    assert!(
+                        matches!(editor.tabs[a].save_state, SaveState::Idle),
+                        "no conflict — keep-mine must not dispatch a save"
+                    );
+                });
+            })
+            .unwrap();
+
+        assert!(
+            open_file_rx.try_recv().is_err(),
+            "no OpenFile may be issued outside a conflict"
+        );
+        assert!(
+            save_file_rx.try_recv().is_err(),
+            "no SaveFile may be issued outside a conflict"
+        );
     }
 
     /// Acceptance (#353): diagnostics for a path route to the tab holding it,
