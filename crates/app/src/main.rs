@@ -260,12 +260,14 @@ fn main() {
                 rift_app::editor::GoBack,
                 Some(rift_app::editor::EDITOR_KEY_CONTEXT),
             ),
-            // Hover popover (#197): Shift+K mirrors VS Code / Neovim (`K` in Normal mode)
-            // muscle memory. Fires `ShowHover` at the cursor position; the result
-            // renders as a markdown popover anchored to the bottom of the editor area.
+            // Hover popover (#197, #435): Ctrl+K Ctrl+I mirrors VS Code muscle
+            // memory. A plain Shift+K binding would shadow typing a capital 'K'
+            // into the buffer, so hover uses a non-typing chord instead. Fires
+            // `ShowHover` at the cursor position; the result renders as a
+            // markdown popover anchored to the bottom of the editor area.
             // Mouse-rest (500 ms debounce) also triggers hover automatically.
             KeyBinding::new(
-                "shift-k",
+                "ctrl-k ctrl-i",
                 rift_app::editor::ShowHover,
                 Some(rift_app::editor::EDITOR_KEY_CONTEXT),
             ),
@@ -1233,7 +1235,7 @@ fn spawn_buffer_change_bridge(
 
 /// Forward the editor's navigation requests onto the protocol (#196, #197, #198):
 /// `DefinitionRequest` (ctrl+click / context-menu / F12), `HoverRequest`
-/// (Shift+K / context-menu "Show Hover" / mouse-rest debounce), and
+/// (Ctrl+K Ctrl+I / context-menu "Show Hover" / mouse-rest debounce), and
 /// `ReferencesRequest` (Shift+F12 / context-menu "Find References") are sent
 /// verbatim; the daemon answers with `DefinitionResponse` / `HoverResponse` /
 /// `ReferencesResponse` that return through [`consume_daemon_messages`] on

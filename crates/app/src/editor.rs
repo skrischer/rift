@@ -120,7 +120,8 @@
 //! # Hover popover (#197)
 //!
 //! Hover is triggered by:
-//! - **`Shift+K`** (scoped to the `Editor` key context, bound in `main.rs`):
+//! - **`Ctrl+K Ctrl+I`** (scoped to the `Editor` key context, bound in
+//!   `main.rs`; a non-typing chord so it cannot shadow typed input, #435):
 //!   dispatches [`ClientMessage::HoverRequest`] at the cursor position.
 //! - **Mouse-rest**: a [`MouseMoveEvent`] on the outer div arms a 500 ms
 //!   debounce timer. When the timer fires, the hover request is dispatched at
@@ -197,7 +198,7 @@ pub struct GoToDefinition;
 pub struct GoBack;
 
 /// Show the LSP hover popover at the current cursor position. Dispatched from
-/// the context-menu entry ("Show Hover") and from the `Shift+K` keybind
+/// the context-menu entry ("Show Hover") and from the `Ctrl+K Ctrl+I` keybind
 /// (bound in `main.rs`, scoped to the editor key context). Also dispatched
 /// internally after the mouse-rest debounce timer fires.
 #[derive(Clone, PartialEq, gpui::Action)]
@@ -1873,7 +1874,7 @@ impl Render for EditorView {
         //     Linux/Windows, Cmd on macOS — `gpui::Modifiers::secondary()`).
         //   - Context menu: right-click → "Go to Definition" → `GoToDefinition`
         //     action, handled by `on_action` below.
-        //   - Shift+K (keybind) or context menu "Show Hover": `ShowHover`
+        //   - Ctrl+K Ctrl+I (keybind) or context menu "Show Hover": `ShowHover`
         //     action at the cursor position.
         //   - Mouse-rest: `on_mouse_move` arms a 500 ms debounce; when it
         //     fires `dispatch_hover_request` is called at cursor position.
