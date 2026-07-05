@@ -21,7 +21,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::Context;
-use rift_protocol::{ClientMessage, DaemonMessage, PaneLayout, WindowLayout};
+use rift_protocol::{ClientMessage, DaemonMessage, PaneLayout, SessionEntry, WindowLayout};
 use rift_tmux_core::{Client, CommandId, Event};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, ChildStdout};
@@ -54,6 +54,17 @@ const RESUME_POLL: Duration = Duration::from_millis(100);
 /// [`parse_layout_line`]). The `#{...}` formats are single-quoted because the
 /// control parser treats an unquoted `#` as a comment (tmux-reference pitfall 9).
 const LAYOUT_QUERY: &str = "list-panes -s -F '#{window_id}\t#{window_active}\t#{pane_id}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_current_command}\t#{pane_current_path}\t#{window_name}'";
+
+/// One query that rebuilds the whole session list (`docs/spec-session-switch.md`),
+/// one line per session on the server. Same conventions as [`LAYOUT_QUERY`]:
+/// tab-separated fields with the free-form one (`session_name`) LAST, so a name
+/// containing spaces or tabs stays intact in the final field (see
+/// [`parse_session_line`]); the `#{...}` formats are single-quoted because the
+/// control parser treats an unquoted `#` as a comment (tmux-reference pitfall 9).
+/// `#{session_id}` (`$<n>`) is the rename-stable key; `#{session_attached}` is
+/// the attached-client count, folded to a bool at the parse.
+const SESSION_LIST_QUERY: &str =
+    "list-sessions -F '#{session_id}\t#{session_windows}\t#{session_attached}\t#{session_name}'";
 
 /// Signals that the connection's outbound channel closed — the client is gone.
 struct Closed;
@@ -243,6 +254,13 @@ struct Attach {
     /// A structural change arrived while a layout query was in flight; re-query
     /// once it returns so a burst of changes collapses to bounded queries.
     layout_dirty: bool,
+    /// The in-flight session-list query (at most one), correlated by
+    /// [`CommandId`] — the same coalescing discipline as `layout_query`.
+    session_list_query: Option<CommandId>,
+    /// Session churn arrived while a session-list query was in flight;
+    /// re-query once it returns so a burst (`%sessions-changed` storms)
+    /// collapses to bounded queries.
+    session_list_dirty: bool,
     /// Panes tmux has paused (flow control); resumed once the outbound channel
     /// has room.
     paused: HashSet<u32>,
@@ -327,6 +345,8 @@ impl Attach {
             snapshot_sent: false,
             layout_query: None,
             layout_dirty: false,
+            session_list_query: None,
+            session_list_dirty: false,
             paused: HashSet::new(),
             captures: HashMap::new(),
             key_table_query: None,
@@ -405,6 +425,9 @@ impl Attach {
             ClientMessage::QueryStatusLine => {
                 self.request_status_line().await?;
             }
+            ClientMessage::QuerySessionList => {
+                self.request_session_list().await;
+            }
             // Empty input is a no-op; Attach is handled by the task; Hello never
             // reaches the terminal task. The buffer-channel requests
             // (`OpenFile`/`SaveFile`) and the live-buffer feed (`BufferChanged`/
@@ -468,15 +491,29 @@ impl Attach {
                     // Sent on attach with this client's own session id and
                     // name; remember the id so foreign `%session-renamed`
                     // broadcasts can be told apart from this attach's own.
+                    // Also sent when this client is switched to another
+                    // session (an external `switch-client`): then — mirroring
+                    // the SessionRenamed arm — re-query the layout so the
+                    // session indicator AND the terminal content refresh now,
+                    // not at the next unrelated structural change. The
+                    // attach-time delivery (no previous id) adopts without
+                    // re-querying: the spawn-time snapshot query is already
+                    // in flight.
+                    let switched = self.session_id.is_some_and(|id| id != session);
                     self.session_id = Some(session);
                     self.session = name;
+                    if switched {
+                        self.request_layout().await;
+                    }
                 }
                 Event::SessionRenamed { session, name } => {
                     // tmux broadcasts %session-renamed for every session on
-                    // the server, not just the attached one. Only when the id
-                    // matches this attach does the layout echo change: adopt
-                    // the new name and re-query so the client sees it now, not
-                    // at the next unrelated structural change.
+                    // the server, not just the attached one — so ANY rename
+                    // changes the session list; refresh it. Only when the id
+                    // matches this attach does the layout echo change too:
+                    // adopt the new name and re-query so the client sees it
+                    // now, not at the next unrelated structural change.
+                    self.request_session_list().await;
                     if self.session_id == Some(session) {
                         self.session = name;
                         self.request_layout().await;
@@ -504,6 +541,20 @@ impl Attach {
                         if self.layout_dirty {
                             self.layout_dirty = false;
                             self.request_layout().await;
+                        }
+                    } else if id.is_some() && id == self.session_list_query {
+                        self.session_list_query = None;
+                        if !error {
+                            outbound
+                                .send(DaemonMessage::SessionListReply {
+                                    sessions: parse_session_list(&output),
+                                })
+                                .await
+                                .map_err(|_| Closed)?;
+                        }
+                        if self.session_list_dirty {
+                            self.session_list_dirty = false;
+                            self.request_session_list().await;
                         }
                     } else if let Some(pane) = id.and_then(|id| self.captures.remove(&id)) {
                         // A `capture-pane` reply: forward the captured bytes (empty
@@ -545,13 +596,15 @@ impl Attach {
                         self.paused.remove(&pane);
                     }
                 }
-                // Session-list churn (%sessions-changed / %client-session-changed)
-                // is consumed by this phase's daemon session-list step
-                // (docs/spec-session-switch.md); inert here until that lands.
-                Event::Other { .. }
-                | Event::PaneModeChanged { .. }
-                | Event::SessionsChanged
-                | Event::ClientSessionChanged { .. } => {}
+                // Session-list churn: a session was created or destroyed
+                // (%sessions-changed) or another client switched sessions
+                // (%client-session-changed, changing attached flags) — re-query
+                // the list, coalesced, and push the fresh reply unprompted
+                // (docs/spec-session-switch.md).
+                Event::SessionsChanged | Event::ClientSessionChanged { .. } => {
+                    self.request_session_list().await;
+                }
+                Event::Other { .. } | Event::PaneModeChanged { .. } => {}
             }
         }
         Ok(Flow::Continue)
@@ -739,6 +792,20 @@ impl Attach {
         }
     }
 
+    /// Issue a session-list query, coalescing so at most one is in flight —
+    /// the same trailing-edge re-issue discipline as [`Attach::request_layout`],
+    /// so a burst of session churn collapses to bounded queries.
+    async fn request_session_list(&mut self) {
+        if self.session_list_query.is_some() {
+            self.session_list_dirty = true;
+            return;
+        }
+        match self.send_command(SESSION_LIST_QUERY).await {
+            Ok(id) => self.session_list_query = Some(id),
+            Err(err) => warn!(%err, "session-list query failed"),
+        }
+    }
+
     /// Resume up to `limit` paused panes (tmux flow control). Bounding to the
     /// outbound channel's free slots avoids a thundering herd: with many panes
     /// paused and little room, only as many as can be absorbed un-pause now; the
@@ -885,6 +952,33 @@ fn parse_layout_line(line: &str) -> Option<ParsedPaneLine> {
     })
 }
 
+/// Parse [`SESSION_LIST_QUERY`] reply lines into session entries, in server
+/// order, skipping malformed lines (same tolerance as [`parse_layout`]).
+fn parse_session_list(lines: &[String]) -> Vec<SessionEntry> {
+    lines
+        .iter()
+        .filter_map(|line| parse_session_line(line))
+        .collect()
+}
+
+/// Parse one tab-separated `$<id> <windows> <attached> <name>` line (see
+/// [`SESSION_LIST_QUERY`] for why tabs); `splitn(4, '\t')` keeps a session
+/// name containing tabs intact in the final field. `attached` is tmux's
+/// attached-client COUNT, folded to a bool.
+fn parse_session_line(line: &str) -> Option<SessionEntry> {
+    let mut fields = line.splitn(4, '\t');
+    let id = fields.next()?.strip_prefix('$')?.parse().ok()?;
+    let windows = fields.next()?.parse().ok()?;
+    let attached = fields.next()?.parse::<u32>().ok()? > 0;
+    let name = fields.next()?.to_owned();
+    Some(SessionEntry {
+        id,
+        name,
+        windows,
+        attached,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1001,6 +1095,69 @@ mod tests {
         let windows = parse_layout(&lines);
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].panes.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_session_line_full_fields() {
+        let parsed = parse_session_line("$3\t2\t1\trift").expect("parse");
+        assert_eq!(
+            parsed,
+            SessionEntry {
+                id: 3,
+                name: "rift".to_owned(),
+                windows: 2,
+                attached: true,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_session_line_name_with_spaces_and_tabs_preserved() {
+        // The name is the LAST field precisely so spaces and even tabs inside
+        // it survive the split (the spec's malformed-name risk).
+        let parsed = parse_session_line("$0\t1\t0\tmy project\twith tab").expect("parse");
+        assert_eq!(parsed.name, "my project\twith tab");
+        assert!(!parsed.attached);
+    }
+
+    #[test]
+    fn test_parse_session_line_attached_count_folds_to_bool() {
+        // `#{session_attached}` is a client COUNT: several attached clients
+        // still mean "attached", zero means not.
+        assert!(
+            parse_session_line("$0\t1\t2\trift")
+                .expect("parse")
+                .attached
+        );
+        assert!(
+            !parse_session_line("$0\t1\t0\trift")
+                .expect("parse")
+                .attached
+        );
+    }
+
+    #[test]
+    fn test_parse_session_line_malformed_returns_none() {
+        assert_eq!(parse_session_line("0\t1\t1\trift").map(|_| ()), None); // id no $
+        assert_eq!(parse_session_line("$0\t1\t1").map(|_| ()), None); // too few fields
+        assert_eq!(parse_session_line("$0\tmany\t1\trift").map(|_| ()), None); // windows not numeric
+        assert_eq!(parse_session_line("$0\t1\tyes\trift").map(|_| ()), None); // attached not numeric
+        assert_eq!(parse_session_line("$0 1 1 rift").map(|_| ()), None); // space-separated
+        assert_eq!(parse_session_line("").map(|_| ()), None);
+    }
+
+    #[test]
+    fn test_parse_session_list_skips_malformed_lines() {
+        let lines = vec![
+            "garbage".to_owned(),
+            "$0\t1\t1\trift".to_owned(),
+            "$5\t3\t0\tscratch".to_owned(),
+        ];
+        let sessions = parse_session_list(&lines);
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].id, 0);
+        assert_eq!(sessions[1].name, "scratch");
+        assert!(!sessions[1].attached);
     }
 
     // --- real-tmux integration (#204) ---
@@ -2009,6 +2166,219 @@ mod tests {
             session.as_deref(),
             Some("rift"),
             "renaming another session must not change this attach's session echo"
+        );
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    // --- session list + external switch-client (docs/spec-session-switch.md) ---
+
+    #[tokio::test]
+    async fn test_query_session_list_returns_attached_session() {
+        let server = TmuxServer::new("sesslist-query");
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+        recv_until(&mut out_rx, 10, |m| {
+            matches!(m, DaemonMessage::LayoutSnapshot { .. }).then_some(())
+        })
+        .await
+        .expect("snapshot");
+
+        in_tx
+            .send(ClientMessage::QuerySessionList)
+            .await
+            .expect("query session list");
+        let sessions = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::SessionListReply { sessions } => Some(sessions.clone()),
+            _ => None,
+        })
+        .await
+        .expect("session-list reply");
+        let rift = sessions
+            .iter()
+            .find(|s| s.name == "rift")
+            .expect("the attached session must be listed");
+        assert!(rift.attached, "this attach counts as an attached client");
+        assert!(rift.windows >= 1, "a live session has at least one window");
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_session_create_and_kill_push_session_list_unprompted() {
+        // Session churn (%sessions-changed) must push a fresh SessionListReply
+        // with NO client request — the live-list contract.
+        let server = TmuxServer::new("sesslist-churn");
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+        recv_until(&mut out_rx, 10, |m| {
+            matches!(m, DaemonMessage::LayoutSnapshot { .. }).then_some(())
+        })
+        .await
+        .expect("snapshot");
+
+        in_tx
+            .send(ClientMessage::TmuxCommand {
+                cmd: "new-session -d -s rift465other".to_owned(),
+            })
+            .await
+            .expect("new-session");
+        let created = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::SessionListReply { sessions } => sessions
+                .iter()
+                .any(|s| s.name == "rift465other")
+                .then_some(()),
+            _ => None,
+        })
+        .await;
+        assert!(
+            created.is_some(),
+            "creating a session must push a SessionListReply listing it, unprompted"
+        );
+
+        in_tx
+            .send(ClientMessage::TmuxCommand {
+                cmd: "kill-session -t rift465other".to_owned(),
+            })
+            .await
+            .expect("kill-session");
+        let dropped = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::SessionListReply { sessions } => sessions
+                .iter()
+                .all(|s| s.name != "rift465other")
+                .then_some(()),
+            _ => None,
+        })
+        .await;
+        assert!(
+            dropped.is_some(),
+            "killing a session must push a SessionListReply without it, unprompted"
+        );
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_session_rename_pushes_session_list_unprompted() {
+        // %session-renamed is broadcast for ANY session on the server; the
+        // list must refresh even when the renamed session is not this attach's.
+        let server = TmuxServer::new("sesslist-rename");
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+        recv_until(&mut out_rx, 10, |m| {
+            matches!(m, DaemonMessage::LayoutSnapshot { .. }).then_some(())
+        })
+        .await
+        .expect("snapshot");
+
+        in_tx
+            .send(ClientMessage::TmuxCommand {
+                cmd: "new-session -d -s rift465ren".to_owned(),
+            })
+            .await
+            .expect("new-session");
+        recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::SessionListReply { sessions } => sessions
+                .iter()
+                .any(|s| s.name == "rift465ren")
+                .then_some(()),
+            _ => None,
+        })
+        .await
+        .expect("create push");
+
+        in_tx
+            .send(ClientMessage::TmuxCommand {
+                cmd: "rename-session -t rift465ren rift465renamed".to_owned(),
+            })
+            .await
+            .expect("rename-session");
+        let renamed = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::SessionListReply { sessions } => {
+                (sessions.iter().any(|s| s.name == "rift465renamed")
+                    && sessions.iter().all(|s| s.name != "rift465ren"))
+                .then_some(())
+            }
+            _ => None,
+        })
+        .await;
+        assert!(
+            renamed.is_some(),
+            "renaming a foreign session must push a SessionListReply with the new name, unprompted"
+        );
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_external_switch_client_refreshes_layout() {
+        // An external `switch-client` (no ClientMessage::Attach involved) sends
+        // only %session-changed — the daemon must re-query so both the session
+        // echo and the terminal content refresh immediately instead of staying
+        // stale until the next structural event (spec finding B1).
+        let server = TmuxServer::new("switchclient");
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+        recv_until(&mut out_rx, 10, |m| {
+            matches!(m, DaemonMessage::LayoutSnapshot { .. }).then_some(())
+        })
+        .await
+        .expect("snapshot");
+
+        in_tx
+            .send(ClientMessage::TmuxCommand {
+                cmd: "new-session -d -s rift465b".to_owned(),
+            })
+            .await
+            .expect("new-session");
+        in_tx
+            .send(ClientMessage::TmuxCommand {
+                cmd: "switch-client -t rift465b".to_owned(),
+            })
+            .await
+            .expect("switch-client");
+
+        let windows = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::LayoutUpdate { session, windows } if session == "rift465b" => {
+                Some(windows.clone())
+            }
+            _ => None,
+        })
+        .await;
+        let windows = windows.expect(
+            "an external switch-client must surface a LayoutUpdate carrying the target session",
+        );
+        assert!(
+            !windows.is_empty(),
+            "the refreshed layout must carry the target session's windows"
         );
 
         drop(in_tx);

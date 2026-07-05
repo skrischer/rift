@@ -11,9 +11,9 @@ discriminator. The authoritative definitions live in `crates/protocol/src/lib.rs
 
 ```json
 // client → daemon
-{ "type": "hello",   "version": 2 }
+{ "type": "hello",   "version": 3 }
 // daemon → client
-{ "type": "welcome", "version": 2 }
+{ "type": "welcome", "version": 3 }
 ```
 
 `version` is the wire `PROTOCOL_VERSION`, independent of the crate semver.
@@ -44,9 +44,11 @@ binary, never by tolerating it (`docs/spec-connection-robustness.md`).
   closes cleanly without streaming; the client owns the resolution (stop the
   stale daemon via the pidfile, redeploy, respawn, re-handshake).
 
-History: version 2 pins the message set as of the connection-robustness phase
-(fingerprint test introduced); version 1 was the original handshake constant,
-carried but never enforced.
+History: version 3 adds the session-list pair `query_session_list` /
+`session_list_reply` (`docs/spec-session-switch.md`); version 2 pins the
+message set as of the connection-robustness phase (fingerprint test
+introduced); version 1 was the original handshake constant, carried but never
+enforced.
 
 ## Terminal streaming
 
@@ -64,6 +66,7 @@ streams pane bytes and layout state back.
 { "type": "capture_pane", "pane_id": 3, "start": "-", "end": "-128", "join": false }
 { "type": "query_key_table" }
 { "type": "query_status_line" }
+{ "type": "query_session_list" }
 ```
 
 - `attach` carries the **session name end-to-end**, so the `RIFT_SESSION` knob
@@ -100,6 +103,16 @@ streams pane bytes and layout state back.
   cadence, so the client only sends `query_status_line` explicitly: on a
   user-triggered refresh, or after dispatching a bound command that sets a
   mirrored `status-*` option.
+- `query_session_list` asks the daemon to (re-)run `list-sessions` for the
+  session switcher (`docs/spec-session-switch.md`). The daemon answers with
+  exactly one `session_list_reply` — a **request/response** exchange, same
+  sibling convention as `query_key_table`. The daemon also re-issues the
+  query on its own — coalesced like the layout re-query — whenever tmux
+  signals session churn (`%sessions-changed`, `%session-renamed`,
+  `%client-session-changed`) and pushes the fresh reply unprompted, so the
+  client's list stays live without polling; the client sends
+  `query_session_list` explicitly only for an on-demand refresh (e.g.
+  opening the switcher).
 
 ### Daemon → client
 
@@ -111,6 +124,7 @@ streams pane bytes and layout state back.
 { "type": "terminal_exit",   "session": "rift", "reason": "server exited" }
 { "type": "key_table_reply", "list_keys": "bind-key -T prefix c new-window\n...", "options": "prefix C-b\nrepeat-time 500\n..." }
 { "type": "status_line_reply", "options": "status-interval 15\nstatus-left-length 10\n...", "status_left": "no-myhost-80-", "status_right": "#[fg=green]01:49#[default]" }
+{ "type": "session_list_reply", "sessions": [{ "id": 0, "name": "rift", "windows": 3, "attached": true }] }
 ```
 
 ```jsonc
@@ -159,6 +173,17 @@ streams pane bytes and layout state back.
   never re-implemented client-side, and still carrying their `#[...]` style
   runs unparsed. None of this is interpreted by the daemon — it is tmux's
   own config, not pane content.
+- `session_list_reply` is the reply to `query_session_list` (and the
+  unprompted churn-driven re-queries): every tmux session on the server,
+  parsed daemon-side from a tab-separated `list-sessions` format with the
+  session name as the LAST field (the layout-query convention, so names with
+  spaces or tabs survive). Per session: `id` is tmux's `$<n>` session id (the
+  rename-stable key), `name` the current name, `windows` the window count,
+  and `attached` whether at least one client is attached (tmux's
+  attached-client count folded to a bool). The client replaces its whole
+  session list on every arrival (replace semantics, like `layout_update`).
+  Which session THIS client is attached to is not carried here — the
+  `session` string on `layout_snapshot`/`layout_update` already owns that.
 
 ### Snapshot ↔ live-stream consistency contract
 
@@ -403,11 +428,13 @@ the fingerprint (see Versioning policy above); the fingerprint test enforces
 this mechanically.
 
 Most paths are **push-only** (structure and decoration: worktree, git,
-diagnostics — "push is the source of truth"). The six request/response
+diagnostics — "push is the source of truth"). The seven request/response
 exceptions are deliberate and scoped: `capture_pane` / `pane_capture` for
 pre-attach scrollback; `query_key_table` / `key_table_reply` for the tmux
 key-table mirror; `query_status_line` / `status_line_reply` for the tmux
-status-line mirror (sibling pattern to the key-table one); the **buffer
+status-line mirror (sibling pattern to the key-table one);
+`query_session_list` / `session_list_reply` for the session switcher (same
+sibling pattern, plus unprompted churn-driven pushes); the **buffer
 channel** (`open_file` → `file_content`, `save_file` → `save_result` /
 `save_conflict`) for file content; the **navigation channel**
 (`hover_request` → `hover_response`, `definition_request` →
