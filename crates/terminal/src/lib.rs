@@ -72,6 +72,36 @@ pub struct KeyTableQueryResult {
     pub options: String,
 }
 
+/// One tmux session for the session-switcher picker, as carried by
+/// `rift_protocol::DaemonMessage::SessionListReply` and mapped at the app seam
+/// (`docs/spec-session-switch.md`). Every arrival replaces the whole list
+/// (replace semantics, like the layout stream); which session THIS client is
+/// attached to is not carried here — the layout snapshot's `session` string
+/// owns that (the truthful-indicator contract).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionListItem {
+    pub name: String,
+    /// The session's window count (`#{session_windows}`).
+    pub windows: u32,
+    /// Whether at least one client is attached to this session.
+    pub attached: bool,
+}
+
+/// A cockpit switch emitted by the session switcher: re-attach this client to
+/// `session` (the daemon's attach-or-create `new-session -A -s <name>`, so a
+/// fresh name creates the session). `size` is the client's current grid,
+/// re-asserted by the bridge task strictly after the `Attach` so the fresh
+/// control child reflows to the live viewport instead of the tmux default —
+/// the render side cannot re-send it itself, its resize channel only fires on
+/// a size *change*. Inert on the legacy tmux path (`RIFT_TERMINAL_LEGACY`):
+/// the receiver drops there, so a switch request goes nowhere (the legacy
+/// path is slated for removal, #285).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionSwitchRequest {
+    pub session: String,
+    pub size: TermSize,
+}
+
 /// A tmux format-subscription update (`%subscription-changed`). `name` is the
 /// subscription registered via [`termy_terminal_ui::TmuxClient::subscribe`];
 /// `pane` is `-` for window- or session-scoped subscriptions.

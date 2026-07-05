@@ -2,8 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::*;
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::popover::Popover;
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::{h_flex, v_flex, ActiveTheme, Sizable};
 use termy_terminal_ui::TmuxSnapshot;
@@ -14,7 +17,7 @@ use crate::layout::{self, LayoutNode};
 use crate::pane_view::{measure_cell_size, statusbar_height, PaneActivity, PaneView};
 use crate::{
     CaptureRequest, CaptureResult, ConnectionStatus, KeyTableQueryResult, PaneInput, PaneOutput,
-    SelectWindow, SubscriptionUpdate, TermSize,
+    SelectWindow, SessionListItem, SessionSwitchRequest, SubscriptionUpdate, TermSize,
 };
 
 const DEFAULT_FONT_SIZE: f32 = 14.0;
@@ -33,6 +36,11 @@ const PANE_SIDEBAR_WIDTH: f32 = 160.0;
 /// fallback needs it; OSC-133 and bell transitions stay event-driven (they
 /// re-render via the per-pane observation) (`docs/spec-pane-activity-indicators.md`).
 const ACTIVITY_IDLE_TICK: Duration = Duration::from_millis(1000);
+/// Width of the session-switcher popover content
+/// (`docs/spec-session-switch.md` UI contract).
+const SESSION_SWITCHER_WIDTH: f32 = 260.0;
+/// Height of one session row (and the new-session footer row) in the switcher.
+const SESSION_SWITCHER_ROW_HEIGHT: f32 = 30.0;
 
 pub struct TerminalHandle {
     pub pane_output_tx: flume::Sender<PaneOutput>,
@@ -52,6 +60,22 @@ pub struct TerminalHandle {
     /// The parsed-ready `list-keys`/`show-options` reply for a refresh request
     /// (including the daemon's own unprompted attach-time query).
     pub key_table_result_tx: flume::Sender<KeyTableQueryResult>,
+    /// The host's session list (`docs/spec-session-switch.md`): every
+    /// `SessionListReply` — the reply to an explicit refresh below or the
+    /// daemon's unprompted churn-driven push — replaces the switcher's whole
+    /// list.
+    pub session_list_tx: flume::Sender<Vec<SessionListItem>>,
+    /// An explicit session-list refresh request (opening the switcher) —
+    /// forwarded onto the protocol as `ClientMessage::QuerySessionList`.
+    /// Unused on the legacy tmux path (`RIFT_TERMINAL_LEGACY`): the receiver
+    /// drops there and a request is a harmless no-op, so the switcher is
+    /// inert (the legacy path is slated for removal, #285).
+    pub session_list_request_rx: flume::Receiver<()>,
+    /// A cockpit switch from the session switcher — forwarded onto the
+    /// protocol as `ClientMessage::Attach { session }` followed by a viewport
+    /// re-assert (see [`SessionSwitchRequest`]). Same legacy-path caveat as
+    /// `session_list_request_rx`.
+    pub session_switch_rx: flume::Receiver<SessionSwitchRequest>,
 }
 
 struct PaneEntry {
@@ -81,6 +105,18 @@ struct WindowState {
 /// `rift_window_name` subscription, never an optimistic local mutation.
 struct WindowRename {
     window_id: String,
+    input: Entity<InputState>,
+    _subscription: Subscription,
+}
+
+/// An in-progress new-session prompt in the switcher's footer row. Mirrors
+/// [`WindowRename`]: `input` holds the edit state and `_subscription` keeps the
+/// submit handler alive while the prompt is active. Enter sends a
+/// [`SessionSwitchRequest`] for the typed name (the daemon child command is
+/// attach-or-create, so a fresh name creates the session); the new list and
+/// indicator arrive via the daemon's push and the fresh snapshot, never an
+/// optimistic local mutation.
+struct NewSessionPrompt {
     input: Entity<InputState>,
     _subscription: Subscription,
 }
@@ -231,6 +267,25 @@ pub struct SessionView {
     /// server-side instead, ordered after the mutation on the same seam
     /// (`spawn_command_bridge` in `crates/app`) — not carried on this channel.
     key_table_request_tx: flume::Sender<()>,
+    /// The host's tmux session list (`docs/spec-session-switch.md`), replaced
+    /// wholesale by every `SessionListReply` (explicit refresh or the daemon's
+    /// unprompted churn-driven push). The ACTUAL attached session is NOT read
+    /// from here — `session_name` (fed by the layout stream) owns that.
+    sessions: Vec<SessionListItem>,
+    /// Whether the session-switcher popover (anchored to the statusbar session
+    /// label) is open. Controlled state, so the command palette can open the
+    /// same switcher programmatically.
+    switcher_open: bool,
+    /// The switcher footer's in-progress new-session prompt, when active.
+    new_session_prompt: Option<NewSessionPrompt>,
+    /// Requests an on-demand session-list refresh (forwarded to
+    /// `TerminalHandle`'s `session_list_request_rx`), sent when the switcher
+    /// opens; between opens the daemon's churn-driven pushes keep the list live.
+    session_list_request_tx: flume::Sender<()>,
+    /// Emits a cockpit switch (forwarded to `TerminalHandle`'s
+    /// `session_switch_rx`) when a switcher row or the new-session prompt
+    /// commits.
+    session_switch_tx: flume::Sender<SessionSwitchRequest>,
 }
 
 impl SessionView {
@@ -247,6 +302,9 @@ impl SessionView {
         let (font_zoom_tx, font_zoom_rx) = flume::unbounded::<i32>();
         let (key_table_request_tx, key_table_request_rx) = flume::unbounded::<()>();
         let (key_table_result_tx, key_table_result_rx) = flume::unbounded::<KeyTableQueryResult>();
+        let (session_list_tx, session_list_rx) = flume::unbounded::<Vec<SessionListItem>>();
+        let (session_list_request_tx, session_list_request_rx) = flume::unbounded::<()>();
+        let (session_switch_tx, session_switch_rx) = flume::unbounded::<SessionSwitchRequest>();
 
         {
             cx.spawn(async move |this, cx| loop {
@@ -393,6 +451,27 @@ impl SessionView {
         }
 
         {
+            // Session-list stream (`docs/spec-session-switch.md`): every reply
+            // — the on-demand refresh or the daemon's unprompted churn-driven
+            // push — replaces the switcher's whole list, so create/kill/rename
+            // reflect without any manual refresh.
+            cx.spawn(async move |this, cx| loop {
+                let Ok(sessions) = session_list_rx.recv_async().await else {
+                    break;
+                };
+                let updated = cx.update(|cx| {
+                    this.update(cx, |view, cx| {
+                        view.apply_session_list(sessions, cx);
+                    })
+                });
+                if updated.is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
+
+        {
             // Idle tick: one recurring re-render so the per-window activity
             // aggregate ages the output-recency fallback from busy back to free.
             // OSC-133 and bell transitions stay event-driven — they re-render
@@ -445,6 +524,11 @@ impl SessionView {
             key_table: Arc::new(KeyTable::default()),
             prefix_options: PrefixOptions::default(),
             key_table_request_tx,
+            sessions: Vec::new(),
+            switcher_open: false,
+            new_session_prompt: None,
+            session_list_request_tx,
+            session_switch_tx,
         };
 
         let handle = TerminalHandle {
@@ -459,6 +543,9 @@ impl SessionView {
             connection_status_tx,
             key_table_request_rx,
             key_table_result_tx,
+            session_list_tx,
+            session_list_request_rx,
+            session_switch_rx,
         };
 
         (view, handle)
@@ -527,6 +614,110 @@ impl SessionView {
             });
         }
         cx.notify();
+    }
+
+    /// Replace the switcher's session list wholesale (replace semantics, like
+    /// the layout stream) — every `SessionListReply` arrival lands here.
+    fn apply_session_list(&mut self, sessions: Vec<SessionListItem>, cx: &mut Context<Self>) {
+        if self.sessions != sessions {
+            self.sessions = sessions;
+            cx.notify();
+        }
+    }
+
+    /// Open the session-switcher popover (`docs/spec-session-switch.md`) —
+    /// the target of the command palette's "Switch Session..." entry, routed
+    /// through the workspace. The statusbar label's own click toggles the
+    /// popover directly and syncs back via [`Self::set_switcher_open`].
+    pub fn open_session_switcher(&mut self, cx: &mut Context<Self>) {
+        self.set_switcher_open(true, cx);
+    }
+
+    /// Open the switcher with the new-session prompt already active — the
+    /// command palette's "New Session..." entry, routed through the workspace.
+    pub fn open_new_session_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_session_switcher(cx);
+        self.start_new_session_prompt(window, cx);
+    }
+
+    /// The single open/close choke point: the palette entry, the statusbar
+    /// trigger's own toggle, and the popover's dismiss paths (click-out,
+    /// Escape) all land here. Opening requests an on-demand list refresh
+    /// (`docs/protocol.md`); between opens the daemon's churn-driven pushes
+    /// keep the list live, so no polling anywhere.
+    fn set_switcher_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.switcher_open == open {
+            return;
+        }
+        self.switcher_open = open;
+        if open {
+            let _ = self.session_list_request_tx.try_send(());
+        } else {
+            self.new_session_prompt = None;
+        }
+        cx.notify();
+    }
+
+    /// Switch the cockpit to `session`: emit the switch request (the app seam
+    /// re-sends `Attach { session }` — attach-or-create, so a fresh name
+    /// creates the session) and close the switcher. The indicator and the
+    /// terminal model reset on the fresh `LayoutSnapshot`, never optimistically
+    /// here. Switching to the already-attached session only closes the popover.
+    fn switch_to_session(&mut self, session: &str, cx: &mut Context<Self>) {
+        if session != self.session_name.as_ref() {
+            if let Err(e) = self.session_switch_tx.try_send(SessionSwitchRequest {
+                session: session.to_string(),
+                size: self.client_grid_size,
+            }) {
+                debug!(error = %e, %session, "failed to send session switch request");
+            }
+        }
+        self.set_switcher_open(false, cx);
+        cx.notify();
+    }
+
+    /// Activate the switcher footer's new-session prompt: seed an empty input,
+    /// focus it, and subscribe for submit/blur (mirroring the window-rename
+    /// prompt). Enter with a non-empty name switches to it (attach-or-create);
+    /// blur cancels.
+    fn start_new_session_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("session name"));
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            move |this, input, event: &InputEvent, _window, cx| match event {
+                InputEvent::PressEnter { .. } => {
+                    // A second Enter after the prompt already committed (or was
+                    // cancelled) must not re-submit.
+                    if this.new_session_prompt.take().is_none() {
+                        return;
+                    }
+                    let value = input.read(cx).value();
+                    let trimmed = value.trim().to_string();
+                    if !trimmed.is_empty() {
+                        this.switch_to_session(&trimmed, cx);
+                    }
+                    cx.notify();
+                }
+                InputEvent::Blur => this.cancel_new_session_prompt(cx),
+                _ => {}
+            },
+        );
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.new_session_prompt = Some(NewSessionPrompt {
+            input,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    /// Cancel an in-progress new-session prompt without emitting anything,
+    /// restoring the footer's "+ New session..." row (the popover stays open).
+    fn cancel_new_session_prompt(&mut self, cx: &mut Context<Self>) {
+        if self.new_session_prompt.is_some() {
+            self.new_session_prompt = None;
+            cx.notify();
+        }
     }
 
     fn apply_snapshot(&mut self, snapshot: TmuxSnapshot, cx: &mut Context<Self>) {
@@ -918,6 +1109,156 @@ impl SessionView {
         handle.into_any_element()
     }
 
+    /// The statusbar session label wrapped in the session-switcher popover
+    /// (`docs/spec-session-switch.md`, interim placement until the phase-21
+    /// custom title bar relocates the indicator group). The trigger is the
+    /// session name (ghost button); the popover lists every host session —
+    /// mono name, "N windows" muted caption, a fixed attached-dot lane — with
+    /// the current session marked by a 2px primary left bar on a surface
+    /// background, and a "+ New session..." footer. All colors are theme
+    /// tokens. Controlled open state, so the command palette opens the same
+    /// switcher; the popover's own toggle/dismiss paths sync back through
+    /// [`Self::set_switcher_open`].
+    fn render_session_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity().clone();
+        let current = self.session_name.clone();
+        // The live host list; before the first reply (or on the legacy tmux
+        // path, where the list channel is inert) fall back to the attached
+        // session alone so the picker never renders an empty shell.
+        let mut rows = self.sessions.clone();
+        if rows.is_empty() && !current.is_empty() {
+            rows.push(SessionListItem {
+                name: current.to_string(),
+                windows: self.windows.len() as u32,
+                attached: true,
+            });
+        }
+        let prompt_input = self.new_session_prompt.as_ref().map(|p| p.input.clone());
+
+        let on_open_entity = entity.clone();
+        Popover::new("session-switcher")
+            .anchor(Anchor::BottomLeft)
+            .trigger(
+                Button::new("session-switcher-trigger")
+                    .ghost()
+                    .xsmall()
+                    .label(current.clone()),
+            )
+            .open(self.switcher_open)
+            .on_open_change(move |open, _window, cx| {
+                on_open_entity.update(cx, |view, cx| view.set_switcher_open(*open, cx));
+            })
+            .content(move |_state, _window, cx| {
+                let border = cx.theme().border;
+                let fg = cx.theme().popover_foreground;
+                let muted = cx.theme().muted_foreground;
+                let current_bg = cx.theme().list_active;
+                let primary = cx.theme().primary;
+                let attached_dot = cx.theme().success;
+
+                let mut list = v_flex()
+                    .w(px(SESSION_SWITCHER_WIDTH))
+                    .text_size(px(13.0))
+                    .text_color(fg)
+                    .font_family("JetBrainsMono Nerd Font Mono");
+
+                for row in &rows {
+                    let is_current = row.name.as_str() == current.as_ref();
+                    let name = row.name.clone();
+                    let row_entity = entity.clone();
+                    list =
+                        list.child(
+                            h_flex()
+                                .w_full()
+                                .h(px(SESSION_SWITCHER_ROW_HEIGHT))
+                                .items_center()
+                                .gap(px(8.0))
+                                .px(px(8.0))
+                                // Every row carries the 2px left-bar slot (the
+                                // current row colors it primary), so the current
+                                // row's content never shifts against the others.
+                                .border_l_2()
+                                .border_color(if is_current {
+                                    primary
+                                } else {
+                                    transparent_black()
+                                })
+                                .when(is_current, |el| el.bg(current_bg))
+                                .hover(move |s| s.bg(current_bg))
+                                .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                                    row_entity.update(cx, |view, cx| {
+                                        view.switch_to_session(&name, cx);
+                                    });
+                                })
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .child(SharedString::from(row.name.clone())),
+                                )
+                                .child(
+                                    div().text_xs().text_color(muted).child(SharedString::from(
+                                        format!("{} windows", row.windows),
+                                    )),
+                                )
+                                // Fixed attached-dot lane, so names and counts
+                                // align whether or not a session is attached.
+                                .child(h_flex().flex_none().w(px(10.0)).justify_center().children(
+                                    row.attached.then(|| {
+                                        div().size(px(6.0)).rounded_full().bg(attached_dot)
+                                    }),
+                                )),
+                        );
+                }
+
+                let footer = match &prompt_input {
+                    Some(input) => {
+                        let cancel_entity = entity.clone();
+                        h_flex()
+                            .w_full()
+                            .h(px(SESSION_SWITCHER_ROW_HEIGHT))
+                            .items_center()
+                            .px(px(8.0))
+                            .border_t_1()
+                            .border_color(border)
+                            .on_key_down(move |event: &KeyDownEvent, _window, cx| {
+                                if event.keystroke.key.as_str() == "escape" {
+                                    cancel_entity.update(cx, |view, cx| {
+                                        view.cancel_new_session_prompt(cx);
+                                    });
+                                    cx.stop_propagation();
+                                }
+                            })
+                            .child(Input::new(input).xsmall())
+                            .into_any_element()
+                    }
+                    None => {
+                        let prompt_entity = entity.clone();
+                        h_flex()
+                            .w_full()
+                            .h(px(SESSION_SWITCHER_ROW_HEIGHT))
+                            .items_center()
+                            .px(px(8.0))
+                            .border_t_1()
+                            .border_color(border)
+                            .text_color(muted)
+                            .cursor_pointer()
+                            .hover(move |s| s.text_color(fg))
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                prompt_entity.update(cx, |view, cx| {
+                                    view.start_new_session_prompt(window, cx);
+                                });
+                            })
+                            .child("+ New session...")
+                            .into_any_element()
+                    }
+                };
+
+                list.child(footer)
+            })
+    }
+
     /// The per-window pane sidebar: a fixed-width column listing the active
     /// window's panes. A row click focuses its pane (`select-pane`), the row
     /// `x` closes it (`kill-pane`), and the header splits the active pane
@@ -1074,9 +1415,10 @@ impl Focusable for SessionView {
 
 impl Render for SessionView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Skip pane auto-focus while an inline rename owns focus, so a snapshot
-        // arriving mid-rename does not steal the keystroke stream from the input.
-        if self.needs_focus && self.renaming_window.is_none() {
+        // Skip pane auto-focus while an inline rename or the switcher's
+        // new-session prompt owns focus, so a snapshot arriving mid-edit does
+        // not steal the keystroke stream from the input.
+        if self.needs_focus && self.renaming_window.is_none() && self.new_session_prompt.is_none() {
             let entity_to_focus = self
                 .active_pane_id
                 .as_ref()
@@ -1338,7 +1680,12 @@ impl Render for SessionView {
                             .child(div().size(px(8.0)).rounded_full().bg(status_color))
                             .child(SharedString::from(status_label)),
                     )
-                    .children((!self.session_name.is_empty()).then(|| self.session_name.clone()))
+                    // Session label doubles as the session-switcher trigger
+                    // (`docs/spec-session-switch.md`, interim statusbar
+                    // placement until the phase-21 title bar).
+                    .children(
+                        (!self.session_name.is_empty()).then(|| self.render_session_switcher(cx)),
+                    )
                     .child(self.ssh_label.clone())
                     .children((!cwd.is_empty()).then(|| SharedString::from(cwd.clone()))),
             )
@@ -1476,10 +1823,10 @@ impl Render for SessionView {
 mod tests {
     use super::{
         activity_dot_color, aggregate_activity, grid_size_for, kill_pane_command, quote_tmux_name,
-        resize_direction, select_pane_command, split_command, PaneActivity, SessionView, TermSize,
-        DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE,
+        resize_direction, select_pane_command, split_command, PaneActivity, SessionListItem,
+        SessionView, TermSize, TerminalHandle, DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE,
     };
-    use gpui::{px, rgb, size, AppContext as _, TestAppContext};
+    use gpui::{px, rgb, size, App, AppContext as _, Entity, SharedString, TestAppContext};
 
     #[test]
     fn test_grid_size_for_exact_multiple_returns_full_grid() {
@@ -1625,6 +1972,182 @@ mod tests {
         assert_eq!(busy, Some(rgb(0xa6e3a1).into()));
         assert_eq!(attention, Some(rgb(0xfab387).into()));
         assert_ne!(busy, attention);
+    }
+
+    /// A `SessionView` plus its channel handle, so switcher tests can assert
+    /// what actually crossed the render seam.
+    fn session_and_handle(cx: &mut App) -> (Entity<SessionView>, TerminalHandle) {
+        let mut handle = None;
+        let session = cx.new(|cx| {
+            let (view, h) = SessionView::new(cx);
+            handle = Some(h);
+            view
+        });
+        (session, handle.expect("handle built by SessionView::new"))
+    }
+
+    /// Opening the switcher (any entry point — statusbar trigger or palette
+    /// command) marks it open and issues exactly one on-demand list refresh;
+    /// re-opening while already open must not spam a second query
+    /// (`docs/spec-session-switch.md`).
+    #[gpui::test]
+    fn test_open_session_switcher_marks_open_and_requests_one_list_refresh(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let (session, handle) = session_and_handle(cx);
+
+            session.update(cx, |view, cx| view.open_session_switcher(cx));
+
+            assert!(session.read(cx).switcher_open, "switcher marked open");
+            assert!(
+                handle.session_list_request_rx.try_recv().is_ok(),
+                "opening requests an on-demand list refresh"
+            );
+
+            session.update(cx, |view, cx| view.open_session_switcher(cx));
+            assert!(
+                handle.session_list_request_rx.try_recv().is_err(),
+                "opening an already-open switcher sends no second refresh"
+            );
+        });
+    }
+
+    /// Selecting another session emits one switch request carrying the current
+    /// client grid (so the fresh control child reflows to the live viewport)
+    /// and closes the switcher; the indicator itself only updates on the fresh
+    /// snapshot, never optimistically.
+    #[gpui::test]
+    fn test_switch_to_session_sends_the_request_and_closes_the_switcher(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, handle) = session_and_handle(cx);
+
+            session.update(cx, |view, cx| {
+                view.session_name = SharedString::from("rift");
+                view.open_session_switcher(cx);
+                view.switch_to_session("agent", cx);
+            });
+
+            let request = handle
+                .session_switch_rx
+                .try_recv()
+                .expect("switch request sent");
+            assert_eq!(request.session, "agent");
+            assert_eq!(
+                request.size,
+                TermSize { cols: 80, rows: 24 },
+                "carries the current client grid"
+            );
+            assert!(!session.read(cx).switcher_open, "switcher closed");
+            assert_eq!(
+                session.read(cx).session_name.as_ref(),
+                "rift",
+                "indicator stays on the attached session until the fresh snapshot"
+            );
+        });
+    }
+
+    /// Selecting the already-attached session only closes the popover — no
+    /// pointless re-attach crosses the seam.
+    #[gpui::test]
+    fn test_switch_to_session_attached_session_sends_nothing(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, handle) = session_and_handle(cx);
+
+            session.update(cx, |view, cx| {
+                view.session_name = SharedString::from("rift");
+                view.open_session_switcher(cx);
+                view.switch_to_session("rift", cx);
+            });
+
+            assert!(
+                handle.session_switch_rx.try_recv().is_err(),
+                "no switch request for the attached session"
+            );
+            assert!(!session.read(cx).switcher_open, "switcher still closes");
+        });
+    }
+
+    /// Every session-list arrival replaces the whole list (replace semantics,
+    /// like the layout stream), so create/kill/rename reflect without any
+    /// merge logic or manual refresh.
+    #[gpui::test]
+    fn test_apply_session_list_replaces_the_whole_list(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, _handle) = session_and_handle(cx);
+
+            let first = vec![SessionListItem {
+                name: "rift".into(),
+                windows: 3,
+                attached: true,
+            }];
+            let second = vec![
+                SessionListItem {
+                    name: "rift".into(),
+                    windows: 3,
+                    attached: true,
+                },
+                SessionListItem {
+                    name: "agent".into(),
+                    windows: 1,
+                    attached: false,
+                },
+            ];
+
+            session.update(cx, |view, cx| view.apply_session_list(first.clone(), cx));
+            assert_eq!(session.read(cx).sessions, first);
+
+            session.update(cx, |view, cx| view.apply_session_list(second.clone(), cx));
+            assert_eq!(session.read(cx).sessions, second);
+
+            session.update(cx, |view, cx| view.apply_session_list(Vec::new(), cx));
+            assert!(
+                session.read(cx).sessions.is_empty(),
+                "an empty reply clears the list rather than merging"
+            );
+        });
+    }
+
+    /// The palette's "New Session..." entry opens the switcher with the footer
+    /// prompt already active (and still triggers the on-open list refresh).
+    #[gpui::test]
+    fn test_open_new_session_prompt_opens_switcher_with_prompt_active(cx: &mut TestAppContext) {
+        let mut built = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |_window, cx| {
+                let (session, handle) = session_and_handle(cx);
+                built = Some((session.clone(), handle));
+                session
+            })
+            .unwrap()
+        });
+        let (session, handle) = built.expect("session constructed inside the window callback");
+
+        cx.update_window(window.into(), |_, window, cx| {
+            session.update(cx, |view, cx| view.open_new_session_prompt(window, cx));
+
+            assert!(session.read(cx).switcher_open, "switcher opened");
+            assert!(
+                session.read(cx).new_session_prompt.is_some(),
+                "new-session prompt active"
+            );
+            assert!(
+                handle.session_list_request_rx.try_recv().is_ok(),
+                "opening still requests the list refresh"
+            );
+
+            session.update(cx, |view, cx| view.cancel_new_session_prompt(cx));
+            assert!(
+                session.read(cx).new_session_prompt.is_none(),
+                "cancel restores the footer row"
+            );
+            assert!(
+                session.read(cx).switcher_open,
+                "cancelling the prompt keeps the switcher open"
+            );
+        })
+        .unwrap();
     }
 
     /// `font_size()` starts at the same default `apply_font_zoom`'s delta path
