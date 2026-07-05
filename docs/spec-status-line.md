@@ -16,10 +16,11 @@ mirrored tmux bar).
       token): left `>_ rift` wordmark (primary) · tmux window list
       (`1:agent*` — active window gets a surface chip, activity dots on busy/
       attention windows, click selects the window) · PREFIX/key-table
-      indicator while active; right: branch (primary) · `+N −M` working-tree
-      line totals (success/danger) · `●e ⚠w` workspace diagnostic counts ·
-      language-server health dot + name · `Ln L, Col C` (editor cursor) ·
-      clock (HH:MM, minute tick).
+      indicator while active; right: branch (primary) with ahead/behind
+      `↑n ↓m` (from the existing `RepoState.ahead_behind`) · `+N −M`
+      working-tree line totals (success/danger) · `●e ⚠w` workspace
+      diagnostic counts · language-server health dot + name ·
+      `Ln L, Col C` (editor cursor) · clock (HH:MM, minute tick).
 - [ ] The window list mirrors tmux live (§8.4): create/close/rename/select/
       activity reflect without refresh, consistent with the tab bar's states.
 - [ ] `+N −M` and the LSP health dot are fed by real streams (new minimal
@@ -52,10 +53,24 @@ mirrored tmux bar).
 - `terminal`: remove SessionView's internal statusbar; `app`: remove the
   mirrored-bar mode (`RIFT_STATUSLINE_MIRROR`, status_bar.rs:149) and its
   render path — superseded by this design (see Prior decisions).
+- Full removal of the now-consumerless phase-8 mirror machinery (a deliberate
+  protocol REMOVAL, version-bumped per the fingerprint policy): the
+  `QueryStatusLine`/`StatusLineReply` protocol pair, the daemon
+  `StatusLineQuery` bundle (terminal.rs:282-309, per-attach issue + interval
+  re-fetch), the workspace `status_line_rx` fold (workspace.rs:481-502), and
+  the `crates/terminal/src/statusline.rs` style-run parser. None of these has
+  a consumer besides the mirror (the keytable path has its OWN query/parser —
+  the two are parallel structures, not shared).
 - Relocations per design: session name + user@host live in the phase-21
-  title bar (already specced); cwd moves into the phase-21 pane headers;
-  the transient grid-size readout on resize becomes a brief overlay toast
-  near the terminal (kept — it is feedback, not chrome).
+  title bar (already specced); cwd moves into the phase-21 pane headers; the
+  grid-size readout (today a persistent segment, session_view.rs:1130) is
+  removed and replaced by a brief resize-feedback overlay near the terminal;
+  the "refresh keys" escape hatch (session_view.rs:1361-1373, mandated by the
+  keytable-mirroring spec) relocates to a command-palette entry
+  ("Refresh tmux key tables") driving the same `key_table_request_tx`.
+- Docs disposition: `spec-tmux-statusline-mirroring.md` and
+  `spec-status-bar.md` are set COMPLETED with a superseded-by note and moved
+  to `docs/archive/` (links repointed) as part of this phase.
 
 ### Out of scope
 
@@ -88,7 +103,10 @@ mirrored tmux bar).
 | Decision | Rationale | Date |
 |---|---|---|
 | One composite bar replaces all three existing bars | The design shows exactly one status line; three coexisting bars are the confirmed wave-1 gap (24px strip with 2 segments, SessionView bar, env-gated mirror) | 2026-07-05 |
-| The phase-8 tmux status-line CONTENT mirror is superseded and removed | The composite bar's window list + rift-native segments cover the design; the mirror was env-gated, default-off, and mutually exclusive with native segments — keeping both violates "no duplicate mechanism". The phase-8 key learnings (option queries, `#{T:...}` expansion) remain in the daemon for the keytable/prefix path | 2026-07-05 |
+| The phase-8 tmux status-line CONTENT mirror is superseded and FULLY removed (protocol pair, daemon query bundle, app fold, style-run parser) | The composite bar's window list + rift-native segments cover the design; the mirror was env-gated, default-off, and mutually exclusive with native segments. NOTE: this consciously overturns the gate-ratified phase-8 decision ("native default + opt-in mirror", 2026-06-05/2026-06-12) — the one-bar design contract is the new precedent; presented as such at this spec's acceptance gate. The keytable path is unaffected (it owns parallel machinery) | 2026-07-05 |
+| Ahead/behind stays a bar segment (`↑n ↓m` beside the branch) | The design's Git artboard shows `develop ↑2`; the data already streams on `RepoState.ahead_behind` | 2026-07-05 |
+| LSP health identity = stable server NAME (e.g. "rust-analyzer"), not per-spawn ServerId; states starting/running/crashed (no "stopped" — servers are never deliberately stopped while attached); detection rides the registry observe cycle | Restarts mint fresh ServerIds (that keying stays for diagnostics); the bar wants "is my language server ok", which is name-scoped. Crash detection is observe-granular today (prune_dead) — acceptable latency, no crates/lsp API change needed | 2026-07-05 |
+| Line-totals semantics = `git diff HEAD --numstat` + untracked text additions; renames diff against the rewrite SOURCE blob (explorer/git.rs Change::Rewrite carries it) | Pins the acceptance semantics; a pure rename contributes 0/0 instead of full-file adds | 2026-07-05 |
 | `+N −M` = daemon-computed worktree-vs-HEAD line totals on RepoState | The design shows line totals, not file counts; gix is already the daemon's git engine and the recompute tick already walks the status — totals are an incremental extension, replayed to new clients like all state | 2026-07-05 |
 | LSP health = registry lifecycle push, not diagnostics-flow inference | The registry owns start/crash/restart (#273/#497 context); inferring health from diagnostics traffic is wrong on idle-but-healthy servers | 2026-07-05 |
 | Grid-size readout becomes a transient overlay near the terminal | It is resize feedback (like an OSD), not persistent status; the design's bar has no such segment | 2026-07-05 |
@@ -107,7 +125,9 @@ None.
 
 ## Tracking
 
-- Milestone: created after this spec merges (phase 22).
+- Milestone: created after this spec merges (phase 22) — with
+  `Depends on milestone: Phase 210` (the relocation homes: title bar, pane
+  headers).
 - Issues: one per implementable step, each referencing this spec path.
 
 ## Verification
@@ -116,8 +136,12 @@ None.
 - [ ] `cargo test --workspace` passes
 - [ ] Protocol tests for the RepoState fields + LspStatus (valid + malformed)
 - [ ] Behavioral: agent edits files → `+N −M` updates on the recompute
-      cadence and matches `git diff --numstat` totals (spot-check); reverting
-      all changes returns to `+0 −0` (hidden when zero)
+      cadence and matches `git diff HEAD --numstat` totals plus untracked
+      text additions (spot-check incl. a rename → 0/0); reverting all
+      changes hides the segment
+- [ ] Ahead/behind (`↑n ↓m`) tracks push/pull state live
+- [ ] The palette entry "Refresh tmux key tables" performs the manual
+      key-table refresh (escape hatch preserved)
 - [ ] Behavioral: killing rust-analyzer flips the health dot (crashed) and a
       restart flips it back — no app restart
 - [ ] Behavioral: window create/close/rename/select/activity reflect in the
@@ -141,3 +165,13 @@ None.
 - 2026-07-05: Spec drafted from the wave-1 gap analysis (three-bar
   fragmentation CONFIRMED; missing segments enumerated) and the design
   distillation §1/§8.4.
+- 2026-07-05: Fresh-context review (PR #517): three blocking findings baked
+  in — (B1) full disposition of the phase-8 machinery (protocol pair, daemon
+  bundle, app fold, parser all removed; "stays for keytable" claim was wrong
+  — parallel structures), (B2) ahead/behind restored as a segment (it is in
+  the design's Git artboard and already streams), (B3) the "refresh keys"
+  escape hatch relocates to a palette entry. Non-blocking adoptions: LSP
+  health identity/granularity pinned, numstat-vs-HEAD + rename semantics,
+  grid-size wording, archive disposition for the two superseded specs,
+  milestone dependency on Phase 210, and the explicit note that the mirror
+  removal overturns the phase-8 ratified decision.
