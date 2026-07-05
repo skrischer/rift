@@ -171,7 +171,8 @@ fn is_mouse_key(key: &str) -> bool {
     MARKERS.iter().any(|marker| key.contains(marker))
 }
 
-/// Session prefix and repeat options, discovered via `show-options`.
+/// Session prefix and repeat options, discovered via `show-options -A`
+/// (session-resolved: includes values inherited from the global scope).
 ///
 /// The prefix is a session option (`prefix`, plus optional `prefix2`), not a
 /// `list-keys` entry, so it must be queried separately; `repeat-time` is likewise
@@ -196,17 +197,21 @@ impl Default for PrefixOptions {
     }
 }
 
-/// Parse `show-options` output into [`PrefixOptions`], overriding the tmux
+/// Parse `show-options -A` output into [`PrefixOptions`], overriding the tmux
 /// defaults for any of `prefix`, `prefix2`, `repeat-time` that appear. Each line
-/// is `name value`; unrelated options and unparseable values are ignored.
+/// is `name value` (a trailing `*` on `name` marks a value inherited from a
+/// higher scope, per `-A`, and is stripped before matching — same convention as
+/// [`crate::statusline::parse_status_options`]); unrelated options and
+/// unparseable values are ignored.
 pub fn parse_options(output: &str) -> PrefixOptions {
     let mut options = PrefixOptions::default();
     for line in output.lines() {
-        let Some((name, after_name)) = lex_token(line, 0) else {
+        let Some((raw_name, after_name)) = lex_token(line, 0) else {
             continue;
         };
+        let name = raw_name.strip_suffix('*').unwrap_or(&raw_name);
         let value = lex_token(line, after_name).map(|(value, _)| value);
-        match name.as_str() {
+        match name {
             "prefix" => options.prefix = parse_key_option(value.as_deref()),
             "prefix2" => options.prefix2 = parse_key_option(value.as_deref()),
             "repeat-time" => {
@@ -776,9 +781,26 @@ repeat-time 300
     }
 
     #[test]
+    fn test_parse_options_inherited_marker_is_stripped() {
+        // `show-options -A` marks a value inherited from a higher scope with
+        // a trailing `*` on the name: a `.tmux.conf` `set -g prefix C-a` with
+        // no session override prints `prefix* C-a` (#439).
+        let input = "\
+prefix* C-a
+prefix2* None
+repeat-time* 300
+";
+        let options = parse_options(input);
+        assert_eq!(options.prefix.as_deref(), Some("C-a"));
+        assert_eq!(options.prefix2, None);
+        assert_eq!(options.repeat_time, 300);
+    }
+
+    #[test]
     fn test_parse_options_ignores_unrelated_and_malformed() {
         let input = "\
 status on
+* orphaned-marker
 prefix C-a
 repeat-time not-a-number
 ";
