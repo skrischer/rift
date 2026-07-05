@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use russh::client::{self, Config, Handle};
 use russh_keys::key::PublicKey;
@@ -9,6 +10,25 @@ use crate::daemon_channel::DaemonChannel;
 use crate::error::SshError;
 use crate::known_hosts::verify_host_key;
 use crate::pty::PtyStream;
+
+/// Send a keepalive probe after this long without receiving server data.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Close the connection after this many unanswered keepalives. Matches the
+/// OpenSSH `ServerAliveCountMax` default; together with the interval a silent
+/// network drop surfaces as a disconnect within roughly one minute instead of
+/// leaving the session frozen in "connected" forever.
+const KEEPALIVE_MAX: usize = 3;
+
+/// Client config for all rift SSH connections: `Config::default()` with
+/// keepalive enabled so dead transports are detected.
+fn client_config() -> Config {
+    Config {
+        keepalive_interval: Some(KEEPALIVE_INTERVAL),
+        keepalive_max: KEEPALIVE_MAX,
+        ..Config::default()
+    }
+}
 
 pub struct SshConnection {
     handle: Handle<ClientHandler>,
@@ -33,7 +53,7 @@ impl SshConnection {
                 .await
                 .map_err(|e| SshError::Key(e.to_string()))??;
 
-        let config = Arc::new(Config::default());
+        let config = Arc::new(client_config());
         let handler = ClientHandler {
             host: host.to_owned(),
             port,
@@ -284,5 +304,24 @@ impl client::Handler for ClientHandler {
     async fn check_server_key(&mut self, key: &PublicKey) -> Result<bool, Self::Error> {
         verify_host_key(&self.host, self.port, key)?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_client_config_keepalive_enabled_interval_and_max_set() {
+        let config = client_config();
+        assert_eq!(config.keepalive_interval, Some(KEEPALIVE_INTERVAL));
+        assert_eq!(config.keepalive_max, KEEPALIVE_MAX);
+    }
+
+    #[test]
+    fn test_client_config_keepalive_max_nonzero_enforces_bounded_window() {
+        // russh treats `keepalive_max == 0` as "never give up"; the whole point
+        // of this config is a bounded detection window, so guard against it.
+        assert!(client_config().keepalive_max > 0);
     }
 }
