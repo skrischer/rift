@@ -60,6 +60,10 @@
 //! [`EditorView::note_external_change_for_path`] runs the pure
 //! [`decide_external_change`] decision on the addressed tab's snapshot
 //! `mtime`: a clean buffer auto-reloads; a dirty buffer surfaces a conflict.
+//! The auto-reload keeps the tab's `InputState` entity and restores the
+//! pre-reload cursor once the fresh content lands ([`EditorTab::pending_restore`],
+//! #432), so watching an agent edit the open file does not yank the viewport
+//! to the top on every write.
 //!
 //! # Live-buffer feed (#189)
 //!
@@ -342,6 +346,14 @@ struct EditorTab {
     /// range immediately instead (no load roundtrip needed).
     pending_jump: Option<Range>,
 
+    /// The cursor position to restore once an auto-reload's fresh content
+    /// lands (#432) — captured from the pre-reload buffer when a clean-buffer
+    /// external change arms the reload; consumed in [`EditorView::load`].
+    /// The restore is clamped to the new content by the input's rope layer,
+    /// so a cursor past the end of a shrunken file lands at its end. `None`
+    /// for plain opens and nav jumps.
+    pending_restore: Option<EditorPosition>,
+
     /// This tab's bounded back-jump stack: (path, position, read_only)
     /// triples recording where a jump *away* from this tab should return —
     /// so `GoBack` while viewing this tab unwinds to wherever the jump that
@@ -462,24 +474,33 @@ impl EditorView {
             hover_content: None,
             hover_move_generation: 0,
             pending_jump: None,
+            pending_restore: None,
             back_stack: VecDeque::new(),
             jump_list: None,
             jump_list_kind: None,
         });
-        self.arm_loading(index, window, cx);
+        self.arm_loading(index, true, window, cx);
         index
     }
 
-    /// Reset the tab at `index` to `Loading` for its current path: rebuilds
-    /// its `InputState`, clears per-load bookkeeping (dirty, save state,
-    /// hover, jump-list), and arms the [`OPEN_TIMEOUT`] guard. Shared by a
-    /// freshly pushed tab and an in-place reload (external change, #188) —
-    /// both start from a blank buffer awaiting a `FileContent` reply.
-    fn arm_loading(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// Reset the tab at `index` to `Loading` for its current path: clears
+    /// per-load bookkeeping (dirty, save state, hover, jump-list) and arms
+    /// the [`OPEN_TIMEOUT`] guard. Shared by a freshly pushed tab
+    /// (`rebuild_input: true` — builds the code-editor `InputState` for the
+    /// path) and an in-place auto-reload (external change, #188;
+    /// `rebuild_input: false` — keeps the live entity so its cursor and
+    /// layout survive for the post-reload viewport restore, #432). Both end
+    /// up awaiting a `FileContent` reply.
+    fn arm_loading(
+        &mut self,
+        index: usize,
+        rebuild_input: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
-        let language = language_for_path(&tab.path);
 
         tab.load_state = TabLoadState::Loading;
         tab.save_state = SaveState::Idle;
@@ -490,17 +511,21 @@ impl EditorView {
         tab.hover_content = None;
         tab.latest_hover_id = None;
         tab.latest_ref_id = None;
+        tab.pending_restore = None;
 
-        tab.input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .code_editor(language)
-                .line_number(true)
-                .tab_size(gpui_component::input::TabSize {
-                    tab_size: TAB_SIZE,
-                    ..Default::default()
-                })
-        });
-        tab._input_change = Self::subscribe_dirty(&tab.input, index, cx);
+        if rebuild_input {
+            let language = language_for_path(&tab.path);
+            tab.input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .code_editor(language)
+                    .line_number(true)
+                    .tab_size(gpui_component::input::TabSize {
+                        tab_size: TAB_SIZE,
+                        ..Default::default()
+                    })
+            });
+            tab._input_change = Self::subscribe_dirty(&tab.input, index, cx);
+        }
 
         tab.generation = tab.generation.wrapping_add(1);
         let generation = tab.generation;
@@ -810,9 +835,41 @@ impl EditorView {
 
         if let Some(range) = self.tabs[index].pending_jump.take() {
             self.apply_jump_range(index, &range, window, cx);
+        } else if let Some(cursor) = self.tabs[index].pending_restore.take() {
+            self.restore_cursor_after_reload(index, cursor, window, cx);
         }
 
         cx.notify();
+    }
+
+    /// Land the pre-reload cursor on the freshly auto-reloaded content (#432).
+    ///
+    /// `InputState::set_cursor_position` clamps the position to the new
+    /// content via the rope layer and scrolls the cursor back into view —
+    /// but it also focuses the input as a side effect. An auto-reload is
+    /// agent-triggered, not user-triggered, so it must never steal focus
+    /// (the user is typically typing in the terminal while the agent
+    /// writes): focus is handed back when it was elsewhere.
+    fn restore_cursor_after_reload(
+        &mut self,
+        index: usize,
+        cursor: EditorPosition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let input_focus = tab.input.focus_handle(cx);
+        let previous_focus = window.focused(cx);
+        tab.input.update(cx, |input, cx| {
+            input.set_cursor_position(cursor, window, cx);
+        });
+        if let Some(previous) = previous_focus {
+            if previous != input_focus {
+                window.focus(&previous, cx);
+            }
+        }
     }
 
     // ── Save ──────────────────────────────────────────────────────────────
@@ -946,7 +1003,15 @@ impl EditorView {
             ExternalChange::None => {}
             ExternalChange::Reload => {
                 let path = self.tabs[index].path.clone();
-                self.arm_loading(index, window, cx);
+                // Capture the cursor before the tab flips to `Loading`;
+                // `load` restores it over the fresh content so the reload
+                // does not yank the viewport to the top (#432). The input
+                // entity is deliberately kept (`rebuild_input: false`) —
+                // its surviving layout is what lets the restore scroll the
+                // cursor back into view.
+                let cursor = self.tabs[index].input.read(cx).cursor_position();
+                self.arm_loading(index, false, window, cx);
+                self.tabs[index].pending_restore = Some(cursor);
                 if let Err(e) = self.open_file_tx.try_send(path.clone()) {
                     tracing::debug!(error = %e, %path, "failed to enqueue auto-reload open");
                 }
@@ -1505,8 +1570,9 @@ impl EditorView {
 impl Focusable for EditorView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         // Delegate to the active tab's input entity — `arm_loading` rebuilds
-        // it per load, so this always reflects the live buffer. Falls back to
-        // the editor's own handle while no tab is open.
+        // it per fresh open (an auto-reload keeps it, #432), so this always
+        // reflects the live buffer. Falls back to the editor's own handle
+        // while no tab is open.
         self.active_tab()
             .map(|tab| tab.input.focus_handle(cx))
             .unwrap_or_else(|| self.focus_handle.clone())
@@ -2546,6 +2612,157 @@ mod tests {
                         "a signal for an unopened path must not touch a.rs"
                     );
                 });
+            })
+            .unwrap();
+    }
+
+    // --- auto-reload viewport restore (#432) ---
+
+    /// Acceptance (#432): a clean-buffer auto-reload must not reset the
+    /// cursor — the pre-reload position is restored once the fresh content
+    /// lands. The input entity must survive the reload (no rebuild): its
+    /// retained layout is what lets the restore scroll the cursor back into
+    /// view instead of leaving the viewport at the top.
+    #[gpui::test]
+    fn test_auto_reload_restores_cursor_and_keeps_the_input_entity(cx: &mut TestAppContext) {
+        let (editor, window, open_file_rx) = build_test_editor(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    editor.active = Some(a);
+                    editor.load(
+                        "a.rs".into(),
+                        "line0\nline1\nline2\nline3\n".into(),
+                        at(100),
+                        window,
+                        cx,
+                    );
+                    editor.tabs[a].input.update(cx, |input, cx| {
+                        input.set_cursor_position(EditorPosition::new(2, 3), window, cx);
+                    });
+                    let entity_before = editor.tabs[a].input.entity_id();
+
+                    editor.note_external_change_for_path("a.rs", at(200), window, cx);
+
+                    assert!(
+                        matches!(editor.tabs[a].load_state, TabLoadState::Loading),
+                        "a clean buffer with a newer snapshot must auto-reload"
+                    );
+                    assert_eq!(
+                        editor.tabs[a].input.entity_id(),
+                        entity_before,
+                        "the reload must keep the input entity — its layout carries the scroll restore"
+                    );
+
+                    editor.load(
+                        "a.rs".into(),
+                        "line0\nline1\nline2 changed\nline3\n".into(),
+                        at(200),
+                        window,
+                        cx,
+                    );
+
+                    assert!(matches!(editor.tabs[a].load_state, TabLoadState::Loaded));
+                    let pos = editor.tabs[a].input.read(cx).cursor_position();
+                    assert_eq!(
+                        (pos.line, pos.character),
+                        (2, 3),
+                        "the pre-reload cursor must survive the auto-reload"
+                    );
+                    assert!(
+                        editor.tabs[a].pending_restore.is_none(),
+                        "the restore is one-shot"
+                    );
+                });
+            })
+            .unwrap();
+
+        assert_eq!(
+            open_file_rx
+                .try_recv()
+                .expect("the reload must re-issue an OpenFile"),
+            "a.rs"
+        );
+    }
+
+    /// Acceptance (#432): a restored cursor beyond the end of the shrunken
+    /// reload content is clamped by the rope layer — it lands at the end of
+    /// the new content instead of a phantom line.
+    #[gpui::test]
+    fn test_auto_reload_clamps_restored_cursor_to_shorter_content(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    editor.active = Some(a);
+                    editor.load("a.rs".into(), "l0\nl1\nl2\nl3".into(), at(100), window, cx);
+                    editor.tabs[a].input.update(cx, |input, cx| {
+                        input.set_cursor_position(EditorPosition::new(3, 2), window, cx);
+                    });
+
+                    editor.note_external_change_for_path("a.rs", at(200), window, cx);
+                    editor.load("a.rs".into(), "ab\ncd".into(), at(200), window, cx);
+
+                    let pos = editor.tabs[a].input.read(cx).cursor_position();
+                    assert_eq!(
+                        (pos.line, pos.character),
+                        (1, 2),
+                        "a cursor past the shrunken content clamps to its end"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// The restore must not steal focus (#432): `set_cursor_position`
+    /// focuses the input as a side effect, but an auto-reload is
+    /// agent-triggered — whatever was focused before (e.g. the terminal)
+    /// must hold focus afterwards.
+    #[gpui::test]
+    fn test_auto_reload_restore_hands_focus_back_when_it_was_elsewhere(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    editor.active = Some(a);
+                    editor.load("a.rs".into(), "l0\nl1\nl2\n".into(), at(100), window, cx);
+                    editor.tabs[a].input.update(cx, |input, cx| {
+                        input.set_cursor_position(EditorPosition::new(1, 1), window, cx);
+                    });
+                });
+
+                // Move focus away from the editor, standing in for the
+                // terminal panel the user is typing into.
+                let elsewhere = cx.focus_handle();
+                window.focus(&elsewhere, cx);
+
+                editor.update(cx, |editor, cx| {
+                    editor.note_external_change_for_path("a.rs", at(200), window, cx);
+                    editor.load(
+                        "a.rs".into(),
+                        "l0\nl1 changed\nl2\n".into(),
+                        at(200),
+                        window,
+                        cx,
+                    );
+                });
+
+                assert!(
+                    window.focused(cx).is_some_and(|f| f == elsewhere),
+                    "the auto-reload restore must hand focus back to the previously focused element"
+                );
+                let pos = editor.read(cx).tabs[0].input.read(cx).cursor_position();
+                assert_eq!(
+                    (pos.line, pos.character),
+                    (1, 1),
+                    "the cursor is still restored even though focus stayed elsewhere"
+                );
             })
             .unwrap();
     }
