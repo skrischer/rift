@@ -149,6 +149,31 @@ Editing uses a deliberate request/response buffer channel over the daemon transp
 8. Three worker threads start: input routing, resize forwarding, notification polling.
 9. UI goes live — poll thread processes `%output`, `NeedsRefresh`, `Exit` notifications.
 
+## Connection robustness contract (phase 20)
+
+> Ratified with `spec-connection-robustness.md` (2026-07-05). Governs every
+> transport seam; supersedes the earlier quit-on-disconnect behavior.
+
+- **Protocol versioning:** `PROTOCOL_VERSION` (crates/protocol) reflects the
+  message set — every message-set change bumps it, enforced by a pinned
+  fingerprint test in the protocol crate. Client and daemon enforce strict
+  equality at Hello/Welcome; the daemon answers a mismatched Hello with its
+  own version and closes cleanly (never streams to a mismatched client).
+- **The client owns the daemon version:** on mismatch with a running daemon,
+  the client stops it (pidfile), re-deploys the matching binary
+  (content-fingerprinted), respawns, and reconnects. The daemon never
+  self-updates.
+- **No silent stream death:** a dead daemon channel (EOF, malformed frame)
+  while SSH is up auto-reconnects and resyncs via the Welcome snapshot replay
+  plus a terminal re-Attach (fresh-LayoutSnapshot reset). An SSH drop enters a
+  visible bounded-backoff reconnect loop (`ConnectionStatus::Reconnecting`)
+  instead of quitting; tmux session persistence makes the terminal lossless
+  across it.
+- **Not-connected is a UI state**, owned by the Connection screen (design
+  "Connection — Startup"), never a blind exit. The screen is also the startup
+  state on every launch (prefilled config, explicit Connect) — the app never
+  auto-connects blindly.
+
 ## Technology map
 
 | Component | Crate / Technology |
