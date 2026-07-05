@@ -77,6 +77,16 @@ impl SshConnection {
         Ok(Self { handle })
     }
 
+    /// Whether the underlying SSH transport has closed (dropped connection,
+    /// exhausted keepalive window). Cheap and non-blocking — the daemon
+    /// reconnect engine checks it to abort early and hand a dead transport to
+    /// the SSH-level reconnect loop (#476,
+    /// `docs/spec-connection-robustness.md`) instead of burning its bounded
+    /// attempts against a connection that cannot carry a channel.
+    pub fn is_closed(&self) -> bool {
+        self.handle.is_closed()
+    }
+
     pub async fn open_pty(&mut self, cols: u16, rows: u16) -> Result<PtyStream, SshError> {
         let channel = self.handle.channel_open_session().await?;
 

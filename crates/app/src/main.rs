@@ -7,6 +7,7 @@
 use std::env;
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use anyhow::{Context as _, Result};
@@ -30,6 +31,10 @@ struct SshConfig {
     key: PathBuf,
 }
 
+// Cloned per connect attempt by the reconnect engine: flume handles are cheap
+// `Arc` clones, and the dead session's clones drop with its runtime, so only
+// the live session consumes the render-side channels.
+#[derive(Clone)]
 struct PtyChannels {
     pane_output_tx: flume::Sender<PaneOutput>,
     input_rx: flume::Receiver<PaneInput>,
@@ -73,6 +78,8 @@ struct PtyChannels {
 /// open-file bridge drains `open_file_rx` into `ClientMessage::OpenFile` reads and
 /// a save-file bridge drains `save_file_rx` into `SaveFile` writes. The matching
 /// GPUI-side endpoints live on [`rift_app::workspace::WorkspaceChannels`].
+/// Cloned per connect attempt by the reconnect engine (see [`PtyChannels`]).
+#[derive(Clone)]
 struct EditorChannels {
     /// Worktree-family daemon messages routed to the file tree's model.
     worktree_tx: flume::Sender<rift_protocol::DaemonMessage>,
@@ -101,6 +108,24 @@ struct EditorChannels {
     /// Root-relative paths to diff, emitted by the source-control panel on
     /// selection; each becomes a `RequestDiff` request.
     request_diff_rx: flume::Receiver<String>,
+}
+
+/// The reconnect engine's cross-attempt state (#476): `watch` channels whose
+/// values must survive the per-attempt tokio runtimes. `run_session_with_reconnect`
+/// owns the struct; each attempt receives it by reference and hands clones of
+/// the senders to the bridges. Without engine scope, an SSH-level reconnect
+/// would silently re-attach the startup session after a cockpit switch (#509)
+/// and leave the fresh tmux child on the attach-default grid.
+struct EngineWatches {
+    /// The session the client is currently attached to: seeded from
+    /// `RIFT_SESSION` once, updated by `spawn_session_switch_bridge` per switch
+    /// the daemon actually saw.
+    session: tokio::sync::watch::Sender<String>,
+    /// The render layer's last known client grid: cached by
+    /// `spawn_resize_bridge` per resize (and by the engine's backlog drain),
+    /// re-asserted as a `ResizePane` after every fresh attach — the render
+    /// layer only re-sends on a size change, which a reconnect is not.
+    viewport: tokio::sync::watch::Sender<Option<TermSize>>,
 }
 
 /// Per-channel log-pair basename, keyed off the same `windowed` feature that
@@ -434,10 +459,13 @@ fn main() {
                             }),
                     };
 
-                    // Kept outside `channels` so the session thread can flip the
-                    // indicator to Disconnected once `run_ssh_session` returns
-                    // (the in-session clone reports Connected).
+                    // Kept outside `channels` so the reconnect engine can drive
+                    // the indicator (SshReconnecting/Disconnected) after
+                    // `run_ssh_session` returns (the in-session clone reports
+                    // Connected). The cancel receiver likewise belongs to the
+                    // engine, not to a single session run.
                     let status_tx = handle.connection_status_tx.clone();
+                    let reconnect_cancel_rx = handle.reconnect_cancel_rx.clone();
 
                     let channels = PtyChannels {
                         pane_output_tx: handle.pane_output_tx,
@@ -480,21 +508,14 @@ fn main() {
                     );
 
                     thread::spawn(move || {
-                        let rt =
-                            tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-                        rt.block_on(async move {
-                            if let Err(e) = run_ssh_session(&ssh, channels, editor_channels).await {
-                                error!(
-                                    %e,
-                                    host = %ssh.host,
-                                    port = ssh.port,
-                                    key = %ssh.key.display(),
-                                    key_exists,
-                                    "SSH session failed"
-                                );
-                            }
-                            let _ = status_tx.send(ConnectionStatus::Disconnected);
-                        });
+                        run_session_with_reconnect(
+                            &ssh,
+                            channels,
+                            editor_channels,
+                            status_tx,
+                            reconnect_cancel_rx,
+                            key_exists,
+                        );
                     });
 
                     view
@@ -539,7 +560,183 @@ fn main() {
     });
 }
 
-async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels, editor: EditorChannels) -> Result<()> {
+/// The SSH-level reconnect engine (#476, `docs/spec-connection-robustness.md`):
+/// run the connect pipeline, and when the session dies with a transport-shaped
+/// error, retry it forever under [`rift_ssh::ReconnectBackoff`]'s jittered
+/// capped schedule (30s cap) — an SSH drop never quits the app. Each retry
+/// surfaces as `ConnectionStatus::SshReconnecting { retry }` (danger banner +
+/// warning dot); a successful reconnect re-runs the full pipeline (daemon
+/// provisioning, attach, resync) and restarts the schedule. The banner's
+/// Cancel and non-retryable failures ([`is_retryable_session_error`]) end the
+/// loop in the visible `Disconnected` state instead — the Connection screen
+/// (#477) will own that state once it lands. An orderly end (`Ok`: the tmux
+/// attach exited) also ends the loop without retrying: the remote session is
+/// gone on purpose, not lost.
+///
+/// Each attempt runs on a fresh tokio runtime: dropping the runtime cancels
+/// every bridge task the dead session spawned, so a stale bridge can never
+/// compete with the fresh session's bridges for the render-side flume
+/// receivers (clones of one MPMC channel are competing consumers). The flip
+/// side is that nothing consumes those receivers while no session is live, so
+/// the engine drops the queued backlog ([`drain_render_backlog`]) before every
+/// attempt — replaying an outage's keystrokes into a fresh attach is exactly
+/// the buffering the spec forbids.
+///
+/// Two `watch` channels live at engine scope because their values must survive
+/// the per-attempt runtimes: the session the client is currently on (seeded
+/// from `RIFT_SESSION` once, updated by the session-switch bridge — a
+/// reconnect after a cockpit switch, #509, must re-attach the session the user
+/// is actually on, the same rule the daemon recovery follows) and the render
+/// layer's last known client grid (re-asserted after every fresh attach — the
+/// render layer only re-sends on a size change, which a reconnect is not).
+///
+/// Cancel is observed between attempts (during the backoff wait): a Cancel
+/// clicked while a connect attempt is in-flight takes effect only once that
+/// attempt resolves — immediately if it fails (the queued Cancel ends the
+/// next wait), silently discarded if it succeeds (the connected-path drain
+/// below; the user is back on a live session, so the stale Cancel must not
+/// kill it). A TCP connect against a black-holed host can keep an attempt
+/// in-flight for tens of seconds; the Connection screen (#477) is the place
+/// to shorten that perceived latency, not a second cancellation seam.
+fn run_session_with_reconnect(
+    ssh: &SshConfig,
+    channels: PtyChannels,
+    editor: EditorChannels,
+    status_tx: flume::Sender<ConnectionStatus>,
+    cancel_rx: flume::Receiver<()>,
+    key_exists: bool,
+) {
+    let mut retry: u32 = 0;
+    let mut backoff = rift_ssh::ReconnectBackoff::new();
+    let connected = AtomicBool::new(false);
+    let initial_session = env::var("RIFT_SESSION").unwrap_or_else(|_| "rift".to_string());
+    let watches = EngineWatches {
+        session: tokio::sync::watch::channel(initial_session).0,
+        viewport: tokio::sync::watch::channel(None::<TermSize>).0,
+    };
+    loop {
+        connected.store(false, Ordering::Relaxed);
+        // Discard everything the render side queued while no session was
+        // live; only the latest grid survives, folded into the viewport
+        // watch. Runs immediately before the attempt, so the residual replay
+        // window is the attempt's own connect/provision phase.
+        drain_render_backlog(&channels, &editor, &watches);
+        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        let result = rt.block_on(run_ssh_session(
+            ssh,
+            channels.clone(),
+            editor.clone(),
+            &connected,
+            &watches,
+        ));
+        // Cancels the dead session's bridge tasks (see the engine doc above).
+        drop(rt);
+        if connected.load(Ordering::Relaxed) {
+            // The session was fully up before it died: the next outage is a
+            // fresh one. Restart the retry schedule and drop a stale Cancel
+            // that raced a reconnect which then succeeded.
+            retry = 0;
+            backoff.reset();
+            while cancel_rx.try_recv().is_ok() {}
+        }
+        let error = match result {
+            Ok(()) => {
+                info!("SSH session ended (orderly tmux exit)");
+                break;
+            }
+            Err(e) => e,
+        };
+        if !is_retryable_session_error(&error) {
+            error!(
+                %error,
+                host = %ssh.host,
+                port = ssh.port,
+                key = %ssh.key.display(),
+                key_exists,
+                "SSH session failed with a non-retryable error"
+            );
+            break;
+        }
+        retry = retry.saturating_add(1);
+        warn!(%error, retry, host = %ssh.host, "SSH connection lost, reconnecting");
+        let _ = status_tx.send(ConnectionStatus::SshReconnecting { retry });
+        match cancel_rx.recv_timeout(backoff.next_delay()) {
+            // The user canceled from the banner: stop retrying and surface
+            // the visible not-connected state.
+            Ok(()) => {
+                info!("SSH reconnect canceled by the user");
+                break;
+            }
+            Err(flume::RecvTimeoutError::Timeout) => {}
+            // The render side is gone (window closed): nobody to reconnect
+            // for.
+            Err(flume::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let _ = status_tx.send(ConnectionStatus::Disconnected);
+}
+
+/// Whether the reconnect engine should retry after this session failure: only
+/// an error chain carrying a retryable [`rift_ssh::SshError`] — a
+/// transport-shaped death — re-enters the loop. Everything else is treated as
+/// deterministic (auth/config failures; typeless session errors such as the
+/// mid-session protocol version mismatch, whose automatic re-run would
+/// re-enter the stale-daemon replacement #475 deliberately cut off) and
+/// surfaces as a visible disconnect instead of hiding behind retries (spec
+/// gate decision 2026-07-05).
+fn is_retryable_session_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<rift_ssh::SshError>()
+            .is_some_and(rift_ssh::SshError::is_retryable)
+    })
+}
+
+/// Drop the render-side backlog that accumulated while no session was live
+/// (spec constraint: no unbounded buffering while disconnected — drop and
+/// resync on reconnect). The engine's per-attempt runtime drop cancels the
+/// dead session's bridge consumers, but the render layer keeps sending on the
+/// shared flume channels, so without this drain every keystroke, tmux command,
+/// capture, and editor request queued during an outage would replay into the
+/// fresh attach — stale input injected into live panes minutes later. The
+/// dropped state is replaced by the resync: the daemon replays its snapshot,
+/// tmux replays the terminal. The one latest-value signal worth keeping is the
+/// client grid: drained resizes fold into the engine's viewport watch (last
+/// one wins), which the fresh attach re-asserts. Called only while no bridges
+/// are alive, so the engine is the sole consumer of the drained receivers.
+fn drain_render_backlog(ch: &PtyChannels, editor: &EditorChannels, watches: &EngineWatches) {
+    if let Some(size) = ch.size_changed_rx.drain().last() {
+        watches.viewport.send_replace(Some(size));
+    }
+    // A switch queued mid-outage is dropped without recording it on the
+    // session watch: the daemon never saw it, and the resync restores the
+    // last session actually asked of the daemon (#475 drop semantics).
+    let dropped = ch.input_rx.drain().count()
+        + ch.tmux_command_rx.drain().count()
+        + ch.capture_request_rx.drain().count()
+        + ch.key_table_request_rx.drain().count()
+        + ch.session_list_request_rx.drain().count()
+        + ch.session_switch_rx.drain().count()
+        + editor.open_file_rx.drain().count()
+        + editor.save_file_rx.drain().count()
+        + editor.buffer_change_rx.drain().count()
+        + editor.nav_request_rx.drain().count()
+        + editor.request_diff_rx.drain().count();
+    if dropped > 0 {
+        debug!(
+            dropped,
+            "dropped render-side backlog queued during the outage"
+        );
+    }
+}
+
+async fn run_ssh_session(
+    ssh: &SshConfig,
+    ch: PtyChannels,
+    editor: EditorChannels,
+    connected: &AtomicBool,
+    watches: &EngineWatches,
+) -> Result<()> {
     use rift_ssh::SshConnection;
 
     let mut conn = SshConnection::connect(&ssh.host, ssh.port, &ssh.user, &ssh.key)
@@ -557,11 +754,13 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels, editor: EditorChannel
     // degrading — falling back would hide real skew as silent feature death.
     let daemon_client = provision_daemon(&mut conn).await?;
 
-    // Tmux session name, overridable so a second rift instance can mirror the
-    // same live session (default `rift`) or attach to an isolated one for
-    // destructive tests (`RIFT_SESSION=rift-dev`). Matches the SshConfig env
-    // pattern above. See docs/spec-dogfooding-channels.md.
-    let session = env::var("RIFT_SESSION").unwrap_or_else(|_| "rift".to_string());
+    // Tmux session name: seeded from `RIFT_SESSION` into the engine's session
+    // watch (overridable so a second rift instance can mirror the same live
+    // session, default `rift`, or attach to an isolated one for destructive
+    // tests, `RIFT_SESSION=rift-dev` — docs/spec-dogfooding-channels.md).
+    // Resolved through the watch, not the env, so an SSH-level reconnect
+    // re-attaches the session a cockpit switch (#509) moved the client to.
+    let session = watches.session.borrow().clone();
 
     // Terminal byte source (Phase 6 swap, #205): the daemon protocol is the
     // default; the legacy direct `tmux -CC` over an SSH PTY stays as an
@@ -572,7 +771,10 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels, editor: EditorChannel
         match daemon_client {
             Some((client, endpoint)) => {
                 info!("terminal source: daemon protocol");
-                return run_daemon_terminal(&mut conn, client, endpoint, session, ch, editor).await;
+                return run_daemon_terminal(
+                    &mut conn, client, endpoint, watches, ch, editor, connected,
+                )
+                .await;
             }
             None => warn!(
                 "daemon terminal selected but no daemon available; \
@@ -601,7 +803,7 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels, editor: EditorChannel
         info!("terminal source: legacy tmux (no daemon configured)");
     }
 
-    run_legacy_terminal(conn, session, ch).await
+    run_legacy_terminal(conn, session, ch, connected).await
 }
 
 /// Whether the terminal sources its bytes from the daemon protocol (the default)
@@ -618,9 +820,11 @@ fn use_daemon_terminal() -> bool {
 /// attach, bridge the reverse path (input, resize, raw commands, capture) onto
 /// the protocol, and fold the daemon's pane-output / layout / worktree stream
 /// into the existing render channels. Blocks until the tmux attach reports
-/// `TerminalExit`; returning ends the session (`Disconnected` → quit), matching
-/// the legacy `tmux` exit path. The SSH connection (`conn`) stays alive for the
-/// session; the recovery engine below reuses it to reopen daemon channels.
+/// `TerminalExit`; returning `Ok` ends the session as an orderly exit, which
+/// the SSH-level engine (#476) surfaces as the visible `Disconnected` state
+/// without retrying — never an app quit. The SSH connection (`conn`) stays
+/// alive for the session; the recovery engine below reuses it to reopen daemon
+/// channels.
 ///
 /// A daemon-channel death (EOF, malformed frame, channel error) while SSH is
 /// up does NOT end the session (#475, `docs/spec-connection-robustness.md`):
@@ -636,14 +840,20 @@ fn use_daemon_terminal() -> bool {
 /// currently attached session (a cockpit switch, #509, may have moved off the
 /// startup one) and the last known client grid (re-asserted as a `ResizePane`
 /// after the re-Attach — the fresh tmux child spawns unsized and the render
-/// layer only re-sends on a size change).
+/// layer only re-sends on a size change). Both live at ENGINE scope
+/// ([`EngineWatches`], owned by `run_session_with_reconnect`), not per
+/// attempt: the SSH-level reconnect needs the same two answers — otherwise it
+/// would silently re-attach the startup session after a cockpit switch and
+/// leave the fresh child on the attach-default grid — so this function
+/// receives the handles instead of creating them.
 async fn run_daemon_terminal(
     conn: &mut rift_ssh::SshConnection,
     client: rift_ssh::DaemonClient,
     endpoint: DaemonEndpoint,
-    session: String,
+    watches: &EngineWatches,
     ch: PtyChannels,
     editor: EditorChannels,
+    connected: &AtomicBool,
 ) -> Result<()> {
     use rift_protocol::ClientMessage;
     use std::sync::Arc;
@@ -660,7 +870,7 @@ async fn run_daemon_terminal(
     // switch; a switch dropped during an outage stays untracked (dropped,
     // never buffered), so recovery restores the last session actually asked of
     // the daemon.
-    let (session_tx, session_rx) = tokio::sync::watch::channel(session.clone());
+    let session_rx = watches.session.subscribe();
     // The render layer's last known client grid. Its resize channel only fires
     // on a size *change*, so after a reconnect nobody would re-send the size —
     // the fresh tmux child would stay on the 80x24 attach default until the
@@ -668,15 +878,40 @@ async fn run_daemon_terminal(
     // here; the recovery re-asserts it right after the re-Attach, mirroring
     // the session switch's viewport re-assert. `None` until the first layout
     // fires (then the attach default is all there is to keep).
-    let (viewport_tx, viewport_rx) = tokio::sync::watch::channel(None::<TermSize>);
+    let viewport_rx = watches.viewport.subscribe();
 
-    // Open this client's own tmux attach, carrying `RIFT_SESSION` end-to-end. The
-    // daemon answers with a LayoutSnapshot baseline, then the live stream.
-    if let Err(e) = client.send(ClientMessage::Attach { session }).await {
-        warn!(%e, "failed to open daemon terminal attach");
-        return Ok(());
+    // Open this client's own tmux attach against the engine-tracked current
+    // session (`RIFT_SESSION`-seeded end-to-end). The daemon answers with a
+    // LayoutSnapshot baseline, then the live stream. A failed send means the
+    // daemon channel died right behind the handshake — a transport death for
+    // the reconnect engine, not an orderly end.
+    let session = watches.session.borrow().clone();
+    client
+        .send(ClientMessage::Attach { session })
+        .await
+        .context("failed to open daemon terminal attach")?;
+    // Re-assert the last known grid behind the attach, exactly like the
+    // recovery's re-Attach does: on an SSH-level reconnect the fresh tmux
+    // child spawns unsized and the render layer will not re-send an unchanged
+    // size. `None` on the very first connect — the initial layout's resize is
+    // still in flight and lands through the resize bridge instead. The value
+    // is copied out before the send so the watch read guard is never held
+    // across an await (`reconnect_daemon` does the same).
+    let viewport = *watches.viewport.borrow();
+    if let Some(size) = viewport {
+        client
+            .send(ClientMessage::ResizePane {
+                pane_id: 0,
+                cols: size.cols as u16,
+                rows: size.rows as u16,
+            })
+            .await
+            .context("failed to re-assert client viewport after attach")?;
     }
     let _ = ch.connection_status_tx.send(ConnectionStatus::Connected);
+    // Tells the reconnect engine this run was fully up, so the next outage
+    // restarts the retry schedule instead of continuing the old one.
+    connected.store(true, Ordering::Relaxed);
 
     // Reverse-path bridges: each forwards a render-side flume stream onto the
     // protocol. They live as long as their render-side channel; a send that
@@ -684,7 +919,11 @@ async fn run_daemon_terminal(
     // resync replaces state). Pane ids cross the seam as tmux's native `%N`
     // form.
     spawn_input_bridge(client_rx.clone(), ch.input_rx);
-    spawn_resize_bridge(client_rx.clone(), ch.size_changed_rx, viewport_tx);
+    spawn_resize_bridge(
+        client_rx.clone(),
+        ch.size_changed_rx,
+        watches.viewport.clone(),
+    );
     spawn_command_bridge(client_rx.clone(), ch.tmux_command_rx);
     spawn_capture_bridge(client_rx.clone(), ch.capture_request_rx);
     // Key-table refresh reverse path (tmux key-table mirroring, #212): each
@@ -704,7 +943,11 @@ async fn run_daemon_terminal(
     // recovery re-attaches to the session the client is actually on, not the
     // one it started on.
     spawn_session_list_bridge(client_rx.clone(), ch.session_list_request_rx);
-    spawn_session_switch_bridge(client_rx.clone(), ch.session_switch_rx, session_tx);
+    spawn_session_switch_bridge(
+        client_rx.clone(),
+        ch.session_switch_rx,
+        watches.session.clone(),
+    );
     // Buffer channel reverse path: the editor's open requests become `OpenFile`
     // reads (#187) and its save requests `SaveFile` writes (#188). The forward
     // replies (`FileContent` / `SaveResult` / `SaveConflict`) return via
@@ -783,9 +1026,20 @@ async fn reconnect_daemon(
     viewport_rx: &tokio::sync::watch::Receiver<Option<TermSize>>,
 ) -> Result<std::sync::Arc<rift_ssh::DaemonClient>> {
     let mut backoff = rift_ssh::ReconnectBackoff::new();
+    let mut last_transient: Option<rift_ssh::SshError> = None;
     for attempt in 1..=DAEMON_RECONNECT_MAX_ATTEMPTS {
         if attempt > 1 {
             tokio::time::sleep(backoff.next_delay()).await;
+        }
+        // A dead SSH transport (drop, exhausted keepalive window, #438)
+        // cannot carry a daemon channel: hand the outage to the SSH-level
+        // reconnect loop (#476) right away instead of burning the bounded
+        // attempts against it.
+        if conn.is_closed() {
+            return Err(anyhow::Error::new(rift_ssh::SshError::Connection(
+                "SSH transport closed".to_string(),
+            ))
+            .context("daemon stream reconnect aborted"));
         }
         info!(attempt, "reconnecting daemon stream");
         let session = session_rx.borrow().clone();
@@ -804,12 +1058,20 @@ async fn reconnect_daemon(
             }
             Err(ReconnectFailure::Transient(e)) => {
                 warn!(%e, attempt, "daemon reconnect attempt failed");
+                last_transient = Some(e);
             }
         }
     }
-    Err(anyhow::anyhow!(
-        "daemon stream reconnect gave up after {DAEMON_RECONNECT_MAX_ATTEMPTS} attempts"
-    ))
+    // Carry the last transport error in the chain so the SSH-level engine can
+    // classify the give-up as retryable (`is_retryable_session_error`).
+    Err(match last_transient {
+        Some(e) => anyhow::Error::new(e).context(format!(
+            "daemon stream reconnect gave up after {DAEMON_RECONNECT_MAX_ATTEMPTS} attempts"
+        )),
+        None => anyhow::anyhow!(
+            "daemon stream reconnect gave up after {DAEMON_RECONNECT_MAX_ATTEMPTS} attempts"
+        ),
+    })
 }
 
 /// One reconnect attempt (#475): reattach to the daemon socket — respawning a
@@ -876,6 +1138,7 @@ async fn run_legacy_terminal(
     mut conn: rift_ssh::SshConnection,
     session: String,
     ch: PtyChannels,
+    connected: &AtomicBool,
 ) -> Result<()> {
     use termy_terminal_ui::{TmuxClient, TmuxNotification, TmuxSocketTarget};
 
@@ -923,6 +1186,8 @@ async fn run_legacy_terminal(
 
     info!("tmux control mode connected");
     let _ = ch.connection_status_tx.send(ConnectionStatus::Connected);
+    // See `run_daemon_terminal`: resets the reconnect engine's retry schedule.
+    connected.store(true, Ordering::Relaxed);
 
     let pane_output_tx = ch.pane_output_tx;
     let input_rx = ch.input_rx;
@@ -1067,9 +1332,12 @@ const DAEMON_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// Upper bound on consecutive daemon reconnect attempts after a mid-session
 /// stream death (#475). With [`rift_ssh::ReconnectBackoff`]'s capped schedule
 /// this covers roughly two minutes of outage before recovery gives up and the
-/// session fails visibly (`Disconnected`) — a daemon that [`reconnect_daemon`]
-/// cannot respawn within that window is a structural failure (SSH transport
-/// dead, binary gone), which the SSH-level reconnect loop (#476) owns.
+/// session fails over to [`run_session_with_reconnect`] — a daemon that
+/// [`reconnect_daemon`] cannot respawn within that window is a structural
+/// failure (SSH transport dead, binary gone), which the SSH-level reconnect
+/// loop (#476) owns. A dead SSH transport short-circuits the window via
+/// `SshConnection::is_closed`, so an SSH drop reaches the SSH-level loop (and
+/// its banner) within the keepalive detection bound (#438), not after it.
 const DAEMON_RECONNECT_MAX_ATTEMPTS: u32 = 10;
 
 /// The resolved remote daemon endpoint [`provision_daemon`] produced:
@@ -1404,10 +1672,10 @@ async fn consume_daemon_messages(
                 info!(%session, ?reason, "daemon terminal path down");
                 if terminal.is_some() {
                     // The tmux attach itself ended (an orderly `%exit`, not a
-                    // transport death): end the session so the app surfaces it
-                    // the same way the legacy `tmux` exit does (Disconnected →
-                    // quit). Never recovered from — recovery is for stream
-                    // deaths only (#475).
+                    // transport death): end the session so it surfaces as the
+                    // visible `Disconnected` state without a reconnect (#476).
+                    // Never recovered from — recovery is for stream deaths
+                    // only (#475).
                     return StreamEnd::TerminalExit;
                 }
             }
@@ -1884,5 +2152,272 @@ fn layout_to_snapshot(
         session_name: session,
         session_id: None,
         windows,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        drain_render_backlog, is_retryable_session_error, CaptureRequest, EditorChannels,
+        EngineWatches, PaneInput, PtyChannels, SessionSwitchRequest, TermSize,
+    };
+
+    /// The engine-side ends ([`PtyChannels`] / [`EditorChannels`] /
+    /// [`EngineWatches`]) plus every render-side sender the backlog drain can
+    /// receive from, wired exactly like the production channel setup.
+    struct BacklogHarness {
+        ch: PtyChannels,
+        editor: EditorChannels,
+        watches: EngineWatches,
+        input_tx: flume::Sender<PaneInput>,
+        size_tx: flume::Sender<TermSize>,
+        command_tx: flume::Sender<String>,
+        capture_tx: flume::Sender<CaptureRequest>,
+        key_table_tx: flume::Sender<()>,
+        session_list_tx: flume::Sender<()>,
+        switch_tx: flume::Sender<SessionSwitchRequest>,
+        open_file_tx: flume::Sender<String>,
+        save_file_tx: flume::Sender<rift_protocol::ClientMessage>,
+        buffer_change_tx: flume::Sender<rift_protocol::ClientMessage>,
+        nav_tx: flume::Sender<rift_protocol::ClientMessage>,
+        request_diff_tx: flume::Sender<String>,
+    }
+
+    fn backlog_harness() -> BacklogHarness {
+        let (pane_output_tx, _) = flume::unbounded();
+        let (input_tx, input_rx) = flume::unbounded();
+        let (size_tx, size_changed_rx) = flume::unbounded();
+        let (snapshot_tx, _) = flume::unbounded();
+        let (command_tx, tmux_command_rx) = flume::unbounded();
+        let (subscription_tx, _) = flume::unbounded();
+        let (capture_tx, capture_request_rx) = flume::unbounded();
+        let (capture_result_tx, _) = flume::unbounded();
+        let (connection_status_tx, _) = flume::unbounded();
+        let (key_table_tx, key_table_request_rx) = flume::unbounded();
+        let (key_table_result_tx, _) = flume::unbounded();
+        let (session_list_result_tx, _) = flume::unbounded();
+        let (session_list_tx, session_list_request_rx) = flume::unbounded();
+        let (switch_tx, session_switch_rx) = flume::unbounded();
+        let (worktree_tx, _) = flume::unbounded();
+        let (buffer_tx, _) = flume::unbounded();
+        let (nav_reply_tx, _) = flume::unbounded();
+        let (status_line_tx, _) = flume::unbounded();
+        let (open_file_tx, open_file_rx) = flume::unbounded();
+        let (save_file_tx, save_file_rx) = flume::unbounded();
+        let (buffer_change_tx, buffer_change_rx) = flume::unbounded();
+        let (nav_tx, nav_request_rx) = flume::unbounded();
+        let (diff_tx, _) = flume::unbounded();
+        let (request_diff_tx, request_diff_rx) = flume::unbounded();
+        BacklogHarness {
+            ch: PtyChannels {
+                pane_output_tx,
+                input_rx,
+                size_changed_rx,
+                snapshot_tx,
+                tmux_command_rx,
+                subscription_tx,
+                capture_request_rx,
+                capture_result_tx,
+                connection_status_tx,
+                key_table_request_rx,
+                key_table_result_tx,
+                session_list_tx: session_list_result_tx,
+                session_list_request_rx,
+                session_switch_rx,
+            },
+            editor: EditorChannels {
+                worktree_tx,
+                buffer_tx,
+                nav_tx: nav_reply_tx,
+                status_line_tx,
+                open_file_rx,
+                save_file_rx,
+                buffer_change_rx,
+                nav_request_rx,
+                diff_tx,
+                request_diff_rx,
+            },
+            watches: EngineWatches {
+                session: tokio::sync::watch::channel("rift".to_string()).0,
+                viewport: tokio::sync::watch::channel(None::<TermSize>).0,
+            },
+            input_tx,
+            size_tx,
+            command_tx,
+            capture_tx,
+            key_table_tx,
+            session_list_tx,
+            switch_tx,
+            open_file_tx,
+            save_file_tx,
+            buffer_change_tx,
+            nav_tx,
+            request_diff_tx,
+        }
+    }
+
+    #[test]
+    fn test_drain_render_backlog_queued_backlog_discarded() {
+        let h = backlog_harness();
+        h.input_tx
+            .send(PaneInput {
+                pane_id: "%1".into(),
+                bytes: b"stale keystrokes\r".to_vec(),
+            })
+            .expect("send input");
+        h.command_tx
+            .send("kill-pane -t %1".into())
+            .expect("send command");
+        h.capture_tx
+            .send(CaptureRequest {
+                pane_id: "%1".into(),
+                start_row: "-".into(),
+                end_row: "-1".into(),
+                join_wraps: false,
+            })
+            .expect("send capture");
+        h.key_table_tx.send(()).expect("send key-table refresh");
+        h.session_list_tx
+            .send(())
+            .expect("send session-list refresh");
+        h.switch_tx
+            .send(SessionSwitchRequest {
+                session: "elsewhere".into(),
+                size: TermSize { cols: 80, rows: 24 },
+            })
+            .expect("send switch");
+        h.open_file_tx
+            .send("src/main.rs".into())
+            .expect("send open");
+        h.save_file_tx
+            .send(rift_protocol::ClientMessage::SaveFile {
+                path: "src/main.rs".into(),
+                content: "fn main() {}\n".into(),
+                base_mtime: std::time::SystemTime::UNIX_EPOCH,
+            })
+            .expect("send save");
+        h.buffer_change_tx
+            .send(rift_protocol::ClientMessage::BufferClosed {
+                path: "src/main.rs".into(),
+            })
+            .expect("send buffer change");
+        h.nav_tx
+            .send(rift_protocol::ClientMessage::DefinitionRequest {
+                id: rift_protocol::NavRequestId(1),
+                path: "src/main.rs".into(),
+                position: rift_protocol::Position {
+                    line: 0,
+                    character: 0,
+                },
+            })
+            .expect("send nav");
+        h.request_diff_tx
+            .send("src/main.rs".into())
+            .expect("send diff request");
+
+        drain_render_backlog(&h.ch, &h.editor, &h.watches);
+
+        assert!(h.ch.input_rx.is_empty());
+        assert!(h.ch.tmux_command_rx.is_empty());
+        assert!(h.ch.capture_request_rx.is_empty());
+        assert!(h.ch.key_table_request_rx.is_empty());
+        assert!(h.ch.session_list_request_rx.is_empty());
+        assert!(h.ch.session_switch_rx.is_empty());
+        assert!(h.editor.open_file_rx.is_empty());
+        assert!(h.editor.save_file_rx.is_empty());
+        assert!(h.editor.buffer_change_rx.is_empty());
+        assert!(h.editor.nav_request_rx.is_empty());
+        assert!(h.editor.request_diff_rx.is_empty());
+    }
+
+    #[test]
+    fn test_drain_render_backlog_latest_size_folded_into_viewport_watch() {
+        let h = backlog_harness();
+        h.size_tx
+            .send(TermSize {
+                cols: 120,
+                rows: 40,
+            })
+            .expect("send size");
+        h.size_tx
+            .send(TermSize {
+                cols: 200,
+                rows: 60,
+            })
+            .expect("send size");
+
+        drain_render_backlog(&h.ch, &h.editor, &h.watches);
+
+        assert_eq!(
+            *h.watches.viewport.borrow(),
+            Some(TermSize {
+                cols: 200,
+                rows: 60
+            })
+        );
+        assert!(h.ch.size_changed_rx.is_empty());
+    }
+
+    #[test]
+    fn test_drain_render_backlog_no_queued_size_keeps_viewport_watch() {
+        let h = backlog_harness();
+        drain_render_backlog(&h.ch, &h.editor, &h.watches);
+        assert_eq!(*h.watches.viewport.borrow(), None);
+    }
+
+    #[test]
+    fn test_drain_render_backlog_dropped_switch_leaves_session_watch_untouched() {
+        // A switch queued mid-outage never reached the daemon: it is dropped,
+        // never buffered, and must not move the session watch (#475 drop
+        // semantics) — the reconnect restores the last session actually asked
+        // of the daemon.
+        let h = backlog_harness();
+        h.switch_tx
+            .send(SessionSwitchRequest {
+                session: "elsewhere".into(),
+                size: TermSize { cols: 80, rows: 24 },
+            })
+            .expect("send switch");
+
+        drain_render_backlog(&h.ch, &h.editor, &h.watches);
+
+        assert_eq!(*h.watches.session.borrow(), "rift");
+    }
+
+    #[test]
+    fn test_is_retryable_session_error_transport_chain_returns_true() {
+        let error = anyhow::Error::new(rift_ssh::SshError::Connection(
+            "connection reset by peer".into(),
+        ))
+        .context("SSH connection failed");
+        assert!(is_retryable_session_error(&error));
+    }
+
+    #[test]
+    fn test_is_retryable_session_error_auth_chain_returns_false() {
+        let error = anyhow::Error::new(rift_ssh::SshError::Auth(
+            "public key authentication failed".into(),
+        ))
+        .context("SSH connection failed");
+        assert!(!is_retryable_session_error(&error));
+    }
+
+    #[test]
+    fn test_is_retryable_session_error_plain_message_returns_false() {
+        // A typeless session error (e.g. the mid-session protocol version
+        // mismatch, #475) must not re-enter the pipeline: retrying would
+        // re-run the stale-daemon replacement against a daemon another live
+        // client owns.
+        let error = anyhow::anyhow!("daemon protocol version changed mid-session");
+        assert!(!is_retryable_session_error(&error));
+    }
+
+    #[test]
+    fn test_is_retryable_session_error_nested_transport_chain_returns_true() {
+        // The daemon recovery's give-up carries its last transport error as
+        // the source, so the engine classifies the whole outage as retryable.
+        let error = anyhow::Error::new(rift_ssh::SshError::Channel("channel closed".into()))
+            .context("daemon stream reconnect gave up after 10 attempts");
+        assert!(is_retryable_session_error(&error));
     }
 }
