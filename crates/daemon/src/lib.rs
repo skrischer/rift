@@ -265,11 +265,14 @@ fn worktree_worker(root: PathBuf, events: mpsc::Sender<WorktreeEvent>) {
 /// into the dispatch loop until a channel closes or the loop is gone.
 ///
 /// In git mode the git channel is the primary wait: `with_git_status` emits a
-/// recompute on *every* flush, while worktree changes are emitted only on a
-/// non-empty diff and always *before* the flush's git tick. So blocking on the
-/// git tick and then draining the worktree changes already queued preserves the
-/// order (tree update before its git decoration). Without git, this is the
-/// original worktree-only relay.
+/// recompute on *every* successful flush, while worktree changes are emitted
+/// only on a non-empty diff and always *before* the flush's git tick. So
+/// blocking on the git tick and then draining the worktree changes already
+/// queued preserves the order (tree update before its git decoration). A flush
+/// whose git recompute fails (e.g. a transient `index.lock`) emits no tick, so
+/// the idle-poll timeout drains the queued worktree changes too — the tree
+/// keeps updating while git status recovers on a later tick (#430). Without
+/// git, this is the original worktree-only relay.
 fn relay_events(
     changes: &std::sync::mpsc::Receiver<Vec<Change>>,
     git: Option<&std::sync::mpsc::Receiver<GitStatus>>,
@@ -282,10 +285,8 @@ fn relay_events(
                 Ok(status) => {
                     // Drain the worktree changes this flush queued before its
                     // git tick, so the tree update precedes the git decoration.
-                    while let Ok(batch) = changes.try_recv() {
-                        if events.blocking_send(WorktreeEvent::Changed(batch)).is_err() {
-                            return;
-                        }
+                    if !drain_changes(changes, events) {
+                        return;
                     }
                     if events
                         .blocking_send(WorktreeEvent::GitRecomputed(status))
@@ -295,6 +296,13 @@ fn relay_events(
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    // No git tick — either idle, or a flush whose git recompute
+                    // failed and emitted none. Its worktree changes are already
+                    // queued; relay them so the client tree never stalls on a
+                    // failing recompute (#430).
+                    if !drain_changes(changes, events) {
+                        return;
+                    }
                     if events.is_closed() {
                         return;
                     }
@@ -316,6 +324,20 @@ fn relay_events(
             },
         }
     }
+}
+
+/// Drain every queued worktree change batch into the dispatch loop. Returns
+/// `false` when the loop is gone (the relay should stop).
+fn drain_changes(
+    changes: &std::sync::mpsc::Receiver<Vec<Change>>,
+    events: &mpsc::Sender<WorktreeEvent>,
+) -> bool {
+    while let Ok(batch) = changes.try_recv() {
+        if events.blocking_send(WorktreeEvent::Changed(batch)).is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Receive the next worktree event, or pend forever when no worktree is armed
@@ -2399,6 +2421,64 @@ mod tests {
         git(&tmp.path, &["add", "tracked.txt"]);
         git(&tmp.path, &["commit", "-q", "-m", "init"]);
         tmp
+    }
+
+    /// A flush whose git recompute fails emits worktree changes but no git tick
+    /// (#430). The relay must still deliver those changes on the idle-poll
+    /// timeout — not hold them until the next successful recompute — and a
+    /// later successful recompute must follow as a normal git tick.
+    #[tokio::test]
+    async fn test_relay_events_git_tick_absent_still_relays_worktree_changes() {
+        let (changes_tx, changes_rx) = std::sync::mpsc::channel::<Vec<Change>>();
+        let (git_tx, git_rx) = std::sync::mpsc::channel::<GitStatus>();
+        let (events_tx, mut events_rx) = mpsc::channel(WORKTREE_EVENT_CAPACITY);
+
+        // `relay_events` blocks (`recv_timeout` / `blocking_send`), so it runs
+        // on its own thread — the same shape as the production worker.
+        let relay = std::thread::spawn(move || {
+            relay_events(&changes_rx, Some(&git_rx), &events_tx);
+        });
+
+        // Injected git failure: the flush queued a change batch, but the failed
+        // recompute produced no git tick.
+        changes_tx
+            .send(vec![Change::Removed {
+                path: PathBuf::from("gone.txt"),
+            }])
+            .expect("queue change batch");
+
+        let event = tokio::time::timeout(Duration::from_secs(5), events_rx.recv())
+            .await
+            .expect("worktree change relayed despite the missing git tick")
+            .expect("relay alive");
+        assert!(
+            matches!(
+                &event,
+                WorktreeEvent::Changed(batch)
+                    if matches!(
+                        batch.as_slice(),
+                        [Change::Removed { path }] if path.as_path() == Path::new("gone.txt")
+                    )
+            ),
+            "expected the queued change batch to be relayed"
+        );
+
+        // Git status recovers on a later tick: the recompute is relayed as a
+        // normal GitRecomputed event.
+        let repo = init_git_repo("relay-drain");
+        let status = GitStatus::compute(&repo.path).expect("compute status");
+        git_tx.send(status).expect("queue git tick");
+        let event = tokio::time::timeout(Duration::from_secs(5), events_rx.recv())
+            .await
+            .expect("git tick relayed after recovery")
+            .expect("relay alive");
+        assert!(matches!(event, WorktreeEvent::GitRecomputed(_)));
+
+        // Dropping the watcher-side senders disconnects the relay's channels;
+        // it must return rather than spin.
+        drop(changes_tx);
+        drop(git_tx);
+        relay.join().expect("relay thread joins cleanly");
     }
 
     #[test]
