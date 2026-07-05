@@ -17,7 +17,8 @@
 //!   rift's own protocol types (the daemon does the translation — `protocol`
 //!   stays free of `lsp-types`) and hands them to the dispatch loop, keyed by
 //!   worktree-relative path and server id for full-set-per-`(file, server)`
-//!   replace.
+//!   replace. A crashed server's replacement publishes under a fresh id, so
+//!   the worker clears the dead id's sets when the registry prunes it (#427).
 //! - **navigation requests** (#195): [`NavRequest`] carries hover / definition /
 //!   references requests from the dispatch loop to the worker. The worker finds
 //!   the first capable server via the registry, spawns a task that issues the
@@ -30,6 +31,7 @@
 //! stdio all live on the registry's own tasks; the loop only forwards change
 //! batches and folds the resulting diagnostics.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use rift_explorer::Change;
@@ -224,6 +226,12 @@ pub struct LspWorker {
     completed_nav: mpsc::UnboundedReceiver<(NavRequestId, DaemonMessage)>,
     /// The sender side of `completed_nav` — cloned into each spawned nav task.
     completed_nav_tx: mpsc::UnboundedSender<(NavRequestId, DaemonMessage)>,
+    /// Worktree-relative paths with a live (non-empty) diagnostic set per
+    /// server instance, mirrored from the publishes forwarded downstream. When
+    /// the registry prunes a dead instance these are the paths that need a
+    /// clearing empty update — the replacement publishes under a fresh id, so
+    /// nothing else would ever drop the dead id's sets (#427).
+    diagnostic_paths: HashMap<ServerId, HashSet<String>>,
 }
 
 impl LspWorker {
@@ -260,6 +268,7 @@ impl LspWorker {
             latest_references_id: None,
             completed_nav,
             completed_nav_tx,
+            diagnostic_paths: HashMap::new(),
         }
     }
 
@@ -317,6 +326,7 @@ impl LspWorker {
             BufferEvent::Changed { path, .. } | BufferEvent::Closed { path } => PathBuf::from(path),
         };
         let ids = self.registry.observe(&path).await;
+        self.clear_pruned();
         // The sink borrows `registry` immutably while `sync` is borrowed mutably —
         // distinct fields, so the split borrow holds (as in `apply_changes`).
         let mut sink = ServerSink::for_servers(&self.registry, ids);
@@ -339,6 +349,9 @@ impl LspWorker {
     async fn apply_changes(&mut self, batch: Vec<DocumentChange>) {
         for change in batch {
             let ids = self.registry.observe(change.path()).await;
+            // The observe may have pruned a dead instance: clear its stale
+            // sets before this change's own publishes land.
+            self.clear_pruned();
             // A change matching no server (unknown language, or every server for
             // it unavailable) drives no document — there is nothing to feed.
             if ids.is_empty() {
@@ -360,14 +373,33 @@ impl LspWorker {
     /// dispatch loop. A publish for a URI outside the watched root, or one that
     /// is not a `file://` path, is dropped — there is no relative key for it.
     fn publish(&mut self, id: ServerId, params: PublishDiagnosticsParams) {
+        // A publish that raced the server's death is dropped: forwarding it
+        // could re-record diagnostics under a dead id after `clear_pruned`
+        // already ran, leaving a stale set nothing would ever clear (#427).
+        if self.registry.server(id).is_none() {
+            return;
+        }
         let Some(path) = self.relative_path(&params) else {
             return;
         };
-        let items = params
+        let items: Vec<Diagnostic> = params
             .diagnostics
             .iter()
             .map(translate_diagnostic)
             .collect();
+        if items.is_empty() {
+            if let Some(paths) = self.diagnostic_paths.get_mut(&id) {
+                paths.remove(&path);
+                if paths.is_empty() {
+                    self.diagnostic_paths.remove(&id);
+                }
+            }
+        } else {
+            self.diagnostic_paths
+                .entry(id)
+                .or_default()
+                .insert(path.clone());
+        }
         let diagnostics = LspDiagnostics {
             path,
             server: id.0.to_string(),
@@ -376,6 +408,30 @@ impl LspWorker {
         // A closed receiver means the dispatch loop is gone; the worker's own
         // channels will close next and `run` will stop, so dropping here is fine.
         let _ = self.diagnostics_out.try_send(diagnostics);
+    }
+
+    /// Push a clearing (empty) update for every path a just-pruned (dead)
+    /// server instance still had live diagnostics on (#427).
+    ///
+    /// Called after each `Registry::observe`: a restart assigns the
+    /// replacement a fresh [`ServerId`], so the dead id's `(path, server)`
+    /// sets downstream would otherwise persist forever — stale errors in the
+    /// problems view and status counts.
+    fn clear_pruned(&mut self) {
+        for id in self.registry.take_pruned() {
+            let Some(paths) = self.diagnostic_paths.remove(&id) else {
+                continue;
+            };
+            for path in paths {
+                let cleared = LspDiagnostics {
+                    path,
+                    server: id.0.to_string(),
+                    items: Vec::new(),
+                };
+                // Same closed-receiver rationale as `publish`.
+                let _ = self.diagnostics_out.try_send(cleared);
+            }
+        }
     }
 
     /// The publish URI as a path relative to the watched root, or `None` when the

@@ -14,6 +14,9 @@
 //! That lets the test introduce an error (write a file containing the marker)
 //! and then clear it (rewrite without the marker) and observe the daemon's
 //! diagnostics model converge. `shutdown` / `exit` end the loop cleanly.
+//! With `--crash-marker <m>`, text containing that marker makes the stub exit
+//! abruptly (no publish, no shutdown handshake) — modelling a server crash for
+//! the restart test (issue #427).
 //!
 //! Parsing is deliberately hand-rolled and dependency-free (no `serde_json`):
 //! the messages are tiny and fully controlled by the test, so scanning for the
@@ -36,21 +39,27 @@ struct Config {
     /// echoing the URI it was opened with. Used by the #308 regression test to
     /// exercise the daemon's root-canonicalization without a real server.
     canonicalize_uri: bool,
+    /// When set, document text containing this marker makes the stub exit
+    /// abruptly — modelling a crash for the restart test (issue #427).
+    crash_marker: Option<String>,
 }
 
-/// Parse `--marker <m>` / `--message <m>` / `--canonicalize-uri` from the process
-/// args. Defaults: the marker is `LSP_STUB_ERROR`; the message echoes the marker
-/// so a single stub is self-describing; URIs are echoed verbatim.
+/// Parse `--marker <m>` / `--message <m>` / `--canonicalize-uri` /
+/// `--crash-marker <m>` from the process args. Defaults: the marker is
+/// `LSP_STUB_ERROR`; the message echoes the marker so a single stub is
+/// self-describing; URIs are echoed verbatim; no crash marker.
 fn config() -> Config {
     let mut marker = None;
     let mut message = None;
     let mut canonicalize_uri = false;
+    let mut crash_marker = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--marker" => marker = args.next(),
             "--message" => message = args.next(),
             "--canonicalize-uri" => canonicalize_uri = true,
+            "--crash-marker" => crash_marker = args.next(),
             _ => {}
         }
     }
@@ -60,6 +69,7 @@ fn config() -> Config {
         marker,
         message,
         canonicalize_uri,
+        crash_marker,
     }
 }
 
@@ -86,6 +96,7 @@ fn main() -> io::Result<()> {
         marker,
         message,
         canonicalize_uri,
+        crash_marker,
     } = config();
     let mut stdin = io::stdin().lock();
     let stdout = io::stdout();
@@ -118,6 +129,11 @@ fn main() -> io::Result<()> {
             }
             "exit" => return Ok(()),
             "textDocument/didOpen" | "textDocument/didChange" => {
+                // A crash-marked document models a server crash: exit abruptly,
+                // before any publish and without the shutdown handshake (#427).
+                if crash_marker.as_deref().is_some_and(|m| body.contains(m)) {
+                    std::process::exit(2);
+                }
                 if let Some(uri) = scan_field(&body, "uri") {
                     let has_error = body.contains(&marker);
                     // Model a real server that publishes under the canonical path
