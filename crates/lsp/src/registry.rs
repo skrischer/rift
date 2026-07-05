@@ -69,6 +69,9 @@ pub struct Registry {
     missing_logged: HashSet<ServerName>,
     /// Per-binary restart throttle.
     backoff: HashMap<ServerName, Backoff>,
+    /// Ids pruned from the store since the last [`Registry::take_pruned`] —
+    /// dead instances whose diagnostics a downstream consumer may still hold.
+    pruned: Vec<ServerId>,
     /// Cloned into each spawned server's router so its diagnostics reach the
     /// daemon consumer.
     diagnostics_tx: mpsc::UnboundedSender<(ServerId, PublishDiagnosticsParams)>,
@@ -101,6 +104,7 @@ impl Registry {
             by_language: HashMap::new(),
             missing_logged: HashSet::new(),
             backoff: HashMap::new(),
+            pruned: Vec::new(),
             diagnostics_tx,
         }
     }
@@ -270,6 +274,7 @@ impl Registry {
                 if let Some(ids) = self.by_language.get_mut(server.language()) {
                     ids.retain(|other| *other != id);
                 }
+                self.pruned.push(id);
                 info!(
                     server = server.name(),
                     language = server.language(),
@@ -278,6 +283,17 @@ impl Registry {
                 );
             }
         }
+    }
+
+    /// Drain the ids of servers pruned since the last call.
+    ///
+    /// A pruned instance's diagnostics stay keyed by its [`ServerId`]
+    /// downstream, and a restarted replacement publishes under a fresh id —
+    /// nothing would ever overwrite the dead id's sets. The consumer drains
+    /// this after each [`Registry::observe`] and pushes clearing (empty)
+    /// updates for the dead ids' paths (issue #427).
+    pub fn take_pruned(&mut self) -> Vec<ServerId> {
+        std::mem::take(&mut self.pruned)
     }
 
     /// Log a missing binary at most once per binary name.
@@ -418,6 +434,17 @@ mod tests {
         // and per-binary bookkeeping addressing each separately.
         assert_eq!(reg.missing_logged.len(), 2);
         assert_eq!(reg.backoff.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_take_pruned_without_dead_servers_returns_empty() {
+        let mut reg = registry(MISSING);
+        assert!(reg.take_pruned().is_empty());
+        reg.observe(Path::new("a.rs")).await;
+        // A failed start is not a prune — only a dead *registered* server is;
+        // the real prune path is covered end-to-end by the daemon's stub-server
+        // crash+restart integration test.
+        assert!(reg.take_pruned().is_empty());
     }
 
     #[tokio::test]

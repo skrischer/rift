@@ -16,6 +16,8 @@ pub enum SshError {
     UnsupportedPlatform(String),
     #[error("daemon launch did not become ready: {0}")]
     DaemonLaunch(String),
+    #[error("timed out after {0:?} waiting for a daemon message")]
+    RecvTimeout(std::time::Duration),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
     #[error(
