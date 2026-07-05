@@ -661,6 +661,16 @@ impl PaneView {
         });
     }
 
+    /// Paste clipboard text into the pane, honoring bracketed-paste mode and
+    /// normalizing line endings (see `keyboard::encode_paste`).
+    fn paste_text(&self, text: &str) {
+        let mode = {
+            let term = self.terminal.lock().expect("term lock poisoned");
+            *term.mode()
+        };
+        self.send_input(keyboard::encode_paste(text, mode));
+    }
+
     pub fn command_lifecycle(&self) -> &CommandLifecycle {
         &self.command_lifecycle
     }
@@ -1272,7 +1282,7 @@ impl Render for PaneView {
                 if ks.modifiers.control && ks.modifiers.shift && ks.key.as_str() == "v" {
                     if let Some(item) = cx.read_from_clipboard() {
                         if let Some(text) = item.text() {
-                            this.send_input(text.as_bytes().to_vec());
+                            this.paste_text(&text);
                         }
                     }
                     return;
@@ -1473,7 +1483,7 @@ impl Render for PaneView {
                     ) {
                         if let Some(item) = cx.read_from_clipboard() {
                             if let Some(text) = item.text() {
-                                this.send_input(text.as_bytes().to_vec());
+                                this.paste_text(&text);
                             }
                         }
                     }
@@ -1499,7 +1509,7 @@ impl Render for PaneView {
                     ) {
                         if let Some(item) = cx.read_from_clipboard() {
                             if let Some(text) = item.text() {
-                                this.send_input(text.as_bytes().to_vec());
+                                this.paste_text(&text);
                             }
                         }
                     }

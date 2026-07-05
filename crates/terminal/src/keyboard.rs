@@ -1,6 +1,27 @@
 use alacritty_terminal::term::TermMode;
 use gpui::Keystroke;
 
+/// Encode clipboard text for the PTY, honoring bracketed-paste mode.
+///
+/// Line endings (`\r\n` and `\n`) are normalized to `\r` in both modes, per
+/// xterm paste behavior — `\r` is what the Enter key produces. With
+/// `TermMode::BRACKETED_PASTE` active the payload is wrapped in
+/// `ESC[200~ .. ESC[201~`; embedded ESC bytes are stripped so pasted text
+/// cannot terminate the bracket early.
+pub fn encode_paste(text: &str, mode: TermMode) -> Vec<u8> {
+    let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+    if mode.contains(TermMode::BRACKETED_PASTE) {
+        let payload = normalized.replace('\x1b', "");
+        let mut bytes = Vec::with_capacity(payload.len() + 12);
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(payload.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+        bytes
+    } else {
+        normalized.into_bytes()
+    }
+}
+
 pub fn encode_keystroke(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
     let key = keystroke.key.as_str();
     let ctrl = keystroke.modifiers.control;
@@ -596,5 +617,41 @@ mod tests {
     fn test_encode_alt_backspace() {
         let ks = alt_key("backspace");
         assert_eq!(encode_keystroke(&ks, normal()), Some(vec![0x1b, 0x7f]));
+    }
+
+    // --- Paste encoding ---
+
+    fn bracketed_paste() -> TermMode {
+        TermMode::BRACKETED_PASTE
+    }
+
+    #[test]
+    fn test_encode_paste_bracketed_multiline_wrapped_and_normalized() {
+        assert_eq!(
+            encode_paste("echo a\r\necho b\necho c", bracketed_paste()),
+            b"\x1b[200~echo a\recho b\recho c\x1b[201~".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_encode_paste_plain_multiline_normalized_without_envelope() {
+        assert_eq!(
+            encode_paste("echo a\r\necho b\necho c", normal()),
+            b"echo a\recho b\recho c".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_encode_paste_bracketed_embedded_escape_stripped() {
+        // A payload containing ESC[201~ must not terminate the bracket early.
+        assert_eq!(
+            encode_paste("a\x1b[201~b", bracketed_paste()),
+            b"\x1b[200~a[201~b\x1b[201~".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_encode_paste_plain_empty_passthrough() {
+        assert_eq!(encode_paste("", normal()), Vec::<u8>::new());
     }
 }
