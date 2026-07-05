@@ -18,6 +18,8 @@ pub enum SshError {
     DaemonLaunch(String),
     #[error("timed out after {0:?} waiting for a daemon message")]
     RecvTimeout(std::time::Duration),
+    #[error("daemon handshake failed: {0}")]
+    Handshake(String),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
     #[error(
