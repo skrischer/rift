@@ -43,6 +43,10 @@ binary, never by tolerating it (`docs/spec-connection-robustness.md`).
   answers a mismatched `hello` with `welcome` carrying its **own** version and
   closes cleanly without streaming; the client owns the resolution (stop the
   stale daemon via the pidfile, redeploy, respawn, re-handshake).
+- The `welcome` is written **per connection**, never on the daemon's shared
+  event bus — one client's handshake (matched or mismatched) cannot surface on
+  a healthy concurrent connection's stream (relevant for the shared stable+dev
+  daemon).
 
 History: version 2 pins the message set as of the connection-robustness phase
 (fingerprint test introduced); version 1 was the original handshake constant,
