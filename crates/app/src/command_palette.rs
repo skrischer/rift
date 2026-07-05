@@ -12,8 +12,9 @@
 //!
 //! Typing filters the registry by [`filter_commands`]'s subsequence match; up
 //! and down navigate the filtered results via the `List`'s own built-in
-//! `SelectUp`/`SelectDown` handling; Enter dispatches the selected command's
-//! action and closes the palette (`CommandPaletteDelegate::confirm`).
+//! `SelectUp`/`SelectDown` handling; Enter closes the palette — restoring the
+//! pre-palette focus — and then dispatches the selected command's action
+//! (`CommandPaletteDelegate::confirm`).
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -119,10 +120,17 @@ impl ListDelegate for CommandPaletteDelegate {
         cx.notify();
     }
 
-    /// Dispatch the selected command's action into the focused context (the
-    /// same action its keybinding would dispatch) and close the palette
-    /// (`docs/spec-command-palette.md`: "selecting a command dispatches its
-    /// action ... then closes the palette").
+    /// Close the palette, then dispatch the selected command's action (the
+    /// same action its keybinding would dispatch,
+    /// `docs/spec-command-palette.md`).
+    ///
+    /// Order matters (#434): `close_dialog` synchronously restores focus to
+    /// the element focused before the palette opened, and `dispatch_action`
+    /// captures the focused element at call time (only the dispatch itself is
+    /// deferred). Dispatching before closing targets the palette's own search
+    /// input, whose dispatch path climbs the dialog overlay — a sibling of
+    /// the dock area — so editor-scoped actions (Save, the LSP-nav entries)
+    /// never reach the editor's `on_action` handlers.
     fn confirm(
         &mut self,
         _secondary: bool,
@@ -134,11 +142,11 @@ impl ListDelegate for CommandPaletteDelegate {
             .and_then(|ix| self.matches.get(ix.row))
             .and_then(|&index| COMMANDS.get(index));
 
+        window.close_dialog(cx);
+
         if let Some(command) = command {
             window.dispatch_action(command.action(), cx);
         }
-
-        window.close_dialog(cx);
     }
 }
 
@@ -165,13 +173,30 @@ impl CommandPalette {
         Self { list }
     }
 
-    /// Open the palette as a `Root` dialog. Resets any query left over from
-    /// the previous time it was opened, so it always starts listing every
-    /// command (`docs/spec-command-palette.md`: "an empty query lists all
-    /// commands").
+    /// Open the palette as a `Root` dialog. Resets the state left over from
+    /// the previous time it was opened, so it always starts with an empty
+    /// query listing every command (`docs/spec-command-palette.md`: "an empty
+    /// query lists all commands") and the first row selected, so Enter on a
+    /// freshly opened palette runs the top match (#434).
     pub fn open(&self, window: &mut Window, cx: &mut App) {
         self.list.update(cx, |list, cx| {
+            // `set_query` writes the input silently (`InputState::set_value`
+            // suppresses `InputEvent::Change`), so `perform_search` never
+            // fires — rebuild the delegate's matches explicitly, otherwise
+            // the previous query's match list survives under the now-empty
+            // input (#434).
+            //
+            // Residual edge case, not fixable app-side: `ListState`'s query
+            // dedupe field (`last_query`, private) is only updated by its
+            // async search task, never by `set_query`, so it survives this
+            // reset. If the first input change after reopening exactly equals
+            // the previous session's final query, `ListState` skips
+            // `perform_search` and the full unfiltered list stays displayed
+            // under that query until the next keystroke self-heals it.
             list.set_query("", window, cx);
+            list.delegate_mut().matches = filter_commands("");
+            list.set_selected_index(Some(IndexPath::default()), window, cx);
+            list.scroll_to_selected_item(window, cx);
         });
 
         let list = self.list.clone();
@@ -192,6 +217,9 @@ impl CommandPalette {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use gpui::TestAppContext;
+    use gpui_component::Root;
 
     fn matched_names(query: &str) -> Vec<&'static str> {
         filter_commands(query)
@@ -242,5 +270,117 @@ mod tests {
     #[test]
     fn test_is_subsequence_rejects_out_of_order_characters() {
         assert!(!is_subsequence("dtg", "Go to Definition"));
+    }
+
+    /// Bare render stub hosting the palette's dialog in a `Root`-wrapped test
+    /// window — the palette needs only the `Root` overlay state, not the full
+    /// workspace.
+    struct StubView;
+
+    impl gpui::Render for StubView {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::div()
+        }
+    }
+
+    fn palette_window(cx: &mut TestAppContext) -> (CommandPalette, gpui::WindowHandle<Root>) {
+        let mut palette: Option<CommandPalette> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                palette = Some(CommandPalette::new(window, cx));
+                let stub = cx.new(|_| StubView);
+                cx.new(|cx| Root::new(stub, window, cx))
+            })
+            .unwrap()
+        });
+        (
+            palette.expect("palette constructed inside the window callback"),
+            window,
+        )
+    }
+
+    /// Reopening the palette after a query was left behind must reset the
+    /// match list and select the first row (#434): `ListState::set_query`
+    /// writes the input silently (no `InputEvent::Change`), so without the
+    /// explicit reset the previous query's matches survive under the
+    /// now-empty input, and Enter on a fresh palette does nothing.
+    #[gpui::test]
+    fn test_open_with_stale_query_state_resets_matches_and_selects_first_row(
+        cx: &mut TestAppContext,
+    ) {
+        let (palette, window) = palette_window(cx);
+
+        // `update_window` instead of `window.update`: the latter leases the
+        // `Root` entity, which `open`'s dialog wiring re-enters (same
+        // pattern as the workspace's palette test).
+        cx.update_window(window.into(), |_, window, cx| {
+            // Simulate the previous session: a narrowed match list and a
+            // cleared selection left behind by typing and dismissing.
+            palette.list.update(cx, |list, cx| {
+                list.set_query("save", window, cx);
+                list.delegate_mut().matches = filter_commands("save");
+                list.set_selected_index(None, window, cx);
+            });
+
+            palette.open(window, cx);
+
+            let list = palette.list.read(cx);
+            assert_eq!(
+                list.delegate().matches,
+                (0..COMMANDS.len()).collect::<Vec<_>>(),
+                "reopening lists every command again"
+            );
+            assert_eq!(
+                list.selected_index(),
+                Some(IndexPath::default()),
+                "reopening selects the first row so Enter runs the top match"
+            );
+        })
+        .unwrap();
+    }
+
+    /// `confirm` must close the dialog — synchronously restoring the focus
+    /// captured when the palette opened — before dispatching the command's
+    /// action (#434): `dispatch_action` targets the element focused at call
+    /// time, so closing afterwards would aim editor-scoped actions at the
+    /// palette's own search input instead of the editor.
+    #[gpui::test]
+    fn test_confirm_closes_the_palette_and_restores_the_previous_focus(cx: &mut TestAppContext) {
+        let (palette, window) = palette_window(cx);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            let previous_focus = cx.focus_handle();
+            window.focus(&previous_focus, cx);
+
+            palette.open(window, cx);
+            assert!(window.has_active_dialog(cx), "open sets an active dialog");
+            assert_ne!(
+                window.focused(cx),
+                Some(previous_focus.clone()),
+                "the palette dialog takes focus while open"
+            );
+
+            // `open` pre-selected the first row, so this confirms the top
+            // match, exactly as Enter on a freshly opened palette does.
+            palette.list.update(cx, |list, cx| {
+                list.delegate_mut().confirm(false, window, cx);
+            });
+
+            assert!(
+                !window.has_active_dialog(cx),
+                "confirm closes the palette dialog"
+            );
+            assert_eq!(
+                window.focused(cx),
+                Some(previous_focus),
+                "confirm restores the pre-palette focus before the action dispatch resolves"
+            );
+        })
+        .unwrap();
     }
 }

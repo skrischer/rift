@@ -581,14 +581,18 @@ impl Attach {
         Some(message)
     }
 
-    /// Issue the `list-keys` + `show-options` query pair for the tmux key-table
-    /// mirror. A request while one is already in flight simply replaces the
-    /// tracked pair; the superseded reply (if it ever arrives) will not match
-    /// either tracked id and is silently dropped — acceptable since a fresher
-    /// query is already running and its reply supersedes it anyway.
+    /// Issue the `list-keys` + `show-options -A` query pair for the tmux
+    /// key-table mirror. `-A` resolves options inherited from the global scope
+    /// (a `.tmux.conf` `set -g prefix C-a` shows up here, unlike plain
+    /// `show-options`, which lists only session-level overrides) — the same
+    /// scoping the status-line query uses. A request while one is already in
+    /// flight simply replaces the tracked pair; the superseded reply (if it
+    /// ever arrives) will not match either tracked id and is silently dropped —
+    /// acceptable since a fresher query is already running and its reply
+    /// supersedes it anyway.
     async fn request_key_table(&mut self) -> std::io::Result<()> {
         let list_keys_id = self.send_command("list-keys").await?;
-        let show_options_id = self.send_command("show-options").await?;
+        let show_options_id = self.send_command("show-options -A").await?;
         self.key_table_query = Some(KeyTableQuery {
             list_keys_id,
             show_options_id,
@@ -666,9 +670,9 @@ impl Attach {
     /// query triple for the tmux status-line mirror
     /// (`docs/spec-tmux-statusline-mirroring.md`). `-A` resolves options
     /// inherited from the global scope (a `.tmux.conf` `set -g status-style
-    /// ...` shows up here, unlike the key-table mirror's plain
-    /// `show-options`, which lists only session-level overrides) —
-    /// "session-resolved" per the spec outcome. The `#{T:...}` fetches expand
+    /// ...` shows up here, unlike plain `show-options`, which lists only
+    /// session-level overrides) — "session-resolved" per the spec outcome,
+    /// same scoping as the key-table query. The `#{T:...}` fetches expand
     /// **by option name only**: the option's own text is never read here and
     /// spliced into a command line — the interpolation hazard the spec
     /// forbids. A request while one is already in flight simply replaces the
@@ -1011,16 +1015,17 @@ mod tests {
     }
 
     /// Set a global tmux option directly via the `tmux` CLI (outside the
-    /// control-mode attach under test), for status-line fixtures that need a
-    /// non-default `status-*` value in place before the daemon's own
-    /// attach-or-create runs. Unlike `new-session`/`attach-session`, plain
-    /// `set-option` never starts a fresh server on an unused socket — it
-    /// errors with "no such file or directory" against a socket nothing has
-    /// bound yet — so this first spins up a detached `rift` session (the
-    /// name every status-line test attaches to) to give the server something
-    /// to run against; `new-session -A` in `Attach::spawn` then attaches to
-    /// that same session instead of creating a second one.
-    fn set_global_status_option(server: &TmuxServer, name: &str, value: &str) {
+    /// control-mode attach under test), for fixtures that need a non-default
+    /// global value (a `status-*` option, the prefix) in place before the
+    /// daemon's own attach-or-create runs. Unlike
+    /// `new-session`/`attach-session`, plain `set-option` never starts a
+    /// fresh server on an unused socket — it errors with "no such file or
+    /// directory" against a socket nothing has bound yet — so this first
+    /// spins up a detached `rift` session (the name every such test attaches
+    /// to) to give the server something to run against; `new-session -A` in
+    /// `Attach::spawn` then attaches to that same session instead of
+    /// creating a second one.
+    fn set_global_option(server: &TmuxServer, name: &str, value: &str) {
         let _ = std::process::Command::new("tmux")
             .args(["-L", &server.name, "new-session", "-d", "-s", "rift"])
             .stderr(std::process::Stdio::null())
@@ -1032,15 +1037,15 @@ mod tests {
         assert!(status.success(), "tmux set-option -g {name} {value} failed");
     }
 
-    /// Whether a `show-options -A` reply's `options` text reports
-    /// `status-interval` as `expected`, tolerating the trailing `*` `-A` adds
-    /// to a name whose value is inherited from a higher scope rather than set
-    /// at this exact level.
-    fn reports_status_interval(options: &str, expected: &str) -> bool {
+    /// Whether a `show-options -A` reply's `options` text reports option
+    /// `name` as `expected`, tolerating the trailing `*` `-A` adds to a name
+    /// whose value is inherited from a higher scope rather than set at this
+    /// exact level.
+    fn reports_option(options: &str, name: &str, expected: &str) -> bool {
         options.lines().any(|line| {
             let mut tokens = line.split_whitespace();
-            let name = tokens.next().unwrap_or("").trim_end_matches('*');
-            name == "status-interval" && tokens.next() == Some(expected)
+            let token = tokens.next().unwrap_or("").trim_end_matches('*');
+            token == name && tokens.next() == Some(expected)
         })
     }
 
@@ -1243,7 +1248,7 @@ mod tests {
             .expect("attach");
 
         // No client request needed: the attach itself issues `list-keys` +
-        // `show-options`, mirroring the unprompted layout query.
+        // `show-options -A`, mirroring the unprompted layout query.
         let list_keys = recv_until(&mut out_rx, 10, |m| match m {
             DaemonMessage::KeyTableReply { list_keys, .. } => Some(list_keys.clone()),
             _ => None,
@@ -1286,6 +1291,37 @@ mod tests {
         assert!(
             second.is_some(),
             "an explicit QueryKeyTable must produce another KeyTableReply"
+        );
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_key_table_options_global_only_prefix_is_resolved() {
+        // The key-table `show-options -A` must resolve a prefix set only at
+        // the *global* scope (a `.tmux.conf` `set -g prefix C-a`) — plain
+        // `show-options` lists only session-level overrides and would miss
+        // it, leaving rift on the C-b default while tmux uses C-a (#439).
+        let server = TmuxServer::new("keytable-resolved");
+        set_global_option(&server, "prefix", "C-a");
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+        let options = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::KeyTableReply { options, .. } => Some(options.clone()),
+            _ => None,
+        })
+        .await
+        .expect("key-table reply after attach");
+        assert!(
+            reports_option(&options, "prefix", "C-a"),
+            "a global-only prefix override must resolve: {options}"
         );
 
         drop(in_tx);
@@ -1364,7 +1400,7 @@ mod tests {
         // scope (a `.tmux.conf` `set -g ...`), not just session-level
         // overrides — the session-resolved discovery the spec requires.
         let server = TmuxServer::new("statusline-resolved");
-        set_global_status_option(&server, "status-style", "bg=colour234,fg=colour253");
+        set_global_option(&server, "status-style", "bg=colour234,fg=colour253");
         let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
 
         in_tx
@@ -1397,7 +1433,7 @@ mod tests {
         // own control-mode client with no explicit `-c` targeting), and a
         // `#()` shell segment (expected empty under one-shot expansion).
         let server = TmuxServer::new("statusline-expand");
-        set_global_status_option(
+        set_global_option(
             &server,
             "status-left",
             "#{?#{==:#{host_short},nonexistenthost},yes,no}-#S-#{client_width}-#(echo shellout)",
@@ -1449,7 +1485,7 @@ mod tests {
         // through strftime, so a literal `%Y` in status-right must become a
         // real (digits-only) year, not pass through unresolved.
         let server = TmuxServer::new("statusline-strftime");
-        set_global_status_option(&server, "status-right", "%Y");
+        set_global_option(&server, "status-right", "%Y");
         let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
 
         in_tx
@@ -1488,7 +1524,7 @@ mod tests {
         // The daemon's own `status-interval` cadence: a fast interval must
         // produce a *second* StatusLineReply with no client message at all.
         let server = TmuxServer::new("statusline-timer");
-        set_global_status_option(&server, "status-interval", "1");
+        set_global_option(&server, "status-interval", "1");
         let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
 
         in_tx
@@ -1522,7 +1558,7 @@ mod tests {
         // in the same test, so a "no timer ever ran" false pass can't hide
         // behind a naive negative wait.
         let server = TmuxServer::new("statusline-notimer");
-        set_global_status_option(&server, "status-interval", "1");
+        set_global_option(&server, "status-interval", "1");
         let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
 
         in_tx
@@ -1558,7 +1594,7 @@ mod tests {
             .expect("query status line");
         let disabled = recv_until(&mut out_rx, 10, |m| match m {
             DaemonMessage::StatusLineReply { options, .. }
-                if reports_status_interval(options, "0") =>
+                if reports_option(options, "status-interval", "0") =>
             {
                 Some(())
             }

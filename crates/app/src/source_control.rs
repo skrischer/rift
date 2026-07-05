@@ -18,6 +18,7 @@ use gpui::{
     Styled as _, Subscription, Window,
 };
 use gpui_component::dock::{Panel, PanelEvent};
+use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::ActiveTheme as _;
 use rift_protocol::{GitEntryStatus, GitStatusCode};
 
@@ -251,14 +252,16 @@ impl gpui::Render for SourceControlPanel {
                 .into_any_element();
         }
 
-        let mut root = div().size_full().flex().flex_col();
+        let mut list = div().size_full().flex().flex_col();
         for (status, paths) in groups {
-            root = root.child(self.render_group_header(status, paths.len(), cx));
+            list = list.child(self.render_group_header(status, paths.len(), cx));
             for path in paths {
-                root = root.child(self.render_row(path, cx));
+                list = list.child(self.render_row(path, cx));
             }
         }
-        root.into_any_element()
+        // A change set taller than the panel scrolls (#436): the themed
+        // scrollbar wrapper owns the scroll state, keyed on this call site.
+        list.overflow_y_scrollbar().into_any_element()
     }
 }
 

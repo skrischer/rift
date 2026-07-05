@@ -55,8 +55,10 @@ pub enum ClientMessage {
         end: String,
         join: bool,
     },
-    /// Ask the daemon to (re-)query `list-keys` and `show-options` for the
-    /// mirrored tmux key-table lookup (`docs/spec-tmux-keytable-mirroring.md`).
+    /// Ask the daemon to (re-)query `list-keys` and `show-options -A`
+    /// (session-resolved — includes values inherited from the global scope,
+    /// e.g. a `.tmux.conf` `set -g prefix C-a`) for the mirrored tmux
+    /// key-table lookup (`docs/spec-tmux-keytable-mirroring.md`).
     /// The daemon answers with exactly one [`DaemonMessage::KeyTableReply`].
     /// Sent automatically by the daemon's own attach (no client request
     /// needed there — mirroring how the layout query is issued unprompted);
@@ -229,7 +231,7 @@ pub enum DaemonMessage {
         bytes: Vec<u8>,
     },
     /// The reply to a [`ClientMessage::QueryKeyTable`]: the raw `list-keys` and
-    /// `show-options` output (newline-joined, tmux-decoded — the control-mode
+    /// `show-options -A` output (newline-joined, tmux-decoded — the control-mode
     /// decode already run by the daemon's command-reply path), for the client
     /// to parse with `rift_terminal::keytable::{parse_list_keys, parse_options}`
     /// into the mirrored key-table lookup. The daemon never interprets this
