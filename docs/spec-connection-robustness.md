@@ -268,3 +268,17 @@ into scope, uses a key the developer already owns; nothing to deliver.)
   reconnect, an orderly exit, and non-retryable failures all surface as the
   muted `disconnected` statusbar state; the legacy tmux escape hatch keeps
   its pre-existing behavior (no reconnect loop) pending its removal (#285).
+- 2026-07-05 (#476, review): The engine drops the render-side backlog
+  immediately before every connect attempt — its per-attempt runtime drop
+  cancels the dead session's bridge consumers, so the shared flume queues
+  would otherwise buffer the whole outage and replay it into the fresh attach
+  (stale keystrokes, pane commands, editor requests landing minutes later),
+  violating the no-buffering constraint. The resync replaces the dropped
+  state; the one latest-value signal kept is the client grid, folded into an
+  engine-scope viewport watch that every fresh attach re-asserts (the render
+  layer only re-sends on a size change, which a reconnect is not).
+  Current-session tracking likewise moved to engine scope, for the same
+  reason the daemon recovery already tracks it (post-#509 decision above):
+  the watch is seeded from `RIFT_SESSION` once and updated by the switch
+  bridge across attempts, so an SSH-level reconnect re-attaches the session
+  the user is actually on, never silently the startup one.
