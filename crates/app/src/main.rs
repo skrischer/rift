@@ -854,6 +854,11 @@ async fn run_legacy_terminal(
     Ok(())
 }
 
+/// Upper bound on the daemon's `Welcome` reply to our `Hello` (#441). A wedged
+/// daemon otherwise blocks [`provision_daemon`] forever, leaving the app stuck
+/// at "connecting" with no error.
+const DAEMON_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Best-effort daemon provisioning, run before the terminal is opened.
 ///
 /// Reads the locally-built musl binary from `RIFT_DAEMON_BINARY` (or the
@@ -865,7 +870,8 @@ async fn run_legacy_terminal(
 /// unchanged deploy skips this and never bounces a healthy daemon. Then
 /// attaches to the remote daemon — spawning it detached if none is running —
 /// via [`rift_ssh::connect_or_spawn_daemon`] and confirms the transport with a
-/// `Hello`/`Welcome` handshake. The detached daemon outlives the SSH connection,
+/// `Hello`/`Welcome` handshake bounded by [`DAEMON_HANDSHAKE_TIMEOUT`].
+/// The detached daemon outlives the SSH connection,
 /// so a later reconnect reattaches to it instead of spawning a second one (#62).
 ///
 /// Returns the live [`rift_ssh::DaemonClient`] on a clean handshake; the caller
@@ -969,7 +975,9 @@ async fn provision_daemon(conn: &mut rift_ssh::SshConnection) -> Option<rift_ssh
 
     // Confirm the reattach transport with a protocol round-trip. The daemon
     // re-broadcasts the full worktree snapshot on every Hello, so the stream
-    // following the Welcome starts with the complete tree.
+    // following the Welcome starts with the complete tree. The wait is bounded
+    // (#441): a wedged daemon must fall back like any other provisioning
+    // failure instead of holding the app at "connecting" forever.
     let client = rift_ssh::DaemonClient::new(channel);
     if let Err(e) = client
         .send(rift_protocol::ClientMessage::Hello {
@@ -980,17 +988,21 @@ async fn provision_daemon(conn: &mut rift_ssh::SshConnection) -> Option<rift_ssh
         warn!(%e, "daemon handshake send failed");
         return None;
     }
-    match client.recv().await {
-        Some(rift_protocol::DaemonMessage::Welcome { version }) => {
+    match client.recv_timeout(DAEMON_HANDSHAKE_TIMEOUT).await {
+        Ok(Some(rift_protocol::DaemonMessage::Welcome { version })) => {
             info!(version, "daemon transport ready (Hello/Welcome ok)");
             Some(client)
         }
-        Some(other) => {
+        Ok(Some(other)) => {
             warn!(?other, "unexpected daemon handshake reply");
             None
         }
-        None => {
+        Ok(None) => {
             warn!("daemon closed before Welcome");
+            None
+        }
+        Err(e) => {
+            warn!(%e, "daemon handshake timed out");
             None
         }
     }
