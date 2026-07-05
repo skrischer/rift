@@ -6,6 +6,8 @@
 //! [`DaemonClient`] layers the protocol framing on top and is the single
 //! app-side emission seam the client `TmuxClient` path later swaps onto.
 
+use std::time::Duration;
+
 use rift_protocol::{encode_frame, ClientMessage, DaemonMessage, FrameDecoder};
 use russh::client;
 use russh::{Channel, ChannelMsg};
@@ -32,6 +34,13 @@ impl DaemonChannel {
 
         tokio::spawn(channel_actor(channel, write_rx, data_tx));
 
+        Self { data_rx, write_tx }
+    }
+
+    /// Wire a channel directly to in-memory queues, bypassing SSH — the test
+    /// seam for exercising [`DaemonClient`] against a stubbed daemon side.
+    #[cfg(test)]
+    fn from_parts(data_rx: flume::Receiver<Vec<u8>>, write_tx: flume::Sender<Vec<u8>>) -> Self {
         Self { data_rx, write_tx }
     }
 
@@ -118,6 +127,17 @@ impl DaemonClient {
         self.channel.write(&frame).await
     }
 
+    /// Receive the next `DaemonMessage`, bounded by `timeout`.
+    ///
+    /// Same closed-stream semantics as [`DaemonClient::recv`] (`Ok(None)` once
+    /// the channel closes); a daemon that stays silent past `timeout` yields
+    /// [`SshError::RecvTimeout`] instead of blocking forever.
+    pub async fn recv_timeout(&self, timeout: Duration) -> Result<Option<DaemonMessage>, SshError> {
+        tokio::time::timeout(timeout, self.recv())
+            .await
+            .map_err(|_| SshError::RecvTimeout(timeout))
+    }
+
     /// Receive the next `DaemonMessage`, reassembling frames across reads.
     ///
     /// Returns `None` once the channel closes before a full frame arrives.
@@ -138,5 +158,52 @@ impl DaemonClient {
                 },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rift_protocol::PROTOCOL_VERSION;
+
+    /// A [`DaemonClient`] over in-memory queues plus the daemon-side byte
+    /// sender: holding the sender open without sending models a wedged daemon,
+    /// dropping it a closed channel.
+    fn wired_client() -> (DaemonClient, flume::Sender<Vec<u8>>) {
+        let (data_tx, data_rx) = flume::unbounded();
+        let (write_tx, _write_rx) = flume::unbounded();
+        let client = DaemonClient::new(DaemonChannel::from_parts(data_rx, write_tx));
+        (client, data_tx)
+    }
+
+    #[tokio::test]
+    async fn test_recv_timeout_wedged_daemon_returns_timeout_error() {
+        // Sender stays alive but never answers: the wait must end in an error.
+        let (client, _data_tx) = wired_client();
+        let result = client.recv_timeout(Duration::from_millis(50)).await;
+        assert!(matches!(result, Err(SshError::RecvTimeout(_))));
+    }
+
+    #[tokio::test]
+    async fn test_recv_timeout_frame_arrives_returns_message() {
+        let (client, data_tx) = wired_client();
+        let frame = encode_frame(&DaemonMessage::Welcome {
+            version: PROTOCOL_VERSION,
+        })
+        .expect("encode welcome frame");
+        data_tx.send(frame).expect("queue frame");
+        let result = client.recv_timeout(Duration::from_secs(5)).await;
+        assert!(matches!(
+            result,
+            Ok(Some(DaemonMessage::Welcome { version })) if version == PROTOCOL_VERSION
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_recv_timeout_closed_channel_returns_none() {
+        let (client, data_tx) = wired_client();
+        drop(data_tx);
+        let result = client.recv_timeout(Duration::from_secs(5)).await;
+        assert!(matches!(result, Ok(None)));
     }
 }
