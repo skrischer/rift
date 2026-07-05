@@ -24,9 +24,9 @@ pub const MIN_FONT_SIZE: f32 = 8.0;
 /// Upper bound of the whole-client font size (see [`MIN_FONT_SIZE`]).
 pub const MAX_FONT_SIZE: f32 = 40.0;
 const FONT_SIZE_STEP: f32 = 1.0;
-/// Width of the always-visible pane sidebar. Shared between the sidebar render
-/// and the tmux client-width compute so the reported column count never
-/// includes the space the sidebar occupies.
+/// Width of the always-visible pane sidebar. The tmux client size no longer
+/// subtracts it: the client grid is derived from the pane area's measured
+/// bounds, which the sidebar (a flex sibling) is already outside of.
 const PANE_SIDEBAR_WIDTH: f32 = 160.0;
 /// Recurring re-render cadence that ages the per-pane output-recency fallback
 /// from busy back to free for the window-tab aggregate. Only the recency
@@ -131,6 +131,16 @@ fn kill_pane_command(pane: &str) -> String {
     format!("kill-pane -t {}", pane)
 }
 
+/// Whole-cell grid dimensions that fit the given pane-area bounds, clamped to
+/// at least 1x1 so a degenerate (collapsed) layout never reports a zero-sized
+/// tmux client. GPUI-free math so the floor/clamp behaviour is unit-testable.
+fn grid_size_for(area: Size<Pixels>, cell: Size<Pixels>) -> TermSize {
+    TermSize {
+        cols: ((area.width / cell.width).floor() as usize).max(1),
+        rows: ((area.height / cell.height).floor() as usize).max(1),
+    }
+}
+
 /// Precedence rank of a [`PaneActivity`] for the per-window aggregate:
 /// attention > busy > free.
 fn activity_rank(activity: PaneActivity) -> u8 {
@@ -200,7 +210,10 @@ pub struct SessionView {
     renaming_window: Option<WindowRename>,
     focus_handle: FocusHandle,
     needs_focus: bool,
-    window_grid_size: TermSize,
+    /// The last grid size sent for the tmux client, derived from the pane
+    /// area's measured element bounds — not the window viewport — so the
+    /// client tracks the terminal panel inside the dock split (#424).
+    client_grid_size: TermSize,
     ssh_label: SharedString,
     session_name: SharedString,
     working_directory: Option<String>,
@@ -424,7 +437,7 @@ impl SessionView {
             renaming_window: None,
             focus_handle: cx.focus_handle(),
             needs_focus: true,
-            window_grid_size: TermSize { cols: 80, rows: 24 },
+            client_grid_size: TermSize { cols: 80, rows: 24 },
             ssh_label,
             session_name: SharedString::default(),
             working_directory: None,
@@ -1094,25 +1107,6 @@ impl Render for SessionView {
         let font_size = self.font_size;
         let cell_size = measure_cell_size(window, font_size);
 
-        let tab_bar_h = statusbar_height();
-
-        let viewport = window.viewport_size();
-        // The pane sidebar occupies a fixed slice of the viewport width, so the
-        // panes only get what remains; reporting the full width to tmux would
-        // clip every pane's right edge.
-        let total_cols =
-            ((viewport.width - px(PANE_SIDEBAR_WIDTH)) / cell_size.width).floor() as usize;
-        let total_rows = ((viewport.height - statusbar_height() - tab_bar_h) / cell_size.height)
-            .floor() as usize;
-        let window_size = TermSize {
-            cols: total_cols.max(1),
-            rows: total_rows.max(1),
-        };
-        if window_size != self.window_grid_size {
-            self.window_grid_size = window_size;
-            let _ = self.size_changed_tx.try_send(window_size);
-        }
-
         let (grid_size, pane_cwd, pane_command, prefix_pending) = self
             .active_pane_id
             .as_ref()
@@ -1296,6 +1290,30 @@ impl Render for SessionView {
             div().flex_grow().into_any_element()
         };
 
+        // The tmux client is sized from the pane area's measured bounds — the
+        // flex slot next to the sidebar, below the tab bar, above the statusbar —
+        // never from the window viewport: with the editor split open, the
+        // terminal panel only gets a slice of the window, and a viewport-derived
+        // grid would overshoot and clip/mis-wrap every pane (#424). The canvas
+        // overlays the pane area (absolute, zero layout impact) and its prepaint
+        // sees the post-layout bounds each frame, so a dock-splitter drag
+        // re-sends the client resize as the panel geometry changes.
+        let entity = cx.entity().clone();
+        let grid_observer = canvas(
+            move |bounds: Bounds<Pixels>, _window: &mut Window, cx: &mut App| {
+                entity.update(cx, |view: &mut Self, _cx| {
+                    let grid = grid_size_for(bounds.size, cell_size);
+                    if grid != view.client_grid_size {
+                        view.client_grid_size = grid;
+                        let _ = view.size_changed_tx.try_send(grid);
+                    }
+                });
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
+
         let statusbar = h_flex()
             .id("statusbar")
             .justify_between()
@@ -1391,7 +1409,15 @@ impl Render for SessionView {
                     .min_h_0()
                     .w_full()
                     .child(self.render_pane_sidebar(cx))
-                    .child(div().flex().flex_1().min_w_0().h_full().child(pane_area)),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(pane_area)
+                            .child(grid_observer),
+                    ),
             )
             .child(statusbar);
 
@@ -1449,11 +1475,35 @@ impl Render for SessionView {
 #[cfg(test)]
 mod tests {
     use super::{
-        activity_dot_color, aggregate_activity, kill_pane_command, quote_tmux_name,
-        resize_direction, select_pane_command, split_command, PaneActivity, SessionView,
+        activity_dot_color, aggregate_activity, grid_size_for, kill_pane_command, quote_tmux_name,
+        resize_direction, select_pane_command, split_command, PaneActivity, SessionView, TermSize,
         DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE,
     };
-    use gpui::{px, rgb, AppContext as _, TestAppContext};
+    use gpui::{px, rgb, size, AppContext as _, TestAppContext};
+
+    #[test]
+    fn test_grid_size_for_exact_multiple_returns_full_grid() {
+        assert_eq!(
+            grid_size_for(size(px(800.0), px(600.0)), size(px(10.0), px(20.0))),
+            TermSize { cols: 80, rows: 30 }
+        );
+    }
+
+    #[test]
+    fn test_grid_size_for_partial_cells_floors_to_whole_cells() {
+        assert_eq!(
+            grid_size_for(size(px(805.0), px(619.0)), size(px(10.0), px(20.0))),
+            TermSize { cols: 80, rows: 30 }
+        );
+    }
+
+    #[test]
+    fn test_grid_size_for_collapsed_area_clamps_to_one_by_one() {
+        assert_eq!(
+            grid_size_for(size(px(0.0), px(0.0)), size(px(10.0), px(20.0))),
+            TermSize { cols: 1, rows: 1 }
+        );
+    }
 
     #[test]
     fn test_quote_tmux_name_plain_wraps_in_single_quotes() {
