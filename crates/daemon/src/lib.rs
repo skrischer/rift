@@ -657,7 +657,9 @@ async fn request_reply(
 /// rather than over the shared `events` bus, whose bounded backlog silently
 /// drops chunks once a large snapshot exceeds its capacity (issue #227). The
 /// bus carries only incremental `UpdateWorktree`s; a lagging writer may still
-/// drop those, but that loss is logged, never silent.
+/// drop those, but that loss is logged, never silent. Bus events are forwarded
+/// only once this connection's `Welcome` has been written (issue #425) — the
+/// client requires `Welcome` as its first frame.
 ///
 /// `inbound` is a clone of the loop's inbound sender (dropped when the
 /// connection ends); `events` is a fresh subscription to the outbound bus;
@@ -680,7 +682,10 @@ where
     let mut buf = vec![0u8; SERVE_READ_BUFFER];
     // Per-connection replay bookkeeping: the snapshot is sent once, right behind
     // the `Welcome`. `handshaken` gates the `state` branch so a snapshot landing
-    // mid-scan is never written ahead of the handshake the client waits for.
+    // mid-scan is never written ahead of the handshake the client waits for, and
+    // the `events` branch so shared bus traffic at connect time can never reach
+    // the socket before the `Welcome` (#425) — the client hard-fails on any
+    // non-`Welcome` first frame.
     let mut handshaken = false;
     let mut snapshot_sent = false;
 
@@ -775,6 +780,14 @@ where
                 match event {
                     Ok(msg) => {
                         let is_welcome = matches!(msg, DaemonMessage::Welcome { .. });
+                        // Pre-handshake bus traffic (events broadcast before this
+                        // connection's `Welcome`) is dropped, never written.
+                        // Nothing is lost: the dispatch loop mutates `State`
+                        // before each broadcast, so everything suppressed here is
+                        // already in the snapshot replayed behind the `Welcome`.
+                        if !handshaken && !is_welcome {
+                            continue;
+                        }
                         let frame = encode_frame(&msg)?;
                         writer.write_all(&frame).await?;
                         writer.flush().await?;
@@ -1875,6 +1888,80 @@ mod tests {
             entries.len(),
             file_count,
             "every entry across all chunks must arrive despite the tiny bus"
+        );
+
+        drop(client_writer);
+        drop(client_reader);
+        conn.abort();
+        loop_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_serve_connection_bus_traffic_at_connect_welcome_is_first_frame() {
+        // Regression for #425: events broadcast on the shared bus before this
+        // connection's handshake completes must never reach its socket — the
+        // client hard-fails on any non-`Welcome` first frame. Flood the bus
+        // before sending `Hello`, then assert `Welcome` arrives first and that
+        // post-handshake bus events flow again.
+        let (daemon, handles) = channels(64, 8);
+        let inbound = handles.inbound.clone();
+        let events = handles.subscribe();
+        let state = handles.state.clone();
+        let loop_handle = tokio::spawn(daemon.run());
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+        let (server_reader, server_writer) = tokio::io::split(server);
+        let conn = tokio::spawn(async move {
+            let _ =
+                serve_connection(server_reader, server_writer, inbound, events, state, None).await;
+        });
+
+        // Sustained bus traffic ahead of the handshake: the connection's
+        // subscription (created above, before the flood) queues these in send
+        // order, so every one of them precedes the `Welcome` on the bus.
+        for i in 0..32 {
+            handles
+                .events
+                .send(DaemonMessage::UpdateWorktree {
+                    added: Vec::new(),
+                    changed: Vec::new(),
+                    removed: vec![format!("pre-handshake-{i}")],
+                })
+                .expect("bus subscriber alive");
+        }
+
+        client_writer
+            .write_all(&hello_frame())
+            .await
+            .expect("send Hello");
+        client_writer.flush().await.expect("flush Hello");
+
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(
+            read_daemon_message(&mut client_reader, &mut decoder).await,
+            DaemonMessage::Welcome {
+                version: PROTOCOL_VERSION,
+            },
+            "Welcome must be the first frame despite pre-handshake bus traffic"
+        );
+
+        // Post-handshake bus events reach the socket again. No worktree is
+        // armed, so no snapshot intervenes: the very next frame must be this
+        // event — any leaked pre-handshake frame would arrive ahead of it.
+        let post = DaemonMessage::UpdateWorktree {
+            added: Vec::new(),
+            changed: Vec::new(),
+            removed: vec!["post-handshake".to_owned()],
+        };
+        handles
+            .events
+            .send(post.clone())
+            .expect("bus subscriber alive");
+        assert_eq!(
+            read_daemon_message(&mut client_reader, &mut decoder).await,
+            post,
+            "bus forwarding must resume after the handshake"
         );
 
         drop(client_writer);
