@@ -7,9 +7,25 @@ pub use frame::{encode_frame, FrameDecoder, FrameError};
 
 /// Wire protocol version negotiated during the client/daemon handshake.
 ///
-/// Independent of the crate's semver: bump it when the message wire format
-/// changes in a way that requires both sides to agree.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Independent of the crate's semver. The policy is **strict equality**
+/// (`docs/protocol.md` — Versioning policy): client and daemon must run the
+/// exact same version, so ANY change to the message set — a variant added,
+/// removed, or renamed; a field added, removed, or renamed; a field's type
+/// changed; a serde attribute changed — requires a bump, even when the change
+/// is wire-compatible in one direction. The message set is pinned by the
+/// fingerprint test beside `PROTOCOL_FINGERPRINT` below, so a message-set
+/// change without a bump cannot pass CI.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Pinned fingerprint of the protocol message set, checked by the
+/// `fingerprint_tests` module: an FNV-1a hash over the serde-visible surface
+/// of [`ClientMessage`] and [`DaemonMessage`] — container serde attributes,
+/// variant names, field names, and field types, with comments and whitespace
+/// ignored. When the message set changes deliberately, bump
+/// [`PROTOCOL_VERSION`] above and re-pin this value (the failing test prints
+/// the new fingerprint).
+#[cfg(test)]
+const PROTOCOL_FINGERPRINT: u64 = 0x05b6_22c9_08df_89c1;
 
 /// Messages the client sends to the daemon.
 ///
@@ -1041,7 +1057,10 @@ mod tests {
             version: PROTOCOL_VERSION,
         };
         let json = serde_json::to_string(&msg).expect("serialize Hello");
-        assert_eq!(json, r#"{"type":"hello","version":1}"#);
+        assert_eq!(
+            json,
+            format!(r#"{{"type":"hello","version":{PROTOCOL_VERSION}}}"#)
+        );
 
         let parsed: ClientMessage = serde_json::from_str(&json).expect("deserialize Hello");
         assert_eq!(parsed, msg);
@@ -1057,7 +1076,10 @@ mod tests {
             version: PROTOCOL_VERSION,
         };
         let json = serde_json::to_string(&msg).expect("serialize Welcome");
-        assert_eq!(json, r#"{"type":"welcome","version":1}"#);
+        assert_eq!(
+            json,
+            format!(r#"{{"type":"welcome","version":{PROTOCOL_VERSION}}}"#)
+        );
 
         let parsed: DaemonMessage = serde_json::from_str(&json).expect("deserialize Welcome");
         assert_eq!(parsed, msg);
@@ -2242,5 +2264,250 @@ mod tests {
             err.is_err(),
             "unknown diff payload kind must not deserialize"
         );
+    }
+}
+
+/// Pins the protocol message set: a stable FNV-1a hash over the serde-visible
+/// surface of `ClientMessage` and `DaemonMessage` (container serde attributes,
+/// variant names, field names, field TYPES — so a wire-breaking type change
+/// also trips it), extracted from this crate's own source with comments and
+/// whitespace stripped. Changing either enum without re-pinning fails
+/// `cargo test -p rift-protocol`; the failure message instructs to bump
+/// `PROTOCOL_VERSION` and re-pin (`docs/protocol.md` — Versioning policy).
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::PROTOCOL_FINGERPRINT;
+
+    /// This crate's own source — the authoritative message-set definition.
+    const PROTOCOL_SOURCE: &str = include_str!("lib.rs");
+
+    /// Strips `//` line comments (doc comments included) from `source`,
+    /// preserving line structure. The enum definitions contain no string
+    /// literal with `//` or braces, so line-based stripping is exact for the
+    /// extracted regions.
+    fn strip_line_comments(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| line.find("//").map_or(line, |idx| &line[..idx]))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Extracts one enum's serde-visible surface from `source`: the
+    /// `#[serde(...)]` container attributes directly above the declaration
+    /// (non-serde attributes such as `#[derive(...)]` are not wire-visible
+    /// and are skipped) plus the `pub enum <name>` declaration and its
+    /// brace-delimited body, with comments stripped and all whitespace
+    /// removed. Returns `None` when the declaration is missing or its body
+    /// braces never balance (malformed input).
+    fn enum_surface(source: &str, name: &str) -> Option<String> {
+        let stripped = strip_line_comments(source);
+        let decl = format!("pub enum {name}");
+        let start = stripped.find(&decl)?;
+
+        let body_open = start + stripped[start..].find('{')?;
+        let mut depth = 0usize;
+        let mut end = None;
+        for (idx, ch) in stripped[body_open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    // The scan starts on the opening brace, so depth is
+                    // always >= 1 here.
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(body_open + idx + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+
+        let mut attrs: Vec<&str> = Vec::new();
+        for line in stripped[..start].lines().rev() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with("#[") {
+                if trimmed.starts_with("#[serde") {
+                    attrs.push(trimmed);
+                }
+                continue;
+            }
+            break;
+        }
+        attrs.reverse();
+
+        let mut surface: String = attrs.concat();
+        surface.push_str(&stripped[start..end]);
+        surface.retain(|ch| !ch.is_whitespace());
+        Some(surface)
+    }
+
+    /// FNV-1a 64-bit — the same tiny, dependency-free hash the daemon deploy
+    /// fingerprint uses (`crates/ssh/src/deploy.rs`; not shared because `ssh`
+    /// depends on `protocol`, never the reverse). Only stability matters here,
+    /// not collision resistance.
+    fn fnv1a_64(bytes: &[u8]) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x100_0000_01b3;
+        let mut hash = FNV_OFFSET;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+
+    /// The message-set fingerprint: FNV-1a over both message enums' surfaces,
+    /// separated so content cannot shift between them without a hash change.
+    fn message_set_fingerprint(source: &str) -> Option<u64> {
+        let client = enum_surface(source, "ClientMessage")?;
+        let daemon = enum_surface(source, "DaemonMessage")?;
+        Some(fnv1a_64(format!("{client}|{daemon}").as_bytes()))
+    }
+
+    /// A sample enum shaped like the real message enums, for the trip-wire
+    /// tests below (its own name, so it never collides with the real
+    /// extraction).
+    const SAMPLE_SOURCE: &str = r#"
+/// A sample message enum.
+#[derive(Debug, Clone, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Sample {
+    /// Doc comment noise.
+    Alpha { id: u32 },
+    Beta { name: String, flag: bool },
+}
+"#;
+
+    fn sample_fingerprint(source: &str) -> u64 {
+        let surface = enum_surface(source, "Sample").expect("sample enum must extract");
+        fnv1a_64(surface.as_bytes())
+    }
+
+    #[test]
+    fn test_message_set_fingerprint_unchanged_source_matches_pin() {
+        let actual = message_set_fingerprint(PROTOCOL_SOURCE)
+            .expect("ClientMessage and DaemonMessage must be extractable from the crate source");
+        assert_eq!(
+            actual, PROTOCOL_FINGERPRINT,
+            "the protocol message set changed (fingerprint 0x{actual:016x}, pinned \
+             0x{PROTOCOL_FINGERPRINT:016x}): bump PROTOCOL_VERSION and re-pin \
+             PROTOCOL_FINGERPRINT in crates/protocol/src/lib.rs (strict-equality \
+             policy, docs/protocol.md)"
+        );
+    }
+
+    #[test]
+    fn test_enum_surface_real_enums_carry_field_types() {
+        // The surface must include field TYPES (a wire-breaking type change
+        // trips the fingerprint) and the container serde attributes.
+        let client = enum_surface(PROTOCOL_SOURCE, "ClientMessage").expect("extract ClientMessage");
+        assert!(client.starts_with(r##"#[serde(tag="type",rename_all="snake_case")]"##));
+        assert!(client.contains("Attach{session:String,}"));
+        assert!(client.contains("Hello{version:u32,}"));
+
+        let daemon = enum_surface(PROTOCOL_SOURCE, "DaemonMessage").expect("extract DaemonMessage");
+        assert!(daemon.contains("PaneOutput{pane_id:u32,bytes:Vec<u8>,}"));
+        assert!(daemon.contains("Welcome{version:u32,}"));
+    }
+
+    #[test]
+    fn test_enum_surface_variant_addition_changes_fingerprint() {
+        let grown = SAMPLE_SOURCE.replace(
+            "Beta { name: String, flag: bool },",
+            "Beta { name: String, flag: bool },\n    Gamma { count: u64 },",
+        );
+        assert_ne!(
+            sample_fingerprint(SAMPLE_SOURCE),
+            sample_fingerprint(&grown)
+        );
+    }
+
+    #[test]
+    fn test_enum_surface_field_rename_changes_fingerprint() {
+        let renamed = SAMPLE_SOURCE.replace("name: String", "title: String");
+        assert_ne!(
+            sample_fingerprint(SAMPLE_SOURCE),
+            sample_fingerprint(&renamed)
+        );
+    }
+
+    #[test]
+    fn test_enum_surface_field_type_change_changes_fingerprint() {
+        let retyped = SAMPLE_SOURCE.replace("id: u32", "id: u64");
+        assert_ne!(
+            sample_fingerprint(SAMPLE_SOURCE),
+            sample_fingerprint(&retyped)
+        );
+    }
+
+    #[test]
+    fn test_enum_surface_serde_attribute_change_changes_fingerprint() {
+        // Container serde attributes are wire-visible (the `type` tag), so
+        // changing one must trip the fingerprint.
+        let retagged = SAMPLE_SOURCE.replace(r#"tag = "type""#, r#"tag = "kind""#);
+        assert_ne!(
+            sample_fingerprint(SAMPLE_SOURCE),
+            sample_fingerprint(&retagged)
+        );
+    }
+
+    #[test]
+    fn test_enum_surface_comment_and_whitespace_changes_keep_fingerprint() {
+        // Doc comments, ordinary comments, and reformatting are not
+        // wire-visible: the fingerprint must not produce false bumps for them.
+        let reformatted = r#"
+// Entirely different commentary.
+#[derive(Debug, Clone, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Sample {
+    Alpha {
+        id: u32
+    },
+    Beta {
+        name: String, flag: bool
+    },
+}
+"#;
+        assert_eq!(
+            sample_fingerprint(SAMPLE_SOURCE),
+            sample_fingerprint(reformatted)
+        );
+    }
+
+    #[test]
+    fn test_enum_surface_derive_attribute_change_keeps_fingerprint() {
+        // Derives are not wire-visible; adding one must not force a version
+        // bump.
+        let rederived = SAMPLE_SOURCE.replace(
+            "#[derive(Debug, Clone, PartialEq)]",
+            "#[derive(Debug, Clone, PartialEq, Eq)]",
+        );
+        assert_eq!(
+            sample_fingerprint(SAMPLE_SOURCE),
+            sample_fingerprint(&rederived)
+        );
+    }
+
+    #[test]
+    fn test_enum_surface_missing_enum_returns_none() {
+        assert_eq!(enum_surface("pub struct NotAnEnum;", "Sample"), None);
+        assert_eq!(enum_surface(SAMPLE_SOURCE, "Missing"), None);
+    }
+
+    #[test]
+    fn test_enum_surface_unbalanced_braces_returns_none() {
+        // A body whose braces never balance is malformed input, not a panic.
+        assert_eq!(
+            enum_surface("pub enum Broken { Alpha { id: u32 }", "Broken"),
+            None
+        );
+        // A declaration with no body brace at all.
+        assert_eq!(enum_surface("pub enum Broken", "Broken"), None);
     }
 }

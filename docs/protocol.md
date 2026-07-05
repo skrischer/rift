@@ -11,12 +11,42 @@ discriminator. The authoritative definitions live in `crates/protocol/src/lib.rs
 
 ```json
 // client → daemon
-{ "type": "hello",   "version": 1 }
+{ "type": "hello",   "version": 2 }
 // daemon → client
-{ "type": "welcome", "version": 1 }
+{ "type": "welcome", "version": 2 }
 ```
 
 `version` is the wire `PROTOCOL_VERSION`, independent of the crate semver.
+
+## Versioning policy
+
+`PROTOCOL_VERSION` (`crates/protocol/src/lib.rs`) is a single integer with
+**strict equality** semantics: client and daemon must run the exact same
+version. There is no cross-version compatibility or message translation —
+both binaries build from one repo, so skew is resolved by replacing the stale
+binary, never by tolerating it (`docs/spec-connection-robustness.md`).
+
+- **Any** change to the message set requires a bump: a variant added, removed,
+  or renamed; a field added, removed, or renamed; a field's **type** changed;
+  a serde attribute changed. This holds even for changes that are
+  wire-compatible in one direction (e.g. an additive `#[serde(default)]`
+  field) — under strict equality, "compatible" skew is still skew.
+- The message set is **pinned by a fingerprint test** in `crates/protocol`
+  (`PROTOCOL_FINGERPRINT`, kept beside the version constant): a stable FNV-1a
+  hash over the serde-visible surface of `ClientMessage` and `DaemonMessage` —
+  container serde attributes, variant names, field names, and field types,
+  ignoring comments and formatting. Changing either enum without re-pinning
+  fails `cargo test -p rift-protocol`; the failure message instructs to bump
+  `PROTOCOL_VERSION` and re-pin. A message-set change without a version bump
+  therefore cannot pass CI.
+- Version skew is negotiated at the handshake, not mid-stream: the daemon
+  answers a mismatched `hello` with `welcome` carrying its **own** version and
+  closes cleanly without streaming; the client owns the resolution (stop the
+  stale daemon via the pidfile, redeploy, respawn, re-handshake).
+
+History: version 2 pins the message set as of the connection-robustness phase
+(fingerprint test introduced); version 1 was the original handshake constant,
+carried but never enforced.
 
 ## Terminal streaming
 
@@ -367,7 +397,10 @@ out-of-root carve-out), and the compute runs off the async I/O path via
 
 All message types live in `crates/protocol/`. Adding a new message type is a
 deliberate API change — both daemon and client must be updated. Keep additions
-**additive**: existing consumers must keep compiling and deserializing.
+**additive**: existing consumers must keep compiling and deserializing. Every
+message-set change — additive or not — bumps `PROTOCOL_VERSION` and re-pins
+the fingerprint (see Versioning policy above); the fingerprint test enforces
+this mechanically.
 
 Most paths are **push-only** (structure and decoration: worktree, git,
 diagnostics — "push is the source of truth"). The six request/response
