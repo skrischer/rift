@@ -36,6 +36,10 @@ const ERROR_MARKER: &str = "LSP_STUB_ERROR";
 /// case.
 const LINT_MARKER: &str = "LSP_STUB_LINT";
 
+/// The marker that makes the crashing stub exit abruptly (no publish, no
+/// shutdown handshake) — the crash+restart test's kill switch (#427).
+const CRASH_MARKER: &str = "LSP_STUB_CRASH";
+
 /// Single-server table: one stub bound to the rust extension, reporting a
 /// recognizable message.
 const ONE_SERVER: &[ServerSpec] = &[ServerSpec {
@@ -62,6 +66,22 @@ const TWO_SERVERS: &[ServerSpec] = &[
         extensions: &["rs"],
     },
 ];
+
+/// Single-server table whose stub additionally dies on the crash marker — the
+/// crash+restart case (#427).
+const CRASHING_SERVER: &[ServerSpec] = &[ServerSpec {
+    language: "rust",
+    binary: "stub_lsp_server",
+    args: &[
+        "--marker",
+        ERROR_MARKER,
+        "--message",
+        "type-checker error",
+        "--crash-marker",
+        CRASH_MARKER,
+    ],
+    extensions: &["rs"],
+}];
 
 /// A self-cleaning temp directory, mirroring the daemon/explorer test helpers so
 /// this stays self-contained without a `tempfile` dev-dependency.
@@ -184,6 +204,49 @@ async fn recv_diagnostics_until<T>(
     .expect("expected a Diagnostics event within the timeout")
 }
 
+/// Repeatedly rewrite `relative` under `root` with `content(revision)` while
+/// waiting for a `Diagnostics` event `pick` accepts. Document sync reads file
+/// content at processing time, so two quick writes can collapse into one
+/// observed content — driving fresh changes until the expected event lands
+/// keeps the crash+restart test deterministic without sleeping on internal
+/// timings.
+async fn write_until_diagnostics<T>(
+    root: &Path,
+    relative: &str,
+    events: &mut broadcast::Receiver<DaemonMessage>,
+    content: impl Fn(u32) -> String,
+    mut pick: impl FnMut(String, String, Vec<rift_protocol::Diagnostic>) -> Option<T>,
+) -> T {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut revision = 0u32;
+        loop {
+            revision += 1;
+            write_file(root, relative, &content(revision));
+            let slice = tokio::time::sleep(Duration::from_secs(2));
+            tokio::pin!(slice);
+            loop {
+                tokio::select! {
+                    _ = &mut slice => break,
+                    msg = events.recv() => match msg {
+                        Ok(DaemonMessage::Diagnostics { path, server, items }) => {
+                            if let Some(found) = pick(path, server, items) {
+                                return found;
+                            }
+                        }
+                        Ok(_) => continue,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            panic!("event bus closed early")
+                        }
+                    },
+                }
+            }
+        }
+    })
+    .await
+    .expect("expected a Diagnostics event within the timeout")
+}
+
 #[tokio::test]
 async fn test_error_introduced_then_fixed_converges() {
     stage_stub_on_path();
@@ -221,6 +284,86 @@ async fn test_error_introduced_then_fixed_converges() {
     })
     .await;
     let () = cleared;
+
+    drop(handles);
+    drop(events);
+    loop_handle.await.expect("dispatch loop joins");
+}
+
+#[tokio::test]
+async fn test_server_crash_and_restart_clears_previous_instance_diagnostics() {
+    // Regression for #427: diagnostics are keyed by per-spawn server id, and a
+    // crashed server's replacement publishes under a fresh id — nothing ever
+    // overwrote the dead id's sets, so stale errors persisted forever. The LSP
+    // worker must push clearing empty updates for the dead instance's paths
+    // when the registry prunes it.
+    stage_stub_on_path();
+    let tmp = TempDir::new("crash-restart");
+
+    let (mut daemon, handles) = channels(256, 16);
+    daemon.watch_worktree(tmp.path.clone());
+    daemon.watch_lsp(
+        tmp.path.clone(),
+        DocumentSelector::with_table(CRASHING_SERVER),
+    );
+    let mut events = handles.subscribe();
+    let loop_handle = tokio::spawn(daemon.run());
+    wait_for_scan(&handles).await;
+
+    // Introduce an error under the first instance (server id "0").
+    write_file(
+        &tmp.path,
+        "app.rs",
+        &format!("fn main() {{}} // {ERROR_MARKER}"),
+    );
+    recv_diagnostics_until(&mut events, |path, server, items| {
+        (path == "app.rs" && server == "0" && !items.is_empty()).then_some(())
+    })
+    .await;
+
+    // Crash the server and drive changes until the daemon observes the death:
+    // the next matching change prunes the dead instance, restarts the binary
+    // under a fresh id, and must push a clearing empty set for the old id's
+    // paths. Every nudge write carries the crash marker, so whichever content
+    // an instance ends up reading it never publishes — the only possible
+    // source of an empty "0" set is the prune-time clear.
+    write_until_diagnostics(
+        &tmp.path,
+        "app.rs",
+        &mut events,
+        |revision| format!("fn main() {{}} // {CRASH_MARKER} rev {revision}"),
+        |path, server, items| (path == "app.rs" && server == "0" && items.is_empty()).then_some(()),
+    )
+    .await;
+
+    // The stale set is gone from the daemon's State, not just cleared on the
+    // bus — a (re)attaching client must not have it replayed either.
+    assert!(
+        !handles
+            .state
+            .borrow()
+            .diagnostics
+            .contains_key(&DiagnosticKey {
+                path: "app.rs".to_string(),
+                server: "0".to_string(),
+            }),
+        "the dead instance's diagnostics must not survive in State"
+    );
+
+    // The replacement serves the file under its own id: reintroducing the
+    // error (without the crash marker) yields a diagnostic keyed by a fresh id.
+    let server = write_until_diagnostics(
+        &tmp.path,
+        "app.rs",
+        &mut events,
+        |revision| format!("fn main() {{}} // {ERROR_MARKER} rev {revision}"),
+        |path, server, items| (path == "app.rs" && !items.is_empty()).then_some(server),
+    )
+    .await;
+    assert_ne!(
+        server, "0",
+        "the restarted server publishes under a fresh id"
+    );
 
     drop(handles);
     drop(events);

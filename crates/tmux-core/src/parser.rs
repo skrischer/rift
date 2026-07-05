@@ -39,7 +39,9 @@ pub(crate) fn parse_notification(line: &[u8]) -> Option<Event> {
         b"%window-close" | b"%unlinked-window-close" => {
             parse_window_id(rest).map(|window| Event::WindowClose { window })
         }
+        b"%window-renamed" => parse_window_renamed(rest),
         b"%session-changed" => parse_session_changed(rest),
+        b"%session-renamed" => parse_session_renamed(rest),
         b"%session-window-changed" => parse_session_window_changed(rest),
         b"%window-pane-changed" => parse_window_pane_changed(rest),
         b"%pane-mode-changed" => parse_pane_id(rest).map(|pane| Event::PaneModeChanged { pane }),
@@ -102,11 +104,32 @@ fn parse_layout_change(rest: &[u8]) -> Option<Event> {
     })
 }
 
+/// `@<window> <name>` — the name is the remainder and may contain spaces.
+fn parse_window_renamed(rest: &[u8]) -> Option<Event> {
+    let (id, name) = split_first_space(rest);
+    let window = parse_u32(id.strip_prefix(b"@")?)?;
+    Some(Event::WindowRenamed {
+        window,
+        name: String::from_utf8_lossy(name).into_owned(),
+    })
+}
+
 /// `$<session> <name>` — the name is the remainder and may contain spaces.
 fn parse_session_changed(rest: &[u8]) -> Option<Event> {
     let (id, name) = split_first_space(rest);
     let session = parse_u32(id.strip_prefix(b"$")?)?;
     Some(Event::SessionChanged {
+        session,
+        name: String::from_utf8_lossy(name).into_owned(),
+    })
+}
+
+/// `$<session> <name>` — same shape as `%session-changed` (the tmux man page
+/// omits the id field, but tmux 3.4 sends it; verified empirically).
+fn parse_session_renamed(rest: &[u8]) -> Option<Event> {
+    let (id, name) = split_first_space(rest);
+    let session = parse_u32(id.strip_prefix(b"$")?)?;
+    Some(Event::SessionRenamed {
         session,
         name: String::from_utf8_lossy(name).into_owned(),
     })
@@ -260,6 +283,59 @@ mod tests {
             parse_notification(b"%unlinked-window-close @4"),
             Some(Event::WindowClose { window: 4 })
         );
+    }
+
+    #[test]
+    fn test_parse_notification_window_renamed_with_and_without_name() {
+        // Spaced name as real tmux 3.4 sends it (`rename-window 'my spaced name'`).
+        assert_eq!(
+            parse_notification(b"%window-renamed @0 my spaced name"),
+            Some(Event::WindowRenamed {
+                window: 0,
+                name: "my spaced name".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse_notification(b"%window-renamed @3"),
+            Some(Event::WindowRenamed {
+                window: 3,
+                name: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_notification_window_renamed_malformed_returns_none() {
+        assert_eq!(parse_notification(b"%window-renamed 0 name"), None); // window no @
+        assert_eq!(parse_notification(b"%window-renamed @x name"), None); // non-numeric
+        assert_eq!(parse_notification(b"%window-renamed"), None); // truncated
+    }
+
+    #[test]
+    fn test_parse_notification_session_renamed_with_and_without_name() {
+        // `$<session> <name>` as real tmux 3.4 sends it (the man page omits the
+        // id field).
+        assert_eq!(
+            parse_notification(b"%session-renamed $0 sess two"),
+            Some(Event::SessionRenamed {
+                session: 0,
+                name: "sess two".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse_notification(b"%session-renamed $1"),
+            Some(Event::SessionRenamed {
+                session: 1,
+                name: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_notification_session_renamed_malformed_returns_none() {
+        assert_eq!(parse_notification(b"%session-renamed 0 name"), None); // session no $
+        assert_eq!(parse_notification(b"%session-renamed $x name"), None); // non-numeric
+        assert_eq!(parse_notification(b"%session-renamed"), None); // truncated
     }
 
     #[test]
