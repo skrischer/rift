@@ -478,45 +478,65 @@ impl FileTree {
             self.cache_dirty = true;
         }
 
+        self.scroll_selected_into_view();
+    }
+
+    /// Scroll the selected row into view. The tail shared by [`FileTree::reveal`]
+    /// and every keyboard-navigation method below (#431): any selection movement
+    /// must keep the selected row on screen — arrow keys used to walk it
+    /// straight off. Refreshes the row cache first (a collapse/expand step may
+    /// have invalidated it) so the row index used to scroll is current; with no
+    /// selection, or one not in the visible set, there is nothing to scroll to.
+    fn scroll_selected_into_view(&mut self) {
         self.refresh_row_cache();
-        if let Some(ix) = self.row_cache.iter().position(|row| row.path == path) {
+        let Some(selected) = self.selected.as_deref() else {
+            return;
+        };
+        if let Some(ix) = row_index(&self.row_cache, selected) {
             self.scroll_handle
                 .scroll_to_item(ix, ScrollStrategy::Nearest);
         }
     }
 
-    /// Move the selection to the previous visible row ([`SelectUp`]).
+    /// Move the selection to the previous visible row ([`SelectUp`]) and
+    /// scroll it into view.
     fn select_up(&mut self) {
         self.refresh_row_cache();
         self.selected = selection_after_up(&self.row_cache, self.selected.as_deref());
+        self.scroll_selected_into_view();
     }
 
-    /// Move the selection to the next visible row ([`SelectDown`]).
+    /// Move the selection to the next visible row ([`SelectDown`]) and scroll
+    /// it into view.
     fn select_down(&mut self) {
         self.refresh_row_cache();
         self.selected = selection_after_down(&self.row_cache, self.selected.as_deref());
+        self.scroll_selected_into_view();
     }
 
-    /// Select the first visible row ([`SelectFirst`]).
+    /// Select the first visible row ([`SelectFirst`]) and scroll it into view.
     fn select_first(&mut self) {
         self.refresh_row_cache();
         self.selected = self.row_cache.first().map(|row| row.path.clone());
+        self.scroll_selected_into_view();
     }
 
-    /// Select the last visible row ([`SelectLast`]).
+    /// Select the last visible row ([`SelectLast`]) and scroll it into view.
     fn select_last(&mut self) {
         self.refresh_row_cache();
         self.selected = self.row_cache.last().map(|row| row.path.clone());
+        self.scroll_selected_into_view();
     }
 
     /// Collapse the selected directory if it is expanded; otherwise select
-    /// its parent ([`CollapseOrSelectParent`]). A no-op at a top-level row
-    /// with nothing to collapse. Selects the first row when nothing was
-    /// selected yet, matching [`FileTree::select_down`]/[`FileTree::select_up`].
+    /// its parent ([`CollapseOrSelectParent`]), scrolling the resulting
+    /// selection into view. A no-op at a top-level row with nothing to
+    /// collapse. Selects the first row when nothing was selected yet, matching
+    /// [`FileTree::select_down`]/[`FileTree::select_up`].
     fn collapse_or_select_parent(&mut self) {
         self.refresh_row_cache();
         let Some(selected) = self.selected.clone() else {
-            self.selected = self.row_cache.first().map(|row| row.path.clone());
+            self.select_first();
             return;
         };
         let Some(index) = row_index(&self.row_cache, &selected) else {
@@ -529,16 +549,18 @@ impl FileTree {
         } else if let Some(parent) = parent_path(&self.row_cache, index).map(str::to_owned) {
             self.selected = Some(parent);
         }
+        self.scroll_selected_into_view();
     }
 
     /// Expand the selected directory if it is collapsed; otherwise select its
-    /// first child ([`ExpandOrSelectChild`]). A no-op on a file or an empty,
-    /// already-expanded directory. Selects the first row when nothing was
-    /// selected yet, matching [`FileTree::select_down`]/[`FileTree::select_up`].
+    /// first child ([`ExpandOrSelectChild`]), scrolling the resulting
+    /// selection into view. A no-op on a file or an empty, already-expanded
+    /// directory. Selects the first row when nothing was selected yet,
+    /// matching [`FileTree::select_down`]/[`FileTree::select_up`].
     fn expand_or_select_child(&mut self) {
         self.refresh_row_cache();
         let Some(selected) = self.selected.clone() else {
-            self.selected = self.row_cache.first().map(|row| row.path.clone());
+            self.select_first();
             return;
         };
         let Some(index) = row_index(&self.row_cache, &selected) else {
@@ -551,6 +573,7 @@ impl FileTree {
         } else if let Some(child) = first_child_path(&self.row_cache, index).map(str::to_owned) {
             self.selected = Some(child);
         }
+        self.scroll_selected_into_view();
     }
 
     /// Open the selected file, or toggle the selected directory
@@ -1663,6 +1686,21 @@ mod tests {
 
         tree.select_first();
         assert_eq!(tree.selected(), Some("a"));
+    }
+
+    #[test]
+    fn test_scroll_selected_into_view_refreshes_the_cache_and_tolerates_a_hidden_selection() {
+        let mut tree = seed(vec![dir("a"), file("a/b.rs"), file("top.rs")]);
+        tree.selected = Some("a/b.rs".into());
+        // Hide the selected row: `a/b.rs` drops out of the visible set and the
+        // cache is marked dirty.
+        tree.toggle_dir("a");
+
+        tree.scroll_selected_into_view();
+
+        assert!(!tree.cache_dirty, "the helper refreshes the cache first");
+        // The hidden selection stays put; there is simply no row to scroll to.
+        assert_eq!(tree.selected(), Some("a/b.rs"));
     }
 
     #[test]
