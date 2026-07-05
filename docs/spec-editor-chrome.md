@@ -22,10 +22,12 @@ file-changed-on-disk dialog — and (gate decision) a minimap strip.
       preview), hairline, doc body, action row `› Definition F12` ·
       `Q References ⇧F12` (Rename is consciously OMITTED — LSP rename is
       post-v1; no dead controls).
-- [ ] References open in a right-dock panel per §3 (search-context chip,
-      "N references · M files", file groups with count badges, match rows
+- [ ] References AND multi-target definitions open in a right-dock panel per
+      §3 (header names the mode — "References"/"Definitions" — search-context
+      chip, "N results · M files", file groups with count badges, match rows
       with the symbol highlighted, active row accent) — replacing the
-      jump-list overlay (#485 gave it a dismiss path; this replaces it).
+      jump-list overlay for BOTH of its consumers (#485 — still open — adds
+      an interim dismiss; this panel removes the overlay entirely).
 - [ ] An OUTLINE panel (left dock, §3 anatomy: kind glyph lanes + mono names,
       selection follows cursor, click jumps) renders from document symbols.
 - [ ] The dirty-buffer conflict surfaces as the design's dialog ("File
@@ -41,16 +43,28 @@ file-changed-on-disk dialog — and (gate decision) a minimap strip.
 - `protocol`/`daemon`/`lsp` (deliberate, minimal API change): a
   `DocumentSymbolRequest { id, path }` → `DocumentSymbolResponse` pair
   (flattened symbol list: name, kind, range, selection_range, depth) via the
-  existing nav-request machinery (drop-stale ids, per-connection reply per
-  #482's routing fix); serves breadcrumb AND outline. Version bump per the
-  fingerprint policy.
+  existing nav-request machinery with drop-stale ids and PER-CONNECTION
+  replies — the DocumentSymbol issue carries `Depends on: #482` (open
+  papercut: today nav responses broadcast to all clients; the new pair must
+  not inherit that). The lsp crate advertises
+  `hierarchical_document_symbol_support` at initialize; the Flat
+  (`SymbolInformation`) response shape is normalized too (fallbacks:
+  selection_range = range, depth from container nesting). Serves breadcrumb
+  AND outline. Version bump per the fingerprint policy.
 - `app` (editor.rs): breadcrumb bar (path from the open tab, symbol =
   innermost symbol containing the cursor, updated on cursor move against the
   cached symbol tree — one request per open/change, not per keystroke);
-  gutter severity dots; inline diagnostic card for the cursor line (replaces
-  the plain inline text row); current-line highlight if not already present.
+  gutter severity dots as an app-side overlay aligned via the input widget's
+  visible_row_range/line_height APIs (the pinned widget has no gutter
+  decoration API); inline diagnostic card for the cursor line — the widget's
+  own mouse-hover DiagnosticPopover is suppressed for that line so one
+  diagnostic never renders twice; current-line highlight if not already
+  present.
 - `app`: hover card restyle to §3 (code block + doc + action row wired to
   the existing GoToDefinition / FindReferences actions with kbd hints).
+  Anchoring/dismissal mechanics stay owned by the open papercut #486
+  (mouse-position anchor, no re-open after dismiss) — the restyle issue
+  carries `Depends on: #486` to avoid double implementation.
 - `app`: references panel in the right dock (gpui-component Panel like
   SourceControl/DiffView), fed by the existing ReferencesResponse; grouped by
   file, count badges, click jumps, Escape/× closes; the overlay path is
@@ -58,8 +72,8 @@ file-changed-on-disk dialog — and (gate decision) a minimap strip.
 - `app`: outline panel in the left dock (toggle via palette + the phase-21
   rail gains its icon in a follow-up there), fed by the document-symbol
   cache of the active editor.
-- `app`: conflict dialog via gpui-component modal (the #423 close-confirm
-  pattern), actions identical to the #433 banner remedies.
+- `app`: conflict dialog via gpui-component modal (the #420 dirty-close
+  confirm pattern), actions identical to the #433 banner remedies.
 - Minimap: per gate decision — if IN: a non-interactive-scroll marks strip
   (~14px: line-length marks, diagnostic tints, viewport slab, click-to-jump)
   as its own issue; if OUT: recorded deviation from the artboard, revisited
@@ -91,8 +105,8 @@ file-changed-on-disk dialog — and (gate decision) a minimap strip.
 |---|---|---|
 | One flattened DocumentSymbol pair serves breadcrumb + outline | Two consumers, one stream, one cache; mirrors how diagnostics fan out client-side | 2026-07-05 |
 | Rename is omitted from the hover action row | LSP rename is explicitly post-v1 (roadmap); a dead Rename button violates the no-dead-controls bar — conscious deviation from the §3 artboard, revisited with the rename feature | 2026-07-05 |
-| References panel replaces the jump-list overlay | The design shows a persistent right panel; the overlay was the interim (its dismiss fix #485 stays useful until this lands) | 2026-07-05 |
-| Conflict UI = modal dialog on the #423 confirm pattern with the #433 actions | Design §7 shows a dialog; the banner was the papercut-scale interim | 2026-07-05 |
+| The results panel takes over BOTH overlay consumers (references AND multi-target definitions, #198 path) | One mechanism per surface; leaving definitions on a removed overlay would orphan them (spec-review finding) | 2026-07-05 |
+| Conflict UI = modal dialog on the #420 confirm pattern with the #433 actions | Design §7 shows a dialog; the banner was the papercut-scale interim | 2026-07-05 |
 | Symbol resolution is client-side against a cached tree | One request per open/change-debounce keeps the seam cheap; cursor moves are local | 2026-07-05 |
 
 ## Prior art
@@ -141,3 +155,11 @@ None.
 - 2026-07-05: Spec drafted from the wave-1 editor gap analysis (breadcrumb/
   minimap/gutter dots/inline card/references panel/outline all CONFIRMED
   missing; hover card partial) and the design distillation §1/§3/§7.
+- 2026-07-05: Fresh-context review (PR #524): blocking findings baked in —
+  the panel takes over multi-target definitions too (#198 overlay consumer),
+  the stale "#485 gave it a dismiss path" claim corrected (open, interim),
+  #482 becomes an issue-level prerequisite of the DocumentSymbol issue, and
+  hover anchoring/dismissal stays owned by #486 (dependency edge).
+  Non-blocking adoptions: #420 (not #423) as the dialog pattern, diagnostic
+  double-surface suppression, capability advertisement + Flat-shape
+  fallbacks, gutter overlay render strategy.
