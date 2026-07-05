@@ -45,30 +45,38 @@ all died silently while the app kept running. This is the shape behind
 ### In scope
 
 - `protocol`: bump `PROTOCOL_VERSION` to 2; add a message-set fingerprint test
-  (stable hash over both enums' variant names + field names) pinned beside the
-  version constant — the test's failure message instructs "bump
-  PROTOCOL_VERSION and re-pin"; document the policy in `docs/protocol.md`.
+  (stable hash over both enums' variant names + field names + field TYPES, so
+  a wire-breaking type change also trips it) pinned beside the version
+  constant — the test's failure message instructs "bump PROTOCOL_VERSION and
+  re-pin"; document the policy in `docs/protocol.md`.
 - `daemon`: enforce Hello version equality (today any version is accepted —
   crates/daemon/src/lib.rs:1273-1276 marks this as deferred); on mismatch reply
   `Welcome { version: <own> }` and close cleanly WITHOUT streaming (the old
   client then sees an orderly version signal, not a mid-stream codec death).
+  Note: today the Welcome rides the shared broadcast bus (lib.rs:1286) — the
+  mismatch reply must be per-connection so one mismatched client cannot
+  interfere with a healthy client's stream (shared stable+dev daemon).
 - `ssh`/`app`: client checks `Welcome.version` for equality (today it only
   logs — crates/app/src/main.rs:992-993); on mismatch: stop the running daemon
-  via the existing pidfile stop (crates/ssh/src/launch.rs:129-131, #281),
+  via the existing pidfile stop (`stop_daemon`, crates/ssh/src/launch.rs:139, #281),
   re-run the existing versioned deploy (content-fingerprinted, deploy.rs),
   respawn, re-handshake (bounded by the #441 timeout). One retry; a second
-  mismatch surfaces as a connection error (screen/banner).
+  mismatch surfaces as a connection error (screen/banner). While touching this
+  path, fix the adjacent stale comment (main.rs ~:976-978 still describes the
+  pre-#227 "re-broadcast on every Hello" behavior).
 - `app`: daemon-stream death recovery — on `daemon message stream ended` /
   malformed frame while SSH is alive: bounded auto-reconnect to the socket,
   fresh Hello/Welcome (snapshot replay restores worktree/git/diagnostics —
   the #227/#425/#426 mechanisms), re-Attach the terminal (fresh LayoutSnapshot
   reset is the existing reconnect contract, protocol lib.rs docs).
-- `app`/`ssh`: SSH-drop handling — replace quit-on-disconnect
+- `app`/`ssh`/`terminal`: SSH-drop handling — replace quit-on-disconnect
   (run_ssh_session error path, crates/app/src/main.rs:466-476, and the
-  `Disconnected → cx.quit()` handler) with a reconnect loop (capped backoff)
-  driving `ConnectionStatus::Reconnecting`; danger banner per design §7 with
-  retry counter; success re-runs the full connect pipeline; failure policy per
-  gate decision.
+  `Disconnected → cx.quit()` handler in crates/terminal/src/session_view.rs:350)
+  with a reconnect loop (capped backoff) driving
+  `ConnectionStatus::Reconnecting` (enum + status-dot rendering live in
+  crates/terminal; the dot colors become theme tokens while touched); danger
+  banner per design §7 with retry counter; success re-runs the full connect
+  pipeline; failure policy per gate decision.
 - `app`: Connection screen per design §6 (UI contract below): connect card
   with Host / User / Port / SSH key / Session fields prefilled from env and
   baked defaults, `Connect` primary button, `tmux -CC -A` caption, RECENT list
