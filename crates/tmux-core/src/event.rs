@@ -41,6 +41,20 @@ pub enum Event {
     /// (verified on tmux 3.4), so consumers must match `session` against
     /// their own attached session id before adopting `name`.
     SessionRenamed { session: u32, name: String },
+    /// `%sessions-changed` — a session was created or destroyed somewhere on
+    /// the server. Carries no payload; a consumer re-queries the session list.
+    SessionsChanged,
+    /// `%client-session-changed <client> $<session> <name>` — ANOTHER client
+    /// switched to the session with the given id and name (tmux's
+    /// `control-notify.c` sends the switching client itself a plain
+    /// [`Event::SessionChanged`] instead), so this never refers to this
+    /// client's own attach. A consumer re-queries the session list to refresh
+    /// per-session attached state.
+    ClientSessionChanged {
+        client: String,
+        session: u32,
+        name: String,
+    },
     /// `%session-window-changed $<session> @<window>` — the attached session's
     /// active window changed (a `select-window` / tab switch). Carries no
     /// geometry; a consumer re-queries the layout to refresh the active flags.
