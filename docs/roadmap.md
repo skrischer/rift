@@ -37,7 +37,7 @@
 | 18 | Window-tab pane-activity indicators — active-pane count + aggregate state (free / busy / attention) per window, derived agent-agnostically from per-pane OSC-133 shell integration + the terminal bell | [archive/spec-pane-activity-indicators.md](archive/spec-pane-activity-indicators.md) | [Phase 180](https://github.com/skrischer/rift/milestone/32) |
 | 19 | tmux session switch — daemon session list + live updates, switcher UI (interim statusbar + palette; title-bar home lands with phase 21), re-attach; parallel sessions via second instance | [spec-session-switch.md](spec-session-switch.md) | [Phase 190](https://github.com/skrischer/rift/milestone/33) |
 | 20 | Protocol & connection robustness — message-set version negotiation, stale-daemon restart, stream-death resync, reconnect loop, connect screen (startup state on every launch) | [spec-connection-robustness.md](spec-connection-robustness.md) | [Phase 200](https://github.com/skrischer/rift/milestone/34) |
-| 21 | Cockpit chrome — custom title bar (connection/session group), activity rail, window-tab redesign, pane headers | — | — |
+| 21 | Cockpit chrome — custom title bar (connection/session group), activity rail, window-tab redesign, pane headers (sidebar removed) | [spec-cockpit-chrome.md](spec-cockpit-chrome.md) | [Phase 210](https://github.com/skrischer/rift/milestone/35) |
 | 22 | Composite status line — window list + activity, branch ± counts, diagnostic counts, LSP health, Ln/Col, clock | — | — |
 | 23 | Editor chrome — breadcrumb + symbol, gutter severity dots, inline diagnostic card, hover card, references/outline panels, conflict dialog | — | — |
 | 24 | Source-control write path — stage/unstage/commit, hunk staging, split diff + word-level emphasis | — | — |
