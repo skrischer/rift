@@ -657,9 +657,10 @@ async fn request_reply(
 /// rather than over the shared `events` bus, whose bounded backlog silently
 /// drops chunks once a large snapshot exceeds its capacity (issue #227). The
 /// bus carries only incremental `UpdateWorktree`s; a lagging writer may still
-/// drop those, but that loss is logged, never silent. Bus events are forwarded
-/// only once this connection's `Welcome` has been written (issue #425) — the
-/// client requires `Welcome` as its first frame.
+/// drop those — the loss is logged and the full snapshot is replayed off-bus
+/// so the client converges rather than staying stale (issue #426). Bus events
+/// are forwarded only once this connection's `Welcome` has been written
+/// (issue #425) — the client requires `Welcome` as its first frame.
 ///
 /// `inbound` is a clone of the loop's inbound sender (dropped when the
 /// connection ends); `events` is a fresh subscription to the outbound bus;
@@ -803,11 +804,19 @@ where
                         }
                     }
                     // The bus carries only incremental updates now; a lagging
-                    // writer drops some. Log the count — never silently — so the
-                    // divergence is observable. The snapshot itself is loss-free,
-                    // delivered off-bus above.
+                    // writer drops some. Log the count — never silently — then
+                    // replay the full snapshot (tree + git + diagnostics)
+                    // off-bus so this client converges instead of staying
+                    // permanently stale (#426): a completed snapshot atomically
+                    // replaces the client model, and the retained bus tail
+                    // written after it re-applies idempotently. Pre-handshake
+                    // there is nothing to resync — bus traffic is suppressed
+                    // above and the snapshot follows the `Welcome` anyway.
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(skipped, "connection lagged, dropped worktree update(s)");
+                        warn!(skipped, "connection lagged, resyncing via snapshot replay");
+                        if handshaken {
+                            snapshot_sent = write_snapshot(&mut writer, &state).await?;
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => break 'serve,
                 }
@@ -1962,6 +1971,96 @@ mod tests {
             read_daemon_message(&mut client_reader, &mut decoder).await,
             post,
             "bus forwarding must resume after the handshake"
+        );
+
+        drop(client_writer);
+        drop(client_reader);
+        conn.abort();
+        loop_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_serve_connection_bus_lag_replays_snapshot_to_converge() {
+        // Regression for #426: when this connection's bus subscription lags,
+        // the dropped incremental updates are unrecoverable — the connection
+        // must replay the full off-bus snapshot so the client model converges
+        // instead of staying permanently stale.
+        let tmp = TempDir::new("lag-resync");
+        write_file(&tmp.path.join("a.txt"), "x");
+        write_file(&tmp.path.join("b.txt"), "y");
+
+        // Bus capacity 2 with a 64-event burst: while the client is not
+        // reading, the connection can drain at most the tiny duplex buffer
+        // plus the retained backlog before it must observe `Lagged` — the
+        // overflow is guaranteed regardless of task scheduling.
+        let (mut daemon, handles) = channels(2, 8);
+        daemon.watch_worktree(tmp.path.clone());
+        let inbound = handles.inbound.clone();
+        let events = handles.subscribe();
+        let state = handles.state.clone();
+        let loop_handle = tokio::spawn(daemon.run());
+
+        let (client, server) = tokio::io::duplex(256);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+        let (server_reader, server_writer) = tokio::io::split(server);
+        let conn = tokio::spawn(async move {
+            let _ =
+                serve_connection(server_reader, server_writer, inbound, events, state, None).await;
+        });
+
+        client_writer
+            .write_all(&hello_frame())
+            .await
+            .expect("send Hello");
+        client_writer.flush().await.expect("flush Hello");
+
+        let mut decoder = FrameDecoder::new();
+        let initial = read_full_snapshot(&mut client_reader, &mut decoder).await;
+        assert_eq!(initial.len(), 2, "initial replay carries the full tree");
+
+        // Burst past the bus capacity while the client reads nothing: the
+        // connection parks on the full duplex and its subscription overflows.
+        for i in 0..64 {
+            handles
+                .events
+                .send(DaemonMessage::UpdateWorktree {
+                    added: Vec::new(),
+                    changed: Vec::new(),
+                    removed: vec![format!("burst-{i}")],
+                })
+                .expect("bus subscriber alive");
+        }
+
+        // Resume reading: burst frames written before the writer parked (and
+        // the retained bus tail re-delivered after the lag) are tolerated —
+        // convergence requires a complete fresh snapshot to arrive.
+        let fresh = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut collected = Vec::new();
+            loop {
+                match read_daemon_message(&mut client_reader, &mut decoder).await {
+                    DaemonMessage::UpdateWorktree { .. } => {}
+                    DaemonMessage::WorktreeSnapshot {
+                        entries,
+                        final_chunk,
+                        ..
+                    } => {
+                        collected.extend(entries);
+                        if final_chunk {
+                            return collected;
+                        }
+                    }
+                    other => panic!("unexpected message during lag resync: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("lagged connection must receive a fresh snapshot");
+
+        let paths: Vec<&str> = fresh.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["a.txt", "b.txt"],
+            "replayed snapshot must carry the full current tree"
         );
 
         drop(client_writer);
