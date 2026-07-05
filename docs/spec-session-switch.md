@@ -19,8 +19,9 @@ label + command palette; the custom title bar relocates it in phase 21).
       named session) from the switcher UI and the command palette; the terminal
       view resets cleanly to the new session's layout.
 - [ ] The session indicator always shows the ACTUAL attached session — after
-      attach-or-create, after a rename, and after an external
-      `switch-client` — never a frozen echo of the requested name.
+      attach-or-create and rename it already does (since #429/#448); after an
+      external `switch-client` the indicator AND the terminal content refresh
+      immediately instead of staying stale until the next structural event.
 - [ ] All of it is agent-agnostic plumbing: no new signal beyond the tmux
       control-mode stream.
 
@@ -29,18 +30,24 @@ label + command palette; the custom title bar relocates it in phase 21).
 ### In scope
 
 - `tmux-core`: parse `%sessions-changed` and `%client-session-changed` into
-  typed events (`%session-renamed` and `%window-renamed` land via #429).
+  typed events (`%session-renamed` and `%window-renamed` landed via #429).
 - `protocol` (deliberate API change, minimal): a `QuerySessionList` →
   `SessionListReply` request/response pair modeled on the existing
-  `QueryKeyTable` → `KeyTableReply`, plus unprompted `SessionListReply` pushes;
-  a truthful attached-session signal (field on `LayoutSnapshot`/`LayoutUpdate`
-  or a dedicated message — implementer picks the smaller diff, see Prior
-  decisions).
-- `daemon`: serve the query via `list-sessions -F '#{session_id} #{session_name}
-  #{session_windows} #{session_attached}'` under the existing correlated-command
-  mechanism; re-issue it coalesced (like the layout re-query) on
-  `%sessions-changed` / `%session-renamed` and push the result; consume
-  `Event::SessionChanged` instead of discarding it (crates/daemon/src/terminal.rs:517).
+  `QueryKeyTable` → `KeyTableReply`, plus unprompted `SessionListReply` pushes.
+  No new attached-session signal: since #429/#448 the `session` string on
+  `LayoutSnapshot`/`LayoutUpdate` already carries the ACTUAL session (adopted
+  from `%session-changed` at crates/daemon/src/terminal.rs:463-469 and
+  `%session-renamed` at :470-479).
+- `daemon`: serve the query via `list-sessions` with a tab-separated format,
+  session name as the LAST field (mirrors the `LAYOUT_QUERY` convention,
+  terminal.rs:52): `#{session_id}\t#{session_windows}\t#{session_attached}\t#{session_name}`,
+  under the existing correlated-command mechanism; re-issue it coalesced (like
+  the layout re-query) on `%sessions-changed` / `%session-renamed` /
+  `%client-session-changed` and push the result. Close the one remaining
+  truthful-indicator gap: the `SessionChanged` arm updates `self.session` but
+  never triggers `request_layout()` — add it (mirroring the `SessionRenamed`
+  arm), so an external `switch-client` refreshes both the indicator and the
+  terminal content instead of staying stale until the next structural event.
 - `terminal`/`app`: client session model (list + actual attached session);
   switcher popover anchored to the statusbar session label; command-palette
   commands ("Switch Session…", "New Session…"); switching sends the existing
@@ -71,12 +78,17 @@ label + command palette; the custom title bar relocates it in phase 21).
   invisible to control clients).
 - Agent-agnostic: session data derives from the control stream only.
 - No `.unwrap()` in library code; crate boundaries via `lib.rs`.
-- UI contract (distilled from the Paper design, Cockpit — IDE artboard):
-  indicator = green 6px connection dot + "user@host · session <name>" (13px,
-  session name mono, muted); picker = popover (bg #181825, border #45475a,
-  radius 8, shadow), rows 30px: session name mono 13px + "N windows" muted
-  caption right + attached-dot lane; current session row = surface bg #313244 +
-  2px primary left bar; footer row "+ New session…" (ghost). No emojis.
+- UI contract (distilled from the Paper design, Cockpit — IDE artboard) — all
+  colors as THEME TOKENS, never hardcoded hex (reference values are Catppuccin
+  Mocha): indicator = green 6px connection dot (success) + "user@host · session
+  <name>" (13px, session name mono, muted.foreground); picker = popover
+  (popover bg, ref #181825; border, ref #45475a; radius 8, shadow), rows 30px:
+  session name mono 13px + "N windows" muted caption right + attached-dot lane
+  (fixed slot); current session row = surface bg (ref #313244) + 2px primary
+  left bar; footer row "+ New session…" (ghost button style). No emojis.
+- The switcher requires the daemon transport (`Attach` is a protocol message);
+  on the `RIFT_TERMINAL_LEGACY` escape hatch it is inert (acceptable — the
+  legacy path is slated for removal, #285).
 
 ## Prior decisions
 
@@ -84,8 +96,7 @@ label + command palette; the custom title bar relocates it in phase 21).
 |---|---|---|
 | Session list via `list-sessions` request/response + notification-driven coalesced re-query and push | Mirrors the proven KeyTableReply and layout re-query patterns already in the daemon; prior-art index Phase 19 (tmux Control Mode; iTerm2 UX reference) | 2026-07-05 |
 | Switch = re-send `Attach { session }` on the same connection | The daemon already detaches the old control child, spawns the new one, and sends a fresh `LayoutSnapshot` (terminal.rs:111-114); the client already resets on snapshots (reconnect contract) | 2026-07-05 |
-| Truthful attached-session signal comes from consuming `Event::SessionChanged` (+ rename events) | Today the layout echoes the *requested* string, which lies after attach-or-create/rename/switch-client; the parser already yields the event — it is discarded at terminal.rs:517 | 2026-07-05 |
-| Implementer picks the smaller diff for carrying the actual session: a field on `LayoutSnapshot`/`LayoutUpdate` OR a dedicated `SessionChanged` message | Both respect the seam; the layout already carries a session string that must stop lying either way | 2026-07-05 |
+| No new attached-session protocol signal; close the `switch-client` gap with `request_layout()` in the `SessionChanged` arm | Since #429/#448 the daemon adopts `%session-changed`/`%session-renamed` into `self.session`, so `LayoutSnapshot`/`LayoutUpdate` already carry the actual name; only the layout refresh on external `switch-client` is missing (spec-review finding B1) | 2026-07-05 |
 | Interim switcher placement: statusbar session label (click → popover) + command palette | The design's title-bar home for the indicator is phase 21 scope; blocking 19 on 21 inverts the roadmap order. The statusbar label already renders the session name today | 2026-07-05 |
 | Parallel sessions v1 = second app instance (one OS window per session) | Zero protocol change (pane ids are server-global; each client gets its own control child); the multi-attach map is a real protocol redesign with no current dogfooding need | 2026-07-05 |
 | New-session creation reuses attach-or-create (`new-session -A -s <name>`) | The daemon child command is already attach-or-create; "create" is just attaching to a fresh name | 2026-07-05 |
@@ -132,13 +143,20 @@ secrets, accounts, or external provisioning.
 |---|---|
 | New ClientMessage variants hit a stale running daemon → connection killed (the phase-20 smoking gun) | Cross-milestone dependency: this phase's protocol issue depends on phase 20's version-negotiation issue; until then the dev channel restarts the daemon on relaunch |
 | `%sessions-changed` bursts (session churn) flooding re-queries | Coalesce exactly like the layout re-query (single in-flight query, trailing-edge re-issue) |
-| Session names with spaces/unicode break the `list-sessions -F` line parsing | Use `#{session_id}` as the key, tab-separated format fields, parser tested with malformed input |
+| Session names with spaces/unicode break the `list-sessions -F` line parsing | Tab-separated format with the name as the LAST field (LAYOUT_QUERY convention), `#{session_id}` as the key, parser tested with malformed input |
 | Switching away mid-capture/mid-query leaks per-session state | The daemon drops per-connection attach state wholesale on re-Attach (already the case); client resets its layout model on the fresh snapshot |
 
 ## Decision log
 
-- 2026-07-05: Spec drafted from the wave-1 daemon recon (verified seams:
-  re-Attach switch path, KeyTableReply correlation mechanism, discarded
-  SessionChanged event) and the Paper design distillation (§1 indicator, §8.6
-  live list). Open decisions resolved at the spec-acceptance gate are recorded
-  below by the gate.
+- 2026-07-05: Spec drafted from the wave-1 daemon recon and the Paper design
+  distillation (§1 indicator, §8.6 live list).
+- 2026-07-05: Spec review (fresh-context agent, PR #459) — blocking finding B1
+  accepted and baked in: #429/#448 (merged the same day) already consume
+  `%session-changed`/`%session-renamed`, so the truthful-indicator work
+  shrinks to `request_layout()` on external `switch-client`; no new protocol
+  signal. Also adopted: tab-separated list format (name last),
+  `%client-session-changed` as re-query trigger, theme tokens instead of hex
+  literals, legacy-path note. Follow-up recorded: the roadmap row 19 wording
+  ("title-bar switcher") and the phase-19 architecture-impact note in
+  roadmap.md §"v1.0 polish cut" are corrected in this phase's step-8 roadmap
+  update PR (interim statusbar placement; SessionChanged already consumed).
