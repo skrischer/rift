@@ -35,6 +35,14 @@
 | 16 | Command palette | [spec-command-palette.md](spec-command-palette.md) | [Phase 160](https://github.com/skrischer/rift/milestone/30) |
 | 17 | Theme & settings | [spec-theme-settings.md](spec-theme-settings.md) | [Phase 170](https://github.com/skrischer/rift/milestone/31) |
 | 18 | Window-tab pane-activity indicators — active-pane count + aggregate state (free / busy / attention) per window, derived agent-agnostically from per-pane OSC-133 shell integration + the terminal bell | [archive/spec-pane-activity-indicators.md](archive/spec-pane-activity-indicators.md) | [Phase 180](https://github.com/skrischer/rift/milestone/32) |
+| 19 | tmux session switch — daemon session list + live updates, title-bar switcher, re-attach / parallel attach | — | — |
+| 20 | Protocol & connection robustness — message-set version negotiation, stale-daemon restart, stream-death resync, reconnect loop, connect screen | — | — |
+| 21 | Cockpit chrome — custom title bar (connection/session group), activity rail, window-tab redesign, pane headers | — | — |
+| 22 | Composite status line — window list + activity, branch ± counts, diagnostic counts, LSP health, Ln/Col, clock | — | — |
+| 23 | Editor chrome — breadcrumb + symbol, gutter severity dots, inline diagnostic card, hover card, references/outline panels, conflict dialog | — | — |
+| 24 | Source-control write path — stage/unstage/commit, hunk staging, split diff + word-level emphasis | — | — |
+| 25 | Explorer design parity — header actions, git letter lane, diagnostic dots + rollup, empty states | — | — |
+| 26 | Settings shell + theme unification — full settings page, theme-driven terminal palette, hardcoded-hex cleanup | — | — |
 
 A phase gets a Spec link once `/loopkit:plan` drafts it, and a Milestone link once
 it is `READY`. The milestone (open/closed + issue progress) is where status lives.
@@ -65,6 +73,39 @@ Explorer **file operations** (create/rename/delete/move) were split out of Phase
 11 at planning into a separate daemon-write phase (a write capability needing new
 protocol variants, unlike Phase 11's read-only decoration/navigation); it is not
 yet sequenced.
+
+## v1.0 polish cut (phases 19–26)
+
+Seeded 2026-07-05 from idea sparring backed by a verified defect/gap analysis
+(73 confirmed defects, 62 design gaps vs the Paper design; live behavioral QA on
+the dev channel). The Paper design file `rift` (7 artboards: Styleguide,
+Cockpit — IDE, Connection — Startup, Parallel Agents — Worktrees, Editor — LSP
+Navigation, Git — Diff Review, Settings) is the visual contract these phases
+close on. Ordering: 19–20 are the feature/correctness backbone — the live-QA
+smoking gun (an app/daemon protocol skew silently killing the whole reactive
+stream, no recovery, no user-visible error) is the root cause behind "reactive
+signals dead" reports — and 21–26 are per-surface design parity.
+
+Foundation impact (authored and ratified in each phase's `/loopkit:plan` spec
+PR, never edited from here):
+
+- Phase 19 — `architecture.md`: the connection model grows a multi-session
+  client dimension (one control child per (client, session)); `protocol` gains
+  session-list messages (deliberate API change). `%sessions-changed` handling
+  replaces today's discarded `Event::SessionChanged`.
+- Phase 20 — `architecture.md` "Connection lifecycle": a reconnect loop
+  replaces quit-on-disconnect; Hello/Welcome carries a message-set version and
+  the client restarts a stale running daemon via the pidfile mechanism
+  (papercuts #425/#426/#438/#441 shipped the small halves; this phase owns
+  negotiation + UX, including the Connection — Startup screen).
+- Phase 24 — `protocol` gains git-write messages (stage/unstage/commit) — a
+  deliberate, reviewed API extension; the daemon gains its first write
+  capability beyond file save.
+- Phase 26 — resolves the constitution tech-debt row on the hardcoded terminal
+  palette (terminal ANSI colors follow the active theme).
+
+Backing prior art: "v1.0 polish + robustness phases — prior-art index
+(Phases 19–26)" in [prior-art.md](prior-art.md).
 
 ## Tracks (tooling/DX, not product phases)
 
