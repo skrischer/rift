@@ -894,8 +894,11 @@ async fn run_daemon_terminal(
     // recovery's re-Attach does: on an SSH-level reconnect the fresh tmux
     // child spawns unsized and the render layer will not re-send an unchanged
     // size. `None` on the very first connect — the initial layout's resize is
-    // still in flight and lands through the resize bridge instead.
-    if let Some(size) = *watches.viewport.borrow() {
+    // still in flight and lands through the resize bridge instead. The value
+    // is copied out before the send so the watch read guard is never held
+    // across an await (`reconnect_daemon` does the same).
+    let viewport = *watches.viewport.borrow();
+    if let Some(size) = viewport {
         client
             .send(ClientMessage::ResizePane {
                 pane_id: 0,
