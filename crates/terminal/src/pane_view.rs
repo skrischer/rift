@@ -76,6 +76,11 @@ struct ActivityTracker {
     /// Unacknowledged terminal-bell attention. Set by [`Self::on_bell`], cleared
     /// by [`Self::acknowledge`].
     attention: bool,
+    /// Whether this pane's window is the session's active window, pushed down
+    /// from the window layer via [`Self::set_window_active`]. Gates bell raises:
+    /// a bell in the window the user is looking at never raises attention
+    /// (`docs/spec-pane-activity-indicators.md`).
+    window_active: bool,
     /// Timestamp of the most recent PTY output, for the recency fallback.
     last_output: Option<Instant>,
 }
@@ -93,13 +98,28 @@ impl ActivityTracker {
     }
 
     /// Raise unacknowledged attention (the pane rang the terminal bell).
+    /// Suppressed while the pane's window is active — the user is already
+    /// looking at it (`docs/spec-pane-activity-indicators.md`).
     fn on_bell(&mut self) {
-        self.attention = true;
+        if !self.window_active {
+            self.attention = true;
+        }
     }
 
     /// Clear attention back to the underlying busy/free state.
     fn acknowledge(&mut self) {
         self.attention = false;
+    }
+
+    /// Record whether this pane's window is the session's active window.
+    /// Activation acknowledges any pending attention (viewing the window is
+    /// the acknowledgement); while active, bell raises are suppressed at the
+    /// source in [`Self::on_bell`].
+    fn set_window_active(&mut self, active: bool) {
+        self.window_active = active;
+        if active {
+            self.attention = false;
+        }
     }
 
     /// Classify the pane's activity for the given command `phase` and clock.
@@ -662,10 +682,19 @@ impl PaneView {
     }
 
     /// Clear this pane's unacknowledged bell attention back to its underlying
-    /// busy/free state. Called by the window layer on the active-window
-    /// transition (`docs/spec-pane-activity-indicators.md`).
+    /// busy/free state. Called by the window layer when the user selects this
+    /// pane's window locally (tab click, Alt+1..9), so the badge clears without
+    /// waiting for the confirming snapshot (`docs/spec-pane-activity-indicators.md`).
     pub fn acknowledge_attention(&mut self) {
         self.activity.acknowledge();
+    }
+
+    /// Record whether this pane's window is the session's active window, from
+    /// the snapshot's `is_active` flag. While active, a bell never raises
+    /// attention; the activation edge acknowledges any pending attention
+    /// (`docs/spec-pane-activity-indicators.md`).
+    pub fn set_window_active(&mut self, active: bool) {
+        self.activity.set_window_active(active);
     }
 
     fn pixel_to_grid(&self, pos: Point<Pixels>) -> (usize, usize) {
@@ -1748,6 +1777,50 @@ mod tests {
             tracker.underlying(CommandPhase::Executing, now),
             PaneActivity::Busy
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_activity_bell_while_window_active_raises_no_attention() {
+        // A bell in the active window is suppressed at raise time: the user is
+        // already looking at it, so no stale attention flag survives leaving
+        // the window.
+        let mut tracker = ActivityTracker::default();
+        tracker.on_osc133();
+        tracker.set_window_active(true);
+        let now = Instant::now();
+
+        tracker.on_bell();
+        assert_eq!(tracker.state(CommandPhase::Idle, now), PaneActivity::Free);
+        assert_eq!(
+            tracker.state(CommandPhase::Executing, now),
+            PaneActivity::Busy
+        );
+
+        // Leaving the window afterwards must not resurface the suppressed bell.
+        tracker.set_window_active(false);
+        assert_eq!(tracker.state(CommandPhase::Idle, now), PaneActivity::Free);
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_activity_window_activation_clears_pending_attention() {
+        // A bell in a background window raises attention; activating the
+        // window acknowledges it (viewing is the acknowledgement), and a later
+        // deactivation does not re-raise it.
+        let mut tracker = ActivityTracker::default();
+        tracker.on_osc133();
+        let now = Instant::now();
+
+        tracker.on_bell();
+        assert_eq!(
+            tracker.state(CommandPhase::Idle, now),
+            PaneActivity::Attention
+        );
+
+        tracker.set_window_active(true);
+        assert_eq!(tracker.state(CommandPhase::Idle, now), PaneActivity::Free);
+
+        tracker.set_window_active(false);
+        assert_eq!(tracker.state(CommandPhase::Idle, now), PaneActivity::Free);
     }
 
     #[::core::prelude::v1::test]
