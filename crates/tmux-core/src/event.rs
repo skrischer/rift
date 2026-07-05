@@ -29,8 +29,15 @@ pub enum Event {
     /// `%window-close @<window>` — also tmux's `%unlinked-window-close`, which
     /// carries the same payload and the same meaning to a client.
     WindowClose { window: u32 },
+    /// `%window-renamed @<window> <name>` — the window's title changed (a
+    /// `rename-window` or the shell's automatic-rename). No structural event
+    /// accompanies it; a consumer re-queries the layout to refresh names.
+    WindowRenamed { window: u32, name: String },
     /// `%session-changed $<session> <name>`.
     SessionChanged { session: u32, name: String },
+    /// `%session-renamed $<session> <name>` — the session was renamed. Like
+    /// [`Event::WindowRenamed`], no structural event accompanies it.
+    SessionRenamed { session: u32, name: String },
     /// `%session-window-changed $<session> @<window>` — the attached session's
     /// active window changed (a `select-window` / tab switch). Carries no
     /// geometry; a consumer re-queries the layout to refresh the active flags.

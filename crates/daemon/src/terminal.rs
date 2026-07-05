@@ -437,17 +437,28 @@ impl Attach {
                         .await
                         .map_err(|_| Closed)?;
                 }
-                // Structural changes and focus changes both re-query the layout:
-                // the `list-panes` query carries window_active/pane_active, so a
-                // `select-window` (tab) or `select-pane` is reflected to the client
-                // as a LayoutUpdate with refreshed active flags. tmux signals focus
-                // moves out-of-band (`%session-window-changed`, `%window-pane-changed`)
-                // with no geometry, so they would otherwise leave the UI stale.
+                // Structural, focus, and rename changes all re-query the layout:
+                // the `list-panes` query carries window_active/pane_active and
+                // window_name, so a `select-window` (tab), `select-pane`, or
+                // `rename-window` (explicit or the shell's automatic-rename) is
+                // reflected to the client as a LayoutUpdate with refreshed flags
+                // and names. tmux signals all of these out-of-band
+                // (`%session-window-changed`, `%window-pane-changed`,
+                // `%window-renamed`) with no geometry, so they would otherwise
+                // leave the UI stale.
                 Event::LayoutChange { .. }
                 | Event::WindowAdd { .. }
                 | Event::WindowClose { .. }
+                | Event::WindowRenamed { .. }
                 | Event::SessionWindowChanged { .. }
                 | Event::WindowPaneChanged { .. } => {
+                    self.request_layout().await;
+                }
+                Event::SessionRenamed { name, .. } => {
+                    // The layout messages echo this attach's session name; adopt
+                    // the new name and re-query so the client sees it now, not at
+                    // the next unrelated structural change.
+                    self.session = name;
                     self.request_layout().await;
                 }
                 Event::CommandReply { id, error, output } => {
@@ -1742,6 +1753,91 @@ mod tests {
         assert!(
             moved.is_some(),
             "select-window must emit a LayoutUpdate with the active flag on the selected window"
+        );
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_layout_update_after_rename_window() {
+        // `rename-window` emits only %window-renamed — no structural event — so
+        // the daemon must re-query the layout for the new name to reach the
+        // client (the stale-tab-label regression this guards).
+        let server = TmuxServer::new("renamewin");
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+        recv_until(&mut out_rx, 10, |m| {
+            matches!(m, DaemonMessage::LayoutSnapshot { .. }).then_some(())
+        })
+        .await
+        .expect("snapshot");
+
+        in_tx
+            .send(ClientMessage::TmuxCommand {
+                cmd: "rename-window rift429renamed".to_owned(),
+            })
+            .await
+            .expect("rename-window");
+
+        let renamed = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::LayoutUpdate { windows, .. } => windows
+                .iter()
+                .any(|w| w.name == "rift429renamed")
+                .then_some(()),
+            _ => None,
+        })
+        .await;
+        assert!(
+            renamed.is_some(),
+            "rename-window must surface a LayoutUpdate carrying the new window name"
+        );
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_layout_update_after_rename_session() {
+        // `rename-session` emits only %session-renamed; the daemon adopts the
+        // new name so the layout echo reports it without waiting for an
+        // unrelated structural change.
+        let server = TmuxServer::new("renamesess");
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+        recv_until(&mut out_rx, 10, |m| {
+            matches!(m, DaemonMessage::LayoutSnapshot { .. }).then_some(())
+        })
+        .await
+        .expect("snapshot");
+
+        in_tx
+            .send(ClientMessage::TmuxCommand {
+                cmd: "rename-session rift429sess".to_owned(),
+            })
+            .await
+            .expect("rename-session");
+
+        let renamed = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::LayoutUpdate { session, .. } if session == "rift429sess" => Some(()),
+            _ => None,
+        })
+        .await;
+        assert!(
+            renamed.is_some(),
+            "rename-session must surface a LayoutUpdate echoing the new session name"
         );
 
         drop(in_tx);
