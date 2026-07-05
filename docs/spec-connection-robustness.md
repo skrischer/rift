@@ -34,9 +34,9 @@ all died silently while the app kept running. This is the shape behind
       connection lost … retrying") + the `Reconnecting` status dot, retries
       with capped backoff, and fully re-initializes on success (daemon channel,
       attach, resync).
-- [ ] A Connection screen owns the not-connected state per the design: connect
-      card (host/user/port/key/session), recent connections, visible status;
-      it appears per the startup policy decided at the acceptance gate.
+- [ ] The Connection screen is the startup state on every launch (prefilled;
+      one click connects) and owns the not-connected state: connect card
+      (host/user/port/key/session), recent connections, visible status.
 - [ ] `ConnectionStatus::Reconnecting` (today a dead variant,
       crates/terminal/src/lib.rs:94) is reachable and rendered.
 
@@ -76,16 +76,23 @@ all died silently while the app kept running. This is the shape behind
   `ConnectionStatus::Reconnecting` (enum + status-dot rendering live in
   crates/terminal; the dot colors become theme tokens while touched); danger
   banner per design §7 with retry counter; success re-runs the full connect
-  pipeline; failure policy per gate decision.
+  pipeline. Policy (gate decision 2026-07-05): unlimited retries with jittered
+  capped backoff (30s cap) and a Cancel action leading to the Connection
+  screen; auth/config failures skip retrying and go straight to the screen
+  with the error surfaced.
 - `app`: Connection screen per design §6 (UI contract below): connect card
   with Host / User / Port / SSH key / Session fields prefilled from env and
   baked defaults, `Connect` primary button, `tmux -CC -A` caption, RECENT list
   (small local store beside the window-state store), "not connected" titlebar
-  state; entered when no complete config exists, when the initial connect
-  fails, or when the user cancels reconnecting (policy details per gate).
-- `ssh`: passphrase-protected keys (today unsupported and failing log-only,
-  crates/ssh/src/connection.rs key loading): decrypt with a passphrase entered
-  in the Connection screen (never persisted) — final in/out per gate decision.
+  state. The screen is the app's startup state on EVERY launch (gate decision
+  2026-07-05): prefilled from config, one click (or Enter) connects; it also
+  owns connect failures and a canceled reconnect. Auto-connect-on-launch is
+  explicitly not wanted.
+- `ssh`: passphrase-protected keys (today unsupported and failing log-only —
+  `load_secret_key(&path, None)`, crates/ssh/src/connection.rs:52): decrypt
+  with a passphrase entered in the Connection screen (never persisted; a wrong
+  passphrase surfaces as a field-level error). In scope per gate decision
+  2026-07-05.
 
 ### Out of scope
 
@@ -138,6 +145,9 @@ all died silently while the app kept running. This is the shape behind
 | Resync = the existing Welcome snapshot replay + terminal re-Attach; no new sync protocol | The per-connection replay (#227, ordered by #425, lag-hardened by #426) and the fresh-LayoutSnapshot reset contract are exactly the resync semantics; a second path would violate the no-duplicate-mechanism rule | 2026-07-05 |
 | Reconnect state surfaces through the existing `ConnectionStatus` channel | The enum + statusbar rendering exist (`Reconnecting` is a dead variant today); no parallel status mechanism | 2026-07-05 |
 | Recents store lives beside the window-state store (same JSON pattern, per-channel) | Window-state persistence (phase 9) is the established local-store pattern; no new dependency | 2026-07-05 |
+| The Connection screen is the startup state on every launch (no auto-connect) | Gate decision: explicit, visible connect step preferred over blind auto-connect; the design's §6 artboard is the startup state | 2026-07-05 |
+| Reconnect: unlimited jittered capped backoff (30s cap) + Cancel → Connection screen; auth/config errors skip retries | Gate decision: a long outage self-heals; the user can always bail out; misconfiguration must not hide behind retries | 2026-07-05 |
+| Passphrase-protected SSH keys are in scope (screen-prompted, never persisted) | Gate decision: the screen provides the natural prompt surface; closes the wave-1 log-only failure | 2026-07-05 |
 
 ## Prior art
 
@@ -176,12 +186,12 @@ into scope, uses a key the developer already owns; nothing to deliver.)
 - [ ] Behavioral: drop SSH (kill sshd connection) → app does NOT quit; danger
       banner + Reconnecting dot; restoring the network restores the full
       cockpit
-- [ ] Behavioral: launch with `RIFT_SSH_HOST` unset → Connection screen per
-      the design contract; connecting from it reaches the cockpit; the recents
-      list records the connection
-- [ ] Encrypted-key flow (if in scope per gate): connecting with a
-      passphrase-protected key prompts once and succeeds; a wrong passphrase
-      surfaces a field-level error, not a log line
+- [ ] Behavioral: every launch lands on the Connection screen with prefilled
+      values; Enter/Connect reaches the cockpit; the recents list records the
+      connection; canceling a reconnect returns to the screen
+- [ ] Encrypted-key flow: connecting with a passphrase-protected key prompts
+      once and succeeds; a wrong passphrase surfaces a field-level error, not
+      a log line
 
 ## Risks and mitigations
 
@@ -199,3 +209,11 @@ into scope, uses a key the developer already owns; nothing to deliver.)
   post-wave code state (#425 Welcome ordering, #426 lag resync, #438
   keepalive, #441 handshake timeout already merged — this spec builds on
   them instead of re-scoping them).
+- 2026-07-05: Fresh-context review (PR #470): APPROVE; adopted the
+  non-blocking findings — per-connection Welcome note, field types in the
+  fingerprint, `terminal` crate in the SSH-drop scope, corrected
+  `stop_daemon` citation, stale-comment cleanup folded into the client issue,
+  architecture.md robustness contract authored in this PR.
+- 2026-07-05: Spec-acceptance gate resolved the three open decisions —
+  Connection screen on every launch (no auto-connect), unlimited capped
+  reconnect with Cancel, passphrase keys in scope — and accepted the spec.

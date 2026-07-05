@@ -170,7 +170,9 @@ Editing uses a deliberate request/response buffer channel over the daemon transp
   instead of quitting; tmux session persistence makes the terminal lossless
   across it.
 - **Not-connected is a UI state**, owned by the Connection screen (design
-  "Connection — Startup"), never a blind exit.
+  "Connection — Startup"), never a blind exit. The screen is also the startup
+  state on every launch (prefilled config, explicit Connect) — the app never
+  auto-connects blindly.
 
 ## Technology map
 
