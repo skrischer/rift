@@ -550,15 +550,14 @@ impl SessionView {
                     if let Some(entry) = self.panes.get(&pane_state.id) {
                         entry.entity.update(cx, |pv, cx| {
                             pv.set_tmux_size(pane_state.width, pane_state.height);
-                            // The active window must never surface attention:
-                            // acknowledge every one of its panes on every snapshot
-                            // (not only on the is_active edge — a continuously
-                            // active window has no edge), so tab clicks, Alt+1..9,
-                            // and %output-confirmed selects clear it uniformly
+                            // Push the window-active flag into the pane's tracker
+                            // on every snapshot (not only on the is_active edge —
+                            // a continuously active window has no edge): while
+                            // active a bell never raises attention, and activation
+                            // acknowledges pending attention, so tab clicks,
+                            // Alt+1..9, and tmux-side selects clear it uniformly
                             // (`docs/spec-pane-activity-indicators.md`).
-                            if is_active_window {
-                                pv.acknowledge_attention();
-                            }
+                            pv.set_window_active(is_active_window);
                             // CWD is subscription-driven (rift_pane_path); the
                             // snapshot seeds it only at pane creation below.
                             cx.notify();
@@ -597,6 +596,7 @@ impl SessionView {
                         if !pane_state.current_command.is_empty() {
                             pv.set_current_command(pane_state.current_command.clone());
                         }
+                        pv.set_window_active(is_active_window);
                         pv
                     });
 
@@ -661,9 +661,9 @@ impl SessionView {
     /// (attention > busy > free) and the count of busy-or-attention panes, for
     /// the tab-bar indicator rendered by a later step. Read live at render so an
     /// observed pane transition reflects immediately. The active window never
-    /// surfaces attention: its panes are acknowledged on every snapshot, and a
-    /// bell arriving between snapshots is read as the pane's underlying busy/free
-    /// (`docs/spec-pane-activity-indicators.md`).
+    /// surfaces attention: its panes' trackers suppress bell raises while the
+    /// window is active, and any pane whose flag is momentarily stale is read as
+    /// its underlying busy/free (`docs/spec-pane-activity-indicators.md`).
     pub fn window_activity(&self, window_id: &str, cx: &App) -> (PaneActivity, usize) {
         let Some(window) = self.windows.iter().find(|w| w.id == window_id) else {
             return (PaneActivity::Free, 0);
@@ -680,6 +680,25 @@ impl SessionView {
             })
         });
         aggregate_activity(activities)
+    }
+
+    /// Acknowledge bell attention on every pane of `window_id`, immediately.
+    /// Called from the local window-select paths (tab click, Alt+1..9) so the
+    /// attention badge clears without waiting for the confirming snapshot's
+    /// round trip through tmux; the snapshot then re-asserts the same state via
+    /// `set_window_active` (`docs/spec-pane-activity-indicators.md`).
+    fn acknowledge_window_attention(&self, window_id: &str, cx: &mut Context<Self>) {
+        let Some(window) = self.windows.iter().find(|w| w.id == window_id) else {
+            return;
+        };
+        for pane_id in &window.pane_ids {
+            if let Some(entry) = self.panes.get(pane_id) {
+                entry.entity.update(cx, |pv, cx| {
+                    pv.acknowledge_attention();
+                    cx.notify();
+                });
+            }
+        }
     }
 
     fn apply_subscription(&mut self, update: SubscriptionUpdate, cx: &mut Context<Self>) {
@@ -1236,11 +1255,14 @@ impl Render for SessionView {
                 tab.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                     if event.click_count() >= 2 {
                         this.start_window_rename(&window_id, window, cx);
-                    } else if let Err(e) = this
-                        .tmux_command_tx
-                        .try_send(format!("select-window -t {}", window_id))
-                    {
-                        debug!(error = %e, "failed to send window switch command");
+                    } else {
+                        if let Err(e) = this
+                            .tmux_command_tx
+                            .try_send(format!("select-window -t {}", window_id))
+                        {
+                            debug!(error = %e, "failed to send window switch command");
+                        }
+                        this.acknowledge_window_attention(&window_id, cx);
                     }
                 })),
             );
@@ -1347,7 +1369,7 @@ impl Render for SessionView {
             // tab-bar click handler. When N exceeds the window count, create a
             // single new window (tmux selects it automatically), completing the
             // affordance like the `+` tab button — never N-M windows.
-            .on_action(cx.listener(|this, action: &SelectWindow, _window, _cx| {
+            .on_action(cx.listener(|this, action: &SelectWindow, _window, cx| {
                 if let Some(win) = this.windows.get(action.0.saturating_sub(1)) {
                     if let Err(e) = this
                         .tmux_command_tx
@@ -1355,6 +1377,7 @@ impl Render for SessionView {
                     {
                         debug!(error = %e, "failed to send window switch command");
                     }
+                    this.acknowledge_window_attention(&win.id, cx);
                 } else if let Err(e) = this.tmux_command_tx.try_send("new-window".into()) {
                     debug!(error = %e, "failed to create new window");
                 }
