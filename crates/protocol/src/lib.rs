@@ -451,6 +451,16 @@ pub struct PaneLayout {
     pub top: u16,
     pub width: u16,
     pub height: u16,
+    /// The pane's current working directory (tmux `#{pane_current_path}`);
+    /// empty when unknown. Defaults on deserialize so a layout emitted before
+    /// this field existed still parses (additive change, #442).
+    #[serde(default)]
+    pub current_path: String,
+    /// The pane's current foreground command name (tmux
+    /// `#{pane_current_command}`); empty when unknown. Same deserialize
+    /// tolerance as `current_path`.
+    #[serde(default)]
+    pub current_command: String,
 }
 
 /// A single worktree entry, keyed by its path relative to the worktree root.
@@ -871,6 +881,8 @@ mod tests {
                         top: 0,
                         width: 80,
                         height: 24,
+                        current_path: "/home/dev/my project".to_owned(),
+                        current_command: "bash".to_owned(),
                     },
                     PaneLayout {
                         pane_id: 1,
@@ -879,6 +891,8 @@ mod tests {
                         top: 0,
                         width: 79,
                         height: 24,
+                        current_path: String::new(),
+                        current_command: String::new(),
                     },
                 ],
             },
@@ -893,6 +907,8 @@ mod tests {
                     top: 0,
                     width: 160,
                     height: 24,
+                    current_path: "/tmp".to_owned(),
+                    current_command: "cargo".to_owned(),
                 }],
             },
         ]
@@ -906,6 +922,25 @@ mod tests {
                 serde_json::from_str(&json).expect("deserialize WindowLayout");
             assert_eq!(parsed, window);
         }
+    }
+
+    #[test]
+    fn test_pane_layout_missing_meta_fields_defaults_to_empty() {
+        // A layout serialized before `current_path`/`current_command` existed
+        // (#442) must still deserialize, with both fields empty ("unknown").
+        let json = r#"{"pane_id":3,"active":false,"left":0,"top":0,"width":80,"height":24}"#;
+        let parsed: PaneLayout = serde_json::from_str(json).expect("deserialize legacy PaneLayout");
+        assert_eq!(parsed.pane_id, 3);
+        assert_eq!(parsed.current_path, "");
+        assert_eq!(parsed.current_command, "");
+    }
+
+    #[test]
+    fn test_pane_layout_malformed_meta_field_type_rejected() {
+        // A present-but-wrongly-typed field is a protocol error, not an
+        // empty-default case.
+        let json = r#"{"pane_id":3,"active":false,"left":0,"top":0,"width":80,"height":24,"current_path":7}"#;
+        assert!(serde_json::from_str::<PaneLayout>(json).is_err());
     }
 
     #[test]
