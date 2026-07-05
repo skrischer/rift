@@ -534,8 +534,10 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels, editor: EditorChannel
     // survives SSH drops, so a reconnect reattaches instead of spawning a second
     // one (#62). Returns the live client on success; `None` when no daemon binary
     // is configured (or a step fails), in which case the legacy tmux path still
-    // runs without daemon-backed features.
-    let daemon_client = provision_daemon(&mut conn).await;
+    // runs without daemon-backed features. A protocol version mismatch that
+    // survives the stale-daemon replacement fails the session instead of
+    // degrading — falling back would hide real skew as silent feature death.
+    let daemon_client = provision_daemon(&mut conn).await?;
 
     // Tmux session name, overridable so a second rift instance can mirror the
     // same live session (default `rift`) or attach to an isolated one for
@@ -872,17 +874,30 @@ const DAEMON_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// unchanged deploy skips this and never bounces a healthy daemon. Then
 /// attaches to the remote daemon — spawning it detached if none is running —
 /// via [`rift_ssh::connect_or_spawn_daemon`] and confirms the transport with a
-/// `Hello`/`Welcome` handshake bounded by [`DAEMON_HANDSHAKE_TIMEOUT`].
-/// The detached daemon outlives the SSH connection,
+/// `Hello`/`Welcome` handshake bounded by [`DAEMON_HANDSHAKE_TIMEOUT`],
+/// enforcing strict protocol version equality (`docs/protocol.md` —
+/// Versioning policy). A mismatched `Welcome` identifies a stale RUNNING
+/// daemon; the client owns the replacement
+/// (`docs/spec-connection-robustness.md`): stop it via its pidfile (#281),
+/// re-run the fingerprinted deploy, respawn detached, re-handshake — one
+/// retry. The detached daemon outlives the SSH connection,
 /// so a later reconnect reattaches to it instead of spawning a second one (#62).
 ///
 /// Returns the live [`rift_ssh::DaemonClient`] on a clean handshake; the caller
 /// decides how to drive it (the terminal byte stream in daemon mode, or just the
-/// worktree/git/diagnostics consumer in legacy mode). Every step is best-effort:
-/// an unconfigured binary or any error logs and returns `None`, so the legacy
-/// tmux flow keeps working without the daemon. The socket and log sit beside the
-/// versioned binary (`<binary>.sock` / `<binary>.log`), inheriting its path.
-async fn provision_daemon(conn: &mut rift_ssh::SshConnection) -> Option<rift_ssh::DaemonClient> {
+/// worktree/git/diagnostics consumer in legacy mode). Provisioning steps are
+/// best-effort: an unconfigured binary or any step error logs and returns
+/// `Ok(None)`, so the legacy tmux flow keeps working without the daemon. The
+/// one hard failure is a version mismatch that persists after the replacement:
+/// that is real protocol skew the fallback would hide as silent feature death,
+/// so it returns `Err` and fails the session visibly. The socket and log sit
+/// beside the versioned binary (`<binary>.sock` / `<binary>.log`), inheriting
+/// its path.
+async fn provision_daemon(
+    conn: &mut rift_ssh::SshConnection,
+) -> Result<Option<rift_ssh::DaemonClient>> {
+    use rift_ssh::Handshake;
+
     // RIFT_DAEMON_BINARY (runtime) wins over the `just promote` compile-time bake
     // RIFT_DEFAULT_DAEMON_BINARY (mirroring the RIFT_SSH_KEY / RIFT_DEFAULT_SSH_KEY
     // split), so a bare desktop-shortcut launch of the pinned stable exe resolves a
@@ -894,7 +909,7 @@ async fn provision_daemon(conn: &mut rift_ssh::SshConnection) -> Option<rift_ssh
             Some(baked) => PathBuf::from(baked),
             None => {
                 debug!("no daemon binary configured (RIFT_DAEMON_BINARY / baked default), skipping daemon");
-                return None;
+                return Ok(None);
             }
         },
     };
@@ -903,7 +918,7 @@ async fn provision_daemon(conn: &mut rift_ssh::SshConnection) -> Option<rift_ssh
         Ok(bytes) => bytes,
         Err(e) => {
             warn!(%e, path = %binary_path.display(), "failed to read local daemon binary, skipping daemon");
-            return None;
+            return Ok(None);
         }
     };
 
@@ -928,7 +943,7 @@ async fn provision_daemon(conn: &mut rift_ssh::SshConnection) -> Option<rift_ssh
         }
         Err(e) => {
             warn!(%e, "daemon auto-deploy failed, continuing with tmux only");
-            return None;
+            return Ok(None);
         }
     };
     let remote_path = outcome.remote_path;
@@ -971,41 +986,89 @@ async fn provision_daemon(conn: &mut rift_ssh::SshConnection) -> Option<rift_ssh
         Ok(channel) => channel,
         Err(e) => {
             warn!(%e, "daemon attach failed, continuing with tmux only");
-            return None;
+            return Ok(None);
         }
     };
 
     // Confirm the reattach transport with a protocol round-trip. The daemon
-    // re-broadcasts the full worktree snapshot on every Hello, so the stream
-    // following the Welcome starts with the complete tree. The wait is bounded
-    // (#441): a wedged daemon must fall back like any other provisioning
-    // failure instead of holding the app at "connecting" forever.
+    // answers each Hello with a per-connection Welcome (#473) and replays its
+    // full state snapshot to this connection right behind it (#227, ordered
+    // by #425), so the stream following the Welcome starts with the complete
+    // tree. The wait is bounded (#441): a wedged daemon must fall back like
+    // any other provisioning failure instead of holding the app at
+    // "connecting" forever.
     let client = rift_ssh::DaemonClient::new(channel);
-    if let Err(e) = client
-        .send(rift_protocol::ClientMessage::Hello {
-            version: rift_protocol::PROTOCOL_VERSION,
-        })
-        .await
-    {
-        warn!(%e, "daemon handshake send failed");
-        return None;
-    }
-    match client.recv_timeout(DAEMON_HANDSHAKE_TIMEOUT).await {
-        Ok(Some(rift_protocol::DaemonMessage::Welcome { version })) => {
-            info!(version, "daemon transport ready (Hello/Welcome ok)");
-            Some(client)
+    let stale_version = match client.handshake(DAEMON_HANDSHAKE_TIMEOUT).await {
+        Ok(Handshake::Ready) => {
+            info!(
+                version = rift_protocol::PROTOCOL_VERSION,
+                "daemon transport ready (Hello/Welcome ok)"
+            );
+            return Ok(Some(client));
         }
-        Ok(Some(other)) => {
-            warn!(?other, "unexpected daemon handshake reply");
-            None
-        }
-        Ok(None) => {
-            warn!("daemon closed before Welcome");
-            None
-        }
+        Ok(Handshake::VersionMismatch { daemon }) => daemon,
         Err(e) => {
-            warn!(%e, "daemon handshake timed out");
-            None
+            warn!(%e, "daemon handshake failed, continuing with tmux only");
+            return Ok(None);
+        }
+    };
+
+    // A RUNNING daemon answered with a different protocol version — a stale
+    // process left behind by an older deploy. Strict equality is resolved
+    // client-side (`docs/spec-connection-robustness.md`): stop it via its
+    // pidfile (#281), re-run the fingerprinted deploy so the on-disk binary
+    // matches this client, respawn detached, and re-handshake, bounded like
+    // the first attempt. One retry only — a second mismatch is real skew the
+    // legacy fallback would hide as silent feature death, so it fails the
+    // session as a visible connection error instead.
+    warn!(
+        daemon = stale_version,
+        client = rift_protocol::PROTOCOL_VERSION,
+        "daemon protocol version mismatch, replacing the stale daemon"
+    );
+    drop(client);
+    if let Err(e) = rift_ssh::stop_daemon(conn, &socket_path).await {
+        warn!(%e, "stale daemon stop failed, continuing with tmux only");
+        return Ok(None);
+    }
+    if let Err(e) =
+        rift_ssh::ensure_daemon_deployed(conn, &bytes, &remote_dir, env!("CARGO_PKG_VERSION")).await
+    {
+        warn!(%e, "daemon redeploy failed, continuing with tmux only");
+        return Ok(None);
+    }
+    let channel = match rift_ssh::connect_or_spawn_daemon(
+        conn,
+        &remote_path,
+        &socket_path,
+        &log_path,
+        project_root.as_deref(),
+    )
+    .await
+    {
+        Ok(channel) => channel,
+        Err(e) => {
+            warn!(%e, "daemon respawn failed, continuing with tmux only");
+            return Ok(None);
+        }
+    };
+    let client = rift_ssh::DaemonClient::new(channel);
+    match client.handshake(DAEMON_HANDSHAKE_TIMEOUT).await {
+        Ok(Handshake::Ready) => {
+            info!(
+                version = rift_protocol::PROTOCOL_VERSION,
+                "daemon transport ready after stale-daemon replacement"
+            );
+            Ok(Some(client))
+        }
+        Ok(Handshake::VersionMismatch { daemon }) => Err(anyhow::anyhow!(
+            "daemon protocol version mismatch persists after replacement \
+             (client v{}, daemon v{daemon})",
+            rift_protocol::PROTOCOL_VERSION
+        )),
+        Err(e) => {
+            warn!(%e, "daemon re-handshake failed, continuing with tmux only");
+            Ok(None)
         }
     }
 }
