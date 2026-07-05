@@ -14,7 +14,8 @@ use gpui::Action;
 
 use crate::editor::{FindReferences, GoToDefinition, Save, ShowHover};
 use crate::workspace::{
-    FocusTerminal, ToggleExplorer, ToggleProblems, ToggleSourceControl, ZoomActivePanel,
+    FocusTerminal, NewSession, SwitchSession, ToggleExplorer, ToggleProblems, ToggleSourceControl,
+    ZoomActivePanel,
 };
 use crate::{
     SelectCatppuccinMochaTheme, SelectDefaultDarkTheme, SelectDefaultLightTheme, ToggleThemeMode,
@@ -65,6 +66,8 @@ pub const COMMANDS: &[Command] = &[
     }),
     Command::new("Focus Terminal", None, || Box::new(FocusTerminal)),
     Command::new("Zoom Active Panel", None, || Box::new(ZoomActivePanel)),
+    Command::new("Switch Session...", None, || Box::new(SwitchSession)),
+    Command::new("New Session...", None, || Box::new(NewSession)),
     Command::new("Toggle Light/Dark Theme", None, || {
         Box::new(ToggleThemeMode)
     }),
@@ -115,6 +118,8 @@ mod tests {
                 "Toggle Source Control",
                 "Focus Terminal",
                 "Zoom Active Panel",
+                "Switch Session...",
+                "New Session...",
                 "Toggle Light/Dark Theme",
                 "Select Theme: Default Light",
                 "Select Theme: Default Dark",
@@ -157,6 +162,19 @@ mod tests {
 
         let mocha = find("Select Theme: Catppuccin Mocha").expect("catppuccin mocha is registered");
         assert!(mocha.action().partial_eq(&SelectCatppuccinMochaTheme));
+    }
+
+    /// Session-switcher commands (`docs/spec-session-switch.md`, issue #466):
+    /// registered under the display names the palette renders, each
+    /// dispatching the workspace-handled action that opens the switcher (with
+    /// the new-session prompt active for "New Session...").
+    #[test]
+    fn test_session_commands_are_registered_and_dispatch_the_expected_actions() {
+        let switch = find("Switch Session...").expect("switch session is registered");
+        assert!(switch.action().partial_eq(&SwitchSession));
+
+        let new = find("New Session...").expect("new session is registered");
+        assert!(new.action().partial_eq(&NewSession));
     }
 
     /// "Dispatch shape": every entry builds a distinct, rift-namespaced

@@ -150,6 +150,14 @@ secrets, accounts, or external provisioning.
 
 - 2026-07-05: Spec drafted from the wave-1 daemon recon and the Paper design
   distillation (§1 indicator, §8.6 live list).
+- 2026-07-05: Switcher UI (#466) — the switch request carries the client's
+  current grid, and the app-seam bridge re-asserts it as a `ResizePane`
+  ordered after the `Attach` on the same task: the render layer's resize
+  channel only fires on a size *change*, so a fresh control child would
+  otherwise stay at tmux's default size until the next real resize. The
+  picker falls back to a single current-session row while the list is empty
+  (first open racing the reply; the inert legacy path), so it never renders
+  an empty shell.
 - 2026-07-05: Spec review (fresh-context agent, PR #459) — blocking finding B1
   accepted and baked in: #429/#448 (merged the same day) already consume
   `%session-changed`/`%session-renamed`, so the truthful-indicator work

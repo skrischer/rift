@@ -18,7 +18,8 @@ use rift_logging::{
 };
 use rift_terminal::{
     CaptureRequest, CaptureResult, ConnectionStatus, KeyTableQueryResult, PaneInput, PaneOutput,
-    SelectWindow, SessionView, SubscriptionUpdate, TermSize, TERMINAL_KEY_CONTEXT,
+    SelectWindow, SessionListItem, SessionSwitchRequest, SessionView, SubscriptionUpdate, TermSize,
+    TERMINAL_KEY_CONTEXT,
 };
 use tracing::{debug, error, info, warn};
 
@@ -49,6 +50,20 @@ struct PtyChannels {
     key_table_request_rx: flume::Receiver<()>,
     /// The parsed-ready reply to a key-table refresh, routed to `SessionView`.
     key_table_result_tx: flume::Sender<KeyTableQueryResult>,
+    /// The host's session list (`docs/spec-session-switch.md`), routed to the
+    /// session switcher: every `SessionListReply` (explicit refresh or the
+    /// daemon's unprompted churn-driven push) replaces the whole list.
+    session_list_tx: flume::Sender<Vec<SessionListItem>>,
+    /// An explicit session-list refresh (opening the switcher); forwarded onto
+    /// the protocol as `ClientMessage::QuerySessionList` in daemon mode.
+    /// Unused in the legacy tmux path — the receiver drops there, so the
+    /// session switcher is inert on `RIFT_TERMINAL_LEGACY` (documented
+    /// limitation; the legacy path is slated for removal, #285).
+    session_list_request_rx: flume::Receiver<()>,
+    /// A cockpit switch from the session switcher; forwarded onto the protocol
+    /// as `ClientMessage::Attach { session }` plus a viewport re-assert in
+    /// daemon mode. Same legacy-path caveat as `session_list_request_rx`.
+    session_switch_rx: flume::Receiver<SessionSwitchRequest>,
 }
 
 /// The daemon-side endpoints of the editor surface's buffer-channel and worktree
@@ -436,6 +451,9 @@ fn main() {
                         connection_status_tx: handle.connection_status_tx,
                         key_table_request_rx: handle.key_table_request_rx,
                         key_table_result_tx: handle.key_table_result_tx,
+                        session_list_tx: handle.session_list_tx,
+                        session_list_request_rx: handle.session_list_request_rx,
+                        session_switch_rx: handle.session_switch_rx,
                     };
 
                     let editor_channels = EditorChannels {
@@ -635,6 +653,13 @@ async fn run_daemon_terminal(
     // task). The reply returns via `consume_daemon_messages` on
     // `sinks.key_table_result_tx`.
     spawn_key_table_bridge(client.clone(), ch.key_table_request_rx);
+    // Session-switch reverse paths (`docs/spec-session-switch.md`): an explicit
+    // list refresh (opening the switcher) becomes a `QuerySessionList` — the
+    // daemon's churn-driven pushes keep the list live in between — and a
+    // switcher selection becomes a re-`Attach` (a clean child swap + fresh
+    // `LayoutSnapshot`, zero daemon changes for the switch itself).
+    spawn_session_list_bridge(client.clone(), ch.session_list_request_rx);
+    spawn_session_switch_bridge(client.clone(), ch.session_switch_rx);
     // Buffer channel reverse path: the editor's open requests become `OpenFile`
     // reads (#187) and its save requests `SaveFile` writes (#188). The forward
     // replies (`FileContent` / `SaveResult` / `SaveConflict`) return via
@@ -661,6 +686,7 @@ async fn run_daemon_terminal(
         snapshot_tx: ch.snapshot_tx,
         capture_result_tx: ch.capture_result_tx,
         key_table_result_tx: ch.key_table_result_tx,
+        session_list_tx: ch.session_list_tx,
     };
     consume_daemon_messages(client, Some(sinks), editor).await;
     Ok(())
@@ -1067,6 +1093,24 @@ async fn consume_daemon_messages(
                         .send(KeyTableQueryResult { list_keys, options });
                 }
             }
+            // The host's session list (the reply to a `QuerySessionList` or the
+            // daemon's unprompted churn-driven push): map the protocol entries
+            // to the render layer's items — `rift-terminal` does not depend on
+            // `rift-protocol`, mirroring the layout seam — and route them to
+            // the session switcher, which replaces its whole list.
+            DaemonMessage::SessionListReply { sessions } => {
+                if let Some(sinks) = &terminal {
+                    let sessions = sessions
+                        .into_iter()
+                        .map(|entry| SessionListItem {
+                            name: entry.name,
+                            windows: entry.windows,
+                            attached: entry.attached,
+                        })
+                        .collect();
+                    let _ = sinks.session_list_tx.send(sessions);
+                }
+            }
             // Snapshot and update both carry the full latest layout (replace
             // semantics), which is exactly what the render layer's `apply_snapshot`
             // expects — so both fold into one synthesized `TmuxSnapshot`.
@@ -1273,6 +1317,7 @@ struct TerminalSinks {
     snapshot_tx: flume::Sender<termy_terminal_ui::TmuxSnapshot>,
     capture_result_tx: flume::Sender<CaptureResult>,
     key_table_result_tx: flume::Sender<KeyTableQueryResult>,
+    session_list_tx: flume::Sender<Vec<SessionListItem>>,
 }
 
 /// Forward typed input from the render layer onto the protocol as
@@ -1403,6 +1448,63 @@ fn spawn_key_table_bridge(
     tokio::spawn(async move {
         while key_table_request_rx.recv_async().await.is_ok() {
             if client.send(ClientMessage::QueryKeyTable).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Forward session-list refresh requests (`docs/spec-session-switch.md`) onto
+/// the protocol as [`rift_protocol::ClientMessage::QuerySessionList`]; the
+/// daemon answers with a `SessionListReply` that returns through
+/// [`consume_daemon_messages`] on `sinks.session_list_tx`. Only the switcher's
+/// on-open refresh rides here — the daemon re-queries on session churn by
+/// itself and pushes the result unprompted.
+fn spawn_session_list_bridge(
+    client: std::sync::Arc<rift_ssh::DaemonClient>,
+    session_list_request_rx: flume::Receiver<()>,
+) {
+    use rift_protocol::ClientMessage;
+    tokio::spawn(async move {
+        while session_list_request_rx.recv_async().await.is_ok() {
+            if client.send(ClientMessage::QuerySessionList).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Forward cockpit switches from the session switcher onto the protocol as
+/// [`rift_protocol::ClientMessage::Attach`] (`docs/spec-session-switch.md`): a
+/// second `Attach` on the same connection performs a clean control-child swap
+/// and answers with a fresh `LayoutSnapshot` the render layer resets on. The
+/// request's grid size is re-asserted as a `ResizePane` on this same task —
+/// sequential sends land in program order, so it reaches the daemon strictly
+/// after the `Attach` and sizes the fresh child (the render layer's own resize
+/// channel only fires on a size *change*, which a switch is not).
+fn spawn_session_switch_bridge(
+    client: std::sync::Arc<rift_ssh::DaemonClient>,
+    session_switch_rx: flume::Receiver<SessionSwitchRequest>,
+) {
+    use rift_protocol::ClientMessage;
+    tokio::spawn(async move {
+        while let Ok(req) = session_switch_rx.recv_async().await {
+            debug!(session = %req.session, "sending session switch attach");
+            if client
+                .send(ClientMessage::Attach {
+                    session: req.session,
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+            let resize = ClientMessage::ResizePane {
+                pane_id: 0,
+                cols: req.size.cols as u16,
+                rows: req.size.rows as u16,
+            };
+            if client.send(resize).await.is_err() {
                 break;
             }
         }

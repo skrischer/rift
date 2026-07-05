@@ -133,6 +133,21 @@ pub struct FocusTerminal;
 #[action(namespace = rift, no_json)]
 pub struct ZoomActivePanel;
 
+/// Open the session switcher (`docs/spec-session-switch.md`): the popover
+/// anchored to the statusbar session label, listing every host tmux session.
+/// Handled at the workspace root (not inside the terminal) so the palette's
+/// dispatch reaches it regardless of which surface holds focus.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct SwitchSession;
+
+/// Open the session switcher with its new-session prompt active
+/// (`docs/spec-session-switch.md`): naming a fresh session attach-creates it
+/// (the daemon child command is `new-session -A -s <name>`).
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct NewSession;
+
 /// Initial width of the left (explorer) dock, in pixels. Purely a starting
 /// point for the user's first resize — `DockArea` owns the size afterward,
 /// replacing the old fixed explorer column (`docs/spec-ide-shell.md`, #324).
@@ -1005,6 +1020,16 @@ impl Render for WorkspaceView {
             }))
             .on_action(cx.listener(|this, _: &ZoomActivePanel, window, cx| {
                 this.zoom_active_panel(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SwitchSession, _window, cx| {
+                this.session_view.update(cx, |session, cx| {
+                    session.open_session_switcher(cx);
+                });
+            }))
+            .on_action(cx.listener(|this, _: &NewSession, window, cx| {
+                this.session_view.update(cx, |session, cx| {
+                    session.open_new_session_prompt(window, cx);
+                });
             }))
             .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
                 this.open_command_palette(window, cx);
