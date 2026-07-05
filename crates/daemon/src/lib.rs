@@ -675,6 +675,15 @@ async fn request_reply(
 /// the `State` it owns live outside it, so they persist across reconnects — the
 /// reattach contract.
 ///
+/// The handshake is answered per connection (issue #473): every `Hello` gets
+/// `Welcome { version: PROTOCOL_VERSION }` written straight to this socket —
+/// never onto the shared bus, so one client's handshake cannot reach another
+/// connection's stream. Version equality is strict: a matching `Hello`
+/// completes the handshake and is followed by the snapshot replay; a
+/// mismatched one gets the same `Welcome` — the orderly early version signal
+/// for a stale client — and then a clean close, with no state or stream
+/// frames.
+///
 /// The snapshot is delivered per connection — backpressured by the socket —
 /// rather than over the shared `events` bus, whose bounded backlog silently
 /// drops chunks once a large snapshot exceeds its capacity (issue #227). The
@@ -704,10 +713,11 @@ where
     let mut decoder = FrameDecoder::new();
     let mut buf = vec![0u8; SERVE_READ_BUFFER];
     // Per-connection replay bookkeeping: the snapshot is sent once, right behind
-    // the `Welcome`. `handshaken` gates the `state` branch so a snapshot landing
-    // mid-scan is never written ahead of the handshake the client waits for, and
-    // the `events` branch so shared bus traffic at connect time can never reach
-    // the socket before the `Welcome` (#425) — the client hard-fails on any
+    // the `Welcome`. `handshaken` is set by the `Hello` arm below only when the
+    // versions match; it gates the `state` branch so a snapshot landing mid-scan
+    // is never written ahead of the handshake the client waits for, and the
+    // `events` branch so shared bus traffic at connect time can never reach the
+    // socket before the `Welcome` (#425) — the client hard-fails on any
     // non-`Welcome` first frame.
     let mut handshaken = false;
     let mut snapshot_sent = false;
@@ -775,9 +785,49 @@ where
                                 writer.flush().await?;
                             }
                         }
-                        // The handshake and the live-buffer feed go to the shared
-                        // loop: the LSP worker that consumes the buffer events lives
-                        // off that single loop (one document model + servers for the
+                        // The handshake is answered per connection (#473): the
+                        // `Welcome` goes to exactly this socket, never onto the
+                        // shared bus, so one client's handshake — matched or
+                        // not — cannot disturb another connection's stream.
+                        // Version equality is strict: on mismatch the `Welcome`
+                        // carrying the daemon's OWN version is the orderly
+                        // early signal a stale client can act on, and the
+                        // connection closes cleanly without streaming — no
+                        // state, no terminal frames, no mid-stream codec death.
+                        ClientMessage::Hello { version } => {
+                            let welcome = encode_frame(&DaemonMessage::Welcome {
+                                version: PROTOCOL_VERSION,
+                            })?;
+                            writer.write_all(&welcome).await?;
+                            writer.flush().await?;
+                            if version != PROTOCOL_VERSION {
+                                warn!(
+                                    client = version,
+                                    daemon = PROTOCOL_VERSION,
+                                    "protocol version mismatch, closing connection"
+                                );
+                                break 'serve;
+                            }
+                            handshaken = true;
+                            // Everything queued on this connection's bus
+                            // subscription up to here predates the handshake:
+                            // the dispatch loop mutates `State` before each
+                            // broadcast, so it is all contained in the snapshot
+                            // written below. Resubscribe at the bus tail so the
+                            // stale backlog is dropped instead of leaking to
+                            // the socket after the `Welcome` (#425).
+                            events = events.resubscribe();
+                            // Replay the snapshot immediately behind the
+                            // handshake so the client sees `Welcome` then a
+                            // complete tree. If the scan has not finished, the
+                            // `state` branch delivers it once it lands.
+                            if !snapshot_sent {
+                                snapshot_sent = write_snapshot(&mut writer, &state).await?;
+                            }
+                        }
+                        // The live-buffer feed goes to the shared loop: the LSP
+                        // worker that consumes the buffer events lives off that
+                        // single loop (one document model + servers for the
                         // daemon), not per connection. Push-only — no reply here;
                         // diagnostics return on the shared broadcast bus.
                         //
@@ -786,8 +836,7 @@ where
                         // the LSP request-path wiring (a follow-on issue); the
                         // dispatch loop's defensive no-op arm absorbs them until
                         // then.
-                        ClientMessage::Hello { .. }
-                        | ClientMessage::BufferChanged { .. }
+                        ClientMessage::BufferChanged { .. }
                         | ClientMessage::BufferClosed { .. }
                         | ClientMessage::HoverRequest { .. }
                         | ClientMessage::DefinitionRequest { .. }
@@ -803,28 +852,19 @@ where
             event = events.recv() => {
                 match event {
                     Ok(msg) => {
-                        let is_welcome = matches!(msg, DaemonMessage::Welcome { .. });
                         // Pre-handshake bus traffic (events broadcast before this
-                        // connection's `Welcome`) is dropped, never written.
+                        // connection's handshake) is dropped, never written.
                         // Nothing is lost: the dispatch loop mutates `State`
                         // before each broadcast, so everything suppressed here is
-                        // already in the snapshot replayed behind the `Welcome`.
-                        if !handshaken && !is_welcome {
+                        // already in the snapshot replayed behind the `Welcome`
+                        // (which the `Hello` arm writes per connection, #473 —
+                        // the bus never carries a `Welcome`).
+                        if !handshaken {
                             continue;
                         }
                         let frame = encode_frame(&msg)?;
                         writer.write_all(&frame).await?;
                         writer.flush().await?;
-                        if is_welcome {
-                            // Replay the snapshot immediately behind the
-                            // handshake so the client sees `Welcome` then a
-                            // complete tree. If the scan has not finished, the
-                            // `state` branch delivers it once it lands.
-                            handshaken = true;
-                            if !snapshot_sent {
-                                snapshot_sent = write_snapshot(&mut writer, &state).await?;
-                            }
-                        }
                     }
                     // The bus carries only incremental updates now; a lagging
                     // writer drops some. Log the count — never silently — then
@@ -1271,28 +1311,10 @@ impl Core {
     /// Route a single `ClientMessage` to its handler.
     fn dispatch(&mut self, msg: ClientMessage) {
         match msg {
-            ClientMessage::Hello { version: _ } => {
-                // Version negotiation / mismatch handling is deferred to the
-                // transport sub-spec (a spec Risk); for now any version is
-                // accepted and a `Welcome` carrying the daemon's
-                // `PROTOCOL_VERSION` is emitted.
-                //
-                // A receiverless broadcast send is not an error here: events are
-                // fire-and-forget, so a `Welcome` with no subscriber is dropped.
-                //
-                // The worktree snapshot is not broadcast here: each connection
-                // replays it from `State` straight to its own socket right after
-                // the `Welcome` (see `serve_connection`), off the bounded event
-                // bus whose backlog would silently drop a large snapshot's
-                // chunks (issue #227).
-                let _ = self.events.send(DaemonMessage::Welcome {
-                    version: PROTOCOL_VERSION,
-                });
-            }
             // Live-buffer feed (#189): the editor's `BufferChanged` / `BufferClosed`
-            // reach the shared dispatch loop (routed here by `serve_connection`,
-            // like `Hello`) because the LSP worker — the single owner of the
-            // document model and servers — lives off this loop, not per connection.
+            // reach the shared dispatch loop (routed here by `serve_connection`)
+            // because the LSP worker — the single owner of the document model
+            // and servers — lives off this loop, not per connection.
             // Forward each to it as a `BufferEvent`; a full queue drops the event
             // (the next `BufferChanged` re-feeds, so a dropped one only delays
             // diagnostics, never corrupts the model), and an unarmed LSP drops it.
@@ -1323,8 +1345,12 @@ impl Core {
             // messages (`OpenFile`/`SaveFile`/`RequestDiff`) likewise never
             // reach it — they are answered per connection by `request_reply`,
             // request/response back to that socket, not on the broadcast bus.
+            // Neither does the handshake: `serve_connection` answers `Hello`
+            // per connection (#473) — the `Welcome` must reach exactly one
+            // socket, and a version mismatch closes only that connection.
             // These arms are a defensive no-op should one arrive here anyway.
-            ClientMessage::Attach { .. }
+            ClientMessage::Hello { .. }
+            | ClientMessage::Attach { .. }
             | ClientMessage::Input { .. }
             | ClientMessage::ResizePane { .. }
             | ClientMessage::TmuxCommand { .. }
@@ -1495,31 +1521,195 @@ mod tests {
         .expect("encode Hello")
     }
 
+    /// A framed `Hello` one version ahead of the daemon's — a mismatched client.
+    fn mismatched_hello_frame() -> Vec<u8> {
+        encode_frame(&ClientMessage::Hello {
+            version: PROTOCOL_VERSION + 1,
+        })
+        .expect("encode mismatched Hello")
+    }
+
+    /// Read `reader` to EOF, panicking if any complete `DaemonMessage` frame
+    /// arrives — the mismatch-close contract: nothing follows the `Welcome`.
+    async fn assert_eof_without_frames<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        decoder: &mut FrameDecoder,
+    ) {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            if let Some(msg) = decoder.next_frame::<DaemonMessage>().expect("decode frame") {
+                panic!("unexpected frame after the mismatch Welcome: {msg:?}");
+            }
+            let n = reader.read(&mut buf).await.expect("read until EOF");
+            if n == 0 {
+                return;
+            }
+            decoder.push(&buf[..n]);
+        }
+    }
+
     #[tokio::test]
-    async fn test_dispatch_hello_current_version_emits_welcome() {
-        let (daemon, handles) = channels(8, 8);
-        let mut events = handles.subscribe();
+    async fn test_serve_connection_hello_mismatch_replies_welcome_then_closes_without_streaming() {
+        // The version gate (#473): a mismatched `Hello` is answered with the
+        // daemon's OWN version and a clean close — no snapshot, no stream
+        // frames. The worktree scan is awaited in `State` BEFORE the handshake,
+        // so the absent snapshot below proves the gate, not a slow scan.
+        let tmp = TempDir::new("mismatch");
+        write_file(&tmp.path.join("tracked.txt"), "x");
+
+        let (mut daemon, handles) = channels(8, 8);
+        daemon.watch_worktree(tmp.path.clone());
+        let inbound = handles.inbound.clone();
+        let events = handles.subscribe();
+        let mut state = handles.state.clone();
         let loop_handle = tokio::spawn(daemon.run());
 
-        handles
-            .inbound
-            .send(ClientMessage::Hello {
-                version: PROTOCOL_VERSION,
-            })
-            .await
-            .expect("send Hello");
+        loop {
+            if state.borrow_and_update().worktree.is_some() {
+                break;
+            }
+            state.changed().await.expect("state sender alive");
+        }
 
-        let reply = events.recv().await.expect("receive Welcome");
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+        let (server_reader, server_writer) = tokio::io::split(server);
+        let conn = tokio::spawn(async move {
+            serve_connection(server_reader, server_writer, inbound, events, state, None).await
+        });
+
+        client_writer
+            .write_all(&mismatched_hello_frame())
+            .await
+            .expect("send mismatched Hello");
+        client_writer.flush().await.expect("flush Hello");
+
+        let mut decoder = FrameDecoder::new();
         assert_eq!(
-            reply,
+            read_daemon_message(&mut client_reader, &mut decoder).await,
+            DaemonMessage::Welcome {
+                version: PROTOCOL_VERSION,
+            },
+            "the mismatch reply must carry the daemon's own version"
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            assert_eof_without_frames(&mut client_reader, &mut decoder),
+        )
+        .await
+        .expect("clean close within the timeout");
+
+        let result = tokio::time::timeout(Duration::from_secs(5), conn)
+            .await
+            .expect("serve_connection returns after the mismatch close")
+            .expect("connection task joins");
+        result.expect("the mismatch close is clean, not an error");
+
+        loop_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_serve_connection_hello_mismatch_does_not_disturb_concurrent_connection() {
+        // The `Welcome` is per connection (#473): a mismatched client's
+        // handshake must never surface on a healthy concurrent connection.
+        // Under the old shared-bus `Welcome`, the mismatched handshake below
+        // would inject a stray `Welcome` into the healthy client's stream.
+        let (daemon, handles) = channels(64, 8);
+        let loop_handle = tokio::spawn(daemon.run());
+
+        // Healthy connection: handshakes at the current version.
+        let (healthy, healthy_srv) = tokio::io::duplex(64 * 1024);
+        let (mut healthy_reader, mut healthy_writer) = tokio::io::split(healthy);
+        let (healthy_srv_reader, healthy_srv_writer) = tokio::io::split(healthy_srv);
+        let healthy_conn = tokio::spawn({
+            let inbound = handles.inbound.clone();
+            let events = handles.subscribe();
+            let state = handles.state.clone();
+            async move {
+                serve_connection(
+                    healthy_srv_reader,
+                    healthy_srv_writer,
+                    inbound,
+                    events,
+                    state,
+                    None,
+                )
+                .await
+            }
+        });
+        healthy_writer
+            .write_all(&hello_frame())
+            .await
+            .expect("send healthy Hello");
+        healthy_writer.flush().await.expect("flush healthy Hello");
+        let mut healthy_decoder = FrameDecoder::new();
+        assert_eq!(
+            read_daemon_message(&mut healthy_reader, &mut healthy_decoder).await,
             DaemonMessage::Welcome {
                 version: PROTOCOL_VERSION,
             }
         );
 
-        // drop all senders so run() observes channel closure and returns
-        drop(handles);
-        loop_handle.await.expect("dispatch loop joins cleanly");
+        // Mismatched connection: drive the full reject cycle (Welcome{own} +
+        // clean close) to completion FIRST, so its handshake has provably been
+        // processed before the healthy stream is asserted below.
+        let (bad, bad_srv) = tokio::io::duplex(64 * 1024);
+        let (mut bad_reader, mut bad_writer) = tokio::io::split(bad);
+        let (bad_srv_reader, bad_srv_writer) = tokio::io::split(bad_srv);
+        let bad_conn = tokio::spawn({
+            let inbound = handles.inbound.clone();
+            let events = handles.subscribe();
+            let state = handles.state.clone();
+            async move {
+                serve_connection(bad_srv_reader, bad_srv_writer, inbound, events, state, None).await
+            }
+        });
+        bad_writer
+            .write_all(&mismatched_hello_frame())
+            .await
+            .expect("send mismatched Hello");
+        bad_writer.flush().await.expect("flush mismatched Hello");
+        let mut bad_decoder = FrameDecoder::new();
+        assert_eq!(
+            read_daemon_message(&mut bad_reader, &mut bad_decoder).await,
+            DaemonMessage::Welcome {
+                version: PROTOCOL_VERSION,
+            }
+        );
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            assert_eof_without_frames(&mut bad_reader, &mut bad_decoder),
+        )
+        .await
+        .expect("mismatched connection closes within the timeout");
+        tokio::time::timeout(Duration::from_secs(5), bad_conn)
+            .await
+            .expect("mismatched serve_connection returns")
+            .expect("mismatched connection task joins")
+            .expect("the mismatch close is clean, not an error");
+
+        // The healthy connection's next frame must be exactly the next bus
+        // event — no stray `Welcome` from the mismatched handshake in between.
+        let post = DaemonMessage::UpdateWorktree {
+            added: Vec::new(),
+            changed: Vec::new(),
+            removed: vec!["after-mismatch".to_owned()],
+        };
+        handles
+            .events
+            .send(post.clone())
+            .expect("bus subscriber alive");
+        assert_eq!(
+            read_daemon_message(&mut healthy_reader, &mut healthy_decoder).await,
+            post,
+            "healthy stream must continue undisturbed after a mismatched Hello"
+        );
+
+        drop(healthy_writer);
+        drop(healthy_reader);
+        healthy_conn.abort();
+        loop_handle.abort();
     }
 
     #[test]
