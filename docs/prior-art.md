@@ -486,6 +486,33 @@ agnostically. tmux exposes activity/silence/bell, not "blocked on stdin" — the
 is the cleanest agnostic attention proxy; whether it suffices, or a silence-after-
 activity heuristic is added, is a spec-time call, not a roadmap guess.
 
+## v1.0 polish + robustness phases — prior-art index (Phases 19–26)
+
+Per-phase prior-art for the v1.0 polish cut ([roadmap.md](roadmap.md)), same
+shape as the v1.0.0 index above. Research mode: none (2026-07-05) — every
+concern resolves against entries already catalogued above; no fresh research.
+
+| Phase | Concern | Reference (repo + path) | License | Verdict |
+|---|---|---|---|---|
+| 19 | tmux session list/switch in control mode | tmux Control Mode (Category 3 #1): `list-sessions` under `%begin/%end` guards, `%sessions-changed`/`%session-changed`/`%session-renamed` notifications; iTerm2 tmux integration (Category 3 #5) session-picker UX | ISC | **reuse** (notifications + commands over the existing control stream) / **reference** (iTerm2's attach-per-session UX). AVOID `choose-tree` — control clients never see rendered chooser UIs; list via commands only |
+| 19 | Parallel-attach client model | rift's own per-client control children (`crates/daemon/src/terminal.rs`) | — | greenfield — extend the existing per-client child to per-(client, session); no external precedent needed |
+| 20 | Versioned daemon + skew recovery | `zed` `crates/remote` + `crates/remote_server` (Category 8 #1): versioned binary upload + reconnect; VS Code Remote server/client handshake | GPL-3.0 | **reference** — adopt "the client owns the daemon version": Hello/Welcome carries a message-set version token; mismatch → atomic replace + pidfile restart (the spec-daemon-redeploy mechanism) |
+| 20 | Reconnect loop + connection screen | `zed` remote reconnect flow (banner + bounded retry); design artboards Connection — Startup / alert banners | GPL-3.0 | reference — visible reconnect state; never quit on drop |
+| 21 | Title bar / activity rail / tab chrome | `longbridge/gpui-component` TitleBar, Dock, Tab, Badge (Category 1 #1); `zed` `crates/title_bar` | Apache-2.0 / GPL-3.0 | **reuse** (gpui-component widgets, already vendored) / reference |
+| 22 | Composite status line | `zed` `crates/status_bar`; `zellij` status bar (Category 9 #1); rift's own statusline mirror (`spec-tmux-statusline-mirroring.md`) | GPL-3.0 / MIT | reference — ONE bar composing native segments + the tmux window list; supersedes the env-gated either/or between native and mirrored modes |
+| 23 | Editor chrome (breadcrumb, hover card, references/outline, minimap) | `zed` `crates/editor` (hover popover, breadcrumbs), `crates/outline_panel` (Category 1 #2); gpui-component code-editor story | GPL-3.0 / Apache-2.0 | reference — anatomy only; rift renders its own chrome from the existing nav/diagnostics streams |
+| 24 | Git write path (stage/unstage/commit, hunks) | `gix` (Byron/gitoxide) staging + commit APIs; `zed` `crates/git_ui`; `gitui` staging UX (Category 6 #3) | Apache-2.0 OR MIT / GPL-3.0 / MIT | **reuse** (gix — already the daemon's git dependency, musl-clean) / reference (hunk-staging interactions) |
+| 24 | Split diff + word-level emphasis | `smolcars/hunk` (Category 1 #3); `Auto-Explore/GitComet` (Category 6 #1) | GPL-3.0 / verify | reference — diff virtualization + intra-line emphasis patterns |
+| 25 | Explorer decoration + rollup | `zed` `crates/project_panel` (Category 5 #1) | GPL-3.0 | reference — `EntryDetails` precompute + ancestor git/severity rollup (already cited for Phase 11; the parity work completes it) |
+| 26 | Settings shell + theme-driven terminal palette | `longbridge/gpui-component` Settings + Theme/ThemeRegistry (Category 1 #1); `alacritty` config theme→ANSI mapping (Category 2 #3) | Apache-2.0 / Apache-2.0 | **reuse** (widgets + theme registry) / reference (ANSI palette derivation from a theme) |
+
+Open design decisions deferred to each phase's `/loopkit:plan` spec (never a
+roadmap guess): phase 19 — whether parallel sessions render as one window with
+a session switcher or as multiple OS windows; phase 20 — the exact version
+token (protocol-hash vs bumped integer) and whether daemon restart stays
+client-driven only; phase 24 — how index-vs-worktree staging semantics surface
+in the UI.
+
 ## Priority reference projects (top 10)
 
 1. **penso/arbor** — Closest existing implementation of rift's exact concept (Rust + GPUI + daemon + SSH outposts + agent state). Read end-to-end before writing any architecture docs.
