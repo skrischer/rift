@@ -42,6 +42,10 @@ pub(crate) fn parse_notification(line: &[u8]) -> Option<Event> {
         b"%window-renamed" => parse_window_renamed(rest),
         b"%session-changed" => parse_session_changed(rest),
         b"%session-renamed" => parse_session_renamed(rest),
+        // No payload (docs/tmux-reference.md); a line with trailing content is
+        // malformed.
+        b"%sessions-changed" => rest.is_empty().then_some(Event::SessionsChanged),
+        b"%client-session-changed" => parse_client_session_changed(rest),
         b"%session-window-changed" => parse_session_window_changed(rest),
         b"%window-pane-changed" => parse_window_pane_changed(rest),
         b"%pane-mode-changed" => parse_pane_id(rest).map(|pane| Event::PaneModeChanged { pane }),
@@ -130,6 +134,23 @@ fn parse_session_renamed(rest: &[u8]) -> Option<Event> {
     let (id, name) = split_first_space(rest);
     let session = parse_u32(id.strip_prefix(b"$")?)?;
     Some(Event::SessionRenamed {
+        session,
+        name: String::from_utf8_lossy(name).into_owned(),
+    })
+}
+
+/// `<client> $<session> <name>` — the client is a single token (a tty path or
+/// `client-<pid>`, never spaced); the name is the remainder and may contain
+/// spaces.
+fn parse_client_session_changed(rest: &[u8]) -> Option<Event> {
+    let (client, after_client) = split_first_space(rest);
+    if client.is_empty() {
+        return None;
+    }
+    let (id, name) = split_first_space(after_client);
+    let session = parse_u32(id.strip_prefix(b"$")?)?;
+    Some(Event::ClientSessionChanged {
+        client: String::from_utf8_lossy(client).into_owned(),
         session,
         name: String::from_utf8_lossy(name).into_owned(),
     })
@@ -357,6 +378,66 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_notification_sessions_changed_no_payload_yields_event() {
+        // Real tmux 3.4 sends the bare notification; a trailing CR is already
+        // trimmed by the line splitter, a trailing space leaves an empty rest.
+        assert_eq!(
+            parse_notification(b"%sessions-changed"),
+            Some(Event::SessionsChanged)
+        );
+        assert_eq!(
+            parse_notification(b"%sessions-changed "),
+            Some(Event::SessionsChanged)
+        );
+    }
+
+    #[test]
+    fn test_parse_notification_sessions_changed_with_payload_returns_none() {
+        assert_eq!(parse_notification(b"%sessions-changed $1"), None);
+        assert_eq!(parse_notification(b"%sessions-changed extra args"), None);
+    }
+
+    #[test]
+    fn test_parse_notification_client_session_changed_with_and_without_name() {
+        // `<client> $<session> <name>` as real tmux 3.4 sends it; the name may
+        // contain spaces or be absent.
+        assert_eq!(
+            parse_notification(b"%client-session-changed /dev/pts/5 $2 my session"),
+            Some(Event::ClientSessionChanged {
+                client: "/dev/pts/5".to_owned(),
+                session: 2,
+                name: "my session".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse_notification(b"%client-session-changed client-1234 $0"),
+            Some(Event::ClientSessionChanged {
+                client: "client-1234".to_owned(),
+                session: 0,
+                name: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_notification_client_session_changed_malformed_returns_none() {
+        // Client token missing (the id token is consumed as the client).
+        assert_eq!(parse_notification(b"%client-session-changed $2 name"), None);
+        // Session id without the $ sigil.
+        assert_eq!(
+            parse_notification(b"%client-session-changed /dev/pts/5 2 name"),
+            None
+        );
+        // Non-numeric session id.
+        assert_eq!(
+            parse_notification(b"%client-session-changed /dev/pts/5 $x name"),
+            None
+        );
+        // Truncated.
+        assert_eq!(parse_notification(b"%client-session-changed"), None);
+    }
+
+    #[test]
     fn test_parse_notification_pane_mode_changed() {
         assert_eq!(
             parse_notification(b"%pane-mode-changed %1"),
@@ -425,10 +506,10 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_notification(b"%sessions-changed"),
+            parse_notification(b"%client-detached /dev/pts/5"),
             Some(Event::Other {
-                name: "%sessions-changed".to_owned(),
-                args: String::new(),
+                name: "%client-detached".to_owned(),
+                args: "/dev/pts/5".to_owned(),
             })
         );
     }

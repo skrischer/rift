@@ -47,6 +47,10 @@ fn test_control_session_fixture_yields_full_notification_set() {
         "expected a %session-renamed notification"
     );
     assert!(
+        events.iter().any(|e| matches!(e, Event::SessionsChanged)),
+        "expected a %sessions-changed notification"
+    );
+    assert!(
         events
             .iter()
             .any(|e| matches!(e, Event::LayoutChange { .. })),
