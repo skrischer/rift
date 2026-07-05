@@ -545,7 +545,13 @@ impl Attach {
                         self.paused.remove(&pane);
                     }
                 }
-                Event::Other { .. } | Event::PaneModeChanged { .. } => {}
+                // Session-list churn (%sessions-changed / %client-session-changed)
+                // is consumed by this phase's daemon session-list step
+                // (docs/spec-session-switch.md); inert here until that lands.
+                Event::Other { .. }
+                | Event::PaneModeChanged { .. }
+                | Event::SessionsChanged
+                | Event::ClientSessionChanged { .. } => {}
             }
         }
         Ok(Flow::Continue)
