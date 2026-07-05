@@ -1,3 +1,4 @@
+mod backoff;
 mod connection;
 mod daemon_channel;
 mod deploy;
@@ -6,6 +7,7 @@ mod known_hosts;
 mod launch;
 mod pty;
 
+pub use backoff::ReconnectBackoff;
 pub use connection::SshConnection;
 pub use daemon_channel::{DaemonChannel, DaemonClient, Handshake};
 pub use deploy::{
