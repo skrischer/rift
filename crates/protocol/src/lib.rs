@@ -15,7 +15,7 @@ pub use frame::{encode_frame, FrameDecoder, FrameError};
 /// is wire-compatible in one direction. The message set is pinned by the
 /// fingerprint test beside `PROTOCOL_FINGERPRINT` below, so a message-set
 /// change without a bump cannot pass CI.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Pinned fingerprint of the protocol message set, checked by the
 /// `fingerprint_tests` module: an FNV-1a hash over the serde-visible surface
@@ -25,7 +25,7 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// [`PROTOCOL_VERSION`] above and re-pin this value (the failing test prints
 /// the new fingerprint).
 #[cfg(test)]
-const PROTOCOL_FINGERPRINT: u64 = 0x05b6_22c9_08df_89c1;
+const PROTOCOL_FINGERPRINT: u64 = 0x4a2b_82d3_7e3e_fad8;
 
 /// Messages the client sends to the daemon.
 ///
@@ -96,6 +96,17 @@ pub enum ClientMessage {
     /// explicitly to refresh on an explicit user trigger, or after
     /// dispatching a bound command that sets a mirrored `status-*` option.
     QueryStatusLine,
+    /// Ask the daemon to (re-)query the host's tmux session list via
+    /// `list-sessions` (`docs/spec-session-switch.md`). The daemon answers
+    /// with exactly one [`DaemonMessage::SessionListReply`] carrying one
+    /// [`SessionEntry`] per session on the server. The daemon also re-issues
+    /// this query on its own — coalesced, like the layout re-query — whenever
+    /// tmux signals session churn (`%sessions-changed`, `%session-renamed`,
+    /// `%client-session-changed`) and pushes the fresh reply unprompted, so
+    /// the client's session list stays live without polling; the client sends
+    /// this explicitly only for an on-demand refresh (e.g. opening the
+    /// session switcher).
+    QuerySessionList,
     /// Read request on the buffer channel: pull the current content of the file
     /// at `path` (relative to the worktree root, the same key space as
     /// [`WorktreeEntry::path`]). The daemon answers with exactly one
@@ -277,6 +288,22 @@ pub enum DaemonMessage {
         options: String,
         status_left: String,
         status_right: String,
+    },
+    /// The reply to a [`ClientMessage::QuerySessionList`]: every tmux session
+    /// on the server, parsed daemon-side from `list-sessions` (a tab-separated
+    /// format with the session name last, the same convention as the daemon's
+    /// layout query, so names with spaces or tabs survive). Also pushed
+    /// unprompted whenever tmux signals session churn (`%sessions-changed`,
+    /// `%session-renamed`, `%client-session-changed`), so the client replaces
+    /// its whole session list on every arrival — replace semantics, like
+    /// [`LayoutUpdate`]. Which session THIS client is attached to is not
+    /// carried here: the `session` string on [`LayoutSnapshot`] /
+    /// [`LayoutUpdate`] already owns that (the truthful-indicator contract).
+    ///
+    /// [`LayoutUpdate`]: DaemonMessage::LayoutUpdate
+    /// [`LayoutSnapshot`]: DaemonMessage::LayoutSnapshot
+    SessionListReply {
+        sessions: Vec<SessionEntry>,
     },
     /// The complete window/pane layout for `session`, sent once per attach as the
     /// baseline of the consistency contract (see the type-level docs). The client
@@ -477,6 +504,24 @@ pub struct PaneLayout {
     /// tolerance as `current_path`.
     #[serde(default)]
     pub current_command: String,
+}
+
+/// One tmux session inside a [`DaemonMessage::SessionListReply`]: its server
+/// identity, name, window count, and whether any client is attached to it.
+///
+/// `id` is tmux's `$<n>` session id as an integer — the stable key across
+/// renames (`#{session_id}`); `name` is the current session name
+/// (`#{session_name}`). `windows` is the session's window count
+/// (`#{session_windows}`); `attached` is whether at least one client is
+/// attached (`#{session_attached}` reports a count; the daemon folds it to a
+/// bool — the picker only marks attached sessions, never counts clients).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEntry {
+    pub id: u32,
+    pub name: String,
+    pub windows: u32,
+    /// Whether at least one client is attached to this session.
+    pub attached: bool,
 }
 
 /// A single worktree entry, keyed by its path relative to the worktree root.
@@ -2264,6 +2309,92 @@ mod tests {
             err.is_err(),
             "unknown diff payload kind must not deserialize"
         );
+    }
+
+    // ---- Session-list round-trip tests (docs/spec-session-switch.md) --------
+
+    #[test]
+    fn test_query_session_list_roundtrips() {
+        let msg = ClientMessage::QuerySessionList;
+        let json = serde_json::to_string(&msg).expect("serialize QuerySessionList");
+        assert_eq!(json, r#"{"type":"query_session_list"}"#);
+        let parsed: ClientMessage =
+            serde_json::from_str(&json).expect("deserialize QuerySessionList");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_session_list_reply_roundtrip_preserves_entries() {
+        let msg = DaemonMessage::SessionListReply {
+            sessions: vec![
+                SessionEntry {
+                    id: 0,
+                    name: "rift".to_owned(),
+                    windows: 3,
+                    attached: true,
+                },
+                SessionEntry {
+                    id: 4,
+                    name: "my project".to_owned(),
+                    windows: 1,
+                    attached: false,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&msg).expect("serialize SessionListReply");
+        assert!(json.contains(r#""type":"session_list_reply""#));
+        assert!(json.contains(r#""name":"rift""#));
+        assert!(json.contains(r#""attached":true"#));
+
+        let parsed: DaemonMessage =
+            serde_json::from_str(&json).expect("deserialize SessionListReply");
+        assert_eq!(parsed, msg);
+        match parsed {
+            DaemonMessage::SessionListReply { sessions } => {
+                assert_eq!(sessions.len(), 2);
+                assert_eq!(sessions[1].name, "my project");
+                assert!(!sessions[1].attached);
+            }
+            other => panic!("expected SessionListReply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_session_list_reply_empty_sessions_roundtrips() {
+        // A server with no session cannot be attached to, but the reply shape
+        // must still round-trip as an empty list, not vanish.
+        let msg = DaemonMessage::SessionListReply { sessions: vec![] };
+        let json = serde_json::to_string(&msg).expect("serialize empty SessionListReply");
+        assert!(json.contains(r#""sessions":[]"#));
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize SessionListReply"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_session_list_reply_missing_sessions_field_is_rejected() {
+        let err = serde_json::from_str::<DaemonMessage>(r#"{"type":"session_list_reply"}"#);
+        assert!(
+            err.is_err(),
+            "a session-list reply without a sessions field must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_session_entry_malformed_field_types_are_rejected() {
+        // A present-but-wrongly-typed field is a protocol error, never coerced.
+        for json in [
+            r#"{"id":"0","name":"rift","windows":1,"attached":true}"#,
+            r#"{"id":0,"name":"rift","windows":"one","attached":true}"#,
+            r#"{"id":0,"name":"rift","windows":1,"attached":1}"#,
+            r#"{"id":0,"name":"rift","windows":1}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<SessionEntry>(json).is_err(),
+                "malformed session entry must not deserialize: {json}"
+            );
+        }
     }
 }
 
