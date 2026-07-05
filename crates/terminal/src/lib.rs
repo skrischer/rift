@@ -115,8 +115,9 @@ pub struct SubscriptionUpdate {
 
 /// The SSH/tmux session lifecycle state, surfaced by the statusbar connection
 /// indicator. Driven by the SSH session thread (not polled): `Connected` once
-/// tmux control mode is up, `Disconnected` when the session ends. `Reconnecting`
-/// is reserved for a future auto-retry driver and is not yet emitted.
+/// tmux control mode is up, `Reconnecting` while the daemon-stream recovery
+/// engine re-establishes a died daemon channel (issue #475,
+/// `docs/spec-connection-robustness.md`), `Disconnected` when the session ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectionStatus {
     Connecting,

@@ -217,3 +217,30 @@ into scope, uses a key the developer already owns; nothing to deliver.)
 - 2026-07-05: Spec-acceptance gate resolved the three open decisions —
   Connection screen on every launch (no auto-connect), unlimited capped
   reconnect with Cancel, passphrase keys in scope — and accepted the spec.
+- 2026-07-05 (#475): The daemon-stream recovery engine bounds itself at 10
+  attempts (~2 min under the capped schedule) and then fails the session
+  visibly — the unlimited-retry + Cancel policy applies to the SSH-level loop
+  (#476), which owns outages where SSH itself is down; a daemon that cannot be
+  respawned within the window is a structural failure retrying cannot fix.
+- 2026-07-05 (#475): A protocol version mismatch during mid-session reconnect
+  aborts recovery with a session error instead of re-running the
+  stop/redeploy/respawn replacement: mid-session, a mismatched daemon means a
+  newer client replaced it, and replacing it back would kill that client's
+  live session (stable/dev tug-of-war).
+- 2026-07-05 (#475): The reverse-path bridges resolve the current client
+  through a `tokio::sync::watch` handle per message (the recovery engine swaps
+  the reconnected client in under them); sends during the gap are dropped, per
+  the no-buffering constraint — the Welcome replay + re-Attach resync replaces
+  the state they would have touched. The jittered capped backoff lives in
+  `rift_ssh::ReconnectBackoff`, ready for reuse by the #476 engine.
+- 2026-07-05 (#475, post-#509 rebase): The recovery's re-Attach targets the
+  currently attached session, not the startup one — a cockpit switch (#509)
+  moves the client mid-session, and re-attaching the original would be a
+  silent regression. The session-switch bridge records each sent switch on a
+  `watch` channel the recovery resolves per attempt; a switch dropped during
+  an outage stays untracked (dropped, never buffered). The re-Attach is also
+  followed by a `ResizePane` re-asserting the last known client grid (cached
+  by the resize bridge), mirroring the switch's viewport re-assert — the
+  fresh tmux child spawns unsized and the render layer only re-sends on a
+  size change, so without it the terminal would stay reflowed to the 80x24
+  default until a manual resize.

@@ -570,27 +570,33 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels, editor: EditorChannel
     // only where the bytes come from changes.
     if use_daemon_terminal() {
         match daemon_client {
-            Some(client) => {
+            Some((client, endpoint)) => {
                 info!("terminal source: daemon protocol");
-                return run_daemon_terminal(client, session, ch, editor).await;
+                return run_daemon_terminal(&mut conn, client, endpoint, session, ch, editor).await;
             }
             None => warn!(
                 "daemon terminal selected but no daemon available; \
                  falling back to the legacy tmux path"
             ),
         }
-    } else if let Some(client) = daemon_client {
+    } else if let Some((client, _endpoint)) = daemon_client {
         // Legacy terminal, but keep the daemon's worktree/git/diagnostics +
         // buffer-channel stream alive on its own task (today's behavior) while
-        // tmux drives the terminal.
+        // tmux drives the terminal. No mid-session daemon recovery on this
+        // escape hatch (#475 scopes it to the daemon terminal path): the watch
+        // sender is dropped right away, so the bridges resolve this one client
+        // for the whole session.
         info!("terminal source: legacy tmux (daemon worktree stream active)");
         let client = std::sync::Arc::new(client);
-        spawn_open_file_bridge(client.clone(), editor.open_file_rx.clone());
-        spawn_save_file_bridge(client.clone(), editor.save_file_rx.clone());
-        spawn_buffer_change_bridge(client.clone(), editor.buffer_change_rx.clone());
-        spawn_nav_bridge(client.clone(), editor.nav_request_rx.clone());
-        spawn_request_diff_bridge(client.clone(), editor.request_diff_rx.clone());
-        tokio::spawn(consume_daemon_messages(client, None, editor));
+        let (_client_tx, client_rx) = tokio::sync::watch::channel(client.clone());
+        spawn_open_file_bridge(client_rx.clone(), editor.open_file_rx.clone());
+        spawn_save_file_bridge(client_rx.clone(), editor.save_file_rx.clone());
+        spawn_buffer_change_bridge(client_rx.clone(), editor.buffer_change_rx.clone());
+        spawn_nav_bridge(client_rx.clone(), editor.nav_request_rx.clone());
+        spawn_request_diff_bridge(client_rx, editor.request_diff_rx.clone());
+        tokio::spawn(async move {
+            consume_daemon_messages(&client, None, &editor).await;
+        });
     } else {
         info!("terminal source: legacy tmux (no daemon configured)");
     }
@@ -611,13 +617,30 @@ fn use_daemon_terminal() -> bool {
 /// Drive the terminal entirely over the daemon protocol: open this client's tmux
 /// attach, bridge the reverse path (input, resize, raw commands, capture) onto
 /// the protocol, and fold the daemon's pane-output / layout / worktree stream
-/// into the existing render channels. Blocks until the daemon channel closes or
-/// the tmux attach reports `TerminalExit`; returning ends the session
-/// (`Disconnected` → quit), matching the legacy `tmux` exit path. The SSH
-/// connection (`conn`) stays alive for the session because it outlives this await
-/// in [`run_ssh_session`]'s frame.
+/// into the existing render channels. Blocks until the tmux attach reports
+/// `TerminalExit`; returning ends the session (`Disconnected` → quit), matching
+/// the legacy `tmux` exit path. The SSH connection (`conn`) stays alive for the
+/// session; the recovery engine below reuses it to reopen daemon channels.
+///
+/// A daemon-channel death (EOF, malformed frame, channel error) while SSH is
+/// up does NOT end the session (#475, `docs/spec-connection-robustness.md`):
+/// the loop surfaces `ConnectionStatus::Reconnecting`, reattaches to the
+/// daemon socket under bounded jittered backoff — respawning the daemon if it
+/// died — re-runs Hello/Welcome (the per-connection Welcome snapshot replay,
+/// #227/#425/#426, restores worktree/git/diagnostics), and re-Attaches the
+/// terminal, whose fresh `LayoutSnapshot` resets the render layer (the
+/// protocol's reconnect contract). The bridges survive the gap: they resolve
+/// the current client through a `watch` channel per message, so the recovery
+/// engine swaps a reconnected client in under them. Two more `watch` channels
+/// feed the recovery what a re-Attach cannot rediscover on its own: the
+/// currently attached session (a cockpit switch, #509, may have moved off the
+/// startup one) and the last known client grid (re-asserted as a `ResizePane`
+/// after the re-Attach — the fresh tmux child spawns unsized and the render
+/// layer only re-sends on a size change).
 async fn run_daemon_terminal(
+    conn: &mut rift_ssh::SshConnection,
     client: rift_ssh::DaemonClient,
+    endpoint: DaemonEndpoint,
     session: String,
     ch: PtyChannels,
     editor: EditorChannels,
@@ -626,27 +649,44 @@ async fn run_daemon_terminal(
     use std::sync::Arc;
 
     let client = Arc::new(client);
+    // The live-client handle the bridges resolve per send; the recovery engine
+    // publishes each reconnected client here (`DaemonClientWatch`).
+    let (client_tx, client_rx) = tokio::sync::watch::channel(client.clone());
+    // The session this client is currently attached to. A cockpit switch
+    // (`docs/spec-session-switch.md`) re-attaches mid-session, so the recovery
+    // engine resolves the current name here instead of reusing the startup one
+    // — otherwise a stream death after a switch would silently re-attach the
+    // original session. Updated by `spawn_session_switch_bridge` per sent
+    // switch; a switch dropped during an outage stays untracked (dropped,
+    // never buffered), so recovery restores the last session actually asked of
+    // the daemon.
+    let (session_tx, session_rx) = tokio::sync::watch::channel(session.clone());
+    // The render layer's last known client grid. Its resize channel only fires
+    // on a size *change*, so after a reconnect nobody would re-send the size —
+    // the fresh tmux child would stay on the 80x24 attach default until the
+    // user happens to resize (#475). `spawn_resize_bridge` caches every grid
+    // here; the recovery re-asserts it right after the re-Attach, mirroring
+    // the session switch's viewport re-assert. `None` until the first layout
+    // fires (then the attach default is all there is to keep).
+    let (viewport_tx, viewport_rx) = tokio::sync::watch::channel(None::<TermSize>);
 
     // Open this client's own tmux attach, carrying `RIFT_SESSION` end-to-end. The
     // daemon answers with a LayoutSnapshot baseline, then the live stream.
-    if let Err(e) = client
-        .send(ClientMessage::Attach {
-            session: session.clone(),
-        })
-        .await
-    {
+    if let Err(e) = client.send(ClientMessage::Attach { session }).await {
         warn!(%e, "failed to open daemon terminal attach");
         return Ok(());
     }
     let _ = ch.connection_status_tx.send(ConnectionStatus::Connected);
 
     // Reverse-path bridges: each forwards a render-side flume stream onto the
-    // protocol. They live as long as the daemon client; a closed channel ends the
-    // bridge. Pane ids cross the seam as tmux's native `%N` form.
-    spawn_input_bridge(client.clone(), ch.input_rx);
-    spawn_resize_bridge(client.clone(), ch.size_changed_rx);
-    spawn_command_bridge(client.clone(), ch.tmux_command_rx);
-    spawn_capture_bridge(client.clone(), ch.capture_request_rx);
+    // protocol. They live as long as their render-side channel; a send that
+    // fails against a dead daemon stream drops the message (the reconnect
+    // resync replaces state). Pane ids cross the seam as tmux's native `%N`
+    // form.
+    spawn_input_bridge(client_rx.clone(), ch.input_rx);
+    spawn_resize_bridge(client_rx.clone(), ch.size_changed_rx, viewport_tx);
+    spawn_command_bridge(client_rx.clone(), ch.tmux_command_rx);
+    spawn_capture_bridge(client_rx.clone(), ch.capture_request_rx);
     // Key-table refresh reverse path (tmux key-table mirroring, #212): each
     // request becomes a `QueryKeyTable`; the daemon also issues one unprompted
     // on attach, so this bridge only carries the statusbar's explicit-refresh
@@ -654,35 +694,39 @@ async fn run_daemon_terminal(
     // `spawn_command_bridge` instead, ordered after the mutation on the same
     // task). The reply returns via `consume_daemon_messages` on
     // `sinks.key_table_result_tx`.
-    spawn_key_table_bridge(client.clone(), ch.key_table_request_rx);
+    spawn_key_table_bridge(client_rx.clone(), ch.key_table_request_rx);
     // Session-switch reverse paths (`docs/spec-session-switch.md`): an explicit
     // list refresh (opening the switcher) becomes a `QuerySessionList` — the
     // daemon's churn-driven pushes keep the list live in between — and a
     // switcher selection becomes a re-`Attach` (a clean child swap + fresh
-    // `LayoutSnapshot`, zero daemon changes for the switch itself).
-    spawn_session_list_bridge(client.clone(), ch.session_list_request_rx);
-    spawn_session_switch_bridge(client.clone(), ch.session_switch_rx);
+    // `LayoutSnapshot`, zero daemon changes for the switch itself). The switch
+    // bridge also records the newly attached session, so a later stream
+    // recovery re-attaches to the session the client is actually on, not the
+    // one it started on.
+    spawn_session_list_bridge(client_rx.clone(), ch.session_list_request_rx);
+    spawn_session_switch_bridge(client_rx.clone(), ch.session_switch_rx, session_tx);
     // Buffer channel reverse path: the editor's open requests become `OpenFile`
     // reads (#187) and its save requests `SaveFile` writes (#188). The forward
     // replies (`FileContent` / `SaveResult` / `SaveConflict`) return via
     // `consume_daemon_messages` on `editor.buffer_tx`.
-    spawn_open_file_bridge(client.clone(), editor.open_file_rx.clone());
-    spawn_save_file_bridge(client.clone(), editor.save_file_rx.clone());
+    spawn_open_file_bridge(client_rx.clone(), editor.open_file_rx.clone());
+    spawn_save_file_bridge(client_rx.clone(), editor.save_file_rx.clone());
     // Live-buffer feed reverse path (#189): the editor's `BufferChanged` /
     // `BufferClosed` forward verbatim so the daemon feeds the LSP the live buffer.
     // Push-only — diagnostics return on the worktree stream as `Diagnostics`.
-    spawn_buffer_change_bridge(client.clone(), editor.buffer_change_rx.clone());
+    spawn_buffer_change_bridge(client_rx.clone(), editor.buffer_change_rx.clone());
     // Navigation request reverse path (#196): `DefinitionRequest` forwards verbatim.
     // The `DefinitionResponse` returns via `consume_daemon_messages` on `editor.nav_tx`.
-    spawn_nav_bridge(client.clone(), editor.nav_request_rx.clone());
+    spawn_nav_bridge(client_rx.clone(), editor.nav_request_rx.clone());
     // Diff pull reverse path (#338): the source-control panel's selection becomes
     // a `RequestDiff`. The `FileDiff` reply returns via `consume_daemon_messages`
     // on `editor.diff_tx`.
-    spawn_request_diff_bridge(client.clone(), editor.request_diff_rx.clone());
+    spawn_request_diff_bridge(client_rx, editor.request_diff_rx.clone());
 
     // Forward path: fold the daemon stream into the render channels (pane output,
     // layout snapshots, capture replies), the file tree, and the editor. Blocks
-    // until the stream ends.
+    // until the tmux attach ends; a stream death instead enters the recovery
+    // engine below.
     let sinks = TerminalSinks {
         pane_output_tx: ch.pane_output_tx,
         snapshot_tx: ch.snapshot_tx,
@@ -690,8 +734,139 @@ async fn run_daemon_terminal(
         key_table_result_tx: ch.key_table_result_tx,
         session_list_tx: ch.session_list_tx,
     };
-    consume_daemon_messages(client, Some(sinks), editor).await;
-    Ok(())
+    let mut current = client;
+    loop {
+        if consume_daemon_messages(&current, Some(&sinks), &editor).await == StreamEnd::TerminalExit
+        {
+            return Ok(());
+        }
+        // The stream died under the consumer while SSH is up: recover instead
+        // of leaving a frozen reactive layer (#475). Reconnect under bounded
+        // backoff, then publish the fresh client to the bridges; the Welcome
+        // snapshot replay and the re-Attach's fresh LayoutSnapshot resync
+        // worktree/git/diagnostics and the terminal. A recovery that gives up
+        // propagates as a session error — the visible failure path
+        // (`Disconnected`), never a silent one.
+        let _ = ch.connection_status_tx.send(ConnectionStatus::Reconnecting);
+        current = reconnect_daemon(conn, &endpoint, &session_rx, &viewport_rx).await?;
+        client_tx.send_replace(current.clone());
+        let _ = ch.connection_status_tx.send(ConnectionStatus::Connected);
+    }
+}
+
+/// Why a single daemon reconnect attempt failed: transient failures retry
+/// under backoff; a protocol version mismatch aborts recovery (real skew).
+enum ReconnectFailure {
+    /// The daemon that answered runs a different protocol version — another
+    /// (newer) client replaced it mid-session. Retrying cannot converge, and
+    /// replacing the daemon from here would kill that client's live session,
+    /// so recovery surfaces it as a session error instead.
+    VersionMismatch { daemon: u32 },
+    /// Anything transport-shaped: probe/spawn/exec failure, handshake timeout,
+    /// a send failure on the fresh channel. Retried under backoff.
+    Transient(rift_ssh::SshError),
+}
+
+/// Reconnect to the daemon after a mid-session stream death (#475): bounded
+/// attempts under [`rift_ssh::ReconnectBackoff`]'s jittered capped schedule
+/// (first attempt immediate, so a plain daemon kill converges within seconds).
+/// Returns the reconnected, re-attached client; errors once
+/// [`DAEMON_RECONNECT_MAX_ATTEMPTS`] is exhausted or a version mismatch proves
+/// the daemon was replaced mid-session. Session and viewport resolve through
+/// their `watch` handles per attempt, so the re-Attach targets the session the
+/// client is currently on and re-asserts the freshest grid even when both
+/// changed since the stream died.
+async fn reconnect_daemon(
+    conn: &mut rift_ssh::SshConnection,
+    endpoint: &DaemonEndpoint,
+    session_rx: &tokio::sync::watch::Receiver<String>,
+    viewport_rx: &tokio::sync::watch::Receiver<Option<TermSize>>,
+) -> Result<std::sync::Arc<rift_ssh::DaemonClient>> {
+    let mut backoff = rift_ssh::ReconnectBackoff::new();
+    for attempt in 1..=DAEMON_RECONNECT_MAX_ATTEMPTS {
+        if attempt > 1 {
+            tokio::time::sleep(backoff.next_delay()).await;
+        }
+        info!(attempt, "reconnecting daemon stream");
+        let session = session_rx.borrow().clone();
+        let viewport = *viewport_rx.borrow();
+        match try_daemon_reconnect(conn, endpoint, &session, viewport).await {
+            Ok(client) => {
+                info!(attempt, "daemon stream reconnected");
+                return Ok(client);
+            }
+            Err(ReconnectFailure::VersionMismatch { daemon }) => {
+                return Err(anyhow::anyhow!(
+                    "daemon protocol version changed mid-session (client v{}, daemon v{daemon}); \
+                     a newer client replaced the daemon",
+                    rift_protocol::PROTOCOL_VERSION
+                ));
+            }
+            Err(ReconnectFailure::Transient(e)) => {
+                warn!(%e, attempt, "daemon reconnect attempt failed");
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "daemon stream reconnect gave up after {DAEMON_RECONNECT_MAX_ATTEMPTS} attempts"
+    ))
+}
+
+/// One reconnect attempt (#475): reattach to the daemon socket — respawning a
+/// dead daemon detached, exactly like the initial provisioning — confirm the
+/// transport with a bounded Hello/Welcome (the daemon replays its full state
+/// snapshot to this connection right behind the Welcome, #227/#425, which IS
+/// the worktree/git/diagnostics resync), then re-open this client's tmux
+/// attach. The fresh `LayoutSnapshot` the attach answers with resets the
+/// render layer per the protocol's reconnect contract; tmux persistence keeps
+/// the terminal content intact across the gap. The last known grid is
+/// re-asserted as a `ResizePane` on this same task, strictly after the
+/// `Attach` (sequential sends land in program order) — the fresh tmux child
+/// spawns unsized and the render layer only re-sends on a size *change*, so
+/// without it the terminal would stay reflowed to the 80x24 attach default
+/// (same re-assert the session-switch bridge does).
+async fn try_daemon_reconnect(
+    conn: &mut rift_ssh::SshConnection,
+    endpoint: &DaemonEndpoint,
+    session: &str,
+    viewport: Option<TermSize>,
+) -> Result<std::sync::Arc<rift_ssh::DaemonClient>, ReconnectFailure> {
+    use rift_ssh::Handshake;
+
+    let channel = rift_ssh::connect_or_spawn_daemon(
+        conn,
+        &endpoint.remote_path,
+        &endpoint.socket_path,
+        &endpoint.log_path,
+        endpoint.project_root.as_deref(),
+    )
+    .await
+    .map_err(ReconnectFailure::Transient)?;
+    let client = rift_ssh::DaemonClient::new(channel);
+    match client.handshake(DAEMON_HANDSHAKE_TIMEOUT).await {
+        Ok(Handshake::Ready) => {}
+        Ok(Handshake::VersionMismatch { daemon }) => {
+            return Err(ReconnectFailure::VersionMismatch { daemon });
+        }
+        Err(e) => return Err(ReconnectFailure::Transient(e)),
+    }
+    client
+        .send(rift_protocol::ClientMessage::Attach {
+            session: session.to_string(),
+        })
+        .await
+        .map_err(ReconnectFailure::Transient)?;
+    if let Some(size) = viewport {
+        client
+            .send(rift_protocol::ClientMessage::ResizePane {
+                pane_id: 0,
+                cols: size.cols as u16,
+                rows: size.rows as u16,
+            })
+            .await
+            .map_err(ReconnectFailure::Transient)?;
+    }
+    Ok(std::sync::Arc::new(client))
 }
 
 /// The legacy terminal path: open a `tmux -CC` control-mode session over an SSH
@@ -889,6 +1064,29 @@ async fn run_legacy_terminal(
 /// at "connecting" with no error.
 const DAEMON_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Upper bound on consecutive daemon reconnect attempts after a mid-session
+/// stream death (#475). With [`rift_ssh::ReconnectBackoff`]'s capped schedule
+/// this covers roughly two minutes of outage before recovery gives up and the
+/// session fails visibly (`Disconnected`) — a daemon that [`reconnect_daemon`]
+/// cannot respawn within that window is a structural failure (SSH transport
+/// dead, binary gone), which the SSH-level reconnect loop (#476) owns.
+const DAEMON_RECONNECT_MAX_ATTEMPTS: u32 = 10;
+
+/// The resolved remote daemon endpoint [`provision_daemon`] produced:
+/// everything a mid-session reconnect needs to reattach to (or respawn) the
+/// same daemon again without re-running the deploy (#475).
+struct DaemonEndpoint {
+    /// Absolute remote path of the deployed, versioned daemon binary.
+    remote_path: String,
+    /// Unix socket beside the binary (`<binary>.sock`).
+    socket_path: String,
+    /// Detached-spawn log beside the binary (`<binary>.log`).
+    log_path: String,
+    /// Project root a fresh spawn watches; a reattach keeps the running
+    /// daemon's root.
+    project_root: Option<String>,
+}
+
 /// Best-effort daemon provisioning, run before the terminal is opened.
 ///
 /// Reads the locally-built musl binary from `RIFT_DAEMON_BINARY` (or the
@@ -909,19 +1107,20 @@ const DAEMON_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// retry. The detached daemon outlives the SSH connection,
 /// so a later reconnect reattaches to it instead of spawning a second one (#62).
 ///
-/// Returns the live [`rift_ssh::DaemonClient`] on a clean handshake; the caller
-/// decides how to drive it (the terminal byte stream in daemon mode, or just the
-/// worktree/git/diagnostics consumer in legacy mode). Provisioning steps are
-/// best-effort: an unconfigured binary or any step error logs and returns
-/// `Ok(None)`, so the legacy tmux flow keeps working without the daemon. The
-/// one hard failure is a version mismatch that persists after the replacement:
-/// that is real protocol skew the fallback would hide as silent feature death,
-/// so it returns `Err` and fails the session visibly. The socket and log sit
-/// beside the versioned binary (`<binary>.sock` / `<binary>.log`), inheriting
-/// its path.
+/// Returns the live [`rift_ssh::DaemonClient`] on a clean handshake, paired
+/// with the [`DaemonEndpoint`] a mid-session reconnect reuses (#475); the
+/// caller decides how to drive it (the terminal byte stream in daemon mode, or
+/// just the worktree/git/diagnostics consumer in legacy mode). Provisioning
+/// steps are best-effort: an unconfigured binary or any step error logs and
+/// returns `Ok(None)`, so the legacy tmux flow keeps working without the
+/// daemon. The one hard failure is a version mismatch that persists after the
+/// replacement: that is real protocol skew the fallback would hide as silent
+/// feature death, so it returns `Err` and fails the session visibly. The
+/// socket and log sit beside the versioned binary (`<binary>.sock` /
+/// `<binary>.log`), inheriting its path.
 async fn provision_daemon(
     conn: &mut rift_ssh::SshConnection,
-) -> Result<Option<rift_ssh::DaemonClient>> {
+) -> Result<Option<(rift_ssh::DaemonClient, DaemonEndpoint)>> {
     use rift_ssh::Handshake;
 
     // RIFT_DAEMON_BINARY (runtime) wins over the `just promote` compile-time bake
@@ -1030,7 +1229,15 @@ async fn provision_daemon(
                 version = rift_protocol::PROTOCOL_VERSION,
                 "daemon transport ready (Hello/Welcome ok)"
             );
-            return Ok(Some(client));
+            return Ok(Some((
+                client,
+                DaemonEndpoint {
+                    remote_path,
+                    socket_path,
+                    log_path,
+                    project_root,
+                },
+            )));
         }
         Ok(Handshake::VersionMismatch { daemon }) => daemon,
         Err(e) => {
@@ -1085,7 +1292,15 @@ async fn provision_daemon(
                 version = rift_protocol::PROTOCOL_VERSION,
                 "daemon transport ready after stale-daemon replacement"
             );
-            Ok(Some(client))
+            Ok(Some((
+                client,
+                DaemonEndpoint {
+                    remote_path,
+                    socket_path,
+                    log_path,
+                    project_root,
+                },
+            )))
         }
         Ok(Handshake::VersionMismatch { daemon }) => Err(anyhow::anyhow!(
             "daemon protocol version mismatch persists after replacement \
@@ -1110,22 +1325,24 @@ async fn provision_daemon(
 /// the per-pane byte stream and layout snapshots into the terminal render
 /// channels (#205). With `terminal` `None` (legacy mode) the terminal arms are
 /// inert — the app never sent `Attach`, so the daemon streams no terminal events,
-/// but the worktree + buffer channel still flow. Ends when the channel closes or
-/// a `TerminalExit` ends the active attach; the detached daemon keeps running for
-/// the next attach. The structure/buffer sends are best-effort: a closed
-/// GPUI-side receiver (window gone) drops the message rather than fail the loop.
+/// but the worktree + buffer channel still flow. Returns how the stream ended
+/// ([`StreamEnd`]): a closed channel is the recoverable stream death the
+/// recovery engine reacts to (#475), a `TerminalExit` the orderly end of the
+/// active attach; either way the detached daemon keeps running for the next
+/// attach. The structure/buffer sends are best-effort: a closed GPUI-side
+/// receiver (window gone) drops the message rather than fail the loop.
 async fn consume_daemon_messages(
-    client: std::sync::Arc<rift_ssh::DaemonClient>,
-    terminal: Option<TerminalSinks>,
-    editor: EditorChannels,
-) {
+    client: &rift_ssh::DaemonClient,
+    terminal: Option<&TerminalSinks>,
+    editor: &EditorChannels,
+) -> StreamEnd {
     use rift_protocol::DaemonMessage;
 
     while let Some(msg) = client.recv().await {
         match msg {
             // --- terminal byte stream (daemon terminal mode only) ---
             DaemonMessage::PaneOutput { pane_id, bytes } => {
-                if let Some(sinks) = &terminal {
+                if let Some(sinks) = terminal {
                     // Pane ids cross the render seam in tmux's native `%N` form,
                     // matching the synthesized snapshot below and the command
                     // targets the session view builds.
@@ -1139,7 +1356,7 @@ async fn consume_daemon_messages(
             // to the originating pane (empty bytes on a capture error clear its
             // in-flight flag without wedging the scroll).
             DaemonMessage::PaneCapture { pane_id, bytes } => {
-                if let Some(sinks) = &terminal {
+                if let Some(sinks) = terminal {
                     let _ = sinks.capture_result_tx.send(CaptureResult {
                         pane_id: format!("%{pane_id}"),
                         bytes,
@@ -1150,7 +1367,7 @@ async fn consume_daemon_messages(
             // attach-time query, or one this client requested): route the raw
             // `list-keys`/`show-options` text to `SessionView` to re-parse.
             DaemonMessage::KeyTableReply { list_keys, options } => {
-                if let Some(sinks) = &terminal {
+                if let Some(sinks) = terminal {
                     let _ = sinks
                         .key_table_result_tx
                         .send(KeyTableQueryResult { list_keys, options });
@@ -1162,7 +1379,7 @@ async fn consume_daemon_messages(
             // `rift-protocol`, mirroring the layout seam — and route them to
             // the session switcher, which replaces its whole list.
             DaemonMessage::SessionListReply { sessions } => {
-                if let Some(sinks) = &terminal {
+                if let Some(sinks) = terminal {
                     let sessions = sessions
                         .into_iter()
                         .map(|entry| SessionListItem {
@@ -1179,17 +1396,19 @@ async fn consume_daemon_messages(
             // expects — so both fold into one synthesized `TmuxSnapshot`.
             DaemonMessage::LayoutSnapshot { session, windows }
             | DaemonMessage::LayoutUpdate { session, windows } => {
-                if let Some(sinks) = &terminal {
+                if let Some(sinks) = terminal {
                     let _ = sinks.snapshot_tx.send(layout_to_snapshot(session, windows));
                 }
             }
             DaemonMessage::TerminalExit { session, reason } => {
                 info!(%session, ?reason, "daemon terminal path down");
                 if terminal.is_some() {
-                    // The tmux attach ended; end the session so the app surfaces
-                    // it the same way the legacy `tmux` exit does (Disconnected →
-                    // quit). Reconnect is #206.
-                    break;
+                    // The tmux attach itself ended (an orderly `%exit`, not a
+                    // transport death): end the session so the app surfaces it
+                    // the same way the legacy `tmux` exit does (Disconnected →
+                    // quit). Never recovered from — recovery is for stream
+                    // deaths only (#475).
+                    return StreamEnd::TerminalExit;
                 }
             }
             // --- worktree structure -> file tree (every mode) ---
@@ -1241,26 +1460,45 @@ async fn consume_daemon_messages(
         }
     }
     info!("daemon message stream ended");
+    StreamEnd::Closed
 }
+
+/// How [`consume_daemon_messages`] ended, deciding the caller's next move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamEnd {
+    /// The channel closed under the consumer — remote EOF, a malformed frame,
+    /// a channel error — without an orderly `TerminalExit`. While SSH is up
+    /// this is the recoverable daemon-stream death (#475): reconnect + resync.
+    Closed,
+    /// The daemon reported the tmux attach ended (`%exit`): an orderly end of
+    /// the session, not a transport failure to recover from.
+    TerminalExit,
+}
+
+/// The bridges' handle to the current daemon client: a `watch` receiver the
+/// recovery engine updates after a reconnect (#475). A bridge resolves the
+/// live client per message instead of capturing one client for its lifetime,
+/// so it survives a daemon-stream death; while the stream is down a send fails
+/// against the dead client and the message is dropped — never buffered — and
+/// the post-reconnect resync (Welcome snapshot replay + fresh LayoutSnapshot)
+/// replaces the state those messages would have touched. Each bridge therefore
+/// ends only when its render-side channel closes.
+type DaemonClientWatch = tokio::sync::watch::Receiver<std::sync::Arc<rift_ssh::DaemonClient>>;
 
 /// Forward the editor's file-open requests onto the protocol as
 /// [`rift_protocol::ClientMessage::OpenFile`] reads (#187). Each path the file
 /// tree emitted becomes one read request; the daemon answers with a
 /// `FileContent` reply that returns through [`consume_daemon_messages`] on
 /// `editor.buffer_tx`. A *refused* request (binary / path escape) draws no
-/// reply by protocol, so the editor's own timeout recovers it. Ends when either
-/// channel closes.
-fn spawn_open_file_bridge(
-    client: std::sync::Arc<rift_ssh::DaemonClient>,
-    open_file_rx: flume::Receiver<String>,
-) {
+/// reply by protocol, so the editor's own timeout recovers it. Ends when the
+/// render-side channel closes.
+fn spawn_open_file_bridge(client_rx: DaemonClientWatch, open_file_rx: flume::Receiver<String>) {
     use rift_protocol::ClientMessage;
     tokio::spawn(async move {
         while let Ok(path) = open_file_rx.recv_async().await {
             debug!(%path, "sending open-file request");
-            if client.send(ClientMessage::OpenFile { path }).await.is_err() {
-                break;
-            }
+            let client = client_rx.borrow().clone();
+            let _ = client.send(ClientMessage::OpenFile { path }).await;
         }
     });
 }
@@ -1269,22 +1507,17 @@ fn spawn_open_file_bridge(
 /// [`rift_protocol::ClientMessage::RequestDiff`] pulls (#338). Each selected
 /// path becomes one diff request; the daemon answers with a `FileDiff` reply
 /// that returns through [`consume_daemon_messages`] on `editor.diff_tx`. Ends
-/// when either channel closes.
+/// when the render-side channel closes.
 fn spawn_request_diff_bridge(
-    client: std::sync::Arc<rift_ssh::DaemonClient>,
+    client_rx: DaemonClientWatch,
     request_diff_rx: flume::Receiver<String>,
 ) {
     use rift_protocol::ClientMessage;
     tokio::spawn(async move {
         while let Ok(path) = request_diff_rx.recv_async().await {
             debug!(%path, "sending diff request");
-            if client
-                .send(ClientMessage::RequestDiff { path })
-                .await
-                .is_err()
-            {
-                break;
-            }
+            let client = client_rx.borrow().clone();
+            let _ = client.send(ClientMessage::RequestDiff { path }).await;
         }
     });
 }
@@ -1294,11 +1527,11 @@ fn spawn_request_diff_bridge(
 /// open buffer plus its base `mtime`; the daemon answers with a `SaveResult` or a
 /// `SaveConflict` that returns through [`consume_daemon_messages`] on
 /// `editor.buffer_tx`. A *refused* write (a path escape, non-UTF-8) draws no reply
-/// by protocol, so the editor's own save timeout recovers it. Ends when either
-/// channel closes. The editor builds the full `SaveFile` (path, content,
-/// base_mtime), so the bridge forwards it unchanged.
+/// by protocol, so the editor's own save timeout recovers it. Ends when the
+/// render-side channel closes. The editor builds the full `SaveFile` (path,
+/// content, base_mtime), so the bridge forwards it unchanged.
 fn spawn_save_file_bridge(
-    client: std::sync::Arc<rift_ssh::DaemonClient>,
+    client_rx: DaemonClientWatch,
     save_file_rx: flume::Receiver<rift_protocol::ClientMessage>,
 ) {
     tokio::spawn(async move {
@@ -1306,9 +1539,8 @@ fn spawn_save_file_bridge(
             if let rift_protocol::ClientMessage::SaveFile { path, .. } = &msg {
                 debug!(%path, "sending save-file request");
             }
-            if client.send(msg).await.is_err() {
-                break;
-            }
+            let client = client_rx.borrow().clone();
+            let _ = client.send(msg).await;
         }
     });
 }
@@ -1317,9 +1549,10 @@ fn spawn_save_file_bridge(
 /// `BufferChanged` (debounced edit) or `BufferClosed` (close / switch / save) is
 /// sent verbatim so the daemon feeds the LSP the live buffer (the disk→buffer
 /// source-of-truth shift). Push-only — there is no reply; diagnostics return on
-/// the worktree stream as `Diagnostics`. Ends when either channel closes.
+/// the worktree stream as `Diagnostics`. Ends when the render-side channel
+/// closes.
 fn spawn_buffer_change_bridge(
-    client: std::sync::Arc<rift_ssh::DaemonClient>,
+    client_rx: DaemonClientWatch,
     buffer_change_rx: flume::Receiver<rift_protocol::ClientMessage>,
 ) {
     tokio::spawn(async move {
@@ -1333,9 +1566,8 @@ fn spawn_buffer_change_bridge(
                 }
                 _ => {}
             }
-            if client.send(msg).await.is_err() {
-                break;
-            }
+            let client = client_rx.borrow().clone();
+            let _ = client.send(msg).await;
         }
     });
 }
@@ -1346,9 +1578,9 @@ fn spawn_buffer_change_bridge(
 /// `ReferencesRequest` (Shift+F12 / context-menu "Find References") are sent
 /// verbatim; the daemon answers with `DefinitionResponse` / `HoverResponse` /
 /// `ReferencesResponse` that return through [`consume_daemon_messages`] on
-/// `editor.nav_tx`. Ends when either channel closes.
+/// `editor.nav_tx`. Ends when the render-side channel closes.
 fn spawn_nav_bridge(
-    client: std::sync::Arc<rift_ssh::DaemonClient>,
+    client_rx: DaemonClientWatch,
     nav_request_rx: flume::Receiver<rift_protocol::ClientMessage>,
 ) {
     tokio::spawn(async move {
@@ -1365,9 +1597,8 @@ fn spawn_nav_bridge(
                 }
                 _ => {}
             }
-            if client.send(msg).await.is_err() {
-                break;
-            }
+            let client = client_rx.borrow().clone();
+            let _ = client.send(msg).await;
         }
     });
 }
@@ -1385,11 +1616,9 @@ struct TerminalSinks {
 
 /// Forward typed input from the render layer onto the protocol as
 /// [`rift_protocol::ClientMessage::Input`]; the daemon replays it to the pane via
-/// `send-keys -H` (opaque bytes, agent-agnostic). Ends when either channel closes.
-fn spawn_input_bridge(
-    client: std::sync::Arc<rift_ssh::DaemonClient>,
-    input_rx: flume::Receiver<PaneInput>,
-) {
+/// `send-keys -H` (opaque bytes, agent-agnostic). Ends when the render-side
+/// channel closes.
+fn spawn_input_bridge(client_rx: DaemonClientWatch, input_rx: flume::Receiver<PaneInput>) {
     use rift_protocol::ClientMessage;
     tokio::spawn(async move {
         while let Ok(input) = input_rx.recv_async().await {
@@ -1400,9 +1629,8 @@ fn spawn_input_bridge(
                 pane_id,
                 data: bytes_to_string(input.bytes),
             };
-            if client.send(msg).await.is_err() {
-                break;
-            }
+            let client = client_rx.borrow().clone();
+            let _ = client.send(msg).await;
         }
     });
 }
@@ -1410,22 +1638,27 @@ fn spawn_input_bridge(
 /// Forward client viewport resizes onto the protocol as
 /// [`rift_protocol::ClientMessage::ResizePane`]; the daemon applies them with
 /// `refresh-client -C <cols>x<rows>` (the control client's single viewport, so
-/// `pane_id` is unused there — any value carries).
+/// `pane_id` is unused there — any value carries). Every grid is also cached
+/// on `viewport_tx` — unconditionally, even when the send drops mid-outage —
+/// so the recovery engine can re-assert the latest known size after a
+/// re-Attach (#475): the render layer itself only re-sends on a size
+/// *change*, which a reconnect is not.
 fn spawn_resize_bridge(
-    client: std::sync::Arc<rift_ssh::DaemonClient>,
+    client_rx: DaemonClientWatch,
     size_rx: flume::Receiver<TermSize>,
+    viewport_tx: tokio::sync::watch::Sender<Option<TermSize>>,
 ) {
     use rift_protocol::ClientMessage;
     tokio::spawn(async move {
         while let Ok(size) = size_rx.recv_async().await {
+            viewport_tx.send_replace(Some(size));
             let msg = ClientMessage::ResizePane {
                 pane_id: 0,
                 cols: size.cols as u16,
                 rows: size.rows as u16,
             };
-            if client.send(msg).await.is_err() {
-                break;
-            }
+            let client = client_rx.borrow().clone();
+            let _ = client.send(msg).await;
         }
     });
 }
@@ -1440,28 +1673,29 @@ fn spawn_resize_bridge(
 /// is guaranteed to reach the daemon after the mutation it is refreshing for.
 /// Issuing a refresh from a separate channel/task (as the render layer used
 /// to) gave no such ordering guarantee.
-fn spawn_command_bridge(
-    client: std::sync::Arc<rift_ssh::DaemonClient>,
-    cmd_rx: flume::Receiver<String>,
-) {
+fn spawn_command_bridge(client_rx: DaemonClientWatch, cmd_rx: flume::Receiver<String>) {
     use rift_protocol::ClientMessage;
     tokio::spawn(async move {
         while let Ok(cmd) = cmd_rx.recv_async().await {
             debug!(cmd = %cmd, "sending tmux command (daemon)");
             let refresh_key_table = rift_terminal::keytable::mutates_bindings(&cmd);
             let refresh_status_line = rift_terminal::statusline::mutates_status_options(&cmd);
+            let client = client_rx.borrow().clone();
             if client
                 .send(ClientMessage::TmuxCommand { cmd })
                 .await
                 .is_err()
             {
-                break;
+                // Dropped mid-outage; skip the follow-up refreshes too — the
+                // daemon re-queries key table and status line unprompted on
+                // the reconnect's re-Attach.
+                continue;
             }
             if refresh_key_table && client.send(ClientMessage::QueryKeyTable).await.is_err() {
-                break;
+                continue;
             }
-            if refresh_status_line && client.send(ClientMessage::QueryStatusLine).await.is_err() {
-                break;
+            if refresh_status_line {
+                let _ = client.send(ClientMessage::QueryStatusLine).await;
             }
         }
     });
@@ -1472,10 +1706,7 @@ fn spawn_command_bridge(
 /// -p -e` and replies with a `PaneCapture` that the consumer routes back to the
 /// originating pane as a [`CaptureResult`]. The render-side `start_row`/`end_row`
 /// tmux line addresses and the `-J` flag cross the seam unchanged.
-fn spawn_capture_bridge(
-    client: std::sync::Arc<rift_ssh::DaemonClient>,
-    capture_rx: flume::Receiver<CaptureRequest>,
-) {
+fn spawn_capture_bridge(client_rx: DaemonClientWatch, capture_rx: flume::Receiver<CaptureRequest>) {
     use rift_protocol::ClientMessage;
     tokio::spawn(async move {
         while let Ok(req) = capture_rx.recv_async().await {
@@ -1488,9 +1719,8 @@ fn spawn_capture_bridge(
                 end: req.end_row,
                 join: req.join_wraps,
             };
-            if client.send(msg).await.is_err() {
-                break;
-            }
+            let client = client_rx.borrow().clone();
+            let _ = client.send(msg).await;
         }
     });
 }
@@ -1503,16 +1733,12 @@ fn spawn_capture_bridge(
 /// statusbar's explicit-refresh trigger — a binding-mutating dispatch's
 /// refresh is issued inline by `spawn_command_bridge` instead, so it lands
 /// strictly after the mutating command on the same task.
-fn spawn_key_table_bridge(
-    client: std::sync::Arc<rift_ssh::DaemonClient>,
-    key_table_request_rx: flume::Receiver<()>,
-) {
+fn spawn_key_table_bridge(client_rx: DaemonClientWatch, key_table_request_rx: flume::Receiver<()>) {
     use rift_protocol::ClientMessage;
     tokio::spawn(async move {
         while key_table_request_rx.recv_async().await.is_ok() {
-            if client.send(ClientMessage::QueryKeyTable).await.is_err() {
-                break;
-            }
+            let client = client_rx.borrow().clone();
+            let _ = client.send(ClientMessage::QueryKeyTable).await;
         }
     });
 }
@@ -1522,17 +1748,18 @@ fn spawn_key_table_bridge(
 /// daemon answers with a `SessionListReply` that returns through
 /// [`consume_daemon_messages`] on `sinks.session_list_tx`. Only the switcher's
 /// on-open refresh rides here — the daemon re-queries on session churn by
-/// itself and pushes the result unprompted.
+/// itself and pushes the result unprompted. A request dropped mid-outage is
+/// harmless: the reconnect's re-Attach makes the daemon push a fresh list.
+/// Ends when the render-side channel closes.
 fn spawn_session_list_bridge(
-    client: std::sync::Arc<rift_ssh::DaemonClient>,
+    client_rx: DaemonClientWatch,
     session_list_request_rx: flume::Receiver<()>,
 ) {
     use rift_protocol::ClientMessage;
     tokio::spawn(async move {
         while session_list_request_rx.recv_async().await.is_ok() {
-            if client.send(ClientMessage::QuerySessionList).await.is_err() {
-                break;
-            }
+            let client = client_rx.borrow().clone();
+            let _ = client.send(ClientMessage::QuerySessionList).await;
         }
     });
 }
@@ -1544,32 +1771,40 @@ fn spawn_session_list_bridge(
 /// request's grid size is re-asserted as a `ResizePane` on this same task —
 /// sequential sends land in program order, so it reaches the daemon strictly
 /// after the `Attach` and sizes the fresh child (the render layer's own resize
-/// channel only fires on a size *change*, which a switch is not).
+/// channel only fires on a size *change*, which a switch is not). Each sent
+/// switch also records the new name on `session_tx`, so a later stream
+/// recovery re-attaches to the session the client is actually on (#475); a
+/// switch dropped mid-outage stays untracked — dropped, never buffered — and
+/// the resync restores the last session the daemon was actually asked for.
+/// Ends when the render-side channel closes.
 fn spawn_session_switch_bridge(
-    client: std::sync::Arc<rift_ssh::DaemonClient>,
+    client_rx: DaemonClientWatch,
     session_switch_rx: flume::Receiver<SessionSwitchRequest>,
+    session_tx: tokio::sync::watch::Sender<String>,
 ) {
     use rift_protocol::ClientMessage;
     tokio::spawn(async move {
         while let Ok(req) = session_switch_rx.recv_async().await {
             debug!(session = %req.session, "sending session switch attach");
+            let client = client_rx.borrow().clone();
             if client
                 .send(ClientMessage::Attach {
-                    session: req.session,
+                    session: req.session.clone(),
                 })
                 .await
                 .is_err()
             {
-                break;
+                // Dropped mid-outage; skip the viewport re-assert and the
+                // session-track update too — the daemon never saw the switch.
+                continue;
             }
+            session_tx.send_replace(req.session);
             let resize = ClientMessage::ResizePane {
                 pane_id: 0,
                 cols: req.size.cols as u16,
                 rows: req.size.rows as u16,
             };
-            if client.send(resize).await.is_err() {
-                break;
-            }
+            let _ = client.send(resize).await;
         }
     });
 }
