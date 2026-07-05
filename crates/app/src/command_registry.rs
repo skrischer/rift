@@ -54,7 +54,7 @@ impl Command {
 pub const COMMANDS: &[Command] = &[
     Command::new("Save", Some("Ctrl+S"), || Box::new(Save)),
     Command::new("Go to Definition", Some("F12"), || Box::new(GoToDefinition)),
-    Command::new("Show Hover", Some("Shift+K"), || Box::new(ShowHover)),
+    Command::new("Show Hover", Some("Ctrl+K Ctrl+I"), || Box::new(ShowHover)),
     Command::new("Find References", Some("Shift+F12"), || {
         Box::new(FindReferences)
     }),
@@ -121,6 +121,15 @@ mod tests {
                 "Select Theme: Catppuccin Mocha",
             ]
         );
+    }
+
+    /// Regression for #435: a bare `Shift+K` hover binding swallowed typing a
+    /// capital 'K' into the buffer. The hint must match the non-typing chord
+    /// bound in `main.rs`; drifting back to a plain typing key fails here.
+    #[test]
+    fn test_show_hover_hint_chord_binding_matches_non_typing_chord() {
+        let hover = find("Show Hover").expect("Show Hover is registered");
+        assert_eq!(hover.keybinding_hint, Some("Ctrl+K Ctrl+I"));
     }
 
     #[test]
