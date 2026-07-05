@@ -8,7 +8,7 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::popover::Popover;
 use gpui_component::tab::{Tab, TabBar};
-use gpui_component::{h_flex, v_flex, ActiveTheme, Sizable};
+use gpui_component::{h_flex, v_flex, ActiveTheme, Icon, IconName, Sizable};
 use termy_terminal_ui::TmuxSnapshot;
 use tracing::debug;
 
@@ -76,6 +76,12 @@ pub struct TerminalHandle {
     /// re-assert (see [`SessionSwitchRequest`]). Same legacy-path caveat as
     /// `session_list_request_rx`.
     pub session_switch_rx: flume::Receiver<SessionSwitchRequest>,
+    /// The reconnect banner's Cancel (#476,
+    /// `docs/spec-connection-robustness.md`): consumed by the SSH-level
+    /// reconnect engine between attempts, which stops retrying and answers
+    /// with `ConnectionStatus::Disconnected` — the visible not-connected
+    /// state (the Connection screen once #477 lands).
+    pub reconnect_cancel_rx: flume::Receiver<()>,
 }
 
 struct PaneEntry {
@@ -165,6 +171,14 @@ fn select_pane_command(pane: &str) -> String {
 /// tmux `kill-pane` command closing the given pane.
 fn kill_pane_command(pane: &str) -> String {
     format!("kill-pane -t {}", pane)
+}
+
+/// The SSH-outage danger banner's body line (design contract in
+/// `docs/spec-connection-robustness.md`): where the reconnect loop is
+/// reconnecting to and which attempt it is on. GPUI-free so the format is
+/// unit-testable.
+fn reconnect_banner_message(ssh_label: &str, retry: u32) -> String {
+    format!("reconnecting to {ssh_label} — retry {retry}")
 }
 
 /// Whole-cell grid dimensions that fit the given pane-area bounds, clamped to
@@ -286,6 +300,9 @@ pub struct SessionView {
     /// `session_switch_rx`) when a switcher row or the new-session prompt
     /// commits.
     session_switch_tx: flume::Sender<SessionSwitchRequest>,
+    /// Emits the reconnect banner's Cancel to the SSH-level reconnect engine
+    /// (forwarded to `TerminalHandle`'s `reconnect_cancel_rx`).
+    reconnect_cancel_tx: flume::Sender<()>,
 }
 
 impl SessionView {
@@ -305,6 +322,7 @@ impl SessionView {
         let (session_list_tx, session_list_rx) = flume::unbounded::<Vec<SessionListItem>>();
         let (session_list_request_tx, session_list_request_rx) = flume::unbounded::<()>();
         let (session_switch_tx, session_switch_rx) = flume::unbounded::<SessionSwitchRequest>();
+        let (reconnect_cancel_tx, reconnect_cancel_rx) = flume::unbounded::<()>();
 
         {
             cx.spawn(async move |this, cx| loop {
@@ -389,25 +407,23 @@ impl SessionView {
 
         {
             // SSH/tmux lifecycle drives the statusbar connection indicator
-            // (event-driven, never polled).
+            // (event-driven, never polled). `Disconnected` is a visible
+            // not-connected end state — an orderly tmux exit, a canceled
+            // reconnect, or a non-retryable connect failure — never an app
+            // quit: the SSH-level reconnect engine owns transport drops
+            // (#476), and the Connection screen (#477) will own this state
+            // once it lands.
             cx.spawn(async move |this, cx| loop {
                 let Ok(status) = connection_status_rx.recv_async().await else {
                     break;
                 };
                 let result = cx.update(|cx| {
-                    let updated = this.update(cx, |view, cx| {
+                    this.update(cx, |view, cx| {
                         if view.connection_status != status {
                             view.connection_status = status;
                             cx.notify();
                         }
-                    });
-                    // `Disconnected` arrives only after `run_ssh_session`
-                    // returns, i.e. the tmux session itself ended. That is the
-                    // single genuine app-shutdown signal; a closing pane is not.
-                    if status == ConnectionStatus::Disconnected {
-                        cx.quit();
-                    }
-                    updated
+                    })
                 });
                 if result.is_err() {
                     break;
@@ -529,6 +545,7 @@ impl SessionView {
             new_session_prompt: None,
             session_list_request_tx,
             session_switch_tx,
+            reconnect_cancel_tx,
         };
 
         let handle = TerminalHandle {
@@ -546,6 +563,7 @@ impl SessionView {
             session_list_tx,
             session_list_request_rx,
             session_switch_rx,
+            reconnect_cancel_rx,
         };
 
         (view, handle)
@@ -1266,6 +1284,65 @@ impl SessionView {
             })
     }
 
+    /// The reconnect banner's Cancel action: ask the SSH-level reconnect
+    /// engine to stop retrying. The engine answers with `Disconnected` on the
+    /// status channel — the banner clears through that status change, never
+    /// through an optimistic local mutation.
+    fn cancel_reconnect(&self) {
+        let _ = self.reconnect_cancel_tx.try_send(());
+    }
+
+    /// The SSH-outage danger banner (#476, design contract in
+    /// `docs/spec-connection-robustness.md`): shown across the top of the
+    /// terminal panel while the SSH-level reconnect engine retries. Danger
+    /// tint + icon, 13/600 title, 12 muted body carrying the target and the
+    /// retry counter — all colors theme tokens — and a Cancel button that
+    /// stops the loop via [`Self::cancel_reconnect`].
+    fn render_reconnect_banner(&self, retry: u32, cx: &mut Context<Self>) -> impl IntoElement {
+        let danger = cx.theme().danger;
+        h_flex()
+            .id("ssh-reconnect-banner")
+            .w_full()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(12.0))
+            .py(px(6.0))
+            .bg(danger.opacity(0.12))
+            .border_b_1()
+            .border_color(danger.opacity(0.35))
+            .child(Icon::new(IconName::TriangleAlert).text_color(danger))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(13.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(cx.theme().foreground)
+                    .child("SSH connection lost"),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(12.0))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(SharedString::from(reconnect_banner_message(
+                        &self.ssh_label,
+                        retry,
+                    ))),
+            )
+            .child(
+                Button::new("cancel-ssh-reconnect")
+                    .danger()
+                    .outline()
+                    .xsmall()
+                    .label("Cancel")
+                    .on_click(cx.listener(|this, _event, _window, _cx| {
+                        this.cancel_reconnect();
+                    })),
+            )
+    }
+
     /// The per-window pane sidebar: a fixed-width column listing the active
     /// window's panes. A row click focuses its pane (`select-pane`), the row
     /// `x` closes it (`kill-pane`), and the header splits the active pane
@@ -1478,13 +1555,27 @@ impl Render for SessionView {
 
         let size_label = format!("{}x{}", grid_size.cols, grid_size.rows);
 
-        // Connection indicator: Catppuccin Mocha semantic colors (not in the
-        // gpui-component theme tokens), driven by the SSH lifecycle channel.
+        // Connection indicator, driven by the SSH lifecycle channel. Theme
+        // tokens per the design contract (`docs/spec-connection-robustness.md`):
+        // connected = success, connecting/reconnecting = warning, not
+        // connected = muted.
         let (status_label, status_color) = match self.connection_status {
-            ConnectionStatus::Connecting => ("connecting", rgb(0xf9e2af)),
-            ConnectionStatus::Connected => ("connected", rgb(0xa6e3a1)),
-            ConnectionStatus::Reconnecting => ("reconnecting", rgb(0xfab387)),
-            ConnectionStatus::Disconnected => ("disconnected", rgb(0xf38ba8)),
+            ConnectionStatus::Connecting => ("connecting", cx.theme().warning),
+            ConnectionStatus::Connected => ("connected", cx.theme().success),
+            ConnectionStatus::Reconnecting | ConnectionStatus::SshReconnecting { .. } => {
+                ("reconnecting", cx.theme().warning)
+            }
+            ConnectionStatus::Disconnected => ("disconnected", cx.theme().muted_foreground),
+        };
+
+        // SSH-outage danger banner (#476): only the SSH-level engine's state
+        // shows it; a daemon-stream recovery (plain `Reconnecting`, #475)
+        // surfaces through the warning dot alone.
+        let reconnect_banner = match self.connection_status {
+            ConnectionStatus::SshReconnecting { retry } => {
+                Some(self.render_reconnect_banner(retry, cx))
+            }
+            _ => None,
         };
 
         let selected_index = self.windows.iter().position(|w| w.is_active).unwrap_or(0);
@@ -1754,6 +1845,7 @@ impl Render for SessionView {
                     debug!(error = %e, "failed to create new window");
                 }
             }))
+            .children(reconnect_banner)
             .child(tab_bar)
             .child(
                 div()
@@ -1830,8 +1922,9 @@ impl Render for SessionView {
 mod tests {
     use super::{
         activity_dot_color, aggregate_activity, grid_size_for, kill_pane_command, quote_tmux_name,
-        resize_direction, select_pane_command, split_command, PaneActivity, SessionListItem,
-        SessionView, TermSize, TerminalHandle, DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE,
+        reconnect_banner_message, resize_direction, select_pane_command, split_command,
+        PaneActivity, SessionListItem, SessionView, TermSize, TerminalHandle, DEFAULT_FONT_SIZE,
+        MAX_FONT_SIZE, MIN_FONT_SIZE,
     };
     use gpui::{
         px, rgb, size, AnyWindowHandle, App, AppContext as _, Entity, SharedString, TestAppContext,
@@ -1984,6 +2077,14 @@ mod tests {
         assert_ne!(busy, attention);
     }
 
+    #[test]
+    fn test_reconnect_banner_message_includes_target_and_retry() {
+        assert_eq!(
+            reconnect_banner_message("developer@100.64.0.1", 3),
+            "reconnecting to developer@100.64.0.1 — retry 3"
+        );
+    }
+
     /// A `SessionView` plus its channel handle, so switcher tests can assert
     /// what actually crossed the render seam.
     fn session_and_handle(cx: &mut App) -> (Entity<SessionView>, TerminalHandle) {
@@ -1994,6 +2095,27 @@ mod tests {
             view
         });
         (session, handle.expect("handle built by SessionView::new"))
+    }
+
+    /// The banner's Cancel action crosses the render seam as exactly one
+    /// signal on the cancel channel; the status change back to `Disconnected`
+    /// comes from the engine, never optimistically from the view.
+    #[gpui::test]
+    fn test_cancel_reconnect_sends_one_cancel_signal(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, handle) = session_and_handle(cx);
+
+            session.read(cx).cancel_reconnect();
+
+            assert!(
+                handle.reconnect_cancel_rx.try_recv().is_ok(),
+                "cancel crossed the seam"
+            );
+            assert!(
+                handle.reconnect_cancel_rx.try_recv().is_err(),
+                "exactly one cancel signal"
+            );
+        });
     }
 
     /// Opening the switcher (any entry point — statusbar trigger or palette

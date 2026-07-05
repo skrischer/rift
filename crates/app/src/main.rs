@@ -7,6 +7,7 @@
 use std::env;
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use anyhow::{Context as _, Result};
@@ -30,6 +31,10 @@ struct SshConfig {
     key: PathBuf,
 }
 
+// Cloned per connect attempt by the reconnect engine: flume handles are cheap
+// `Arc` clones, and the dead session's clones drop with its runtime, so only
+// the live session consumes the render-side channels.
+#[derive(Clone)]
 struct PtyChannels {
     pane_output_tx: flume::Sender<PaneOutput>,
     input_rx: flume::Receiver<PaneInput>,
@@ -73,6 +78,8 @@ struct PtyChannels {
 /// open-file bridge drains `open_file_rx` into `ClientMessage::OpenFile` reads and
 /// a save-file bridge drains `save_file_rx` into `SaveFile` writes. The matching
 /// GPUI-side endpoints live on [`rift_app::workspace::WorkspaceChannels`].
+/// Cloned per connect attempt by the reconnect engine (see [`PtyChannels`]).
+#[derive(Clone)]
 struct EditorChannels {
     /// Worktree-family daemon messages routed to the file tree's model.
     worktree_tx: flume::Sender<rift_protocol::DaemonMessage>,
@@ -434,10 +441,13 @@ fn main() {
                             }),
                     };
 
-                    // Kept outside `channels` so the session thread can flip the
-                    // indicator to Disconnected once `run_ssh_session` returns
-                    // (the in-session clone reports Connected).
+                    // Kept outside `channels` so the reconnect engine can drive
+                    // the indicator (SshReconnecting/Disconnected) after
+                    // `run_ssh_session` returns (the in-session clone reports
+                    // Connected). The cancel receiver likewise belongs to the
+                    // engine, not to a single session run.
                     let status_tx = handle.connection_status_tx.clone();
+                    let reconnect_cancel_rx = handle.reconnect_cancel_rx.clone();
 
                     let channels = PtyChannels {
                         pane_output_tx: handle.pane_output_tx,
@@ -480,21 +490,14 @@ fn main() {
                     );
 
                     thread::spawn(move || {
-                        let rt =
-                            tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-                        rt.block_on(async move {
-                            if let Err(e) = run_ssh_session(&ssh, channels, editor_channels).await {
-                                error!(
-                                    %e,
-                                    host = %ssh.host,
-                                    port = ssh.port,
-                                    key = %ssh.key.display(),
-                                    key_exists,
-                                    "SSH session failed"
-                                );
-                            }
-                            let _ = status_tx.send(ConnectionStatus::Disconnected);
-                        });
+                        run_session_with_reconnect(
+                            &ssh,
+                            channels,
+                            editor_channels,
+                            status_tx,
+                            reconnect_cancel_rx,
+                            key_exists,
+                        );
                     });
 
                     view
@@ -539,7 +542,112 @@ fn main() {
     });
 }
 
-async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels, editor: EditorChannels) -> Result<()> {
+/// The SSH-level reconnect engine (#476, `docs/spec-connection-robustness.md`):
+/// run the connect pipeline, and when the session dies with a transport-shaped
+/// error, retry it forever under [`rift_ssh::ReconnectBackoff`]'s jittered
+/// capped schedule (30s cap) — an SSH drop never quits the app. Each retry
+/// surfaces as `ConnectionStatus::SshReconnecting { retry }` (danger banner +
+/// warning dot); a successful reconnect re-runs the full pipeline (daemon
+/// provisioning, attach, resync) and restarts the schedule. The banner's
+/// Cancel and non-retryable failures ([`is_retryable_session_error`]) end the
+/// loop in the visible `Disconnected` state instead — the Connection screen
+/// (#477) will own that state once it lands. An orderly end (`Ok`: the tmux
+/// attach exited) also ends the loop without retrying: the remote session is
+/// gone on purpose, not lost.
+///
+/// Each attempt runs on a fresh tokio runtime: dropping the runtime cancels
+/// every bridge task the dead session spawned, so a stale bridge can never
+/// compete with the fresh session's bridges for the render-side flume
+/// receivers (clones of one MPMC channel are competing consumers).
+fn run_session_with_reconnect(
+    ssh: &SshConfig,
+    channels: PtyChannels,
+    editor: EditorChannels,
+    status_tx: flume::Sender<ConnectionStatus>,
+    cancel_rx: flume::Receiver<()>,
+    key_exists: bool,
+) {
+    let mut retry: u32 = 0;
+    let mut backoff = rift_ssh::ReconnectBackoff::new();
+    let connected = AtomicBool::new(false);
+    loop {
+        connected.store(false, Ordering::Relaxed);
+        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        let result = rt.block_on(run_ssh_session(
+            ssh,
+            channels.clone(),
+            editor.clone(),
+            &connected,
+        ));
+        // Cancels the dead session's bridge tasks (see the engine doc above).
+        drop(rt);
+        if connected.load(Ordering::Relaxed) {
+            // The session was fully up before it died: the next outage is a
+            // fresh one. Restart the retry schedule and drop a stale Cancel
+            // that raced a reconnect which then succeeded.
+            retry = 0;
+            backoff.reset();
+            while cancel_rx.try_recv().is_ok() {}
+        }
+        let error = match result {
+            Ok(()) => {
+                info!("SSH session ended (orderly tmux exit)");
+                break;
+            }
+            Err(e) => e,
+        };
+        if !is_retryable_session_error(&error) {
+            error!(
+                %error,
+                host = %ssh.host,
+                port = ssh.port,
+                key = %ssh.key.display(),
+                key_exists,
+                "SSH session failed with a non-retryable error"
+            );
+            break;
+        }
+        retry = retry.saturating_add(1);
+        warn!(%error, retry, host = %ssh.host, "SSH connection lost, reconnecting");
+        let _ = status_tx.send(ConnectionStatus::SshReconnecting { retry });
+        match cancel_rx.recv_timeout(backoff.next_delay()) {
+            // The user canceled from the banner: stop retrying and surface
+            // the visible not-connected state.
+            Ok(()) => {
+                info!("SSH reconnect canceled by the user");
+                break;
+            }
+            Err(flume::RecvTimeoutError::Timeout) => {}
+            // The render side is gone (window closed): nobody to reconnect
+            // for.
+            Err(flume::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let _ = status_tx.send(ConnectionStatus::Disconnected);
+}
+
+/// Whether the reconnect engine should retry after this session failure: only
+/// an error chain carrying a retryable [`rift_ssh::SshError`] — a
+/// transport-shaped death — re-enters the loop. Everything else is treated as
+/// deterministic (auth/config failures; typeless session errors such as the
+/// mid-session protocol version mismatch, whose automatic re-run would
+/// re-enter the stale-daemon replacement #475 deliberately cut off) and
+/// surfaces as a visible disconnect instead of hiding behind retries (spec
+/// gate decision 2026-07-05).
+fn is_retryable_session_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<rift_ssh::SshError>()
+            .is_some_and(rift_ssh::SshError::is_retryable)
+    })
+}
+
+async fn run_ssh_session(
+    ssh: &SshConfig,
+    ch: PtyChannels,
+    editor: EditorChannels,
+    connected: &AtomicBool,
+) -> Result<()> {
     use rift_ssh::SshConnection;
 
     let mut conn = SshConnection::connect(&ssh.host, ssh.port, &ssh.user, &ssh.key)
@@ -572,7 +680,10 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels, editor: EditorChannel
         match daemon_client {
             Some((client, endpoint)) => {
                 info!("terminal source: daemon protocol");
-                return run_daemon_terminal(&mut conn, client, endpoint, session, ch, editor).await;
+                return run_daemon_terminal(
+                    &mut conn, client, endpoint, session, ch, editor, connected,
+                )
+                .await;
             }
             None => warn!(
                 "daemon terminal selected but no daemon available; \
@@ -601,7 +712,7 @@ async fn run_ssh_session(ssh: &SshConfig, ch: PtyChannels, editor: EditorChannel
         info!("terminal source: legacy tmux (no daemon configured)");
     }
 
-    run_legacy_terminal(conn, session, ch).await
+    run_legacy_terminal(conn, session, ch, connected).await
 }
 
 /// Whether the terminal sources its bytes from the daemon protocol (the default)
@@ -618,9 +729,11 @@ fn use_daemon_terminal() -> bool {
 /// attach, bridge the reverse path (input, resize, raw commands, capture) onto
 /// the protocol, and fold the daemon's pane-output / layout / worktree stream
 /// into the existing render channels. Blocks until the tmux attach reports
-/// `TerminalExit`; returning ends the session (`Disconnected` → quit), matching
-/// the legacy `tmux` exit path. The SSH connection (`conn`) stays alive for the
-/// session; the recovery engine below reuses it to reopen daemon channels.
+/// `TerminalExit`; returning `Ok` ends the session as an orderly exit, which
+/// the SSH-level engine (#476) surfaces as the visible `Disconnected` state
+/// without retrying — never an app quit. The SSH connection (`conn`) stays
+/// alive for the session; the recovery engine below reuses it to reopen daemon
+/// channels.
 ///
 /// A daemon-channel death (EOF, malformed frame, channel error) while SSH is
 /// up does NOT end the session (#475, `docs/spec-connection-robustness.md`):
@@ -644,6 +757,7 @@ async fn run_daemon_terminal(
     session: String,
     ch: PtyChannels,
     editor: EditorChannels,
+    connected: &AtomicBool,
 ) -> Result<()> {
     use rift_protocol::ClientMessage;
     use std::sync::Arc;
@@ -670,13 +784,18 @@ async fn run_daemon_terminal(
     // fires (then the attach default is all there is to keep).
     let (viewport_tx, viewport_rx) = tokio::sync::watch::channel(None::<TermSize>);
 
-    // Open this client's own tmux attach, carrying `RIFT_SESSION` end-to-end. The
-    // daemon answers with a LayoutSnapshot baseline, then the live stream.
-    if let Err(e) = client.send(ClientMessage::Attach { session }).await {
-        warn!(%e, "failed to open daemon terminal attach");
-        return Ok(());
-    }
+    // Open this client's own tmux attach, carrying `RIFT_SESSION` end-to-end.
+    // The daemon answers with a LayoutSnapshot baseline, then the live stream.
+    // A failed send means the daemon channel died right behind the handshake —
+    // a transport death for the reconnect engine, not an orderly end.
+    client
+        .send(ClientMessage::Attach { session })
+        .await
+        .context("failed to open daemon terminal attach")?;
     let _ = ch.connection_status_tx.send(ConnectionStatus::Connected);
+    // Tells the reconnect engine this run was fully up, so the next outage
+    // restarts the retry schedule instead of continuing the old one.
+    connected.store(true, Ordering::Relaxed);
 
     // Reverse-path bridges: each forwards a render-side flume stream onto the
     // protocol. They live as long as their render-side channel; a send that
@@ -783,9 +902,20 @@ async fn reconnect_daemon(
     viewport_rx: &tokio::sync::watch::Receiver<Option<TermSize>>,
 ) -> Result<std::sync::Arc<rift_ssh::DaemonClient>> {
     let mut backoff = rift_ssh::ReconnectBackoff::new();
+    let mut last_transient: Option<rift_ssh::SshError> = None;
     for attempt in 1..=DAEMON_RECONNECT_MAX_ATTEMPTS {
         if attempt > 1 {
             tokio::time::sleep(backoff.next_delay()).await;
+        }
+        // A dead SSH transport (drop, exhausted keepalive window, #438)
+        // cannot carry a daemon channel: hand the outage to the SSH-level
+        // reconnect loop (#476) right away instead of burning the bounded
+        // attempts against it.
+        if conn.is_closed() {
+            return Err(anyhow::Error::new(rift_ssh::SshError::Connection(
+                "SSH transport closed".to_string(),
+            ))
+            .context("daemon stream reconnect aborted"));
         }
         info!(attempt, "reconnecting daemon stream");
         let session = session_rx.borrow().clone();
@@ -804,12 +934,20 @@ async fn reconnect_daemon(
             }
             Err(ReconnectFailure::Transient(e)) => {
                 warn!(%e, attempt, "daemon reconnect attempt failed");
+                last_transient = Some(e);
             }
         }
     }
-    Err(anyhow::anyhow!(
-        "daemon stream reconnect gave up after {DAEMON_RECONNECT_MAX_ATTEMPTS} attempts"
-    ))
+    // Carry the last transport error in the chain so the SSH-level engine can
+    // classify the give-up as retryable (`is_retryable_session_error`).
+    Err(match last_transient {
+        Some(e) => anyhow::Error::new(e).context(format!(
+            "daemon stream reconnect gave up after {DAEMON_RECONNECT_MAX_ATTEMPTS} attempts"
+        )),
+        None => anyhow::anyhow!(
+            "daemon stream reconnect gave up after {DAEMON_RECONNECT_MAX_ATTEMPTS} attempts"
+        ),
+    })
 }
 
 /// One reconnect attempt (#475): reattach to the daemon socket — respawning a
@@ -876,6 +1014,7 @@ async fn run_legacy_terminal(
     mut conn: rift_ssh::SshConnection,
     session: String,
     ch: PtyChannels,
+    connected: &AtomicBool,
 ) -> Result<()> {
     use termy_terminal_ui::{TmuxClient, TmuxNotification, TmuxSocketTarget};
 
@@ -923,6 +1062,8 @@ async fn run_legacy_terminal(
 
     info!("tmux control mode connected");
     let _ = ch.connection_status_tx.send(ConnectionStatus::Connected);
+    // See `run_daemon_terminal`: resets the reconnect engine's retry schedule.
+    connected.store(true, Ordering::Relaxed);
 
     let pane_output_tx = ch.pane_output_tx;
     let input_rx = ch.input_rx;
@@ -1067,9 +1208,12 @@ const DAEMON_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// Upper bound on consecutive daemon reconnect attempts after a mid-session
 /// stream death (#475). With [`rift_ssh::ReconnectBackoff`]'s capped schedule
 /// this covers roughly two minutes of outage before recovery gives up and the
-/// session fails visibly (`Disconnected`) — a daemon that [`reconnect_daemon`]
-/// cannot respawn within that window is a structural failure (SSH transport
-/// dead, binary gone), which the SSH-level reconnect loop (#476) owns.
+/// session fails over to [`run_session_with_reconnect`] — a daemon that
+/// [`reconnect_daemon`] cannot respawn within that window is a structural
+/// failure (SSH transport dead, binary gone), which the SSH-level reconnect
+/// loop (#476) owns. A dead SSH transport short-circuits the window via
+/// `SshConnection::is_closed`, so an SSH drop reaches the SSH-level loop (and
+/// its banner) within the keepalive detection bound (#438), not after it.
 const DAEMON_RECONNECT_MAX_ATTEMPTS: u32 = 10;
 
 /// The resolved remote daemon endpoint [`provision_daemon`] produced:
@@ -1404,10 +1548,10 @@ async fn consume_daemon_messages(
                 info!(%session, ?reason, "daemon terminal path down");
                 if terminal.is_some() {
                     // The tmux attach itself ended (an orderly `%exit`, not a
-                    // transport death): end the session so the app surfaces it
-                    // the same way the legacy `tmux` exit does (Disconnected →
-                    // quit). Never recovered from — recovery is for stream
-                    // deaths only (#475).
+                    // transport death): end the session so it surfaces as the
+                    // visible `Disconnected` state without a reconnect (#476).
+                    // Never recovered from — recovery is for stream deaths
+                    // only (#475).
                     return StreamEnd::TerminalExit;
                 }
             }
@@ -1884,5 +2028,47 @@ fn layout_to_snapshot(
         session_name: session,
         session_id: None,
         windows,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_retryable_session_error;
+
+    #[test]
+    fn test_is_retryable_session_error_transport_chain_returns_true() {
+        let error = anyhow::Error::new(rift_ssh::SshError::Connection(
+            "connection reset by peer".into(),
+        ))
+        .context("SSH connection failed");
+        assert!(is_retryable_session_error(&error));
+    }
+
+    #[test]
+    fn test_is_retryable_session_error_auth_chain_returns_false() {
+        let error = anyhow::Error::new(rift_ssh::SshError::Auth(
+            "public key authentication failed".into(),
+        ))
+        .context("SSH connection failed");
+        assert!(!is_retryable_session_error(&error));
+    }
+
+    #[test]
+    fn test_is_retryable_session_error_plain_message_returns_false() {
+        // A typeless session error (e.g. the mid-session protocol version
+        // mismatch, #475) must not re-enter the pipeline: retrying would
+        // re-run the stale-daemon replacement against a daemon another live
+        // client owns.
+        let error = anyhow::anyhow!("daemon protocol version changed mid-session");
+        assert!(!is_retryable_session_error(&error));
+    }
+
+    #[test]
+    fn test_is_retryable_session_error_nested_transport_chain_returns_true() {
+        // The daemon recovery's give-up carries its last transport error as
+        // the source, so the engine classifies the whole outage as retryable.
+        let error = anyhow::Error::new(rift_ssh::SshError::Channel("channel closed".into()))
+            .context("daemon stream reconnect gave up after 10 attempts");
+        assert!(is_retryable_session_error(&error));
     }
 }
