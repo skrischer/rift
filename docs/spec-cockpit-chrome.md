@@ -25,11 +25,11 @@ running pill — replacing the interim pane sidebar.
       fixed state slot — busy = green 7px dot (+ busy-pane count when > 1),
       attention = 16px danger badge with "!", idle = empty slot; active tab
       merges with the body background; "+" creates a window.
-- [ ] Every terminal pane has a 32px header: prompt glyph, pane command title,
-      cwd (muted), live state pill ("● running" while busy, hidden when free),
-      split + zoom actions — fed by the pane metadata that #442/#469 wired
-      (pane_current_command / pane_current_path) and the existing
-      ActivityTracker state.
+- [ ] Every terminal pane has a 32px header: type glyph, pane command title,
+      cwd (muted), "● running" pill while busy (hidden when free), split-h /
+      split-v / zoom actions — fed by the pane metadata that #442/#469 wired
+      and the existing ActivityTracker state; stacked splits never clip
+      bottom rows (the reported grid subtracts header rows).
 - [ ] The interim 160px pane sidebar is removed (per gate decision) — tabs +
       pane headers carry its information.
 - [ ] All colors/typography via theme tokens (mono for session name, cwd,
@@ -53,18 +53,33 @@ running pill — replacing the interim pane sidebar.
 - `terminal`: window-tab rendering to design anatomy (index caption, type
   glyph, name, fixed 16px state slot, close ×, "+" button); attention becomes
   the 16px danger "!"-badge, busy stays the green dot + count; idle keeps the
-  slot empty (lane alignment). Type glyph derived agent-agnostically from
-  tmux's `pane_current_command` of the window's active pane: default-shell →
-  prompt glyph, anything else → process glyph. No command taxonomy, no agent
-  names.
-- `terminal`: per-pane header (32px): prompt glyph, `pane_current_command`
-  title (mono 13px), cwd muted (mono 12px, home-relative), state pill from
-  `ActivityTracker` (running = success pill; attention = danger pill), right:
-  split-horizontal + zoom icons issuing the existing tmux commands
-  (`split-window`, `resize-pane -Z`).
-- `terminal`: remove the pane sidebar (gate decision) and its width handling;
-  keyboard pane navigation and the pane-select affordances it carried move to
-  the headers/tabs (click header = focus pane).
+  slot empty (lane alignment). Type glyph derived agent-agnostically INSIDE
+  tmux: the layout query gains the format field
+  `#{==:#{pane_current_command},#{b:default-shell}}` (tmux compares the pane
+  command against the basename of its own `default-shell` option) → a boolean
+  `is_shell` per pane; shell → prompt glyph, anything else → process glyph.
+  No client-side command taxonomy, no agent names, no shell list.
+- `protocol`/`daemon` (deliberate, minimal API change): the `is_shell` boolean
+  on the pane layout type + the extra format field in `LAYOUT_QUERY`
+  (crates/daemon/src/terminal.rs:56) — same shape as the #442 pane-metadata
+  addition; documented in docs/protocol.md, tested valid + malformed.
+- `terminal`: per-pane header (32px): type glyph, `pane_current_command`
+  title (mono 13px), cwd muted (mono 12px, home-relative), "● running" pill
+  from `ActivityTracker` while busy — hidden when free (attention never
+  renders here: under the #428 gating a VISIBLE pane's window is active, so
+  pane-level attention is unreachable by design); right: split-horizontal,
+  split-vertical, and zoom icons sent over the existing tmux-command channel
+  (`split-window -h`/`-v` as the sidebar does today; `resize-pane -Z` is a
+  new command through the same send mechanism). Click on the header focuses
+  the pane (replacing the sidebar's mouse pane-select).
+- `terminal`: header height vs the #424 grid invariant — the pane area's
+  reported tmux client size subtracts the header rows: reported rows =
+  floor((panel_px_height − max_vertical_pane_count × 32px) / cell_height),
+  where max_vertical_pane_count derives from the current layout tree;
+  re-reported on every layout change through the existing resize path. No
+  pane may clip its bottom rows.
+- `terminal`: remove the pane sidebar (gate decision — see Prior decisions
+  for the full affordance delta) and its width handling.
 
 ### Out of scope
 
@@ -99,8 +114,11 @@ running pill — replacing the interim pane sidebar.
 
 | Decision | Rationale | Date |
 |---|---|---|
-| Build on gpui-component `TitleBar` | Vendored, gallery-proven, handles Windows caption semantics; constitution: don't rebuild primitives | 2026-07-05 |
-| Type glyph = default-shell vs other, from `pane_current_command` | The design shows per-window glyphs; a shell/non-shell split is the largest agent-agnostic distinction available from pure tmux metadata (no taxonomy, no agent detection). #442/#469 already deliver the field | 2026-07-05 |
+| Build on gpui-component `TitleBar` | Handles Windows caption semantics (WindowControlArea) at the pinned rev, proven by upstream's story crate; constitution: don't rebuild primitives. Its default 34px height is styled to the design's 38px via its `Styled` impl — never fork the widget | 2026-07-05 |
+| Type glyph = tmux-evaluated `is_shell` bool (`#{==:#{pane_current_command},#{b:default-shell}}`) | The design shows per-window glyphs; letting tmux compare against its own `default-shell` keeps the client free of any command taxonomy or shell list (agent-agnostic); minimal protocol field, same shape as #442 | 2026-07-05 |
+| Pane headers reserve their height from the reported tmux grid (rows shrink by max vertical pane count × header height) | One tmux client size serves all panes (#424 invariant); overlaying would hide content, and per-pane sizes are tmux-owned — shrinking the reported grid is the only lossless reconciliation | 2026-07-05 |
+| Custom title bar renders in BOTH app states — cockpit and the phase-20 Connection screen ("not connected" group per the design) | One chrome; the design's startup artboard shows the same bar with a muted state | 2026-07-05 |
+| Sidebar removal delta (gate-ratified): mouse pane-select → header click; split -h/-v → header buttons; per-pane kill "×" → dropped (covered by mirrored tmux prefix bindings + process exit) | The design has no sidebar and no kill affordance; keeping a redundant kill button contradicts design parity — the tmux keytable mirror already carries kill-pane for keyboard users | 2026-07-05 |
 | Attention rendering becomes the 16px danger "!"-badge (replacing the peach dot) | Wave-1 confirmed the hue-only dot is indistinguishable from busy at a glance; the design specifies two distinct shapes/sizes | 2026-07-05 |
 | Omit the search rail icon | The design shows it, but v1 has no search panel — a dead control violates the polish bar; the rail gains it with the future search phase | 2026-07-05 |
 | Session switcher anchor relocates into the title-bar connection group | The interim statusbar anchor was explicitly a phase-19 placement decision pending this phase | 2026-07-05 |
@@ -133,7 +151,15 @@ None.
 - [ ] Rail badges update live (stage a file → SCM count changes; introduce an
       error → diagnostics dot turns danger) without any refresh
 - [ ] Session switcher opens from the title-bar group (phase-19 behavior
-      preserved after relocation)
+      preserved after relocation; the relocation issue carries a
+      `Depends on:` edge to phase-19's #466)
+- [ ] Type glyph: a pane idling at the shell shows the prompt glyph; running
+      any long-lived process flips it to the process glyph on the next layout
+      refresh (agent-agnostic — verified with two different processes)
+- [ ] Stacked vertical splits show full content — no bottom-row clipping
+      (grid subtraction verified with 2- and 3-pane stacks)
+- [ ] Tab indices agree with Alt+1..9 ordering at the QA gate (#495 tracks
+      making them real tmux indices in daemon mode)
 - [ ] No hardcoded hex in the new/touched rendering code (grep-verified)
 
 ## Risks and mitigations
@@ -149,3 +175,14 @@ None.
 - 2026-07-05: Spec drafted from the wave-1 design-gap analysis (title bar /
   rail / tab anatomy / pane header gaps all CONFIRMED) on top of the shipped
   papercuts (#428 bell gating, #442/#469 pane metadata, #424 client sizing).
+- 2026-07-05: Fresh-context review (PR #503): four blocking findings baked
+  in — (B1) type glyph gets a real data source via a tmux-evaluated
+  `is_shell` format comparison (small deliberate protocol field); (B2) the
+  pane-header attention pill was unreachable under #428 gating and is
+  dropped (running-only pill); (B3) the sidebar-removal delta is spelled out
+  (kill-pane "×" is consciously dropped — prefix bindings cover it) and
+  ratified as a Prior-decisions row; (B4) header height reconciles with the
+  #424 grid invariant by subtracting header rows from the reported client
+  size. Non-blocking adoptions: #466 dependency edge, title bar on the
+  Connection screen, TitleBar height styling note, resize-pane -Z wording,
+  #495 index note, glyph + clipping verification bullets.
