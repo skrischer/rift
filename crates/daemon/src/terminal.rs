@@ -45,11 +45,15 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const RESUME_POLL: Duration = Duration::from_millis(100);
 
 /// One query that rebuilds the entire session layout. `-s` covers every window;
-/// the format is one line per pane with the window fields repeated. `window_name`
-/// is last so a name containing spaces stays in the final field (see
+/// the format is one line per pane with the window fields repeated. Fields are
+/// tab-separated because both `pane_current_path` and `window_name` may contain
+/// spaces — with tabs each stays a single field (a literal tab inside a quoted
+/// tmux argument is preserved, and tmux octal-escapes it in the reply, which the
+/// control-mode [`Client`] decodes back; tmux-reference pitfall 8). `window_name`
+/// is last so a name containing tabs stays in the final field (see
 /// [`parse_layout_line`]). The `#{...}` formats are single-quoted because the
 /// control parser treats an unquoted `#` as a comment (tmux-reference pitfall 9).
-const LAYOUT_QUERY: &str = "list-panes -s -F '#{window_id} #{window_active} #{pane_id} #{pane_active} #{pane_left} #{pane_top} #{pane_width} #{pane_height} #{window_name}'";
+const LAYOUT_QUERY: &str = "list-panes -s -F '#{window_id}\t#{window_active}\t#{pane_id}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_current_command}\t#{pane_current_path}\t#{window_name}'";
 
 /// Signals that the connection's outbound channel closed — the client is gone.
 struct Closed;
@@ -841,10 +845,12 @@ struct ParsedPaneLine {
     pane: PaneLayout,
 }
 
-/// Parse one `@<win> <win_active> %<pane> <pane_active> <left> <top> <width>
-/// <height> <name>` line; `splitn(9, ' ')` keeps a spaced window name intact.
+/// Parse one tab-separated `@<win> <win_active> %<pane> <pane_active> <left>
+/// <top> <width> <height> <command> <path> <name>` line (see [`LAYOUT_QUERY`]
+/// for why tabs); `splitn(11, '\t')` keeps a window name containing tabs
+/// intact in the final field.
 fn parse_layout_line(line: &str) -> Option<ParsedPaneLine> {
-    let mut fields = line.splitn(9, ' ');
+    let mut fields = line.splitn(11, '\t');
     let window_id = fields.next()?.strip_prefix('@')?.parse().ok()?;
     let window_active = fields.next()? == "1";
     let pane_id = fields.next()?.strip_prefix('%')?.parse().ok()?;
@@ -853,6 +859,8 @@ fn parse_layout_line(line: &str) -> Option<ParsedPaneLine> {
     let top = fields.next()?.parse().ok()?;
     let width = fields.next()?.parse().ok()?;
     let height = fields.next()?.parse().ok()?;
+    let current_command = fields.next()?.to_owned();
+    let current_path = fields.next()?.to_owned();
     let window_name = fields.next().unwrap_or("").to_owned();
     Some(ParsedPaneLine {
         window_id,
@@ -865,6 +873,8 @@ fn parse_layout_line(line: &str) -> Option<ParsedPaneLine> {
             top,
             width,
             height,
+            current_path,
+            current_command,
         },
     })
 }
@@ -890,7 +900,8 @@ mod tests {
 
     #[test]
     fn test_parse_layout_line_full_fields() {
-        let parsed = parse_layout_line("@0 1 %1 1 51 0 49 30 bash").expect("parse");
+        let parsed = parse_layout_line("@0\t1\t%1\t1\t51\t0\t49\t30\tnvim\t/home/dev/proj\tbash")
+            .expect("parse");
         assert_eq!(parsed.window_id, 0);
         assert!(parsed.window_active);
         assert_eq!(parsed.window_name, "bash");
@@ -903,37 +914,62 @@ mod tests {
                 top: 0,
                 width: 49,
                 height: 30,
+                current_path: "/home/dev/proj".to_owned(),
+                current_command: "nvim".to_owned(),
             }
         );
     }
 
     #[test]
-    fn test_parse_layout_line_window_name_with_spaces_is_preserved() {
-        let parsed = parse_layout_line("@2 0 %5 0 0 0 80 24 my project").expect("parse");
+    fn test_parse_layout_line_spaced_path_and_window_name_are_preserved() {
+        // Both the cwd and the window name may contain spaces; the tab
+        // separator keeps each a single field.
+        let parsed =
+            parse_layout_line("@2\t0\t%5\t0\t0\t0\t80\t24\tbash\t/home/dev/my repo\tmy project")
+                .expect("parse");
         assert_eq!(parsed.window_name, "my project");
+        assert_eq!(parsed.pane.current_path, "/home/dev/my repo");
+        assert_eq!(parsed.pane.current_command, "bash");
         assert!(!parsed.window_active);
         assert!(!parsed.pane.active);
     }
 
     #[test]
+    fn test_parse_layout_line_empty_meta_fields_parse_as_empty() {
+        // tmux emits an empty field (two adjacent tabs) when a format
+        // variable has no value; that must parse, not skip the pane.
+        let parsed = parse_layout_line("@0\t1\t%1\t1\t0\t0\t80\t24\t\t\tbash").expect("parse");
+        assert_eq!(parsed.pane.current_command, "");
+        assert_eq!(parsed.pane.current_path, "");
+        assert_eq!(parsed.window_name, "bash");
+    }
+
+    #[test]
     fn test_parse_layout_line_malformed_returns_none() {
         assert_eq!(
-            parse_layout_line("0 1 %1 1 0 0 80 24 bash").map(|_| ()),
+            parse_layout_line("0\t1\t%1\t1\t0\t0\t80\t24\tbash\t/tmp\tbash").map(|_| ()),
             None
         ); // window id no @
         assert_eq!(
-            parse_layout_line("@0 1 1 1 0 0 80 24 bash").map(|_| ()),
+            parse_layout_line("@0\t1\t1\t1\t0\t0\t80\t24\tbash\t/tmp\tbash").map(|_| ()),
             None
         ); // pane id no %
-        assert_eq!(parse_layout_line("@0 1 %1 1 0 0 80").map(|_| ()), None); // too few fields
+        assert_eq!(
+            parse_layout_line("@0\t1\t%1\t1\t0\t0\t80").map(|_| ()),
+            None
+        ); // too few fields
+        assert_eq!(
+            parse_layout_line("@0 1 %1 1 0 0 80 24 bash").map(|_| ()),
+            None
+        ); // pre-#442 space-separated line
     }
 
     #[test]
     fn test_parse_layout_groups_panes_by_window_in_order() {
         let lines = vec![
-            "@0 1 %0 0 0 0 50 30 editor".to_owned(),
-            "@0 1 %1 1 51 0 49 30 editor".to_owned(),
-            "@1 0 %2 1 0 0 100 30 logs".to_owned(),
+            "@0\t1\t%0\t0\t0\t0\t50\t30\tbash\t/tmp\teditor".to_owned(),
+            "@0\t1\t%1\t1\t51\t0\t49\t30\tbash\t/tmp\teditor".to_owned(),
+            "@1\t0\t%2\t1\t0\t0\t100\t30\tbash\t/tmp\tlogs".to_owned(),
         ];
         let windows = parse_layout(&lines);
         assert_eq!(windows.len(), 2);
@@ -954,7 +990,7 @@ mod tests {
     fn test_parse_layout_skips_malformed_lines() {
         let lines = vec![
             "garbage line".to_owned(),
-            "@0 1 %0 1 0 0 80 24 bash".to_owned(),
+            "@0\t1\t%0\t1\t0\t0\t80\t24\tbash\t/tmp\tbash".to_owned(),
         ];
         let windows = parse_layout(&lines);
         assert_eq!(windows.len(), 1);
@@ -1103,6 +1139,18 @@ mod tests {
         let windows = snapshot_windows.expect("snapshot present");
         assert!(!windows.is_empty(), "snapshot has a window");
         assert!(!windows[0].panes.is_empty(), "window has a pane");
+        // The pane metadata added in #442: a fresh pane runs the shell in the
+        // directory the session was created from, so both fields are live.
+        let pane = &windows[0].panes[0];
+        assert!(
+            pane.current_path.starts_with('/'),
+            "pane cwd must be an absolute path: {:?}",
+            pane.current_path
+        );
+        assert!(
+            !pane.current_command.is_empty(),
+            "pane current command must name the running shell"
+        );
 
         drop(in_tx);
         let _ = task.await;
