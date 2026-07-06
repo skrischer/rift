@@ -43,9 +43,36 @@ truth, milestones and issues are created on GitHub from them.
 - Build: `just build` (workspace excluding `rift-app`); the GPUI app itself is
   compiled by the CI `app-check` job on every PR.
 
-Verify is the per-iteration gate: run it after every change set and fix until
-green. Acceptance items no machine check covers are verified at the human
-milestone-QA gate.
+Verify is the per-iteration gate for solo/interactive work in a warm checkout.
+In multi-agent runs it is bounded by the RAM budget below. Acceptance items no
+machine check covers are verified at the human milestone-QA gate.
+
+## Local build discipline (host RAM budget)
+
+The dev host is shared (WSL): the developer's editors, language servers, and
+other project services already hold most of RAM, leaving ~1-2 GB free. cargo
+defaults to one job per core (here -j20), so a *cold* `just ci` in a fresh
+worktree is a full-workspace build spawning up to 20 rustc at once — several GB
+on its own. Several agents each doing that concurrently exhausts host RAM and
+wedges WSL. Measured for contrast: a *warm* single-crate rebuild is ~100-300 MB.
+
+Rules:
+- **Full builds run in CI, not locally.** In a multi-agent run, implementation
+  agents do NOT run `just ci` or any cold full-workspace build in their fresh
+  worktree. They implement, commit, push, and open the PR; the CI checks
+  (`Check`, `app-check`) are the verification gate — and also the merge gate, so
+  nothing unverified merges.
+- **Local runs are only small and warm.** A single targeted test against an
+  already-warm target (`cargo test -p <crate> <test>`) recompiles just the
+  changed crate — fine in the main checkout. Never a cold workspace build in a
+  worktree.
+- **No per-worktree job cap.** Once agents don't build locally there is no local
+  build to cap; the CI-only rule already prevents the RAM spike.
+- **Cap concurrent agents to free RAM** (~2 at the default baseline; more once
+  heavy host services — spare DBs, a second language-server instance — are
+  stopped).
+- Solo/interactive work in a warm checkout may still use `just ci` (incremental,
+  ~30 s); the restriction targets cold builds fanned out across agents.
 
 ## Branch and spec naming
 
