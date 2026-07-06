@@ -508,13 +508,13 @@ impl SessionView {
             .detach();
         }
 
-        let ssh_user = std::env::var("RIFT_SSH_USER").unwrap_or_default();
-        let ssh_host = std::env::var("RIFT_SSH_HOST").unwrap_or_else(|_| "localhost".into());
-        let ssh_label: SharedString = if ssh_user.is_empty() {
-            ssh_host.into()
-        } else {
-            format!("{}@{}", ssh_user, ssh_host).into()
-        };
+        // Placeholder until the caller feeds the resolved host/user of the
+        // actual connection via `set_ssh_label` (#494) — this view has no
+        // connection of its own to resolve a default from, so it must not
+        // guess one independently (that guess previously diverged from the
+        // real `SshConfig` the app connects with: `localhost` vs
+        // `127.0.0.1`, missing user vs `developer`).
+        let ssh_label: SharedString = SharedString::default();
 
         let view = Self {
             panes: HashMap::new(),
@@ -592,6 +592,14 @@ impl SessionView {
     pub fn set_font_size(&mut self, size: Pixels, cx: &mut Context<Self>) {
         let clamped = px(f32::from(size).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE));
         self.apply_font_size(clamped, cx);
+    }
+
+    /// Feed the statusbar host label from the resolved host/user the caller
+    /// actually connects with, so it can never diverge from the real
+    /// connection (#494). The label is display-only: callers format it
+    /// (typically `user@host`), this just stores it.
+    pub fn set_ssh_label(&mut self, label: impl Into<SharedString>) {
+        self.ssh_label = label.into();
     }
 
     /// Apply an absolute font size, notifying every live pane and arming the
@@ -2503,6 +2511,38 @@ mod tests {
                 session.set_font_size(px(MAX_FONT_SIZE + 5.0), cx);
             });
             assert_eq!(session.read(cx).font_size(), px(MAX_FONT_SIZE));
+        });
+    }
+
+    /// Before the caller feeds a real connection's host/user, the label is
+    /// empty rather than guessed — the guessed default (env-var resolution)
+    /// is exactly what caused it to diverge from the actual connection
+    /// (#494).
+    #[gpui::test]
+    fn test_ssh_label_defaults_to_empty_until_the_caller_sets_it(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let session = cx.new(|cx| SessionView::new(cx).0);
+            assert_eq!(session.read(cx).ssh_label, SharedString::default());
+        });
+    }
+
+    /// `set_ssh_label` is the single seam through which the statusbar label
+    /// is fed — the caller passes the already-resolved host/user of the
+    /// connection it actually establishes, so the label can never diverge
+    /// from it (#494).
+    #[gpui::test]
+    fn test_set_ssh_label_stores_the_given_label(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let session = cx.new(|cx| SessionView::new(cx).0);
+
+            session.update(cx, |session, _cx| {
+                session.set_ssh_label("developer@100.64.0.1");
+            });
+
+            assert_eq!(
+                session.read(cx).ssh_label,
+                SharedString::from("developer@100.64.0.1")
+            );
         });
     }
 }
