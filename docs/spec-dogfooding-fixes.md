@@ -179,3 +179,11 @@ includes:
   `\x1b\x7f` shares the alphanumeric word boundary of the already-working Ctrl+Left/Right
   (`\x1b[1;5D`) and is the sequence Alt+Backspace already emits, so `cd /pfad/zu` loses
   one path segment per press rather than the whole path. Plain Backspace stays `0x7f`.
+- 2026-07-06: **daemon watches $HOME with no `--root`** resolved (#502, PR #557).
+  Category 2 (defect in an existing path). Without `--root`, `watched_root` fell back to
+  `std::env::current_dir()` — over SSH the launch directory is the login shell's `$HOME`,
+  so an unconfigured daemon silently scanned the whole home directory instead of the
+  intended project. Decision: remove the fallback; `watched_root` now errors with a
+  clear message when the flag is absent, since every sanctioned launch path
+  (`crates/ssh/src/launch.rs` via `RIFT_PROJECT_ROOT`, the justfile's default) already
+  resolves and passes an explicit root.
