@@ -244,3 +244,41 @@ into scope, uses a key the developer already owns; nothing to deliver.)
   fresh tmux child spawns unsized and the render layer only re-sends on a
   size change, so without it the terminal would stay reflowed to the 80x24
   default until a manual resize.
+- 2026-07-05 (#476): The SSH-level engine classifies failures by allowlist:
+  only an error chain carrying a retryable `SshError` (transport-shaped)
+  re-enters the loop; auth/key/host-key failures and typeless session errors
+  — notably the mid-session protocol mismatch, whose automatic re-run would
+  re-enter the replacement tug-of-war #475 cut off — end in the visible
+  `Disconnected` state. An orderly tmux exit (`TerminalExit`) also ends
+  without retrying: the session is gone on purpose, not lost. The daemon
+  recovery's give-up carries its last transport error in the chain so the
+  engine can classify it.
+- 2026-07-05 (#476): Each connect attempt runs on a fresh tokio runtime —
+  dropping it cancels the dead session's bridge tasks, which would otherwise
+  compete with the fresh session's bridges for the shared flume receivers
+  (MPMC). The daemon recovery aborts early when the SSH transport is closed
+  (`SshConnection::is_closed`), handing an SSH drop to the SSH-level loop
+  (and its banner) within the keepalive detection bound instead of burning
+  its ~2-minute attempt window first.
+- 2026-07-05 (#476): The danger banner renders across the top of the
+  terminal panel (`SessionView`), where the connection state, `user@host`
+  label, and the Cancel channel already live; the status dot colors moved to
+  theme tokens (connected = success, connecting/reconnecting = warning, not
+  connected = muted). Until the Connection screen (#477) lands, a canceled
+  reconnect, an orderly exit, and non-retryable failures all surface as the
+  muted `disconnected` statusbar state; the legacy tmux escape hatch keeps
+  its pre-existing behavior (no reconnect loop) pending its removal (#285).
+- 2026-07-05 (#476, review): The engine drops the render-side backlog
+  immediately before every connect attempt — its per-attempt runtime drop
+  cancels the dead session's bridge consumers, so the shared flume queues
+  would otherwise buffer the whole outage and replay it into the fresh attach
+  (stale keystrokes, pane commands, editor requests landing minutes later),
+  violating the no-buffering constraint. The resync replaces the dropped
+  state; the one latest-value signal kept is the client grid, folded into an
+  engine-scope viewport watch that every fresh attach re-asserts (the render
+  layer only re-sends on a size change, which a reconnect is not).
+  Current-session tracking likewise moved to engine scope, for the same
+  reason the daemon recovery already tracks it (post-#509 decision above):
+  the watch is seeded from `RIFT_SESSION` once and updated by the switch
+  bridge across attempts, so an SSH-level reconnect re-attaches the session
+  the user is actually on, never silently the startup one.

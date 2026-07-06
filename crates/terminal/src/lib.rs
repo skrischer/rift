@@ -114,15 +114,26 @@ pub struct SubscriptionUpdate {
 }
 
 /// The SSH/tmux session lifecycle state, surfaced by the statusbar connection
-/// indicator. Driven by the SSH session thread (not polled): `Connected` once
-/// tmux control mode is up, `Reconnecting` while the daemon-stream recovery
-/// engine re-establishes a died daemon channel (issue #475,
-/// `docs/spec-connection-robustness.md`), `Disconnected` when the session ends.
+/// indicator (dot colors per the design contract: connected = success,
+/// reconnecting = warning, not connected = muted). Driven by the SSH session
+/// thread (not polled) — see `docs/spec-connection-robustness.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectionStatus {
     Connecting,
     Connected,
+    /// Mid-session daemon-stream recovery while SSH itself is up (#475):
+    /// renders the warning dot only, no banner.
     Reconnecting,
+    /// The SSH-level reconnect loop (#476): SSH itself dropped and the engine
+    /// retries forever under jittered capped backoff. Renders the warning dot
+    /// plus the danger banner carrying this 1-based retry counter and the
+    /// Cancel action.
+    SshReconnecting {
+        retry: u32,
+    },
+    /// A visible not-connected end state (orderly tmux exit, canceled
+    /// reconnect, or a non-retryable auth/config failure) — never an app
+    /// quit. The Connection screen (#477) will own this state once it lands.
     Disconnected,
 }
 
