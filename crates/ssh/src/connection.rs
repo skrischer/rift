@@ -30,6 +30,24 @@ fn client_config() -> Config {
     }
 }
 
+/// Whether the private key at `path` is passphrase-protected (issue #478,
+/// `docs/spec-connection-robustness.md`): attempts to load it with no
+/// password and reports `Ok(true)` only for the specific "needs a password"
+/// failure (`russh_keys::Error::KeyIsEncrypted`), never for a missing file,
+/// an unsupported format, or a corrupt key — those surface as `Err` so the
+/// real connect attempt reports them properly instead of this probe
+/// misreporting them as "show the passphrase field". A cheap, synchronous
+/// parse (no KDF/decrypt runs when no password is supplied), safe to call
+/// from a UI thread the same way [`Path::exists`] already is at the connect
+/// call site.
+pub fn key_requires_passphrase(path: &Path) -> Result<bool, SshError> {
+    match russh_keys::load_secret_key(path, None) {
+        Ok(_) => Ok(false),
+        Err(russh_keys::Error::KeyIsEncrypted) => Ok(true),
+        Err(e) => Err(SshError::from(e)),
+    }
+}
+
 pub struct SshConnection {
     handle: Handle<ClientHandler>,
 }
@@ -40,6 +58,7 @@ impl SshConnection {
         port: u16,
         user: &str,
         key_path: &Path,
+        passphrase: Option<&str>,
     ) -> Result<Self, SshError> {
         let key_exists = key_path.exists();
         debug!(
@@ -48,10 +67,12 @@ impl SshConnection {
             "loading SSH key"
         );
         let path = key_path.to_path_buf();
-        let key_pair =
-            tokio::task::spawn_blocking(move || russh_keys::load_secret_key(&path, None))
-                .await
-                .map_err(|e| SshError::Key(e.to_string()))??;
+        let passphrase = passphrase.map(str::to_owned);
+        let key_pair = tokio::task::spawn_blocking(move || {
+            russh_keys::load_secret_key(&path, passphrase.as_deref())
+        })
+        .await
+        .map_err(|e| SshError::Key(e.to_string()))??;
 
         let config = Arc::new(client_config());
         let handler = ClientHandler {
@@ -333,5 +354,69 @@ mod tests {
         // russh treats `keepalive_max == 0` as "never give up"; the whole point
         // of this config is a bounded detection window, so guard against it.
         assert!(client_config().keepalive_max > 0);
+    }
+
+    // ── key_requires_passphrase ──────────────────────────────────────────
+    //
+    // Fixtures below are real `ssh-keygen -t ed25519` output (no live secret,
+    // just a throwaway keypair generated for this test), exercising the exact
+    // OpenSSH-format encrypted/plain shapes a developer's real `~/.ssh` key
+    // would have — the same format russh_keys' own `KeyIsEncrypted` path
+    // targets (`format/openssh.rs`).
+
+    const PLAIN_ED25519_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACDD+Spx6Grs23TtvNlnEgT2ZvRWq6IGz3+w318y0vAe5wAAAIioE9c+qBPX
+PgAAAAtzc2gtZWQyNTUxOQAAACDD+Spx6Grs23TtvNlnEgT2ZvRWq6IGz3+w318y0vAe5w
+AAAECfLgpKaZM2WCQOK+K561MNE0reaXGkQxF+LfZm9eJrbsP5KnHoauzbdO282WcSBPZm
+9FarogbPf7DfXzLS8B7nAAAAAAECAwQF
+-----END OPENSSH PRIVATE KEY-----
+";
+
+    const ENCRYPTED_ED25519_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABA1nA1UjL
+/BxU/vOLR2n8WtAAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIBTskMRnp64+FGOU
+vHVkvR7+pmsv8ayZd9OzYo32D1vrAAAAkDJbty+E0n7yTQ5NEBbe2SIW0Izkk7aMc9mYgh
+idatDXrAohqSsRJREqRkTEJJWxObn3AO1WA8j+KwIbI4842uVHjzmeXiT2F4c2RPcpEiVL
+hTyMJu70Hu4ysIYhC+jhtY6kDNquv0P5q5/z0sy+DMB6tQl9uxrjc6HAD3n1ZiYVA8xSGa
+2AAbPYqAztDXtY1w==
+-----END OPENSSH PRIVATE KEY-----
+";
+
+    fn write_fixture(dir: &tempfile::TempDir, name: &str, contents: &str) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        std::fs::write(&path, contents).expect("failed to write key fixture");
+        path
+    }
+
+    #[test]
+    fn test_key_requires_passphrase_plain_key_returns_false() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = write_fixture(&dir, "id_ed25519", PLAIN_ED25519_KEY);
+
+        assert!(!key_requires_passphrase(&path).expect("plain key should load"));
+    }
+
+    #[test]
+    fn test_key_requires_passphrase_encrypted_key_returns_true() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = write_fixture(&dir, "id_ed25519_enc", ENCRYPTED_ED25519_KEY);
+
+        assert!(key_requires_passphrase(&path).expect("encrypted key should probe cleanly"));
+    }
+
+    #[test]
+    fn test_key_requires_passphrase_malformed_key_returns_err() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = write_fixture(&dir, "garbage", "not a key\n");
+
+        assert!(key_requires_passphrase(&path).is_err());
+    }
+
+    #[test]
+    fn test_key_requires_passphrase_missing_file_returns_err() {
+        let path = std::path::Path::new("/nonexistent/rift-test-key");
+
+        assert!(key_requires_passphrase(path).is_err());
     }
 }

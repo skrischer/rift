@@ -6,6 +6,8 @@ pub enum SshError {
     Auth(String),
     #[error("key loading failed: {0}")]
     Key(String),
+    #[error("SSH key is passphrase-protected; enter the passphrase to continue")]
+    KeyEncrypted,
     #[error("channel error: {0}")]
     Channel(String),
     #[error("pty error: {0}")]
@@ -51,6 +53,7 @@ impl SshError {
             self,
             SshError::Auth(_)
                 | SshError::Key(_)
+                | SshError::KeyEncrypted
                 | SshError::HostKeyMismatch { .. }
                 | SshError::KnownHosts(_)
         )
@@ -65,7 +68,15 @@ impl From<russh::Error> for SshError {
 
 impl From<russh_keys::Error> for SshError {
     fn from(e: russh_keys::Error) -> Self {
-        SshError::Key(e.to_string())
+        match e {
+            // The one case with a dedicated variant: an encrypted key loaded
+            // with no password (issue #478) — distinguished from every other
+            // key failure (wrong passphrase, corrupt key, unsupported type)
+            // so the Connection screen can prompt for a passphrase instead of
+            // showing a generic failure.
+            russh_keys::Error::KeyIsEncrypted => SshError::KeyEncrypted,
+            other => SshError::Key(other.to_string()),
+        }
     }
 }
 
@@ -86,11 +97,28 @@ mod tests {
     fn test_is_retryable_auth_and_config_failures_return_false() {
         assert!(!SshError::Auth("public key authentication failed".into()).is_retryable());
         assert!(!SshError::Key("bad passphrase".into()).is_retryable());
+        assert!(!SshError::KeyEncrypted.is_retryable());
         assert!(!SshError::HostKeyMismatch {
             host: "vps".into(),
             line: 3,
         }
         .is_retryable());
         assert!(!SshError::KnownHosts("unreadable known_hosts".into()).is_retryable());
+    }
+
+    #[test]
+    fn test_from_russh_keys_error_key_is_encrypted_maps_to_dedicated_variant() {
+        assert!(matches!(
+            SshError::from(russh_keys::Error::KeyIsEncrypted),
+            SshError::KeyEncrypted
+        ));
+    }
+
+    #[test]
+    fn test_from_russh_keys_error_other_failure_maps_to_key_variant() {
+        assert!(matches!(
+            SshError::from(russh_keys::Error::KeyIsCorrupt),
+            SshError::Key(_)
+        ));
     }
 }

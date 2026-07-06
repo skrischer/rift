@@ -7,13 +7,20 @@
 //! deliberately not implemented (gate decision in the spec): the user always
 //! takes the explicit Connect step, even when every field is already correct.
 //!
+//! Issue #478 adds passphrase-protected key support: a probe
+//! ([`rift_ssh::key_requires_passphrase`]) reacts to the SSH key field and
+//! shows a masked Passphrase row only while the current path is detected as
+//! encrypted; the value is carried on [`ConnectRequest`] but never persisted
+//! (excluded from [`crate::recents::RecentConnection`]) and never logged
+//! ([`ConnectRequest`]'s `Debug` impl redacts it below).
+//!
 //! This module is deliberately GPUI-view-only: it emits [`ConnectionScreenEvent`]
 //! and never touches SSH, threads, or the recents *file* directly — `main.rs`
 //! owns the connect pipeline and the recents read/write, mirroring how
 //! `rift_terminal::SessionView` only emits terminal input and never touches
 //! the SSH connection itself.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -134,13 +141,36 @@ pub fn live_defaults() -> ConnectDefaults {
 
 /// A submitted connect attempt: the Connect button, Enter in any field, or a
 /// RECENT row click, all resolve to one of these.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Debug` is hand-written rather than derived: `passphrase` must never reach
+/// a log line (constitution: no secrets in logs), so a future `debug!(?request)`
+/// prints `Some("<redacted>")` instead of the plaintext value.
+#[derive(Clone, PartialEq)]
 pub struct ConnectRequest {
     pub host: String,
     pub user: String,
     pub port: u16,
     pub key: PathBuf,
     pub session: String,
+    /// The passphrase entered for an encrypted SSH key (#478); `None` for a
+    /// plain key. Never persisted to the recents store and never logged.
+    pub passphrase: Option<String>,
+}
+
+impl std::fmt::Debug for ConnectRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectRequest")
+            .field("host", &self.host)
+            .field("user", &self.user)
+            .field("port", &self.port)
+            .field("key", &self.key)
+            .field("session", &self.session)
+            .field(
+                "passphrase",
+                &self.passphrase.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// Emitted by [`ConnectionScreen`]; `main.rs`'s Shell subscribes and drives
@@ -151,18 +181,54 @@ pub enum ConnectionScreenEvent {
 
 impl EventEmitter<ConnectionScreenEvent> for ConnectionScreen {}
 
-/// The Connection screen view: the connect card's five inputs, the RECENT
-/// list it was constructed with, and an optional error surfaced from a
-/// previous connect attempt (field/banner, never log-only —
+/// A connect failure surfaced by the Shell (`main.rs`) after a non-retryable
+/// connect attempt ends, and internally by [`ConnectionScreen::build_request`]'s
+/// field validation — both funnel through the same shape so the screen has
+/// one place that decides where an error renders:
+/// [`ConnectError::General`] on the card's bottom banner,
+/// [`ConnectError::Passphrase`] at the passphrase field (and forces its row
+/// visible even if the encrypted-key probe had not already shown it) — a
+/// wrong or missing passphrase points at the field to fix (#478,
 /// `docs/spec-connection-robustness.md`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConnectError {
+    General(String),
+    Passphrase(String),
+}
+
+/// Whether the SSH key at `path` is passphrase-protected — decides whether
+/// the passphrase row renders (design contract: "SSH key (+ passphrase row
+/// when the key is encrypted)"). Any probe failure (missing file, unreadable,
+/// unsupported format) is treated as "not encrypted" here: this probe only
+/// decides the row's visibility, and the real connect attempt surfaces those
+/// failures properly (general banner) instead of this best-effort UX hint
+/// misreporting them as a passphrase problem.
+fn key_needs_passphrase(path: &Path) -> bool {
+    rift_ssh::key_requires_passphrase(path).unwrap_or(false)
+}
+
+/// The Connection screen view: the connect card's six inputs (the passphrase
+/// row renders only while `key_encrypted`), the RECENT list it was
+/// constructed with, and the two error slots a previous connect attempt (or
+/// this screen's own field validation) may have set — never both at once
+/// (`docs/spec-connection-robustness.md`).
 pub struct ConnectionScreen {
     host_input: Entity<InputState>,
     user_input: Entity<InputState>,
     port_input: Entity<InputState>,
     key_input: Entity<InputState>,
+    passphrase_input: Entity<InputState>,
     session_input: Entity<InputState>,
     recents: Vec<RecentConnection>,
+    /// The card's bottom banner (host/user/port/key validation, or a general
+    /// connect failure).
     error: Option<String>,
+    /// Rendered at the passphrase field instead of the bottom banner (a
+    /// missing or wrong passphrase — #478).
+    passphrase_error: Option<String>,
+    /// Whether the SSH key field's current path is detected as encrypted;
+    /// gates the passphrase row's visibility.
+    key_encrypted: bool,
 }
 
 impl ConnectionScreen {
@@ -173,7 +239,7 @@ impl ConnectionScreen {
     pub fn new(
         defaults: &ConnectDefaults,
         recents: Vec<RecentConnection>,
-        error: Option<String>,
+        error: Option<ConnectError>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -186,6 +252,7 @@ impl ConnectionScreen {
         let key_input = cx.new(|cx| {
             InputState::new(window, cx).default_value(defaults.key.display().to_string())
         });
+        let passphrase_input = cx.new(|cx| InputState::new(window, cx).masked(true));
         let session_input =
             cx.new(|cx| InputState::new(window, cx).default_value(defaults.session.clone()));
 
@@ -196,6 +263,7 @@ impl ConnectionScreen {
             &user_input,
             &port_input,
             &key_input,
+            &passphrase_input,
             &session_input,
         ] {
             cx.subscribe_in(
@@ -210,14 +278,51 @@ impl ConnectionScreen {
             .detach();
         }
 
+        // The passphrase row's visibility reacts live to the SSH key field —
+        // typing/pasting a different path re-probes it, independent of the
+        // Enter-submits subscription above (which only reacts to
+        // `PressEnter`).
+        cx.subscribe_in(
+            &key_input,
+            window,
+            |this, _input, event: &InputEvent, _window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.refresh_key_encrypted(cx);
+                }
+            },
+        )
+        .detach();
+
+        let (error, passphrase_error, force_encrypted) = match error {
+            Some(ConnectError::General(message)) => (Some(message), None, false),
+            Some(ConnectError::Passphrase(message)) => (None, Some(message), true),
+            None => (None, None, false),
+        };
+        let key_encrypted = force_encrypted || key_needs_passphrase(&defaults.key);
+
         Self {
             host_input,
             user_input,
             port_input,
             key_input,
+            passphrase_input,
             session_input,
             recents,
             error,
+            passphrase_error,
+            key_encrypted,
+        }
+    }
+
+    /// Re-probe the SSH key field's current path and update [`Self::key_encrypted`]
+    /// (only notifying when it actually changes, so an unrelated keystroke in
+    /// an already-settled state does not re-render for nothing).
+    fn refresh_key_encrypted(&mut self, cx: &mut Context<Self>) {
+        let key_text = self.key_input.read(cx).value().trim().to_string();
+        let encrypted = !key_text.is_empty() && key_needs_passphrase(Path::new(&key_text));
+        if encrypted != self.key_encrypted {
+            self.key_encrypted = encrypted;
+            cx.notify();
         }
     }
 
@@ -227,38 +332,61 @@ impl ConnectionScreen {
         match self.build_request(cx) {
             Ok(request) => {
                 self.error = None;
+                self.passphrase_error = None;
                 cx.emit(ConnectionScreenEvent::Connect(request));
                 cx.notify();
             }
-            Err(message) => {
+            Err(ConnectError::General(message)) => {
                 self.error = Some(message);
+                self.passphrase_error = None;
+                cx.notify();
+            }
+            Err(ConnectError::Passphrase(message)) => {
+                self.error = None;
+                self.passphrase_error = Some(message);
                 cx.notify();
             }
         }
     }
 
-    /// Read the five inputs and validate them into a [`ConnectRequest`]. Host
-    /// and User must be non-empty; Port must parse as a `u16`; the SSH key
-    /// path must be non-empty; an empty Session defaults to `"rift"` rather
-    /// than erroring, mirroring the pre-#477 `RIFT_SESSION` fallback.
-    fn build_request(&self, cx: &App) -> Result<ConnectRequest, String> {
+    /// Read the inputs and validate them into a [`ConnectRequest`]. Host and
+    /// User must be non-empty; Port must parse as a `u16`; the SSH key path
+    /// must be non-empty; an empty Session defaults to `"rift"` rather than
+    /// erroring, mirroring the pre-#477 `RIFT_SESSION` fallback. When the key
+    /// is detected as encrypted, the passphrase field must be non-empty too
+    /// (#478) — surfaced via [`ConnectError::Passphrase`] so it renders at
+    /// that field rather than the bottom banner.
+    fn build_request(&self, cx: &App) -> Result<ConnectRequest, ConnectError> {
         let host = self.host_input.read(cx).value().trim().to_string();
         if host.is_empty() {
-            return Err("Host is required.".to_string());
+            return Err(ConnectError::General("Host is required.".to_string()));
         }
         let user = self.user_input.read(cx).value().trim().to_string();
         if user.is_empty() {
-            return Err("User is required.".to_string());
+            return Err(ConnectError::General("User is required.".to_string()));
         }
         let port_text = self.port_input.read(cx).value();
         let port_text = port_text.trim();
         let port: u16 = port_text
             .parse()
-            .map_err(|_| format!("\"{port_text}\" is not a valid port."))?;
+            .map_err(|_| ConnectError::General(format!("\"{port_text}\" is not a valid port.")))?;
         let key_text = self.key_input.read(cx).value().trim().to_string();
         if key_text.is_empty() {
-            return Err("SSH key path is required.".to_string());
+            return Err(ConnectError::General(
+                "SSH key path is required.".to_string(),
+            ));
         }
+        let passphrase = if self.key_encrypted {
+            let value = self.passphrase_input.read(cx).value().to_string();
+            if value.is_empty() {
+                return Err(ConnectError::Passphrase(
+                    "A passphrase is required for this SSH key.".to_string(),
+                ));
+            }
+            Some(value)
+        } else {
+            None
+        };
         let session = self.session_input.read(cx).value().trim().to_string();
         let session = if session.is_empty() {
             DEFAULT_SESSION.to_string()
@@ -272,14 +400,19 @@ impl ConnectionScreen {
             port,
             key: PathBuf::from(key_text),
             session,
+            passphrase,
         })
     }
 
     /// A RECENT row click: prefill every field with that entry's values (so
     /// a failed attempt still shows what was tried) and emit `Connect`
     /// immediately — "clickable (prefill + connect)" per the issue's
-    /// acceptance. Silently ignored if `index` is stale (the list changed
-    /// under a slow click), rather than panicking.
+    /// acceptance. Recents never carry a passphrase (never persisted —
+    /// #478), so a click landing on an encrypted key stops short of
+    /// connecting and prompts for it instead of spinning up a connect
+    /// attempt that would deterministically fail. Silently ignored if
+    /// `index` is stale (the list changed under a slow click), rather than
+    /// panicking.
     fn connect_from_recent(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(recent) = self.recents.get(index).cloned() else {
             return;
@@ -296,17 +429,29 @@ impl ConnectionScreen {
         self.key_input.update(cx, |input, cx| {
             input.set_value(recent.key.clone(), window, cx)
         });
+        self.passphrase_input
+            .update(cx, |input, cx| input.set_value(String::new(), window, cx));
         self.session_input.update(cx, |input, cx| {
             input.set_value(recent.session.clone(), window, cx)
         });
+        self.refresh_key_encrypted(cx);
+
+        if self.key_encrypted {
+            self.error = None;
+            self.passphrase_error = Some("Enter the passphrase for this SSH key.".to_string());
+            cx.notify();
+            return;
+        }
 
         self.error = None;
+        self.passphrase_error = None;
         cx.emit(ConnectionScreenEvent::Connect(ConnectRequest {
             host: recent.host,
             user: recent.user,
             port: recent.port,
             key: PathBuf::from(recent.key),
             session: recent.session,
+            passphrase: None,
         }));
         cx.notify();
     }
@@ -367,6 +512,22 @@ fn render_field(
                 .font_family(mono)
                 .prefix(Icon::new(icon).text_color(muted)),
         )
+}
+
+/// The Passphrase row (design contract: "+ passphrase row when the key is
+/// encrypted", #478): a masked [`render_field`], with its own error banner
+/// directly beneath it when `error` is set — a field-level error, distinct
+/// from the card's bottom banner, so a wrong or missing passphrase points at
+/// the field to fix.
+fn render_passphrase_field(
+    cx: &mut Context<ConnectionScreen>,
+    input: &Entity<InputState>,
+    error: Option<&str>,
+) -> impl IntoElement {
+    v_flex()
+        .gap(px(8.0))
+        .child(render_field(cx, "Passphrase", input, IconName::Asterisk))
+        .children(error.map(|message| render_error_banner(cx, message)))
 }
 
 /// The right-aligned mono caption below the Session field (design contract:
@@ -561,6 +722,9 @@ impl Render for ConnectionScreen {
             .error
             .clone()
             .map(|error| render_error_banner(cx, &error));
+        let passphrase_row = self.key_encrypted.then(|| {
+            render_passphrase_field(cx, &self.passphrase_input, self.passphrase_error.as_deref())
+        });
         let recents_section = render_recents_section(cx, &self.recents);
 
         let card = v_flex()
@@ -596,6 +760,7 @@ impl Render for ConnectionScreen {
                     ))),
             )
             .child(render_field(cx, "SSH key", &self.key_input, IconName::File))
+            .children(passphrase_row)
             .child(render_field(
                 cx,
                 "Session",
@@ -718,5 +883,47 @@ mod tests {
                 .join(".ssh")
                 .join("id_ed25519")
         );
+    }
+
+    // ── key_needs_passphrase ──────────────────────────────────────────────
+    //
+    // The detection algorithm itself (encrypted vs. plain vs. malformed key)
+    // is `rift_ssh::key_requires_passphrase`'s own tested surface; this only
+    // covers the one bit of logic this wrapper adds — an `Err` probe (missing
+    // file, unreadable, unsupported format) coalesces to "not encrypted"
+    // rather than propagating, so it never blocks the row from rendering.
+
+    #[::core::prelude::v1::test]
+    fn test_key_needs_passphrase_probe_error_coalesces_to_false() {
+        let path = Path::new("/nonexistent/rift-connection-screen-test-key");
+        assert!(!key_needs_passphrase(path));
+    }
+
+    // ── ConnectRequest (Debug redaction) ──────────────────────────────────
+
+    fn sample_request(passphrase: Option<&str>) -> ConnectRequest {
+        ConnectRequest {
+            host: "100.64.0.1".to_string(),
+            user: "developer".to_string(),
+            port: 22,
+            key: PathBuf::from("/home/developer/.ssh/id_ed25519"),
+            session: "rift".to_string(),
+            passphrase: passphrase.map(str::to_string),
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_connect_request_debug_with_passphrase_redacts_it() {
+        let debug = format!("{:?}", sample_request(Some("correct horse battery staple")));
+
+        assert!(!debug.contains("correct horse battery staple"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_connect_request_debug_without_passphrase_shows_none() {
+        let debug = format!("{:?}", sample_request(None));
+
+        assert!(debug.contains("passphrase: None"));
     }
 }

@@ -312,3 +312,34 @@ into scope, uses a key the developer already owns; nothing to deliver.)
   issue's UI (no passphrase row, no encrypted-key detection) — that surface
   is #478's scope; the connect card's SSH key field is a plain path input
   until #478 adds the conditional row the design calls for.
+- 2026-07-06 (#478): Encrypted-key detection is a synchronous probe
+  (`rift_ssh::key_requires_passphrase`, a `load_secret_key(path, None)` call
+  that only distinguishes `KeyIsEncrypted` from every other failure) run on
+  the Connection screen's own thread, reacting live to the SSH key field's
+  `Change` event — the passphrase row appears/disappears as the user edits
+  the path, instead of waiting for a failed connect attempt to reveal it.
+  The probe is best-effort UX only: any error (missing file, unreadable,
+  unsupported format) reads as "not encrypted" and defers to the real connect
+  attempt, which surfaces those failures on the general banner as before.
+- 2026-07-06 (#478): The passphrase's field-level error reuses #477's
+  existing `Option<String>` connect-failure channel rather than adding a
+  parallel one: it is now `Option<ConnectError>`, an enum with `General`
+  (bottom banner) and `Passphrase` (rendered at the passphrase field, and
+  forces the row visible) variants — one shape covers both the screen's own
+  field validation (`build_request`) and the Shell's post-attempt
+  classification (`classify_connect_error`, `crates/app/src/main.rs`), so
+  there is exactly one place deciding where a message renders. A `Key`-shaped
+  `SshError` classifies as `Passphrase` only when this attempt actually
+  carried one (otherwise it is a different problem — corrupt/unsupported key
+  — and stays on the general banner); `SshError::KeyEncrypted` always
+  classifies as `Passphrase`, covering the rare case where the screen's own
+  probe missed the encryption.
+- 2026-07-06 (#478): The passphrase never reaches the recents store (already
+  excluded — `RecentConnection` has no such field) or a log line: it flows
+  from the card to `SshConnection::connect` only as a `String` field nobody
+  formats with `{:?}`/`{}`, reinforced by a hand-written `ConnectRequest`
+  `Debug` impl that redacts it, so a future accidental `debug!(?request)`
+  cannot leak it. A RECENT row click on a key the probe detects as encrypted
+  stops short of auto-connecting (recents never carry a passphrase to
+  prefill) and prompts for it instead of spinning up a connect attempt that
+  would deterministically fail.

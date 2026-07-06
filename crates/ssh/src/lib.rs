@@ -8,7 +8,7 @@ mod launch;
 mod pty;
 
 pub use backoff::ReconnectBackoff;
-pub use connection::SshConnection;
+pub use connection::{key_requires_passphrase, SshConnection};
 pub use daemon_channel::{DaemonChannel, DaemonClient, Handshake};
 pub use deploy::{
     ensure_daemon_deployed, needs_upload, remote_binary_name, target_triple_from_uname,
