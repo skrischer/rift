@@ -2685,6 +2685,7 @@ mod tests {
                 height: 24,
                 current_path: String::new(),
                 current_command: String::new(),
+                is_shell: false,
             }],
         }
     }
