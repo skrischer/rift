@@ -282,3 +282,33 @@ into scope, uses a key the developer already owns; nothing to deliver.)
   the watch is seeded from `RIFT_SESSION` once and updated by the switch
   bridge across attempts, so an SSH-level reconnect re-attaches the session
   the user is actually on, never silently the startup one.
+- 2026-07-06 (#477): The window's root is now a small `Shell` (`main.rs`)
+  holding either the Connection screen or the `WorkspaceView`; the SSH
+  connect pipeline (channels, `SessionView`, `WorkspaceView`, the SSH thread)
+  that used to build unconditionally at launch now builds only from
+  `Shell::connect`, driven by the screen's `Connect` event — the auto-connect
+  gate decision made structural, not just a skipped call. `run_session_with_
+  reconnect` takes the session name as a parameter (the connect request's
+  Session field, itself prefilled from `RIFT_SESSION`) instead of reading the
+  env var itself, so a value the user changed in the card before connecting
+  is what actually gets attached.
+- 2026-07-06 (#477): A connect failure/cancel routes back to the Connection
+  screen through a dedicated `flume::Sender<Option<String>>` the SSH thread
+  fires exactly once when `run_session_with_reconnect`'s loop ends (`Some`
+  reason for a non-retryable failure, `None` for an orderly exit or a
+  canceled reconnect) — kept separate from `rift_terminal::ConnectionStatus`
+  deliberately: that enum is a `[terminal]`-crate concern the statusbar dot
+  already owns, and #477 is an `[app]`-only change per the issue's crate
+  scope; duplicating a second status enum there would be the "no parallel
+  status mechanism" violation the spec's reconnect-state decision already
+  ruled out for `ConnectionStatus` itself.
+- 2026-07-06 (#477): The recents store (`crates/app/src/recents.rs`) dedupes
+  by host/user/port/key, deliberately excluding the session name from
+  identity — reconnecting to the same host under a different session name
+  refreshes the one existing entry (to the newest session) rather than
+  growing the list per session tried against the same host, matching the
+  spec's "convenience prefills, not a session manager" framing for recents.
+- 2026-07-06 (#477): Passphrase-protected keys stay entirely out of this
+  issue's UI (no passphrase row, no encrypted-key detection) — that surface
+  is #478's scope; the connect card's SSH key field is a plain path input
+  until #478 adds the conditional row the design calls for.

@@ -6,14 +6,16 @@
 
 use std::env;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use anyhow::{Context as _, Result};
 use gpui::*;
 use gpui_component::Root;
-use rift_app::{apply_persisted_theme, window_state, workspace};
+use rift_app::connection_screen::{ConnectRequest, ConnectionScreen, ConnectionScreenEvent};
+use rift_app::recents::RecentConnection;
+use rift_app::{apply_persisted_theme, recents, window_state, workspace};
 use rift_logging::{
     LogTarget, RotatingMakeWriter, SizedWriter, DEFAULT_MAX_BYTES, FORCE_CONSOLE_ENV,
 };
@@ -117,9 +119,10 @@ struct EditorChannels {
 /// would silently re-attach the startup session after a cockpit switch (#509)
 /// and leave the fresh tmux child on the attach-default grid.
 struct EngineWatches {
-    /// The session the client is currently attached to: seeded from
-    /// `RIFT_SESSION` once, updated by `spawn_session_switch_bridge` per switch
-    /// the daemon actually saw.
+    /// The session the client is currently attached to: seeded once from the
+    /// Connection screen's connect request (its Session field, itself
+    /// prefilled from `RIFT_SESSION` — #477), updated by
+    /// `spawn_session_switch_bridge` per switch the daemon actually saw.
     session: tokio::sync::watch::Sender<String>,
     /// The render layer's last known client grid: cached by
     /// `spawn_resize_bridge` per resize (and by the engine's backlog drain),
@@ -392,6 +395,16 @@ fn main() {
             .as_deref()
             .map(window_state::load)
             .unwrap_or_default();
+        // Recent-connections store (#477, `docs/spec-connection-robustness.md`):
+        // beside the window-state file, same per-channel keying, same
+        // tolerant-degrade-on-error contract.
+        let recents_path = match recents::recents_path() {
+            Ok(path) => Some(path),
+            Err(e) => {
+                warn!(%e, "recent-connections persistence disabled");
+                None
+            }
+        };
         let window_bounds =
             workspace::initial_window_bounds(&restored, &workspace::display_rects(cx));
         // Per-channel window title (matching the per-channel taskbar icons), so the
@@ -402,6 +415,7 @@ fn main() {
         } else {
             "rift (dev)"
         };
+        let font_size_px = restored.font_size_px;
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(window_bounds),
@@ -412,168 +426,314 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                // Editor surface (#187) wiring: the daemon stream reader forwards
-                // worktree structure and `FileContent` replies onto these, and the
-                // tree's open requests come back on `open_file`. The daemon-side
-                // ends thread into the SSH session below; the GPUI-side ends into
-                // the `WorkspaceView`.
-                let (worktree_tx, worktree_rx) = flume::unbounded();
-                let (buffer_tx, buffer_rx) = flume::unbounded();
-                let (nav_daemon_tx, nav_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
-                let (status_line_tx, status_line_rx) =
-                    flume::unbounded::<rift_protocol::DaemonMessage>();
-                let (open_file_tx, open_file_rx) = flume::unbounded::<String>();
-                let (save_file_tx, save_file_rx) =
-                    flume::unbounded::<rift_protocol::ClientMessage>();
-                let (buffer_change_tx, buffer_change_rx) =
-                    flume::unbounded::<rift_protocol::ClientMessage>();
-                let (nav_request_tx, nav_request_rx) =
-                    flume::unbounded::<rift_protocol::ClientMessage>();
-                let (diff_tx, diff_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
-                let (request_diff_tx, request_diff_rx) = flume::unbounded::<String>();
-
-                let session_view = cx.new(|cx| {
-                    let (mut view, handle) = SessionView::new(cx);
-                    // Font-size restore (#225): set before the first tmux
-                    // snapshot creates any panes, so every pane picks up the
-                    // restored size from the start rather than flashing the
-                    // default and then resizing. `apply_font_size` no-ops
-                    // safely against the still-empty panes map at this point.
-                    view.set_font_size(px(restored.font_size_px), cx);
-
-                    let ssh = SshConfig {
-                        host: env::var("RIFT_SSH_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-                        user: env::var("RIFT_SSH_USER").unwrap_or_else(|_| "developer".into()),
-                        port: env::var("RIFT_SSH_PORT")
-                            .ok()
-                            .and_then(|p| p.parse().ok())
-                            .unwrap_or(22),
-                        key: env::var("RIFT_SSH_KEY")
-                            .ok()
-                            // Compile-time default baked by `just promote`
-                            // (RIFT_DEFAULT_SSH_KEY), so the pinned stable exe
-                            // launches from a bare desktop shortcut without any
-                            // user env; runtime RIFT_SSH_KEY still wins.
-                            .or_else(|| option_env!("RIFT_DEFAULT_SSH_KEY").map(String::from))
-                            .map(PathBuf::from)
-                            .unwrap_or_else(|| {
-                                let home = env::var("USERPROFILE")
-                                    .or_else(|_| env::var("HOME"))
-                                    .unwrap_or_else(|_| {
-                                        if cfg!(target_os = "windows") {
-                                            "C:\\Users\\Default".into()
-                                        } else {
-                                            "/home/developer".into()
-                                        }
-                                    });
-                                PathBuf::from(home).join(".ssh").join("id_ed25519")
-                            }),
-                    };
-
-                    // Feed the statusbar label from this same resolved config
-                    // rather than a second, independent env resolution — the
-                    // two previously had divergent defaults (#494).
-                    view.set_ssh_label(format!("{}@{}", ssh.user, ssh.host));
-
-                    // Kept outside `channels` so the reconnect engine can drive
-                    // the indicator (SshReconnecting/Disconnected) after
-                    // `run_ssh_session` returns (the in-session clone reports
-                    // Connected). The cancel receiver likewise belongs to the
-                    // engine, not to a single session run.
-                    let status_tx = handle.connection_status_tx.clone();
-                    let reconnect_cancel_rx = handle.reconnect_cancel_rx.clone();
-
-                    let channels = PtyChannels {
-                        pane_output_tx: handle.pane_output_tx,
-                        input_rx: handle.input_rx,
-                        size_changed_rx: handle.size_changed_rx,
-                        snapshot_tx: handle.snapshot_tx,
-                        tmux_command_rx: handle.tmux_command_rx,
-                        subscription_tx: handle.subscription_tx,
-                        capture_request_rx: handle.capture_request_rx,
-                        capture_result_tx: handle.capture_result_tx,
-                        connection_status_tx: handle.connection_status_tx,
-                        key_table_request_rx: handle.key_table_request_rx,
-                        key_table_result_tx: handle.key_table_result_tx,
-                        session_list_tx: handle.session_list_tx,
-                        session_list_request_rx: handle.session_list_request_rx,
-                        session_switch_rx: handle.session_switch_rx,
-                    };
-
-                    let editor_channels = EditorChannels {
-                        worktree_tx,
-                        buffer_tx,
-                        nav_tx: nav_daemon_tx,
-                        status_line_tx,
-                        open_file_rx,
-                        save_file_rx,
-                        buffer_change_rx,
-                        nav_request_rx,
-                        diff_tx,
-                        request_diff_rx,
-                    };
-
-                    let key_exists = ssh.key.exists();
-                    debug!(
-                        host = %ssh.host,
-                        port = ssh.port,
-                        user = %ssh.user,
-                        key = %ssh.key.display(),
-                        key_exists,
-                        "connecting via SSH"
-                    );
-
-                    thread::spawn(move || {
-                        run_session_with_reconnect(
-                            &ssh,
-                            channels,
-                            editor_channels,
-                            status_tx,
-                            reconnect_cancel_rx,
-                            key_exists,
-                        );
-                    });
-
-                    view
-                });
-
-                // The app root: the file-tree explorer + code editor mounted beside
-                // the terminal (#187). `SessionView` lives in `rift-terminal`, which
-                // cannot reach `rift-app`'s explorer/editor, so the composition lives
-                // here. Focus still delegates to the terminal so keystrokes reach the
-                // active pane.
-                let workspace = cx.new(|cx| {
-                    workspace::WorkspaceView::new(
-                        session_view,
-                        workspace::WorkspaceChannels {
-                            worktree_rx,
-                            buffer_rx,
-                            nav_rx,
-                            status_line_rx,
-                            diff_rx,
-                            open_file_tx,
-                            save_file_tx,
-                            buffer_change_tx,
-                            nav_tx: nav_request_tx,
-                            request_diff_tx,
-                        },
-                        state_path,
-                        window,
-                        cx,
-                    )
-                });
-
-                let focus_handle = workspace.focus_handle(cx);
-                window.defer(cx, move |window, cx| {
-                    focus_handle.focus(window, cx);
-                });
-
-                cx.new(|cx| Root::new(workspace, window, cx))
+                // The Connection screen (#477) is the startup state on every
+                // launch (no auto-connect, per the spec's gate decision): the
+                // Shell renders it first, and only builds the session
+                // pipeline below once the user submits the connect card.
+                let shell =
+                    cx.new(|cx| Shell::new(state_path, recents_path, font_size_px, window, cx));
+                cx.new(|cx| Root::new(shell, window, cx))
             },
         )
         .unwrap();
         cx.activate(true);
     });
+}
+
+/// The window's root content (#477, `docs/spec-connection-robustness.md`):
+/// the Connection screen until a connect attempt reaches the cockpit, then
+/// the [`workspace::WorkspaceView`] — and back to a fresh Connection screen
+/// (carrying the failure reason, if any) once that session ends, whether
+/// from an orderly exit, a canceled reconnect, or a non-retryable connect
+/// failure. Auto-connect-on-launch is deliberately not implemented (spec
+/// gate decision): every launch starts on the screen, prefilled, one
+/// explicit Connect (or Enter) away from the cockpit.
+enum ScreenState {
+    Connection(Entity<ConnectionScreen>),
+    Workspace(Entity<workspace::WorkspaceView>),
+}
+
+struct Shell {
+    screen: ScreenState,
+    state_path: Option<PathBuf>,
+    recents_path: Option<PathBuf>,
+    font_size_px: f32,
+}
+
+impl Shell {
+    fn new(
+        state_path: Option<PathBuf>,
+        recents_path: Option<PathBuf>,
+        font_size_px: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let screen = Self::build_connection_screen(recents_path.as_deref(), None, window, cx);
+        Self::watch_connection_screen(&screen, window, cx);
+        Self::focus_connection_screen(&screen, window, cx);
+        Self {
+            screen: ScreenState::Connection(screen),
+            state_path,
+            recents_path,
+            font_size_px,
+        }
+    }
+
+    /// Build a fresh Connection screen prefilled from the live environment
+    /// (`connection_screen::live_defaults`) and the on-disk RECENT list,
+    /// optionally carrying `error` — a previous connect attempt's failure,
+    /// surfaced on the card itself (field/banner) rather than only logged.
+    fn build_connection_screen(
+        recents_path: Option<&Path>,
+        error: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Shell>,
+    ) -> Entity<ConnectionScreen> {
+        let defaults = rift_app::connection_screen::live_defaults();
+        let recents = recents_path.map(recents::load).unwrap_or_default();
+        cx.new(|cx| ConnectionScreen::new(&defaults, recents, error, window, cx))
+    }
+
+    /// Subscribe to the screen's `Connect` event so a submitted card drives
+    /// [`Shell::connect`].
+    fn watch_connection_screen(
+        screen: &Entity<ConnectionScreen>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.subscribe_in(
+            screen,
+            window,
+            |this, _screen, event: &ConnectionScreenEvent, window, cx| {
+                let ConnectionScreenEvent::Connect(request) = event;
+                this.connect(request.clone(), window, cx);
+            },
+        )
+        .detach();
+    }
+
+    /// Move keyboard focus onto the screen's Host field, mirroring the
+    /// pre-#477 startup path's deferred focus of the workspace.
+    fn focus_connection_screen(
+        screen: &Entity<ConnectionScreen>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focus_handle = screen.focus_handle(cx);
+        window.defer(cx, move |window, cx| {
+            focus_handle.focus(window, cx);
+        });
+    }
+
+    /// Drive a submitted connect attempt: record it in the RECENT store, then
+    /// build the full session pipeline (channels, `SessionView`,
+    /// `WorkspaceView`, the SSH thread) exactly like the pre-#477 startup path
+    /// did unconditionally at launch — now gated behind an explicit Connect
+    /// instead. A watcher task routes back to a fresh Connection screen once
+    /// the session ends ([`Shell::return_to_connection_screen`]).
+    fn connect(&mut self, request: ConnectRequest, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = &self.recents_path {
+            let now = recents::now_unix_secs();
+            let entry = RecentConnection {
+                host: request.host.clone(),
+                user: request.user.clone(),
+                port: request.port,
+                key: request.key.display().to_string(),
+                session: request.session.clone(),
+                last_connected_unix_secs: now,
+            };
+            if let Err(e) = recents::record(path, entry, now) {
+                warn!(%e, "failed to record recent connection");
+            }
+        }
+
+        let ssh = SshConfig {
+            host: request.host,
+            user: request.user,
+            port: request.port,
+            key: request.key,
+        };
+        let session_name = request.session;
+
+        // Editor surface (#187) wiring: the daemon stream reader forwards
+        // worktree structure and `FileContent` replies onto these, and the
+        // tree's open requests come back on `open_file`. The daemon-side
+        // ends thread into the SSH session below; the GPUI-side ends into
+        // the `WorkspaceView`.
+        let (worktree_tx, worktree_rx) = flume::unbounded();
+        let (buffer_tx, buffer_rx) = flume::unbounded();
+        let (nav_daemon_tx, nav_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
+        let (status_line_tx, status_line_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
+        let (open_file_tx, open_file_rx) = flume::unbounded::<String>();
+        let (save_file_tx, save_file_rx) = flume::unbounded::<rift_protocol::ClientMessage>();
+        let (buffer_change_tx, buffer_change_rx) =
+            flume::unbounded::<rift_protocol::ClientMessage>();
+        let (nav_request_tx, nav_request_rx) = flume::unbounded::<rift_protocol::ClientMessage>();
+        let (diff_tx, diff_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
+        let (request_diff_tx, request_diff_rx) = flume::unbounded::<String>();
+        // Fires once when the session pipeline this attempt spawned ends —
+        // orderly exit, a canceled reconnect, or a non-retryable failure
+        // (`run_session_with_reconnect`'s `end_reason`) — so the Shell can
+        // route back to the Connection screen instead of leaving a dead
+        // cockpit up.
+        let (session_ended_tx, session_ended_rx) = flume::unbounded::<Option<String>>();
+
+        let font_size_px = self.font_size_px;
+        let state_path = self.state_path.clone();
+        let session_view = cx.new(|cx| {
+            let (mut view, handle) = SessionView::new(cx);
+            // Font-size restore (#225): set before the first tmux snapshot
+            // creates any panes, so every pane picks up the restored size
+            // from the start rather than flashing the default and then
+            // resizing. `apply_font_size` no-ops safely against the
+            // still-empty panes map at this point.
+            view.set_font_size(px(font_size_px), cx);
+
+            // Feed the statusbar label from this same resolved config rather
+            // than a second, independent env resolution — the two previously
+            // had divergent defaults (#494).
+            view.set_ssh_label(format!("{}@{}", ssh.user, ssh.host));
+
+            // Kept outside `channels` so the reconnect engine can drive the
+            // indicator (SshReconnecting/Disconnected) after
+            // `run_ssh_session` returns (the in-session clone reports
+            // Connected). The cancel receiver likewise belongs to the
+            // engine, not to a single session run.
+            let status_tx = handle.connection_status_tx.clone();
+            let reconnect_cancel_rx = handle.reconnect_cancel_rx.clone();
+
+            let channels = PtyChannels {
+                pane_output_tx: handle.pane_output_tx,
+                input_rx: handle.input_rx,
+                size_changed_rx: handle.size_changed_rx,
+                snapshot_tx: handle.snapshot_tx,
+                tmux_command_rx: handle.tmux_command_rx,
+                subscription_tx: handle.subscription_tx,
+                capture_request_rx: handle.capture_request_rx,
+                capture_result_tx: handle.capture_result_tx,
+                connection_status_tx: handle.connection_status_tx,
+                key_table_request_rx: handle.key_table_request_rx,
+                key_table_result_tx: handle.key_table_result_tx,
+                session_list_tx: handle.session_list_tx,
+                session_list_request_rx: handle.session_list_request_rx,
+                session_switch_rx: handle.session_switch_rx,
+            };
+
+            let editor_channels = EditorChannels {
+                worktree_tx,
+                buffer_tx,
+                nav_tx: nav_daemon_tx,
+                status_line_tx,
+                open_file_rx,
+                save_file_rx,
+                buffer_change_rx,
+                nav_request_rx,
+                diff_tx,
+                request_diff_rx,
+            };
+
+            let key_exists = ssh.key.exists();
+            debug!(
+                host = %ssh.host,
+                port = ssh.port,
+                user = %ssh.user,
+                key = %ssh.key.display(),
+                key_exists,
+                "connecting via SSH"
+            );
+
+            thread::spawn(move || {
+                run_session_with_reconnect(
+                    &ssh,
+                    SessionRunParams {
+                        channels,
+                        editor: editor_channels,
+                        status_tx,
+                        cancel_rx: reconnect_cancel_rx,
+                        key_exists,
+                        session: session_name,
+                        session_ended_tx,
+                    },
+                );
+            });
+
+            view
+        });
+
+        // The app root: the file-tree explorer + code editor mounted beside
+        // the terminal (#187). `SessionView` lives in `rift-terminal`, which
+        // cannot reach `rift-app`'s explorer/editor, so the composition lives
+        // here. Focus still delegates to the terminal so keystrokes reach the
+        // active pane.
+        let workspace = cx.new(|cx| {
+            workspace::WorkspaceView::new(
+                session_view,
+                workspace::WorkspaceChannels {
+                    worktree_rx,
+                    buffer_rx,
+                    nav_rx,
+                    status_line_rx,
+                    diff_rx,
+                    open_file_tx,
+                    save_file_tx,
+                    buffer_change_tx,
+                    nav_tx: nav_request_tx,
+                    request_diff_tx,
+                },
+                state_path,
+                window,
+                cx,
+            )
+        });
+
+        let focus_handle = workspace.focus_handle(cx);
+        window.defer(cx, move |window, cx| {
+            focus_handle.focus(window, cx);
+        });
+
+        // Route back to a fresh Connection screen once this session ends —
+        // the SSH thread has already returned by the time this fires, so
+        // nothing beyond dropping the dead workspace/session entities is
+        // needed.
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(reason) = session_ended_rx.recv_async().await else {
+                return;
+            };
+            let _ = this.update_in(cx, |shell, window, cx| {
+                shell.return_to_connection_screen(reason, window, cx);
+            });
+        })
+        .detach();
+
+        self.screen = ScreenState::Workspace(workspace);
+        cx.notify();
+    }
+
+    /// The session pipeline a connect attempt spawned has ended: build a
+    /// fresh Connection screen (carrying `reason` when the end was a
+    /// non-retryable failure) and swap it in as the window's content.
+    fn return_to_connection_screen(
+        &mut self,
+        reason: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let screen =
+            Self::build_connection_screen(self.recents_path.as_deref(), reason, window, cx);
+        Self::watch_connection_screen(&screen, window, cx);
+        Self::focus_connection_screen(&screen, window, cx);
+        self.screen = ScreenState::Connection(screen);
+        cx.notify();
+    }
+}
+
+impl Render for Shell {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        match &self.screen {
+            ScreenState::Connection(screen) => screen.clone().into_any_element(),
+            ScreenState::Workspace(workspace) => workspace.clone().into_any_element(),
+        }
+    }
 }
 
 /// The SSH-level reconnect engine (#476, `docs/spec-connection-robustness.md`):
@@ -585,9 +745,9 @@ fn main() {
 /// provisioning, attach, resync) and restarts the schedule. The banner's
 /// Cancel and non-retryable failures ([`is_retryable_session_error`]) end the
 /// loop in the visible `Disconnected` state instead — the Connection screen
-/// (#477) will own that state once it lands. An orderly end (`Ok`: the tmux
-/// attach exited) also ends the loop without retrying: the remote session is
-/// gone on purpose, not lost.
+/// (#477) owns that state, routed back to by [`Shell::return_to_connection_screen`].
+/// An orderly end (`Ok`: the tmux attach exited) also ends the loop without
+/// retrying: the remote session is gone on purpose, not lost.
 ///
 /// Each attempt runs on a fresh tokio runtime: dropping the runtime cancels
 /// every bridge task the dead session spawned, so a stale bridge can never
@@ -600,7 +760,7 @@ fn main() {
 ///
 /// Two `watch` channels live at engine scope because their values must survive
 /// the per-attempt runtimes: the session the client is currently on (seeded
-/// from `RIFT_SESSION` once, updated by the session-switch bridge — a
+/// once from the connect request, updated by the session-switch bridge — a
 /// reconnect after a cockpit switch, #509, must re-attach the session the user
 /// is actually on, the same rule the daemon recovery follows) and the render
 /// layer's last known client grid (re-asserted after every fresh attach — the
@@ -614,20 +774,40 @@ fn main() {
 /// kill it). A TCP connect against a black-holed host can keep an attempt
 /// in-flight for tens of seconds; the Connection screen (#477) is the place
 /// to shorten that perceived latency, not a second cancellation seam.
-fn run_session_with_reconnect(
-    ssh: &SshConfig,
+struct SessionRunParams {
     channels: PtyChannels,
     editor: EditorChannels,
     status_tx: flume::Sender<ConnectionStatus>,
     cancel_rx: flume::Receiver<()>,
     key_exists: bool,
-) {
+    /// The tmux session name to attach to — the connect request's Session
+    /// field, itself prefilled from `RIFT_SESSION` (#477).
+    session: String,
+    /// Fires exactly once when this run's loop ends, so the Shell can route
+    /// back to a fresh Connection screen (#477).
+    session_ended_tx: flume::Sender<Option<String>>,
+}
+
+fn run_session_with_reconnect(ssh: &SshConfig, params: SessionRunParams) {
+    let SessionRunParams {
+        channels,
+        editor,
+        status_tx,
+        cancel_rx,
+        key_exists,
+        session,
+        session_ended_tx,
+    } = params;
     let mut retry: u32 = 0;
     let mut backoff = rift_ssh::ReconnectBackoff::new();
     let connected = AtomicBool::new(false);
-    let initial_session = env::var("RIFT_SESSION").unwrap_or_else(|_| "rift".to_string());
+    // A non-retryable failure's message, surfaced on the Connection screen
+    // (#477) once this loop ends — `None` for every other end (orderly tmux
+    // exit, a canceled reconnect, or the render side going away), which the
+    // screen treats as "no error to show", not log-only.
+    let mut end_reason: Option<String> = None;
     let watches = EngineWatches {
-        session: tokio::sync::watch::channel(initial_session).0,
+        session: tokio::sync::watch::channel(session).0,
         viewport: tokio::sync::watch::channel(None::<TermSize>).0,
     };
     loop {
@@ -671,6 +851,7 @@ fn run_session_with_reconnect(
                 key_exists,
                 "SSH session failed with a non-retryable error"
             );
+            end_reason = Some(error.to_string());
             break;
         }
         retry = retry.saturating_add(1);
@@ -689,6 +870,7 @@ fn run_session_with_reconnect(
             Err(flume::RecvTimeoutError::Disconnected) => break,
         }
     }
+    let _ = session_ended_tx.send(end_reason);
     let _ = status_tx.send(ConnectionStatus::Disconnected);
 }
 
@@ -770,12 +952,14 @@ async fn run_ssh_session(
     // degrading — falling back would hide real skew as silent feature death.
     let daemon_client = provision_daemon(&mut conn).await?;
 
-    // Tmux session name: seeded from `RIFT_SESSION` into the engine's session
-    // watch (overridable so a second rift instance can mirror the same live
-    // session, default `rift`, or attach to an isolated one for destructive
-    // tests, `RIFT_SESSION=rift-dev` — docs/spec-dogfooding-channels.md).
-    // Resolved through the watch, not the env, so an SSH-level reconnect
-    // re-attaches the session a cockpit switch (#509) moved the client to.
+    // Tmux session name: seeded from the Connection screen's connect request
+    // into the engine's session watch (the screen's Session field defaults
+    // to `RIFT_SESSION`/`rift`, so a second rift instance still mirrors the
+    // same live session, or attaches to an isolated one for destructive
+    // tests, `RIFT_SESSION=rift-dev` — docs/spec-dogfooding-channels.md, by
+    // leaving the field at its prefilled default). Resolved through the
+    // watch, not the request, so an SSH-level reconnect re-attaches the
+    // session a cockpit switch (#509) moved the client to.
     let session = watches.session.borrow().clone();
 
     // Terminal byte source (Phase 6 swap, #205): the daemon protocol is the
@@ -897,7 +1081,8 @@ async fn run_daemon_terminal(
     let viewport_rx = watches.viewport.subscribe();
 
     // Open this client's own tmux attach against the engine-tracked current
-    // session (`RIFT_SESSION`-seeded end-to-end). The daemon answers with a
+    // session (seeded end-to-end from the Connection screen's connect
+    // request). The daemon answers with a
     // LayoutSnapshot baseline, then the live stream. A failed send means the
     // daemon channel died right behind the handshake — a transport death for
     // the reconnect engine, not an orderly end.
