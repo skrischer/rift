@@ -19,13 +19,15 @@
 //!   worktree-relative path and server id for full-set-per-`(file, server)`
 //!   replace. A crashed server's replacement publishes under a fresh id, so
 //!   the worker clears the dead id's sets when the registry prunes it (#427).
-//! - **navigation requests** (#195): [`NavRequest`] carries hover / definition /
-//!   references requests from the dispatch loop to the worker. The worker finds
-//!   the first capable server via the registry, spawns a task that issues the
-//!   typed LSP request, and forwards the rift-typed [`DaemonMessage`] response
-//!   back to the dispatch loop for broadcasting. Drop-stale discipline: the
-//!   worker tracks the latest [`NavRequestId`] per operation type; a response
-//!   whose id is superseded is silently dropped.
+//! - **navigation requests** (#195, #482): [`NavRequest`] carries hover /
+//!   definition / references requests from a connection to the worker, each
+//!   tagged with the requesting connection's private `reply` channel. The worker
+//!   finds the first capable server via the registry, spawns a task that issues
+//!   the typed LSP request, and sends the rift-typed [`DaemonMessage`] response
+//!   straight back on that connection's `reply` channel — never onto the shared
+//!   bus, so with two clients attached one client's answer cannot reach the
+//!   other (#482). The worker is stateless for nav; drop-stale discipline is
+//!   enforced per connection at the connection, keyed by [`NavRequestId`].
 //!
 //! The dispatch loop never blocks on server I/O: spawning, initialization, and
 //! stdio all live on the registry's own tasks; the loop only forwards change
@@ -71,30 +73,35 @@ pub enum BufferEvent {
     Closed { path: String },
 }
 
-/// A navigation request forwarded from the dispatch loop to the [`LspWorker`]
-/// (issue #195). Carries the protocol fields needed to issue the typed LSP
-/// request off the dispatch loop and correlate the response.
+/// A navigation request forwarded from a connection to the [`LspWorker`]
+/// (issues #195, #482). Carries the protocol fields needed to issue the typed
+/// LSP request off the dispatch loop, plus `reply` — the requesting connection's
+/// private response channel, so the answer returns to that socket alone and is
+/// never broadcast to other attached clients.
 ///
 /// The worker spawns a task per request so slow server I/O never blocks document
-/// sync or diagnostics. `id` is the drop-stale correlation key: the worker
-/// tracks the latest `NavRequestId` per operation type and silently drops a
-/// response if a newer request has been forwarded since this one was dispatched.
+/// sync or diagnostics. `id` is the drop-stale correlation key, applied per
+/// connection at the connection: a response whose id a newer request has
+/// superseded is dropped before it reaches the socket.
 #[derive(Debug)]
 pub enum NavRequest {
     Hover {
         id: NavRequestId,
         path: String,
         position: Position,
+        reply: mpsc::Sender<DaemonMessage>,
     },
     Definition {
         id: NavRequestId,
         path: String,
         position: Position,
+        reply: mpsc::Sender<DaemonMessage>,
     },
     References {
         id: NavRequestId,
         path: String,
         position: Position,
+        reply: mpsc::Sender<DaemonMessage>,
     },
 }
 
@@ -198,10 +205,10 @@ impl DocumentSink for ServerSink<'_> {
 ///
 /// Navigation requests (#195) arrive on `nav_requests`: the worker looks up the
 /// first capable server in the registry, spawns a task to issue the typed LSP
-/// request off the loop, and forwards the translated [`DaemonMessage`] response
-/// on `nav_responses`. Drop-stale correlation is enforced here (one
-/// latest-id-per-op-type tracker), so superseded in-flight tasks are silently
-/// discarded before broadcasting.
+/// request off the loop, and sends the translated [`DaemonMessage`] response
+/// straight back on the request's own `reply` channel — the requesting
+/// connection's private inbox (#482). The worker holds no nav state: routing to
+/// the right socket and drop-stale correlation both live at the connection.
 pub struct LspWorker {
     root: PathBuf,
     registry: Registry,
@@ -212,20 +219,9 @@ pub struct LspWorker {
     diagnostics_out: mpsc::Sender<LspDiagnostics>,
     /// The registry's diagnostics channel, drained by `run`.
     server_diagnostics: mpsc::UnboundedReceiver<(ServerId, PublishDiagnosticsParams)>,
-    /// Navigation requests from the dispatch loop (#195).
+    /// Navigation requests from the connections (#195, #482), each carrying the
+    /// requesting connection's `reply` channel for the response.
     nav_requests: mpsc::Receiver<NavRequest>,
-    /// Translated navigation responses flowing back to the dispatch loop.
-    nav_responses: mpsc::Sender<DaemonMessage>,
-    /// Latest `NavRequestId` forwarded for each operation type, used for
-    /// drop-stale discipline: a response whose id is older than the latest is
-    /// dropped before broadcasting.
-    latest_hover_id: Option<NavRequestId>,
-    latest_definition_id: Option<NavRequestId>,
-    latest_references_id: Option<NavRequestId>,
-    /// Completed response tasks: each yields a `(NavRequestId, DaemonMessage)`.
-    completed_nav: mpsc::UnboundedReceiver<(NavRequestId, DaemonMessage)>,
-    /// The sender side of `completed_nav` — cloned into each spawned nav task.
-    completed_nav_tx: mpsc::UnboundedSender<(NavRequestId, DaemonMessage)>,
     /// Worktree-relative paths with a live (non-empty) diagnostic set per
     /// server instance, mirrored from the publishes forwarded downstream. When
     /// the registry prunes a dead instance these are the paths that need a
@@ -239,7 +235,8 @@ impl LspWorker {
     /// `doc_changes` carries disk-driven change batches from the dispatch loop;
     /// `buffer_events` carries the editor's live-buffer feed (#189);
     /// `diagnostics_out` carries translated diagnostics back to it.
-    /// `nav_requests` / `nav_responses` are the navigation request path (#195).
+    /// `nav_requests` carries navigation requests (#195, #482), each with the
+    /// requesting connection's `reply` channel for the response.
     pub fn new(
         root: PathBuf,
         selector: DocumentSelector,
@@ -247,12 +244,10 @@ impl LspWorker {
         buffer_events: mpsc::Receiver<BufferEvent>,
         diagnostics_out: mpsc::Sender<LspDiagnostics>,
         nav_requests: mpsc::Receiver<NavRequest>,
-        nav_responses: mpsc::Sender<DaemonMessage>,
     ) -> Self {
         let (server_tx, server_diagnostics) = mpsc::unbounded_channel();
         let registry = Registry::with_selector(selector, root.clone(), server_tx);
         let sync = DocumentSync::new(root.clone());
-        let (completed_nav_tx, completed_nav) = mpsc::unbounded_channel();
         Self {
             root,
             registry,
@@ -262,12 +257,6 @@ impl LspWorker {
             diagnostics_out,
             server_diagnostics,
             nav_requests,
-            nav_responses,
-            latest_hover_id: None,
-            latest_definition_id: None,
-            latest_references_id: None,
-            completed_nav,
-            completed_nav_tx,
             diagnostic_paths: HashMap::new(),
         }
     }
@@ -302,15 +291,11 @@ impl LspWorker {
                 },
                 req = self.nav_requests.recv() => match req {
                     Some(req) => self.dispatch_nav(req).await,
-                    // Same as `buffer_events`: a closed inbound channel means
-                    // the dispatch loop is gone — stop instead of parking the
+                    // Same as `buffer_events`: every connection dropped its
+                    // `nav_requests` clone (and the dispatch loop's keeper) —
+                    // the daemon is going away, so stop instead of parking the
                     // select loop (#497).
                     None => break,
-                },
-                result = self.completed_nav.recv() => {
-                    if let Some((id, msg)) = result {
-                        self.forward_nav_response(id, msg);
-                    }
                 },
             }
         }
@@ -465,23 +450,25 @@ impl LspWorker {
     /// registry is owned by this task), clones its socket and capabilities
     /// (the only handles that are `Send + 'static`), then spawns a task that
     /// issues the typed LSP request and sends the translated [`DaemonMessage`]
-    /// back via `completed_nav_tx`. The caller's `id` is recorded as the latest
-    /// for its operation type so `forward_nav_response` can apply drop-stale.
+    /// straight back on the request's `reply` channel — the requesting
+    /// connection's private inbox, so no other client sees it (#482). Drop-stale
+    /// is the connection's concern, not the worker's.
     ///
     /// When no server is capable (not started, indexing, or wrong language) the
     /// request is a silent no-op — "no result" is the correct answer, not an
-    /// error, matching the capability-check behaviour in [`NavRequester`].
+    /// error, matching the capability-check behaviour in [`NavRequester`]. The
+    /// connection recorded this request's id as its latest on send, so a later
+    /// request still supersedes it even though this one produced no response.
     async fn dispatch_nav(&mut self, req: NavRequest) {
         let root = self.root.clone();
-        let tx = self.completed_nav_tx.clone();
 
         match req {
-            NavRequest::Hover { id, path, position } => {
-                // Record the latest id before the capability check: if no server
-                // is available the early-return means the client gets no response
-                // (treated as "server not ready"), and a subsequent hover request
-                // that does find a server will correctly supersede this id.
-                self.latest_hover_id = Some(id);
+            NavRequest::Hover {
+                id,
+                path,
+                position,
+                reply,
+            } => {
                 let Some(requester) = self.find_capable_server(&path, NavCap::Hover) else {
                     return;
                 };
@@ -495,7 +482,9 @@ impl LspWorker {
                     .unwrap_or_default();
                     match requester.hover(&abs_path, position, &text).await {
                         Ok(content) => {
-                            let _ = tx.send((id, DaemonMessage::HoverResponse { id, content }));
+                            let _ = reply
+                                .send(DaemonMessage::HoverResponse { id, content })
+                                .await;
                         }
                         Err(err) => {
                             warn!(%err, "hover request failed");
@@ -503,8 +492,12 @@ impl LspWorker {
                     }
                 });
             }
-            NavRequest::Definition { id, path, position } => {
-                self.latest_definition_id = Some(id);
+            NavRequest::Definition {
+                id,
+                path,
+                position,
+                reply,
+            } => {
                 let Some(requester) = self.find_capable_server(&path, NavCap::Definition) else {
                     return;
                 };
@@ -518,8 +511,9 @@ impl LspWorker {
                     .unwrap_or_default();
                     match requester.definition(&abs_path, position, &text).await {
                         Ok(targets) => {
-                            let _ =
-                                tx.send((id, DaemonMessage::DefinitionResponse { id, targets }));
+                            let _ = reply
+                                .send(DaemonMessage::DefinitionResponse { id, targets })
+                                .await;
                         }
                         Err(err) => {
                             warn!(%err, "definition request failed");
@@ -527,8 +521,12 @@ impl LspWorker {
                     }
                 });
             }
-            NavRequest::References { id, path, position } => {
-                self.latest_references_id = Some(id);
+            NavRequest::References {
+                id,
+                path,
+                position,
+                reply,
+            } => {
                 let Some(requester) = self.find_capable_server(&path, NavCap::References) else {
                     return;
                 };
@@ -542,40 +540,15 @@ impl LspWorker {
                     .unwrap_or_default();
                     match requester.references(&abs_path, position, &text).await {
                         Ok(locations) => {
-                            let _ =
-                                tx.send((id, DaemonMessage::ReferencesResponse { id, locations }));
+                            let _ = reply
+                                .send(DaemonMessage::ReferencesResponse { id, locations })
+                                .await;
                         }
                         Err(err) => {
                             warn!(%err, "references request failed");
                         }
                     }
                 });
-            }
-        }
-    }
-
-    /// Forward a completed nav response to the dispatch loop, applying drop-stale
-    /// discipline: if a newer request of the same type was dispatched after the
-    /// one that produced this response, drop it silently.
-    fn forward_nav_response(&self, id: NavRequestId, msg: DaemonMessage) {
-        let latest = match &msg {
-            DaemonMessage::HoverResponse { .. } => self.latest_hover_id,
-            DaemonMessage::DefinitionResponse { .. } => self.latest_definition_id,
-            DaemonMessage::ReferencesResponse { .. } => self.latest_references_id,
-            // Only nav response messages are routed here; any other variant is a
-            // caller bug — drop it rather than panic.
-            _ => return,
-        };
-        match latest {
-            Some(latest_id) if latest_id == id => {
-                // This response is still current: forward to the dispatch loop.
-                // A closed receiver means the loop is gone; dropping is correct.
-                if let Err(err) = self.nav_responses.try_send(msg) {
-                    warn!(%err, "dropped nav response (dispatch loop full or closed)");
-                }
-            }
-            _ => {
-                // Superseded — a newer request was dispatched; drop silently.
             }
         }
     }
@@ -842,176 +815,9 @@ mod tests {
         assert_eq!(translated.code.as_deref(), Some("E0308"));
     }
 
-    // ── Navigation correlation drop-stale tests ──────────────────────────────
-
-    /// Minimal test harness for `forward_nav_response`: constructs the minimum
-    /// `LspWorker` state needed to call the method without a real registry,
-    /// by wrapping the fields directly.
-    ///
-    /// Acceptance: "an out-of-order / superseded response is dropped, not
-    /// applied" (issue #195). This test drives `forward_nav_response`
-    /// directly with a response whose id is older than `latest_hover_id`.
-    #[test]
-    fn test_correlation_superseded_hover_response_is_dropped() {
-        // Two request ids: the client sent id=1, then immediately id=2.
-        let id_first = NavRequestId(1);
-        let id_second = NavRequestId(2);
-
-        let (nav_resp_tx, mut nav_resp_rx) = tokio::sync::mpsc::channel::<DaemonMessage>(8);
-
-        // Simulate: latest hover id is 2 (the second request was dispatched).
-        // A response for id=1 arrives first (slow server, out of order).
-        // Not used — we test forward_nav_response directly via the harness.
-        let (_completed_nav_tx, _completed_nav_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(NavRequestId, DaemonMessage)>();
-
-        // Build a minimal LspWorker with the fields we need by calling
-        // forward_nav_response directly on a partial struct through a helper.
-        // We test the logic independently of the registry and async machinery.
-        let worker_state = WorkerDropStaleHarness {
-            latest_hover_id: Some(id_second),
-            latest_definition_id: None,
-            latest_references_id: None,
-            nav_responses: nav_resp_tx,
-        };
-
-        // Response for the FIRST (superseded) request — must be dropped.
-        let superseded_msg = DaemonMessage::HoverResponse {
-            id: id_first,
-            content: None,
-        };
-        worker_state.forward_nav_response(id_first, superseded_msg);
-
-        // Nothing should have arrived on the channel.
-        assert!(
-            nav_resp_rx.try_recv().is_err(),
-            "a superseded hover response must be dropped, not forwarded"
-        );
-
-        // Response for the SECOND (current) request — must be forwarded.
-        let current_msg = DaemonMessage::HoverResponse {
-            id: id_second,
-            content: Some(rift_protocol::HoverContent {
-                markdown: "fn foo()".to_owned(),
-                range: None,
-            }),
-        };
-        worker_state.forward_nav_response(id_second, current_msg);
-
-        let forwarded = nav_resp_rx
-            .try_recv()
-            .expect("current hover response must be forwarded");
-        match forwarded {
-            DaemonMessage::HoverResponse { id, .. } => {
-                assert_eq!(id, id_second, "forwarded response id must match latest");
-            }
-            other => panic!("expected HoverResponse, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_correlation_superseded_definition_response_is_dropped() {
-        let id_old = NavRequestId(10);
-        let id_new = NavRequestId(11);
-        let (nav_resp_tx, mut nav_resp_rx) = tokio::sync::mpsc::channel::<DaemonMessage>(8);
-
-        let harness = WorkerDropStaleHarness {
-            latest_hover_id: None,
-            latest_definition_id: Some(id_new),
-            latest_references_id: None,
-            nav_responses: nav_resp_tx,
-        };
-
-        // Old definition response: drop.
-        harness.forward_nav_response(
-            id_old,
-            DaemonMessage::DefinitionResponse {
-                id: id_old,
-                targets: vec![],
-            },
-        );
-        assert!(
-            nav_resp_rx.try_recv().is_err(),
-            "superseded definition response must be dropped"
-        );
-
-        // New definition response: forward.
-        harness.forward_nav_response(
-            id_new,
-            DaemonMessage::DefinitionResponse {
-                id: id_new,
-                targets: vec![],
-            },
-        );
-        assert!(
-            nav_resp_rx.try_recv().is_ok(),
-            "current definition response must be forwarded"
-        );
-    }
-
-    #[test]
-    fn test_correlation_superseded_references_response_is_dropped() {
-        let id_old = NavRequestId(20);
-        let id_new = NavRequestId(21);
-        let (nav_resp_tx, mut nav_resp_rx) = tokio::sync::mpsc::channel::<DaemonMessage>(8);
-
-        let harness = WorkerDropStaleHarness {
-            latest_hover_id: None,
-            latest_definition_id: None,
-            latest_references_id: Some(id_new),
-            nav_responses: nav_resp_tx,
-        };
-
-        harness.forward_nav_response(
-            id_old,
-            DaemonMessage::ReferencesResponse {
-                id: id_old,
-                locations: vec![],
-            },
-        );
-        assert!(
-            nav_resp_rx.try_recv().is_err(),
-            "superseded references response must be dropped"
-        );
-
-        harness.forward_nav_response(
-            id_new,
-            DaemonMessage::ReferencesResponse {
-                id: id_new,
-                locations: vec![],
-            },
-        );
-        assert!(
-            nav_resp_rx.try_recv().is_ok(),
-            "current references response must be forwarded"
-        );
-    }
-
-    /// Minimal struct for testing `forward_nav_response` without a full
-    /// `LspWorker` — only the fields the method reads.
-    struct WorkerDropStaleHarness {
-        latest_hover_id: Option<NavRequestId>,
-        latest_definition_id: Option<NavRequestId>,
-        latest_references_id: Option<NavRequestId>,
-        nav_responses: tokio::sync::mpsc::Sender<DaemonMessage>,
-    }
-
-    impl WorkerDropStaleHarness {
-        fn forward_nav_response(&self, id: NavRequestId, msg: DaemonMessage) {
-            let latest = match &msg {
-                DaemonMessage::HoverResponse { .. } => self.latest_hover_id,
-                DaemonMessage::DefinitionResponse { .. } => self.latest_definition_id,
-                DaemonMessage::ReferencesResponse { .. } => self.latest_references_id,
-                _ => return,
-            };
-            match latest {
-                Some(latest_id) if latest_id == id => {
-                    let _ = self.nav_responses.try_send(msg);
-                }
-                _ => {}
-            }
-        }
-    }
+    // Navigation drop-stale routing (per connection) is exercised in the
+    // `crates/daemon/src/lib.rs` tests, where the connection-side gate and the
+    // two-connection reply routing live (#482).
 
     // ── Worker shutdown on channel close (#497) ──────────────────────────────
 
@@ -1022,7 +828,6 @@ mod tests {
         buffer_tx: mpsc::Sender<BufferEvent>,
         diag_rx: mpsc::Receiver<LspDiagnostics>,
         nav_req_tx: mpsc::Sender<NavRequest>,
-        nav_resp_rx: mpsc::Receiver<DaemonMessage>,
     }
 
     /// A worker over an empty server table (no external process is ever
@@ -1032,7 +837,6 @@ mod tests {
         let (buffer_tx, buffer_rx) = mpsc::channel(8);
         let (diag_tx, diag_rx) = mpsc::channel(8);
         let (nav_req_tx, nav_req_rx) = mpsc::channel(8);
-        let (nav_resp_tx, nav_resp_rx) = mpsc::channel(8);
         let worker = LspWorker::new(
             PathBuf::from("."),
             DocumentSelector::with_table(&[]),
@@ -1040,14 +844,12 @@ mod tests {
             buffer_rx,
             diag_tx,
             nav_req_rx,
-            nav_resp_tx,
         );
         let channels = WorkerChannels {
             doc_tx,
             buffer_tx,
             diag_rx,
             nav_req_tx,
-            nav_resp_rx,
         };
         (worker, channels)
     }
@@ -1072,15 +874,9 @@ mod tests {
             buffer_tx,
             diag_rx,
             nav_req_tx,
-            nav_resp_rx,
         } = channels;
         drop(doc_tx);
-        assert_run_terminates(
-            worker,
-            (buffer_tx, diag_rx, nav_req_tx, nav_resp_rx),
-            "doc_changes",
-        )
-        .await;
+        assert_run_terminates(worker, (buffer_tx, diag_rx, nav_req_tx), "doc_changes").await;
     }
 
     /// Regression (#497): a closed buffer-event channel used to await
@@ -1094,15 +890,9 @@ mod tests {
             buffer_tx,
             diag_rx,
             nav_req_tx,
-            nav_resp_rx,
         } = channels;
         drop(buffer_tx);
-        assert_run_terminates(
-            worker,
-            (doc_tx, diag_rx, nav_req_tx, nav_resp_rx),
-            "buffer_events",
-        )
-        .await;
+        assert_run_terminates(worker, (doc_tx, diag_rx, nav_req_tx), "buffer_events").await;
     }
 
     /// Regression (#497): same park as `buffer_events`, on the nav path.
@@ -1114,14 +904,8 @@ mod tests {
             buffer_tx,
             diag_rx,
             nav_req_tx,
-            nav_resp_rx,
         } = channels;
         drop(nav_req_tx);
-        assert_run_terminates(
-            worker,
-            (doc_tx, buffer_tx, diag_rx, nav_resp_rx),
-            "nav_requests",
-        )
-        .await;
+        assert_run_terminates(worker, (doc_tx, buffer_tx, diag_rx), "nav_requests").await;
     }
 }
