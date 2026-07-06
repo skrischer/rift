@@ -13,7 +13,9 @@ use std::thread;
 use anyhow::{Context as _, Result};
 use gpui::*;
 use gpui_component::Root;
-use rift_app::connection_screen::{ConnectRequest, ConnectionScreen, ConnectionScreenEvent};
+use rift_app::connection_screen::{
+    ConnectError, ConnectRequest, ConnectionScreen, ConnectionScreenEvent,
+};
 use rift_app::recents::RecentConnection;
 use rift_app::{apply_persisted_theme, recents, window_state, workspace};
 use rift_logging::{
@@ -31,6 +33,11 @@ struct SshConfig {
     port: u16,
     user: String,
     key: PathBuf,
+    /// The Connection screen's passphrase field value for an encrypted key
+    /// (#478, `docs/spec-connection-robustness.md`) — `None` for a plain key.
+    /// Deliberately not `Debug`-derived on this struct: never format this
+    /// field into a log line (constitution: no secrets in logs).
+    passphrase: Option<String>,
 }
 
 // Cloned per connect attempt by the reconnect engine: flume handles are cheap
@@ -485,7 +492,7 @@ impl Shell {
     /// surfaced on the card itself (field/banner) rather than only logged.
     fn build_connection_screen(
         recents_path: Option<&Path>,
-        error: Option<String>,
+        error: Option<ConnectError>,
         window: &mut Window,
         cx: &mut Context<Shell>,
     ) -> Entity<ConnectionScreen> {
@@ -552,6 +559,7 @@ impl Shell {
             user: request.user,
             port: request.port,
             key: request.key,
+            passphrase: request.passphrase,
         };
         let session_name = request.session;
 
@@ -576,7 +584,7 @@ impl Shell {
         // (`run_session_with_reconnect`'s `end_reason`) — so the Shell can
         // route back to the Connection screen instead of leaving a dead
         // cockpit up.
-        let (session_ended_tx, session_ended_rx) = flume::unbounded::<Option<String>>();
+        let (session_ended_tx, session_ended_rx) = flume::unbounded::<Option<ConnectError>>();
 
         let font_size_px = self.font_size_px;
         let state_path = self.state_path.clone();
@@ -714,7 +722,7 @@ impl Shell {
     /// non-retryable failure) and swap it in as the window's content.
     fn return_to_connection_screen(
         &mut self,
-        reason: Option<String>,
+        reason: Option<ConnectError>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -784,8 +792,11 @@ struct SessionRunParams {
     /// field, itself prefilled from `RIFT_SESSION` (#477).
     session: String,
     /// Fires exactly once when this run's loop ends, so the Shell can route
-    /// back to a fresh Connection screen (#477).
-    session_ended_tx: flume::Sender<Option<String>>,
+    /// back to a fresh Connection screen (#477). Carries [`ConnectError::Passphrase`]
+    /// instead of [`ConnectError::General`] when the failure was the SSH key
+    /// needing (or rejecting) a passphrase (#478), so the screen points the
+    /// error at that field rather than only the general banner.
+    session_ended_tx: flume::Sender<Option<ConnectError>>,
 }
 
 fn run_session_with_reconnect(ssh: &SshConfig, params: SessionRunParams) {
@@ -805,7 +816,7 @@ fn run_session_with_reconnect(ssh: &SshConfig, params: SessionRunParams) {
     // (#477) once this loop ends — `None` for every other end (orderly tmux
     // exit, a canceled reconnect, or the render side going away), which the
     // screen treats as "no error to show", not log-only.
-    let mut end_reason: Option<String> = None;
+    let mut end_reason: Option<ConnectError> = None;
     let watches = EngineWatches {
         session: tokio::sync::watch::channel(session).0,
         viewport: tokio::sync::watch::channel(None::<TermSize>).0,
@@ -851,7 +862,7 @@ fn run_session_with_reconnect(ssh: &SshConfig, params: SessionRunParams) {
                 key_exists,
                 "SSH session failed with a non-retryable error"
             );
-            end_reason = Some(error.to_string());
+            end_reason = Some(classify_connect_error(ssh, &error));
             break;
         }
         retry = retry.saturating_add(1);
@@ -888,6 +899,33 @@ fn is_retryable_session_error(error: &anyhow::Error) -> bool {
             .downcast_ref::<rift_ssh::SshError>()
             .is_some_and(rift_ssh::SshError::is_retryable)
     })
+}
+
+/// Classify a non-retryable connect failure for the Connection screen (#478,
+/// `docs/spec-connection-robustness.md`): a wrong or missing SSH key
+/// passphrase routes to the passphrase field ([`ConnectError::Passphrase`])
+/// instead of the general banner. Two chain shapes qualify:
+/// [`rift_ssh::SshError::KeyEncrypted`] (the key needs a passphrase and none
+/// was supplied — normally caught earlier by the screen's own probe, but
+/// classified here too as the connect attempt's own ground truth) and
+/// [`rift_ssh::SshError::Key`] when this attempt actually carried a
+/// passphrase (almost certainly the wrong one — a `Key` failure with no
+/// passphrase supplied is a different problem, e.g. a corrupt or unsupported
+/// key, and stays on the general banner).
+fn classify_connect_error(ssh: &SshConfig, error: &anyhow::Error) -> ConnectError {
+    let is_passphrase_issue = error.chain().any(|cause| match cause.downcast_ref() {
+        Some(rift_ssh::SshError::KeyEncrypted) => true,
+        Some(rift_ssh::SshError::Key(_)) => ssh.passphrase.is_some(),
+        _ => false,
+    });
+    if is_passphrase_issue {
+        // `error.to_string()` would only print the `run_ssh_session` context
+        // wrapper ("SSH connection failed"), leaving the passphrase field's
+        // error uninformative; the root cause is the actionable message.
+        ConnectError::Passphrase(error.root_cause().to_string())
+    } else {
+        ConnectError::General(error.to_string())
+    }
 }
 
 /// Drop the render-side backlog that accumulated while no session was live
@@ -937,9 +975,15 @@ async fn run_ssh_session(
 ) -> Result<()> {
     use rift_ssh::SshConnection;
 
-    let mut conn = SshConnection::connect(&ssh.host, ssh.port, &ssh.user, &ssh.key)
-        .await
-        .context("SSH connection failed")?;
+    let mut conn = SshConnection::connect(
+        &ssh.host,
+        ssh.port,
+        &ssh.user,
+        &ssh.key,
+        ssh.passphrase.as_deref(),
+    )
+    .await
+    .context("SSH connection failed")?;
 
     // Provision the daemon ahead of the terminal: detect the platform, upload the
     // versioned binary when absent, then attach — spawning it detached if none is
