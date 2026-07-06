@@ -11,6 +11,14 @@ use serde::Serialize;
 /// Number of bytes in the big-endian length prefix that precedes each frame.
 const LEN_PREFIX: usize = std::mem::size_of::<u32>();
 
+/// Maximum accepted payload length of a single frame, in bytes.
+///
+/// Legitimate protocol messages stay far below this generous bound; a length
+/// prefix beyond it indicates a corrupted stream, so the decoder fails fast
+/// instead of buffering toward 4 GiB. Both transport ends treat frame errors
+/// as connection-fatal.
+pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+
 /// Errors raised while encoding or decoding a frame.
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
@@ -20,6 +28,10 @@ pub enum FrameError {
     /// A frame advertised a length that does not fit in `usize` on this target.
     #[error("frame length {0} exceeds platform addressable size")]
     LengthOverflow(u32),
+    /// A frame advertised a length beyond [`MAX_FRAME_LEN`], indicating a
+    /// corrupted length prefix.
+    #[error("frame length {0} exceeds maximum {MAX_FRAME_LEN}")]
+    FrameTooLarge(u32),
 }
 
 /// Encode a value as a single length-delimited JSON frame.
@@ -70,6 +82,9 @@ impl FrameDecoder {
         let mut len_bytes = [0u8; LEN_PREFIX];
         len_bytes.copy_from_slice(&self.buffer[..LEN_PREFIX]);
         let payload_len = u32::from_be_bytes(len_bytes);
+        if u64::from(payload_len) > MAX_FRAME_LEN as u64 {
+            return Err(FrameError::FrameTooLarge(payload_len));
+        }
         let payload_len =
             usize::try_from(payload_len).map_err(|_| FrameError::LengthOverflow(payload_len))?;
 
@@ -155,6 +170,44 @@ mod tests {
             decoder.next_frame::<Sample>().expect("complete"),
             Some(sample(7, "boundary"))
         );
+    }
+
+    #[test]
+    fn test_next_frame_length_prefix_above_max_errors_immediately() {
+        let corrupt_len = u32::MAX;
+
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&corrupt_len.to_be_bytes());
+
+        let err = decoder
+            .next_frame::<Sample>()
+            .expect_err("corrupted length prefix must error before buffering");
+        assert!(matches!(err, FrameError::FrameTooLarge(len) if len == corrupt_len));
+    }
+
+    #[test]
+    fn test_next_frame_length_prefix_just_above_max_errors_immediately() {
+        let corrupt_len = MAX_FRAME_LEN as u32 + 1;
+
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&corrupt_len.to_be_bytes());
+
+        let err = decoder
+            .next_frame::<Sample>()
+            .expect_err("length one past the bound must error");
+        assert!(matches!(err, FrameError::FrameTooLarge(len) if len == corrupt_len));
+    }
+
+    #[test]
+    fn test_next_frame_length_prefix_at_max_waits_for_payload() {
+        let max_len = MAX_FRAME_LEN as u32;
+
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&max_len.to_be_bytes());
+
+        // A frame exactly at the bound is legal: the decoder keeps waiting for
+        // the payload instead of rejecting the prefix.
+        assert_eq!(decoder.next_frame::<Sample>().expect("at bound"), None);
     }
 
     #[test]
