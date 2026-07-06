@@ -1,14 +1,3 @@
-// `cargo clippy -p rift-app --features gallery --all-targets` (the only CI
-// path that ever type-checks `rift_app`'s test targets — the default `Check`
-// job runs `--exclude rift-app`) hits the default 128 recursion limit once
-// #477's two new test modules (`connection_screen.rs`, `recents.rs`) add to
-// the crate's existing test surface. 256 was not enough headroom (the
-// compiler's own worker thread overflowed its native stack partway through
-// re-attempting at the higher bound); 1024 is a deliberately generous ceiling
-// so this doesn't need re-tuning every time a future PR adds a handful more
-// tests to this crate.
-#![recursion_limit = "1024"]
-
 use std::collections::HashMap;
 use std::rc::Rc;
 
