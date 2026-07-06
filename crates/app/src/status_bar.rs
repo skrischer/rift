@@ -3,7 +3,8 @@
 //! (`docs/spec-status-bar.md`). Renders two groups: the left group is the
 //! current git branch plus its ahead/behind counts against the upstream,
 //! sourced from `WorktreeModel::branch()` / `ahead_behind()` (`RepoState`
-//! folds); the right group is the aggregate error/warning diagnostic counts,
+//! folds) and shown only once a `RepoState` has actually arrived (#490);
+//! the right group is the aggregate error/warning diagnostic counts,
 //! aggregated locally from `WorktreeModel::all_diagnostics()` (`Diagnostics`
 //! folds) — the shared `DiagnosticSeverity` derives no `Ord`, so the counting
 //! (unlike `problems_panel`'s sorted grouping) needs no ordinal, just a match
@@ -29,25 +30,35 @@ use rift_terminal::{
 /// competing with the dock area for vertical space.
 const HEIGHT: f32 = 24.0;
 
-/// Label shown when there is no branch to report: HEAD is detached, or the
-/// worktree is not a git repo. The client cannot tell the two apart — both
-/// collapse to a `None` `RepoState.branch` (`crates/protocol/src/lib.rs`) — so
-/// one muted indicator covers both, per the spec's degrade-cleanly outcome.
+/// Label shown when a received `RepoState` carries no branch. The daemon only
+/// emits `RepoState` for git-repo roots, so once one has arrived a `None`
+/// branch genuinely means a detached HEAD — while no `RepoState` has arrived
+/// (startup, not connected, non-repo root) the segment is omitted entirely
+/// instead of claiming this (#490).
 const NO_BRANCH_LABEL: &str = "detached HEAD";
 
-/// Format the branch + ahead/behind label. The ahead/behind counts are
-/// appended only when there is something to show: a `None` `ahead_behind` (no
-/// upstream) or an up-to-date `0`/`0` both omit them, mirroring git's own
-/// porcelain output (`git status` drops the bracket when there is nothing to
-/// report).
-fn segment_text(branch: Option<&str>, ahead_behind: Option<AheadBehind>) -> String {
+/// Format the branch + ahead/behind label, or `None` while no `RepoState` has
+/// arrived — startup, a lost connection, and non-repo roots all make no branch
+/// claim rather than fabricating "detached HEAD" (#490). The ahead/behind
+/// counts are appended only when there is something to show: a `None`
+/// `ahead_behind` (no upstream) or an up-to-date `0`/`0` both omit them,
+/// mirroring git's own porcelain output (`git status` drops the bracket when
+/// there is nothing to report).
+fn segment_text(
+    repo_state_received: bool,
+    branch: Option<&str>,
+    ahead_behind: Option<AheadBehind>,
+) -> Option<String> {
+    if !repo_state_received {
+        return None;
+    }
     let mut text = branch.unwrap_or(NO_BRANCH_LABEL).to_owned();
     if let Some(AheadBehind { ahead, behind }) = ahead_behind {
         if ahead > 0 || behind > 0 {
             text.push_str(&format!(" \u{2191}{ahead} \u{2193}{behind}"));
         }
     }
-    text
+    Some(text)
 }
 
 /// Total error/warning diagnostic counts across every file and server in the
@@ -98,14 +109,18 @@ fn diagnostics_text(errors: usize, warnings: usize) -> Option<String> {
 
 /// Render the status bar strip: the left group (branch + ahead/behind) and
 /// the right group (aggregate diagnostic counts), pushed apart by a flexible
-/// spacer. A missing branch (detached HEAD / no repo) renders muted; zero
-/// diagnostics omits the right group entirely — neither is ever a crash.
+/// spacer. Until a `RepoState` arrives the left group is omitted entirely
+/// (no branch claim at startup or on non-repo roots, #490); a received state
+/// without a branch (detached HEAD) renders muted; zero diagnostics omits
+/// the right group entirely — none of these is ever a crash.
 pub fn render(
+    repo_state_received: bool,
     branch: Option<&str>,
     ahead_behind: Option<AheadBehind>,
     diagnostics: &BTreeMap<String, BTreeMap<String, Vec<Diagnostic>>>,
     cx: &App,
 ) -> impl IntoElement {
+    let branch_text = segment_text(repo_state_received, branch, ahead_behind);
     let branch_color = if branch.is_some() {
         cx.theme().foreground
     } else {
@@ -120,7 +135,7 @@ pub fn render(
         cx.theme().warning
     };
 
-    let bar = div()
+    let mut bar = div()
         .flex()
         .flex_shrink_0()
         .items_center()
@@ -130,13 +145,12 @@ pub fn render(
         .border_t_1()
         .border_color(cx.theme().border)
         .bg(cx.theme().background)
-        .text_xs()
-        .child(
-            div()
-                .text_color(branch_color)
-                .child(segment_text(branch, ahead_behind)),
-        )
-        .child(div().flex_1());
+        .text_xs();
+
+    if let Some(text) = branch_text {
+        bar = bar.child(div().text_color(branch_color).child(text));
+    }
+    let bar = bar.child(div().flex_1());
 
     match counts_text {
         Some(text) => bar.child(div().text_color(counts_color).child(text)),
@@ -338,25 +352,41 @@ mod tests {
 
     #[test]
     fn test_segment_text_shows_branch_name_when_present_with_no_upstream() {
-        assert_eq!(segment_text(Some("main"), None), "main");
+        assert_eq!(
+            segment_text(true, Some("main"), None),
+            Some("main".to_owned())
+        );
     }
 
     #[test]
-    fn test_segment_text_shows_muted_indicator_when_detached_or_no_repo() {
-        assert_eq!(segment_text(None, None), "detached HEAD");
+    fn test_segment_text_before_repo_state_arrives_is_hidden() {
+        // Startup / not connected / non-repo root: no `RepoState` has arrived,
+        // so there is no branch claim to make — never "detached HEAD" (#490).
+        assert_eq!(segment_text(false, None, None), None);
+    }
+
+    #[test]
+    fn test_segment_text_shows_detached_head_only_after_repo_state_arrived() {
+        // A received `RepoState` without a branch genuinely means a detached
+        // HEAD — the daemon only emits `RepoState` for repo roots.
+        assert_eq!(
+            segment_text(true, None, None),
+            Some("detached HEAD".to_owned())
+        );
     }
 
     #[test]
     fn test_segment_text_appends_ahead_behind_counts() {
         assert_eq!(
             segment_text(
+                true,
                 Some("main"),
                 Some(AheadBehind {
                     ahead: 2,
                     behind: 1
                 })
             ),
-            "main \u{2191}2 \u{2193}1"
+            Some("main \u{2191}2 \u{2193}1".to_owned())
         );
     }
 
@@ -364,13 +394,14 @@ mod tests {
     fn test_segment_text_omits_ahead_behind_when_up_to_date() {
         assert_eq!(
             segment_text(
+                true,
                 Some("main"),
                 Some(AheadBehind {
                     ahead: 0,
                     behind: 0
                 })
             ),
-            "main"
+            Some("main".to_owned())
         );
     }
 
@@ -378,13 +409,14 @@ mod tests {
     fn test_segment_text_includes_both_counts_when_only_one_side_is_nonzero() {
         assert_eq!(
             segment_text(
+                true,
                 Some("main"),
                 Some(AheadBehind {
                     ahead: 3,
                     behind: 0
                 })
             ),
-            "main \u{2191}3 \u{2193}0"
+            Some("main \u{2191}3 \u{2193}0".to_owned())
         );
     }
 
@@ -395,13 +427,14 @@ mod tests {
         // that combination away — it just composes the two independently.
         assert_eq!(
             segment_text(
+                true,
                 None,
                 Some(AheadBehind {
                     ahead: 1,
                     behind: 0
                 })
             ),
-            "detached HEAD \u{2191}1 \u{2193}0"
+            Some("detached HEAD \u{2191}1 \u{2193}0".to_owned())
         );
     }
 
