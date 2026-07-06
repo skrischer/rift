@@ -15,8 +15,10 @@
 //! - **Multi-server-per-language**: two specs targeting the same language both
 //!   start and get distinct [`ServerId`]s, addressable independently.
 //! - **Supervision**: a server that has exited is restarted lazily on the next
-//!   matching change, throttled by per-binary exponential backoff; the daemon
-//!   never panics on a server crash.
+//!   matching change, throttled by per-binary exponential backoff; an instance
+//!   must outlive a short liveness window to clear its backoff, so one that
+//!   survives `initialize` but then crash-loops at runtime stays throttled
+//!   (issue #273). The daemon never panics on a server crash.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -33,13 +35,21 @@ use crate::server::{Server, ServerId};
 use crate::{LspError, Result};
 
 /// First retry delay after a server exit. Doubles on each consecutive failed
-/// restart up to [`MAX_BACKOFF`]; a restart that initializes successfully clears
-/// the backoff for that binary.
+/// restart up to [`MAX_BACKOFF`]; the backoff clears only once a restarted
+/// instance outlives [`LIVENESS_WINDOW`], not the moment it initializes.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Ceiling for the exponential restart backoff — a server that keeps crashing is
 /// retried at most this often, so a restart-storm cannot busy-spawn.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// How long a (re)started server must stay up before its restart backoff is
+/// considered earned-clear. An instance that exits within this window of its
+/// spawn is treated as crash-looping — its backoff escalates rather than
+/// resets — so a server that survives `initialize` but then dies at runtime is
+/// still throttled (issue #273). An instance that outlives the window has
+/// proven stable and clears the backoff.
+const LIVENESS_WINDOW: Duration = Duration::from_secs(5);
 
 /// Per-binary restart-backoff bookkeeping. Keyed by [`ServerName`] so a crash of
 /// one server does not throttle an unrelated one.
@@ -205,8 +215,11 @@ impl Registry {
 
         match self.start(spec).await {
             Ok(id) => {
-                // A clean start clears the throttle for this binary.
-                self.backoff.remove(spec.binary);
+                // The backoff is NOT cleared here: a successful `initialize` is
+                // not proof of stability. A server that starts but then
+                // crash-loops at runtime must stay throttled, so the backoff
+                // clears only once the instance outlives the liveness window —
+                // decided in `note_exit` when it is pruned (issue #273).
                 Some(id)
             }
             Err(LspError::Spawn { .. }) => {
@@ -261,8 +274,12 @@ impl Registry {
     }
 
     /// Drop servers whose main loop has ended, removing them from both the store
-    /// and the language index so the next matching change restarts them.
+    /// and the language index so the next matching change restarts them. Each
+    /// exit updates the per-binary backoff through [`Registry::note_exit`],
+    /// escalating it for a crash-looping instance and clearing it for one that
+    /// stayed up.
     fn prune_dead(&mut self) {
+        let now = Instant::now();
         let dead: Vec<ServerId> = self
             .servers
             .iter()
@@ -275,13 +292,30 @@ impl Registry {
                     ids.retain(|other| *other != id);
                 }
                 self.pruned.push(id);
+                let alive = now.saturating_duration_since(server.started_at());
+                self.note_exit(server.name(), alive);
                 info!(
                     server = server.name(),
                     language = server.language(),
                     id = id.0,
+                    alive_secs = alive.as_secs_f64(),
                     "language server exited; pruned, will restart on the next matching change"
                 );
             }
+        }
+    }
+
+    /// Fold a just-pruned instance's lifetime into the per-binary backoff. An
+    /// instance that outlived [`LIVENESS_WINDOW`] proved stable, so its backoff
+    /// clears and the next restart is immediate. One that died within the window
+    /// is crash-looping, so its backoff escalates via [`Registry::bump_backoff`]
+    /// — this is what keeps a server that survives `initialize` but then dies at
+    /// runtime throttled, rather than restarted unbounded (issue #273).
+    fn note_exit(&mut self, binary: ServerName, alive: Duration) {
+        if alive >= LIVENESS_WINDOW {
+            self.backoff.remove(binary);
+        } else {
+            self.bump_backoff(binary);
         }
     }
 
@@ -457,5 +491,45 @@ mod tests {
         // restart is skipped before any spawn attempt).
         reg.observe(Path::new("a.rs")).await;
         assert_eq!(reg.backoff[binary].next_attempt, first);
+    }
+
+    #[tokio::test]
+    async fn test_exit_within_liveness_window_escalates_backoff() {
+        let mut reg = registry(MISSING);
+        let binary = MISSING[0].binary;
+        // A server that dies well within the liveness window is crash-looping:
+        // the exit must arm a throttle even though its `initialize` succeeded.
+        reg.note_exit(binary, Duration::from_millis(50));
+        assert!(
+            reg.backoff.contains_key(binary),
+            "a crash-loop exit arms the backoff"
+        );
+        assert!(
+            !reg.backoff_elapsed(binary),
+            "the throttle window blocks an immediate restart"
+        );
+        let first_delay = reg.backoff[binary].delay;
+        // A second fast exit escalates the delay — exponential, not flat.
+        reg.note_exit(binary, Duration::from_millis(50));
+        assert!(
+            reg.backoff[binary].delay > first_delay,
+            "consecutive crash-loop exits escalate the backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exit_after_liveness_window_clears_backoff() {
+        let mut reg = registry(MISSING);
+        let binary = MISSING[0].binary;
+        // Seed an escalated throttle as if the binary had crash-looped before.
+        reg.bump_backoff(binary);
+        assert!(reg.backoff.contains_key(binary));
+        // An instance that outlived the window proved stable: its exit clears
+        // the backoff so the next restart is not throttled.
+        reg.note_exit(binary, LIVENESS_WINDOW);
+        assert!(
+            !reg.backoff.contains_key(binary),
+            "a server that stayed up clears its backoff"
+        );
     }
 }
