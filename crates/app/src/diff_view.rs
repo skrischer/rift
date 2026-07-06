@@ -259,6 +259,26 @@ impl DiffView {
         }
     }
 
+    /// React to an `UpdateWorktree` tick for the currently open diff's path
+    /// (#488): a content-only edit to an already-tracked file leaves its git
+    /// status unchanged (`M` stays `M`), so `git_delta_messages` (daemon
+    /// `crates/daemon/src/lib.rs`) never emits an `UpdateGitStatus` for it and
+    /// `apply_git_update` alone never re-requests — an agent iterating on an
+    /// open file's content leaves the diff stale. `UpdateWorktree` fires on
+    /// every disk write regardless of git status (file-watch, not git-status,
+    /// driven), so re-requesting here catches the content-only case that
+    /// `apply_git_update` misses. `open_diff`'s same-path branch keeps the
+    /// rendered diff visible until the reply swaps it in — no loading flash.
+    /// A no-op when no diff is open or `changed` does not mention it.
+    pub fn apply_content_update(&mut self, changed: &[String], cx: &mut Context<Self>) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        if changed.iter().any(|changed_path| changed_path == &path) {
+            self.open_diff(path, cx);
+        }
+    }
+
     /// Empty the view and forget the open path: the file it was showing left
     /// the changed set (e.g. a commit landed), so there is nothing left to
     /// review. No request is sent — mirrors `open_diff`'s state assignment in
@@ -734,6 +754,86 @@ mod tests {
         cx.update(|cx| {
             diff_view.update(cx, |view, cx| {
                 view.apply_git_update(&["a.rs".to_owned()], &["b.rs".to_owned()], cx);
+            });
+        });
+
+        assert!(
+            rx.try_recv().is_err(),
+            "no diff open means no request is sent"
+        );
+        cx.update(|cx| {
+            assert!(diff_view.read(cx).path.is_none());
+        });
+    }
+
+    // --- DiffView::apply_content_update (#488) ---
+
+    #[gpui::test]
+    fn test_apply_content_update_refreshes_the_open_path_on_a_content_only_change(
+        cx: &mut TestAppContext,
+    ) {
+        let (tx, rx) = flume::unbounded();
+        let diff_view = cx.update(|cx| cx.new(|cx| DiffView::new(tx, cx)));
+
+        cx.update(|cx| {
+            diff_view.update(cx, |view, cx| view.open_diff("a.rs".to_owned(), cx));
+        });
+        assert_eq!(
+            rx.try_recv().expect("open_diff sends the initial request"),
+            "a.rs"
+        );
+
+        cx.update(|cx| {
+            diff_view.update(cx, |view, cx| {
+                view.apply_content_update(&["a.rs".to_owned()], cx);
+            });
+        });
+
+        assert_eq!(
+            rx.try_recv()
+                .expect("a content-only tick for the open path re-requests its diff"),
+            "a.rs"
+        );
+        cx.update(|cx| {
+            assert_eq!(diff_view.read(cx).path.as_deref(), Some("a.rs"));
+        });
+    }
+
+    #[gpui::test]
+    fn test_apply_content_update_ignores_a_tick_that_does_not_mention_the_open_path(
+        cx: &mut TestAppContext,
+    ) {
+        let (tx, rx) = flume::unbounded();
+        let diff_view = cx.update(|cx| cx.new(|cx| DiffView::new(tx, cx)));
+
+        cx.update(|cx| {
+            diff_view.update(cx, |view, cx| view.open_diff("a.rs".to_owned(), cx));
+        });
+        rx.try_recv().expect("open_diff sends the initial request");
+
+        cx.update(|cx| {
+            diff_view.update(cx, |view, cx| {
+                view.apply_content_update(&["b.rs".to_owned()], cx);
+            });
+        });
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a tick for an unrelated path sends no new diff request"
+        );
+        cx.update(|cx| {
+            assert_eq!(diff_view.read(cx).path.as_deref(), Some("a.rs"));
+        });
+    }
+
+    #[gpui::test]
+    fn test_apply_content_update_is_a_no_op_when_no_diff_is_open(cx: &mut TestAppContext) {
+        let (tx, rx) = flume::unbounded();
+        let diff_view = cx.update(|cx| cx.new(|cx| DiffView::new(tx, cx)));
+
+        cx.update(|cx| {
+            diff_view.update(cx, |view, cx| {
+                view.apply_content_update(&["a.rs".to_owned()], cx);
             });
         });
 
