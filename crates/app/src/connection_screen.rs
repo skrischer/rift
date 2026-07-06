@@ -49,6 +49,21 @@ pub struct ConnectDefaults {
     pub session: String,
 }
 
+/// Explicit inputs to [`resolve_defaults`], grouped into a struct so the
+/// function stays under clippy's argument-count threshold — every field
+/// mirrors one live-environment input [`live_defaults`] reads.
+#[derive(Default)]
+pub struct DefaultsInputs<'a> {
+    pub host: Option<&'a str>,
+    pub user: Option<&'a str>,
+    pub port: Option<&'a str>,
+    pub key: Option<&'a str>,
+    pub baked_key: Option<&'a str>,
+    pub home: Option<&'a str>,
+    pub session: Option<&'a str>,
+    pub windows: bool,
+}
+
 /// Resolve the connect card's prefill values from explicit inputs (pure, for
 /// tests) — [`live_defaults`] wraps this with the live environment. Mirrors
 /// the pre-#477 inline `SshConfig` resolution in `main.rs` verbatim (no
@@ -56,24 +71,19 @@ pub struct ConnectDefaults {
 /// var is entirely unset, never on an empty-but-set value, and an unparsable
 /// port silently falls back to [`DEFAULT_PORT`] rather than surfacing an
 /// error this far back.
-pub fn resolve_defaults(
-    host: Option<&str>,
-    user: Option<&str>,
-    port: Option<&str>,
-    key: Option<&str>,
-    baked_key: Option<&str>,
-    home: Option<&str>,
-    session: Option<&str>,
-    windows: bool,
-) -> ConnectDefaults {
-    let host = host.unwrap_or(DEFAULT_HOST).to_string();
-    let user = user.unwrap_or(DEFAULT_USER).to_string();
-    let port = port.and_then(|p| p.parse().ok()).unwrap_or(DEFAULT_PORT);
-    let key = key
-        .or(baked_key)
+pub fn resolve_defaults(inputs: DefaultsInputs) -> ConnectDefaults {
+    let host = inputs.host.unwrap_or(DEFAULT_HOST).to_string();
+    let user = inputs.user.unwrap_or(DEFAULT_USER).to_string();
+    let port = inputs
+        .port
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(DEFAULT_PORT);
+    let key = inputs
+        .key
+        .or(inputs.baked_key)
         .map(PathBuf::from)
-        .unwrap_or_else(|| default_key_path(home, windows));
-    let session = session.unwrap_or(DEFAULT_SESSION).to_string();
+        .unwrap_or_else(|| default_key_path(inputs.home, inputs.windows));
+    let session = inputs.session.unwrap_or(DEFAULT_SESSION).to_string();
 
     ConnectDefaults {
         host,
@@ -110,16 +120,16 @@ pub fn live_defaults() -> ConnectDefaults {
         .ok();
     let session = std::env::var("RIFT_SESSION").ok();
 
-    resolve_defaults(
-        host.as_deref(),
-        user.as_deref(),
-        port.as_deref(),
-        key.as_deref(),
-        option_env!("RIFT_DEFAULT_SSH_KEY"),
-        home.as_deref(),
-        session.as_deref(),
-        cfg!(target_os = "windows"),
-    )
+    resolve_defaults(DefaultsInputs {
+        host: host.as_deref(),
+        user: user.as_deref(),
+        port: port.as_deref(),
+        key: key.as_deref(),
+        baked_key: option_env!("RIFT_DEFAULT_SSH_KEY"),
+        home: home.as_deref(),
+        session: session.as_deref(),
+        windows: cfg!(target_os = "windows"),
+    })
 }
 
 /// A submitted connect attempt: the Connect button, Enter in any field, or a
@@ -635,7 +645,7 @@ mod tests {
 
     #[test]
     fn test_resolve_defaults_uses_hardcoded_defaults_when_nothing_is_set() {
-        let defaults = resolve_defaults(None, None, None, None, None, None, None, false);
+        let defaults = resolve_defaults(DefaultsInputs::default());
 
         assert_eq!(defaults.host, DEFAULT_HOST);
         assert_eq!(defaults.user, DEFAULT_USER);
@@ -651,16 +661,16 @@ mod tests {
 
     #[test]
     fn test_resolve_defaults_uses_every_explicit_value_when_set() {
-        let defaults = resolve_defaults(
-            Some("100.64.0.1"),
-            Some("alice"),
-            Some("2222"),
-            Some("/keys/mine"),
-            Some("/keys/baked"),
-            Some("/home/alice"),
-            Some("work"),
-            false,
-        );
+        let defaults = resolve_defaults(DefaultsInputs {
+            host: Some("100.64.0.1"),
+            user: Some("alice"),
+            port: Some("2222"),
+            key: Some("/keys/mine"),
+            baked_key: Some("/keys/baked"),
+            home: Some("/home/alice"),
+            session: Some("work"),
+            windows: false,
+        });
 
         assert_eq!(defaults.host, "100.64.0.1");
         assert_eq!(defaults.user, "alice");
@@ -671,55 +681,41 @@ mod tests {
 
     #[test]
     fn test_resolve_defaults_unparsable_port_falls_back_to_default() {
-        let defaults = resolve_defaults(
-            None,
-            None,
-            Some("not-a-port"),
-            None,
-            None,
-            None,
-            None,
-            false,
-        );
+        let defaults = resolve_defaults(DefaultsInputs {
+            port: Some("not-a-port"),
+            ..Default::default()
+        });
 
         assert_eq!(defaults.port, DEFAULT_PORT);
     }
 
     #[test]
     fn test_resolve_defaults_prefers_runtime_key_over_baked_default() {
-        let defaults = resolve_defaults(
-            None,
-            None,
-            None,
-            Some("/keys/runtime"),
-            Some("/keys/baked"),
-            None,
-            None,
-            false,
-        );
+        let defaults = resolve_defaults(DefaultsInputs {
+            key: Some("/keys/runtime"),
+            baked_key: Some("/keys/baked"),
+            ..Default::default()
+        });
 
         assert_eq!(defaults.key, PathBuf::from("/keys/runtime"));
     }
 
     #[test]
     fn test_resolve_defaults_falls_back_to_baked_key_when_runtime_unset() {
-        let defaults = resolve_defaults(
-            None,
-            None,
-            None,
-            None,
-            Some("/keys/baked"),
-            None,
-            None,
-            false,
-        );
+        let defaults = resolve_defaults(DefaultsInputs {
+            baked_key: Some("/keys/baked"),
+            ..Default::default()
+        });
 
         assert_eq!(defaults.key, PathBuf::from("/keys/baked"));
     }
 
     #[test]
     fn test_resolve_defaults_windows_home_fallback_when_home_unset() {
-        let defaults = resolve_defaults(None, None, None, None, None, None, None, true);
+        let defaults = resolve_defaults(DefaultsInputs {
+            windows: true,
+            ..Default::default()
+        });
 
         assert_eq!(
             defaults.key,
