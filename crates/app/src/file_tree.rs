@@ -18,7 +18,9 @@
 //! path — the clean signal the editor surface (#187) subscribes to. Rows carry
 //! git status and diagnostic severity from the model, rolled up onto ancestor
 //! directories (`compute_rollup`, #329) so a collapsed folder still surfaces a
-//! modified/errored descendant. No rich operations (create/rename/delete/move)
+//! modified/errored descendant; a deleted tracked file, whose own row is gone,
+//! rolls its status up onto surviving ancestors the same way (#480).
+//! No rich operations (create/rename/delete/move)
 //! live here — that stays a later explorer-panel sub-spec. Selecting changes no
 //! tmux pane/window state — this is a pure GUI surface, agent-agnostic by
 //! construction (it only ever reads file paths, kinds, git status, diagnostics,
@@ -137,9 +139,12 @@ struct Row {
 
 /// A directory's or file's rolled-up git status, ordered by the roll-up's
 /// rendering precedence (`docs/spec-explorer-panel.md`: `conflicted > changed
-/// > untracked > clean`). Declared low-to-high so `Option<GitRollupStatus>`'s
-/// derived `Ord` (`None` sorts below every variant, standing in for "clean")
-/// lets [`Rollup::merge`] pick the worst of two with a plain `max`.
+/// > untracked > clean`). A deleted tracked file rolls up under `changed`
+/// (the same affordance as modified/added/renamed, per that spec) — #480 only
+/// adds the ancestor roll-up, not a new lane. Declared low-to-high so
+/// `Option<GitRollupStatus>`'s derived `Ord` (`None` sorts below every variant,
+/// standing in for "clean") lets [`Rollup::merge`] pick the worst of two with a
+/// plain `max`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum GitRollupStatus {
     Untracked,
@@ -151,7 +156,8 @@ impl GitRollupStatus {
     /// Classify one path's raw index/worktree status into the roll-up's
     /// three-way precedence. `None` (clean on both sides) is never actually
     /// sent by the daemon (`WorktreeModel::apply_git_update`'s doc), but is
-    /// handled rather than assumed away.
+    /// handled rather than assumed away. A deletion is a non-`Unmodified`
+    /// status, so it classifies as `Changed` via the catch-all.
     fn from_status(status: GitEntryStatus) -> Option<Self> {
         if status.index == GitStatusCode::Unmerged || status.worktree == GitStatusCode::Unmerged {
             Some(Self::Conflicted)
@@ -244,7 +250,10 @@ impl Rollup {
 /// Compute every path's rolled-up git status + diagnostic severity in a
 /// single pass over the model's full entry set — deliberately *not* the
 /// collapse-filtered visible set, since a collapsed directory must still
-/// surface a hidden descendant's status.
+/// surface a hidden descendant's status. A trailing pass folds in git
+/// statuses whose path has left the tree (deleted tracked files, #480): they
+/// have no row of their own, so their status rolls up onto every surviving
+/// ancestor directory instead.
 ///
 /// Tracks currently open ancestor directories by their `dir/` prefix, mirroring
 /// [`FileTree::visible_rows`]'s `skip_prefix` — *not* by depth. Depth alone is
@@ -290,6 +299,30 @@ fn compute_rollup(model: &WorktreeModel) -> HashMap<String, Rollup> {
 
         if entry.kind == EntryKind::Dir {
             open_dirs.push((format!("{path}/"), path.clone()));
+        }
+    }
+
+    // Deleted tracked files have no tree entry anymore (the worktree update
+    // removed it), so the pass above never sees them — but the model still
+    // holds their git status (a `Deleted` code, classified as `Changed`). Roll
+    // each tree-absent status path up onto its surviving ancestor directories
+    // so the deletion stays visible in the explorer (#480). No severity here:
+    // diagnostics are keyed to live files, and a gone path contributes none.
+    for (path, status) in model.git_statuses() {
+        if model.get(path).is_some() {
+            continue;
+        }
+        let Some(git_status) = GitRollupStatus::from_status(*status) else {
+            continue;
+        };
+        let own = Rollup {
+            git_status: Some(git_status),
+            severity: None,
+        };
+        for ancestor in ancestor_dirs(path) {
+            if model.get(ancestor).is_some() {
+                result.entry(ancestor.to_owned()).or_default().merge(own);
+            }
         }
     }
 
@@ -1188,6 +1221,38 @@ mod tests {
     }
 
     #[test]
+    fn test_git_rollup_status_from_status_deleted_on_either_side_maps_to_changed() {
+        use GitStatusCode::{Deleted, Unmerged, Unmodified};
+
+        // Unstaged deletion (the common case: file removed from the worktree):
+        // rolls up under the shared `changed` lane, per spec-explorer-panel.md.
+        assert_eq!(
+            GitRollupStatus::from_status(GitEntryStatus {
+                index: Unmodified,
+                worktree: Deleted
+            }),
+            Some(GitRollupStatus::Changed)
+        );
+        // Staged deletion.
+        assert_eq!(
+            GitRollupStatus::from_status(GitEntryStatus {
+                index: Deleted,
+                worktree: Unmodified
+            }),
+            Some(GitRollupStatus::Changed)
+        );
+        // A conflict still outranks a deletion on the other side.
+        assert_eq!(
+            GitRollupStatus::from_status(GitEntryStatus {
+                index: Deleted,
+                worktree: Unmerged
+            }),
+            Some(GitRollupStatus::Conflicted)
+        );
+        assert_eq!(GitRollupStatus::Changed.badge(), "M");
+    }
+
+    #[test]
     fn test_worse_severity_orders_error_above_warning_above_information_above_hint() {
         use DiagnosticSeverity::{Error, Hint, Information, Warning};
 
@@ -1397,6 +1462,177 @@ mod tests {
             rollup.get("src").copied().unwrap_or_default(),
             Rollup::default()
         );
+    }
+
+    // --- deleted tracked files: changed roll-up onto surviving ancestors (#480) ---
+
+    #[test]
+    fn test_compute_rollup_deleted_path_absent_from_tree_marks_surviving_ancestors() {
+        // `a/b/gone.rs` was deleted: its tree entry is gone, but the git
+        // recompute still reports it as worktree-deleted. Both surviving
+        // ancestors must carry the changed roll-up; the clean sibling stays clean.
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk(
+            "/proj".into(),
+            vec![dir("a"), dir("a/b"), file("a/b/keep.rs")],
+            true,
+        );
+        model.apply_git_update(
+            vec![git_entry(
+                "a/b/gone.rs",
+                GitStatusCode::Unmodified,
+                GitStatusCode::Deleted,
+            )],
+            vec![],
+        );
+
+        let rollup = compute_rollup(&model);
+        let at = |path: &str| rollup.get(path).copied().unwrap_or_default();
+
+        let changed = Rollup {
+            git_status: Some(GitRollupStatus::Changed),
+            severity: None,
+        };
+        assert_eq!(at("a"), changed);
+        assert_eq!(at("a/b"), changed);
+        assert_eq!(at("a/b/keep.rs"), Rollup::default());
+        // The gone path itself gets no entry — there is no row to decorate.
+        assert!(!rollup.contains_key("a/b/gone.rs"));
+    }
+
+    #[test]
+    fn test_compute_rollup_deleted_subtree_skips_ancestors_that_also_left_the_tree() {
+        // The whole `a/b` directory was deleted with its file: only the
+        // surviving ancestor `a` is marked; no phantom `a/b` roll-up appears.
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk("/proj".into(), vec![dir("a"), file("a/keep.rs")], true);
+        model.apply_git_update(
+            vec![git_entry(
+                "a/b/gone.rs",
+                GitStatusCode::Unmodified,
+                GitStatusCode::Deleted,
+            )],
+            vec![],
+        );
+
+        let rollup = compute_rollup(&model);
+        assert_eq!(
+            rollup.get("a").copied().unwrap_or_default(),
+            Rollup {
+                git_status: Some(GitRollupStatus::Changed),
+                severity: None,
+            }
+        );
+        assert!(!rollup.contains_key("a/b"));
+    }
+
+    #[test]
+    fn test_compute_rollup_deleted_and_modified_share_the_changed_lane() {
+        // `src` holds both an ordinary edit and a deletion; both classify as
+        // `Changed`, so the shared ancestor carries the changed roll-up.
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk("/proj".into(), vec![dir("src"), file("src/kept.rs")], true);
+        model.apply_git_update(
+            vec![
+                git_entry(
+                    "src/kept.rs",
+                    GitStatusCode::Unmodified,
+                    GitStatusCode::Modified,
+                ),
+                git_entry(
+                    "src/gone.rs",
+                    GitStatusCode::Unmodified,
+                    GitStatusCode::Deleted,
+                ),
+            ],
+            vec![],
+        );
+
+        let rollup = compute_rollup(&model);
+        assert_eq!(
+            rollup.get("src").copied().unwrap_or_default().git_status,
+            Some(GitRollupStatus::Changed)
+        );
+    }
+
+    #[test]
+    fn test_compute_rollup_deleted_top_level_path_without_ancestors_adds_nothing() {
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk("/proj".into(), vec![file("keep.rs")], true);
+        model.apply_git_update(
+            vec![git_entry(
+                "gone.rs",
+                GitStatusCode::Unmodified,
+                GitStatusCode::Deleted,
+            )],
+            vec![],
+        );
+
+        let rollup = compute_rollup(&model);
+        assert_eq!(
+            rollup.get("keep.rs").copied().unwrap_or_default(),
+            Rollup::default()
+        );
+        assert!(!rollup.contains_key("gone.rs"));
+    }
+
+    #[test]
+    fn test_compute_rollup_deleted_rollup_clears_when_the_status_clears() {
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk("/proj".into(), vec![dir("src"), file("src/keep.rs")], true);
+        model.apply_git_update(
+            vec![git_entry(
+                "src/gone.rs",
+                GitStatusCode::Unmodified,
+                GitStatusCode::Deleted,
+            )],
+            vec![],
+        );
+        assert_eq!(
+            compute_rollup(&model)
+                .get("src")
+                .copied()
+                .unwrap_or_default()
+                .git_status,
+            Some(GitRollupStatus::Changed)
+        );
+
+        // The deletion gets committed (or restored): the recompute clears it.
+        model.apply_git_update(vec![], vec!["src/gone.rs".into()]);
+        assert_eq!(
+            compute_rollup(&model)
+                .get("src")
+                .copied()
+                .unwrap_or_default(),
+            Rollup::default()
+        );
+    }
+
+    #[test]
+    fn test_dir_row_carries_the_changed_rollup_after_a_tracked_file_deletion() {
+        // End-to-end through the view: fold the same message sequence the
+        // daemon sends on a deletion (worktree update removing the entry,
+        // then the git recompute reporting it deleted) and check the parent
+        // directory's rendered row carries the changed decoration.
+        let mut tree = seed(vec![dir("src"), file("src/gone.rs"), file("top.rs")]);
+        tree.model_mut()
+            .apply_update(vec![], vec![], vec!["src/gone.rs".into()]);
+        tree.model_mut().apply_git_update(
+            vec![git_entry(
+                "src/gone.rs",
+                GitStatusCode::Unmodified,
+                GitStatusCode::Deleted,
+            )],
+            vec![],
+        );
+
+        let rows = tree.visible_rows();
+        let visible: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(visible, vec!["src", "top.rs"]);
+
+        let src_row = rows.iter().find(|r| r.path == "src").expect("src row");
+        assert_eq!(src_row.git_status, Some(GitRollupStatus::Changed));
+        assert_eq!(src_row.severity, None);
     }
 
     #[test]
