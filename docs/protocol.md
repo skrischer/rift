@@ -143,7 +143,7 @@ streams pane bytes and layout state back.
   "panes": [ <pane>, ... ]
 }
 // <pane>  (PaneLayout) — geometry in terminal cells, offset from the window's top-left
-{ "pane_id": 0, "active": true, "left": 0, "top": 0, "width": 80, "height": 24 }
+{ "pane_id": 0, "active": true, "left": 0, "top": 0, "width": 80, "height": 24, "is_shell": true }
 ```
 
 - `pane_output` carries **raw terminal bytes, not cells** (the VTE-location spike
@@ -160,6 +160,11 @@ streams pane bytes and layout state back.
 - `layout_update` is the **full latest layout** after a structural change (window
   add/close, pane split/resize, active-window switch) — a replace, not a delta, so
   applying it is idempotent.
+- `PaneLayout.is_shell` is tmux's own `#{==:#{pane_current_command},#{b:default-shell}}`
+  format comparison (`LAYOUT_QUERY`, `crates/daemon/src/terminal.rs`) — the pane's
+  foreground command against the basename of its session's `default-shell` option,
+  evaluated server-side into a boolean. The client never carries a shell name list
+  or command taxonomy (agent-agnostic, #510); it only reads the resulting flag.
 - `terminal_exit` signals the attach's terminal path went down — the tmux server
   exited (`%exit`) or the control-mode child died. It is a per-attach signal, not a
   daemon failure: the daemon keeps serving its other clients, and the client may

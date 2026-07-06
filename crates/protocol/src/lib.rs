@@ -512,6 +512,15 @@ pub struct PaneLayout {
     /// tolerance as `current_path`.
     #[serde(default)]
     pub current_command: String,
+    /// Whether the pane's foreground command is its shell — tmux's own
+    /// `#{==:#{pane_current_command},#{b:default-shell}}` comparison against
+    /// the session's `default-shell` option, evaluated server-side so the
+    /// client never carries a shell name list or process taxonomy
+    /// (agent-agnostic, #510). Defaults to `false` on deserialize so a layout
+    /// emitted before this field existed still parses (additive change, same
+    /// tolerance as `current_path`).
+    #[serde(default)]
+    pub is_shell: bool,
 }
 
 /// One tmux session inside a [`DaemonMessage::SessionListReply`]: its server
@@ -953,6 +962,7 @@ mod tests {
                         height: 24,
                         current_path: "/home/dev/my project".to_owned(),
                         current_command: "bash".to_owned(),
+                        is_shell: true,
                     },
                     PaneLayout {
                         pane_id: 1,
@@ -963,6 +973,7 @@ mod tests {
                         height: 24,
                         current_path: String::new(),
                         current_command: String::new(),
+                        is_shell: false,
                     },
                 ],
             },
@@ -982,6 +993,7 @@ mod tests {
                     height: 24,
                     current_path: "/tmp".to_owned(),
                     current_command: "cargo".to_owned(),
+                    is_shell: false,
                 }],
             },
         ]
@@ -1006,6 +1018,7 @@ mod tests {
         assert_eq!(parsed.pane_id, 3);
         assert_eq!(parsed.current_path, "");
         assert_eq!(parsed.current_command, "");
+        assert!(!parsed.is_shell);
     }
 
     #[test]
@@ -1013,6 +1026,25 @@ mod tests {
         // A present-but-wrongly-typed field is a protocol error, not an
         // empty-default case.
         let json = r#"{"pane_id":3,"active":false,"left":0,"top":0,"width":80,"height":24,"current_path":7}"#;
+        assert!(serde_json::from_str::<PaneLayout>(json).is_err());
+    }
+
+    #[test]
+    fn test_pane_layout_missing_is_shell_defaults_to_false() {
+        // A layout serialized before `is_shell` existed (#510) must still
+        // deserialize, with the field defaulting to false — same additive
+        // tolerance as `current_path`/`current_command` (#442).
+        let json = r#"{"pane_id":3,"active":false,"left":0,"top":0,"width":80,"height":24,"current_path":"/tmp","current_command":"cargo"}"#;
+        let parsed: PaneLayout = serde_json::from_str(json).expect("deserialize legacy PaneLayout");
+        assert_eq!(parsed.pane_id, 3);
+        assert!(!parsed.is_shell);
+    }
+
+    #[test]
+    fn test_pane_layout_malformed_is_shell_field_type_rejected() {
+        // A present-but-wrongly-typed field is a protocol error, not a
+        // default-to-false case.
+        let json = r#"{"pane_id":3,"active":false,"left":0,"top":0,"width":80,"height":24,"is_shell":"yes"}"#;
         assert!(serde_json::from_str::<PaneLayout>(json).is_err());
     }
 

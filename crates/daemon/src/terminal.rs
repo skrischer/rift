@@ -49,7 +49,11 @@ const RESUME_POLL: Duration = Duration::from_millis(100);
 /// carries tmux's real `#{window_index}` (the tab number the client renders and
 /// `select-window -t :N` targets) end-to-end instead of a synthesized array
 /// position, so a closed window's gap (`renumber-windows` off, the default) shows
-/// up client-side too (#495). Fields are tab-separated because both
+/// up client-side too (#495). `#{==:#{pane_current_command},#{b:default-shell}}`
+/// is tmux's own comparison of the pane's foreground command against the
+/// basename of its `default-shell` option, evaluated server-side into a `0`/`1`
+/// — the client never carries a shell name list or process taxonomy
+/// (agent-agnostic, #510). Fields are tab-separated because both
 /// `pane_current_path` and `window_name` may contain spaces — with tabs each stays
 /// a single field (a literal tab inside a quoted tmux argument is preserved, and
 /// tmux octal-escapes it in the reply, which the control-mode [`Client`] decodes
@@ -57,7 +61,7 @@ const RESUME_POLL: Duration = Duration::from_millis(100);
 /// tabs stays in the final field (see [`parse_layout_line`]). The `#{...}` formats
 /// are single-quoted because the control parser treats an unquoted `#` as a
 /// comment (tmux-reference pitfall 9).
-const LAYOUT_QUERY: &str = "list-panes -s -F '#{window_id}\t#{window_index}\t#{window_active}\t#{pane_id}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_current_command}\t#{pane_current_path}\t#{window_name}'";
+const LAYOUT_QUERY: &str = "list-panes -s -F '#{window_id}\t#{window_index}\t#{window_active}\t#{pane_id}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_current_command}\t#{pane_current_path}\t#{==:#{pane_current_command},#{b:default-shell}}\t#{window_name}'";
 
 /// One query that rebuilds the whole session list (`docs/spec-session-switch.md`),
 /// one line per session on the server. Same conventions as [`LAYOUT_QUERY`]:
@@ -925,11 +929,11 @@ struct ParsedPaneLine {
 }
 
 /// Parse one tab-separated `@<win> <win_index> <win_active> %<pane>
-/// <pane_active> <left> <top> <width> <height> <command> <path> <name>` line
-/// (see [`LAYOUT_QUERY`] for why tabs); `splitn(12, '\t')` keeps a window name
-/// containing tabs intact in the final field.
+/// <pane_active> <left> <top> <width> <height> <command> <path> <is_shell>
+/// <name>` line (see [`LAYOUT_QUERY`] for why tabs); `splitn(13, '\t')` keeps a
+/// window name containing tabs intact in the final field.
 fn parse_layout_line(line: &str) -> Option<ParsedPaneLine> {
-    let mut fields = line.splitn(12, '\t');
+    let mut fields = line.splitn(13, '\t');
     let window_id = fields.next()?.strip_prefix('@')?.parse().ok()?;
     let window_index = fields.next()?.parse().ok()?;
     let window_active = fields.next()? == "1";
@@ -941,6 +945,7 @@ fn parse_layout_line(line: &str) -> Option<ParsedPaneLine> {
     let height = fields.next()?.parse().ok()?;
     let current_command = fields.next()?.to_owned();
     let current_path = fields.next()?.to_owned();
+    let is_shell = fields.next()? == "1";
     let window_name = fields.next().unwrap_or("").to_owned();
     Some(ParsedPaneLine {
         window_id,
@@ -956,6 +961,7 @@ fn parse_layout_line(line: &str) -> Option<ParsedPaneLine> {
             height,
             current_path,
             current_command,
+            is_shell,
         },
     })
 }
@@ -1009,7 +1015,7 @@ mod tests {
     #[test]
     fn test_parse_layout_line_full_fields() {
         let parsed =
-            parse_layout_line("@0\t3\t1\t%1\t1\t51\t0\t49\t30\tnvim\t/home/dev/proj\tbash")
+            parse_layout_line("@0\t3\t1\t%1\t1\t51\t0\t49\t30\tnvim\t/home/dev/proj\t0\tbash")
                 .expect("parse");
         assert_eq!(parsed.window_id, 0);
         assert_eq!(
@@ -1029,6 +1035,7 @@ mod tests {
                 height: 30,
                 current_path: "/home/dev/proj".to_owned(),
                 current_command: "nvim".to_owned(),
+                is_shell: false,
             }
         );
     }
@@ -1037,9 +1044,10 @@ mod tests {
     fn test_parse_layout_line_spaced_path_and_window_name_are_preserved() {
         // Both the cwd and the window name may contain spaces; the tab
         // separator keeps each a single field.
-        let parsed =
-            parse_layout_line("@2\t5\t0\t%5\t0\t0\t0\t80\t24\tbash\t/home/dev/my repo\tmy project")
-                .expect("parse");
+        let parsed = parse_layout_line(
+            "@2\t5\t0\t%5\t0\t0\t0\t80\t24\tbash\t/home/dev/my repo\t1\tmy project",
+        )
+        .expect("parse");
         assert_eq!(parsed.window_index, 5);
         assert_eq!(parsed.window_name, "my project");
         assert_eq!(parsed.pane.current_path, "/home/dev/my repo");
@@ -1049,12 +1057,32 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_layout_line_is_shell_true_for_shell_idle_pane() {
+        // tmux's own `#{==:...}` comparison reports `1` when the pane's
+        // foreground command is its default shell.
+        let parsed =
+            parse_layout_line("@0\t0\t1\t%1\t1\t0\t0\t80\t24\tbash\t/tmp\t1\tbash").expect("parse");
+        assert!(parsed.pane.is_shell);
+    }
+
+    #[test]
+    fn test_parse_layout_line_is_shell_false_for_running_process() {
+        // Any foreground command other than the default shell compares
+        // unequal — no client-side command taxonomy involved (#510).
+        let parsed = parse_layout_line("@0\t0\t1\t%1\t1\t0\t0\t80\t24\tcargo\t/tmp\t0\tbash")
+            .expect("parse");
+        assert!(!parsed.pane.is_shell);
+    }
+
+    #[test]
     fn test_parse_layout_line_empty_meta_fields_parse_as_empty() {
         // tmux emits an empty field (two adjacent tabs) when a format
         // variable has no value; that must parse, not skip the pane.
-        let parsed = parse_layout_line("@0\t0\t1\t%1\t1\t0\t0\t80\t24\t\t\tbash").expect("parse");
+        let parsed =
+            parse_layout_line("@0\t0\t1\t%1\t1\t0\t0\t80\t24\t\t\t0\tbash").expect("parse");
         assert_eq!(parsed.pane.current_command, "");
         assert_eq!(parsed.pane.current_path, "");
+        assert!(!parsed.pane.is_shell);
         assert_eq!(parsed.window_name, "bash");
     }
 
@@ -1085,12 +1113,12 @@ mod tests {
     #[test]
     fn test_parse_layout_groups_panes_by_window_in_order() {
         let lines = vec![
-            "@0\t0\t1\t%0\t0\t0\t0\t50\t30\tbash\t/tmp\teditor".to_owned(),
-            "@0\t0\t1\t%1\t1\t51\t0\t49\t30\tbash\t/tmp\teditor".to_owned(),
+            "@0\t0\t1\t%0\t0\t0\t0\t50\t30\tbash\t/tmp\t1\teditor".to_owned(),
+            "@0\t0\t1\t%1\t1\t51\t0\t49\t30\tbash\t/tmp\t1\teditor".to_owned(),
             // window_index 2, not 1: simulates the gap tmux leaves after
             // closing window 1 (`renumber-windows` off, the default) — the
             // real index must survive, not collapse to array position (#495).
-            "@1\t2\t0\t%2\t1\t0\t0\t100\t30\tbash\t/tmp\tlogs".to_owned(),
+            "@1\t2\t0\t%2\t1\t0\t0\t100\t30\tbash\t/tmp\t1\tlogs".to_owned(),
         ];
         let windows = parse_layout(&lines);
         assert_eq!(windows.len(), 2);
@@ -1117,7 +1145,7 @@ mod tests {
     fn test_parse_layout_skips_malformed_lines() {
         let lines = vec![
             "garbage line".to_owned(),
-            "@0\t0\t1\t%0\t1\t0\t0\t80\t24\tbash\t/tmp\tbash".to_owned(),
+            "@0\t0\t1\t%0\t1\t0\t0\t80\t24\tbash\t/tmp\t1\tbash".to_owned(),
         ];
         let windows = parse_layout(&lines);
         assert_eq!(windows.len(), 1);
