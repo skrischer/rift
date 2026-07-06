@@ -470,6 +470,11 @@ fn main() {
                             }),
                     };
 
+                    // Feed the statusbar label from this same resolved config
+                    // rather than a second, independent env resolution — the
+                    // two previously had divergent defaults (#494).
+                    view.set_ssh_label(format!("{}@{}", ssh.user, ssh.host));
+
                     // Kept outside `channels` so the reconnect engine can drive
                     // the indicator (SshReconnecting/Disconnected) after
                     // `run_ssh_session` returns (the in-session clone reports
