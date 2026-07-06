@@ -645,13 +645,15 @@ impl Shell {
             thread::spawn(move || {
                 run_session_with_reconnect(
                     &ssh,
-                    channels,
-                    editor_channels,
-                    status_tx,
-                    reconnect_cancel_rx,
-                    key_exists,
-                    session_name,
-                    session_ended_tx,
+                    SessionRunParams {
+                        channels,
+                        editor: editor_channels,
+                        status_tx,
+                        cancel_rx: reconnect_cancel_rx,
+                        key_exists,
+                        session: session_name,
+                        session_ended_tx,
+                    },
                 );
             });
 
@@ -743,9 +745,9 @@ impl Render for Shell {
 /// provisioning, attach, resync) and restarts the schedule. The banner's
 /// Cancel and non-retryable failures ([`is_retryable_session_error`]) end the
 /// loop in the visible `Disconnected` state instead — the Connection screen
-/// (#477) will own that state once it lands. An orderly end (`Ok`: the tmux
-/// attach exited) also ends the loop without retrying: the remote session is
-/// gone on purpose, not lost.
+/// (#477) owns that state, routed back to by [`Shell::return_to_connection_screen`].
+/// An orderly end (`Ok`: the tmux attach exited) also ends the loop without
+/// retrying: the remote session is gone on purpose, not lost.
 ///
 /// Each attempt runs on a fresh tokio runtime: dropping the runtime cancels
 /// every bridge task the dead session spawned, so a stale bridge can never
@@ -772,16 +774,30 @@ impl Render for Shell {
 /// kill it). A TCP connect against a black-holed host can keep an attempt
 /// in-flight for tens of seconds; the Connection screen (#477) is the place
 /// to shorten that perceived latency, not a second cancellation seam.
-fn run_session_with_reconnect(
-    ssh: &SshConfig,
+struct SessionRunParams {
     channels: PtyChannels,
     editor: EditorChannels,
     status_tx: flume::Sender<ConnectionStatus>,
     cancel_rx: flume::Receiver<()>,
     key_exists: bool,
+    /// The tmux session name to attach to — the connect request's Session
+    /// field, itself prefilled from `RIFT_SESSION` (#477).
     session: String,
+    /// Fires exactly once when this run's loop ends, so the Shell can route
+    /// back to a fresh Connection screen (#477).
     session_ended_tx: flume::Sender<Option<String>>,
-) {
+}
+
+fn run_session_with_reconnect(ssh: &SshConfig, params: SessionRunParams) {
+    let SessionRunParams {
+        channels,
+        editor,
+        status_tx,
+        cancel_rx,
+        key_exists,
+        session,
+        session_ended_tx,
+    } = params;
     let mut retry: u32 = 0;
     let mut backoff = rift_ssh::ReconnectBackoff::new();
     let connected = AtomicBool::new(false);
