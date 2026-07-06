@@ -137,6 +137,7 @@ streams pane bytes and layout state back.
 // <window>  (WindowLayout)
 {
   "window_id": 1,
+  "window_index": 0,
   "name": "editor",
   "active": true,
   "panes": [ <pane>, ... ]

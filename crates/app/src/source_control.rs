@@ -141,7 +141,10 @@ pub struct SourceControlPanel {
     /// there by `WorkspaceView` from the daemon stream. Observed so a status
     /// fold's `cx.notify()` on the tree repaints this panel too.
     file_tree: Entity<FileTree>,
-    /// The currently selected changed file's path, or `None`.
+    /// The currently selected changed file's path, or `None`. Cleared by the
+    /// tree observer (see [`Self::new`]) the moment `path` leaves the
+    /// changed set — a commit or revert must not leave a stale selection
+    /// highlighting a row that no longer exists (#489).
     selected: Option<String>,
     focus_handle: FocusHandle,
     _observe_tree: Subscription,
@@ -151,7 +154,19 @@ impl SourceControlPanel {
     /// Create the panel around the workspace's existing file-tree entity — the
     /// shared `WorktreeModel` this panel reads, never its own copy.
     pub fn new(file_tree: Entity<FileTree>, cx: &mut Context<Self>) -> Self {
-        let observe_tree = cx.observe(&file_tree, |_this, _tree, cx| cx.notify());
+        let observe_tree = cx.observe(&file_tree, |this, tree, cx| {
+            // A status fold (commit, revert, stage/unstage) may have dropped
+            // the selected path from the changed set entirely; a stale
+            // selection would otherwise linger with nothing left to show for
+            // it (#489). Any path still present, changed or not, is left
+            // alone here — grouping/order changes don't affect selection.
+            if let Some(selected) = &this.selected {
+                if !tree.read(cx).model().git_statuses().contains_key(selected) {
+                    this.selected = None;
+                }
+            }
+            cx.notify();
+        });
         Self {
             file_tree,
             selected: None,
@@ -268,6 +283,7 @@ impl gpui::Render for SourceControlPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{AppContext as _, TestAppContext};
     use rift_protocol::{AheadBehind, GitStatusCode, GitStatusEntry, WorktreeEntry};
 
     fn status(index: GitStatusCode, worktree: GitStatusCode) -> GitEntryStatus {
@@ -485,5 +501,114 @@ mod tests {
         assert!(!grouped_changed_files(&model)
             .iter()
             .any(|(_, paths)| paths.iter().any(|p| p == "staged.rs")));
+    }
+
+    // --- SourceControlPanel selection lifecycle (#489) ---
+
+    #[gpui::test]
+    fn test_selected_path_leaving_the_changed_set_clears_the_selection(cx: &mut TestAppContext) {
+        let (file_tree, panel) = cx.update(|cx| {
+            let file_tree = cx.new(|_cx| FileTree::new());
+            file_tree.update(cx, |tree, _cx| {
+                tree.model_mut()
+                    .apply_snapshot_chunk("/proj".into(), vec![file("dirty.rs")], true);
+                tree.model_mut().apply_git_update(
+                    vec![git_entry(
+                        "dirty.rs",
+                        GitStatusCode::Unmodified,
+                        GitStatusCode::Modified,
+                    )],
+                    vec![],
+                );
+            });
+            let panel = cx.new(|cx| SourceControlPanel::new(file_tree.clone(), cx));
+            (file_tree, panel)
+        });
+
+        cx.update(|cx| {
+            panel.update(cx, |panel, _cx| {
+                panel.selected = Some("dirty.rs".to_owned())
+            });
+        });
+        cx.update(|cx| {
+            assert_eq!(panel.read(cx).selected(), Some("dirty.rs"));
+        });
+
+        // The commit lands: dirty.rs leaves the changed set entirely.
+        cx.update(|cx| {
+            file_tree.update(cx, |tree, cx| {
+                tree.model_mut()
+                    .apply_git_update(vec![], vec!["dirty.rs".into()]);
+                cx.notify();
+            });
+        });
+
+        // `cx.observe`'s callback runs on effect flush at the end of the
+        // *outermost* `cx.update` call, not mid-closure on the nested
+        // `Entity::update` above — so the clear is only observable from a
+        // separate top-level call after the one that triggered it (mirrors
+        // `ProblemsPanel`'s equivalent live-update test).
+        cx.update(|cx| {
+            assert_eq!(
+                panel.read(cx).selected(),
+                None,
+                "the path leaving the changed set clears the stale selection"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn test_selected_path_still_changed_keeps_the_selection(cx: &mut TestAppContext) {
+        let (file_tree, panel) = cx.update(|cx| {
+            let file_tree = cx.new(|_cx| FileTree::new());
+            file_tree.update(cx, |tree, _cx| {
+                tree.model_mut().apply_snapshot_chunk(
+                    "/proj".into(),
+                    vec![file("dirty.rs"), file("other.rs")],
+                    true,
+                );
+                tree.model_mut().apply_git_update(
+                    vec![
+                        git_entry(
+                            "dirty.rs",
+                            GitStatusCode::Unmodified,
+                            GitStatusCode::Modified,
+                        ),
+                        git_entry(
+                            "other.rs",
+                            GitStatusCode::Unmodified,
+                            GitStatusCode::Untracked,
+                        ),
+                    ],
+                    vec![],
+                );
+            });
+            let panel = cx.new(|cx| SourceControlPanel::new(file_tree.clone(), cx));
+            (file_tree, panel)
+        });
+
+        cx.update(|cx| {
+            panel.update(cx, |panel, _cx| {
+                panel.selected = Some("dirty.rs".to_owned())
+            });
+        });
+
+        // A status tick that clears a *different* path leaves the selection
+        // untouched.
+        cx.update(|cx| {
+            file_tree.update(cx, |tree, cx| {
+                tree.model_mut()
+                    .apply_git_update(vec![], vec!["other.rs".into()]);
+                cx.notify();
+            });
+        });
+
+        cx.update(|cx| {
+            assert_eq!(
+                panel.read(cx).selected(),
+                Some("dirty.rs"),
+                "a tick that doesn't touch the selected path leaves it selected"
+            );
+        });
     }
 }

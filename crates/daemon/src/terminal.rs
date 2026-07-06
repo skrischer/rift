@@ -45,15 +45,19 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const RESUME_POLL: Duration = Duration::from_millis(100);
 
 /// One query that rebuilds the entire session layout. `-s` covers every window;
-/// the format is one line per pane with the window fields repeated. Fields are
-/// tab-separated because both `pane_current_path` and `window_name` may contain
-/// spaces — with tabs each stays a single field (a literal tab inside a quoted
-/// tmux argument is preserved, and tmux octal-escapes it in the reply, which the
-/// control-mode [`Client`] decodes back; tmux-reference pitfall 8). `window_name`
-/// is last so a name containing tabs stays in the final field (see
-/// [`parse_layout_line`]). The `#{...}` formats are single-quoted because the
-/// control parser treats an unquoted `#` as a comment (tmux-reference pitfall 9).
-const LAYOUT_QUERY: &str = "list-panes -s -F '#{window_id}\t#{window_active}\t#{pane_id}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_current_command}\t#{pane_current_path}\t#{window_name}'";
+/// the format is one line per pane with the window fields repeated. `window_index`
+/// carries tmux's real `#{window_index}` (the tab number the client renders and
+/// `select-window -t :N` targets) end-to-end instead of a synthesized array
+/// position, so a closed window's gap (`renumber-windows` off, the default) shows
+/// up client-side too (#495). Fields are tab-separated because both
+/// `pane_current_path` and `window_name` may contain spaces — with tabs each stays
+/// a single field (a literal tab inside a quoted tmux argument is preserved, and
+/// tmux octal-escapes it in the reply, which the control-mode [`Client`] decodes
+/// back; tmux-reference pitfall 8). `window_name` is last so a name containing
+/// tabs stays in the final field (see [`parse_layout_line`]). The `#{...}` formats
+/// are single-quoted because the control parser treats an unquoted `#` as a
+/// comment (tmux-reference pitfall 9).
+const LAYOUT_QUERY: &str = "list-panes -s -F '#{window_id}\t#{window_index}\t#{window_active}\t#{pane_id}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_current_command}\t#{pane_current_path}\t#{window_name}'";
 
 /// One query that rebuilds the whole session list (`docs/spec-session-switch.md`),
 /// one line per session on the server. Same conventions as [`LAYOUT_QUERY`]:
@@ -901,6 +905,7 @@ fn parse_layout(lines: &[String]) -> Vec<WindowLayout> {
             Some(window) => window.panes.push(parsed.pane),
             None => windows.push(WindowLayout {
                 window_id: parsed.window_id,
+                window_index: parsed.window_index,
                 name: parsed.window_name,
                 active: parsed.window_active,
                 panes: vec![parsed.pane],
@@ -913,18 +918,20 @@ fn parse_layout(lines: &[String]) -> Vec<WindowLayout> {
 /// One parsed [`LAYOUT_QUERY`] line: the pane plus its window's identity.
 struct ParsedPaneLine {
     window_id: u32,
+    window_index: u32,
     window_active: bool,
     window_name: String,
     pane: PaneLayout,
 }
 
-/// Parse one tab-separated `@<win> <win_active> %<pane> <pane_active> <left>
-/// <top> <width> <height> <command> <path> <name>` line (see [`LAYOUT_QUERY`]
-/// for why tabs); `splitn(11, '\t')` keeps a window name containing tabs
-/// intact in the final field.
+/// Parse one tab-separated `@<win> <win_index> <win_active> %<pane>
+/// <pane_active> <left> <top> <width> <height> <command> <path> <name>` line
+/// (see [`LAYOUT_QUERY`] for why tabs); `splitn(12, '\t')` keeps a window name
+/// containing tabs intact in the final field.
 fn parse_layout_line(line: &str) -> Option<ParsedPaneLine> {
-    let mut fields = line.splitn(11, '\t');
+    let mut fields = line.splitn(12, '\t');
     let window_id = fields.next()?.strip_prefix('@')?.parse().ok()?;
+    let window_index = fields.next()?.parse().ok()?;
     let window_active = fields.next()? == "1";
     let pane_id = fields.next()?.strip_prefix('%')?.parse().ok()?;
     let pane_active = fields.next()? == "1";
@@ -937,6 +944,7 @@ fn parse_layout_line(line: &str) -> Option<ParsedPaneLine> {
     let window_name = fields.next().unwrap_or("").to_owned();
     Some(ParsedPaneLine {
         window_id,
+        window_index,
         window_active,
         window_name,
         pane: PaneLayout {
@@ -1000,9 +1008,14 @@ mod tests {
 
     #[test]
     fn test_parse_layout_line_full_fields() {
-        let parsed = parse_layout_line("@0\t1\t%1\t1\t51\t0\t49\t30\tnvim\t/home/dev/proj\tbash")
-            .expect("parse");
+        let parsed =
+            parse_layout_line("@0\t3\t1\t%1\t1\t51\t0\t49\t30\tnvim\t/home/dev/proj\tbash")
+                .expect("parse");
         assert_eq!(parsed.window_id, 0);
+        assert_eq!(
+            parsed.window_index, 3,
+            "window_index is tmux's real index, independent of window_id"
+        );
         assert!(parsed.window_active);
         assert_eq!(parsed.window_name, "bash");
         assert_eq!(
@@ -1025,8 +1038,9 @@ mod tests {
         // Both the cwd and the window name may contain spaces; the tab
         // separator keeps each a single field.
         let parsed =
-            parse_layout_line("@2\t0\t%5\t0\t0\t0\t80\t24\tbash\t/home/dev/my repo\tmy project")
+            parse_layout_line("@2\t5\t0\t%5\t0\t0\t0\t80\t24\tbash\t/home/dev/my repo\tmy project")
                 .expect("parse");
+        assert_eq!(parsed.window_index, 5);
         assert_eq!(parsed.window_name, "my project");
         assert_eq!(parsed.pane.current_path, "/home/dev/my repo");
         assert_eq!(parsed.pane.current_command, "bash");
@@ -1038,7 +1052,7 @@ mod tests {
     fn test_parse_layout_line_empty_meta_fields_parse_as_empty() {
         // tmux emits an empty field (two adjacent tabs) when a format
         // variable has no value; that must parse, not skip the pane.
-        let parsed = parse_layout_line("@0\t1\t%1\t1\t0\t0\t80\t24\t\t\tbash").expect("parse");
+        let parsed = parse_layout_line("@0\t0\t1\t%1\t1\t0\t0\t80\t24\t\t\tbash").expect("parse");
         assert_eq!(parsed.pane.current_command, "");
         assert_eq!(parsed.pane.current_path, "");
         assert_eq!(parsed.window_name, "bash");
@@ -1047,15 +1061,19 @@ mod tests {
     #[test]
     fn test_parse_layout_line_malformed_returns_none() {
         assert_eq!(
-            parse_layout_line("0\t1\t%1\t1\t0\t0\t80\t24\tbash\t/tmp\tbash").map(|_| ()),
+            parse_layout_line("0\t0\t1\t%1\t1\t0\t0\t80\t24\tbash\t/tmp\tbash").map(|_| ()),
             None
         ); // window id no @
         assert_eq!(
-            parse_layout_line("@0\t1\t1\t1\t0\t0\t80\t24\tbash\t/tmp\tbash").map(|_| ()),
+            parse_layout_line("@0\tabc\t1\t%1\t1\t0\t0\t80\t24\tbash\t/tmp\tbash").map(|_| ()),
+            None
+        ); // window index non-numeric (#495)
+        assert_eq!(
+            parse_layout_line("@0\t0\t1\t1\t0\t0\t80\t24\tbash\t/tmp\tbash").map(|_| ()),
             None
         ); // pane id no %
         assert_eq!(
-            parse_layout_line("@0\t1\t%1\t1\t0\t0\t80").map(|_| ()),
+            parse_layout_line("@0\t0\t1\t%1\t1\t0\t0\t80").map(|_| ()),
             None
         ); // too few fields
         assert_eq!(
@@ -1067,13 +1085,17 @@ mod tests {
     #[test]
     fn test_parse_layout_groups_panes_by_window_in_order() {
         let lines = vec![
-            "@0\t1\t%0\t0\t0\t0\t50\t30\tbash\t/tmp\teditor".to_owned(),
-            "@0\t1\t%1\t1\t51\t0\t49\t30\tbash\t/tmp\teditor".to_owned(),
-            "@1\t0\t%2\t1\t0\t0\t100\t30\tbash\t/tmp\tlogs".to_owned(),
+            "@0\t0\t1\t%0\t0\t0\t0\t50\t30\tbash\t/tmp\teditor".to_owned(),
+            "@0\t0\t1\t%1\t1\t51\t0\t49\t30\tbash\t/tmp\teditor".to_owned(),
+            // window_index 2, not 1: simulates the gap tmux leaves after
+            // closing window 1 (`renumber-windows` off, the default) — the
+            // real index must survive, not collapse to array position (#495).
+            "@1\t2\t0\t%2\t1\t0\t0\t100\t30\tbash\t/tmp\tlogs".to_owned(),
         ];
         let windows = parse_layout(&lines);
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].window_id, 0);
+        assert_eq!(windows[0].window_index, 0);
         assert_eq!(windows[0].name, "editor");
         assert!(windows[0].active);
         assert_eq!(windows[0].panes.len(), 2);
@@ -1081,6 +1103,11 @@ mod tests {
         assert_eq!(windows[0].panes[1].pane_id, 1);
         assert!(windows[0].panes[1].active);
         assert_eq!(windows[1].window_id, 1);
+        assert_eq!(
+            windows[1].window_index, 2,
+            "the real tmux window index must survive even when non-contiguous \
+             with the previous window's index"
+        );
         assert_eq!(windows[1].name, "logs");
         assert!(!windows[1].active);
         assert_eq!(windows[1].panes.len(), 1);
@@ -1090,7 +1117,7 @@ mod tests {
     fn test_parse_layout_skips_malformed_lines() {
         let lines = vec![
             "garbage line".to_owned(),
-            "@0\t1\t%0\t1\t0\t0\t80\t24\tbash\t/tmp\tbash".to_owned(),
+            "@0\t0\t1\t%0\t1\t0\t0\t80\t24\tbash\t/tmp\tbash".to_owned(),
         ];
         let windows = parse_layout(&lines);
         assert_eq!(windows.len(), 1);
@@ -2015,6 +2042,83 @@ mod tests {
         assert!(
             moved.is_some(),
             "select-window must emit a LayoutUpdate with the active flag on the selected window"
+        );
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_layout_update_after_kill_window_keeps_real_tmux_indices() {
+        // `renumber-windows` is off by default, so killing a non-last window
+        // leaves a gap in tmux's own index numbering. The layout must surface
+        // that real gap, not a synthesized array-position stand-in that would
+        // silently close it (#495).
+        let server = TmuxServer::new("killwin");
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+        recv_until(&mut out_rx, 10, |m| {
+            matches!(m, DaemonMessage::LayoutSnapshot { .. }).then_some(())
+        })
+        .await
+        .expect("snapshot");
+
+        // Two more windows.
+        for _ in 0..2 {
+            in_tx
+                .send(ClientMessage::TmuxCommand {
+                    cmd: "new-window".to_owned(),
+                })
+                .await
+                .expect("new-window");
+        }
+        let indices_before = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::LayoutUpdate { windows, .. } => {
+                if windows.len() != 3 {
+                    return None;
+                }
+                let mut indices: Vec<u32> = windows.iter().map(|w| w.window_index).collect();
+                indices.sort_unstable();
+                Some(indices)
+            }
+            _ => None,
+        })
+        .await
+        .expect("3-window layout update");
+
+        // Kill the middle window by its real tmux index (not an assumed
+        // array position — the whole point under test).
+        let middle = indices_before[1];
+        in_tx
+            .send(ClientMessage::TmuxCommand {
+                cmd: format!("kill-window -t :{middle}"),
+            })
+            .await
+            .expect("kill-window");
+
+        let indices_after = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::LayoutUpdate { windows, .. } => {
+                if windows.len() != 2 {
+                    return None;
+                }
+                let mut indices: Vec<u32> = windows.iter().map(|w| w.window_index).collect();
+                indices.sort_unstable();
+                Some(indices)
+            }
+            _ => None,
+        })
+        .await;
+        assert_eq!(
+            indices_after,
+            Some(vec![indices_before[0], indices_before[2]]),
+            "surviving windows must keep their real (now-gapped) indices, not renumber to be \
+             contiguous"
         );
 
         drop(in_tx);
