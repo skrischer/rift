@@ -38,6 +38,7 @@ use lsp_types::{
     TextDocumentSyncClientCapabilities, Url, WindowClientCapabilities, WorkspaceFolder,
 };
 use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tower::ServiceBuilder;
 use tracing::{info, warn};
@@ -79,6 +80,12 @@ pub struct Server {
     /// `true` while the main loop runs; flipped to `false` by the supervisor the
     /// moment the server exits. The registry reads this to decide a restart.
     alive: watch::Receiver<bool>,
+    /// When this instance was spawned. The registry measures the interval to
+    /// exit against a liveness window: an instance that dies within it is
+    /// crash-looping, so its restart backoff escalates instead of resetting —
+    /// a server that survives `initialize` but then dies at runtime stays
+    /// throttled (issue #273).
+    started_at: Instant,
 }
 
 impl Server {
@@ -101,6 +108,12 @@ impl Server {
     /// and the registry should restart it on the next matching change.
     pub fn is_alive(&self) -> bool {
         *self.alive.borrow()
+    }
+
+    /// When this instance was spawned, for the registry's liveness-window
+    /// backoff decision on exit (issue #273).
+    pub(crate) fn started_at(&self) -> Instant {
+        self.started_at
     }
 
     /// The `ServerCapabilities` this server reported in its `InitializeResult`.
@@ -285,6 +298,7 @@ impl Server {
             socket,
             capabilities: ServerCapabilities::default(),
             alive: alive_rx,
+            started_at: Instant::now(),
         };
 
         server.initialize(root_uri).await?;
