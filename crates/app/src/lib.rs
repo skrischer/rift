@@ -1,3 +1,12 @@
+// The Connection screen's test module (`connection_screen.rs`, #477) combines
+// GPUI's already-generic `Context`/`Entity` machinery with `#[gpui::test]`'s
+// own expansion across ~15 test functions; the default 128 trips clippy's
+// `--all-targets` build (`could not compile ... due to 1 previous error:
+// recursion limit reached while expanding #[test]`) even though a plain
+// `cargo test` compiles fine. Bumping the limit is the compiler's own
+// suggested fix for this diagnostic, not a workaround for a logic bug.
+#![recursion_limit = "256"]
+
 use std::collections::HashMap;
 use std::rc::Rc;
 
