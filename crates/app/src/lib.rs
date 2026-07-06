@@ -94,6 +94,23 @@ fn resolve_theme(
         .cloned()
 }
 
+/// `Theme::change`, then ensure a repaint reaches the screen even without a
+/// `Window` handle (issue #493). `gpui-component`'s `SettingField` setters —
+/// what the settings surface's dropdowns dispatch through — only ever hand
+/// their closure a `cx: &mut App`, no window; `Theme::change` only calls
+/// `window.refresh()` when given one, so a `None` window silently skipped the
+/// repaint and the dialog sat stale until the next unrelated notification.
+/// `App::refresh_windows` schedules every open window for redraw and is the
+/// same fallback `gpui-component`'s own `ThemeRegistry` reload path uses for
+/// this exact gap.
+fn apply_theme_mode(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
+    let has_window = window.is_some();
+    Theme::change(mode, window, cx);
+    if !has_window {
+        cx.refresh_windows();
+    }
+}
+
 /// Switch the active theme by name, live — the runtime counterpart to the
 /// startup hardcode `apply_theme` used to be. Looks `name` up in the
 /// `ThemeRegistry`, assigns it into whichever of `Theme`'s `light_theme` /
@@ -122,7 +139,7 @@ pub fn set_theme(name: &str, window: Option<&mut Window>, cx: &mut App) {
     } else {
         Theme::global_mut(cx).light_theme = theme;
     }
-    Theme::change(mode, window, cx);
+    apply_theme_mode(mode, window, cx);
 }
 
 /// Switch only the light/dark mode, keeping whichever named theme is currently
@@ -130,7 +147,7 @@ pub fn set_theme(name: &str, window: Option<&mut Window>, cx: &mut App) {
 /// startup). A thin, discoverable wrapper around `Theme::change` for the
 /// settings surface and command palette to dispatch (`docs/spec-theme-settings.md`).
 pub fn set_theme_mode(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
-    Theme::change(mode, window, cx);
+    apply_theme_mode(mode, window, cx);
 }
 
 /// Flip between light and dark mode, keeping whichever named theme is
@@ -290,6 +307,24 @@ mod tests {
             name: name.into(),
             mode,
             ..Default::default()
+        }
+    }
+
+    /// A minimal view that counts its own `render` calls — lets a test
+    /// observe whether an open window actually redrew, rather than only
+    /// asserting on `Theme` global state.
+    struct CountingView {
+        render_count: Rc<std::cell::Cell<usize>>,
+    }
+
+    impl gpui::Render for CountingView {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            self.render_count.set(self.render_count.get() + 1);
+            gpui::Empty
         }
     }
 
@@ -476,6 +511,39 @@ mod tests {
                 CATPPUCCIN_MOCHA_THEME_NAME
             );
         });
+    }
+
+    /// Issue #493: the settings surface's dropdowns dispatch through
+    /// `gpui-component`'s `SettingField` setters, whose closures only ever
+    /// receive `cx: &mut App` — never a `Window` — so `set_theme_mode(_,
+    /// None, _)` must still make an open window repaint on its own, instead
+    /// of relying on `Theme::change`'s `window.refresh()` (which is skipped
+    /// entirely when `window` is `None`). Verified by counting an open
+    /// window's own `render` calls rather than only asserting on `Theme`
+    /// global state, since a global mutation alone does not redraw a window.
+    #[gpui::test]
+    fn test_set_theme_mode_without_a_window_still_refreshes_open_windows(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            apply_theme(cx);
+        });
+
+        let render_count = Rc::new(std::cell::Cell::new(0usize));
+        let view_render_count = render_count.clone();
+        let _window = cx.add_window(move |_, _| CountingView {
+            render_count: view_render_count,
+        });
+        assert_eq!(render_count.get(), 1, "window draws once on creation");
+
+        cx.update(|cx| {
+            set_theme_mode(ThemeMode::Light, None, cx);
+        });
+
+        assert_eq!(
+            render_count.get(),
+            2,
+            "refresh_windows should schedule a redraw even without a Window handle"
+        );
     }
 
     /// The command palette's "Toggle Light/Dark Theme" entry flips dark to

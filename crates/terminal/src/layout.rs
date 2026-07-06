@@ -59,16 +59,18 @@ fn partition_by_left(panes: &[TmuxPaneState]) -> Option<Vec<Vec<TmuxPaneState>>>
     let mut sorted: Vec<_> = panes.to_vec();
     sorted.sort_by_key(|p| p.left);
 
+    let (first, rest) = sorted.split_first()?;
     let mut groups: Vec<Vec<TmuxPaneState>> = Vec::new();
-    let mut current = vec![sorted[0].clone()];
+    let mut current = vec![first.clone()];
+    let mut max_right = first.left + first.width;
 
-    for pane in &sorted[1..] {
-        let max_right: u16 = current.iter().map(|p| p.left + p.width).max().unwrap();
+    for pane in rest {
         if pane.left >= max_right {
-            groups.push(std::mem::take(&mut current));
-            current.push(pane.clone());
+            groups.push(std::mem::replace(&mut current, vec![pane.clone()]));
+            max_right = pane.left + pane.width;
         } else {
             current.push(pane.clone());
+            max_right = max_right.max(pane.left + pane.width);
         }
     }
     groups.push(current);
@@ -80,16 +82,18 @@ fn partition_by_top(panes: &[TmuxPaneState]) -> Option<Vec<Vec<TmuxPaneState>>> 
     let mut sorted: Vec<_> = panes.to_vec();
     sorted.sort_by_key(|p| p.top);
 
+    let (first, rest) = sorted.split_first()?;
     let mut groups: Vec<Vec<TmuxPaneState>> = Vec::new();
-    let mut current = vec![sorted[0].clone()];
+    let mut current = vec![first.clone()];
+    let mut max_bottom = first.top + first.height;
 
-    for pane in &sorted[1..] {
-        let max_bottom: u16 = current.iter().map(|p| p.top + p.height).max().unwrap();
+    for pane in rest {
         if pane.top >= max_bottom {
-            groups.push(std::mem::take(&mut current));
-            current.push(pane.clone());
+            groups.push(std::mem::replace(&mut current, vec![pane.clone()]));
+            max_bottom = pane.top + pane.height;
         } else {
             current.push(pane.clone());
+            max_bottom = max_bottom.max(pane.top + pane.height);
         }
     }
     groups.push(current);
@@ -225,6 +229,16 @@ mod tests {
     #[test]
     fn test_build_layout_empty() {
         assert_eq!(build_layout(&[]), LayoutNode::Pane(String::new()));
+    }
+
+    #[test]
+    fn test_partition_by_left_empty_returns_none() {
+        assert_eq!(partition_by_left(&[]), None);
+    }
+
+    #[test]
+    fn test_partition_by_top_empty_returns_none() {
+        assert_eq!(partition_by_top(&[]), None);
     }
 
     #[test]
