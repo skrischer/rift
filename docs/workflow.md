@@ -57,18 +57,33 @@ on its own. Several agents each doing that concurrently exhausts host RAM and
 wedges WSL. Measured for contrast: a *warm* single-crate rebuild is ~100-300 MB.
 
 Rules:
-- **Full builds run in CI, not locally.** In a multi-agent run, implementation
-  agents do NOT run `just ci` or any cold full-workspace build in their fresh
-  worktree. They implement, commit, push, and open the PR; the CI checks
-  (`Check`, `app-check`) are the verification gate — and also the merge gate, so
-  nothing unverified merges.
-- **Local runs are only small and warm.** A single targeted test against an
-  already-warm target (`cargo test -p <crate> <test>`) recompiles just the
-  changed crate — fine in the main checkout. Never a cold workspace build in a
-  worktree.
-- **No per-worktree job cap.** Once agents don't build locally there is no local
-  build to cap; the CI-only rule already prevents the RAM spike.
-- **Cap concurrent agents to free RAM** (~2 at the default baseline; more once
+- **Verify compilability locally against the *warm station target*, never a
+  cold worktree build.** An implementation agent's worktree has an empty
+  `target/`, so a build there is cold (skia + every dep from scratch). Instead,
+  point cargo at the station's warm `target/` so only the changed crate
+  recompiles (deps and skia stay cached → ~5-25 s, a few hundred MB):
+
+  ```
+  CARGO_TARGET_DIR=<repo>/target cargo clippy -p <crate> --all-targets -j4 -- -D warnings
+  # app-crate change → match App Check exactly:
+  CARGO_TARGET_DIR=<repo>/target cargo clippy -p rift-app --features gallery --all-targets -j4 -- -D warnings
+  ```
+
+  This is the same compilability + lint gate App Check runs — caught in seconds
+  instead of a blind CI round-trip. `cargo check`/`cargo clippy` type-check only
+  (no codegen, no linking, no skia rebuild), which is why it is cheap; a full
+  `cargo build` is not (`build ist übertrieben`). The shared-target cargo lock
+  serializes concurrent agents' checks, so this stays RAM-safe even at pool
+  width. (Gotcha: `use gpui::*` glob-imports `gpui::test` and shadows the
+  builtin `#[test]`; in such modules write `#[::core::prelude::v1::test]` — the
+  crate convention — or the test build recurses unboundedly.)
+- **Full build + test *run* stay in CI.** Do NOT run `just ci`, `just build`,
+  `cargo build`, or `cargo test` (codegen + linking + running tests is the
+  RAM-heavy part, and `-j20` cold across several agents wedges WSL). Compile the
+  crate locally (clippy/check, warm target); let CI (`Check`, `app-check`) do
+  the full build and run the tests. CI is also the merge gate, so a runtime
+  test failure still blocks the merge.
+- **Cap concurrent agents to free RAM** (~2 at the default baseline; 4+ once
   heavy host services — spare DBs, a second language-server instance — are
   stopped).
 - Solo/interactive work in a warm checkout may still use `just ci` (incremental,
