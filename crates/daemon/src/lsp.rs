@@ -284,10 +284,14 @@ impl LspWorker {
                 },
                 event = self.buffer_events.recv() => match event {
                     Some(event) => self.apply_buffer_event(event).await,
-                    // The buffer-event sender dropped (dispatch loop gone). The
-                    // disk path may still run, so do not stop on this alone;
-                    // `doc_changes` / the registry channel close drives the stop.
-                    None => std::future::pending::<()>().await,
+                    // The buffer-event sender dropped (dispatch loop gone).
+                    // Awaiting a pending future here would park the whole
+                    // select loop forever (#497) — the arm handler never
+                    // returns, so no other channel is ever polled again.
+                    // Every inbound sender lives on the dispatch loop, so a
+                    // closed channel means the loop is gone: stop and let the
+                    // shutdown below clean up the servers.
+                    None => break,
                 },
                 published = self.server_diagnostics.recv() => match published {
                     Some((id, params)) => self.publish(id, params),
@@ -298,10 +302,10 @@ impl LspWorker {
                 },
                 req = self.nav_requests.recv() => match req {
                     Some(req) => self.dispatch_nav(req).await,
-                    // Nav request sender dropped (dispatch loop gone). The disk
-                    // path may still serve; stop is driven by `doc_changes` or
-                    // the diagnostics channel.
-                    None => std::future::pending::<()>().await,
+                    // Same as `buffer_events`: a closed inbound channel means
+                    // the dispatch loop is gone — stop instead of parking the
+                    // select loop (#497).
+                    None => break,
                 },
                 result = self.completed_nav.recv() => {
                     if let Some((id, msg)) = result {
@@ -1007,5 +1011,117 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    // ── Worker shutdown on channel close (#497) ──────────────────────────────
+
+    /// Every channel handle the dispatch loop would hold against a worker,
+    /// so a test can drop exactly one sender and keep the rest alive.
+    struct WorkerChannels {
+        doc_tx: mpsc::Sender<Vec<DocumentChange>>,
+        buffer_tx: mpsc::Sender<BufferEvent>,
+        diag_rx: mpsc::Receiver<LspDiagnostics>,
+        nav_req_tx: mpsc::Sender<NavRequest>,
+        nav_resp_rx: mpsc::Receiver<DaemonMessage>,
+    }
+
+    /// A worker over an empty server table (no external process is ever
+    /// spawned) plus the dispatch-loop side of all its channels.
+    fn worker_with_channels() -> (LspWorker, WorkerChannels) {
+        let (doc_tx, doc_rx) = mpsc::channel(8);
+        let (buffer_tx, buffer_rx) = mpsc::channel(8);
+        let (diag_tx, diag_rx) = mpsc::channel(8);
+        let (nav_req_tx, nav_req_rx) = mpsc::channel(8);
+        let (nav_resp_tx, nav_resp_rx) = mpsc::channel(8);
+        let worker = LspWorker::new(
+            PathBuf::from("."),
+            DocumentSelector::with_table(&[]),
+            doc_rx,
+            buffer_rx,
+            diag_tx,
+            nav_req_rx,
+            nav_resp_tx,
+        );
+        let channels = WorkerChannels {
+            doc_tx,
+            buffer_tx,
+            diag_rx,
+            nav_req_tx,
+            nav_resp_rx,
+        };
+        (worker, channels)
+    }
+
+    /// Await `run()` under a timeout, keeping the still-open handles alive for
+    /// the duration so only the channel the test closed is closed. A timeout
+    /// means the worker parked instead of shutting down.
+    async fn assert_run_terminates<Open>(worker: LspWorker, still_open: Open, closed: &str) {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), worker.run()).await;
+        assert!(
+            result.is_ok(),
+            "run() must terminate when {closed} closes, not park the worker"
+        );
+        drop(still_open);
+    }
+
+    #[tokio::test]
+    async fn test_run_doc_changes_closed_terminates() {
+        let (worker, channels) = worker_with_channels();
+        let WorkerChannels {
+            doc_tx,
+            buffer_tx,
+            diag_rx,
+            nav_req_tx,
+            nav_resp_rx,
+        } = channels;
+        drop(doc_tx);
+        assert_run_terminates(
+            worker,
+            (buffer_tx, diag_rx, nav_req_tx, nav_resp_rx),
+            "doc_changes",
+        )
+        .await;
+    }
+
+    /// Regression (#497): a closed buffer-event channel used to await
+    /// `std::future::pending()` inside the select arm, freezing `run()` even
+    /// though every other channel was still open.
+    #[tokio::test]
+    async fn test_run_buffer_events_closed_terminates() {
+        let (worker, channels) = worker_with_channels();
+        let WorkerChannels {
+            doc_tx,
+            buffer_tx,
+            diag_rx,
+            nav_req_tx,
+            nav_resp_rx,
+        } = channels;
+        drop(buffer_tx);
+        assert_run_terminates(
+            worker,
+            (doc_tx, diag_rx, nav_req_tx, nav_resp_rx),
+            "buffer_events",
+        )
+        .await;
+    }
+
+    /// Regression (#497): same park as `buffer_events`, on the nav path.
+    #[tokio::test]
+    async fn test_run_nav_requests_closed_terminates() {
+        let (worker, channels) = worker_with_channels();
+        let WorkerChannels {
+            doc_tx,
+            buffer_tx,
+            diag_rx,
+            nav_req_tx,
+            nav_resp_rx,
+        } = channels;
+        drop(nav_req_tx);
+        assert_run_terminates(
+            worker,
+            (doc_tx, buffer_tx, diag_rx, nav_resp_rx),
+            "nav_requests",
+        )
+        .await;
     }
 }

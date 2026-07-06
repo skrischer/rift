@@ -408,6 +408,12 @@ pub enum DispatchDecision {
     /// A bound `confirm-before` command: render a native confirm dialog with
     /// `prompt`, dispatching `wrapped` only if the user confirms.
     Confirm { prompt: String, wrapped: String },
+    /// A `switch-client -T` to a mirrored table (`prefix`/`root`): a
+    /// transition of rift's own local key-table engine
+    /// (`PrefixEngine::switch_table`), never a server dispatch — the server's
+    /// per-client key table has no effect on locally resolved keys, so
+    /// dispatching would silently break sticky-prefix bindings (#484).
+    SwitchTable(String),
 }
 
 /// Classify a resolved bound command (verbatim `list-keys` text) into a
@@ -438,10 +444,11 @@ pub fn classify_command(command: &str) -> DispatchDecision {
             None => DispatchDecision::Dispatch(command.to_string()),
         },
         "switch-client" => match switch_client_table(command) {
-            Some(table) if table != "prefix" && table != "root" => {
-                DispatchDecision::Hint("that key table is not mirrored")
+            Some(table) if table == "prefix" || table == "root" => {
+                DispatchDecision::SwitchTable(table)
             }
-            _ => DispatchDecision::Dispatch(command.to_string()),
+            Some(_) => DispatchDecision::Hint("that key table is not mirrored"),
+            None => DispatchDecision::Dispatch(command.to_string()),
         },
         _ => DispatchDecision::Dispatch(command.to_string()),
     }
@@ -1039,18 +1046,23 @@ repeat-time not-a-number
     }
 
     #[test]
-    fn test_classify_command_switch_client_mirrored_table_dispatches() {
-        for cmd in [
-            "switch-client -T prefix",
-            "switch-client -T root",
-            "switch-client -n",
-        ] {
-            assert_eq!(
-                classify_command(cmd),
-                DispatchDecision::Dispatch(cmd.to_string()),
-                "{cmd}"
-            );
-        }
+    fn test_classify_command_switch_client_mirrored_table_switches_locally() {
+        assert_eq!(
+            classify_command("switch-client -T prefix"),
+            DispatchDecision::SwitchTable("prefix".to_string())
+        );
+        assert_eq!(
+            classify_command("switch-client -T root"),
+            DispatchDecision::SwitchTable("root".to_string())
+        );
+    }
+
+    #[test]
+    fn test_classify_command_switch_client_without_table_dispatches() {
+        assert_eq!(
+            classify_command("switch-client -n"),
+            DispatchDecision::Dispatch("switch-client -n".to_string())
+        );
     }
 
     // --- confirm-before parser ---
