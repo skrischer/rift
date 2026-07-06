@@ -16,8 +16,8 @@ daemon (gix), agent-agnostically.
       primary `✓ Commit` button with a live `N staged` suffix; `STAGED
       CHANGES` and `CHANGES` sections (driven by the EXISTING index/worktree
       split on `GitStatusEntry`) with count pills, section-level stage-all/
-      unstage-all icons, and per-row hover actions (stage/unstage; discard per
-      gate decision).
+      unstage-all icons, and per-row hover actions (unstage in STAGED;
+      stage + discard in CHANGES).
 - [ ] Committing the staged set from the panel creates a real commit (author/
       committer from the repo's git config); the panel, explorer decoration,
       status-line totals, and ahead counter converge on the daemon's next
@@ -43,7 +43,7 @@ daemon (gix), agent-agnostically.
 - `protocol` (deliberate API change, version-bumped): request/response pairs
   `StageFile { path }`, `UnstageFile { path }`, `StageHunk { path, hunk_id }`,
   `Commit { message }` → one `GitOpResult { op, ok, error }` reply each, plus
-  `DiscardFile { path }` if the gate accepts discard. `hunk_id` is defined
+  `DiscardFile { path }` (discard is in scope, gate-decided). `hunk_id` is defined
   normatively: the FNV-1a hash (the deploy.rs fingerprint pattern) over the
   hunk's header numbers AND all its lines — a same-shape content change
   yields a different id, so the daemon verifies content identity before any
@@ -56,7 +56,10 @@ daemon (gix), agent-agnostically.
   uses gix's `tree-editor` feature, zero new dependencies): stage = write the
   worktree blob into the index at `path` (add for untracked, filters per
   gix's autocrlf pipeline); unstage = restore the index entry from HEAD
-  (remove for newly added); commit = build the tree from the index
+  (remove for newly added); discard = restore the worktree file from the
+  index (checkout-file semantics — unstaged edits reverted, staged content
+  kept; an untracked file, absent from the index, is removed), always behind
+  the confirm dialog and never batched; commit = build the tree from the index
   (tree-editor), commit with parents=[HEAD], author/committer from config,
   reject an empty message or a NOTHING-STAGED state (index tree == HEAD
   tree — an index is never literally empty in a non-empty repo); a transient
@@ -90,9 +93,8 @@ daemon (gix), agent-agnostically.
 ### Out of scope
 
 - Push/pull/fetch, branch operations, merge/rebase UI (no remote writes in
-  v1; the commit-button dropdown segment ships only if the gate accepts
-  Amend — see open decision — otherwise the button renders without the
-  segment, a recorded deviation).
+  v1; the commit button renders without an amend dropdown segment — amend is
+  omitted in v1, a recorded deviation, see the decision log).
 - Per-side diffs (index-vs-HEAD vs worktree-vs-index views): v1 keeps ONE
   worktree-vs-HEAD diff per file. Honest consequence: already-staged hunks
   keep rendering as changes (worktree still differs from HEAD) with a live
@@ -110,7 +112,7 @@ daemon (gix), agent-agnostically.
   shelling out to a git binary.
 - All writes go through the daemon protocol — the client never touches the
   repo directly (remote-first).
-- Destructive ops (discard, if accepted) require an explicit confirm dialog
+- Destructive ops (discard) require an explicit confirm dialog
   (#420 pattern) and are never batched.
 - Theme tokens only; diff tints derive from success/danger at low alpha per
   §0; mono for all code/numbers. The Commit button's check mark is a
@@ -127,6 +129,8 @@ daemon (gix), agent-agnostically.
 | Git ops reply only ok/error; state arrives via the existing push recompute | One source of truth for git state (the push path); echoing state in replies would create a second sync mechanism | 2026-07-06 |
 | Split|Unified preference persists in the window-state store | Established local-persistence pattern (phase 9); a per-file toggle would be noise | 2026-07-06 |
 | No hook execution in v1 | gix does not run hooks natively; silently skipping hooks must be documented, not accidental (constitution: no surprising behavior); revisit on demand | 2026-07-06 |
+| Discard is in scope: `DiscardFile` = restore-from-index (checkout-file semantics), behind the #420 confirm dialog, never batched | Spec-acceptance gate decision; restore-from-index reverts unstaged edits while preserving a partially-staged set, matching the CHANGES-section mental model | 2026-07-06 |
+| Amend is omitted in v1 (commit button has no dropdown segment) | Spec-acceptance gate decision; `commit_as` expects the ref to equal the first parent, so amend needs a manual ref transaction — cost not justified for v1, revisit on demand | 2026-07-06 |
 | Word-level emphasis is client-side LCS on hunk line pairs | Presentation concern; the protocol stays line-based (hunks unchanged) | 2026-07-06 |
 
 ## Prior art
@@ -164,8 +168,9 @@ configured on the host.)
       shows exactly that hunk
 - [ ] Split view: aligned columns, word-level emphasis, hatched fillers;
       toggle persists across restarts
-- [ ] Discard (if in scope): confirm dialog, file restored to HEAD, panel
-      converges
+- [ ] Discard: confirm dialog, worktree file restored from the index
+      (unstaged edits reverted, staged content kept; untracked file removed),
+      panel converges
 - [ ] Visual match vs the Git — Diff Review artboard at the QA gate
 
 ## Risks and mitigations
@@ -195,3 +200,7 @@ configured on the host.)
   icon-not-glyph note, index.lock bounded retry, corrected per-connection
   citation. Amend's extra gix cost (manual ref transaction — commit_as
   expects ref == first parent) recorded for the gate decision.
+- 2026-07-06: Spec-acceptance gate resolved the two open decisions — discard
+  is IN scope as restore-from-index (checkout-file semantics, behind the #420
+  confirm dialog, never batched); amend is OMITTED in v1 (commit button ships
+  without the dropdown segment, a recorded deviation). Spec accepted.
