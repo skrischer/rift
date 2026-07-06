@@ -52,7 +52,8 @@ fn daemon_is_running(probe_output: &str) -> bool {
 ///
 /// When `root` is set, a single-quoted `--root <path>` is appended to the daemon
 /// invocation so it watches that directory; absent, the flag is omitted and the
-/// daemon falls back to its launch directory.
+/// daemon refuses to start (it no longer falls back to its launch directory,
+/// which over SSH is `$HOME`).
 fn launch_command(
     binary_path: &str,
     socket_path: &str,

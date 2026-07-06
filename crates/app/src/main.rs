@@ -1471,9 +1471,10 @@ async fn provision_daemon(
 
     // Project root the daemon should watch: RIFT_PROJECT_ROOT (runtime) wins over
     // a `just promote` compile-time bake (RIFT_DEFAULT_PROJECT_ROOT), mirroring the
-    // RIFT_SSH_KEY / RIFT_DEFAULT_SSH_KEY split. None leaves the daemon on its
-    // launch directory; the root is only honored on a fresh spawn, so a reattach
-    // keeps the already-running daemon's root.
+    // RIFT_SSH_KEY / RIFT_DEFAULT_SSH_KEY split. None makes a freshly spawned daemon
+    // refuse to start and this call fall back to tmux-only (see the `Err` arm
+    // below); the root is only honored on a fresh spawn, so a reattach keeps the
+    // already-running daemon's root regardless of this value.
     let project_root = env::var("RIFT_PROJECT_ROOT")
         .ok()
         .or_else(|| option_env!("RIFT_DEFAULT_PROJECT_ROOT").map(String::from));

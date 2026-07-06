@@ -60,7 +60,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(other) => anyhow::bail!("unknown argument: {other}"),
         // Default stdio mode: speak the protocol over stdin/stdout for a single
-        // session. `serve` returns when stdin reaches EOF.
+        // session. `serve` returns when stdin reaches EOF. No production or
+        // integration path launches the binary bare like this — `crates/ssh/src/launch.rs`
+        // drives `--serve-uds`/`--connect` exclusively — so `watched_root(None)`
+        // deliberately always errors here rather than silently watching `$HOME`;
+        // this mode is effectively unusable until a caller can supply a root.
         None => {
             let root = watched_root(None)?;
             init_logging(PathBuf::from("rift-daemon.log"), None)?;
