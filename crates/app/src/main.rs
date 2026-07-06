@@ -2111,9 +2111,12 @@ fn bytes_to_string(bytes: Vec<u8>) -> String {
 /// protocol layout. The render `apply_snapshot` replaces its whole model from
 /// this, so a `LayoutSnapshot` and a `LayoutUpdate` map identically. Window and
 /// pane ids take tmux's native `@N` / `%N` form, matching the command targets the
-/// session view embeds and the `%N` pane ids on `PaneOutput`. Per-pane
-/// CWD/command ride the daemon layout query (#442) and refresh on its coalesced
-/// re-query cadence; on the legacy path they stay subscription-driven.
+/// session view embeds and the `%N` pane ids on `PaneOutput`. The tab number
+/// (`TmuxWindowState::index`) carries the daemon's real tmux `window_index`
+/// (#495) rather than the window's array position, so a closed window's gap in
+/// the numbering matches `tmux list-windows` instead of silently collapsing.
+/// Per-pane CWD/command ride the daemon layout query (#442) and refresh on its
+/// coalesced re-query cadence; on the legacy path they stay subscription-driven.
 fn layout_to_snapshot(
     session: String,
     windows: Vec<rift_protocol::WindowLayout>,
@@ -2122,8 +2125,7 @@ fn layout_to_snapshot(
 
     let windows = windows
         .into_iter()
-        .enumerate()
-        .map(|(index, window)| {
+        .map(|window| {
             let window_id = format!("@{}", window.window_id);
             let active_pane_id = window
                 .panes
@@ -2150,10 +2152,11 @@ fn layout_to_snapshot(
                 .collect();
             TmuxWindowState {
                 id: window_id,
-                // The daemon layout query carries no tmux window index; the layout
-                // order is a stable, monotonic stand-in for the tab number (display
-                // only — window selection targets the `@N` id, not this).
-                index: index as i32,
+                // tmux's real window index (#495): display only, so a closed
+                // window's gap in the numbering (`renumber-windows` off, the
+                // default) shows up here too — window selection targets the
+                // `@N` id, never this.
+                index: window.window_index as i32,
                 name: window.name,
                 layout: String::new(),
                 is_active: window.active,
@@ -2174,8 +2177,8 @@ fn layout_to_snapshot(
 #[cfg(test)]
 mod tests {
     use super::{
-        drain_render_backlog, is_retryable_session_error, CaptureRequest, EditorChannels,
-        EngineWatches, PaneInput, PtyChannels, SessionSwitchRequest, TermSize,
+        drain_render_backlog, is_retryable_session_error, layout_to_snapshot, CaptureRequest,
+        EditorChannels, EngineWatches, PaneInput, PtyChannels, SessionSwitchRequest, TermSize,
     };
 
     /// The engine-side ends ([`PtyChannels`] / [`EditorChannels`] /
@@ -2435,5 +2438,42 @@ mod tests {
         let error = anyhow::Error::new(rift_ssh::SshError::Channel("channel closed".into()))
             .context("daemon stream reconnect gave up after 10 attempts");
         assert!(is_retryable_session_error(&error));
+    }
+
+    fn window_layout(window_id: u32, window_index: u32) -> rift_protocol::WindowLayout {
+        rift_protocol::WindowLayout {
+            window_id,
+            window_index,
+            name: format!("win-{window_id}"),
+            active: false,
+            panes: vec![rift_protocol::PaneLayout {
+                pane_id: window_id,
+                active: true,
+                left: 0,
+                top: 0,
+                width: 80,
+                height: 24,
+                current_path: String::new(),
+                current_command: String::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn test_layout_to_snapshot_uses_real_window_index_not_array_position() {
+        // Closing window 1 leaves a gap in tmux's own numbering
+        // (`renumber-windows` off, the default): the daemon layout carries
+        // window_index 0 and 2, not the contiguous 0 and 1 an array-position
+        // stand-in would produce (#495).
+        let windows = vec![window_layout(0, 0), window_layout(5, 2)];
+
+        let snapshot = layout_to_snapshot("rift".to_owned(), windows);
+
+        let indices: Vec<i32> = snapshot.windows.iter().map(|w| w.index).collect();
+        assert_eq!(
+            indices,
+            vec![0, 2],
+            "the tab index must be the real tmux window_index, not array position"
+        );
     }
 }
