@@ -8,7 +8,10 @@
 //! non-ignored directories are watched — a large ignored tree like `target/`
 //! (excluded from the scan entirely) or `dist/`/`.venv/` (scanned, but unwatched)
 //! never consumes an OS watch; if the watch limit is still hit the watcher logs once
-//! and degrades rather than panicking.
+//! and degrades that directory rather than panicking. Degradation does not stick
+//! forever (#496): a bounded periodic timer retries every directory that failed to
+//! register, and any successful retry is followed by a full rescan, so changes
+//! missed while degraded are caught up in one batch.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -33,6 +36,11 @@ const DEBOUNCE: Duration = Duration::from_millis(100);
 const MAX_COALESCE: Duration = Duration::from_secs(1);
 /// Idle wake interval so the worker notices shutdown between bursts.
 const IDLE_POLL: Duration = Duration::from_millis(500);
+/// Bounded interval between attempts to re-register a directory that previously
+/// failed to watch (e.g. the OS watch limit was hit). Checked on the idle-poll
+/// path, so degradation recovers even when the unwatched subtree itself never
+/// generates an event to trigger a reconcile.
+const REARM_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Watches a worktree root and emits coalesced [`Change`] batches as files are
 /// created, modified, deleted, or moved. Dropping the watcher stops the background
@@ -125,6 +133,7 @@ impl Watcher {
                     change_tx,
                     git_tx,
                     worker_shutdown,
+                    REARM_INTERVAL,
                 )
             })
             .map_err(|err| ExplorerError::WatchError(err.to_string()))?;
@@ -154,6 +163,9 @@ impl Drop for Watcher {
 struct WatchSet {
     watcher: RecommendedWatcher,
     dirs: BTreeSet<PathBuf>,
+    /// Directories that are desired (part of the latest snapshot) but failed to
+    /// register — e.g. the OS watch limit was hit. Retried by [`WatchSet::rearm`].
+    failed: BTreeSet<PathBuf>,
     warned: bool,
     warned_git: bool,
 }
@@ -163,6 +175,7 @@ impl WatchSet {
         Self {
             watcher,
             dirs: BTreeSet::new(),
+            failed: BTreeSet::new(),
             warned: false,
             warned_git: false,
         }
@@ -170,13 +183,15 @@ impl WatchSet {
 
     /// Watch `dir` non-recursively unless it already is. A failure (e.g. the inotify
     /// watch limit) is logged once and then suppressed, leaving that subtree unwatched
-    /// rather than aborting the watcher.
+    /// rather than aborting the watcher; the directory is recorded in `failed` so
+    /// [`WatchSet::rearm`] can retry it later.
     fn watch(&mut self, dir: PathBuf) {
         if self.dirs.contains(&dir) {
             return;
         }
         match self.watcher.watch(&dir, RecursiveMode::NonRecursive) {
             Ok(()) => {
+                self.failed.remove(&dir);
                 self.dirs.insert(dir);
             }
             Err(err) => {
@@ -184,15 +199,36 @@ impl WatchSet {
                     self.warned = true;
                     tracing::warn!(%err, "cannot register filesystem watch (OS watch limit?); some changes may be missed");
                 }
+                self.failed.insert(dir);
             }
         }
     }
 
     fn unwatch(&mut self, dir: &Path) {
+        self.failed.remove(dir);
         if self.dirs.remove(dir) {
             // The directory is usually already gone, so an error here is expected.
             let _ = self.watcher.unwatch(dir);
         }
+    }
+
+    /// Retry every directory that previously failed to register. Returns whether at
+    /// least one newly succeeded — the caller uses that to trigger a full rescan,
+    /// since changes inside a directory that was never watched would otherwise stay
+    /// invisible until something else happens to trigger one.
+    ///
+    /// Once every failed directory recovers, `warned` resets so a future
+    /// degradation logs again instead of staying silent forever after the first.
+    fn rearm(&mut self) -> bool {
+        let pending: Vec<PathBuf> = self.failed.iter().cloned().collect();
+        let before = self.failed.len();
+        for dir in pending {
+            self.watch(dir);
+        }
+        if self.failed.is_empty() {
+            self.warned = false;
+        }
+        self.failed.len() < before
     }
 
     /// Watch `path` once, outside the snapshot-reconciled `dirs` set, so
@@ -235,6 +271,10 @@ impl WatchSet {
         for dir in stale {
             self.unwatch(&dir);
         }
+        // A directory that failed to register earlier but is no longer part of the
+        // tree (e.g. it was removed while degraded) must not linger in `failed`
+        // forever — rearm would keep retrying a path that can never succeed again.
+        self.failed.retain(|dir| desired.contains(dir));
         for dir in desired {
             self.watch(dir);
         }
@@ -244,6 +284,9 @@ impl WatchSet {
 /// The background worker: coalesce event bursts and, at each quiet point, rescan and
 /// diff against the held snapshot to emit a change batch. The notify watcher lives
 /// here (inside `watches`), so the event channel stays open for the worker's life.
+///
+/// `rearm_interval` is [`REARM_INTERVAL`] in production; tests inject a shorter
+/// value so a simulated watch failure can recover within the test timeout.
 fn run(
     mut watches: WatchSet,
     mut snapshot: Snapshot,
@@ -251,7 +294,9 @@ fn run(
     changes: mpsc::Sender<Vec<Change>>,
     git: Option<mpsc::Sender<GitStatus>>,
     shutdown: Arc<AtomicBool>,
+    rearm_interval: Duration,
 ) {
+    let mut last_rearm = Instant::now();
     while !shutdown.load(Ordering::Relaxed) {
         // Block (waking periodically to notice shutdown) until a burst begins.
         let mut saw_change = match events.recv_timeout(IDLE_POLL) {
@@ -259,7 +304,23 @@ fn run(
                 log_event_error(&event);
                 is_change(&event)
             }
-            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Timeout) => {
+                // No event arrived, but a directory may still be degraded (e.g.
+                // the OS watch limit) with nothing left watched to ever trigger a
+                // reconcile. Retry on a bounded interval rather than waiting
+                // forever for a signal that may never come.
+                if !try_rearm(
+                    &mut watches,
+                    &mut snapshot,
+                    &changes,
+                    &git,
+                    &mut last_rearm,
+                    rearm_interval,
+                ) {
+                    return;
+                }
+                continue;
+            }
             Err(RecvTimeoutError::Disconnected) => return,
         };
 
@@ -290,42 +351,81 @@ fn run(
             continue;
         }
 
-        // Reconcile against the current tree and emit any worktree deltas. A
-        // rescan failure is logged but must not skip the git recompute below: a
-        // `.git/`-only change leaves the worktree unchanged yet still alters git
-        // status.
-        match Snapshot::scan(snapshot.root()) {
-            Ok(next) => {
-                let batch = snapshot.diff(&next);
-                if !batch.is_empty() {
-                    snapshot = next;
-                    watches.reconcile(&snapshot);
-                    if changes.send(batch).is_err() {
-                        // The consumer dropped the receiver; nothing more to do.
-                        return;
-                    }
+        if !flush(&mut watches, &mut snapshot, &changes, &git) {
+            return;
+        }
+    }
+}
+
+/// Rescan the tree, diff against the held snapshot, reconcile the watch set, and
+/// emit any resulting change batch, then recompute git status (git mode only).
+/// Returns `false` if a receiver has gone away and the worker should stop.
+///
+/// A rescan failure is logged but must not skip the git recompute: a `.git/`-only
+/// change leaves the worktree unchanged yet still alters git status.
+fn flush(
+    watches: &mut WatchSet,
+    snapshot: &mut Snapshot,
+    changes: &mpsc::Sender<Vec<Change>>,
+    git: &Option<mpsc::Sender<GitStatus>>,
+) -> bool {
+    match Snapshot::scan(snapshot.root()) {
+        Ok(next) => {
+            let batch = snapshot.diff(&next);
+            if !batch.is_empty() {
+                *snapshot = next;
+                watches.reconcile(snapshot);
+                if changes.send(batch).is_err() {
+                    // The consumer dropped the receiver; nothing more to do.
+                    return false;
                 }
             }
-            Err(err) => tracing::warn!(%err, "worktree rescan failed; keeping previous snapshot"),
         }
+        Err(err) => tracing::warn!(%err, "worktree rescan failed; keeping previous snapshot"),
+    }
 
-        // Git status recompute (git mode only). Runs on every flush — a worktree
-        // edit or any `.git/` control change. A compute error (e.g. a transient
-        // `index.lock` while git is mid-write) is logged and skipped; the next
-        // flush recomputes, so a momentary lock never aborts watching.
-        if let Some(git_tx) = &git {
-            match GitStatus::compute(snapshot.root()) {
-                Ok(status) => {
-                    if git_tx.send(status).is_err() {
-                        return;
-                    }
+    // Git status recompute (git mode only). Runs on every flush — a worktree
+    // edit or any `.git/` control change. A compute error (e.g. a transient
+    // `index.lock` while git is mid-write) is logged and skipped; the next
+    // flush recomputes, so a momentary lock never aborts watching.
+    if let Some(git_tx) = git {
+        match GitStatus::compute(snapshot.root()) {
+            Ok(status) => {
+                if git_tx.send(status).is_err() {
+                    return false;
                 }
-                Err(err) => {
-                    tracing::warn!(%err, "git status recompute failed; retrying on next change")
-                }
+            }
+            Err(err) => {
+                tracing::warn!(%err, "git status recompute failed; retrying on next change")
             }
         }
     }
+    true
+}
+
+/// Retry any directory that previously failed to register, on a bounded interval,
+/// and follow a successful retry with a full [`flush`] — a directory that was
+/// never watched can have missed changes only a fresh rescan surfaces. A no-op
+/// (returning `true`) when nothing has failed or the interval has not yet
+/// elapsed. Returns `false` if a receiver has gone away and the worker should
+/// stop.
+fn try_rearm(
+    watches: &mut WatchSet,
+    snapshot: &mut Snapshot,
+    changes: &mpsc::Sender<Vec<Change>>,
+    git: &Option<mpsc::Sender<GitStatus>>,
+    last_rearm: &mut Instant,
+    rearm_interval: Duration,
+) -> bool {
+    if watches.failed.is_empty() || last_rearm.elapsed() < rearm_interval {
+        return true;
+    }
+    *last_rearm = Instant::now();
+    if watches.rearm() {
+        tracing::info!("recovered from watch-limit degradation; rescanning");
+        return flush(watches, snapshot, changes, git);
+    }
+    true
 }
 
 /// A notify error surfaces through the same channel as events; the event payload is
@@ -529,6 +629,109 @@ mod tests {
             !watches.dirs.contains(&root.join("dist")),
             "an ignored directory must never be OS-watched"
         );
+    }
+
+    // --- watch-limit degradation recovery (#496) ---
+
+    /// A failed [`WatchSet::watch`] (simulated here via a directory that does not
+    /// exist yet, the same failure shape as hitting the OS watch limit) must stay
+    /// retryable rather than permanently degraded: [`WatchSet::rearm`] keeps
+    /// failing while the path is unwatchable, then succeeds — and clears it from
+    /// `failed` — the moment it becomes watchable.
+    #[test]
+    fn test_rearm_recovers_previously_failed_directory_once_watchable() {
+        let tmp = TempDir::new("rearm-watchset");
+        let root = &tmp.path;
+        write_file(&root.join("existing.txt"), "x");
+
+        let (event_tx, _event_rx) = mpsc::channel();
+        let watcher = RecommendedWatcher::new(
+            move |result: notify::Result<Event>| {
+                let _ = event_tx.send(result);
+            },
+            Config::default(),
+        )
+        .expect("create watcher");
+        let mut watches = WatchSet::new(watcher);
+
+        // The directory does not exist yet, so registering it fails the same way
+        // an OS watch-limit rejection would.
+        let missing = root.join("sub");
+        watches.watch(missing.clone());
+        assert!(watches.failed.contains(&missing));
+        assert!(!watches.dirs.contains(&missing));
+
+        assert!(
+            !watches.rearm(),
+            "retrying before the directory exists must still fail"
+        );
+        assert!(watches.failed.contains(&missing));
+
+        std::fs::create_dir_all(&missing).expect("create dir");
+        assert!(
+            watches.rearm(),
+            "retrying once the directory exists must succeed"
+        );
+        assert!(watches.dirs.contains(&missing));
+        assert!(!watches.failed.contains(&missing));
+    }
+
+    /// End-to-end: a directory that failed to register recovers on the bounded
+    /// re-arm interval and the worker delivers a fresh snapshot for changes that
+    /// happened while it was unwatched — without any filesystem event ever
+    /// arriving on `run`'s event channel, proving the periodic timer (not event
+    /// delivery) drives the recovery.
+    #[test]
+    fn test_watcher_run_recovers_from_watch_failure_after_rearm_interval() {
+        let tmp = TempDir::new("rearm-run");
+        let root = &tmp.path;
+        write_file(&root.join("existing.txt"), "x");
+        let initial = Snapshot::scan(root).expect("scan");
+
+        // A real underlying watcher is required to call `.watch()`/`.unwatch()`,
+        // but its own generated events are discarded here — `run` below is fed
+        // through a completely separate channel that nothing ever writes to, so
+        // the only path that can produce a batch is the periodic rearm under test.
+        let watcher =
+            RecommendedWatcher::new(|_result: notify::Result<Event>| {}, Config::default())
+                .expect("create watcher");
+        let mut watches = WatchSet::new(watcher);
+
+        let sub = root.join("sub");
+        watches.watch(sub.clone());
+        assert!(watches.failed.contains(&sub), "fixture assumption");
+
+        let (_event_tx, event_rx) = mpsc::channel::<notify::Result<Event>>();
+        let (change_tx, change_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let rearm_interval = Duration::from_millis(200);
+
+        let handle = std::thread::spawn(move || {
+            run(
+                watches,
+                initial,
+                event_rx,
+                change_tx,
+                None,
+                worker_shutdown,
+                rearm_interval,
+            )
+        });
+
+        // `sub` becomes watchable and gains a file while the watcher is degraded.
+        // No event ever announces this on `run`'s channel.
+        write_file(&sub.join("new.txt"), "new");
+
+        let batch = change_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a fresh batch once the periodic rearm recovers");
+        assert!(batch.iter().any(|c| {
+            matches!(c, Change::Added { path, .. } if path == Path::new("sub/new.txt"))
+        }));
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().expect("worker thread joins after shutdown");
     }
 
     #[test]
