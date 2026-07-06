@@ -204,130 +204,144 @@ const WORKTREE_IDLE_POLL: Duration = Duration::from_millis(500);
 /// batches all live here, so the dispatch loop never blocks on filesystem work.
 /// A scan or watch failure is logged and degrades to "no worktree" — the daemon
 /// keeps serving (stderr is the daemon's log sink).
+///
+/// Git watching is not fixed at startup. A root that is not a repository yet is
+/// watched worktree-only while `GitStatus::compute` is re-probed on every tick;
+/// the moment a repository appears (`git init`, or a transient boot-time
+/// unreadability clearing) the worker upgrades in place to git watching against
+/// a fresh baseline (#483). Git mode itself is terminal — a repo that loses its
+/// `.git` just fails recomputes, which the git relay already tolerates (#430).
 fn worktree_worker(root: PathBuf, events: mpsc::Sender<WorktreeEvent>) {
-    let snapshot = match Snapshot::scan(&root) {
-        Ok(snapshot) => snapshot,
-        Err(err) => {
-            error!(root = %root.display(), %err, "worktree scan failed");
-            return;
-        }
-    };
+    loop {
+        let snapshot = match Snapshot::scan(&root) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                error!(root = %root.display(), %err, "worktree scan failed");
+                return;
+            }
+        };
 
-    // Compute the initial git status before arming the watcher. A successful
-    // compute means the root is a git repository, so enable git watching
-    // (`with_git_status`) — the `.git/` whitelist plus a recompute per flush. An
-    // error (not a repo, or git unreadable) degrades to worktree-only watching
-    // (`Watcher::new`), so a non-repo root still streams its file tree without
-    // spamming per-flush git errors.
-    //
-    // The watcher is armed BEFORE the snapshot/status is delivered: it registers
-    // its watch set synchronously, so once a consumer has observed the initial
-    // state, any later change is guaranteed to produce an event. The reverse
-    // order races — a write right after delivery would precede the watches and,
-    // with no event, the rescan-on-event watcher would never surface it. The
-    // clone is the two-owner boundary: the watcher keeps the diff baseline, the
-    // dispatch loop's `State` gets its own copy.
-    match GitStatus::compute(&root) {
-        Ok(initial_git) => {
-            let (_watcher, changes, git_rx) = match Watcher::with_git_status(snapshot.clone()) {
-                Ok(triple) => triple,
-                Err(err) => {
-                    error!(%err, "worktree watch failed");
-                    return;
-                }
-            };
-            if events
-                .blocking_send(WorktreeEvent::Scanned(snapshot))
-                .is_err()
-                || events
-                    .blocking_send(WorktreeEvent::GitRecomputed(initial_git))
+        // Probe for a repository at the root. A successful compute means it is
+        // one, so arm git watching (`with_git_status`) — the `.git/` whitelist
+        // plus a recompute per flush. An error (not a repo yet, or git
+        // unreadable) watches worktree-only (`Watcher::new`) and re-probes until
+        // a repo appears, so a non-repo root still streams its file tree without
+        // spamming per-flush git errors.
+        //
+        // The watcher is armed BEFORE the snapshot/status is delivered: it
+        // registers its watch set synchronously, so once a consumer has observed
+        // the initial state, any later change is guaranteed to produce an event.
+        // The reverse order races — a write right after delivery would precede
+        // the watches and, with no event, the rescan-on-event watcher would never
+        // surface it. The clone is the two-owner boundary: the watcher keeps the
+        // diff baseline, the dispatch loop's `State` gets its own copy.
+        match GitStatus::compute(&root) {
+            Ok(initial_git) => {
+                watch_git_mode(snapshot, initial_git, &events);
+                return;
+            }
+            Err(err) => {
+                info!(root = %root.display(), %err, "no git status; watching worktree only");
+                let (_watcher, changes) = match Watcher::new(snapshot.clone()) {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        error!(%err, "worktree watch failed");
+                        return;
+                    }
+                };
+                if events
+                    .blocking_send(WorktreeEvent::Scanned(snapshot))
                     .is_err()
-            {
-                return;
-            }
-            relay_events(&changes, Some(&git_rx), &events);
-        }
-        Err(err) => {
-            info!(root = %root.display(), %err, "no git status; watching worktree only");
-            let (_watcher, changes) = match Watcher::new(snapshot.clone()) {
-                Ok(pair) => pair,
-                Err(err) => {
-                    error!(%err, "worktree watch failed");
+                {
                     return;
                 }
-            };
-            if events
-                .blocking_send(WorktreeEvent::Scanned(snapshot))
-                .is_err()
-            {
-                return;
+                match relay_worktree_until_git(&root, &changes, &events) {
+                    // A repo appeared: drop this worktree-only watcher (end of
+                    // its scope) and loop to arm a git-mode watch on a fresh scan.
+                    RelayOutcome::Upgrade => continue,
+                    // The dispatch loop is gone; the worker is done.
+                    RelayOutcome::Stop => return,
+                }
             }
-            relay_events(&changes, None, &events);
         }
     }
 }
 
-/// Relay the watcher's change batches (and, in git mode, git-status recomputes)
-/// into the dispatch loop until a channel closes or the loop is gone.
+/// Arm a git-mode watch on the snapshot's root, deliver the initial scan and git
+/// status, then relay change batches and git recomputes until a channel closes
+/// or the dispatch loop is gone. `initial_git` is the already-computed status
+/// delivered right behind the scan — the watcher is armed before either is sent,
+/// the ordering the worker relies on (see [`worktree_worker`]).
+fn watch_git_mode(
+    snapshot: Snapshot,
+    initial_git: GitStatus,
+    events: &mpsc::Sender<WorktreeEvent>,
+) {
+    let (_watcher, changes, git_rx) = match Watcher::with_git_status(snapshot.clone()) {
+        Ok(triple) => triple,
+        Err(err) => {
+            error!(%err, "worktree watch failed");
+            return;
+        }
+    };
+    if events
+        .blocking_send(WorktreeEvent::Scanned(snapshot))
+        .is_err()
+        || events
+            .blocking_send(WorktreeEvent::GitRecomputed(initial_git))
+            .is_err()
+    {
+        return;
+    }
+    relay_events(&changes, &git_rx, events);
+}
+
+/// Relay the watcher's change batches and git-status recomputes into the
+/// dispatch loop until a channel closes or the loop is gone.
 ///
-/// In git mode the git channel is the primary wait: `with_git_status` emits a
-/// recompute on *every* successful flush, while worktree changes are emitted
-/// only on a non-empty diff and always *before* the flush's git tick. So
-/// blocking on the git tick and then draining the worktree changes already
-/// queued preserves the order (tree update before its git decoration). A flush
-/// whose git recompute fails (e.g. a transient `index.lock`) emits no tick, so
-/// the idle-poll timeout drains the queued worktree changes too — the tree
-/// keeps updating while git status recovers on a later tick (#430). Without
-/// git, this is the original worktree-only relay.
+/// The git channel is the primary wait: `with_git_status` emits a recompute on
+/// *every* successful flush, while worktree changes are emitted only on a
+/// non-empty diff and always *before* the flush's git tick. So blocking on the
+/// git tick and then draining the worktree changes already queued preserves the
+/// order (tree update before its git decoration). A flush whose git recompute
+/// fails (e.g. a transient `index.lock`) emits no tick, so the idle-poll timeout
+/// drains the queued worktree changes too — the tree keeps updating while git
+/// status recovers on a later tick (#430). The pre-repository phase has its own
+/// relay ([`relay_worktree_until_git`]); this runs only once a repo exists.
 fn relay_events(
     changes: &std::sync::mpsc::Receiver<Vec<Change>>,
-    git: Option<&std::sync::mpsc::Receiver<GitStatus>>,
+    git: &std::sync::mpsc::Receiver<GitStatus>,
     events: &mpsc::Sender<WorktreeEvent>,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
     loop {
-        match git {
-            Some(git_rx) => match git_rx.recv_timeout(WORKTREE_IDLE_POLL) {
-                Ok(status) => {
-                    // Drain the worktree changes this flush queued before its
-                    // git tick, so the tree update precedes the git decoration.
-                    if !drain_changes(changes, events) {
-                        return;
-                    }
-                    if events
-                        .blocking_send(WorktreeEvent::GitRecomputed(status))
-                        .is_err()
-                    {
-                        return;
-                    }
+        match git.recv_timeout(WORKTREE_IDLE_POLL) {
+            Ok(status) => {
+                // Drain the worktree changes this flush queued before its git
+                // tick, so the tree update precedes the git decoration.
+                if !drain_changes(changes, events) {
+                    return;
                 }
-                Err(RecvTimeoutError::Timeout) => {
-                    // No git tick — either idle, or a flush whose git recompute
-                    // failed and emitted none. Its worktree changes are already
-                    // queued; relay them so the client tree never stalls on a
-                    // failing recompute (#430).
-                    if !drain_changes(changes, events) {
-                        return;
-                    }
-                    if events.is_closed() {
-                        return;
-                    }
+                if events
+                    .blocking_send(WorktreeEvent::GitRecomputed(status))
+                    .is_err()
+                {
+                    return;
                 }
-                Err(RecvTimeoutError::Disconnected) => return,
-            },
-            None => match changes.recv_timeout(WORKTREE_IDLE_POLL) {
-                Ok(batch) => {
-                    if events.blocking_send(WorktreeEvent::Changed(batch)).is_err() {
-                        return;
-                    }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // No git tick — either idle, or a flush whose git recompute
+                // failed and emitted none. Its worktree changes are already
+                // queued; relay them so the client tree never stalls on a
+                // failing recompute (#430).
+                if !drain_changes(changes, events) {
+                    return;
                 }
-                Err(RecvTimeoutError::Timeout) => {
-                    if events.is_closed() {
-                        return;
-                    }
+                if events.is_closed() {
+                    return;
                 }
-                Err(RecvTimeoutError::Disconnected) => return,
-            },
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
         }
     }
 }
@@ -344,6 +358,50 @@ fn drain_changes(
         }
     }
     true
+}
+
+/// Why the worktree-only relay ([`relay_worktree_until_git`]) returned: a
+/// repository appeared (upgrade to git watching) or the dispatch loop is gone
+/// (stop the worker).
+enum RelayOutcome {
+    Upgrade,
+    Stop,
+}
+
+/// Relay worktree change batches while the root is not (yet) a git repository,
+/// re-probing `GitStatus::compute` on every tick — each change flush and each
+/// idle poll.
+///
+/// A bare `git init` mutates only `.git/`, which the worktree scan excludes, so
+/// it yields no change batch; the idle-poll re-probe is what catches it (#483).
+/// The probe is a cheap `gix::open` that fails fast on a non-repo, so polling it
+/// each tick is inexpensive. Returns [`RelayOutcome::Upgrade`] the moment a repo
+/// is detected — the caller then arms a git-mode watch against a fresh baseline
+/// — or [`RelayOutcome::Stop`] when the dispatch loop has dropped the channel.
+fn relay_worktree_until_git(
+    root: &Path,
+    changes: &std::sync::mpsc::Receiver<Vec<Change>>,
+    events: &mpsc::Sender<WorktreeEvent>,
+) -> RelayOutcome {
+    use std::sync::mpsc::RecvTimeoutError;
+    loop {
+        match changes.recv_timeout(WORKTREE_IDLE_POLL) {
+            Ok(batch) => {
+                if events.blocking_send(WorktreeEvent::Changed(batch)).is_err() {
+                    return RelayOutcome::Stop;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if events.is_closed() {
+                    return RelayOutcome::Stop;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return RelayOutcome::Stop,
+        }
+        if GitStatus::compute(root).is_ok() {
+            return RelayOutcome::Upgrade;
+        }
+    }
 }
 
 /// Receive the next worktree event, or pend forever when no worktree is armed
@@ -2773,7 +2831,7 @@ mod tests {
         // `relay_events` blocks (`recv_timeout` / `blocking_send`), so it runs
         // on its own thread — the same shape as the production worker.
         let relay = std::thread::spawn(move || {
-            relay_events(&changes_rx, Some(&git_rx), &events_tx);
+            relay_events(&changes_rx, &git_rx, &events_tx);
         });
 
         // Injected git failure: the flush queued a change batch, but the failed
@@ -3003,6 +3061,52 @@ mod tests {
 
         server.abort();
         let _ = tokio::fs::remove_file(&sock).await;
+    }
+
+    #[tokio::test]
+    async fn test_worktree_worker_upgrades_to_git_after_init() {
+        // A root that becomes a git repository after startup must gain git status
+        // without a daemon restart: the worktree-only phase re-probes each tick
+        // and upgrades in place when a repo appears (#483).
+        let tmp = TempDir::new("git-reprobe");
+        write_file(&tmp.path.join("tracked.txt"), "v1\n");
+        let (mut daemon, handles) = channels(64, 8);
+        daemon.watch_worktree(tmp.path.clone());
+        let mut state = handles.state.clone();
+        let loop_handle = tokio::spawn(daemon.run());
+        // The initial scan lands with no git status — the root is not a repo yet.
+        loop {
+            {
+                let snap = state.borrow_and_update();
+                if snap.worktree.is_some() {
+                    assert!(snap.git.is_none(), "a non-repo root carries no git status");
+                    break;
+                }
+            }
+            state.changed().await.expect("state sender alive");
+        }
+        // Make the root a repository. `git add` (no commit) leaves tracked.txt
+        // staged as an add, so the recomputed status carries an entry for it.
+        git(&tmp.path, &["init", "-q", "-b", "main"]);
+        git(&tmp.path, &["add", "tracked.txt"]);
+        // The next re-probe tick upgrades in place: git status for the tracked
+        // file arrives without a restart.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                state.changed().await.expect("state sender alive");
+                let has_status = state
+                    .borrow_and_update()
+                    .git
+                    .as_ref()
+                    .is_some_and(|status| status.get(Path::new("tracked.txt")).is_some());
+                if has_status {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("git status delivered after init without a daemon restart");
+        loop_handle.abort();
     }
 
     // ── Navigation routing + per-connection drop-stale (#482) ────────────────
