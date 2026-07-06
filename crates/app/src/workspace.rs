@@ -980,6 +980,7 @@ impl Render for WorkspaceView {
             status_bar::StatusBarMode::Native => {
                 let model = self.file_tree.read(cx).model();
                 status_bar::render(
+                    model.repo_state_received(),
                     model.branch(),
                     model.ahead_behind(),
                     model.all_diagnostics(),
