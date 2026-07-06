@@ -638,7 +638,7 @@ mod tests {
 
     // ── resolve_defaults (pure) ──────────────────────────────────────────
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn test_resolve_defaults_uses_hardcoded_defaults_when_nothing_is_set() {
         let defaults = resolve_defaults(DefaultsInputs::default());
 
@@ -654,7 +654,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn test_resolve_defaults_uses_every_explicit_value_when_set() {
         let defaults = resolve_defaults(DefaultsInputs {
             host: Some("100.64.0.1"),
@@ -674,7 +674,7 @@ mod tests {
         assert_eq!(defaults.session, "work");
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn test_resolve_defaults_unparsable_port_falls_back_to_default() {
         let defaults = resolve_defaults(DefaultsInputs {
             port: Some("not-a-port"),
@@ -684,7 +684,7 @@ mod tests {
         assert_eq!(defaults.port, DEFAULT_PORT);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn test_resolve_defaults_prefers_runtime_key_over_baked_default() {
         let defaults = resolve_defaults(DefaultsInputs {
             key: Some("/keys/runtime"),
@@ -695,7 +695,7 @@ mod tests {
         assert_eq!(defaults.key, PathBuf::from("/keys/runtime"));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn test_resolve_defaults_falls_back_to_baked_key_when_runtime_unset() {
         let defaults = resolve_defaults(DefaultsInputs {
             baked_key: Some("/keys/baked"),
@@ -705,7 +705,7 @@ mod tests {
         assert_eq!(defaults.key, PathBuf::from("/keys/baked"));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn test_resolve_defaults_windows_home_fallback_when_home_unset() {
         let defaults = resolve_defaults(DefaultsInputs {
             windows: true,
