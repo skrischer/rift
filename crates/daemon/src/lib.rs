@@ -11,8 +11,8 @@ use lsp::{document_changes, BufferEvent, LspDiagnostics, LspWorker, NavRequest};
 use rift_explorer::{Change, Entry, GitStatus, Snapshot, Watcher};
 use rift_lsp::{DocumentChange, DocumentSelector};
 use rift_protocol::{
-    encode_frame, ClientMessage, DaemonMessage, Diagnostic, EntryKind, FrameDecoder, WorktreeEntry,
-    PROTOCOL_VERSION,
+    encode_frame, ClientMessage, DaemonMessage, Diagnostic, EntryKind, FrameDecoder, NavRequestId,
+    WorktreeEntry, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -80,9 +80,6 @@ pub struct Daemon {
     /// then pends forever (never fires) so the loop is unaffected when LSP is
     /// off.
     lsp_diagnostics: Option<mpsc::Receiver<LspDiagnostics>>,
-    /// Navigation responses from the off-loop LSP worker (#195), polled as a
-    /// dispatch branch. `None` until [`Daemon::watch_lsp`] arms the worker.
-    nav_responses: Option<mpsc::Receiver<DaemonMessage>>,
     core: Core,
 }
 
@@ -100,9 +97,13 @@ struct Core {
     /// #189) to the off-loop LSP worker — the disk→buffer source-of-truth shift.
     /// `None` when LSP is not armed; the dispatch loop then drops buffer events.
     buffer_events: Option<mpsc::Sender<BufferEvent>>,
-    /// Forwards navigation requests (hover/definition/references, #195) to the
-    /// off-loop LSP worker. `None` when LSP is not armed; nav messages are then
-    /// silently dropped (no server to route them to).
+    /// The canonical navigation-request sender into the off-loop LSP worker
+    /// (#195, #482). `None` when LSP is not armed. Unlike the disk/buffer feeds
+    /// above, the dispatch loop does not forward nav itself: each connection
+    /// holds its own clone (see [`serve_connection`]) so it can attach its
+    /// private `reply` channel and receive the answer on its own socket alone.
+    /// The dispatch loop keeps this original alive for the daemon's lifetime so
+    /// the worker's nav channel does not close as clients come and go.
     nav_requests: Option<mpsc::Sender<NavRequest>>,
 }
 
@@ -138,7 +139,6 @@ pub fn channels(event_capacity: usize, inbound_capacity: usize) -> (Daemon, Hand
         inbound: inbound_rx,
         worktree: None,
         lsp_diagnostics: None,
-        nav_responses: None,
         core: Core {
             events: events_tx.clone(),
             state: state_tx,
@@ -175,6 +175,12 @@ const SERVE_READ_BUFFER: usize = 8 * 1024;
 /// never grow this without bound (its backpressure pauses the pane tmux-side).
 const TERMINAL_INBOUND_CAPACITY: usize = 256;
 const TERMINAL_OUTBOUND_CAPACITY: usize = 256;
+
+/// Per-connection navigation-reply channel bound (#482): the private inbox the
+/// LSP worker's spawned nav tasks send this connection's hover/definition/
+/// references answers to. Nav responses are user-paced (one per hover or click),
+/// so a small buffer absorbs a burst without ever backing up the worker.
+const NAV_REPLY_CAPACITY: usize = 32;
 
 /// Queue depth for worktree events flowing from the blocking worker into the
 /// dispatch loop. Bounds how far the worker may run ahead while the loop is busy.
@@ -414,17 +420,6 @@ async fn next_worktree_event(
 async fn next_lsp_diagnostics(
     rx: &mut Option<mpsc::Receiver<LspDiagnostics>>,
 ) -> Option<LspDiagnostics> {
-    match rx {
-        Some(rx) => rx.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
-/// Receive the next navigation response from the off-loop LSP worker, or pend
-/// forever when LSP is not armed (so the `select!` branch never fires).
-async fn next_nav_response(
-    rx: &mut Option<mpsc::Receiver<DaemonMessage>>,
-) -> Option<DaemonMessage> {
     match rx {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
@@ -724,6 +719,80 @@ async fn request_reply(
     }
 }
 
+/// Convert a navigation `ClientMessage` into the internal [`NavRequest`] the LSP
+/// worker consumes, attaching `reply` — the requesting connection's private
+/// response channel (#482). Returns `None` for any non-navigation message; the
+/// caller only ever passes the three navigation variants, so `None` is a
+/// caller bug handled as a silent drop rather than a panic.
+fn nav_request(msg: ClientMessage, reply: mpsc::Sender<DaemonMessage>) -> Option<NavRequest> {
+    match msg {
+        ClientMessage::HoverRequest { id, path, position } => Some(NavRequest::Hover {
+            id,
+            path,
+            position,
+            reply,
+        }),
+        ClientMessage::DefinitionRequest { id, path, position } => Some(NavRequest::Definition {
+            id,
+            path,
+            position,
+            reply,
+        }),
+        ClientMessage::ReferencesRequest { id, path, position } => Some(NavRequest::References {
+            id,
+            path,
+            position,
+            reply,
+        }),
+        _ => None,
+    }
+}
+
+/// Per-connection drop-stale bookkeeping for the navigation reply path (#482).
+///
+/// A connection issues hover / definition / references requests with a
+/// client-assigned [`NavRequestId`] and receives their answers on its own reply
+/// channel. A slow server can deliver an answer after the user has moved on and
+/// issued a newer request of the same kind; this gate records the latest id per
+/// operation on send ([`record`](NavStaleGate::record)) and, on receipt, reports
+/// whether the answer still matches ([`is_current`](NavStaleGate::is_current)) —
+/// a superseded answer is dropped before it reaches the socket. Keeping the
+/// state per connection is the fix's core: one client's newer request can no
+/// longer cancel another client's in-flight answer.
+#[derive(Default)]
+struct NavStaleGate {
+    latest_hover: Option<NavRequestId>,
+    latest_definition: Option<NavRequestId>,
+    latest_references: Option<NavRequestId>,
+}
+
+impl NavStaleGate {
+    /// Record `msg` (an outbound navigation `ClientMessage`) as this connection's
+    /// latest request of its kind. Non-navigation messages are ignored.
+    fn record(&mut self, msg: &ClientMessage) {
+        match msg {
+            ClientMessage::HoverRequest { id, .. } => self.latest_hover = Some(*id),
+            ClientMessage::DefinitionRequest { id, .. } => self.latest_definition = Some(*id),
+            ClientMessage::ReferencesRequest { id, .. } => self.latest_references = Some(*id),
+            _ => {}
+        }
+    }
+
+    /// Report whether `msg` (a navigation response from the worker) still matches
+    /// the latest request of its kind this connection issued. An answer with no
+    /// matching request, or one a newer request has superseded, is stale. Only
+    /// navigation responses ever reach the reply channel, so any other variant is
+    /// treated as current (written through) rather than dropped.
+    fn is_current(&self, msg: &DaemonMessage) -> bool {
+        match msg {
+            DaemonMessage::HoverResponse { id, .. } => self.latest_hover == Some(*id),
+            DaemonMessage::DefinitionResponse { id, .. } => self.latest_definition == Some(*id),
+            DaemonMessage::ReferencesResponse { id, .. } => self.latest_references == Some(*id),
+            _ => true,
+        }
+    }
+}
+
 /// Serve one client connection against an already-running dispatch loop.
 ///
 /// Decodes [`ClientMessage`] frames from `reader` into the loop via `inbound`,
@@ -751,9 +820,21 @@ async fn request_reply(
 /// are forwarded only once this connection's `Welcome` has been written
 /// (issue #425) — the client requires `Welcome` as its first frame.
 ///
+/// Navigation requests (hover/definition/references) are answered per connection
+/// too (#482): each is forwarded to the off-loop LSP worker over `nav_requests`
+/// carrying this connection's own private `reply` channel, and the worker sends
+/// the answer straight back on it. The answer is written to *this* socket alone,
+/// never onto the shared bus — so with two clients attached (stable + dev share
+/// one daemon) one client's request can neither leak into nor cancel the other's
+/// navigation UI. Drop-stale is enforced per connection by [`NavStaleGate`]: a
+/// slow answer the user has already superseded with a newer request of the same
+/// kind is dropped before it reaches the socket.
+///
 /// `inbound` is a clone of the loop's inbound sender (dropped when the
 /// connection ends); `events` is a fresh subscription to the outbound bus;
-/// `state` observes the latest worktree snapshot. Returns once the reader
+/// `state` observes the latest worktree snapshot; `nav_requests` is this
+/// connection's clone of the LSP worker's request sender (`None` when LSP is not
+/// armed — nav requests are then silently dropped). Returns once the reader
 /// reaches EOF, the dispatch loop is gone, or the event bus closes.
 async fn serve_connection<R, W>(
     reader: R,
@@ -761,6 +842,7 @@ async fn serve_connection<R, W>(
     inbound: mpsc::Sender<ClientMessage>,
     mut events: broadcast::Receiver<DaemonMessage>,
     mut state: watch::Receiver<State>,
+    nav_requests: Option<mpsc::Sender<NavRequest>>,
     tmux_server: Option<String>,
 ) -> anyhow::Result<()>
 where
@@ -779,6 +861,14 @@ where
     // non-`Welcome` first frame.
     let mut handshaken = false;
     let mut snapshot_sent = false;
+
+    // This connection's private navigation reply path (#482): the LSP worker's
+    // spawned nav tasks send hover/definition/references answers here, and only
+    // here — never onto the shared bus — so another attached client can neither
+    // see nor cancel them. `nav_gate` tracks the latest request id per operation
+    // for this connection so a superseded answer is dropped before the socket.
+    let (nav_reply_tx, mut nav_reply_rx) = mpsc::channel::<DaemonMessage>(NAV_REPLY_CAPACITY);
+    let mut nav_gate = NavStaleGate::default();
 
     // This connection's own tmux attach: terminal `ClientMessage`s are routed to
     // a dedicated `terminal_task` (each client gets its own `tmux -C` child), and
@@ -888,20 +978,34 @@ where
                         // single loop (one document model + servers for the
                         // daemon), not per connection. Push-only — no reply here;
                         // diagnostics return on the shared broadcast bus.
-                        //
-                        // Navigation requests (hover/definition/references, #193)
-                        // are likewise routed to the shared dispatch loop pending
-                        // the LSP request-path wiring (a follow-on issue); the
-                        // dispatch loop's defensive no-op arm absorbs them until
-                        // then.
                         ClientMessage::BufferChanged { .. }
-                        | ClientMessage::BufferClosed { .. }
-                        | ClientMessage::HoverRequest { .. }
-                        | ClientMessage::DefinitionRequest { .. }
-                        | ClientMessage::ReferencesRequest { .. } => {
+                        | ClientMessage::BufferClosed { .. } => {
                             if inbound.send(msg).await.is_err() {
                                 // Dispatch loop gone; nothing left to serve.
                                 break 'serve;
+                            }
+                        }
+                        // Navigation requests (hover/definition/references) are
+                        // answered per connection (#482): forward to the off-loop
+                        // LSP worker carrying this connection's private `reply`
+                        // channel, and record the id as the latest of its kind so
+                        // a superseded answer is drop-stale-gated below. The worker
+                        // sends the answer back on the reply channel (the
+                        // `nav_reply_rx` branch), which writes it to this socket
+                        // alone — never onto the shared bus. When LSP is not armed
+                        // (`nav_requests` is `None`) or the worker's queue is full,
+                        // the request is dropped; "no answer" is a valid nav result
+                        // and a later request re-drives it.
+                        ClientMessage::HoverRequest { .. }
+                        | ClientMessage::DefinitionRequest { .. }
+                        | ClientMessage::ReferencesRequest { .. } => {
+                            nav_gate.record(&msg);
+                            if let Some(nav_requests) = &nav_requests {
+                                if let Some(req) = nav_request(msg, nav_reply_tx.clone()) {
+                                    if let Err(err) = nav_requests.try_send(req) {
+                                        warn!(%err, "dropped navigation request");
+                                    }
+                                }
                             }
                         }
                     }
@@ -964,6 +1068,22 @@ where
                     // The terminal task ended; stop polling its channel so this
                     // branch cannot busy-loop. The worktree path keeps serving.
                     None => terminal_done = true,
+                }
+            }
+            // This connection's private navigation answers (#482), off the shared
+            // bus: the LSP worker's nav task sends hover/definition/references
+            // results here. Drop a superseded answer (the user issued a newer
+            // request of the same kind since) and, once handshaken, write the
+            // rest to this socket alone. `nav_reply_tx` is held by this task for
+            // the connection's lifetime, so this branch never yields `None` — no
+            // guard is needed and it cannot busy-loop.
+            nav_reply = nav_reply_rx.recv() => {
+                if let Some(msg) = nav_reply {
+                    if handshaken && nav_gate.is_current(&msg) {
+                        let frame = encode_frame(&msg)?;
+                        writer.write_all(&frame).await?;
+                        writer.flush().await?;
+                    }
                 }
             }
         }
@@ -1065,13 +1185,17 @@ where
     let events = handles.subscribe();
     let inbound = handles.inbound.clone();
     let state = handles.state.clone();
+    // This connection's clone of the LSP worker's nav-request sender (#482), so
+    // its hover/definition/references answers return to this socket alone. `None`
+    // when LSP is not armed. Cloned before `daemon.run()` consumes the daemon.
+    let nav_requests = daemon.nav_request_sender();
     // Drop the spare handles so the dispatch loop ends once the connection's
     // `inbound` clone is dropped at EOF.
     drop(handles);
 
     let dispatch = tokio::spawn(daemon.run());
-    // `None`: production uses the default tmux server for terminal attaches.
-    let result = serve_connection(reader, writer, inbound, events, state, None).await;
+    // The trailing `None`: production uses the default tmux server for attaches.
+    let result = serve_connection(reader, writer, inbound, events, state, nav_requests, None).await;
     // `serve_connection` dropped its `inbound` clone on return, so the dispatch
     // loop has observed channel closure and will join.
     dispatch.await?;
@@ -1167,6 +1291,12 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
         daemon.watch_worktree(root.clone());
         daemon.watch_lsp(root, DocumentSelector::builtin());
     }
+    // The LSP worker's nav-request sender (#482): each accepted connection gets a
+    // clone so its navigation answers route to its own socket. Grabbed before
+    // `daemon.run()` consumes the daemon, and this original is held for the accept
+    // loop's lifetime — the dispatch loop keeps its own too, so the worker's nav
+    // channel never closes as clients come and go. `None` when LSP is not armed.
+    let nav_requests = daemon.nav_request_sender();
     // Held for the lifetime of the accept loop, so the dispatch loop and its
     // `State` stay alive even while no client is attached.
     let _dispatch = tokio::spawn(daemon.run());
@@ -1188,8 +1318,11 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
         let inbound = handles.inbound.clone();
         let events = handles.subscribe();
         let state = handles.state.clone();
+        let nav_requests = nav_requests.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_connection(reader, writer, inbound, events, state, None).await {
+            if let Err(e) =
+                serve_connection(reader, writer, inbound, events, state, nav_requests, None).await
+            {
                 // The active sink (stderr or the rotated file) is the daemon's
                 // log; one failed connection must not stop the daemon.
                 warn!(err = %e, "connection ended with error");
@@ -1291,22 +1424,25 @@ impl Daemon {
         let (buffer_tx, buffer_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
         let (diag_tx, diag_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
         let (nav_req_tx, nav_req_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
-        let (nav_resp_tx, nav_resp_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
-        let worker = LspWorker::new(
-            root,
-            selector,
-            doc_rx,
-            buffer_rx,
-            diag_tx,
-            nav_req_rx,
-            nav_resp_tx,
-        );
+        let worker = LspWorker::new(root, selector, doc_rx, buffer_rx, diag_tx, nav_req_rx);
         tokio::spawn(worker.run());
         self.core.doc_changes = Some(doc_tx);
         self.core.buffer_events = Some(buffer_tx);
+        // Kept as the daemon-lifetime keeper for the worker's nav channel; each
+        // connection receives its own clone via [`Daemon::nav_request_sender`]
+        // (#482). The dispatch loop no longer forwards nav itself.
         self.core.nav_requests = Some(nav_req_tx);
         self.lsp_diagnostics = Some(diag_rx);
-        self.nav_responses = Some(nav_resp_rx);
+    }
+
+    /// A clone of the LSP worker's navigation-request sender, or `None` when LSP
+    /// is not armed (#482). Each connection takes one so its hover/definition/
+    /// references answers return to that socket alone; the dispatch loop keeps
+    /// the original ([`Core::nav_requests`]) alive for the daemon's lifetime so
+    /// the worker's nav channel does not close as clients come and go. Must be
+    /// read before [`Daemon::run`] consumes the daemon.
+    fn nav_request_sender(&self) -> Option<mpsc::Sender<NavRequest>> {
+        self.core.nav_requests.clone()
     }
 
     /// Run the flat dispatch loop until the inbound channel closes.
@@ -1319,7 +1455,6 @@ impl Daemon {
             mut inbound,
             mut worktree,
             mut lsp_diagnostics,
-            mut nav_responses,
             mut core,
         } = self;
         loop {
@@ -1338,22 +1473,6 @@ impl Daemon {
                     Some(diagnostics) => core.apply_diagnostics(diagnostics),
                     // The LSP worker ended; stop polling the closed channel.
                     None => lsp_diagnostics = None,
-                },
-                nav = next_nav_response(&mut nav_responses) => match nav {
-                    Some(msg) => {
-                        // Broadcast the nav response on the shared event bus.
-                        // A closed receiver (no subscribers) is not an error:
-                        // the client may have disconnected before the slow LSP
-                        // round-trip finished.
-                        let _ = core.events.send(msg);
-                    }
-                    // The LSP worker ended; stop polling both sides so
-                    // subsequent nav requests are dropped cleanly (no noise
-                    // from try_send on a closed channel).
-                    None => {
-                        nav_responses = None;
-                        core.nav_requests = None;
-                    }
                 },
             }
         }
@@ -1382,31 +1501,20 @@ impl Core {
             ClientMessage::BufferClosed { path } => {
                 self.forward_buffer_event(BufferEvent::Closed { path });
             }
-            // Navigation requests (#195): routed to the off-loop LSP worker via
-            // `nav_requests`. The worker finds the first capable server, spawns
-            // a task for the LSP round-trip, and sends the translated response
-            // back on `nav_responses`, which the dispatch loop then broadcasts.
-            // When LSP is not armed, `nav_requests` is `None` and the request
-            // is silently dropped — no server to route to.
-            ClientMessage::HoverRequest { id, path, position } => {
-                self.forward_nav_request(NavRequest::Hover { id, path, position });
-            }
-            ClientMessage::DefinitionRequest { id, path, position } => {
-                self.forward_nav_request(NavRequest::Definition { id, path, position });
-            }
-            ClientMessage::ReferencesRequest { id, path, position } => {
-                self.forward_nav_request(NavRequest::References { id, path, position });
-            }
             // Terminal/tmux messages never reach the shared dispatch loop:
             // `serve_connection` routes them to this connection's own
             // `terminal_task` (per-client attach). The request/response
             // messages (`OpenFile`/`SaveFile`/`RequestDiff`) likewise never
             // reach it — they are answered per connection by `request_reply`,
             // request/response back to that socket, not on the broadcast bus.
-            // Neither does the handshake: `serve_connection` answers `Hello`
-            // per connection (#473) — the `Welcome` must reach exactly one
-            // socket, and a version mismatch closes only that connection.
-            // These arms are a defensive no-op should one arrive here anyway.
+            // Navigation requests (hover/definition/references) are also answered
+            // per connection (#482): `serve_connection` forwards them straight to
+            // the LSP worker with the connection's private reply channel, so they
+            // never pass through here either. Neither does the handshake:
+            // `serve_connection` answers `Hello` per connection (#473) — the
+            // `Welcome` must reach exactly one socket, and a version mismatch
+            // closes only that connection. These arms are a defensive no-op
+            // should one arrive here anyway.
             ClientMessage::Hello { .. }
             | ClientMessage::Attach { .. }
             | ClientMessage::Input { .. }
@@ -1418,17 +1526,10 @@ impl Core {
             | ClientMessage::QuerySessionList
             | ClientMessage::OpenFile { .. }
             | ClientMessage::SaveFile { .. }
-            | ClientMessage::RequestDiff { .. } => {}
-        }
-    }
-
-    /// Forward a nav request to the off-loop LSP worker, dropping it (with a
-    /// log) if LSP is not armed or the worker's queue is full.
-    fn forward_nav_request(&self, req: NavRequest) {
-        if let Some(nav_requests) = &self.nav_requests {
-            if let Err(err) = nav_requests.try_send(req) {
-                warn!(%err, "dropped navigation request");
-            }
+            | ClientMessage::RequestDiff { .. }
+            | ClientMessage::HoverRequest { .. }
+            | ClientMessage::DefinitionRequest { .. }
+            | ClientMessage::ReferencesRequest { .. } => {}
         }
     }
 
@@ -1633,7 +1734,16 @@ mod tests {
         let (mut client_reader, mut client_writer) = tokio::io::split(client);
         let (server_reader, server_writer) = tokio::io::split(server);
         let conn = tokio::spawn(async move {
-            serve_connection(server_reader, server_writer, inbound, events, state, None).await
+            serve_connection(
+                server_reader,
+                server_writer,
+                inbound,
+                events,
+                state,
+                None,
+                None,
+            )
+            .await
         });
 
         client_writer
@@ -1692,6 +1802,7 @@ mod tests {
                     events,
                     state,
                     None,
+                    None,
                 )
                 .await
             }
@@ -1720,7 +1831,16 @@ mod tests {
             let events = handles.subscribe();
             let state = handles.state.clone();
             async move {
-                serve_connection(bad_srv_reader, bad_srv_writer, inbound, events, state, None).await
+                serve_connection(
+                    bad_srv_reader,
+                    bad_srv_writer,
+                    inbound,
+                    events,
+                    state,
+                    None,
+                    None,
+                )
+                .await
             }
         });
         bad_writer
@@ -2153,8 +2273,16 @@ mod tests {
         let (mut client_reader, mut client_writer) = tokio::io::split(client);
         let (server_reader, server_writer) = tokio::io::split(server);
         let conn = tokio::spawn(async move {
-            let _ =
-                serve_connection(server_reader, server_writer, inbound, events, state, None).await;
+            let _ = serve_connection(
+                server_reader,
+                server_writer,
+                inbound,
+                events,
+                state,
+                None,
+                None,
+            )
+            .await;
         });
 
         client_writer
@@ -2194,8 +2322,16 @@ mod tests {
         let (mut client_reader, mut client_writer) = tokio::io::split(client);
         let (server_reader, server_writer) = tokio::io::split(server);
         let conn = tokio::spawn(async move {
-            let _ =
-                serve_connection(server_reader, server_writer, inbound, events, state, None).await;
+            let _ = serve_connection(
+                server_reader,
+                server_writer,
+                inbound,
+                events,
+                state,
+                None,
+                None,
+            )
+            .await;
         });
 
         // Sustained bus traffic ahead of the handshake: the connection's
@@ -2276,8 +2412,16 @@ mod tests {
         let (mut client_reader, mut client_writer) = tokio::io::split(client);
         let (server_reader, server_writer) = tokio::io::split(server);
         let conn = tokio::spawn(async move {
-            let _ =
-                serve_connection(server_reader, server_writer, inbound, events, state, None).await;
+            let _ = serve_connection(
+                server_reader,
+                server_writer,
+                inbound,
+                events,
+                state,
+                None,
+                None,
+            )
+            .await;
         });
 
         client_writer
@@ -2423,6 +2567,7 @@ mod tests {
                 inbound,
                 events,
                 state,
+                None,
                 Some(tmux_name),
             )
             .await
@@ -2925,12 +3070,10 @@ mod tests {
         // and upgrades in place when a repo appears (#483).
         let tmp = TempDir::new("git-reprobe");
         write_file(&tmp.path.join("tracked.txt"), "v1\n");
-
         let (mut daemon, handles) = channels(64, 8);
         daemon.watch_worktree(tmp.path.clone());
         let mut state = handles.state.clone();
         let loop_handle = tokio::spawn(daemon.run());
-
         // The initial scan lands with no git status — the root is not a repo yet.
         loop {
             {
@@ -2942,12 +3085,10 @@ mod tests {
             }
             state.changed().await.expect("state sender alive");
         }
-
         // Make the root a repository. `git add` (no commit) leaves tracked.txt
         // staged as an add, so the recomputed status carries an entry for it.
         git(&tmp.path, &["init", "-q", "-b", "main"]);
         git(&tmp.path, &["add", "tracked.txt"]);
-
         // The next re-probe tick upgrades in place: git status for the tracked
         // file arrives without a restart.
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -2965,7 +3106,340 @@ mod tests {
         })
         .await
         .expect("git status delivered after init without a daemon restart");
-
         loop_handle.abort();
+    }
+
+    // ── Navigation routing + per-connection drop-stale (#482) ────────────────
+
+    /// A hover request `ClientMessage` at `id` for a fixed position.
+    fn hover_request_frame(id: u64) -> Vec<u8> {
+        encode_frame(&ClientMessage::HoverRequest {
+            id: NavRequestId(id),
+            path: "a.rs".to_string(),
+            position: rift_protocol::Position {
+                line: 0,
+                character: 0,
+            },
+        })
+        .expect("encode HoverRequest")
+    }
+
+    /// Read framed messages until a `HoverResponse` arrives, returning its id.
+    /// Tolerates the leading `Welcome`; panics on any other message so a frame
+    /// that leaked from another connection fails the test loudly. Bounded so a
+    /// regression that never routes the answer fails fast instead of hanging CI.
+    async fn read_hover_response_id<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        decoder: &mut FrameDecoder,
+    ) -> NavRequestId {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match read_daemon_message(reader, decoder).await {
+                    DaemonMessage::Welcome { .. } => continue,
+                    DaemonMessage::HoverResponse { id, .. } => return id,
+                    other => panic!("unexpected frame before hover response: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("a hover response must arrive within the timeout")
+    }
+
+    /// Assert no further frame arrives within `dur` — the discriminator between
+    /// per-connection routing and the old broadcast: a leaked response would show
+    /// up here. The connection stays open (its writer is held), so a quiet socket
+    /// times out rather than closing.
+    async fn assert_quiet<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        decoder: &mut FrameDecoder,
+        dur: Duration,
+    ) {
+        if let Ok(msg) = tokio::time::timeout(dur, read_daemon_message(reader, decoder)).await {
+            panic!("unexpected extra frame (nav response leaked across connections?): {msg:?}");
+        }
+    }
+
+    #[test]
+    fn test_nav_stale_gate_supersedes_older_request_of_same_kind() {
+        let pos = rift_protocol::Position {
+            line: 0,
+            character: 0,
+        };
+        let mut gate = NavStaleGate::default();
+
+        // Nothing recorded yet: any answer is stale — there is no request to match.
+        assert!(!gate.is_current(&DaemonMessage::HoverResponse {
+            id: NavRequestId(1),
+            content: None,
+        }));
+
+        // The user hovers, then hovers again before the first answer returns.
+        gate.record(&ClientMessage::HoverRequest {
+            id: NavRequestId(1),
+            path: "a.rs".to_string(),
+            position: pos,
+        });
+        gate.record(&ClientMessage::HoverRequest {
+            id: NavRequestId(2),
+            path: "a.rs".to_string(),
+            position: pos,
+        });
+
+        // The superseded id=1 answer is dropped; the latest id=2 answer passes.
+        assert!(!gate.is_current(&DaemonMessage::HoverResponse {
+            id: NavRequestId(1),
+            content: None,
+        }));
+        assert!(gate.is_current(&DaemonMessage::HoverResponse {
+            id: NavRequestId(2),
+            content: None,
+        }));
+    }
+
+    #[test]
+    fn test_nav_stale_gate_keys_each_operation_independently() {
+        let pos = rift_protocol::Position {
+            line: 0,
+            character: 0,
+        };
+        let mut gate = NavStaleGate::default();
+        gate.record(&ClientMessage::HoverRequest {
+            id: NavRequestId(1),
+            path: "a.rs".to_string(),
+            position: pos,
+        });
+        gate.record(&ClientMessage::DefinitionRequest {
+            id: NavRequestId(2),
+            path: "a.rs".to_string(),
+            position: pos,
+        });
+        gate.record(&ClientMessage::ReferencesRequest {
+            id: NavRequestId(3),
+            path: "a.rs".to_string(),
+            position: pos,
+        });
+
+        // Each operation matches only its own latest id — no cross-talk.
+        assert!(gate.is_current(&DaemonMessage::HoverResponse {
+            id: NavRequestId(1),
+            content: None,
+        }));
+        assert!(gate.is_current(&DaemonMessage::DefinitionResponse {
+            id: NavRequestId(2),
+            targets: vec![],
+        }));
+        assert!(gate.is_current(&DaemonMessage::ReferencesResponse {
+            id: NavRequestId(3),
+            locations: vec![],
+        }));
+        // A hover answer carrying the definition's id does not match hover.
+        assert!(!gate.is_current(&DaemonMessage::HoverResponse {
+            id: NavRequestId(2),
+            content: None,
+        }));
+    }
+
+    /// Two connections share one dispatch loop and one off-loop LSP worker (the
+    /// stable + dev dogfooding case): each connection's hover answer must reach
+    /// only its own socket. Before the fix the worker broadcast nav responses, so
+    /// both sockets saw both answers — the leak `assert_quiet` catches.
+    #[tokio::test]
+    async fn test_nav_response_routes_to_requesting_connection_only() {
+        let (daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
+        let _dispatch = tokio::spawn(daemon.run());
+
+        // Fake off-loop LSP worker: echo each hover request's id back on ITS OWN
+        // reply channel — the routing the real worker performs, minus a server.
+        let (nav_tx, mut nav_rx) = mpsc::channel::<NavRequest>(16);
+        let _worker = tokio::spawn(async move {
+            while let Some(req) = nav_rx.recv().await {
+                if let NavRequest::Hover { id, reply, .. } = req {
+                    let _ = reply
+                        .send(DaemonMessage::HoverResponse { id, content: None })
+                        .await;
+                }
+            }
+        });
+
+        let (client_a, server_a) = tokio::io::duplex(64 * 1024);
+        let (mut ca_reader, mut ca_writer) = tokio::io::split(client_a);
+        let (sa_reader, sa_writer) = tokio::io::split(server_a);
+        let _conn_a = {
+            let (inbound, events, state, nav) = (
+                handles.inbound.clone(),
+                handles.subscribe(),
+                handles.state.clone(),
+                nav_tx.clone(),
+            );
+            tokio::spawn(async move {
+                serve_connection(
+                    sa_reader,
+                    sa_writer,
+                    inbound,
+                    events,
+                    state,
+                    Some(nav),
+                    None,
+                )
+                .await
+            })
+        };
+
+        let (client_b, server_b) = tokio::io::duplex(64 * 1024);
+        let (mut cb_reader, mut cb_writer) = tokio::io::split(client_b);
+        let (sb_reader, sb_writer) = tokio::io::split(server_b);
+        let _conn_b = {
+            let (inbound, events, state, nav) = (
+                handles.inbound.clone(),
+                handles.subscribe(),
+                handles.state.clone(),
+                nav_tx.clone(),
+            );
+            tokio::spawn(async move {
+                serve_connection(
+                    sb_reader,
+                    sb_writer,
+                    inbound,
+                    events,
+                    state,
+                    Some(nav),
+                    None,
+                )
+                .await
+            })
+        };
+
+        let mut da = FrameDecoder::new();
+        let mut db = FrameDecoder::new();
+
+        // Handshake both connections.
+        ca_writer.write_all(&hello_frame()).await.expect("A Hello");
+        ca_writer.flush().await.expect("flush A Hello");
+        assert!(matches!(
+            read_daemon_message(&mut ca_reader, &mut da).await,
+            DaemonMessage::Welcome { .. }
+        ));
+        cb_writer.write_all(&hello_frame()).await.expect("B Hello");
+        cb_writer.flush().await.expect("flush B Hello");
+        assert!(matches!(
+            read_daemon_message(&mut cb_reader, &mut db).await,
+            DaemonMessage::Welcome { .. }
+        ));
+
+        // A asks for hover id=100, B for hover id=200.
+        ca_writer
+            .write_all(&hover_request_frame(100))
+            .await
+            .expect("A sends hover");
+        ca_writer.flush().await.expect("flush A hover");
+        cb_writer
+            .write_all(&hover_request_frame(200))
+            .await
+            .expect("B sends hover");
+        cb_writer.flush().await.expect("flush B hover");
+
+        // Each connection receives only its own answer, and nothing else.
+        assert_eq!(
+            read_hover_response_id(&mut ca_reader, &mut da).await,
+            NavRequestId(100),
+            "connection A must receive its own hover answer"
+        );
+        assert_eq!(
+            read_hover_response_id(&mut cb_reader, &mut db).await,
+            NavRequestId(200),
+            "connection B must receive its own hover answer"
+        );
+        assert_quiet(&mut ca_reader, &mut da, Duration::from_millis(300)).await;
+        assert_quiet(&mut cb_reader, &mut db, Duration::from_millis(300)).await;
+    }
+
+    /// A single connection issues two hovers before the first answer returns; the
+    /// gate drops the superseded answer so only the latest reaches the socket —
+    /// per-connection drop-stale over the real transport (#482).
+    #[tokio::test]
+    async fn test_nav_superseded_response_dropped_per_connection() {
+        let (daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
+        let _dispatch = tokio::spawn(daemon.run());
+
+        // Fake worker: wait for BOTH requests before answering, so the connection
+        // has recorded id=2 as its latest hover before the stale id=1 answer is
+        // even sent. Then answer id=1 (stale) first, then id=2.
+        let (nav_tx, mut nav_rx) = mpsc::channel::<NavRequest>(16);
+        let _worker = tokio::spawn(async move {
+            let first = nav_rx.recv().await.expect("first nav request");
+            let second = nav_rx.recv().await.expect("second nav request");
+            let (id1, reply1) = match first {
+                NavRequest::Hover { id, reply, .. } => (id, reply),
+                other => panic!("expected hover, got {other:?}"),
+            };
+            let (id2, reply2) = match second {
+                NavRequest::Hover { id, reply, .. } => (id, reply),
+                other => panic!("expected hover, got {other:?}"),
+            };
+            let _ = reply1
+                .send(DaemonMessage::HoverResponse {
+                    id: id1,
+                    content: None,
+                })
+                .await;
+            let _ = reply2
+                .send(DaemonMessage::HoverResponse {
+                    id: id2,
+                    content: None,
+                })
+                .await;
+        });
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut c_reader, mut c_writer) = tokio::io::split(client);
+        let (s_reader, s_writer) = tokio::io::split(server);
+        let _conn = {
+            let (inbound, events, state) = (
+                handles.inbound.clone(),
+                handles.subscribe(),
+                handles.state.clone(),
+            );
+            tokio::spawn(async move {
+                serve_connection(
+                    s_reader,
+                    s_writer,
+                    inbound,
+                    events,
+                    state,
+                    Some(nav_tx),
+                    None,
+                )
+                .await
+            })
+        };
+
+        let mut decoder = FrameDecoder::new();
+        c_writer
+            .write_all(&hello_frame())
+            .await
+            .expect("send Hello");
+        c_writer.flush().await.expect("flush Hello");
+        assert!(matches!(
+            read_daemon_message(&mut c_reader, &mut decoder).await,
+            DaemonMessage::Welcome { .. }
+        ));
+
+        c_writer
+            .write_all(&hover_request_frame(1))
+            .await
+            .expect("hover 1");
+        c_writer
+            .write_all(&hover_request_frame(2))
+            .await
+            .expect("hover 2");
+        c_writer.flush().await.expect("flush hovers");
+
+        // The stale id=1 answer is dropped; only the latest id=2 reaches the wire.
+        assert_eq!(
+            read_hover_response_id(&mut c_reader, &mut decoder).await,
+            NavRequestId(2),
+            "only the latest hover answer is written; the superseded one is dropped"
+        );
+        assert_quiet(&mut c_reader, &mut decoder, Duration::from_millis(300)).await;
     }
 }
