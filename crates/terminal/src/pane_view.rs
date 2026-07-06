@@ -1733,6 +1733,14 @@ impl Render for PaneView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `use super::*` re-globs the module's `use gpui::*`, which shadows bare
+    // `#[test]` with `gpui::test`. That is harmless for the plain
+    // `#[::core::prelude::v1::test]`-qualified tests below (they never resolve
+    // `test` by its bare name), but `#[gpui::test]`'s own expansion emits a
+    // nested bare `#[test]` — under the shadow that recurses into itself and
+    // blows the recursion limit. This explicit import shadows `test` back to
+    // the real attribute for this module, breaking the recursion.
+    use ::core::prelude::v1::test;
 
     fn row_text(row: &[CellRenderInfo]) -> String {
         row.iter().map(|cell| cell.char).collect::<String>()
