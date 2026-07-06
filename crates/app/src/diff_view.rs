@@ -204,15 +204,22 @@ impl DiffView {
         }
     }
 
-    /// Open `path`'s diff: arm the loading state and send the request onto
-    /// the protocol. Called by the workspace on
-    /// [`crate::source_control::SourceControlEvent::OpenDiff`].
+    /// Open `path`'s diff: send the request onto the protocol and arm the
+    /// loading state — but only when `path` differs from the currently open
+    /// one. Re-requesting the already-open path (a git-status refresh tick,
+    /// or the user reselecting the same row) keeps the rendered diff visible
+    /// until the reply swaps it in (#487) — no "Loading diff..." flash for
+    /// content that is most likely unchanged. Called by the workspace on
+    /// [`crate::source_control::SourceControlEvent::OpenDiff`] and by
+    /// [`Self::apply_git_update`]'s refresh path.
     pub fn open_diff(&mut self, path: String, cx: &mut Context<Self>) {
         if let Err(e) = self.request_diff_tx.try_send(path.clone()) {
             debug!(error = %e, %path, "failed to enqueue diff request");
         }
-        self.path = Some(path);
-        self.state = DiffViewState::Loading;
+        if self.path.as_deref() != Some(path.as_str()) {
+            self.path = Some(path);
+            self.state = DiffViewState::Loading;
+        }
         cx.notify();
     }
 
@@ -736,6 +743,117 @@ mod tests {
         );
         cx.update(|cx| {
             assert!(diff_view.read(cx).path.is_none());
+        });
+    }
+
+    // --- DiffView::open_diff refresh semantics (#487) ---
+
+    fn one_context_line_payload() -> FileDiffPayload {
+        FileDiffPayload::Hunks {
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_len: 1,
+                new_start: 1,
+                new_len: 1,
+                lines: vec![line(DiffLineKind::Context, "a1")],
+            }],
+        }
+    }
+
+    #[gpui::test]
+    fn test_open_diff_same_path_keeps_rendered_diff_until_reply(cx: &mut TestAppContext) {
+        let (tx, rx) = flume::unbounded();
+        let diff_view = cx.update(|cx| cx.new(|cx| DiffView::new(tx, cx)));
+
+        cx.update(|cx| {
+            diff_view.update(cx, |view, cx| {
+                view.open_diff("a.rs".to_owned(), cx);
+                view.apply_file_diff("a.rs".to_owned(), one_context_line_payload(), cx);
+            });
+        });
+        rx.try_recv().expect("open_diff sends the initial request");
+
+        cx.update(|cx| {
+            diff_view.update(cx, |view, cx| view.open_diff("a.rs".to_owned(), cx));
+        });
+
+        assert_eq!(
+            rx.try_recv().expect("re-opening the same path re-requests"),
+            "a.rs"
+        );
+        cx.update(|cx| {
+            assert!(
+                matches!(diff_view.read(cx).state, DiffViewState::Hunks(_)),
+                "the rendered diff stays visible instead of flashing Loading"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn test_open_diff_different_path_arms_loading(cx: &mut TestAppContext) {
+        let (tx, rx) = flume::unbounded();
+        let diff_view = cx.update(|cx| cx.new(|cx| DiffView::new(tx, cx)));
+
+        cx.update(|cx| {
+            diff_view.update(cx, |view, cx| {
+                view.open_diff("a.rs".to_owned(), cx);
+                view.apply_file_diff("a.rs".to_owned(), one_context_line_payload(), cx);
+                view.open_diff("b.rs".to_owned(), cx);
+            });
+        });
+
+        rx.try_recv().expect("open_diff sends the initial request");
+        assert_eq!(
+            rx.try_recv().expect("opening a new path sends its request"),
+            "b.rs"
+        );
+        cx.update(|cx| {
+            let view = diff_view.read(cx);
+            assert_eq!(view.path.as_deref(), Some("b.rs"));
+            assert_eq!(
+                view.state,
+                DiffViewState::Loading,
+                "a different path must not show the previous file's diff"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn test_apply_git_update_refresh_keeps_rendered_diff_then_reply_swaps_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (tx, rx) = flume::unbounded();
+        let diff_view = cx.update(|cx| cx.new(|cx| DiffView::new(tx, cx)));
+
+        cx.update(|cx| {
+            diff_view.update(cx, |view, cx| {
+                view.open_diff("a.rs".to_owned(), cx);
+                view.apply_file_diff("a.rs".to_owned(), one_context_line_payload(), cx);
+                view.apply_git_update(&["a.rs".to_owned()], &[], cx);
+            });
+        });
+
+        rx.try_recv().expect("open_diff sends the initial request");
+        rx.try_recv()
+            .expect("the refresh tick re-requests the diff");
+        cx.update(|cx| {
+            assert!(
+                matches!(diff_view.read(cx).state, DiffViewState::Hunks(_)),
+                "the refresh tick keeps the rendered diff visible"
+            );
+        });
+
+        cx.update(|cx| {
+            diff_view.update(cx, |view, cx| {
+                view.apply_file_diff("a.rs".to_owned(), FileDiffPayload::Binary, cx);
+            });
+        });
+        cx.update(|cx| {
+            assert_eq!(
+                diff_view.read(cx).state,
+                DiffViewState::Binary,
+                "the replacement reply still swaps the view"
+            );
         });
     }
 
