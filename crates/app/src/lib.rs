@@ -10,10 +10,12 @@ pub mod gallery;
 
 pub mod command_palette;
 pub mod command_registry;
+pub mod connection_screen;
 pub mod diff_view;
 pub mod editor;
 pub mod file_tree;
 pub mod problems_panel;
+pub mod recents;
 pub mod settings;
 pub mod source_control;
 pub mod status_bar;
