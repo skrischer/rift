@@ -74,6 +74,20 @@ Rules:
 - Solo/interactive work in a warm checkout may still use `just ci` (incremental,
   ~30 s); the restriction targets cold builds fanned out across agents.
 
+## Model routing (orchestration speed)
+
+Route subagent work by task shape, not uniformly — latency is the driver, not
+token cost:
+- **Spec-driven implementation, fix-ups, and mechanical steps** (applying a
+  merge, formatting) run on **Sonnet 5** — much faster, and a well-specified
+  change does not need the strongest model. In Workflow scripts pass
+  `model: 'sonnet'` on those `agent()` calls; with the Agent tool pass
+  `model: 'sonnet'` or use the `rust-implementer` subagent (it pins Sonnet and
+  the build/RAM discipline).
+- **Adversarial review, planning, design, and any genuinely-open judgment** stay
+  on the default (strong) model — the correctness of a gate matters more than
+  its speed.
+
 ## Branch and spec naming
 
 - Branches: `feat/<scope>`, `fix/<scope>`, `chore/<scope>`, `docs/<scope>`.
