@@ -144,14 +144,18 @@ fn parse_serve_uds_args(
     Ok((path, root, log_file))
 }
 
-/// The directory the daemon watches: the `--root` flag when present, otherwise
-/// the daemon's launch directory (current behavior). Both the socket and stdio
-/// modes share this fallback.
+/// The directory the daemon watches: the `--root` flag, required. There is no
+/// launch-directory fallback (issue #502): over SSH the launch directory is
+/// `$HOME`, so falling back to it silently pointed the file watcher and git
+/// status at the whole home directory instead of the intended project. Every
+/// sanctioned launch path (`crates/ssh/src/launch.rs`, `justfile`) already
+/// resolves and passes an explicit root; a missing one is refused loudly
+/// instead of scanning the wrong tree quietly.
 fn watched_root(flag: Option<PathBuf>) -> anyhow::Result<PathBuf> {
-    match flag {
-        Some(root) => Ok(root),
-        None => std::env::current_dir().context("cannot resolve the daemon launch directory"),
-    }
+    flag.context(
+        "no watch root given: pass --root <path> (the daemon refuses to fall back to its \
+         launch directory, which is $HOME over SSH)",
+    )
 }
 
 #[cfg(test)]
@@ -235,8 +239,8 @@ mod tests {
     }
 
     #[test]
-    fn test_watched_root_falls_back_to_current_dir_when_absent() {
-        let resolved = watched_root(None).expect("resolve");
-        assert_eq!(resolved, std::env::current_dir().expect("cwd"));
+    fn test_watched_root_errors_when_absent() {
+        let err = watched_root(None).expect_err("missing root must be refused");
+        assert!(err.to_string().contains("--root"));
     }
 }
