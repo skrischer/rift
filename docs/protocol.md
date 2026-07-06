@@ -3,7 +3,9 @@
 The client and daemon exchange length-delimited JSON frames over the SSH-tunnelled
 transport (a `u32` big-endian length prefix per message — see
 `crates/protocol/src/frame.rs`; the wire format is serialization-agnostic and may
-migrate to MessagePack). Every message is a `serde` enum tagged by a `type`
+migrate to MessagePack). The decoder rejects any length prefix above
+`MAX_FRAME_LEN` (64 MiB) as stream corruption; both ends treat frame errors as
+connection-fatal. Every message is a `serde` enum tagged by a `type`
 discriminator. The authoritative definitions live in `crates/protocol/src/lib.rs`
 (`ClientMessage`, `DaemonMessage`) — this document describes their contract.
 
