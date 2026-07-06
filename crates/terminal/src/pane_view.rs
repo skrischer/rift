@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -971,6 +972,109 @@ impl Focusable for PaneView {
     }
 }
 
+/// Routes IME/composed text (dead-key accents, emoji picker inserts, ...) into
+/// the existing [`Self::send_input`] seam via GPUI's platform input handler
+/// (`docs/spec-dogfooding-fixes.md`). The terminal has no addressable text
+/// buffer for the platform to query/replace, so every range-based accessor
+/// reports a neutral "no buffer" answer; only `replace_text_in_range` — the
+/// platform's final, committed text — carries bytes to the PTY.
+///
+/// Multi-stage IME preedit (CJK composition) stays out of scope: forwarding
+/// intermediate `replace_and_mark_text_in_range` text to the PTY on every
+/// keystroke would flood the shell with partial characters. Dead-key
+/// composition (e.g. `´` + `e` -> `é`) resolves in a single
+/// `replace_text_in_range` call, which is what this handler forwards.
+/// Keystroke encoding (`keyboard::encode_keystroke`, `on_key_down` above) is
+/// untouched.
+impl EntityInputHandler for PaneView {
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: 0..0,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        None
+    }
+
+    fn text_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        _adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    fn replace_text_in_range(
+        &mut self,
+        _replacement_range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        // Committed text snaps back to the live bottom, matching the raw
+        // keystroke path in `on_key_down` above.
+        {
+            let mut term = self.terminal.lock().expect("term lock poisoned");
+            if term.grid().display_offset() > 0 {
+                term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+            }
+        }
+        self.history_scroll = 0;
+        self.selection = None;
+        self.cursor_blink_visible = true;
+        self.send_input(text.as_bytes().to_vec());
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range_utf16: Option<Range<usize>>,
+        _new_text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        // No pre-edit visualization and no PTY writes: see the impl doc comment.
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        _element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        None
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
 pub fn measure_cell_size(window: &mut Window, font_size: Pixels) -> Size<Pixels> {
     let text_system = window.text_system();
     let font = Font {
@@ -1277,13 +1381,21 @@ impl Render for PaneView {
         };
 
         let entity = cx.entity().clone();
+        let ime_entity = cx.entity().clone();
+        let ime_focus_handle = self.focus_handle.clone();
         let bounds_observer = canvas(
             move |bounds: Bounds<Pixels>, _window: &mut Window, cx: &mut App| {
                 entity.update(cx, |view: &mut Self, _cx| {
                     view.content_origin = bounds.origin;
                 });
             },
-            |_, _, _, _| {},
+            move |bounds: Bounds<Pixels>, _, window: &mut Window, cx: &mut App| {
+                window.handle_input(
+                    &ime_focus_handle,
+                    ElementInputHandler::new(bounds, ime_entity),
+                    cx,
+                );
+            },
         )
         .absolute()
         .size_full();
@@ -1624,6 +1736,97 @@ mod tests {
 
     fn row_text(row: &[CellRenderInfo]) -> String {
         row.iter().map(|cell| cell.char).collect::<String>()
+    }
+
+    /// A windowed `PaneView` plus the `PaneInput` receiver, so IME input-handler
+    /// tests can assert exactly what crossed the `send_input` seam.
+    fn windowed_pane_view(
+        cx: &mut TestAppContext,
+    ) -> (
+        AnyWindowHandle,
+        Entity<PaneView>,
+        flume::Receiver<PaneInput>,
+    ) {
+        let (_pty_tx, pty_rx) = flume::unbounded::<Vec<u8>>();
+        let (input_tx, input_rx) = flume::unbounded::<PaneInput>();
+        let (size_changed_tx, _size_changed_rx) = flume::unbounded::<TermSize>();
+        let (capture_request_tx, _capture_request_rx) = flume::unbounded::<CaptureRequest>();
+        let (font_zoom_tx, _font_zoom_rx) = flume::unbounded::<i32>();
+        let (tmux_command_tx, _tmux_command_rx) = flume::unbounded::<String>();
+
+        let window = cx.add_window(|_window, cx| {
+            PaneView::new(
+                cx,
+                pty_rx,
+                input_tx,
+                size_changed_tx,
+                capture_request_tx,
+                font_zoom_tx,
+                tmux_command_tx,
+                Arc::new(KeyTable::default()),
+                PrefixOptions::default(),
+            )
+        });
+        let pane = window.root(cx).expect("pane view root");
+        (window.into(), pane, input_rx)
+    }
+
+    /// A dead-key composition (e.g. `´` + `e`) resolves in a single platform
+    /// commit — `replace_text_in_range` — which must reach the PTY through the
+    /// existing `send_input` seam (`docs/spec-dogfooding-fixes.md`, issue #501).
+    #[gpui::test]
+    fn test_replace_text_in_range_sends_committed_text_to_pty(cx: &mut TestAppContext) {
+        let (window, pane, input_rx) = windowed_pane_view(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |view, cx| {
+                view.replace_text_in_range(None, "\u{e9}", window, cx);
+            });
+        })
+        .unwrap();
+
+        let sent = input_rx.try_recv().expect("composed text reaches the PTY");
+        assert_eq!(sent.bytes, "\u{e9}".as_bytes());
+    }
+
+    /// Some input clients call `replace_text_in_range` with an empty string
+    /// (e.g. clearing composition state); that must not write a spurious empty
+    /// payload to the PTY.
+    #[gpui::test]
+    fn test_replace_text_in_range_empty_text_sends_nothing(cx: &mut TestAppContext) {
+        let (window, pane, input_rx) = windowed_pane_view(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |view, cx| {
+                view.replace_text_in_range(None, "", window, cx);
+            });
+        })
+        .unwrap();
+
+        assert!(
+            input_rx.try_recv().is_err(),
+            "empty commit forwards nothing"
+        );
+    }
+
+    /// Multi-stage IME preedit (CJK composition) is out of scope (issue #501):
+    /// intermediate `replace_and_mark_text_in_range` calls stay local and never
+    /// reach the PTY, so a shell mid-composition never sees partial characters.
+    #[gpui::test]
+    fn test_replace_and_mark_text_in_range_forwards_nothing_to_pty(cx: &mut TestAppContext) {
+        let (window, pane, input_rx) = windowed_pane_view(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |view, cx| {
+                view.replace_and_mark_text_in_range(None, "n", None, window, cx);
+            });
+        })
+        .unwrap();
+
+        assert!(
+            input_rx.try_recv().is_err(),
+            "preedit composition stays local"
+        );
     }
 
     #[::core::prelude::v1::test]
