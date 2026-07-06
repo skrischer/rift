@@ -14,6 +14,12 @@ pub enum SshError {
     Exec { code: u32, stderr: String },
     #[error("unsupported remote platform '{0}' (no daemon binary)")]
     UnsupportedPlatform(String),
+    #[error(
+        "cannot resolve remote path '{0}': expanding another user's home \
+         ('~user/…') is not supported, only '~/…' (your own home); use an \
+         absolute path instead"
+    )]
+    UnsupportedHomePath(String),
     #[error("daemon launch did not become ready: {0}")]
     DaemonLaunch(String),
     #[error("timed out after {0:?} waiting for a daemon message")]

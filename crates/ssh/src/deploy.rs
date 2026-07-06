@@ -122,17 +122,34 @@ fn mkdir_command(remote_dir: &str) -> String {
 /// fixed, data-free command (`printf '%s' "$HOME"`) and joined client-side —
 /// so the raw configured value never enters a variable-expanding shell context.
 /// Any other value is treated as an already-absolute literal path.
-fn join_home(home: &str, remote_dir: &str) -> String {
+///
+/// `~user/…` (another user's home) is rejected with a clear error rather than
+/// silently expanded against the *connecting* user's `$HOME` — `~user` and
+/// `~` resolve to different directories, and resolving it correctly would
+/// need a remote `getent`/`eval` lookup, which is not worth the complexity at
+/// this scale.
+fn join_home(home: &str, remote_dir: &str) -> Result<String, SshError> {
     let home = home.trim_end_matches('/');
-    let rest = remote_dir
-        .strip_prefix("$HOME")
-        .or_else(|| remote_dir.strip_prefix('~'))
-        .map(|r| r.trim_start_matches('/'));
-    match rest {
-        Some("") => home.to_string(),
-        Some(rest) => format!("{home}/{rest}"),
-        None => remote_dir.to_string(),
+    if let Some(rest) = remote_dir.strip_prefix("$HOME") {
+        let rest = rest.trim_start_matches('/');
+        return Ok(if rest.is_empty() {
+            home.to_string()
+        } else {
+            format!("{home}/{rest}")
+        });
     }
+    if let Some(rest) = remote_dir.strip_prefix('~') {
+        if rest.is_empty() || rest.starts_with('/') {
+            let rest = rest.trim_start_matches('/');
+            return Ok(if rest.is_empty() {
+                home.to_string()
+            } else {
+                format!("{home}/{rest}")
+            });
+        }
+        return Err(SshError::UnsupportedHomePath(remote_dir.to_string()));
+    }
+    Ok(remote_dir.to_string())
 }
 
 /// Outcome of [`ensure_daemon_deployed`]: the resolved remote binary path, plus
@@ -168,7 +185,7 @@ pub async fn ensure_daemon_deployed(
     // is never placed in a variable-expanding shell context.
     let remote_dir = if remote_dir.starts_with("$HOME") || remote_dir.starts_with('~') {
         let home = conn.exec_capture("printf '%s' \"$HOME\"").await?;
-        join_home(home.trim(), remote_dir)
+        join_home(home.trim(), remote_dir)?
     } else {
         remote_dir.to_string()
     };
@@ -358,22 +375,47 @@ mod tests {
 
     #[test]
     fn test_join_home_expands_dollar_home_prefix() {
-        assert_eq!(join_home("/home/u", "$HOME/.rift/bin"), "/home/u/.rift/bin");
+        assert_eq!(
+            join_home("/home/u", "$HOME/.rift/bin").expect("expands"),
+            "/home/u/.rift/bin"
+        );
     }
 
     #[test]
     fn test_join_home_expands_tilde_prefix() {
-        assert_eq!(join_home("/home/u", "~/.rift/bin"), "/home/u/.rift/bin");
+        assert_eq!(
+            join_home("/home/u", "~/.rift/bin").expect("expands"),
+            "/home/u/.rift/bin"
+        );
     }
 
     #[test]
     fn test_join_home_bare_home_yields_home() {
-        assert_eq!(join_home("/home/u/", "$HOME"), "/home/u");
-        assert_eq!(join_home("/home/u", "~"), "/home/u");
+        assert_eq!(join_home("/home/u/", "$HOME").expect("expands"), "/home/u");
+        assert_eq!(join_home("/home/u", "~").expect("expands"), "/home/u");
     }
 
     #[test]
     fn test_join_home_absolute_path_is_left_literal() {
-        assert_eq!(join_home("/home/u", "/opt/rift/bin"), "/opt/rift/bin");
+        assert_eq!(
+            join_home("/home/u", "/opt/rift/bin").expect("passthrough"),
+            "/opt/rift/bin"
+        );
+    }
+
+    #[test]
+    fn test_join_home_tilde_user_path_errors_clearly() {
+        // `~other/…` is a different user's home, not `$HOME` — must not
+        // silently resolve against the connecting user's home directory.
+        let err = join_home("/home/u", "~other/.rift/bin").expect_err("must reject");
+        assert!(matches!(err, SshError::UnsupportedHomePath(ref p) if p == "~other/.rift/bin"));
+        assert!(err.to_string().contains("~other/.rift/bin"));
+    }
+
+    #[test]
+    fn test_join_home_bare_tilde_user_path_errors_clearly() {
+        // No trailing slash at all: `~other` with no path component.
+        let err = join_home("/home/u", "~other").expect_err("must reject");
+        assert!(matches!(err, SshError::UnsupportedHomePath(ref p) if p == "~other"));
     }
 }
