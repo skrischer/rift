@@ -485,6 +485,15 @@ impl FileTree {
         self.cache_dirty = true;
     }
 
+    /// Handle a click on a directory row (#481): select it, then toggle its
+    /// expansion. Without the selection, arrow-key navigation right after a
+    /// click resumed from whatever was selected before, not the row just
+    /// clicked.
+    fn click_dir(&mut self, path: &str) {
+        self.selected = Some(path.to_owned());
+        self.toggle_dir(path);
+    }
+
     /// Reveal `path` in the tree: expand every ancestor directory, select its
     /// row, and scroll it into view. [`crate::workspace::WorkspaceView`] calls
     /// this whenever the editor finishes opening or switching to a file
@@ -697,8 +706,9 @@ impl FileTree {
         path.rsplit('/').next().unwrap_or(path)
     }
 
-    /// Render one row as an interactive element. Clicking a directory toggles
-    /// its expansion; clicking a file selects it and emits the open signal.
+    /// Render one row as an interactive element. Clicking a directory selects
+    /// it and toggles its expansion; clicking a file selects it and emits the
+    /// open signal.
     fn render_row(&self, row: &Row, cx: &mut Context<Self>) -> impl IntoElement {
         let is_dir = row.kind == EntryKind::Dir;
         let is_selected = self.selected.as_deref() == Some(row.path.as_str());
@@ -793,7 +803,7 @@ impl FileTree {
 
         root.on_click(cx.listener(move |this, _event, _window, cx| {
             if is_dir {
-                this.toggle_dir(&path);
+                this.click_dir(&path);
             } else {
                 this.selected = Some(path.clone());
                 this.cache_dirty = true;
@@ -1142,6 +1152,34 @@ mod tests {
         tree.refresh_row_cache();
         let visible: Vec<&str> = tree.row_cache.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(visible, vec!["src", "top.rs"]);
+    }
+
+    #[test]
+    fn test_click_dir_selects_and_toggles_the_directory() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs"), file("top.rs")]);
+
+        tree.click_dir("src");
+        assert_eq!(tree.selected(), Some("src"));
+        assert!(tree.is_collapsed("src"));
+
+        // A second click on the still-selected directory re-expands it and
+        // leaves the selection unchanged.
+        tree.click_dir("src");
+        assert_eq!(tree.selected(), Some("src"));
+        assert!(!tree.is_collapsed("src"));
+    }
+
+    #[test]
+    fn test_click_dir_moves_the_selection_off_a_previously_selected_row() {
+        // Regression for #481: clicking a directory used to toggle it without
+        // touching the selection, so the old selection stuck around and
+        // arrow keys resumed from there instead of the row just clicked.
+        let mut tree = seed(vec![dir("src"), file("src/main.rs"), file("top.rs")]);
+        tree.selected = Some("top.rs".into());
+
+        tree.click_dir("src");
+
+        assert_eq!(tree.selected(), Some("src"));
     }
 
     // --- git + diagnostic decoration / ancestor roll-up (#329) ---
