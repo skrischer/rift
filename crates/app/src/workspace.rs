@@ -350,6 +350,20 @@ impl WorkspaceView {
                         )),
                         _ => None,
                     };
+                    // Content-only diff refresh (#488): pull the changed paths
+                    // out of an `UpdateWorktree` before `msg` moves into the
+                    // fold below, mirroring `git_status_update` above — this
+                    // fires on every disk write, catching the content-only
+                    // edits `UpdateGitStatus` never reports (status unchanged).
+                    let worktree_content_update = match &msg {
+                        DaemonMessage::UpdateWorktree { changed, .. } => Some(
+                            changed
+                                .iter()
+                                .map(|entry| entry.path.clone())
+                                .collect::<Vec<String>>(),
+                        ),
+                        _ => None,
+                    };
                     view.file_tree.update(cx, |tree, cx| {
                         apply_worktree_message(tree, msg);
                         cx.notify();
@@ -388,6 +402,15 @@ impl WorkspaceView {
                     if let Some((changed, cleared)) = git_status_update {
                         view.diff_view.update(cx, |diff_view, cx| {
                             diff_view.apply_git_update(&changed, &cleared, cx);
+                        });
+                    }
+                    // Live diff refresh (#488): a content-only edit to the open
+                    // diff's path (`M` stays `M`, no `UpdateGitStatus` above)
+                    // still re-requests the diff here, on the `UpdateWorktree`
+                    // every disk write produces.
+                    if let Some(changed) = worktree_content_update {
+                        view.diff_view.update(cx, |diff_view, cx| {
+                            diff_view.apply_content_update(&changed, cx);
                         });
                     }
                 });
