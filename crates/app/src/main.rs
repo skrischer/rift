@@ -318,6 +318,17 @@ fn main() {
                 rift_app::editor::FindReferences,
                 Some(rift_app::editor::EDITOR_KEY_CONTEXT),
             ),
+            // Jump-list dismissal (#485): Escape closes the references/
+            // definitions overlay without selecting an entry. The input's own
+            // `escape` binding (deeper "Input" context) is tried first and
+            // propagates when it has nothing to do (no context menu, inline
+            // completion, or IME composition), so the keystroke falls through
+            // to this binding.
+            KeyBinding::new(
+                "escape",
+                rift_app::editor::DismissJumpList,
+                Some(rift_app::editor::EDITOR_KEY_CONTEXT),
+            ),
         ]);
         // Explorer keyboard navigation (#332): up/down move the selection,
         // left/right collapse/expand (stepping to parent/first-child at the

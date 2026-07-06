@@ -3,7 +3,7 @@ use std::time::SystemTime;
 
 mod frame;
 
-pub use frame::{encode_frame, FrameDecoder, FrameError};
+pub use frame::{encode_frame, FrameDecoder, FrameError, MAX_FRAME_LEN};
 
 /// Wire protocol version negotiated during the client/daemon handshake.
 ///
