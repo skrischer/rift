@@ -137,6 +137,25 @@ pub enum ConnectionStatus {
     Disconnected,
 }
 
+impl ConnectionStatus {
+    /// The status-dot label and theme color for this state — shared by
+    /// `SessionView`'s own statusbar and the title bar's connection group
+    /// (#511, `docs/spec-cockpit-chrome.md`), so the two render the identical
+    /// mapping instead of drifting apart.
+    pub fn status_dot(self, cx: &gpui::App) -> (&'static str, gpui::Hsla) {
+        use gpui_component::ActiveTheme as _;
+
+        match self {
+            ConnectionStatus::Connecting => ("connecting", cx.theme().warning),
+            ConnectionStatus::Connected => ("connected", cx.theme().success),
+            ConnectionStatus::Reconnecting | ConnectionStatus::SshReconnecting { .. } => {
+                ("reconnecting", cx.theme().warning)
+            }
+            ConnectionStatus::Disconnected => ("disconnected", cx.theme().muted_foreground),
+        }
+    }
+}
+
 /// Switches to the Nth window (1-based, by statusbar tab order) of the active
 /// tmux session. Bound to `Alt+1..9` in the app and dispatched to [`SessionView`]
 /// through the GPUI action system, so the chord is intercepted before the
@@ -166,5 +185,57 @@ impl Dimensions for TermSize {
 
     fn columns(&self) -> usize {
         self.cols
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use gpui_component::ActiveTheme as _;
+
+    #[gpui::test]
+    fn test_status_dot_connected_reads_success_label_and_color(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            let (label, color) = ConnectionStatus::Connected.status_dot(cx);
+            assert_eq!(label, "connected");
+            assert_eq!(color, cx.theme().success);
+        });
+    }
+
+    #[gpui::test]
+    fn test_status_dot_connecting_reads_warning_label_and_color(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            let (label, color) = ConnectionStatus::Connecting.status_dot(cx);
+            assert_eq!(label, "connecting");
+            assert_eq!(color, cx.theme().warning);
+        });
+    }
+
+    #[gpui::test]
+    fn test_status_dot_reconnecting_variants_read_warning_label_and_color(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+
+            let (label, color) = ConnectionStatus::Reconnecting.status_dot(cx);
+            assert_eq!(label, "reconnecting");
+            assert_eq!(color, cx.theme().warning);
+
+            let (label, color) = ConnectionStatus::SshReconnecting { retry: 3 }.status_dot(cx);
+            assert_eq!(label, "reconnecting");
+            assert_eq!(color, cx.theme().warning);
+        });
+    }
+
+    #[gpui::test]
+    fn test_status_dot_disconnected_reads_muted_label_and_color(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            let (label, color) = ConnectionStatus::Disconnected.status_dot(cx);
+            assert_eq!(label, "disconnected");
+            assert_eq!(color, cx.theme().muted_foreground);
+        });
     }
 }
