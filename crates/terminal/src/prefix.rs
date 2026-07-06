@@ -67,6 +67,20 @@ impl PrefixEngine {
         matches!(self.state, State::Pending)
     }
 
+    /// Apply a bound `switch-client -T` to the engine's own table state (the
+    /// [`crate::keytable::DispatchDecision::SwitchTable`] classification,
+    /// #484): `prefix` arms the capture exactly as if the prefix key had been
+    /// pressed, any other mirrored table (`root`) returns to idle. Replaces
+    /// whatever state is current — including an open repeat window — just as
+    /// tmux replaces the client's key table.
+    pub fn switch_table(&mut self, table: &str) {
+        self.state = if table == PREFIX_TABLE {
+            State::Pending
+        } else {
+            State::Idle
+        };
+    }
+
     /// Resolve one normalized tmux key name (from
     /// [`crate::keytable::keystroke_to_tmux_key`]) against the mirrored
     /// tables, advancing the state machine.
@@ -174,13 +188,14 @@ mod tests {
 
     // Mirrors the real-tmux shape used by the keytable.rs fixtures: a stock
     // `send-prefix` binding, one plain prefix binding, one repeatable prefix
-    // binding, and a `bind -n` root binding — enough to exercise every
-    // transition in this module.
+    // binding, a `bind -n` root binding, and a sticky-prefix table switch —
+    // enough to exercise every transition in this module.
     const FIXTURE: &str = "\
 bind-key    -T prefix C-b     send-prefix
 bind-key    -T prefix c       new-window
 bind-key -r -T prefix Left    resize-pane -L 5
 bind-key    -T root  M-Left   select-pane -L
+bind-key    -T root  C-Space  switch-client -T prefix
 ";
 
     fn table() -> KeyTable {
@@ -373,6 +388,65 @@ bind-key    -T root  M-Left   select-pane -L
             PrefixAction::Consume
         );
         assert!(engine.pending());
+    }
+
+    #[test]
+    fn test_switch_table_binding_arms_prefix_capture() {
+        use crate::keytable::{classify_command, DispatchDecision};
+
+        let table = table();
+        let options = default_options();
+        let mut engine = PrefixEngine::new();
+        let now = Instant::now();
+
+        // The sticky-prefix root binding resolves to its raw command...
+        let action = engine.handle_key("C-Space", &table, &options, now);
+        let PrefixAction::Dispatch(command) = action else {
+            panic!("expected Dispatch, got {action:?}");
+        };
+        // ...which classifies as a local table switch, not a server dispatch
+        // (#484)...
+        let DispatchDecision::SwitchTable(target) = classify_command(&command) else {
+            panic!("expected SwitchTable for {command:?}");
+        };
+        engine.switch_table(&target);
+
+        // ...so the engine is in the prefix table: the next key resolves
+        // there without the prefix key ever being pressed.
+        assert!(engine.pending());
+        assert_eq!(
+            engine.handle_key("c", &table, &options, now),
+            PrefixAction::Dispatch("new-window".to_string())
+        );
+        assert!(!engine.pending());
+    }
+
+    #[test]
+    fn test_switch_table_root_returns_engine_to_idle() {
+        let mut engine = PrefixEngine::new();
+        engine.switch_table("prefix");
+        assert!(engine.pending());
+        engine.switch_table("root");
+        assert!(!engine.pending());
+    }
+
+    #[test]
+    fn test_switch_table_replaces_open_repeat_window() {
+        let table = table();
+        let options = default_options();
+        let mut engine = PrefixEngine::new();
+        let base = Instant::now();
+
+        engine.handle_key("C-b", &table, &options, base);
+        engine.handle_key("Left", &table, &options, base);
+        engine.switch_table("prefix");
+
+        // Still inside repeat-time, but the switch replaced the window: the
+        // key resolves in the prefix table as a fresh chord.
+        assert_eq!(
+            engine.handle_key("c", &table, &options, base + Duration::from_millis(50)),
+            PrefixAction::Dispatch("new-window".to_string())
+        );
     }
 
     #[test]

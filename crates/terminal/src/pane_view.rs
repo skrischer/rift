@@ -465,6 +465,13 @@ impl PaneView {
             keytable::DispatchDecision::Confirm { prompt, wrapped } => {
                 self.open_confirm_dialog(prompt, wrapped, window, cx);
             }
+            keytable::DispatchDecision::SwitchTable(table) => {
+                // A mirror of the engine's own table state, never a server
+                // dispatch (#484). Notify here because the confirm-dialog
+                // path also lands here, outside the key-down notify.
+                self.prefix_engine.switch_table(&table);
+                cx.notify();
+            }
         }
     }
 
