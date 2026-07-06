@@ -139,31 +139,28 @@ struct Row {
 
 /// A directory's or file's rolled-up git status, ordered by the roll-up's
 /// rendering precedence (`docs/spec-explorer-panel.md`: `conflicted > changed
-/// > untracked > clean`, extended by `deleted` between `conflicted` and
-/// `changed` — a deletion must stay visible on a directory that also holds
-/// ordinary edits, #480). Declared low-to-high so `Option<GitRollupStatus>`'s
-/// derived `Ord` (`None` sorts below every variant, standing in for "clean")
-/// lets [`Rollup::merge`] pick the worst of two with a plain `max`.
+/// > untracked > clean`). A deleted tracked file rolls up under `changed`
+/// (the same affordance as modified/added/renamed, per that spec) — #480 only
+/// adds the ancestor roll-up, not a new lane. Declared low-to-high so
+/// `Option<GitRollupStatus>`'s derived `Ord` (`None` sorts below every variant,
+/// standing in for "clean") lets [`Rollup::merge`] pick the worst of two with a
+/// plain `max`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum GitRollupStatus {
     Untracked,
     Changed,
-    Deleted,
     Conflicted,
 }
 
 impl GitRollupStatus {
     /// Classify one path's raw index/worktree status into the roll-up's
-    /// precedence. `None` (clean on both sides) is never actually
+    /// three-way precedence. `None` (clean on both sides) is never actually
     /// sent by the daemon (`WorktreeModel::apply_git_update`'s doc), but is
-    /// handled rather than assumed away.
+    /// handled rather than assumed away. A deletion is a non-`Unmodified`
+    /// status, so it classifies as `Changed` via the catch-all.
     fn from_status(status: GitEntryStatus) -> Option<Self> {
         if status.index == GitStatusCode::Unmerged || status.worktree == GitStatusCode::Unmerged {
             Some(Self::Conflicted)
-        } else if status.index == GitStatusCode::Deleted
-            || status.worktree == GitStatusCode::Deleted
-        {
-            Some(Self::Deleted)
         } else if status.index == GitStatusCode::Untracked
             || status.worktree == GitStatusCode::Untracked
         {
@@ -181,7 +178,6 @@ impl GitRollupStatus {
     fn badge(self) -> &'static str {
         match self {
             Self::Conflicted => "C",
-            Self::Deleted => "D",
             Self::Changed => "M",
             Self::Untracked => "U",
         }
@@ -308,10 +304,10 @@ fn compute_rollup(model: &WorktreeModel) -> HashMap<String, Rollup> {
 
     // Deleted tracked files have no tree entry anymore (the worktree update
     // removed it), so the pass above never sees them — but the model still
-    // holds their git status (the `D` lane). Roll each tree-absent status
-    // path up onto its surviving ancestor directories so the deletion stays
-    // visible in the explorer (#480). No severity here: diagnostics are keyed
-    // to live files, and a gone path contributes none.
+    // holds their git status (a `Deleted` code, classified as `Changed`). Roll
+    // each tree-absent status path up onto its surviving ancestor directories
+    // so the deletion stays visible in the explorer (#480). No severity here:
+    // diagnostics are keyed to live files, and a gone path contributes none.
     for (path, status) in model.git_statuses() {
         if model.get(path).is_some() {
             continue;
@@ -743,9 +739,9 @@ impl FileTree {
         });
 
         // Git-status color: tints the name itself, mirroring the roll-up
-        // precedence (`conflicted > deleted > changed > untracked`).
+        // precedence (`conflicted > changed > untracked`).
         let git_color = row.git_status.map(|status| match status {
-            GitRollupStatus::Conflicted | GitRollupStatus::Deleted => cx.theme().danger,
+            GitRollupStatus::Conflicted => cx.theme().danger,
             GitRollupStatus::Changed => cx.theme().warning,
             GitRollupStatus::Untracked => cx.theme().success,
         });
@@ -760,7 +756,7 @@ impl FileTree {
             div()
                 .text_xs()
                 .text_color(match status {
-                    GitRollupStatus::Conflicted | GitRollupStatus::Deleted => cx.theme().danger,
+                    GitRollupStatus::Conflicted => cx.theme().danger,
                     GitRollupStatus::Changed => cx.theme().warning,
                     GitRollupStatus::Untracked => cx.theme().success,
                 })
@@ -1225,16 +1221,17 @@ mod tests {
     }
 
     #[test]
-    fn test_git_rollup_status_from_status_deleted_on_either_side_maps_to_deleted() {
+    fn test_git_rollup_status_from_status_deleted_on_either_side_maps_to_changed() {
         use GitStatusCode::{Deleted, Unmerged, Unmodified};
 
-        // Unstaged deletion (the common case: file removed from the worktree).
+        // Unstaged deletion (the common case: file removed from the worktree):
+        // rolls up under the shared `changed` lane, per spec-explorer-panel.md.
         assert_eq!(
             GitRollupStatus::from_status(GitEntryStatus {
                 index: Unmodified,
                 worktree: Deleted
             }),
-            Some(GitRollupStatus::Deleted)
+            Some(GitRollupStatus::Changed)
         );
         // Staged deletion.
         assert_eq!(
@@ -1242,7 +1239,7 @@ mod tests {
                 index: Deleted,
                 worktree: Unmodified
             }),
-            Some(GitRollupStatus::Deleted)
+            Some(GitRollupStatus::Changed)
         );
         // A conflict still outranks a deletion on the other side.
         assert_eq!(
@@ -1252,7 +1249,7 @@ mod tests {
             }),
             Some(GitRollupStatus::Conflicted)
         );
-        assert_eq!(GitRollupStatus::Deleted.badge(), "D");
+        assert_eq!(GitRollupStatus::Changed.badge(), "M");
     }
 
     #[test]
@@ -1467,13 +1464,13 @@ mod tests {
         );
     }
 
-    // --- deleted tracked files: D roll-up onto surviving ancestors (#480) ---
+    // --- deleted tracked files: changed roll-up onto surviving ancestors (#480) ---
 
     #[test]
     fn test_compute_rollup_deleted_path_absent_from_tree_marks_surviving_ancestors() {
         // `a/b/gone.rs` was deleted: its tree entry is gone, but the git
         // recompute still reports it as worktree-deleted. Both surviving
-        // ancestors must carry the D roll-up; the clean sibling stays clean.
+        // ancestors must carry the changed roll-up; the clean sibling stays clean.
         let mut model = WorktreeModel::default();
         model.apply_snapshot_chunk(
             "/proj".into(),
@@ -1492,12 +1489,12 @@ mod tests {
         let rollup = compute_rollup(&model);
         let at = |path: &str| rollup.get(path).copied().unwrap_or_default();
 
-        let deleted = Rollup {
-            git_status: Some(GitRollupStatus::Deleted),
+        let changed = Rollup {
+            git_status: Some(GitRollupStatus::Changed),
             severity: None,
         };
-        assert_eq!(at("a"), deleted);
-        assert_eq!(at("a/b"), deleted);
+        assert_eq!(at("a"), changed);
+        assert_eq!(at("a/b"), changed);
         assert_eq!(at("a/b/keep.rs"), Rollup::default());
         // The gone path itself gets no entry — there is no row to decorate.
         assert!(!rollup.contains_key("a/b/gone.rs"));
@@ -1522,7 +1519,7 @@ mod tests {
         assert_eq!(
             rollup.get("a").copied().unwrap_or_default(),
             Rollup {
-                git_status: Some(GitRollupStatus::Deleted),
+                git_status: Some(GitRollupStatus::Changed),
                 severity: None,
             }
         );
@@ -1530,9 +1527,9 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_rollup_deleted_outranks_changed_on_the_shared_ancestor() {
-        // `src` holds both an ordinary edit and a deletion; the D lane must
-        // stay visible rather than being drowned out by the M.
+    fn test_compute_rollup_deleted_and_modified_share_the_changed_lane() {
+        // `src` holds both an ordinary edit and a deletion; both classify as
+        // `Changed`, so the shared ancestor carries the changed roll-up.
         let mut model = WorktreeModel::default();
         model.apply_snapshot_chunk("/proj".into(), vec![dir("src"), file("src/kept.rs")], true);
         model.apply_git_update(
@@ -1554,7 +1551,7 @@ mod tests {
         let rollup = compute_rollup(&model);
         assert_eq!(
             rollup.get("src").copied().unwrap_or_default().git_status,
-            Some(GitRollupStatus::Deleted)
+            Some(GitRollupStatus::Changed)
         );
     }
 
@@ -1597,7 +1594,7 @@ mod tests {
                 .copied()
                 .unwrap_or_default()
                 .git_status,
-            Some(GitRollupStatus::Deleted)
+            Some(GitRollupStatus::Changed)
         );
 
         // The deletion gets committed (or restored): the recompute clears it.
@@ -1612,11 +1609,11 @@ mod tests {
     }
 
     #[test]
-    fn test_dir_row_carries_the_deleted_rollup_after_a_tracked_file_deletion() {
+    fn test_dir_row_carries_the_changed_rollup_after_a_tracked_file_deletion() {
         // End-to-end through the view: fold the same message sequence the
         // daemon sends on a deletion (worktree update removing the entry,
         // then the git recompute reporting it deleted) and check the parent
-        // directory's rendered row carries the D decoration.
+        // directory's rendered row carries the changed decoration.
         let mut tree = seed(vec![dir("src"), file("src/gone.rs"), file("top.rs")]);
         tree.model_mut()
             .apply_update(vec![], vec![], vec!["src/gone.rs".into()]);
@@ -1634,7 +1631,7 @@ mod tests {
         assert_eq!(visible, vec!["src", "top.rs"]);
 
         let src_row = rows.iter().find(|r| r.path == "src").expect("src row");
-        assert_eq!(src_row.git_status, Some(GitRollupStatus::Deleted));
+        assert_eq!(src_row.git_status, Some(GitRollupStatus::Changed));
         assert_eq!(src_row.severity, None);
     }
 
