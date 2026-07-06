@@ -39,8 +39,8 @@
 | 20 | Protocol & connection robustness — message-set version negotiation, stale-daemon restart, stream-death resync, reconnect loop, connect screen (startup state on every launch) | [spec-connection-robustness.md](spec-connection-robustness.md) | [Phase 200](https://github.com/skrischer/rift/milestone/34) |
 | 21 | Cockpit chrome — custom title bar (connection/session group), activity rail, window-tab redesign, pane headers (sidebar removed) | [spec-cockpit-chrome.md](spec-cockpit-chrome.md) | [Phase 210](https://github.com/skrischer/rift/milestone/35) |
 | 22 | Composite status line — window list + activity, branch ↑↓ + line totals, diagnostic counts, LSP health, Ln/Col, clock; supersedes the phase-8 content mirror | [spec-status-line.md](spec-status-line.md) | [Phase 220](https://github.com/skrischer/rift/milestone/36) |
-| 23 | Editor chrome — breadcrumb + symbol, gutter severity dots, inline diagnostic card, hover card, references/outline panels, conflict dialog | — | — |
-| 24 | Source-control write path — stage/unstage/commit, hunk staging, split diff + word-level emphasis | — | — |
+| 23 | Editor chrome — breadcrumb + symbol, gutter severity dots, inline diagnostic card, hover card, results/outline panels, minimap, conflict dialog | [spec-editor-chrome.md](spec-editor-chrome.md) | [Phase 230](https://github.com/skrischer/rift/milestone/37) |
+| 24 | Source-control write path — stage/unstage/commit, hunk staging, split diff + word-level emphasis | [spec-source-control-write.md](spec-source-control-write.md) | [Phase 240](https://github.com/skrischer/rift/milestone/38) |
 | 25 | Explorer design parity — header actions, git letter lane, diagnostic dots + rollup, empty states | — | — |
 | 26 | Settings shell + theme unification — full settings page, theme-driven terminal palette, hardcoded-hex cleanup | — | — |
 

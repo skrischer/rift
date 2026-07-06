@@ -42,6 +42,13 @@ pub struct WorktreeModel {
     branch: Option<String>,
     /// Ahead/behind vs the upstream (`None` = no upstream / no repo).
     ahead_behind: Option<AheadBehind>,
+    /// Whether a `RepoState` has arrived since the last completed snapshot.
+    /// The daemon only emits `RepoState` for git-repo roots, so while this is
+    /// `false` (startup, not connected, non-repo root) there is no repo-level
+    /// claim to make — the status bar shows no branch segment (#490). Reset
+    /// with the rest of the git decoration on every snapshot: the replay
+    /// behind the snapshot re-delivers it for repo roots.
+    repo_state_received: bool,
     /// Per-file diagnostics, keyed by path (same key space as `entries`) then by
     /// the publishing language server's id. Independent of the tree, exactly like
     /// `git`: a set may exist for a path the tree has not added yet (a renderer
@@ -107,6 +114,7 @@ impl WorktreeModel {
         self.git.clear();
         self.branch = None;
         self.ahead_behind = None;
+        self.repo_state_received = false;
         // Same reasoning for diagnostics: the daemon replays the full live error
         // set right behind every snapshot (`write_snapshot`, #177), so drop the
         // prior decoration — it is about to be re-applied, and anything not in
@@ -179,6 +187,7 @@ impl WorktreeModel {
     pub fn apply_repo_state(&mut self, branch: Option<String>, ahead_behind: Option<AheadBehind>) {
         self.branch = branch;
         self.ahead_behind = ahead_behind;
+        self.repo_state_received = true;
     }
 
     /// Apply one `Diagnostics` update: full-set-replace `server`'s diagnostics
@@ -232,6 +241,14 @@ impl WorktreeModel {
     /// Ahead/behind vs the upstream, or `None` when there is no upstream / repo.
     pub fn ahead_behind(&self) -> Option<AheadBehind> {
         self.ahead_behind
+    }
+
+    /// Whether a `RepoState` has arrived since the last completed snapshot.
+    /// `false` means no repo-level state is known at all (startup, not
+    /// connected, non-repo root) — distinct from a received state whose
+    /// [`WorktreeModel::branch`] is `None` (a genuine detached HEAD).
+    pub fn repo_state_received(&self) -> bool {
+        self.repo_state_received
     }
 
     /// One file's diagnostics, keyed by the publishing server's id, or `None`
@@ -506,6 +523,33 @@ mod tests {
         model.apply_snapshot_chunk("/proj".into(), vec![file("early.rs", 1)], true);
         assert_eq!(model.git_status("early.rs"), None);
         assert_eq!(model.branch(), None);
+    }
+
+    #[test]
+    fn test_repo_state_received_before_any_repo_state_is_false() {
+        let model = WorktreeModel::default();
+        assert!(!model.repo_state_received());
+    }
+
+    #[test]
+    fn test_repo_state_received_after_apply_repo_state_is_true() {
+        let mut model = WorktreeModel::default();
+        // Even a fully empty repo state (detached HEAD, no upstream) counts as
+        // received: the daemon only emits it for repo roots.
+        model.apply_repo_state(None, None);
+        assert!(model.repo_state_received());
+    }
+
+    #[test]
+    fn test_repo_state_received_after_snapshot_completion_is_reset() {
+        let mut model = WorktreeModel::default();
+        model.apply_repo_state(Some("main".into()), None);
+
+        // A new snapshot (e.g. a reattach, possibly onto a non-repo root)
+        // wipes the repo-level claim along with the rest of the git
+        // decoration; the replay behind it re-delivers it for repo roots.
+        model.apply_snapshot_chunk("/proj".into(), vec![file("a.rs", 1)], true);
+        assert!(!model.repo_state_received());
     }
 
     #[test]
