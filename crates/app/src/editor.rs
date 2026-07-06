@@ -213,6 +213,13 @@ pub struct ShowHover;
 #[action(namespace = rift, no_json)]
 pub struct FindReferences;
 
+/// Dismiss the transient references/definitions jump-list overlay without
+/// selecting an entry (#485). Bound to `Escape` in `main.rs`, scoped to the
+/// editor key context; a left click outside the overlay dismisses it too.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct DismissJumpList;
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// The GPUI key context the editor establishes around its input, so the
@@ -1499,6 +1506,31 @@ impl EditorView {
         }
     }
 
+    /// Dismiss the active tab's jump-list overlay without selecting an entry
+    /// (#485). Both dismiss paths land here: `Escape` (via the
+    /// [`DismissJumpList`] action) and a left click outside the overlay (the
+    /// root mouse-down handler; clicks inside the overlay stop propagation
+    /// before reaching it). Hands focus back to the editor buffer so the
+    /// keyboard keeps working where the user was. Returns `false` when no
+    /// overlay was visible, so the action handler can let `Escape` propagate
+    /// to any other meaning instead of swallowing it.
+    fn dismiss_jump_list(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(active) = self.active else {
+            return false;
+        };
+        let tab = &mut self.tabs[active];
+        if tab.jump_list.is_none() {
+            return false;
+        }
+        tab.jump_list = None;
+        tab.jump_list_kind = None;
+        tab.input.update(cx, |input, cx| {
+            input.focus(window, cx);
+        });
+        cx.notify();
+        true
+    }
+
     // ── Tab bar: switch / close (#352, #354) ──────────────────────────────
 
     /// Activate the tab at `index` (tab-bar click) and move focus to its
@@ -1755,6 +1787,14 @@ impl Render for EditorView {
                 .border_b_1()
                 .border_color(cx.theme().border)
                 .shadow_md()
+                // Swallow left clicks inside the overlay (#485): an entry's
+                // own handler has already run (children dispatch first in the
+                // bubble phase); stopping here keeps the click from reaching
+                // the root's click-outside dismissal and from moving the text
+                // cursor in the input underneath.
+                .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                    cx.stop_propagation();
+                })
                 .child(
                     div()
                         .px(px(8.0))
@@ -1900,9 +1940,17 @@ impl Render for EditorView {
             .on_action(cx.listener(|this, _: &FindReferences, _window, cx| {
                 this.dispatch_references_request(cx);
             }))
+            .on_action(cx.listener(|this, _: &DismissJumpList, window, cx| {
+                // Escape dismisses the jump-list overlay (#485). With no
+                // overlay visible the keystroke propagates on, keeping any
+                // other Escape meaning intact.
+                if !this.dismiss_jump_list(window, cx) {
+                    cx.propagate();
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     // Dismiss any visible hover popover on click and cancel any
                     // in-flight hover request so a delayed response does not
                     // re-open the popover after the user clicked away.
@@ -1914,6 +1962,11 @@ impl Render for EditorView {
                             cx.notify();
                         }
                     }
+                    // Click-outside dismissal for the jump-list overlay
+                    // (#485): clicks inside the overlay stop propagation
+                    // before reaching this bubble-phase handler, so any left
+                    // click landing here is outside it.
+                    this.dismiss_jump_list(window, cx);
                     if event.modifiers.secondary() {
                         // Cursor is already at the clicked position (InputState
                         // processed the event first in its own update cycle).
@@ -3429,5 +3482,91 @@ mod tests {
         let g2 = gen;
         assert_ne!(g1, g2);
         assert!(g2 > g1);
+    }
+
+    // --- jump-list overlay dismissal (#485) ---
+
+    fn jump_target(path: &str, line: u32) -> NavLocation {
+        let pos = Position { line, character: 0 };
+        NavLocation {
+            path: path.to_owned(),
+            range: Range {
+                start: pos,
+                end: pos,
+            },
+            out_of_root: false,
+            line_preview: None,
+        }
+    }
+
+    /// Acceptance (#485): dismissing the visible jump-list overlay (Escape /
+    /// click-outside both land in `dismiss_jump_list`) clears it without
+    /// jumping and hands focus back to the editor buffer.
+    #[gpui::test]
+    fn test_dismiss_jump_list_with_visible_overlay_clears_it_and_focuses_editor(
+        cx: &mut TestAppContext,
+    ) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    editor.tabs[a].load_state = TabLoadState::Loaded;
+                    editor.active = Some(a);
+
+                    // Populate the overlay the way the real flow does: a
+                    // references response matching the tab's in-flight id.
+                    editor.tabs[a].latest_ref_id = Some(NavRequestId(1));
+                    editor.apply_references_response(
+                        NavRequestId(1),
+                        vec![jump_target("a.rs", 1), jump_target("b.rs", 2)],
+                        cx,
+                    );
+                    assert!(editor.tabs[a].jump_list.is_some(), "overlay is visible");
+                });
+
+                // Focus sits elsewhere; the dismissal must hand it back to
+                // the editor buffer.
+                let elsewhere = cx.focus_handle();
+                window.focus(&elsewhere, cx);
+
+                editor.update(cx, |editor, cx| {
+                    assert!(
+                        editor.dismiss_jump_list(window, cx),
+                        "a visible overlay reports dismissed"
+                    );
+                    assert!(editor.tabs[0].jump_list.is_none());
+                    assert!(editor.tabs[0].jump_list_kind.is_none());
+                });
+
+                let input_handle = editor.read(cx).tabs[0].input.focus_handle(cx);
+                assert!(
+                    window.focused(cx).is_some_and(|f| f == input_handle),
+                    "dismissal must return focus to the editor buffer"
+                );
+            })
+            .unwrap();
+    }
+
+    /// With no overlay visible `dismiss_jump_list` reports `false`, so the
+    /// Escape action handler propagates the keystroke instead of swallowing
+    /// it — with or without an open tab.
+    #[gpui::test]
+    fn test_dismiss_jump_list_without_overlay_reports_nothing_dismissed(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    assert!(!editor.dismiss_jump_list(window, cx), "no tab open");
+
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    editor.tabs[a].load_state = TabLoadState::Loaded;
+                    editor.active = Some(a);
+                    assert!(!editor.dismiss_jump_list(window, cx), "no overlay visible");
+                });
+            })
+            .unwrap();
     }
 }
