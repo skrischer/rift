@@ -472,6 +472,14 @@ pub enum DaemonMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowLayout {
     pub window_id: u32,
+    /// tmux's real `#{window_index}` (the tab number `list-windows`/`select-window
+    /// -t :N` uses), not a position derived from array order — closing a window
+    /// leaves a gap in this numbering unless `renumber-windows` is set, and the
+    /// client must show that same gap (#495). Defaults on deserialize so a layout
+    /// emitted before this field existed still parses (additive change, same
+    /// tolerance as `PaneLayout::current_path`, #442).
+    #[serde(default)]
+    pub window_index: u32,
     pub name: String,
     /// Whether this is the session's active (currently selected) window.
     pub active: bool,
@@ -932,6 +940,7 @@ mod tests {
         vec![
             WindowLayout {
                 window_id: 1,
+                window_index: 0,
                 name: "editor".to_owned(),
                 active: true,
                 panes: vec![
@@ -959,6 +968,9 @@ mod tests {
             },
             WindowLayout {
                 window_id: 2,
+                // Deliberately non-contiguous with the first window's index,
+                // matching a real gap left by a closed window (#495) — not 1.
+                window_index: 2,
                 name: "logs".to_owned(),
                 active: false,
                 panes: vec![PaneLayout {
@@ -1002,6 +1014,26 @@ mod tests {
         // empty-default case.
         let json = r#"{"pane_id":3,"active":false,"left":0,"top":0,"width":80,"height":24,"current_path":7}"#;
         assert!(serde_json::from_str::<PaneLayout>(json).is_err());
+    }
+
+    #[test]
+    fn test_window_layout_missing_index_defaults_to_zero() {
+        // A layout serialized before `window_index` existed (#495) must still
+        // deserialize, with the field defaulting to 0.
+        let json = r#"{"window_id":1,"name":"editor","active":true,"panes":[]}"#;
+        let parsed: WindowLayout =
+            serde_json::from_str(json).expect("deserialize legacy WindowLayout");
+        assert_eq!(parsed.window_id, 1);
+        assert_eq!(parsed.window_index, 0);
+    }
+
+    #[test]
+    fn test_window_layout_malformed_index_field_type_rejected() {
+        // A present-but-wrongly-typed field is a protocol error, not an
+        // empty-default case.
+        let json =
+            r#"{"window_id":1,"window_index":"one","name":"editor","active":true,"panes":[]}"#;
+        assert!(serde_json::from_str::<WindowLayout>(json).is_err());
     }
 
     #[test]
