@@ -33,7 +33,10 @@ file-changed-on-disk dialog — and (gate decision) a minimap strip.
 - [ ] The dirty-buffer conflict surfaces as the design's dialog ("File
       changed on disk", body copy, secondary "Keep mine" + primary "Reload
       from disk") — upgrading the #433 banner; same two actions.
-- [ ] Minimap per gate decision (see Prior decisions once resolved).
+- [ ] A minimap strip (~14px) renders on the editor's right edge: line-length
+      marks from the shaped-line cache, diagnostic tints, viewport slab,
+      click-to-jump — damage-only redraw, explicitly NOT a pixel code render
+      (gate decision 2026-07-06: build).
 - [ ] All colors/typography via theme tokens; no dead controls.
 
 ## Scope
@@ -74,10 +77,10 @@ file-changed-on-disk dialog — and (gate decision) a minimap strip.
   cache of the active editor.
 - `app`: conflict dialog via gpui-component modal (the #420 dirty-close
   confirm pattern), actions identical to the #433 banner remedies.
-- Minimap: per gate decision — if IN: a non-interactive-scroll marks strip
-  (~14px: line-length marks, diagnostic tints, viewport slab, click-to-jump)
-  as its own issue; if OUT: recorded deviation from the artboard, revisited
-  post-v1.
+- Minimap (gate decision: IN): a marks strip (~14px: line-length marks,
+  diagnostic tints, viewport slab, click-to-jump) as its own issue — marks
+  from the existing shaped-line cache, damage-only redraw, no pixel-perfect
+  code render.
 
 ### Out of scope
 
