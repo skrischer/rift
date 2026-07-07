@@ -42,8 +42,13 @@ use rift_lsp::lsp_types::{
     DidSaveTextDocumentParams, NumberOrString, PublishDiagnosticsParams, ServerCapabilities,
 };
 use rift_lsp::nav::PositionEncoding;
-use rift_lsp::{DocumentChange, DocumentSelector, DocumentSink, DocumentSync, Registry, ServerId};
-use rift_protocol::{DaemonMessage, Diagnostic, DiagnosticSeverity, NavRequestId, Position, Range};
+use rift_lsp::{
+    DocumentChange, DocumentSelector, DocumentSink, DocumentSync, Registry, ServerId,
+    ServerLifecycle,
+};
+use rift_protocol::{
+    DaemonMessage, Diagnostic, DiagnosticSeverity, LspServerState, NavRequestId, Position, Range,
+};
 use tokio::sync::mpsc;
 use tracing::warn;
 
@@ -56,6 +61,17 @@ pub struct LspDiagnostics {
     pub path: String,
     pub server: String,
     pub items: Vec<Diagnostic>,
+}
+
+/// One language server's lifecycle transition (issue #520), ready to fold
+/// into the daemon `State` and broadcast as a `DaemonMessage::LspStatus`.
+/// `server` is the stable server name (e.g. `"rust-analyzer"`), not a
+/// per-spawn id — mirroring [`LspDiagnostics`] structurally, but keyed
+/// differently (name-scoped health vs id-scoped diagnostics).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspStatusEvent {
+    pub server: String,
+    pub state: LspServerState,
 }
 
 /// A live-buffer event from the editor (#189): the disk→buffer source-of-truth
@@ -217,6 +233,9 @@ pub struct LspWorker {
     /// Live-buffer events from the editor (#189), driving the disk→buffer shift.
     buffer_events: mpsc::Receiver<BufferEvent>,
     diagnostics_out: mpsc::Sender<LspDiagnostics>,
+    /// Lifecycle transitions (#520), drained from the registry after every
+    /// `observe` call alongside `clear_pruned`.
+    lifecycle_out: mpsc::Sender<LspStatusEvent>,
     /// The registry's diagnostics channel, drained by `run`.
     server_diagnostics: mpsc::UnboundedReceiver<(ServerId, PublishDiagnosticsParams)>,
     /// Navigation requests from the connections (#195, #482), each carrying the
@@ -234,7 +253,8 @@ impl LspWorker {
     /// Wire a worker for `root` using `selector`'s language → server table.
     /// `doc_changes` carries disk-driven change batches from the dispatch loop;
     /// `buffer_events` carries the editor's live-buffer feed (#189);
-    /// `diagnostics_out` carries translated diagnostics back to it.
+    /// `diagnostics_out` carries translated diagnostics back to it;
+    /// `lifecycle_out` carries lifecycle transitions (#520).
     /// `nav_requests` carries navigation requests (#195, #482), each with the
     /// requesting connection's `reply` channel for the response.
     pub fn new(
@@ -243,6 +263,7 @@ impl LspWorker {
         doc_changes: mpsc::Receiver<Vec<DocumentChange>>,
         buffer_events: mpsc::Receiver<BufferEvent>,
         diagnostics_out: mpsc::Sender<LspDiagnostics>,
+        lifecycle_out: mpsc::Sender<LspStatusEvent>,
         nav_requests: mpsc::Receiver<NavRequest>,
     ) -> Self {
         let (server_tx, server_diagnostics) = mpsc::unbounded_channel();
@@ -255,6 +276,7 @@ impl LspWorker {
             doc_changes,
             buffer_events,
             diagnostics_out,
+            lifecycle_out,
             server_diagnostics,
             nav_requests,
             diagnostic_paths: HashMap::new(),
@@ -316,6 +338,7 @@ impl LspWorker {
         };
         let ids = self.registry.observe(&path).await;
         self.clear_pruned();
+        self.forward_lifecycle();
         // The sink borrows `registry` immutably while `sync` is borrowed mutably —
         // distinct fields, so the split borrow holds (as in `apply_changes`).
         let mut sink = ServerSink::for_servers(&self.registry, ids);
@@ -341,6 +364,7 @@ impl LspWorker {
             // The observe may have pruned a dead instance: clear its stale
             // sets before this change's own publishes land.
             self.clear_pruned();
+            self.forward_lifecycle();
             // A change matching no server (unknown language, or every server for
             // it unavailable) drives no document — there is nothing to feed.
             if ids.is_empty() {
@@ -420,6 +444,20 @@ impl LspWorker {
                 // Same closed-receiver rationale as `publish`.
                 let _ = self.diagnostics_out.try_send(cleared);
             }
+        }
+    }
+
+    /// Forward every lifecycle transition the registry has recorded since the
+    /// last call (issue #520), translated to the wire state. Called after
+    /// each `Registry::observe`, alongside `clear_pruned`.
+    fn forward_lifecycle(&mut self) {
+        for (server, state) in self.registry.take_lifecycle_events() {
+            let event = LspStatusEvent {
+                server: server.to_string(),
+                state: translate_lifecycle(state),
+            };
+            // Same closed-receiver rationale as `publish`.
+            let _ = self.lifecycle_out.try_send(event);
         }
     }
 
@@ -592,6 +630,17 @@ impl NavCap {
             NavCap::Definition => has_definition(caps),
             NavCap::References => has_references(caps),
         }
+    }
+}
+
+/// Translate the registry's lifecycle enum into the wire state (1:1) — kept
+/// as a translation, not a shared type, so `rift-lsp`'s lifecycle bookkeeping
+/// stays independent of the protocol's exact wire shape.
+fn translate_lifecycle(state: ServerLifecycle) -> LspServerState {
+    match state {
+        ServerLifecycle::Starting => LspServerState::Starting,
+        ServerLifecycle::Running => LspServerState::Running,
+        ServerLifecycle::Crashed => LspServerState::Crashed,
     }
 }
 
@@ -815,6 +864,75 @@ mod tests {
         assert_eq!(translated.code.as_deref(), Some("E0308"));
     }
 
+    #[test]
+    fn test_translate_lifecycle_maps_each_state() {
+        assert_eq!(
+            translate_lifecycle(ServerLifecycle::Starting),
+            LspServerState::Starting
+        );
+        assert_eq!(
+            translate_lifecycle(ServerLifecycle::Running),
+            LspServerState::Running
+        );
+        assert_eq!(
+            translate_lifecycle(ServerLifecycle::Crashed),
+            LspServerState::Crashed
+        );
+    }
+
+    /// A table whose binary cannot exist on `$PATH`, so `observe` always
+    /// takes the failed-start path deterministically (issue #520) — no real
+    /// server process is ever spawned.
+    const MISSING_BINARY: &[rift_lsp::ServerSpec] = &[rift_lsp::ServerSpec {
+        language: "rust",
+        binary: "rift-nonexistent-lsp-status-test",
+        args: &[],
+        extensions: &["rs"],
+    }];
+
+    #[tokio::test]
+    async fn test_apply_changes_forwards_starting_then_crashed_for_missing_binary() {
+        let (_doc_tx, doc_rx) = mpsc::channel(8);
+        let (_buffer_tx, buffer_rx) = mpsc::channel(8);
+        let (diag_tx, _diag_rx) = mpsc::channel(8);
+        let (status_tx, mut status_rx) = mpsc::channel(8);
+        let (_nav_req_tx, nav_req_rx) = mpsc::channel(8);
+        // An absolute root: `Url::from_file_path` rejects a relative one.
+        let root = std::env::current_dir().expect("cwd is readable in tests");
+        let mut worker = LspWorker::new(
+            root,
+            DocumentSelector::with_table(MISSING_BINARY),
+            doc_rx,
+            buffer_rx,
+            diag_tx,
+            status_tx,
+            nav_req_rx,
+        );
+
+        worker
+            .apply_changes(vec![DocumentChange::Created {
+                path: PathBuf::from("main.rs"),
+            }])
+            .await;
+
+        let binary = MISSING_BINARY[0].binary;
+        assert_eq!(
+            status_rx.try_recv(),
+            Ok(LspStatusEvent {
+                server: binary.to_string(),
+                state: LspServerState::Starting,
+            })
+        );
+        assert_eq!(
+            status_rx.try_recv(),
+            Ok(LspStatusEvent {
+                server: binary.to_string(),
+                state: LspServerState::Crashed,
+            })
+        );
+        assert!(status_rx.try_recv().is_err(), "no further events");
+    }
+
     // Navigation drop-stale routing (per connection) is exercised in the
     // `crates/daemon/src/lib.rs` tests, where the connection-side gate and the
     // two-connection reply routing live (#482).
@@ -827,6 +945,7 @@ mod tests {
         doc_tx: mpsc::Sender<Vec<DocumentChange>>,
         buffer_tx: mpsc::Sender<BufferEvent>,
         diag_rx: mpsc::Receiver<LspDiagnostics>,
+        status_rx: mpsc::Receiver<LspStatusEvent>,
         nav_req_tx: mpsc::Sender<NavRequest>,
     }
 
@@ -836,6 +955,7 @@ mod tests {
         let (doc_tx, doc_rx) = mpsc::channel(8);
         let (buffer_tx, buffer_rx) = mpsc::channel(8);
         let (diag_tx, diag_rx) = mpsc::channel(8);
+        let (status_tx, status_rx) = mpsc::channel(8);
         let (nav_req_tx, nav_req_rx) = mpsc::channel(8);
         let worker = LspWorker::new(
             PathBuf::from("."),
@@ -843,12 +963,14 @@ mod tests {
             doc_rx,
             buffer_rx,
             diag_tx,
+            status_tx,
             nav_req_rx,
         );
         let channels = WorkerChannels {
             doc_tx,
             buffer_tx,
             diag_rx,
+            status_rx,
             nav_req_tx,
         };
         (worker, channels)
@@ -873,10 +995,16 @@ mod tests {
             doc_tx,
             buffer_tx,
             diag_rx,
+            status_rx,
             nav_req_tx,
         } = channels;
         drop(doc_tx);
-        assert_run_terminates(worker, (buffer_tx, diag_rx, nav_req_tx), "doc_changes").await;
+        assert_run_terminates(
+            worker,
+            (buffer_tx, diag_rx, status_rx, nav_req_tx),
+            "doc_changes",
+        )
+        .await;
     }
 
     /// Regression (#497): a closed buffer-event channel used to await
@@ -889,10 +1017,16 @@ mod tests {
             doc_tx,
             buffer_tx,
             diag_rx,
+            status_rx,
             nav_req_tx,
         } = channels;
         drop(buffer_tx);
-        assert_run_terminates(worker, (doc_tx, diag_rx, nav_req_tx), "buffer_events").await;
+        assert_run_terminates(
+            worker,
+            (doc_tx, diag_rx, status_rx, nav_req_tx),
+            "buffer_events",
+        )
+        .await;
     }
 
     /// Regression (#497): same park as `buffer_events`, on the nav path.
@@ -903,9 +1037,15 @@ mod tests {
             doc_tx,
             buffer_tx,
             diag_rx,
+            status_rx,
             nav_req_tx,
         } = channels;
         drop(nav_req_tx);
-        assert_run_terminates(worker, (doc_tx, buffer_tx, diag_rx), "nav_requests").await;
+        assert_run_terminates(
+            worker,
+            (doc_tx, buffer_tx, diag_rx, status_rx),
+            "nav_requests",
+        )
+        .await;
     }
 }

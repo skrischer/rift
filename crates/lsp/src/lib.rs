@@ -30,7 +30,7 @@ pub use async_lsp::ServerSocket;
 pub use document::{DocumentAction, DocumentChange, DocumentSink, DocumentSync};
 pub use error::LspError;
 pub use nav::{NavRequester, OwnedNavRequester, PositionEncoding};
-pub use registry::Registry;
+pub use registry::{Registry, ServerLifecycle};
 pub use selector::{DocumentSelector, ServerSpec};
 pub use server::{Server, ServerId};
 

@@ -15,7 +15,7 @@ pub use frame::{encode_frame, FrameDecoder, FrameError, MAX_FRAME_LEN};
 /// is wire-compatible in one direction. The message set is pinned by the
 /// fingerprint test beside `PROTOCOL_FINGERPRINT` below, so a message-set
 /// change without a bump cannot pass CI.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Pinned fingerprint of the protocol message set, checked by the
 /// `fingerprint_tests` module: an FNV-1a hash over the serde-visible surface
@@ -25,7 +25,7 @@ pub const PROTOCOL_VERSION: u32 = 3;
 /// [`PROTOCOL_VERSION`] above and re-pin this value (the failing test prints
 /// the new fingerprint).
 #[cfg(test)]
-const PROTOCOL_FINGERPRINT: u64 = 0x4a2b_82d3_7e3e_fad8;
+const PROTOCOL_FINGERPRINT: u64 = 0x6f9b_3c2c_bbe6_4577;
 
 /// Messages the client sends to the daemon.
 ///
@@ -364,13 +364,23 @@ pub enum DaemonMessage {
         cleared: Vec<String>,
     },
     /// Repo-level git state for the watched worktree, recomputed on `.git/`
-    /// changes (commit, branch switch, staging). `branch` is `None` when HEAD
+    /// changes (commit, branch switch, staging) and on a worktree change — the
+    /// line totals ride the same debounced git-status recompute as the rest
+    /// of this message, never a dedicated timer. `branch` is `None` when HEAD
     /// is detached; `ahead_behind` is `None` when the current branch has no
-    /// upstream. Produced and streamed by Phase 3.3, but not wired into the
-    /// statusbar by it (the #18 statusbar swap is a later step).
+    /// upstream. `lines_added`/`lines_removed` are the working-tree line
+    /// totals — `git diff HEAD --numstat` semantics (worktree content vs
+    /// HEAD, regardless of staging) plus untracked text file additions; a
+    /// rename with no content change contributes `0`/`0` (it diffs against
+    /// its rewrite source blob, not a nonexistent HEAD entry at the new
+    /// path). Both are `0` on a clean worktree. Produced and streamed by
+    /// Phase 3.3, but not wired into the statusbar by it (the #18 statusbar
+    /// swap is a later step).
     RepoState {
         branch: Option<String>,
         ahead_behind: Option<AheadBehind>,
+        lines_added: u32,
+        lines_removed: u32,
     },
     /// The complete current diagnostic set one language server reports for one
     /// file, replacing whatever that server last reported for it. Keyed by
@@ -390,6 +400,24 @@ pub enum DaemonMessage {
         path: String,
         server: String,
         items: Vec<Diagnostic>,
+    },
+    /// A language server's lifecycle transition, keyed by `server` — its
+    /// stable name (e.g. `"rust-analyzer"`), NOT the per-spawn server id
+    /// [`Diagnostics`](DaemonMessage::Diagnostics) keys by. A restart mints a
+    /// fresh internal id, but the status-line health dot asks "is my
+    /// rust-analyzer OK", which is name-scoped, not spawn-scoped. Emitted by
+    /// the daemon's LSP registry around its observe cycle: `starting` when a
+    /// (re)start is triggered, `running` once the server has completed its
+    /// `initialize` handshake, `crashed` once a dead instance is pruned
+    /// (detected on the next observe after the server exits) or a (re)start
+    /// attempt fails. There is no `stopped` state — a server the daemon has
+    /// observed is never deliberately stopped while a client is attached.
+    /// Push-only, and replayed once per known server behind
+    /// [`Welcome`](DaemonMessage::Welcome) so a (re)attaching client sees
+    /// current health without waiting for the next transition.
+    LspStatus {
+        server: String,
+        state: LspServerState,
     },
     /// The reply to a [`ClientMessage::OpenFile`]: the whole current UTF-8
     /// `content` of the file at `path` (relative to the worktree root) plus its
@@ -645,6 +673,23 @@ pub enum DiagnosticSeverity {
     Warning,
     Information,
     Hint,
+}
+
+/// A language server's lifecycle state, carried by
+/// [`DaemonMessage::LspStatus`]. No `Stopped` variant: a server the daemon
+/// has observed is never deliberately stopped while a client is attached —
+/// only started, running, or crashed (and possibly restarted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LspServerState {
+    /// A (re)start was just triggered; the `initialize` handshake has not
+    /// completed yet.
+    Starting,
+    /// The server is alive and has completed its `initialize` handshake.
+    Running,
+    /// The server's main loop ended (exit, crash, or a transport failure)
+    /// and it has not been restarted yet.
+    Crashed,
 }
 
 /// A half-open span within a file, from `start` (inclusive) to `end`
@@ -1383,28 +1428,99 @@ mod tests {
                 ahead: 2,
                 behind: 1,
             }),
+            lines_added: 12,
+            lines_removed: 3,
         };
         let json = serde_json::to_string(&on_branch).expect("serialize RepoState");
         assert!(json.contains(r#""type":"repo_state""#));
         assert!(json.contains(r#""branch":"main""#));
         assert!(json.contains(r#""ahead":2"#));
+        assert!(json.contains(r#""lines_added":12"#));
+        assert!(json.contains(r#""lines_removed":3"#));
         assert_eq!(
             serde_json::from_str::<DaemonMessage>(&json).expect("deserialize RepoState"),
             on_branch
         );
 
-        // Detached HEAD with no upstream: both fields are absent (`None`).
+        // Detached HEAD with no upstream and a clean worktree: both optional
+        // fields are absent (`None`) and the totals are both zero.
         let detached = DaemonMessage::RepoState {
             branch: None,
             ahead_behind: None,
+            lines_added: 0,
+            lines_removed: 0,
         };
         let json = serde_json::to_string(&detached).expect("serialize detached RepoState");
         assert!(json.contains(r#""branch":null"#));
         assert!(json.contains(r#""ahead_behind":null"#));
+        assert!(json.contains(r#""lines_added":0"#));
+        assert!(json.contains(r#""lines_removed":0"#));
         assert_eq!(
             serde_json::from_str::<DaemonMessage>(&json).expect("deserialize detached RepoState"),
             detached
         );
+    }
+
+    #[test]
+    fn test_repo_state_missing_line_totals_are_rejected() {
+        // The totals are non-optional plain `u32`s (always `0` on a clean
+        // worktree, never absent) — a `RepoState` frame missing either must
+        // not deserialize by silently defaulting to zero.
+        for json in [
+            r#"{"type":"repo_state","branch":null,"ahead_behind":null,"lines_removed":0}"#,
+            r#"{"type":"repo_state","branch":null,"ahead_behind":null,"lines_added":0}"#,
+            r#"{"type":"repo_state","branch":null,"ahead_behind":null,"lines_added":"1","lines_removed":0}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<DaemonMessage>(json).is_err(),
+                "malformed RepoState must not deserialize: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lsp_status_roundtrips_each_state() {
+        for state in [
+            LspServerState::Starting,
+            LspServerState::Running,
+            LspServerState::Crashed,
+        ] {
+            let msg = DaemonMessage::LspStatus {
+                server: "rust-analyzer".to_owned(),
+                state,
+            };
+            let json = serde_json::to_string(&msg).expect("serialize LspStatus");
+            assert!(json.contains(r#""type":"lsp_status""#));
+            assert!(json.contains(r#""server":"rust-analyzer""#));
+            assert_eq!(
+                serde_json::from_str::<DaemonMessage>(&json).expect("deserialize LspStatus"),
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_lsp_status_unknown_state_is_rejected() {
+        // An unrecognized state must fail loudly, not coerce to a known one —
+        // the same strict-enum discipline as `GitStatusCode`.
+        let json = r#"{"type":"lsp_status","server":"rust-analyzer","state":"stopped"}"#;
+        assert!(
+            serde_json::from_str::<DaemonMessage>(json).is_err(),
+            "an unknown LspServerState must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_lsp_status_missing_field_is_rejected() {
+        for json in [
+            r#"{"type":"lsp_status","state":"running"}"#,
+            r#"{"type":"lsp_status","server":"rust-analyzer"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<DaemonMessage>(json).is_err(),
+                "malformed LspStatus must not deserialize: {json}"
+            );
+        }
     }
 
     #[test]

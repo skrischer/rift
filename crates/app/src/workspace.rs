@@ -961,7 +961,10 @@ fn apply_worktree_message(tree: &mut FileTree, msg: DaemonMessage) {
         DaemonMessage::RepoState {
             branch,
             ahead_behind,
+            ..
         } => {
+            // `lines_added`/`lines_removed` (issue #520) are not yet consumed
+            // here — the composite status line reads them (issue #521).
             model.apply_repo_state(branch, ahead_behind);
         }
         DaemonMessage::Diagnostics {

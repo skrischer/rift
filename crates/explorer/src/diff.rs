@@ -80,24 +80,63 @@ pub enum FileDiff {
 pub fn compute(root: &Path, relative: &Path) -> Result<FileDiff> {
     let repo = gix::open(root)
         .map_err(|e| ExplorerError::GitError(format!("open {}: {e}", root.display())))?;
+    compute_in_repo(&repo, root, relative)
+}
 
-    let old_bytes = head_blob(&repo, relative)?;
-    let new_bytes = match std::fs::read(root.join(relative)) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => {
-            return Err(ExplorerError::GitError(format!(
-                "read {}: {e}",
-                relative.display()
-            )));
-        }
-    };
+/// Like [`compute`], but reuses an already-open `repo` instead of opening one
+/// per call — the worktree-status recompute (`git.rs`'s line totals) diffs
+/// every changed path in one pass and must not reopen the repository each
+/// time.
+pub(crate) fn compute_in_repo(
+    repo: &gix::Repository,
+    root: &Path,
+    relative: &Path,
+) -> Result<FileDiff> {
+    let old_bytes = head_blob(repo, relative)?;
+    let new_bytes = read_worktree(root, relative)?;
+    diff_bytes(&old_bytes, &new_bytes, relative)
+}
 
+/// Like [`compute_in_repo`], but diffs `relative`'s current worktree content
+/// against a specific blob `old_id` instead of the HEAD blob at `relative`'s
+/// own path. A rename's destination path has no HEAD-tree entry (the path is
+/// new to HEAD), but the rewrite that produced it carries the *source*
+/// blob's id (`git.rs`'s `Change::Rewrite::source_id`) — diffing against that
+/// instead means a pure rename (identical content) yields no hunks, rather
+/// than a full add against an empty old side.
+pub(crate) fn compute_rewrite(
+    repo: &gix::Repository,
+    root: &Path,
+    old_id: gix::ObjectId,
+    relative: &Path,
+) -> Result<FileDiff> {
+    let old_bytes = blob_bytes(repo, old_id, relative)?;
+    let new_bytes = read_worktree(root, relative)?;
+    diff_bytes(&old_bytes, &new_bytes, relative)
+}
+
+/// Read `relative`'s current worktree content under `root`, or empty when the
+/// path is absent (a deleted file diffs to empty on the new side).
+fn read_worktree(root: &Path, relative: &Path) -> Result<Vec<u8>> {
+    match std::fs::read(root.join(relative)) {
+        Ok(bytes) => Ok(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(ExplorerError::GitError(format!(
+            "read {}: {e}",
+            relative.display()
+        ))),
+    }
+}
+
+/// Diff two byte buffers into a [`FileDiff`], applying the size/binary
+/// sentinels before attempting a line diff. `relative` is used only for error
+/// messages.
+fn diff_bytes(old_bytes: &[u8], new_bytes: &[u8], relative: &Path) -> Result<FileDiff> {
     if old_bytes.len().max(new_bytes.len()) > MAX_SIDE_BYTES {
         return Ok(FileDiff::TooLarge);
     }
 
-    let (Some(old_text), Some(new_text)) = (as_text(&old_bytes), as_text(&new_bytes)) else {
+    let (Some(old_text), Some(new_text)) = (as_text(old_bytes), as_text(new_bytes)) else {
         return Ok(FileDiff::Binary);
     };
 
@@ -144,6 +183,22 @@ fn head_blob(repo: &gix::Repository, relative: &Path) -> Result<Vec<u8>> {
         .try_into_blob()
         .map_err(|e| {
             ExplorerError::GitError(format!("{} is not a blob: {e}", relative.display()))
+        })?;
+    Ok(blob.take_data())
+}
+
+/// Read a specific blob's content by id — used by [`compute_rewrite`] to read
+/// a rename's source content, which lives at a different path (or no longer
+/// exists at any path) than the one being diffed.
+fn blob_bytes(repo: &gix::Repository, id: gix::ObjectId, relative: &Path) -> Result<Vec<u8>> {
+    let mut blob = repo
+        .find_object(id)
+        .map_err(|e| {
+            ExplorerError::GitError(format!("read blob {id} ({}): {e}", relative.display()))
+        })?
+        .try_into_blob()
+        .map_err(|e| {
+            ExplorerError::GitError(format!("{id} ({}) is not a blob: {e}", relative.display()))
         })?;
     Ok(blob.take_data())
 }
@@ -395,5 +450,87 @@ mod tests {
         let hunks = only_hunks(compute(&tmp.path, Path::new("only.txt")).expect("compute"));
         assert_eq!(hunks.len(), 1);
         assert_eq!(hunks[0].old_len, 0);
+    }
+
+    /// The blob id of `relative` at HEAD, via `git rev-parse` — ground truth
+    /// for the [`compute_rewrite`] tests, which need a real object id to diff
+    /// against.
+    fn head_blob_id(repo_root: &Path, relative: &str) -> gix::ObjectId {
+        let output = Command::new("git")
+            .args(["rev-parse", &format!("HEAD:{relative}")])
+            .current_dir(repo_root)
+            .output()
+            .expect("run git rev-parse");
+        assert!(
+            output.status.success(),
+            "rev-parse {relative} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let hex = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        gix::ObjectId::from_hex(hex.as_bytes()).expect("parse blob id")
+    }
+
+    #[test]
+    fn test_compute_in_repo_reuses_open_repo_matches_compute() {
+        let repo = init_repo("in-repo");
+        write(&repo.path.join("tracked.txt"), b"one\nTWO\nthree\n");
+
+        let open = gix::open(&repo.path).expect("open repo");
+        let hunks = only_hunks(
+            compute_in_repo(&open, &repo.path, Path::new("tracked.txt")).expect("compute"),
+        );
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].lines[1].content, "two");
+    }
+
+    #[test]
+    fn test_compute_rewrite_pure_rename_yields_no_hunks() {
+        // A rename with identical content: diffing the new path's worktree
+        // content against the rewrite's *source* blob must yield no hunks —
+        // diffing against the (nonexistent) HEAD entry at the new path would
+        // instead show a full add.
+        let repo = init_repo("rewrite-pure");
+        let source_id = head_blob_id(&repo.path, "tracked.txt");
+        std::fs::rename(repo.path.join("tracked.txt"), repo.path.join("renamed.txt"))
+            .expect("rename on disk");
+
+        let open = gix::open(&repo.path).expect("open repo");
+        let hunks = only_hunks(
+            compute_rewrite(&open, &repo.path, source_id, Path::new("renamed.txt"))
+                .expect("compute"),
+        );
+        assert!(hunks.is_empty(), "a pure rename must yield no hunks");
+    }
+
+    #[test]
+    fn test_compute_rewrite_renamed_and_edited_yields_only_the_content_diff() {
+        // A rename plus a content edit: the diff must reflect only the edit,
+        // not a full add — proving the source blob (not empty) is the old side.
+        let repo = init_repo("rewrite-edited");
+        let source_id = head_blob_id(&repo.path, "tracked.txt");
+        std::fs::rename(repo.path.join("tracked.txt"), repo.path.join("renamed.txt"))
+            .expect("rename on disk");
+        write(&repo.path.join("renamed.txt"), b"one\nTWO\nthree\n");
+
+        let open = gix::open(&repo.path).expect("open repo");
+        let hunks = only_hunks(
+            compute_rewrite(&open, &repo.path, source_id, Path::new("renamed.txt"))
+                .expect("compute"),
+        );
+        assert_eq!(hunks.len(), 1);
+        let lines: Vec<(DiffLineKind, &str)> = hunks[0]
+            .lines
+            .iter()
+            .map(|l| (l.kind, l.content.as_str()))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                (DiffLineKind::Context, "one"),
+                (DiffLineKind::Remove, "two"),
+                (DiffLineKind::Add, "TWO"),
+                (DiffLineKind::Context, "three"),
+            ]
+        );
     }
 }

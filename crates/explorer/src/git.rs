@@ -53,13 +53,23 @@ pub struct AheadBehind {
     pub behind: u32,
 }
 
-/// Repo-level git state: the current branch (None when HEAD is detached) and
+/// Repo-level git state: the current branch (None when HEAD is detached),
 /// ahead/behind vs the upstream (None when the branch has no upstream or its
-/// tip cannot be resolved, e.g. an unborn branch).
+/// tip cannot be resolved, e.g. an unborn branch), and the working-tree line
+/// totals.
+///
+/// `lines_added`/`lines_removed` mirror `git diff HEAD --numstat`: current
+/// worktree content vs `HEAD`, regardless of staging, summed across every
+/// non-clean path plus untracked text files. A rename diffs against its
+/// rewrite *source* blob rather than the nonexistent `HEAD` entry at the new
+/// path, so a pure rename contributes `0`/`0` — see [`GitStatus::compute`].
+/// Both are `0` on a clean worktree.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RepoState {
     pub branch: Option<String>,
     pub ahead_behind: Option<AheadBehind>,
+    pub lines_added: u32,
+    pub lines_removed: u32,
 }
 
 /// A point-in-time git status for a worktree: per-path porcelain status plus
@@ -81,6 +91,11 @@ impl GitStatus {
             .map_err(|e| ExplorerError::GitError(format!("open {}: {e}", root.display())))?;
 
         let mut entries: BTreeMap<PathBuf, GitEntryStatus> = BTreeMap::new();
+        // Destination path -> rewrite source blob id, captured alongside
+        // `entries` so the line-totals pass can diff a rename against its
+        // actual source content instead of the (nonexistent) HEAD entry at
+        // the new path.
+        let mut rename_sources: BTreeMap<PathBuf, gix::ObjectId> = BTreeMap::new();
 
         let iter = repo
             .status(gix::progress::Discard)
@@ -96,7 +111,10 @@ impl GitStatus {
             match item {
                 // HEAD-tree vs index: the staged (index) side.
                 gix::status::Item::TreeIndex(change) => {
-                    let (path, code) = tree_index_status(&change);
+                    let (path, code, source_id) = tree_index_status(&change);
+                    if let Some(source_id) = source_id {
+                        rename_sources.insert(path.clone(), source_id);
+                    }
                     entries.entry(path).or_default().index = code;
                 }
                 // Index vs worktree: the unstaged (worktree) side, plus untracked.
@@ -124,7 +142,8 @@ impl GitStatus {
             }
         }
 
-        let repo = repo_state(&repo);
+        let (lines_added, lines_removed) = line_totals(&repo, root, &entries, &rename_sources);
+        let repo = repo_state(&repo, lines_added, lines_removed);
         Ok(Self { entries, repo })
     }
 
@@ -162,21 +181,42 @@ fn bstr_to_path(bytes: &gix::bstr::BStr) -> PathBuf {
 }
 
 /// Map a HEAD-tree<->index change (the staged side) to a path + status code.
-fn tree_index_status(change: &gix::diff::index::Change) -> (PathBuf, GitStatusCode) {
+///
+/// Also returns the rewrite's source blob id for a rename/copy — `None` for
+/// every other change kind — so the caller can key [`line_totals`]'s diff
+/// against the actual source content rather than the (nonexistent) HEAD
+/// entry at the new path.
+fn tree_index_status(
+    change: &gix::diff::index::Change,
+) -> (PathBuf, GitStatusCode, Option<gix::ObjectId>) {
     use gix::diff::index::Change;
-    let code = match change {
-        Change::Addition { .. } => GitStatusCode::Added,
-        Change::Deletion { .. } => GitStatusCode::Deleted,
-        Change::Modification { .. } => GitStatusCode::Modified,
-        Change::Rewrite { copy, .. } => {
-            if *copy {
+    match change {
+        Change::Addition { .. } => (bstr_to_path(change.location()), GitStatusCode::Added, None),
+        Change::Deletion { .. } => (
+            bstr_to_path(change.location()),
+            GitStatusCode::Deleted,
+            None,
+        ),
+        Change::Modification { .. } => (
+            bstr_to_path(change.location()),
+            GitStatusCode::Modified,
+            None,
+        ),
+        Change::Rewrite {
+            source_id, copy, ..
+        } => {
+            let code = if *copy {
                 GitStatusCode::Copied
             } else {
                 GitStatusCode::Renamed
-            }
+            };
+            (
+                bstr_to_path(change.location()),
+                code,
+                Some(source_id.clone().into_owned()),
+            )
         }
-    };
-    (bstr_to_path(change.location()), code)
+    }
 }
 
 /// Map an index-vs-worktree item (the unstaged side, plus untracked files) to a
@@ -235,11 +275,12 @@ fn index_worktree_status(
     }
 }
 
-/// Read the repo-level state: branch short name (None when detached) and
+/// Read the repo-level state: branch short name (None when detached),
 /// ahead/behind vs the upstream (None when there is no upstream or the tip
-/// cannot be resolved). Best-effort — a failure to resolve ahead/behind yields
-/// `None` rather than failing the whole status.
-fn repo_state(repo: &gix::Repository) -> RepoState {
+/// cannot be resolved), and the already-computed working-tree line totals.
+/// Best-effort — a failure to resolve ahead/behind yields `None` rather than
+/// failing the whole status.
+fn repo_state(repo: &gix::Repository, lines_added: u32, lines_removed: u32) -> RepoState {
     let branch = repo
         .head_name()
         .ok()
@@ -249,6 +290,8 @@ fn repo_state(repo: &gix::Repository) -> RepoState {
     RepoState {
         branch,
         ahead_behind: ahead_behind(repo),
+        lines_added,
+        lines_removed,
     }
 }
 
@@ -282,6 +325,52 @@ fn ahead_behind(repo: &gix::Repository) -> Option<AheadBehind> {
         ahead: count(local_id, upstream_id)?,
         behind: count(upstream_id, local_id)?,
     })
+}
+
+/// Sum `git diff HEAD --numstat`-equivalent added/removed line counts across
+/// every path in `entries` — every tracked modified/deleted/renamed file plus
+/// every untracked text file, i.e. exactly the paths the porcelain scan above
+/// already found non-clean. Each path diffs its current worktree content
+/// against `HEAD`, regardless of staging state (matching `crate::diff::compute`'s
+/// worktree-vs-HEAD semantics); a path in `rename_sources` diffs against that
+/// rewrite's *source* blob instead, so a pure rename contributes `0`/`0`
+/// rather than a full add against the (nonexistent) HEAD entry at its new
+/// path.
+///
+/// Mirrors `diff`'s own per-file caps and binary skip (`MAX_SIDE_BYTES`,
+/// `MAX_CHANGED_LINES`, the NUL-byte binary sniff): a file that hits either
+/// sentinel, or fails to read, contributes nothing rather than aborting the
+/// whole total — a single oversized or unreadable file must never blank the
+/// status line's totals.
+fn line_totals(
+    repo: &gix::Repository,
+    root: &Path,
+    entries: &BTreeMap<PathBuf, GitEntryStatus>,
+    rename_sources: &BTreeMap<PathBuf, gix::ObjectId>,
+) -> (u32, u32) {
+    let mut added = 0u32;
+    let mut removed = 0u32;
+    for path in entries.keys() {
+        let diff = match rename_sources.get(path) {
+            Some(&source_id) => crate::diff::compute_rewrite(repo, root, source_id, path),
+            None => crate::diff::compute_in_repo(repo, root, path),
+        };
+        let Ok(crate::FileDiff::Hunks(hunks)) = diff else {
+            // Binary, too-large, or a read/object error: contribute nothing
+            // rather than fail the whole recompute.
+            continue;
+        };
+        for hunk in &hunks {
+            for line in &hunk.lines {
+                match line.kind {
+                    crate::DiffLineKind::Add => added += 1,
+                    crate::DiffLineKind::Remove => removed += 1,
+                    crate::DiffLineKind::Context => {}
+                }
+            }
+        }
+    }
+    (added, removed)
 }
 
 #[cfg(test)]
@@ -542,5 +631,118 @@ mod tests {
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         assert_eq!(ours, listed, "status key set must match git porcelain");
+    }
+
+    // --- working-tree line totals (`RepoState.lines_added`/`lines_removed`) ---
+
+    /// Sum `git diff HEAD --numstat`'s added/removed columns — ground truth
+    /// for the line-totals tests below. `git diff HEAD` covers tracked
+    /// modifications/deletions and staged additions, but NEVER untracked
+    /// files — matching `RepoState`'s totals exactly on a fixture with no
+    /// untracked paths.
+    fn numstat_totals(repo_root: &Path) -> (u32, u32) {
+        let output = Command::new("git")
+            .args(["diff", "HEAD", "--numstat"])
+            .current_dir(repo_root)
+            .output()
+            .expect("run git diff --numstat");
+        assert!(
+            output.status.success(),
+            "git diff --numstat failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut added = 0u32;
+        let mut removed = 0u32;
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let mut fields = line.split_whitespace();
+            added += fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
+            removed += fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
+        }
+        (added, removed)
+    }
+
+    #[test]
+    fn test_line_totals_match_git_diff_numstat_for_tracked_changes() {
+        // Only tracked changes (no untracked paths), so the totals must match
+        // `git diff HEAD --numstat` exactly: an unstaged modification, a
+        // staged new file, and a committed-then-deleted file.
+        let repo = init_repo("numstat");
+        write(&repo.path.join("tracked.txt"), "v2\nextra\n");
+        write(&repo.path.join("added.txt"), "one\ntwo\nthree\n");
+        git(&repo.path, &["add", "added.txt"]);
+        write(&repo.path.join("doomed.txt"), "bye\n");
+        git(&repo.path, &["add", "doomed.txt"]);
+        git(&repo.path, &["commit", "-q", "-m", "add doomed"]);
+        std::fs::remove_file(repo.path.join("doomed.txt")).expect("remove doomed.txt");
+
+        let status = GitStatus::compute(&repo.path).expect("compute");
+        let (expected_added, expected_removed) = numstat_totals(&repo.path);
+        assert!(
+            expected_added > 0 && expected_removed > 0,
+            "fixture assumption: both sides of the diff are non-empty"
+        );
+        assert_eq!(status.repo().lines_added, expected_added);
+        assert_eq!(status.repo().lines_removed, expected_removed);
+    }
+
+    #[test]
+    fn test_line_totals_count_untracked_text_file_additions() {
+        // `git diff HEAD --numstat` never reports an untracked file, but the
+        // status-line totals must — the spec's "numstat + untracked
+        // additions" semantics.
+        let repo = init_repo("untracked-totals");
+        write(&repo.path.join("loose.txt"), "a\nb\nc\n");
+
+        let status = GitStatus::compute(&repo.path).expect("compute");
+        assert_eq!(status.repo().lines_added, 3);
+        assert_eq!(status.repo().lines_removed, 0);
+    }
+
+    #[test]
+    fn test_line_totals_pure_rename_contributes_zero() {
+        // A rename with no content change must contribute 0/0: diffing
+        // against the (nonexistent) HEAD entry at the new path would
+        // otherwise show a full-file add. `diff.renames` is pinned locally so
+        // the rewrite detection this asserts on does not depend on the
+        // environment's global git config.
+        let repo = init_repo("rename-pure");
+        git(&repo.path, &["config", "diff.renames", "true"]);
+        git(&repo.path, &["mv", "tracked.txt", "renamed.txt"]);
+
+        let status = GitStatus::compute(&repo.path).expect("compute");
+        assert_eq!(
+            status_of(&status, "renamed.txt").map(|s| s.index),
+            Some(GitStatusCode::Renamed),
+            "fixture assumption: git mv is detected as a rename"
+        );
+        assert_eq!(status.repo().lines_added, 0);
+        assert_eq!(status.repo().lines_removed, 0);
+    }
+
+    #[test]
+    fn test_line_totals_renamed_and_edited_counts_only_the_edit() {
+        // A rename plus a content edit must count only the edit — proving the
+        // diff runs against the rewrite's source blob, not an empty old side.
+        let repo = init_repo("rename-edit");
+        git(&repo.path, &["config", "diff.renames", "true"]);
+        git(&repo.path, &["mv", "tracked.txt", "renamed.txt"]);
+        write(&repo.path.join("renamed.txt"), "v2\n");
+
+        let status = GitStatus::compute(&repo.path).expect("compute");
+        assert_eq!(
+            status_of(&status, "renamed.txt").map(|s| s.index),
+            Some(GitStatusCode::Renamed),
+            "fixture assumption: git mv is detected as a rename"
+        );
+        assert_eq!(status.repo().lines_added, 1);
+        assert_eq!(status.repo().lines_removed, 1);
+    }
+
+    #[test]
+    fn test_line_totals_clean_repo_is_zero() {
+        let repo = init_repo("totals-clean");
+        let status = GitStatus::compute(&repo.path).expect("compute");
+        assert_eq!(status.repo().lines_added, 0);
+        assert_eq!(status.repo().lines_removed, 0);
     }
 }

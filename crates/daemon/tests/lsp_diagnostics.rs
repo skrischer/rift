@@ -23,7 +23,7 @@ use std::time::Duration;
 use rift_daemon::{channels, DiagnosticKey, Handles};
 use rift_lsp::selector::ServerSpec;
 use rift_lsp::DocumentSelector;
-use rift_protocol::{ClientMessage, DaemonMessage, DiagnosticSeverity};
+use rift_protocol::{ClientMessage, DaemonMessage, DiagnosticSeverity, LspServerState};
 use tokio::sync::broadcast;
 
 /// The marker that makes the (single / type-checker) stub publish a diagnostic.
@@ -247,6 +247,71 @@ async fn write_until_diagnostics<T>(
     .expect("expected a Diagnostics event within the timeout")
 }
 
+/// Receive `LspStatus` events until `pick` yields (issue #520), the
+/// lifecycle-health analogue of `recv_diagnostics_until`.
+async fn recv_lsp_status_until<T>(
+    events: &mut broadcast::Receiver<DaemonMessage>,
+    mut pick: impl FnMut(String, LspServerState) -> Option<T>,
+) -> T {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match events.recv().await {
+                Ok(DaemonMessage::LspStatus { server, state }) => {
+                    if let Some(found) = pick(server, state) {
+                        return found;
+                    }
+                }
+                Ok(_) => continue,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => panic!("event bus closed early"),
+            }
+        }
+    })
+    .await
+    .expect("expected an LspStatus event within the timeout")
+}
+
+/// Repeatedly rewrite `relative` under `root` with `content(revision)` while
+/// waiting for an `LspStatus` event `pick` accepts — the lifecycle-health
+/// analogue of `write_until_diagnostics`, needed for the same reason: a quick
+/// write can collapse before the server processes it.
+async fn write_until_lsp_status<T>(
+    root: &Path,
+    relative: &str,
+    events: &mut broadcast::Receiver<DaemonMessage>,
+    content: impl Fn(u32) -> String,
+    mut pick: impl FnMut(String, LspServerState) -> Option<T>,
+) -> T {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut revision = 0u32;
+        loop {
+            revision += 1;
+            write_file(root, relative, &content(revision));
+            let slice = tokio::time::sleep(Duration::from_secs(2));
+            tokio::pin!(slice);
+            loop {
+                tokio::select! {
+                    _ = &mut slice => break,
+                    msg = events.recv() => match msg {
+                        Ok(DaemonMessage::LspStatus { server, state }) => {
+                            if let Some(found) = pick(server, state) {
+                                return found;
+                            }
+                        }
+                        Ok(_) => continue,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            panic!("event bus closed early")
+                        }
+                    },
+                }
+            }
+        }
+    })
+    .await
+    .expect("expected an LspStatus event within the timeout")
+}
+
 #[tokio::test]
 async fn test_error_introduced_then_fixed_converges() {
     stage_stub_on_path();
@@ -363,6 +428,95 @@ async fn test_server_crash_and_restart_clears_previous_instance_diagnostics() {
     assert_ne!(
         server, "0",
         "the restarted server publishes under a fresh id"
+    );
+
+    drop(handles);
+    drop(events);
+    loop_handle.await.expect("dispatch loop joins");
+}
+
+#[tokio::test]
+async fn test_lsp_status_crash_then_restart_flips_health_dot() {
+    // Acceptance (issue #520): killing the language server yields `crashed`
+    // on the next observe; a restart yields `running` — no app restart.
+    // `LspStatus` is keyed by the server's stable *name* (the stub binary),
+    // unlike `Diagnostics`, which the sibling crash+restart test keys by the
+    // per-spawn id.
+    stage_stub_on_path();
+    let tmp = TempDir::new("status-crash-restart");
+
+    let (mut daemon, handles) = channels(256, 16);
+    daemon.watch_worktree(tmp.path.clone());
+    daemon.watch_lsp(
+        tmp.path.clone(),
+        DocumentSelector::with_table(CRASHING_SERVER),
+    );
+    let mut events = handles.subscribe();
+    let loop_handle = tokio::spawn(daemon.run());
+    wait_for_scan(&handles).await;
+
+    // First start: `starting` then `running` for the stub's stable name.
+    write_file(
+        &tmp.path,
+        "app.rs",
+        &format!("fn main() {{}} // {ERROR_MARKER}"),
+    );
+    recv_lsp_status_until(&mut events, |server, state| {
+        (server == "stub_lsp_server" && state == LspServerState::Running).then_some(())
+    })
+    .await;
+    assert_eq!(
+        handles
+            .state
+            .borrow()
+            .lsp_status
+            .get("stub_lsp_server")
+            .copied(),
+        Some(LspServerState::Running)
+    );
+
+    // Crash it, then drive changes (still crash-marked) until the daemon
+    // observes the death and flips the name-keyed health to `crashed`.
+    write_until_lsp_status(
+        &tmp.path,
+        "app.rs",
+        &mut events,
+        |revision| format!("fn main() {{}} // {CRASH_MARKER} rev {revision}"),
+        |server, state| {
+            (server == "stub_lsp_server" && state == LspServerState::Crashed).then_some(())
+        },
+    )
+    .await;
+    assert_eq!(
+        handles
+            .state
+            .borrow()
+            .lsp_status
+            .get("stub_lsp_server")
+            .copied(),
+        Some(LspServerState::Crashed)
+    );
+
+    // A later change without the crash marker restarts it: health flips back
+    // to `running` — no app restart needed.
+    write_until_lsp_status(
+        &tmp.path,
+        "app.rs",
+        &mut events,
+        |revision| format!("fn main() {{}} // {ERROR_MARKER} rev {revision}"),
+        |server, state| {
+            (server == "stub_lsp_server" && state == LspServerState::Running).then_some(())
+        },
+    )
+    .await;
+    assert_eq!(
+        handles
+            .state
+            .borrow()
+            .lsp_status
+            .get("stub_lsp_server")
+            .copied(),
+        Some(LspServerState::Running)
     );
 
     drop(handles);
