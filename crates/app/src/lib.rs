@@ -18,6 +18,7 @@ pub mod file_tree;
 pub mod outline_panel;
 pub mod problems_panel;
 pub mod recents;
+pub mod results_panel;
 pub mod settings;
 pub mod source_control;
 pub mod status_bar;
