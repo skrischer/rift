@@ -38,7 +38,7 @@
 
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// Why a buffer read or write was refused.
 ///
@@ -141,11 +141,25 @@ pub async fn read_file(root: &Path, path: &str) -> Result<(String, SystemTime), 
     Ok((content, mtime))
 }
 
+/// Cross-platform `mtime` tolerance for the conflict check. The `base_mtime` a
+/// client hands back has round-tripped through the client's own
+/// `std::time::SystemTime`, and some platforms carry coarser precision than the
+/// daemon's Linux filesystem: Windows `SystemTime` is FILETIME-backed (100 ns
+/// granularity), so the base returns a few hundred nanoseconds *older* than the
+/// file's true on-disk `mtime` even when nothing changed — which made
+/// `disk_mtime > base_mtime` fire on every save of every file (a Windows-only
+/// regression CI's Linux-only tests never reproduced). Treat the file as
+/// unchanged unless the on-disk `mtime` is newer than the base by more than
+/// this. Real external writes are milliseconds+ apart, so a 1 µs floor never
+/// masks a genuine conflict while absorbing the ≤100 ns round-trip loss.
+const CONFLICT_MTIME_TOLERANCE: Duration = Duration::from_micros(1);
+
 /// Write `content` to the file at `rel_path` (relative to `root`) atomically,
 /// guarding against a concurrent change.
 ///
-/// If the on-disk `mtime` is newer than `base_mtime` the file changed under the
-/// editor: the write is rejected and the file left untouched, returning
+/// If the on-disk `mtime` is newer than `base_mtime` (beyond
+/// [`CONFLICT_MTIME_TOLERANCE`]) the file changed under the editor: the write is
+/// rejected and the file left untouched, returning
 /// [`SaveOutcome::Conflict`] with the current on-disk `mtime`. Otherwise the
 /// content is written to a temp file in the target's own directory and renamed
 /// over the target (atomic on a single filesystem), returning
@@ -163,11 +177,12 @@ pub async fn write_file(
     let resolved = resolve(root, rel_path)?;
 
     // Conflict check: compare the base the editor read against the current
-    // on-disk mtime. A file that vanished since the open (NotFound) is no
-    // conflict — the save recreates it. Any other stat error is surfaced.
+    // on-disk mtime, tolerating the client's cross-platform mtime precision loss
+    // (CONFLICT_MTIME_TOLERANCE). A file that vanished since the open (NotFound)
+    // is no conflict — the save recreates it. Any other stat error is surfaced.
     match mtime_of(&resolved, rel_path).await {
         Ok(disk_mtime) => {
-            if disk_mtime > base_mtime {
+            if disk_mtime > base_mtime + CONFLICT_MTIME_TOLERANCE {
                 // Newer on disk than the editor's base: reject, do not clobber.
                 return Ok(SaveOutcome::Conflict(disk_mtime));
             }
@@ -537,6 +552,46 @@ mod tests {
             std::fs::read(&file).expect("read back"),
             agent_content,
             "a stale-base save must not clobber the newer on-disk file"
+        );
+    }
+
+    /// The Windows round-trip regression: a client's `base_mtime` comes back a
+    /// few hundred nanoseconds *older* than the true on-disk mtime (FILETIME's
+    /// 100 ns granularity) with no real change. A difference within
+    /// `CONFLICT_MTIME_TOLERANCE` must NOT conflict (or every Windows save is
+    /// falsely rejected); a difference beyond it still must.
+    #[tokio::test]
+    async fn test_write_file_mtime_tolerance_absorbs_client_precision_loss() {
+        let tmp = TempDir::new("write-precision");
+        let file = tmp.path.join("f.rs");
+        write_disk(&file, b"v1\n");
+
+        // Within tolerance (500 ns older base, no real change): must SAVE.
+        let disk = std::fs::metadata(&file)
+            .expect("stat")
+            .modified()
+            .expect("mtime");
+        let base_within = disk - Duration::from_nanos(500);
+        let outcome = write_file(&tmp.path, "f.rs", "v2\n", base_within)
+            .await
+            .expect("save returns an outcome");
+        assert!(
+            matches!(outcome, SaveOutcome::Saved(_)),
+            "a base within the mtime tolerance must save, not conflict: {outcome:?}"
+        );
+
+        // Beyond tolerance (1 ms older base): a genuine external change — CONFLICT.
+        let disk2 = std::fs::metadata(&file)
+            .expect("stat")
+            .modified()
+            .expect("mtime");
+        let base_beyond = disk2 - Duration::from_millis(1);
+        let outcome = write_file(&tmp.path, "f.rs", "v3\n", base_beyond)
+            .await
+            .expect("save returns an outcome");
+        assert!(
+            matches!(outcome, SaveOutcome::Conflict(_)),
+            "a base older than the tolerance must conflict: {outcome:?}"
         );
     }
 
