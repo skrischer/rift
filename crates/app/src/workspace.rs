@@ -985,20 +985,29 @@ impl Focusable for WorkspaceView {
 
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // The custom title bar (#511, `docs/spec-cockpit-chrome.md`): the
+        // The custom title bar (#511/#512, `docs/spec-cockpit-chrome.md`): the
         // connection group reads the live `SessionView` fields the terminal
-        // crate's own statusbar shows, so the two never disagree. The
-        // settings gear dispatches through the same `open_settings` path as
-        // the `OpenSettings` action below.
+        // crate's own statusbar shows, so the two never disagree, and hosts
+        // the session-switcher popover itself (relocated from the interim
+        // statusbar anchor) once a live session names it. The settings gear
+        // dispatches through the same `open_settings` path as the
+        // `OpenSettings` action below.
         let connection = {
-            let session = self.session_view.read(cx);
-            let (_, dot_color) = session.connection_status().status_dot(cx);
-            let label = SharedString::from(format!(
-                "{} \u{b7} session {}",
-                session.ssh_label(),
-                session.session_name()
-            ));
-            title_bar::ConnectionGroup { dot_color, label }
+            let (dot_color, ssh_label, has_session) = {
+                let session = self.session_view.read(cx);
+                let (_, dot_color) = session.connection_status().status_dot(cx);
+                (
+                    dot_color,
+                    SharedString::from(session.ssh_label().to_string()),
+                    !session.session_name().is_empty(),
+                )
+            };
+            let switcher = has_session.then(|| {
+                self.session_view.update(cx, |session, cx| {
+                    session.render_session_switcher(cx).into_any_element()
+                })
+            });
+            title_bar::ConnectionGroup::connected(dot_color, ssh_label, switcher)
         };
         let settings_button = Button::new("title-bar-settings")
             .ghost()

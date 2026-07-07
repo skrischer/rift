@@ -286,9 +286,9 @@ pub struct SessionView {
     /// unprompted churn-driven push). The ACTUAL attached session is NOT read
     /// from here — `session_name` (fed by the layout stream) owns that.
     sessions: Vec<SessionListItem>,
-    /// Whether the session-switcher popover (anchored to the statusbar session
-    /// label) is open. Controlled state, so the command palette can open the
-    /// same switcher programmatically.
+    /// Whether the session-switcher popover (anchored to the title bar's
+    /// connection group, #512) is open. Controlled state, so the command
+    /// palette can open the same switcher programmatically.
     switcher_open: bool,
     /// The switcher footer's in-progress new-session prompt, when active.
     new_session_prompt: Option<NewSessionPrompt>,
@@ -1162,17 +1162,20 @@ impl SessionView {
         handle.into_any_element()
     }
 
-    /// The statusbar session label wrapped in the session-switcher popover
-    /// (`docs/spec-session-switch.md`, interim placement until the phase-21
-    /// custom title bar relocates the indicator group). The trigger is the
-    /// session name (ghost button); the popover lists every host session —
-    /// mono name, "N windows" muted caption, a fixed attached-dot lane — with
-    /// the current session marked by a 2px primary left bar on a surface
-    /// background, and a "+ New session..." footer. All colors are theme
-    /// tokens. Controlled open state, so the command palette opens the same
-    /// switcher; the popover's own toggle/dismiss paths sync back through
-    /// [`Self::set_switcher_open`].
-    fn render_session_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The session-switcher popover trigger + content (`docs/spec-session-switch.md`),
+    /// anchored to the title bar's connection group (#512,
+    /// `docs/spec-cockpit-chrome.md`) — `app::workspace::WorkspaceView` embeds
+    /// this via `title_bar::ConnectionGroup::connected`, so the popover lives
+    /// beside the plain `user@host` label rather than the statusbar, which
+    /// now shows a plain (non-interactive) session name. The trigger reads
+    /// "session <name>" (ghost button); the popover lists every host
+    /// session — mono name, "N windows" muted caption, a fixed attached-dot
+    /// lane — with the current session marked by a 2px primary left bar on a
+    /// surface background, and a "+ New session..." footer. All colors are
+    /// theme tokens. Controlled open state, so the command palette opens the
+    /// same switcher; the popover's own toggle/dismiss paths sync back
+    /// through [`Self::set_switcher_open`].
+    pub fn render_session_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
         let current = self.session_name.clone();
         // The live host list; before the first reply (or on the legacy tmux
@@ -1190,12 +1193,15 @@ impl SessionView {
 
         let on_open_entity = entity.clone();
         Popover::new("session-switcher")
-            .anchor(Anchor::BottomLeft)
+            // Top-anchored: the trigger now lives in the title bar (top of
+            // the window, #512), so the popover opens downward beneath it —
+            // the inverse of the interim statusbar's `Anchor::BottomLeft`.
+            .anchor(Anchor::TopLeft)
             .trigger(
                 Button::new("session-switcher-trigger")
                     .ghost()
                     .xsmall()
-                    .label(current.clone()),
+                    .label(SharedString::from(format!("session {current}"))),
             )
             .open(self.switcher_open)
             .on_open_change(move |open, _window, cx| {
@@ -1800,12 +1806,11 @@ impl Render for SessionView {
                             .child(div().size(px(8.0)).rounded_full().bg(status_color))
                             .child(SharedString::from(status_label)),
                     )
-                    // Session label doubles as the session-switcher trigger
-                    // (`docs/spec-session-switch.md`, interim statusbar
-                    // placement until the phase-21 title bar).
-                    .children(
-                        (!self.session_name.is_empty()).then(|| self.render_session_switcher(cx)),
-                    )
+                    // Plain session name — the switcher popover itself now
+                    // anchors to the title bar's connection group (#512,
+                    // `docs/spec-cockpit-chrome.md`); the statusbar keeps a
+                    // non-interactive label.
+                    .children((!self.session_name.is_empty()).then(|| self.session_name.clone()))
                     .child(self.ssh_label.clone())
                     .children((!cwd.is_empty()).then(|| SharedString::from(cwd.clone()))),
             )
