@@ -627,8 +627,13 @@ impl WorkspaceView {
         // git status — the existing client git-status model, not a re-derived
         // copy (`docs/spec-source-control.md`).
         let source_control =
-            cx.new(|cx| SourceControlPanel::new(file_tree.clone(), git_op_tx, window, cx));
-        let diff_view = cx.new(|cx| DiffView::new(request_diff_tx, cx));
+            cx.new(|cx| SourceControlPanel::new(file_tree.clone(), git_op_tx.clone(), window, cx));
+        // The diff header's `+ Stage hunk` button (#547) shares the same
+        // git-op channel the source-control panel's stage/unstage/discard
+        // actions use, and its Split|Unified toggle persists into the same
+        // window-state file the workspace itself restores from.
+        let diff_view =
+            cx.new(|cx| DiffView::new(request_diff_tx, git_op_tx, window_state_path.clone(), cx));
         let problems_panel = cx.new(|cx| ProblemsPanel::new(file_tree.clone(), cx));
         // Reads (never mutates) the editor's active-tab document-symbol cache
         // (`docs/spec-editor-chrome.md`, #530) — the same cache the

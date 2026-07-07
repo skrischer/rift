@@ -19,11 +19,29 @@
 //! Rows are flattened once per reply (not re-derived per virtual-list frame,
 //! unlike [`crate::problems_panel::ProblemsPanel`]'s smaller diagnostics set) —
 //! the spec's size ceiling (~20k changed lines) makes a per-frame re-flatten
-//! wasteful for the view this panel renders.
+//! wasteful for the view this panel renders. [`flatten_hunks`] also derives one
+//! [`HunkSummary`] per hunk (its content-fingerprint `hunk_id` plus added/
+//! removed line counts) in the same pass — the header's `+n -m` total and mini
+//! hunk squares (issue #547) read these instead of re-walking the rows.
 //!
-//! Read-only, agent-agnostic: this view only requests and displays a computed
-//! diff; it performs no git write operations and inspects no agent output.
+//! The header (issue #547, `docs/spec-source-control-write.md` §4) shows the
+//! open file's name + directory, the aggregated `+n -m` line counts, one mini
+//! square per hunk, and a Split|Unified segmented toggle whose preference is
+//! persisted in the window-state store (`crate::window_state`) — mirroring
+//! `crate::set_theme_mode_persisted`'s "apply, then best-effort persist"
+//! shape. `Split` only selects the toggle state in this issue; the actual
+//! split renderer is issue #548's scope, so both modes render the existing
+//! unified rows for now. Each hunk header row also carries a `+ Stage hunk`
+//! ghost button wired to [`rift_protocol::ClientMessage::StageHunk`] with the
+//! hunk's own fingerprint — the daemon (`crates/daemon/src/git_write.rs`)
+//! recomputes and verifies it before applying, so a stale id is rejected
+//! rather than mis-staged.
+//!
+//! Agent-agnostic: this view only requests/displays a computed diff and sends
+//! explicit user stage actions; it performs no other git write operations and
+//! inspects no agent output.
 
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use flume::Sender;
@@ -31,10 +49,17 @@ use gpui::{
     div, px, AnyElement, App, Context, EventEmitter, FocusHandle, Focusable, Hsla, IntoElement,
     ParentElement as _, Pixels, Render, SharedString, Size, Styled as _, Window,
 };
+use gpui_component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_component::dock::{Panel, PanelEvent};
-use gpui_component::{v_virtual_list, ActiveTheme as _, VirtualListScrollHandle};
-use rift_protocol::{DiffHunk, DiffLineKind, FileDiffPayload};
+use gpui_component::{
+    h_flex, v_virtual_list, ActiveTheme as _, IconName, Selectable as _, Sizable as _,
+    VirtualListScrollHandle,
+};
+use rift_protocol::{hunk_fingerprint, ClientMessage, DiffHunk, DiffLineKind, FileDiffPayload};
 use tracing::debug;
+
+use crate::source_control::split_name_dir;
+use crate::window_state::{self, DiffViewMode};
 
 /// Stable, distinct dock-panel identity for the diff view (`Panel::panel_name`).
 /// Once shipped this must not change — it is the persisted panel identifier.
@@ -45,11 +70,19 @@ pub const DIFF_VIEW_PANEL_NAME: &str = "diff-view";
 /// `ProblemsPanel::ROW_HEIGHT`.
 const ROW_HEIGHT: Pixels = px(20.0);
 
-/// Height of the fixed path header above the scrollable diff.
-const HEADER_HEIGHT: Pixels = px(28.0);
+/// Height of the fixed path header above the scrollable diff — roomier than
+/// `ROW_HEIGHT` so the Split|Unified toggle's buttons fit comfortably (#547).
+const HEADER_HEIGHT: Pixels = px(32.0);
 
 /// Width of each line-number column.
 const LINE_NUMBER_WIDTH: Pixels = px(44.0);
+
+/// Side length of one hunk mini-square in the header (#547).
+const HUNK_SQUARE_SIZE: Pixels = px(6.0);
+
+/// Cap on the hunk-squares strip's width, so a file with dozens of hunks
+/// clips instead of pushing the Split|Unified toggle off the header.
+const HUNK_SQUARES_MAX_WIDTH: Pixels = px(160.0);
 
 /// One flattened row of the virtualized diff list: either a hunk's `@@ ... @@`
 /// header or one of its lines, addressed against both the old (HEAD) and new
@@ -59,6 +92,11 @@ const LINE_NUMBER_WIDTH: Pixels = px(44.0);
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DiffRow {
     HunkHeader {
+        /// The [`hunk_fingerprint`] of the hunk this header opens — carried
+        /// on the row so the row's `+ Stage hunk` button (#547) can send
+        /// [`ClientMessage::StageHunk`] without re-deriving it from the
+        /// header numbers alone (which omit line content).
+        hunk_id: u64,
         old_start: u32,
         old_len: u32,
         new_start: u32,
@@ -76,16 +114,47 @@ enum DiffRow {
     },
 }
 
+/// One hunk's header-strip summary (#547): its content-fingerprint `hunk_id`
+/// (the same value carried on its [`DiffRow::HunkHeader`]) plus its added/
+/// removed line counts, feeding the diff header's `+n -m` total and mini
+/// hunk squares without a second walk over the flattened rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HunkSummary {
+    hunk_id: u64,
+    added: u32,
+    removed: u32,
+}
+
 /// Flatten a [`FileDiffPayload::Hunks`]' hunks into the virtual list's row
 /// sequence, computing each line's old/new line number by walking the hunk's
 /// `old_start`/`new_start` forward: context and remove lines advance the old
 /// counter, context and add lines advance the new counter — mirroring
-/// unified-diff's own line-counting rule. Pure and GPUI-free so it is
+/// unified-diff's own line-counting rule. Also derives one [`HunkSummary`]
+/// per hunk in the same pass (#547). Pure and GPUI-free so it is
 /// unit-testable headless.
-fn flatten_hunks(hunks: Vec<DiffHunk>) -> Vec<DiffRow> {
+fn flatten_hunks(hunks: Vec<DiffHunk>) -> (Vec<DiffRow>, Vec<HunkSummary>) {
     let mut rows = Vec::new();
+    let mut summaries = Vec::with_capacity(hunks.len());
     for hunk in hunks {
+        let hunk_id = hunk_fingerprint(&hunk);
+        let added = hunk
+            .lines
+            .iter()
+            .filter(|line| line.kind == DiffLineKind::Add)
+            .count() as u32;
+        let removed = hunk
+            .lines
+            .iter()
+            .filter(|line| line.kind == DiffLineKind::Remove)
+            .count() as u32;
+        summaries.push(HunkSummary {
+            hunk_id,
+            added,
+            removed,
+        });
+
         rows.push(DiffRow::HunkHeader {
+            hunk_id,
             old_start: hunk.old_start,
             old_len: hunk.old_len,
             new_start: hunk.new_start,
@@ -121,7 +190,7 @@ fn flatten_hunks(hunks: Vec<DiffHunk>) -> Vec<DiffRow> {
             });
         }
     }
-    rows
+    (rows, summaries)
 }
 
 /// The diff view's current display state for the open path. `Empty` (no file
@@ -131,7 +200,13 @@ fn flatten_hunks(hunks: Vec<DiffHunk>) -> Vec<DiffRow> {
 enum DiffViewState {
     Empty,
     Loading,
-    Hunks(Vec<DiffRow>),
+    Hunks {
+        rows: Vec<DiffRow>,
+        /// One summary per hunk, in the same order as their
+        /// [`DiffRow::HunkHeader`]s — feeds the header's `+n -m` total and
+        /// mini hunk squares (#547).
+        hunks: Vec<HunkSummary>,
+    },
     Binary,
     TooLarge,
 }
@@ -142,7 +217,10 @@ impl DiffViewState {
     /// unit-testable headless, alongside [`flatten_hunks`].
     fn from_payload(payload: FileDiffPayload) -> Self {
         match payload {
-            FileDiffPayload::Hunks { hunks } => Self::Hunks(flatten_hunks(hunks)),
+            FileDiffPayload::Hunks { hunks } => {
+                let (rows, hunks) = flatten_hunks(hunks);
+                Self::Hunks { rows, hunks }
+            }
             FileDiffPayload::Binary => Self::Binary,
             FileDiffPayload::TooLarge => Self::TooLarge,
         }
@@ -189,18 +267,80 @@ pub struct DiffView {
     /// the protocol as `ClientMessage::RequestDiff` (mirrors
     /// `WorkspaceChannels::open_file_tx`).
     request_diff_tx: Sender<String>,
+    /// Git write op sender: the per-hunk `+ Stage hunk` button (#547) sends
+    /// `ClientMessage::StageHunk { path, hunk_id }` on it, mirroring
+    /// `SourceControlPanel::git_op_tx` — the daemon's `ok`/`error` reply is
+    /// not echoed into this view's state, the resulting change arrives via
+    /// the existing push recompute.
+    git_op_tx: Sender<ClientMessage>,
+    /// The header's Split|Unified display preference (#547). `Split` only
+    /// drives the toggle's selected state in this issue — the split renderer
+    /// itself is issue #548's scope.
+    view_mode: DiffViewMode,
+    /// Where to persist `view_mode`; `None` degrades to in-memory-only for
+    /// the session, mirroring `WorkspaceView::window_state_path`.
+    window_state_path: Option<PathBuf>,
     focus_handle: FocusHandle,
     scroll_handle: VirtualListScrollHandle,
 }
 
 impl DiffView {
-    pub fn new(request_diff_tx: Sender<String>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        request_diff_tx: Sender<String>,
+        git_op_tx: Sender<ClientMessage>,
+        window_state_path: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let view_mode = window_state_path
+            .as_deref()
+            .map(|path| window_state::load(path).diff_view_mode)
+            .unwrap_or_default();
         Self {
             path: None,
             state: DiffViewState::Empty,
             request_diff_tx,
+            git_op_tx,
+            view_mode,
+            window_state_path,
             focus_handle: cx.focus_handle(),
             scroll_handle: VirtualListScrollHandle::new(),
+        }
+    }
+
+    /// Switch the Split|Unified preference and best-effort persist it — a
+    /// no-op if it already matches, mirroring `open_diff`'s own guard against
+    /// redundant work. Persistence failure only logs, matching
+    /// `crate::persist_theme_mode`'s "the live change already applied
+    /// regardless" contract.
+    fn set_view_mode(&mut self, mode: DiffViewMode, cx: &mut Context<Self>) {
+        if self.view_mode == mode {
+            return;
+        }
+        self.view_mode = mode;
+        if let Some(path) = &self.window_state_path {
+            if let Err(e) = window_state::save_diff_view_mode(path, mode) {
+                tracing::warn!(error = %e, "failed to persist diff view mode");
+            }
+        }
+        cx.notify();
+    }
+
+    /// Send `StageHunk` for `hunk_id` against the currently open path — the
+    /// `+ Stage hunk` button's action (#547), sent verbatim like
+    /// `SourceControlPanel::send_op`; the daemon recomputes and verifies the
+    /// fingerprint before applying, so a stale id is rejected, never
+    /// mis-staged (`docs/spec-source-control-write.md`). A no-op when no diff
+    /// is open — the button only ever renders while one is, but this keeps
+    /// the method safe to call regardless.
+    fn stage_hunk(&self, hunk_id: u64) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        if let Err(e) = self
+            .git_op_tx
+            .try_send(ClientMessage::StageHunk { path, hunk_id })
+        {
+            debug!(error = %e, hunk_id, "failed to enqueue stage hunk");
         }
     }
 
@@ -299,30 +439,49 @@ impl DiffView {
             .into_any_element()
     }
 
-    /// Render one row: a hunk's `@@ ... @@` header, or one line with its
-    /// old/new line numbers, a +/-/space marker, and add/remove/context
-    /// styling from theme tokens (`success`/`danger`, mirroring the file
-    /// tree's git-status decoration — no diff-specific tokens invented).
+    /// Render one row: a hunk's `@@ ... @@` header (with its `+ Stage hunk`
+    /// ghost button, #547), or one line with its old/new line numbers, a
+    /// +/-/space marker, and add/remove/context styling from theme tokens
+    /// (`success`/`danger`, mirroring the file tree's git-status decoration —
+    /// no diff-specific tokens invented).
     fn render_row(row: &DiffRow, cx: &mut Context<Self>) -> AnyElement {
         match row {
             DiffRow::HunkHeader {
+                hunk_id,
                 old_start,
                 old_len,
                 new_start,
                 new_len,
-            } => div()
-                .h(ROW_HEIGHT)
-                .flex()
-                .items_center()
-                .px(px(8.0))
-                .bg(cx.theme().muted)
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .font_family(cx.theme().mono_font_family.clone())
-                .child(format!(
-                    "@@ -{old_start},{old_len} +{new_start},{new_len} @@"
-                ))
-                .into_any_element(),
+            } => {
+                let hunk_id = *hunk_id;
+                h_flex()
+                    .h(ROW_HEIGHT)
+                    .items_center()
+                    .justify_between()
+                    .px(px(8.0))
+                    .bg(cx.theme().muted)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .child(format!(
+                                "@@ -{old_start},{old_len} +{new_start},{new_len} @@"
+                            )),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("diff-stage-hunk-{hunk_id}")))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Plus)
+                            .label("Stage hunk")
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                cx.stop_propagation();
+                                this.stage_hunk(hunk_id);
+                            })),
+                    )
+                    .into_any_element()
+            }
             DiffRow::Line {
                 kind,
                 old_line,
@@ -378,6 +537,129 @@ impl DiffView {
             }
         }
     }
+
+    /// The fixed header above the scrollable diff (#547, §4): the open
+    /// file's two-tone name + directory (reusing
+    /// `crate::source_control::split_name_dir`), the aggregated `+n -m` line
+    /// counts, one mini square per hunk, and the Split|Unified segmented
+    /// toggle. `hunks` is the same [`HunkSummary`] slice `render` already
+    /// holds — no re-derivation from the rows.
+    fn render_header(
+        &self,
+        path: &str,
+        hunks: &[HunkSummary],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (name, dir) = split_name_dir(path);
+        let total_added: u32 = hunks.iter().map(|hunk| hunk.added).sum();
+        let total_removed: u32 = hunks.iter().map(|hunk| hunk.removed).sum();
+
+        let mut name_column = h_flex()
+            .items_center()
+            .gap(px(6.0))
+            .min_w_0()
+            .flex_1()
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(cx.theme().foreground)
+                    .child(name.to_owned()),
+            );
+        if !dir.is_empty() {
+            name_column = name_column.child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(dir.to_owned()),
+            );
+        }
+
+        let stats = h_flex()
+            .flex_none()
+            .items_center()
+            .gap(px(4.0))
+            .font_family(cx.theme().mono_font_family.clone())
+            .text_xs()
+            .child(
+                div()
+                    .text_color(cx.theme().success)
+                    .child(format!("+{total_added}")),
+            )
+            .child(
+                div()
+                    .text_color(cx.theme().danger)
+                    .child(format!("-{total_removed}")),
+            );
+
+        let squares = h_flex()
+            .flex_none()
+            .items_center()
+            .gap(px(2.0))
+            .max_w(HUNK_SQUARES_MAX_WIDTH)
+            .overflow_hidden()
+            .children(hunks.iter().map(|hunk| {
+                let color = if hunk.added > 0 && hunk.removed > 0 {
+                    cx.theme().warning
+                } else if hunk.removed > 0 {
+                    cx.theme().danger
+                } else {
+                    cx.theme().success
+                };
+                div()
+                    .flex_none()
+                    .size(HUNK_SQUARE_SIZE)
+                    .rounded(px(1.0))
+                    .bg(color)
+            }));
+
+        let toggle = ButtonGroup::new("diff-view-mode")
+            .compact()
+            .outline()
+            .xsmall()
+            .child(
+                Button::new("diff-view-mode-unified")
+                    .label("Unified")
+                    .selected(self.view_mode == DiffViewMode::Unified),
+            )
+            .child(
+                Button::new("diff-view-mode-split")
+                    .label("Split")
+                    .selected(self.view_mode == DiffViewMode::Split),
+            )
+            .on_click(cx.listener(|this, clicks: &Vec<usize>, _window, cx| {
+                let mode = if clicks.contains(&1) {
+                    DiffViewMode::Split
+                } else {
+                    DiffViewMode::Unified
+                };
+                this.set_view_mode(mode, cx);
+            }));
+
+        div()
+            .h(HEADER_HEIGHT)
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(8.0))
+            .px(px(8.0))
+            .text_sm()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(name_column)
+            .child(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(stats)
+                    .child(squares)
+                    .child(toggle),
+            )
+            .into_any_element()
+    }
 }
 
 impl Focusable for DiffView {
@@ -404,17 +686,17 @@ impl Render for DiffView {
             return Self::placeholder("Select a changed file to view its diff", cx);
         };
 
-        let rows = match &self.state {
+        let (rows, hunks) = match &self.state {
             DiffViewState::Empty => {
                 return Self::placeholder("Select a changed file to view its diff", cx)
             }
             DiffViewState::Loading => return Self::placeholder("Loading diff...", cx),
             DiffViewState::Binary => return Self::placeholder("Binary file - diff not shown", cx),
             DiffViewState::TooLarge => return Self::placeholder("Diff too large to display", cx),
-            DiffViewState::Hunks(rows) if rows.is_empty() => {
+            DiffViewState::Hunks { rows, .. } if rows.is_empty() => {
                 return Self::placeholder("No changes", cx)
             }
-            DiffViewState::Hunks(rows) => rows,
+            DiffViewState::Hunks { rows, hunks } => (rows, hunks),
         };
 
         let item_sizes: Rc<Vec<Size<Pixels>>> = Rc::new(
@@ -422,24 +704,13 @@ impl Render for DiffView {
                 .map(|_| Size::new(px(0.0), ROW_HEIGHT))
                 .collect(),
         );
+        let header = self.render_header(&path, hunks, cx);
 
         div()
             .size_full()
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .h(HEADER_HEIGHT)
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .px(px(8.0))
-                    .text_sm()
-                    .text_color(cx.theme().foreground)
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(path),
-            )
+            .child(header)
             .child(
                 div().flex_1().min_h_0().child(
                     v_virtual_list(
@@ -447,7 +718,7 @@ impl Render for DiffView {
                         "diff-view-list",
                         item_sizes,
                         move |this, visible_range, _window, cx| {
-                            let DiffViewState::Hunks(rows) = &this.state else {
+                            let DiffViewState::Hunks { rows, .. } = &this.state else {
                                 return Vec::new();
                             };
                             visible_range
@@ -465,7 +736,7 @@ impl Render for DiffView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui::{AppContext as _, Entity, TestAppContext};
     use rift_protocol::DiffLine;
 
     fn line(kind: DiffLineKind, content: &str) -> DiffLine {
@@ -475,13 +746,30 @@ mod tests {
         }
     }
 
+    /// Construct a `DiffView` wired to fresh unbounded channels and no
+    /// window-state path (in-memory-only view-mode persistence) — the shared
+    /// rig every `DiffView` test below builds on (#547).
+    fn new_test_diff_view(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<DiffView>,
+        flume::Receiver<String>,
+        flume::Receiver<ClientMessage>,
+    ) {
+        let (request_diff_tx, request_diff_rx) = flume::unbounded();
+        let (git_op_tx, git_op_rx) = flume::unbounded();
+        let diff_view =
+            cx.update(|cx| cx.new(|cx| DiffView::new(request_diff_tx, git_op_tx, None, cx)));
+        (diff_view, request_diff_rx, git_op_rx)
+    }
+
     // --- flatten_hunks ---
 
     #[test]
     fn test_flatten_single_hunk_numbers_context_add_remove_lines_correctly() {
         // 3 old lines (1..3), 3 new lines (1..3): line 2 removed and replaced
         // by a new "b2" line, mirroring a typical one-line edit.
-        let hunks = vec![DiffHunk {
+        let hunk = DiffHunk {
             old_start: 1,
             old_len: 3,
             new_start: 1,
@@ -492,13 +780,15 @@ mod tests {
                 line(DiffLineKind::Add, "b2"),
                 line(DiffLineKind::Context, "a3"),
             ],
-        }];
+        };
+        let hunk_id = hunk_fingerprint(&hunk);
 
-        let rows = flatten_hunks(hunks);
+        let (rows, hunks) = flatten_hunks(vec![hunk]);
         assert_eq!(
             rows,
             vec![
                 DiffRow::HunkHeader {
+                    hunk_id,
                     old_start: 1,
                     old_len: 3,
                     new_start: 1,
@@ -530,6 +820,15 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(
+            hunks,
+            vec![HunkSummary {
+                hunk_id,
+                added: 1,
+                removed: 1,
+            }],
+            "one added and one removed line summarize into the hunk's totals"
+        );
     }
 
     #[test]
@@ -551,8 +850,9 @@ mod tests {
             },
         ];
 
-        let rows = flatten_hunks(hunks);
+        let (rows, summaries) = flatten_hunks(hunks);
         assert_eq!(rows.len(), 4, "2 headers + 2 lines");
+        assert_eq!(summaries.len(), 2, "one summary per hunk");
         assert_eq!(
             rows[1],
             DiffRow::Line {
@@ -586,7 +886,7 @@ mod tests {
             ],
         }];
 
-        let rows = flatten_hunks(hunks);
+        let (rows, summaries) = flatten_hunks(hunks);
         for row in &rows[1..] {
             match row {
                 DiffRow::Line {
@@ -598,11 +898,36 @@ mod tests {
                 other => panic!("expected a line row, got {other:?}"),
             }
         }
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].added, 2);
+        assert_eq!(summaries[0].removed, 0);
     }
 
     #[test]
-    fn test_flatten_empty_hunks_yields_no_rows() {
-        assert!(flatten_hunks(vec![]).is_empty());
+    fn test_flatten_empty_hunks_yields_no_rows_or_summaries() {
+        let (rows, hunks) = flatten_hunks(vec![]);
+        assert!(rows.is_empty());
+        assert!(hunks.is_empty());
+    }
+
+    #[test]
+    fn test_flatten_same_shape_different_content_hunks_yield_different_ids() {
+        // Spec-review finding 2: a same-shape edit (identical header, different
+        // line text) must fingerprint differently, so a stale `hunk_id`
+        // (`docs/spec-source-control-write.md`) is never fuzzily matched.
+        let base = DiffHunk {
+            old_start: 1,
+            old_len: 1,
+            new_start: 1,
+            new_len: 1,
+            lines: vec![line(DiffLineKind::Remove, "old")],
+        };
+        let mut changed = base.clone();
+        changed.lines = vec![line(DiffLineKind::Remove, "different")];
+
+        let (_, summaries_a) = flatten_hunks(vec![base]);
+        let (_, summaries_b) = flatten_hunks(vec![changed]);
+        assert_ne!(summaries_a[0].hunk_id, summaries_b[0].hunk_id);
     }
 
     // --- DiffViewState::from_payload ---
@@ -619,7 +944,10 @@ mod tests {
             }],
         };
         match DiffViewState::from_payload(payload) {
-            DiffViewState::Hunks(rows) => assert_eq!(rows.len(), 2),
+            DiffViewState::Hunks { rows, hunks } => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(hunks.len(), 1);
+            }
             other => panic!("expected Hunks state, got {other:?}"),
         }
     }
@@ -629,7 +957,10 @@ mod tests {
         // Empty `hunks` means "identical to HEAD", not a sentinel — the render
         // path shows "No changes" for this, distinct from binary/too-large.
         match DiffViewState::from_payload(FileDiffPayload::Hunks { hunks: vec![] }) {
-            DiffViewState::Hunks(rows) => assert!(rows.is_empty()),
+            DiffViewState::Hunks { rows, hunks } => {
+                assert!(rows.is_empty());
+                assert!(hunks.is_empty());
+            }
             other => panic!("expected an empty Hunks state, got {other:?}"),
         }
     }
@@ -692,8 +1023,7 @@ mod tests {
 
     #[gpui::test]
     fn test_apply_git_update_refreshes_the_still_open_path(cx: &mut TestAppContext) {
-        let (tx, rx) = flume::unbounded();
-        let diff_view = cx.update(|cx| cx.new(|cx| DiffView::new(tx, cx)));
+        let (diff_view, rx, _git_op_rx) = new_test_diff_view(cx);
 
         cx.update(|cx| {
             diff_view.update(cx, |view, cx| view.open_diff("a.rs".to_owned(), cx));
@@ -721,8 +1051,7 @@ mod tests {
 
     #[gpui::test]
     fn test_apply_git_update_closes_the_path_that_left_the_changed_set(cx: &mut TestAppContext) {
-        let (tx, rx) = flume::unbounded();
-        let diff_view = cx.update(|cx| cx.new(|cx| DiffView::new(tx, cx)));
+        let (diff_view, rx, _git_op_rx) = new_test_diff_view(cx);
 
         cx.update(|cx| {
             diff_view.update(cx, |view, cx| view.open_diff("a.rs".to_owned(), cx));
@@ -748,8 +1077,7 @@ mod tests {
 
     #[gpui::test]
     fn test_apply_git_update_is_a_no_op_when_no_diff_is_open(cx: &mut TestAppContext) {
-        let (tx, rx) = flume::unbounded();
-        let diff_view = cx.update(|cx| cx.new(|cx| DiffView::new(tx, cx)));
+        let (diff_view, rx, _git_op_rx) = new_test_diff_view(cx);
 
         cx.update(|cx| {
             diff_view.update(cx, |view, cx| {
@@ -772,8 +1100,7 @@ mod tests {
     fn test_apply_content_update_refreshes_the_open_path_on_a_content_only_change(
         cx: &mut TestAppContext,
     ) {
-        let (tx, rx) = flume::unbounded();
-        let diff_view = cx.update(|cx| cx.new(|cx| DiffView::new(tx, cx)));
+        let (diff_view, rx, _git_op_rx) = new_test_diff_view(cx);
 
         cx.update(|cx| {
             diff_view.update(cx, |view, cx| view.open_diff("a.rs".to_owned(), cx));
@@ -803,8 +1130,7 @@ mod tests {
     fn test_apply_content_update_ignores_a_tick_that_does_not_mention_the_open_path(
         cx: &mut TestAppContext,
     ) {
-        let (tx, rx) = flume::unbounded();
-        let diff_view = cx.update(|cx| cx.new(|cx| DiffView::new(tx, cx)));
+        let (diff_view, rx, _git_op_rx) = new_test_diff_view(cx);
 
         cx.update(|cx| {
             diff_view.update(cx, |view, cx| view.open_diff("a.rs".to_owned(), cx));
@@ -828,8 +1154,7 @@ mod tests {
 
     #[gpui::test]
     fn test_apply_content_update_is_a_no_op_when_no_diff_is_open(cx: &mut TestAppContext) {
-        let (tx, rx) = flume::unbounded();
-        let diff_view = cx.update(|cx| cx.new(|cx| DiffView::new(tx, cx)));
+        let (diff_view, rx, _git_op_rx) = new_test_diff_view(cx);
 
         cx.update(|cx| {
             diff_view.update(cx, |view, cx| {
@@ -862,8 +1187,7 @@ mod tests {
 
     #[gpui::test]
     fn test_open_diff_same_path_keeps_rendered_diff_until_reply(cx: &mut TestAppContext) {
-        let (tx, rx) = flume::unbounded();
-        let diff_view = cx.update(|cx| cx.new(|cx| DiffView::new(tx, cx)));
+        let (diff_view, rx, _git_op_rx) = new_test_diff_view(cx);
 
         cx.update(|cx| {
             diff_view.update(cx, |view, cx| {
@@ -883,7 +1207,7 @@ mod tests {
         );
         cx.update(|cx| {
             assert!(
-                matches!(diff_view.read(cx).state, DiffViewState::Hunks(_)),
+                matches!(diff_view.read(cx).state, DiffViewState::Hunks { .. }),
                 "the rendered diff stays visible instead of flashing Loading"
             );
         });
@@ -891,8 +1215,7 @@ mod tests {
 
     #[gpui::test]
     fn test_open_diff_different_path_arms_loading(cx: &mut TestAppContext) {
-        let (tx, rx) = flume::unbounded();
-        let diff_view = cx.update(|cx| cx.new(|cx| DiffView::new(tx, cx)));
+        let (diff_view, rx, _git_op_rx) = new_test_diff_view(cx);
 
         cx.update(|cx| {
             diff_view.update(cx, |view, cx| {
@@ -922,8 +1245,7 @@ mod tests {
     fn test_apply_git_update_refresh_keeps_rendered_diff_then_reply_swaps_it(
         cx: &mut TestAppContext,
     ) {
-        let (tx, rx) = flume::unbounded();
-        let diff_view = cx.update(|cx| cx.new(|cx| DiffView::new(tx, cx)));
+        let (diff_view, rx, _git_op_rx) = new_test_diff_view(cx);
 
         cx.update(|cx| {
             diff_view.update(cx, |view, cx| {
@@ -938,7 +1260,7 @@ mod tests {
             .expect("the refresh tick re-requests the diff");
         cx.update(|cx| {
             assert!(
-                matches!(diff_view.read(cx).state, DiffViewState::Hunks(_)),
+                matches!(diff_view.read(cx).state, DiffViewState::Hunks { .. }),
                 "the refresh tick keeps the rendered diff visible"
             );
         });
@@ -961,8 +1283,7 @@ mod tests {
     fn test_apply_git_update_ignores_a_tick_that_does_not_mention_the_open_path(
         cx: &mut TestAppContext,
     ) {
-        let (tx, rx) = flume::unbounded();
-        let diff_view = cx.update(|cx| cx.new(|cx| DiffView::new(tx, cx)));
+        let (diff_view, rx, _git_op_rx) = new_test_diff_view(cx);
 
         cx.update(|cx| {
             diff_view.update(cx, |view, cx| view.open_diff("a.rs".to_owned(), cx));
@@ -981,6 +1302,122 @@ mod tests {
         );
         cx.update(|cx| {
             assert_eq!(diff_view.read(cx).path.as_deref(), Some("a.rs"));
+        });
+    }
+
+    // --- DiffView::stage_hunk (#547) ---
+
+    #[gpui::test]
+    fn test_stage_hunk_sends_stage_hunk_for_the_open_path(cx: &mut TestAppContext) {
+        let (diff_view, _rx, git_op_rx) = new_test_diff_view(cx);
+
+        cx.update(|cx| {
+            diff_view.update(cx, |view, cx| {
+                view.open_diff("a.rs".to_owned(), cx);
+                view.stage_hunk(42);
+            });
+        });
+
+        assert_eq!(
+            git_op_rx.drain().collect::<Vec<_>>(),
+            vec![ClientMessage::StageHunk {
+                path: "a.rs".to_owned(),
+                hunk_id: 42,
+            }]
+        );
+    }
+
+    #[gpui::test]
+    fn test_stage_hunk_is_a_no_op_when_no_diff_is_open(cx: &mut TestAppContext) {
+        let (diff_view, _rx, git_op_rx) = new_test_diff_view(cx);
+
+        cx.update(|cx| {
+            diff_view.update(cx, |view, _cx| view.stage_hunk(42));
+        });
+
+        assert!(
+            git_op_rx.drain().next().is_none(),
+            "no diff open means no StageHunk is sent"
+        );
+    }
+
+    // --- DiffView::set_view_mode / persisted restore (#547) ---
+
+    #[gpui::test]
+    fn test_set_view_mode_is_a_no_op_for_the_already_active_mode(cx: &mut TestAppContext) {
+        let (diff_view, _rx, _git_op_rx) = new_test_diff_view(cx);
+
+        cx.update(|cx| {
+            diff_view.update(cx, |view, cx| {
+                assert_eq!(view.view_mode, DiffViewMode::Unified, "the default mode");
+                view.set_view_mode(DiffViewMode::Unified, cx);
+                assert_eq!(view.view_mode, DiffViewMode::Unified);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_set_view_mode_switches_and_persists_to_the_state_path(cx: &mut TestAppContext) {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "rift-app-diff-view-mode-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let (request_diff_tx, _request_diff_rx) = flume::unbounded();
+        let (git_op_tx, _git_op_rx) = flume::unbounded();
+        let diff_view = cx.update(|cx| {
+            cx.new(|cx| DiffView::new(request_diff_tx, git_op_tx, Some(path.clone()), cx))
+        });
+
+        cx.update(|cx| {
+            diff_view.update(cx, |view, cx| {
+                view.set_view_mode(DiffViewMode::Split, cx);
+                assert_eq!(view.view_mode, DiffViewMode::Split);
+            });
+        });
+
+        assert_eq!(
+            window_state::load(&path).diff_view_mode,
+            DiffViewMode::Split,
+            "the toggle persists into the window-state store"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[gpui::test]
+    fn test_new_restores_a_persisted_view_mode(cx: &mut TestAppContext) {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "rift-app-diff-view-mode-restore-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_file(&path);
+        window_state::save_diff_view_mode(&path, DiffViewMode::Split)
+            .expect("seed a persisted Split preference");
+
+        let (request_diff_tx, _request_diff_rx) = flume::unbounded();
+        let (git_op_tx, _git_op_rx) = flume::unbounded();
+        let diff_view = cx.update(|cx| {
+            cx.new(|cx| DiffView::new(request_diff_tx, git_op_tx, Some(path.clone()), cx))
+        });
+
+        cx.update(|cx| {
+            assert_eq!(diff_view.read(cx).view_mode, DiffViewMode::Split);
+        });
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[gpui::test]
+    fn test_new_defaults_to_unified_without_a_window_state_path(cx: &mut TestAppContext) {
+        let (diff_view, _rx, _git_op_rx) = new_test_diff_view(cx);
+        cx.update(|cx| {
+            assert_eq!(diff_view.read(cx).view_mode, DiffViewMode::Unified);
         });
     }
 }

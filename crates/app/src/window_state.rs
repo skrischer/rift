@@ -40,6 +40,20 @@ const MIN_WINDOW_HEIGHT: f64 = 150.0;
 /// and wires this value through it.
 const DEFAULT_FONT_SIZE_PX: f32 = 14.0;
 
+/// The diff view's Split|Unified display preference
+/// (`docs/spec-source-control-write.md`, issue #547): which renderer the
+/// header's segmented toggle selects for the open file's diff. `Unified` is
+/// the default — the only renderer that exists until #548 lands the split
+/// view. Persisted so a restart keeps the last choice, mirroring
+/// `theme_mode`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffViewMode {
+    #[default]
+    Unified,
+    Split,
+}
+
 /// A plain axis-aligned rectangle in logical pixels. Used both for the
 /// persisted window bounds and, at the caller's discretion, for the live
 /// display bounds passed into [`clamp_bounds`] — this module has no GPUI
@@ -90,6 +104,10 @@ pub struct WindowState {
     /// Last active light/dark mode, which can diverge from `theme_name`'s own
     /// mode when toggled independently via `crate::set_theme_mode`.
     pub theme_mode: ThemeMode,
+    /// The diff view's Split|Unified display preference, set independently
+    /// of the theme/geometry fields above (`docs/spec-source-control-write.md`,
+    /// issue #547).
+    pub diff_view_mode: DiffViewMode,
 }
 
 impl Default for WindowState {
@@ -104,6 +122,7 @@ impl Default for WindowState {
             // the same "missing/corrupt/unknown falls back to dark" default the
             // rest of the store's tolerant load already promises.
             theme_mode: ThemeMode::Dark,
+            diff_view_mode: DiffViewMode::default(),
         }
     }
 }
@@ -129,6 +148,16 @@ pub fn save_theme(path: &Path, name: &str, mode: ThemeMode) -> Result<(), StoreE
 pub fn save_theme_mode(path: &Path, mode: ThemeMode) -> Result<(), StoreError> {
     let mut state = load(path);
     state.theme_mode = mode;
+    save(path, &state)
+}
+
+/// Persist the diff view's Split|Unified preference into the store at
+/// `path`: a read-modify-write that updates only `diff_view_mode`, leaving
+/// whatever bounds/theme/font is already on disk untouched — mirrors
+/// [`save_theme_mode`]'s shape (issue #547).
+pub fn save_diff_view_mode(path: &Path, mode: DiffViewMode) -> Result<(), StoreError> {
+    let mut state = load(path);
+    state.diff_view_mode = mode;
     save(path, &state)
 }
 
@@ -389,6 +418,7 @@ mod tests {
             font_size_px: 16.5,
             theme_name: "Default Light".to_string(),
             theme_mode: ThemeMode::Light,
+            diff_view_mode: DiffViewMode::Split,
         }
     }
 
@@ -418,6 +448,7 @@ mod tests {
         assert_eq!(parsed.font_size_px, DEFAULT_FONT_SIZE_PX);
         assert_eq!(parsed.theme_name, crate::DEFAULT_THEME_NAME);
         assert_eq!(parsed.theme_mode, ThemeMode::Dark);
+        assert_eq!(parsed.diff_view_mode, DiffViewMode::Unified);
     }
 
     #[test]
@@ -445,6 +476,11 @@ mod tests {
         assert_eq!(parsed.font_size_px, 18.0);
         assert_eq!(parsed.theme_name, "Default Light");
         assert_eq!(parsed.theme_mode, ThemeMode::Light);
+        assert_eq!(
+            parsed.diff_view_mode,
+            DiffViewMode::Unified,
+            "a field this JSON predates falls back to its default"
+        );
     }
 
     /// A pre-Phase-17 on-disk file (#224's original fields only, no theme
@@ -463,6 +499,7 @@ mod tests {
         assert_eq!(parsed.font_size_px, 16.5);
         assert_eq!(parsed.theme_name, crate::DEFAULT_THEME_NAME);
         assert_eq!(parsed.theme_mode, ThemeMode::Dark);
+        assert_eq!(parsed.diff_view_mode, DiffViewMode::Unified);
     }
 
     #[test]
@@ -635,6 +672,42 @@ mod tests {
         assert_eq!(loaded.font_size_px, 18.0);
         assert_eq!(loaded.theme_name, "Catppuccin Mocha");
         assert_eq!(loaded.theme_mode, ThemeMode::Dark);
+    }
+
+    // --- diff-view-mode persistence (#547) ----------------------------------
+
+    #[test]
+    fn test_save_diff_view_mode_updates_only_that_field_and_preserves_the_rest() {
+        let scratch = Scratch::new("save_diff_view_mode");
+        let path = scratch.path("state.json");
+        let initial = WindowState {
+            diff_view_mode: DiffViewMode::Unified,
+            ..sample_state()
+        };
+        save(&path, &initial).expect("initial save");
+
+        save_diff_view_mode(&path, DiffViewMode::Split).expect("save_diff_view_mode");
+
+        let loaded = load(&path);
+        assert_eq!(loaded.diff_view_mode, DiffViewMode::Split);
+        assert_eq!(loaded.theme_name, initial.theme_name);
+        assert_eq!(loaded.theme_mode, initial.theme_mode);
+        assert_eq!(loaded.bounds, initial.bounds);
+        assert_eq!(loaded.maximized, initial.maximized);
+        assert_eq!(loaded.font_size_px, initial.font_size_px);
+    }
+
+    #[test]
+    fn test_save_diff_view_mode_on_missing_file_starts_from_defaults() {
+        let scratch = Scratch::new("save_diff_view_mode_missing");
+        let path = scratch.path("does-not-exist.json");
+
+        save_diff_view_mode(&path, DiffViewMode::Split).expect("save_diff_view_mode");
+
+        let loaded = load(&path);
+        assert_eq!(loaded.diff_view_mode, DiffViewMode::Split);
+        assert_eq!(loaded.theme_name, crate::DEFAULT_THEME_NAME);
+        assert_eq!(loaded.bounds, Rect::default());
     }
 
     // --- platform path resolution -------------------------------------------
