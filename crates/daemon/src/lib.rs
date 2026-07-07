@@ -955,7 +955,6 @@ where
                         | ClientMessage::TmuxCommand { .. }
                         | ClientMessage::CapturePane { .. }
                         | ClientMessage::QueryKeyTable
-                        | ClientMessage::QueryStatusLine
                         | ClientMessage::QuerySessionList => {
                             if terminal_in_tx.send(msg).await.is_err() {
                                 // Terminal task gone; the terminal path is dead,
@@ -1585,7 +1584,6 @@ impl Core {
             | ClientMessage::TmuxCommand { .. }
             | ClientMessage::CapturePane { .. }
             | ClientMessage::QueryKeyTable
-            | ClientMessage::QueryStatusLine
             | ClientMessage::QuerySessionList
             | ClientMessage::OpenFile { .. }
             | ClientMessage::SaveFile { .. }

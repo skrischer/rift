@@ -57,6 +57,7 @@
 //! #351) — never the merely-active tab, so a stale response for a superseded
 //! request can never land on the wrong tab.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -69,7 +70,7 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dock::{DockArea, DockItem, DockPlacement};
 use gpui_component::{ActiveTheme as _, IconName, Root, Sizable as _};
-use rift_protocol::{ClientMessage, DaemonMessage};
+use rift_protocol::{ClientMessage, DaemonMessage, LspServerState};
 use rift_terminal::{SessionView, SessionViewEvent};
 use tracing::{debug, warn};
 
@@ -151,6 +152,14 @@ pub struct SwitchSession;
 #[action(namespace = rift, no_json)]
 pub struct NewSession;
 
+/// Manually refresh the mirrored tmux key tables (the escape hatch the
+/// keytable-mirroring spec mandates, relocated off the removed statusbar to a
+/// command-palette entry, `docs/spec-status-line.md`). Handled at the workspace
+/// root, driving the terminal's `key_table_request_tx`.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct RefreshKeyTables;
+
 /// Initial width of the left (explorer) dock, in pixels. Purely a starting
 /// point for the user's first resize — `DockArea` owns the size afterward,
 /// replacing the old fixed explorer column (`docs/spec-ide-shell.md`, #324).
@@ -181,9 +190,9 @@ pub struct WorkspaceChannels {
     /// Nav replies to route to the editor: `DefinitionResponse` (#196),
     /// `HoverResponse` (#197), `ReferencesResponse` (#198).
     pub nav_rx: Receiver<DaemonMessage>,
-    /// `StatusLineReply` replies to fold into the mirrored tmux status line's
-    /// render model (#221, `docs/spec-tmux-statusline-mirroring.md`).
-    pub status_line_rx: Receiver<DaemonMessage>,
+    /// `LspStatus` pushes to fold into the composite status line's
+    /// language-server health map (`docs/spec-status-line.md`).
+    pub lsp_status_rx: Receiver<DaemonMessage>,
     /// `FileDiff` replies to route to the diff view (#338).
     pub diff_rx: Receiver<DaemonMessage>,
     /// Read requests: the root-relative path of a file to open. The tokio side
@@ -220,15 +229,11 @@ pub struct WorkspaceView {
     // `--all-targets` build.
     #[allow(dead_code)]
     problems_panel: Entity<ProblemsPanel>,
-    /// Which status-bar render mode is active (#221): resolved once at
-    /// startup from `RIFT_STATUSLINE_MIRROR` and never changed at runtime —
-    /// the spec's v1 opt-in toggle, mutually exclusive with the native fields.
-    status_bar_mode: status_bar::StatusBarMode,
-    /// The mirrored tmux status line's current render model (#221), folded
-    /// from the daemon's `StatusLineReply` stream. Read only when
-    /// `status_bar_mode` is `Mirrored`; kept at its default (empty, no
-    /// leftover state) otherwise.
-    mirrored_status_line: status_bar::MirroredStatusLine,
+    /// Language-server health for the composite status line's LSP segment
+    /// (`docs/spec-status-line.md`), keyed by stable server name and folded
+    /// from the daemon's `LspStatus` push (replayed behind Welcome). Read
+    /// inline in [`WorkspaceView::render`].
+    lsp: BTreeMap<String, LspServerState>,
     /// The diff view (`docs/spec-source-control.md`, #338): renders the
     /// `FileDiff` streamed for the source-control panel's selection. Kept as
     /// its own field for the same reason as `problems_panel` above; the
@@ -283,7 +288,7 @@ impl WorkspaceView {
             worktree_rx,
             buffer_rx,
             nav_rx,
-            status_line_rx,
+            lsp_status_rx,
             diff_rx,
             open_file_tx,
             save_file_tx,
@@ -504,32 +509,22 @@ impl WorkspaceView {
             .detach();
         }
 
-        // Mirrored status line stream -> render model (#221): each
-        // `StatusLineReply` rebuilds the parsed left/right runs and the
-        // resolved base style, then a notify repaints the status bar (folded
-        // regardless of `status_bar_mode`, mirroring the nav/buffer loops
-        // above — the render branch, not this fold, is what makes the two
-        // modes exclusive). Routed through this view's weak handle so a
-        // closed window ends the loop gracefully.
+        // Language-server health stream -> composite status line
+        // (`docs/spec-status-line.md`): each `LspStatus` push replaces the
+        // server's health by name (replayed behind Welcome so a reattach sees
+        // current health), then a notify repaints the status bar. Routed
+        // through this view's weak handle so a closed window ends the loop
+        // gracefully.
         {
             cx.spawn(async move |this, cx| loop {
-                let Ok(msg) = status_line_rx.recv_async().await else {
+                let Ok(msg) = lsp_status_rx.recv_async().await else {
                     break;
                 };
                 let result = this.update(cx, |view, cx| {
-                    let DaemonMessage::StatusLineReply {
-                        options,
-                        status_left,
-                        status_right,
-                    } = msg
-                    else {
+                    let DaemonMessage::LspStatus { server, state } = msg else {
                         return;
                     };
-                    view.mirrored_status_line = status_bar::build_mirrored_status_line(
-                        &options,
-                        &status_left,
-                        &status_right,
-                    );
+                    view.lsp.insert(server, state);
                     cx.notify();
                 });
                 if result.is_err() {
@@ -683,13 +678,36 @@ impl WorkspaceView {
             });
         }
 
+        // Composite status line reactivity (`docs/spec-status-line.md`): the
+        // window list, activity dots, and PREFIX segment read `session_view`'s
+        // live state, and the Ln/Col segment reads the editor's cursor, so this
+        // view must repaint when either notifies. `cx.observe` fires on every
+        // notify of the observed entity — the same signal that already redraws
+        // the terminal's own tab bar and the editor.
+        cx.observe(&session_view, |_this, _session_view, cx| cx.notify())
+            .detach();
+        cx.observe(&editor, |_this, _editor, cx| cx.notify())
+            .detach();
+
+        // Minute clock (`docs/spec-status-line.md`): repaint once per minute so
+        // the clock's `HH:MM` advances, aligned to the minute boundary (delay to
+        // the next boundary, then every 60s) — at most one wakeup per minute, no
+        // per-second poll. The value itself is read from `chrono::Local::now()`
+        // in `render`; this loop only drives the repaint.
+        cx.spawn(async move |this, cx| loop {
+            smol::Timer::after(duration_to_next_minute()).await;
+            if this.update(cx, |_view, cx| cx.notify()).is_err() {
+                break;
+            }
+        })
+        .detach();
+
         Self {
             file_tree,
             editor,
             session_view,
             problems_panel,
-            status_bar_mode: status_bar::StatusBarMode::from_env(),
-            mirrored_status_line: status_bar::MirroredStatusLine::default(),
+            lsp: BTreeMap::new(),
             diff_view,
             open_file_tx,
             dock_area,
@@ -935,6 +953,24 @@ pub fn initial_window_bounds(
     }
 }
 
+/// The composite status line's client-local minute clock as `HH:MM`
+/// (`docs/spec-status-line.md`). Read at render; `chrono::Local` resolves the
+/// wall-clock hour/minute and [`status_bar::format_clock`] zero-pads them.
+fn current_clock() -> String {
+    use chrono::Timelike as _;
+    let now = chrono::Local::now();
+    status_bar::format_clock(now.hour(), now.minute())
+}
+
+/// Time from now until the next wall-clock minute boundary, so the clock timer
+/// wakes once per minute aligned to `:00` seconds rather than drifting. Falls
+/// back to a full minute if the current second reads at the boundary.
+fn duration_to_next_minute() -> Duration {
+    use chrono::Timelike as _;
+    let secs = u64::from(chrono::Local::now().second());
+    Duration::from_secs(60u64.saturating_sub(secs).max(1))
+}
+
 /// Fold one worktree-family daemon message into the file tree's model. Only the
 /// structure-path messages are routed here; any other variant is ignored (the
 /// tokio side forwards only this family on `worktree_rx`).
@@ -961,11 +997,10 @@ fn apply_worktree_message(tree: &mut FileTree, msg: DaemonMessage) {
         DaemonMessage::RepoState {
             branch,
             ahead_behind,
-            ..
+            lines_added,
+            lines_removed,
         } => {
-            // `lines_added`/`lines_removed` (issue #520) are not yet consumed
-            // here — the composite status line reads them (issue #521).
-            model.apply_repo_state(branch, ahead_behind);
+            model.apply_repo_state(branch, ahead_behind, lines_added, lines_removed);
         }
         DaemonMessage::Diagnostics {
             path,
@@ -1044,36 +1079,44 @@ impl Render for WorkspaceView {
         // The dock shell fills the window below the custom title bar (the
         // native OS chrome is gone, #511); the `flex_col` mirrors
         // `examples/dock.rs` at the pinned gpui-component rev.
-        // The status bar (#347, #348, `docs/spec-status-bar.md`) is a plain
-        // `flex_col` sibling below the dock — bottom chrome, not a dock `Panel` —
-        // reading the file tree's mirrored `WorktreeModel` inline (repainted by
-        // the `RepoState`/`Diagnostics`-fold `cx.notify()` above).
+        //
+        // The composite status line (`docs/spec-status-line.md`) is a plain
+        // `flex_col` sibling below the dock — bottom chrome, not a dock `Panel`.
+        // Its left segments read the terminal's live window/prefix state, its
+        // right segments the file tree's `WorktreeModel` (branch/ahead-behind/
+        // line totals/diagnostics), the folded `lsp` health, the editor cursor,
+        // and a client-local minute clock — repainted by the folds' `cx.notify`
+        // and the `session_view`/`editor` observes above.
         //
         // The shell command actions (issue #358) are handled here, at the
         // workspace root, rather than scoped to a key context: they are
         // global commands the command palette dispatches regardless of which
         // panel currently has focus.
-        //
-        // Render mode (#221, `docs/spec-tmux-statusline-mirroring.md`): the
-        // native fields and the mirrored tmux status line are mutually
-        // exclusive branches, never composed. `status_bar_mode` is fixed for
-        // the process's lifetime (resolved once from an env var at
-        // construction), so this never toggles mid-session.
-        let status_bar = match self.status_bar_mode {
-            status_bar::StatusBarMode::Native => {
-                let model = self.file_tree.read(cx).model();
-                status_bar::render(
-                    model.repo_state_received(),
-                    model.branch(),
-                    model.ahead_behind(),
-                    model.all_diagnostics(),
-                    cx,
-                )
-                .into_any_element()
-            }
-            status_bar::StatusBarMode::Mirrored => {
-                status_bar::render_mirrored(&self.mirrored_status_line, cx).into_any_element()
-            }
+        let windows = self.session_view.read(cx).status_windows(cx);
+        let prefix_pending = self.session_view.read(cx).prefix_pending(cx);
+        let cursor = self.editor.read(cx).cursor_position(cx);
+        let clock = current_clock();
+        let status_bar = {
+            let model = self.file_tree.read(cx).model();
+            let (lines_added, lines_removed) = model.line_totals();
+            status_bar::render(
+                status_bar::StatusLineModel {
+                    windows: &windows,
+                    prefix_pending,
+                    repo_state_received: model.repo_state_received(),
+                    branch: model.branch(),
+                    ahead_behind: model.ahead_behind(),
+                    lines_added,
+                    lines_removed,
+                    diagnostics: model.all_diagnostics(),
+                    lsp: &self.lsp,
+                    cursor,
+                    clock: &clock,
+                },
+                &self.session_view,
+                cx,
+            )
+            .into_any_element()
         };
 
         // `Root`'s overlay layers (issue #359, `docs/spec-command-palette.md`):
@@ -1114,6 +1157,9 @@ impl Render for WorkspaceView {
                 this.session_view.update(cx, |session, cx| {
                     session.open_new_session_prompt(window, cx);
                 });
+            }))
+            .on_action(cx.listener(|this, _: &RefreshKeyTables, _window, cx| {
+                this.session_view.read(cx).request_key_table_refresh();
             }))
             .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
                 this.open_command_palette(window, cx);
@@ -1234,7 +1280,7 @@ mod tests {
         let (_worktree_tx, worktree_rx) = flume::unbounded();
         let (_buffer_tx, buffer_rx) = flume::unbounded();
         let (_nav_reply_tx, nav_rx) = flume::unbounded();
-        let (_status_line_tx, status_line_rx) = flume::unbounded();
+        let (_lsp_status_tx, lsp_status_rx) = flume::unbounded();
         let (_diff_reply_tx, diff_rx) = flume::unbounded();
         let (open_file_tx, _open_file_rx) = flume::unbounded();
         let (save_file_tx, _save_file_rx) = flume::unbounded();
@@ -1245,7 +1291,7 @@ mod tests {
             worktree_rx,
             buffer_rx,
             nav_rx,
-            status_line_rx,
+            lsp_status_rx,
             diff_rx,
             open_file_tx,
             save_file_tx,

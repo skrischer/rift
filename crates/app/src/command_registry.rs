@@ -14,8 +14,8 @@ use gpui::Action;
 
 use crate::editor::{FindReferences, GoToDefinition, Save, ShowHover};
 use crate::workspace::{
-    FocusTerminal, NewSession, SwitchSession, ToggleExplorer, ToggleProblems, ToggleSourceControl,
-    ZoomActivePanel,
+    FocusTerminal, NewSession, RefreshKeyTables, SwitchSession, ToggleExplorer, ToggleProblems,
+    ToggleSourceControl, ZoomActivePanel,
 };
 use crate::{
     SelectCatppuccinMochaTheme, SelectDefaultDarkTheme, SelectDefaultLightTheme, ToggleThemeMode,
@@ -68,6 +68,9 @@ pub const COMMANDS: &[Command] = &[
     Command::new("Zoom Active Panel", None, || Box::new(ZoomActivePanel)),
     Command::new("Switch Session...", None, || Box::new(SwitchSession)),
     Command::new("New Session...", None, || Box::new(NewSession)),
+    Command::new("Refresh tmux key tables", None, || {
+        Box::new(RefreshKeyTables)
+    }),
     Command::new("Toggle Light/Dark Theme", None, || {
         Box::new(ToggleThemeMode)
     }),
@@ -120,6 +123,7 @@ mod tests {
                 "Zoom Active Panel",
                 "Switch Session...",
                 "New Session...",
+                "Refresh tmux key tables",
                 "Toggle Light/Dark Theme",
                 "Select Theme: Default Light",
                 "Select Theme: Default Dark",

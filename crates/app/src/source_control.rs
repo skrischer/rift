@@ -435,6 +435,8 @@ mod tests {
                 ahead: 0,
                 behind: 0,
             }),
+            0,
+            0,
         );
         model
     }

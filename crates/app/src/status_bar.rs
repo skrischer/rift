@@ -1,50 +1,76 @@
-//! Status bar: a thin, read-only strip along the bottom of the window — a
-//! `flex_col` sibling of the `DockArea`, not a dock `Panel`
-//! (`docs/spec-status-bar.md`). Renders two groups: the left group is the
-//! current git branch plus its ahead/behind counts against the upstream,
-//! sourced from `WorktreeModel::branch()` / `ahead_behind()` (`RepoState`
-//! folds) and shown only once a `RepoState` has actually arrived (#490);
-//! the right group is the aggregate error/warning diagnostic counts,
-//! aggregated locally from `WorktreeModel::all_diagnostics()` (`Diagnostics`
-//! folds) — the shared `DiagnosticSeverity` derives no `Ord`, so the counting
-//! (unlike `problems_panel`'s sorted grouping) needs no ordinal, just a match
-//! per item.
+//! The composite status line (`docs/spec-status-line.md`): one 28px workspace
+//! bar, all mono, on the darkest ground token — replacing the three competing
+//! bars the wave-1 gap analysis found (the 24px workspace strip, SessionView's
+//! own statusbar, and the env-gated tmux mirror).
 //!
-//! [`render`] is one of the two exclusive render modes
-//! (`docs/spec-tmux-statusline-mirroring.md`, #221); [`StatusBarMode`] selects
-//! between it and [`render_mirrored`], the mirrored tmux status line built
-//! from [`MirroredStatusLine`]. The two never compose.
+//! Left group: the `>_ rift` wordmark, the live tmux window list (each window a
+//! clickable `index:name` chip — the active one on a surface chip, a dot on
+//! busy/attention windows; clicks select the window through the terminal's
+//! existing command channel), and a transient PREFIX indicator while a chord is
+//! pending. Right group: the git branch with its ahead/behind counts, the
+//! working-tree `+N -M` line totals (hidden when clean), the aggregate error/
+//! warning counts (hidden at zero), the language-server health dot + name, the
+//! editor cursor `Ln L, Col C`, and a minute clock. Every value is read from an
+//! existing model plus the two new streams; the pure formatting helpers below
+//! are unit-tested, the element is assembled in [`render`].
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 
-use gpui::{div, px, App, FontWeight, Hsla, IntoElement, ParentElement as _, Styled as _};
-use gpui_component::ActiveTheme as _;
-use rift_protocol::{AheadBehind, Diagnostic, DiagnosticSeverity};
-use rift_terminal::{
-    parse_status_options, parse_style, parse_style_runs, truncate_runs, ResolvedColor, StatusStyle,
-    StyleRun,
+use gpui::{
+    div, px, App, Entity, FontWeight, InteractiveElement as _, IntoElement, MouseButton,
+    ParentElement as _, SharedString, Styled as _,
 };
+use gpui_component::{h_flex, ActiveTheme as _};
+use rift_protocol::{AheadBehind, Diagnostic, DiagnosticSeverity, LspServerState};
+use rift_terminal::{PaneActivity, SessionView, StatusWindow};
 
-/// Fixed height of the status bar strip, in pixels — a thin single row, never
-/// competing with the dock area for vertical space.
-const HEIGHT: f32 = 24.0;
+/// Fixed height of the composite status line, in pixels (the design's 28px).
+const HEIGHT: f32 = 28.0;
 
-/// Label shown when a received `RepoState` carries no branch. The daemon only
-/// emits `RepoState` for git-repo roots, so once one has arrived a `None`
-/// branch genuinely means a detached HEAD — while no `RepoState` has arrived
-/// (startup, not connected, non-repo root) the segment is omitted entirely
-/// instead of claiming this (#490).
+/// Mono text size shared by every segment (the design's 12px).
+const TEXT_SIZE: f32 = 12.0;
+
+/// Label shown when a received `RepoState` carries no branch (a genuine
+/// detached HEAD — the daemon only emits `RepoState` for git-repo roots). While
+/// no `RepoState` has arrived the branch segment is omitted entirely rather than
+/// claiming this (#490).
 const NO_BRANCH_LABEL: &str = "detached HEAD";
 
+/// The full set of values the composite status line renders, borrowed from the
+/// workspace's existing models plus the two new streams. Kept as one struct so
+/// [`render`]'s signature stays legible and the workspace assembles the read in
+/// one place.
+pub struct StatusLineModel<'a> {
+    /// The live tmux window list, in tab order (`SessionView::status_windows`).
+    pub windows: &'a [StatusWindow],
+    /// Whether the focused pane is mid-chord after the tmux prefix.
+    pub prefix_pending: bool,
+    /// Whether a `RepoState` has arrived (gates the branch segment, #490).
+    pub repo_state_received: bool,
+    /// Current branch, or `None` for a detached HEAD.
+    pub branch: Option<&'a str>,
+    /// Ahead/behind vs the upstream, or `None` when there is none.
+    pub ahead_behind: Option<AheadBehind>,
+    /// Working-tree lines added vs HEAD (#520).
+    pub lines_added: u32,
+    /// Working-tree lines removed vs HEAD (#520).
+    pub lines_removed: u32,
+    /// The workspace's aggregate diagnostics map (path -> server -> items).
+    pub diagnostics: &'a BTreeMap<String, BTreeMap<String, Vec<Diagnostic>>>,
+    /// Language-server health, keyed by stable server name (`LspStatus`).
+    pub lsp: &'a BTreeMap<String, LspServerState>,
+    /// The active editor tab's zero-based cursor `(line, column)`, or `None`
+    /// when no tab is open.
+    pub cursor: Option<(u32, u32)>,
+    /// The client-local minute clock, pre-formatted (`format_clock`).
+    pub clock: &'a str,
+}
+
 /// Format the branch + ahead/behind label, or `None` while no `RepoState` has
-/// arrived — startup, a lost connection, and non-repo roots all make no branch
-/// claim rather than fabricating "detached HEAD" (#490). The ahead/behind
-/// counts are appended only when there is something to show: a `None`
-/// `ahead_behind` (no upstream) or an up-to-date `0`/`0` both omit them,
-/// mirroring git's own porcelain output (`git status` drops the bracket when
-/// there is nothing to report).
-fn segment_text(
+/// arrived (#490). Ahead/behind is appended only when there is something to
+/// show — no upstream, or an up-to-date `0`/`0`, both omit it, mirroring git's
+/// own porcelain output.
+fn branch_text(
     repo_state_received: bool,
     branch: Option<&str>,
     ahead_behind: Option<AheadBehind>,
@@ -61,13 +87,9 @@ fn segment_text(
     Some(text)
 }
 
-/// Total error/warning diagnostic counts across every file and server in the
-/// model's diagnostics map. A small local aggregation — the shared
-/// `DiagnosticSeverity` derives no `Ord`, mirroring the reason
-/// `problems_panel::SeverityCounts` also computes locally; only the two
-/// counts the status bar needs are isolated here, per the spec's
-/// optional-shared-helper note (duplicating `problems_panel`'s counting is
-/// accepted for v1).
+/// Total error/warning diagnostic counts across every file and server. A small
+/// local aggregation — the shared `DiagnosticSeverity` derives no `Ord`, so
+/// this counts with a match per item (like `problems_panel::SeverityCounts`).
 fn diagnostic_counts(
     diagnostics: &BTreeMap<String, BTreeMap<String, Vec<Diagnostic>>>,
 ) -> (usize, usize) {
@@ -83,302 +105,259 @@ fn diagnostic_counts(
     (errors, warnings)
 }
 
-/// `count noun`/`count nouns` — singular for exactly one, plural otherwise.
-fn pluralize(count: usize, noun: &str) -> String {
-    if count == 1 {
-        format!("{count} {noun}")
-    } else {
-        format!("{count} {noun}s")
-    }
-}
-
-/// Format the diagnostic-counts segment text, or `None` when there is
-/// nothing to report — a zero/zero total renders quietly (the segment is
-/// omitted entirely), mirroring how the left group omits ahead/behind when
-/// up to date.
-fn diagnostics_text(errors: usize, warnings: usize) -> Option<String> {
-    if errors == 0 && warnings == 0 {
+/// The `+N` / `-M` working-tree line-total labels, or `None` on a clean
+/// worktree (both zero) so the segment hides itself. Both labels are always
+/// present together once shown, even when one side is zero, matching `git diff
+/// --numstat`'s paired totals.
+fn line_totals_text(added: u32, removed: u32) -> Option<(String, String)> {
+    if added == 0 && removed == 0 {
         return None;
     }
-    Some(format!(
-        "{}, {}",
-        pluralize(errors, "error"),
-        pluralize(warnings, "warning")
-    ))
+    Some((format!("+{added}"), format!("-{removed}")))
 }
 
-/// Render the status bar strip: the left group (branch + ahead/behind) and
-/// the right group (aggregate diagnostic counts), pushed apart by a flexible
-/// spacer. Until a `RepoState` arrives the left group is omitted entirely
-/// (no branch claim at startup or on non-repo roots, #490); a received state
-/// without a branch (detached HEAD) renders muted; zero diagnostics omits
-/// the right group entirely — none of these is ever a crash.
+/// The `Ln L, Col C` cursor label (1-based for display), or `None` when no
+/// editor tab is open. The model carries the zero-based `(line, column)` the
+/// editor's `InputState` reports.
+fn cursor_text(cursor: Option<(u32, u32)>) -> Option<String> {
+    cursor.map(|(line, column)| format!("Ln {}, Col {}", line + 1, column + 1))
+}
+
+/// The client-local minute clock, `HH:MM`, zero-padded. Pure so the caller
+/// feeds `chrono::Local::now()`'s hour/minute and this stays testable without a
+/// clock.
+pub fn format_clock(hour: u32, minute: u32) -> String {
+    format!("{hour:02}:{minute:02}")
+}
+
+/// Build the composite status line element. Theme tokens only: the bar sits on
+/// the sidebar (darkest chrome) ground, mono at [`TEXT_SIZE`]; counts and the
+/// LSP dot color by severity/state via `success`/`warning`/`danger`. Window
+/// chips dispatch `select-window` through `session_view` (the existing tmux
+/// command channel) on click.
 pub fn render(
-    repo_state_received: bool,
-    branch: Option<&str>,
-    ahead_behind: Option<AheadBehind>,
-    diagnostics: &BTreeMap<String, BTreeMap<String, Vec<Diagnostic>>>,
+    model: StatusLineModel,
+    session_view: &Entity<SessionView>,
     cx: &App,
 ) -> impl IntoElement {
-    let branch_text = segment_text(repo_state_received, branch, ahead_behind);
-    let branch_color = if branch.is_some() {
-        cx.theme().foreground
-    } else {
-        cx.theme().muted_foreground
-    };
+    let theme = cx.theme();
+    let mono = theme.mono_font_family.clone();
 
-    let (errors, warnings) = diagnostic_counts(diagnostics);
-    let counts_text = diagnostics_text(errors, warnings);
-    let counts_color = if errors > 0 {
-        cx.theme().danger
-    } else {
-        cx.theme().warning
-    };
+    // --- left group: wordmark, window list, PREFIX ---------------------------
+    let wordmark = div()
+        .font_weight(FontWeight::BOLD)
+        .text_color(theme.primary)
+        .child(">_ rift");
 
-    let mut bar = div()
-        .flex()
-        .flex_shrink_0()
+    let mut window_list = h_flex().gap(px(4.0)).items_center();
+    for w in model.windows {
+        window_list = window_list.child(window_chip(w, session_view, cx));
+    }
+
+    let prefix = model.prefix_pending.then(|| {
+        div()
+            .px(px(6.0))
+            .rounded(px(3.0))
+            .bg(theme.warning)
+            .text_color(theme.background)
+            .font_weight(FontWeight::BOLD)
+            .child("PREFIX")
+    });
+
+    let left = h_flex()
+        .gap(px(16.0))
         .items_center()
-        .w_full()
-        .h(px(HEIGHT))
-        .px(px(8.0))
-        .border_t_1()
-        .border_color(cx.theme().border)
-        .bg(cx.theme().background)
-        .text_xs();
+        .child(wordmark)
+        .child(window_list)
+        .children(prefix);
 
-    if let Some(text) = branch_text {
-        bar = bar.child(div().text_color(branch_color).child(text));
-    }
-    let bar = bar.child(div().flex_1());
+    // --- right group: branch, totals, counts, LSP, cursor, clock ------------
+    let branch =
+        branch_text(model.repo_state_received, model.branch, model.ahead_behind).map(|t| {
+            let color = if model.branch.is_some() {
+                theme.foreground
+            } else {
+                theme.muted_foreground
+            };
+            div().text_color(color).child(SharedString::from(t))
+        });
 
-    match counts_text {
-        Some(text) => bar.child(div().text_color(counts_color).child(text)),
-        None => bar,
-    }
-}
+    let totals =
+        line_totals_text(model.lines_added, model.lines_removed).map(|(added, removed)| {
+            h_flex()
+                .gap(px(6.0))
+                .items_center()
+                .child(
+                    div()
+                        .text_color(theme.success)
+                        .child(SharedString::from(added)),
+                )
+                .child(
+                    div()
+                        .text_color(theme.danger)
+                        .child(SharedString::from(removed)),
+                )
+        });
 
-/// Env var enabling the mirrored tmux status line (the spec's `RIFT_*`
-/// opt-in toggle, `docs/spec-tmux-statusline-mirroring.md`).
-const MIRROR_ENV_VAR: &str = "RIFT_STATUSLINE_MIRROR";
-
-/// Which render mode the status bar uses: the native Phase 2d fields (this
-/// module's default `render`) or the mirrored tmux status line
-/// ([`render_mirrored`]) — mutually exclusive, resolved once at startup; the
-/// two never compose.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatusBarMode {
-    Native,
-    Mirrored,
-}
-
-impl StatusBarMode {
-    /// Resolve the mode from [`MIRROR_ENV_VAR`]: any non-empty value selects
-    /// the mirrored render, matching the `RIFT_TERMINAL_LEGACY` escape-hatch
-    /// convention elsewhere in the app. Read once at startup — a launch-time
-    /// mode switch, not a live UI toggle (the spec's v1 scope).
-    pub fn from_env() -> Self {
-        Self::resolve(std::env::var_os(MIRROR_ENV_VAR))
-    }
-
-    fn resolve(var: Option<OsString>) -> Self {
-        if var.is_some_and(|v| !v.is_empty()) {
-            Self::Mirrored
-        } else {
-            Self::Native
+    let (errors, warnings) = diagnostic_counts(model.diagnostics);
+    let counts = (errors > 0 || warnings > 0).then(|| {
+        let mut row = h_flex().gap(px(10.0)).items_center();
+        if errors > 0 {
+            row = row.child(count_segment(theme.danger, errors));
         }
+        if warnings > 0 {
+            row = row.child(count_segment(theme.warning, warnings));
+        }
+        row
+    });
+
+    let mut lsp = h_flex().gap(px(10.0)).items_center();
+    for (server, state) in model.lsp {
+        lsp = lsp.child(
+            h_flex()
+                .gap(px(4.0))
+                .items_center()
+                .child(dot(lsp_state_color(*state, cx)))
+                .child(
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(server.clone())),
+                ),
+        );
     }
-}
 
-/// The mirrored tmux status line's render model (#221): the resolved
-/// `status-style` base plus the parsed, length-truncated runs for the left
-/// and right segments — everything [`render_mirrored`] needs. Carries no GPUI
-/// state, so building it from a raw `StatusLineReply` stays unit-testable
-/// without a GPUI context. The default (empty runs, the theme-deferring base
-/// style) is what renders before the first reply arrives — never a blanked
-/// bar, never a panic.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct MirroredStatusLine {
-    pub base: StatusStyle,
-    pub left: Vec<StyleRun>,
-    pub right: Vec<StyleRun>,
-}
+    let cursor = cursor_text(model.cursor).map(|t| {
+        div()
+            .text_color(theme.muted_foreground)
+            .child(SharedString::from(t))
+    });
 
-/// Build the render model from a `StatusLineReply`'s three raw strings: the
-/// `show-options -A` output and the two server-side-expanded segments
-/// (`docs/spec-tmux-statusline-mirroring.md`). `status-style` resolves to the
-/// base every run starts from and `#[default]` resets to; each segment is
-/// then parsed and truncated to its own `status-*-length`.
-pub fn build_mirrored_status_line(
-    options: &str,
-    status_left: &str,
-    status_right: &str,
-) -> MirroredStatusLine {
-    let options = parse_status_options(options);
-    let base = parse_style(&options.status_style);
-    let left = truncate_runs(
-        parse_style_runs(status_left, base),
-        options.status_left_length,
-    );
-    let right = truncate_runs(
-        parse_style_runs(status_right, base),
-        options.status_right_length,
-    );
-    MirroredStatusLine { base, left, right }
-}
+    let clock = div()
+        .text_color(theme.muted_foreground)
+        .child(SharedString::from(model.clock.to_owned()));
 
-/// Resolve a tmux color token against the active theme: `ResolvedColor::Theme`
-/// (tmux `default`/`terminal`, or a style option itself left at `default`)
-/// defers to `theme_color`; a concrete `ResolvedColor::Color` wins outright.
-/// Re-run on every render, so a theme switch re-resolves `default` colors
-/// live.
-fn resolve_color(color: ResolvedColor, theme_color: Hsla) -> Hsla {
-    match color {
-        ResolvedColor::Theme => theme_color,
-        ResolvedColor::Color(hsla) => hsla,
-    }
-}
+    let right = h_flex()
+        .gap(px(16.0))
+        .items_center()
+        .children(branch)
+        .children(totals)
+        .children(counts)
+        .children((!model.lsp.is_empty()).then_some(lsp))
+        .children(cursor)
+        .child(clock);
 
-/// One status-line run's fully resolved render data: colors resolved against
-/// the theme, attributes mapped to their GPUI-facing form — before it becomes
-/// a `div`. Kept as its own step so the `StyleRun` -> render mapping is
-/// unit-testable without a GPUI context. `blink` and `overline` have no
-/// static-frame GPUI equivalent and are accepted no-ops here, mirroring how
-/// `acs` is a no-op in the parser.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct ResolvedSpan {
-    fg: Hsla,
-    bg: Hsla,
-    bold: bool,
-    italic: bool,
-    underline: bool,
-    strikethrough: bool,
-    opacity: f32,
-}
-
-fn resolve_span(style: &StatusStyle, base_fg: Hsla, base_bg: Hsla) -> ResolvedSpan {
-    let fg = resolve_color(style.fg, base_fg);
-    let bg = resolve_color(style.bg, base_bg);
-    // tmux's `reverse` swaps the resolved fg/bg pair, not the tokens
-    // themselves — mirroring the terminal cell renderer's own inverse handling
-    // (`rift_terminal::pane_view::extract_row_cells`).
-    let (fg, bg) = if style.attrs.reverse {
-        (bg, fg)
-    } else {
-        (fg, bg)
-    };
-    let opacity = if style.attrs.hidden {
-        0.0
-    } else if style.attrs.dim {
-        0.6
-    } else {
-        1.0
-    };
-    ResolvedSpan {
-        fg,
-        bg,
-        bold: style.attrs.bold,
-        italic: style.attrs.italic,
-        underline: style.attrs.underline,
-        strikethrough: style.attrs.strikethrough,
-        opacity,
-    }
-}
-
-/// Turn one resolved run into a styled `div`, applying only the attributes it
-/// actually sets (leaving GPUI's defaults otherwise).
-fn styled_run(run: &StyleRun, base_fg: Hsla, base_bg: Hsla) -> impl IntoElement {
-    let span = resolve_span(&run.style, base_fg, base_bg);
-    let mut el = div()
-        .text_color(span.fg)
-        .bg(span.bg)
-        .opacity(span.opacity)
-        .child(run.text.clone());
-    if span.bold {
-        el = el.font_weight(FontWeight::BOLD);
-    }
-    if span.italic {
-        el = el.italic();
-    }
-    if span.underline {
-        el = el.underline();
-    }
-    if span.strikethrough {
-        el = el.line_through();
-    }
-    el
-}
-
-/// Render the mirrored tmux status line (#221): the left segment's runs, a
-/// flexible spacer, then the right segment's runs — the exclusive alternative
-/// to [`render`] selected by [`StatusBarMode::Mirrored`]. `status-style`
-/// paints the bar's own background/foreground; `default` colors (in the base
-/// or any run) resolve against `cx.theme()`, so a theme switch re-resolves
-/// them live on the next render.
-pub fn render_mirrored(mirrored: &MirroredStatusLine, cx: &App) -> impl IntoElement {
-    let base_fg = resolve_color(mirrored.base.fg, cx.theme().foreground);
-    let base_bg = resolve_color(mirrored.base.bg, cx.theme().background);
-
-    div()
-        .flex()
+    h_flex()
         .flex_shrink_0()
+        .justify_between()
         .items_center()
         .w_full()
         .h(px(HEIGHT))
-        .px(px(8.0))
+        .px(px(12.0))
         .border_t_1()
-        .border_color(cx.theme().border)
-        .bg(base_bg)
-        .text_xs()
-        .text_color(base_fg)
-        .children(
-            mirrored
-                .left
-                .iter()
-                .map(|run| styled_run(run, base_fg, base_bg)),
-        )
-        .child(div().flex_1())
-        .children(
-            mirrored
-                .right
-                .iter()
-                .map(|run| styled_run(run, base_fg, base_bg)),
-        )
+        .border_color(theme.border)
+        .bg(theme.sidebar)
+        .font_family(mono)
+        .text_size(px(TEXT_SIZE))
+        .text_color(theme.foreground)
+        .child(left)
+        .child(right)
+}
+
+/// One window as a clickable `index:name` chip. The active window sits on a
+/// surface chip (`list_active`); a busy/attention window carries a leading dot
+/// (success / danger). Click dispatches `select-window` through `session_view`
+/// (the existing tmux command channel) — never a parallel path.
+fn window_chip(w: &StatusWindow, session_view: &Entity<SessionView>, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let activity_color = match w.activity {
+        PaneActivity::Busy => Some(theme.success),
+        PaneActivity::Attention => Some(theme.danger),
+        PaneActivity::Free => None,
+    };
+    let label = format!("{}:{}", w.index, w.name);
+    let entity = session_view.clone();
+    let window_id = w.id.clone();
+
+    let mut chip = div()
+        .id(SharedString::from(format!("status-window-{}", w.id)))
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .px(px(6.0))
+        .rounded(px(3.0))
+        .cursor_pointer()
+        .text_color(if w.is_active {
+            theme.foreground
+        } else {
+            theme.muted_foreground
+        });
+    if w.is_active {
+        chip = chip.bg(theme.list_active);
+    } else {
+        chip = chip.hover(|s| s.bg(theme.list_hover));
+    }
+    chip.children(activity_color.map(dot))
+        .child(SharedString::from(label))
+        .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+            entity.update(cx, |view, cx| view.select_window(&window_id, cx));
+        })
+}
+
+/// A colored dot + count, for one diagnostic severity (`●e` / `⚠w` in the
+/// design, rendered as a token-colored dot so no emoji glyph is used).
+fn count_segment(color: gpui::Hsla, count: usize) -> impl IntoElement {
+    h_flex()
+        .gap(px(4.0))
+        .items_center()
+        .child(dot(color))
+        .child(SharedString::from(count.to_string()))
+}
+
+/// A 6px filled status dot in `color`.
+fn dot(color: gpui::Hsla) -> impl IntoElement {
+    div().size(px(6.0)).rounded_full().bg(color)
+}
+
+/// The health-dot color for one language-server state: running = success,
+/// starting = warning, crashed = danger.
+fn lsp_state_color(state: LspServerState, cx: &App) -> gpui::Hsla {
+    match state {
+        LspServerState::Running => cx.theme().success,
+        LspServerState::Starting => cx.theme().warning,
+        LspServerState::Crashed => cx.theme().danger,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rift_protocol::{Position, Range};
 
     #[test]
-    fn test_segment_text_shows_branch_name_when_present_with_no_upstream() {
+    fn test_branch_text_shows_branch_name_when_present_with_no_upstream() {
         assert_eq!(
-            segment_text(true, Some("main"), None),
+            branch_text(true, Some("main"), None),
             Some("main".to_owned())
         );
     }
 
     #[test]
-    fn test_segment_text_before_repo_state_arrives_is_hidden() {
-        // Startup / not connected / non-repo root: no `RepoState` has arrived,
-        // so there is no branch claim to make — never "detached HEAD" (#490).
-        assert_eq!(segment_text(false, None, None), None);
+    fn test_branch_text_before_repo_state_arrives_is_hidden() {
+        assert_eq!(branch_text(false, None, None), None);
     }
 
     #[test]
-    fn test_segment_text_shows_detached_head_only_after_repo_state_arrived() {
-        // A received `RepoState` without a branch genuinely means a detached
-        // HEAD — the daemon only emits `RepoState` for repo roots.
+    fn test_branch_text_shows_detached_head_only_after_repo_state_arrived() {
         assert_eq!(
-            segment_text(true, None, None),
+            branch_text(true, None, None),
             Some("detached HEAD".to_owned())
         );
     }
 
     #[test]
-    fn test_segment_text_appends_ahead_behind_counts() {
+    fn test_branch_text_appends_ahead_behind_counts() {
         assert_eq!(
-            segment_text(
+            branch_text(
                 true,
                 Some("main"),
                 Some(AheadBehind {
@@ -391,9 +370,9 @@ mod tests {
     }
 
     #[test]
-    fn test_segment_text_omits_ahead_behind_when_up_to_date() {
+    fn test_branch_text_omits_ahead_behind_when_up_to_date() {
         assert_eq!(
-            segment_text(
+            branch_text(
                 true,
                 Some("main"),
                 Some(AheadBehind {
@@ -405,42 +384,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_segment_text_includes_both_counts_when_only_one_side_is_nonzero() {
-        assert_eq!(
-            segment_text(
-                true,
-                Some("main"),
-                Some(AheadBehind {
-                    ahead: 3,
-                    behind: 0
-                })
-            ),
-            Some("main \u{2191}3 \u{2193}0".to_owned())
-        );
-    }
-
-    #[test]
-    fn test_segment_text_detached_with_ahead_behind_still_appends_counts() {
-        // Defensive: the daemon never pairs a `None` branch with `Some`
-        // ahead/behind in practice, but the formatter must not special-case
-        // that combination away — it just composes the two independently.
-        assert_eq!(
-            segment_text(
-                true,
-                None,
-                Some(AheadBehind {
-                    ahead: 1,
-                    behind: 0
-                })
-            ),
-            Some("detached HEAD \u{2191}1 \u{2193}0".to_owned())
-        );
-    }
-
     fn diag(severity: DiagnosticSeverity) -> Diagnostic {
-        use rift_protocol::{Position, Range};
-
         Diagnostic {
             range: Range {
                 start: Position {
@@ -497,7 +441,6 @@ mod tests {
                 ],
             ),
         ]);
-
         assert_eq!(diagnostic_counts(&map), (2, 2));
     }
 
@@ -511,158 +454,46 @@ mod tests {
                 diag(DiagnosticSeverity::Hint),
             ],
         )]);
-
         assert_eq!(diagnostic_counts(&map), (0, 0));
     }
 
     #[test]
-    fn test_diagnostics_text_hides_when_zero_errors_and_zero_warnings() {
-        assert_eq!(diagnostics_text(0, 0), None);
+    fn test_line_totals_text_hidden_on_clean_worktree() {
+        assert_eq!(line_totals_text(0, 0), None);
     }
 
     #[test]
-    fn test_diagnostics_text_pluralizes_singular_counts() {
+    fn test_line_totals_text_shows_both_sides_when_shown_even_if_one_is_zero() {
         assert_eq!(
-            diagnostics_text(1, 0),
-            Some("1 error, 0 warnings".to_owned())
+            line_totals_text(12, 0),
+            Some(("+12".to_owned(), "-0".to_owned()))
         );
         assert_eq!(
-            diagnostics_text(0, 1),
-            Some("0 errors, 1 warning".to_owned())
+            line_totals_text(0, 3),
+            Some(("+0".to_owned(), "-3".to_owned()))
         );
-    }
-
-    #[test]
-    fn test_diagnostics_text_shows_both_counts_when_both_nonzero() {
         assert_eq!(
-            diagnostics_text(2, 3),
-            Some("2 errors, 3 warnings".to_owned())
-        );
-    }
-
-    // --- mirrored status line toggle + render model (#221) ---
-
-    #[test]
-    fn test_status_bar_mode_resolve_absent_var_is_native() {
-        assert_eq!(StatusBarMode::resolve(None), StatusBarMode::Native);
-    }
-
-    #[test]
-    fn test_status_bar_mode_resolve_empty_var_is_native() {
-        assert_eq!(
-            StatusBarMode::resolve(Some(OsString::from(""))),
-            StatusBarMode::Native
+            line_totals_text(12, 3),
+            Some(("+12".to_owned(), "-3".to_owned()))
         );
     }
 
     #[test]
-    fn test_status_bar_mode_resolve_nonempty_var_is_mirrored() {
-        assert_eq!(
-            StatusBarMode::resolve(Some(OsString::from("1"))),
-            StatusBarMode::Mirrored
-        );
+    fn test_cursor_text_is_hidden_without_a_tab() {
+        assert_eq!(cursor_text(None), None);
     }
 
     #[test]
-    fn test_build_mirrored_status_line_resolves_base_and_truncates_segments() {
-        let options = "\
-status-style bg=colour234,fg=colour253
-status-left-length 3
-status-right-length 40
-";
-        let mirrored = build_mirrored_status_line(options, "#[fg=green]hello", "#[fg=yellow]world");
-
-        assert_eq!(mirrored.base, parse_style("bg=colour234,fg=colour253"));
-        assert_eq!(mirrored.left.len(), 1);
-        assert_eq!(mirrored.left[0].text, "hel");
-        assert_eq!(mirrored.right.len(), 1);
-        assert_eq!(mirrored.right[0].text, "world");
+    fn test_cursor_text_is_one_based_for_display() {
+        // Zero-based (0, 0) from the editor reads as Ln 1, Col 1.
+        assert_eq!(cursor_text(Some((0, 0))), Some("Ln 1, Col 1".to_owned()));
+        assert_eq!(cursor_text(Some((41, 7))), Some("Ln 42, Col 8".to_owned()));
     }
 
     #[test]
-    fn test_build_mirrored_status_line_defaults_on_empty_input() {
-        let mirrored = build_mirrored_status_line("", "", "");
-        assert_eq!(mirrored.base, StatusStyle::default());
-        assert!(mirrored.left.is_empty());
-        assert!(mirrored.right.is_empty());
-    }
-
-    fn hsla(l: f32) -> Hsla {
-        Hsla {
-            h: 0.0,
-            s: 0.0,
-            l,
-            a: 1.0,
-        }
-    }
-
-    #[test]
-    fn test_resolve_color_theme_defers_to_theme_color() {
-        let theme = hsla(0.5);
-        assert_eq!(resolve_color(ResolvedColor::Theme, theme), theme);
-    }
-
-    #[test]
-    fn test_resolve_color_concrete_color_wins_over_theme() {
-        let concrete = hsla(0.2);
-        assert_eq!(
-            resolve_color(ResolvedColor::Color(concrete), hsla(0.9)),
-            concrete
-        );
-    }
-
-    #[test]
-    fn test_resolve_span_reverse_swaps_fg_and_bg() {
-        let mut style = StatusStyle {
-            fg: ResolvedColor::Color(hsla(0.1)),
-            bg: ResolvedColor::Color(hsla(0.8)),
-            ..Default::default()
-        };
-        style.attrs.reverse = true;
-        let span = resolve_span(&style, hsla(0.0), hsla(1.0));
-        assert_eq!(span.fg, hsla(0.8));
-        assert_eq!(span.bg, hsla(0.1));
-    }
-
-    #[test]
-    fn test_resolve_span_hidden_overrides_dim_to_zero_opacity() {
-        let mut style = StatusStyle::default();
-        style.attrs.dim = true;
-        style.attrs.hidden = true;
-        let span = resolve_span(&style, hsla(0.0), hsla(1.0));
-        assert_eq!(span.opacity, 0.0);
-    }
-
-    #[test]
-    fn test_resolve_span_dim_alone_reduces_opacity() {
-        let mut style = StatusStyle::default();
-        style.attrs.dim = true;
-        let span = resolve_span(&style, hsla(0.0), hsla(1.0));
-        assert_eq!(span.opacity, 0.6);
-    }
-
-    #[test]
-    fn test_resolve_span_no_attrs_is_full_opacity_no_flags() {
-        let style = StatusStyle::default();
-        let span = resolve_span(&style, hsla(0.0), hsla(1.0));
-        assert_eq!(span.opacity, 1.0);
-        assert!(!span.bold);
-        assert!(!span.italic);
-        assert!(!span.underline);
-        assert!(!span.strikethrough);
-    }
-
-    #[test]
-    fn test_resolve_span_passes_through_bold_italic_underline_strikethrough() {
-        let mut style = StatusStyle::default();
-        style.attrs.bold = true;
-        style.attrs.italic = true;
-        style.attrs.underline = true;
-        style.attrs.strikethrough = true;
-        let span = resolve_span(&style, hsla(0.0), hsla(1.0));
-        assert!(span.bold);
-        assert!(span.italic);
-        assert!(span.underline);
-        assert!(span.strikethrough);
+    fn test_format_clock_zero_pads_hour_and_minute() {
+        assert_eq!(format_clock(9, 5), "09:05");
+        assert_eq!(format_clock(23, 59), "23:59");
+        assert_eq!(format_clock(0, 0), "00:00");
     }
 }
