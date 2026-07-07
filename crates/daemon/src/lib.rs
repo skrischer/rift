@@ -771,7 +771,7 @@ async fn request_reply(
 /// Convert a navigation `ClientMessage` into the internal [`NavRequest`] the LSP
 /// worker consumes, attaching `reply` — the requesting connection's private
 /// response channel (#482). Returns `None` for any non-navigation message; the
-/// caller only ever passes the three navigation variants, so `None` is a
+/// caller only ever passes the four navigation variants, so `None` is a
 /// caller bug handled as a silent drop rather than a panic.
 fn nav_request(msg: ClientMessage, reply: mpsc::Sender<DaemonMessage>) -> Option<NavRequest> {
     match msg {
@@ -793,19 +793,23 @@ fn nav_request(msg: ClientMessage, reply: mpsc::Sender<DaemonMessage>) -> Option
             position,
             reply,
         }),
+        ClientMessage::DocumentSymbolRequest { id, path } => {
+            Some(NavRequest::DocumentSymbol { id, path, reply })
+        }
         _ => None,
     }
 }
 
 /// Per-connection drop-stale bookkeeping for the navigation reply path (#482).
 ///
-/// A connection issues hover / definition / references requests with a
-/// client-assigned [`NavRequestId`] and receives their answers on its own reply
-/// channel. A slow server can deliver an answer after the user has moved on and
-/// issued a newer request of the same kind; this gate records the latest id per
-/// operation on send ([`record`](NavStaleGate::record)) and, on receipt, reports
-/// whether the answer still matches ([`is_current`](NavStaleGate::is_current)) —
-/// a superseded answer is dropped before it reaches the socket. Keeping the
+/// A connection issues hover / definition / references / document-symbol
+/// requests with a client-assigned [`NavRequestId`] and receives their
+/// answers on its own reply channel. A slow server can deliver an answer
+/// after the user has moved on and issued a newer request of the same kind;
+/// this gate records the latest id per operation on send
+/// ([`record`](NavStaleGate::record)) and, on receipt, reports whether the
+/// answer still matches ([`is_current`](NavStaleGate::is_current)) — a
+/// superseded answer is dropped before it reaches the socket. Keeping the
 /// state per connection is the fix's core: one client's newer request can no
 /// longer cancel another client's in-flight answer.
 #[derive(Default)]
@@ -813,6 +817,7 @@ struct NavStaleGate {
     latest_hover: Option<NavRequestId>,
     latest_definition: Option<NavRequestId>,
     latest_references: Option<NavRequestId>,
+    latest_document_symbol: Option<NavRequestId>,
 }
 
 impl NavStaleGate {
@@ -823,6 +828,9 @@ impl NavStaleGate {
             ClientMessage::HoverRequest { id, .. } => self.latest_hover = Some(*id),
             ClientMessage::DefinitionRequest { id, .. } => self.latest_definition = Some(*id),
             ClientMessage::ReferencesRequest { id, .. } => self.latest_references = Some(*id),
+            ClientMessage::DocumentSymbolRequest { id, .. } => {
+                self.latest_document_symbol = Some(*id)
+            }
             _ => {}
         }
     }
@@ -837,6 +845,9 @@ impl NavStaleGate {
             DaemonMessage::HoverResponse { id, .. } => self.latest_hover == Some(*id),
             DaemonMessage::DefinitionResponse { id, .. } => self.latest_definition == Some(*id),
             DaemonMessage::ReferencesResponse { id, .. } => self.latest_references == Some(*id),
+            DaemonMessage::DocumentSymbolResponse { id, .. } => {
+                self.latest_document_symbol == Some(*id)
+            }
             _ => true,
         }
     }
@@ -869,8 +880,9 @@ impl NavStaleGate {
 /// are forwarded only once this connection's `Welcome` has been written
 /// (issue #425) — the client requires `Welcome` as its first frame.
 ///
-/// Navigation requests (hover/definition/references) are answered per connection
-/// too (#482): each is forwarded to the off-loop LSP worker over `nav_requests`
+/// Navigation requests (hover/definition/references/document-symbol) are
+/// answered per connection too (#482): each is forwarded to the off-loop LSP
+/// worker over `nav_requests`
 /// carrying this connection's own private `reply` channel, and the worker sends
 /// the answer straight back on it. The answer is written to *this* socket alone,
 /// never onto the shared bus — so with two clients attached (stable + dev share
@@ -912,10 +924,11 @@ where
     let mut snapshot_sent = false;
 
     // This connection's private navigation reply path (#482): the LSP worker's
-    // spawned nav tasks send hover/definition/references answers here, and only
-    // here — never onto the shared bus — so another attached client can neither
-    // see nor cancel them. `nav_gate` tracks the latest request id per operation
-    // for this connection so a superseded answer is dropped before the socket.
+    // spawned nav tasks send hover/definition/references/document-symbol
+    // answers here, and only here — never onto the shared bus — so another
+    // attached client can neither see nor cancel them. `nav_gate` tracks the
+    // latest request id per operation for this connection so a superseded
+    // answer is dropped before the socket.
     let (nav_reply_tx, mut nav_reply_rx) = mpsc::channel::<DaemonMessage>(NAV_REPLY_CAPACITY);
     let mut nav_gate = NavStaleGate::default();
 
@@ -1033,20 +1046,22 @@ where
                                 break 'serve;
                             }
                         }
-                        // Navigation requests (hover/definition/references) are
-                        // answered per connection (#482): forward to the off-loop
-                        // LSP worker carrying this connection's private `reply`
-                        // channel, and record the id as the latest of its kind so
-                        // a superseded answer is drop-stale-gated below. The worker
-                        // sends the answer back on the reply channel (the
-                        // `nav_reply_rx` branch), which writes it to this socket
-                        // alone — never onto the shared bus. When LSP is not armed
-                        // (`nav_requests` is `None`) or the worker's queue is full,
-                        // the request is dropped; "no answer" is a valid nav result
-                        // and a later request re-drives it.
+                        // Navigation requests (hover/definition/references/
+                        // document-symbol) are answered per connection (#482):
+                        // forward to the off-loop LSP worker carrying this
+                        // connection's private `reply` channel, and record the
+                        // id as the latest of its kind so a superseded answer is
+                        // drop-stale-gated below. The worker sends the answer
+                        // back on the reply channel (the `nav_reply_rx` branch),
+                        // which writes it to this socket alone — never onto the
+                        // shared bus. When LSP is not armed (`nav_requests` is
+                        // `None`) or the worker's queue is full, the request is
+                        // dropped; "no answer" is a valid nav result and a later
+                        // request re-drives it.
                         ClientMessage::HoverRequest { .. }
                         | ClientMessage::DefinitionRequest { .. }
-                        | ClientMessage::ReferencesRequest { .. } => {
+                        | ClientMessage::ReferencesRequest { .. }
+                        | ClientMessage::DocumentSymbolRequest { .. } => {
                             nav_gate.record(&msg);
                             if let Some(nav_requests) = &nav_requests {
                                 if let Some(req) = nav_request(msg, nav_reply_tx.clone()) {
@@ -1119,12 +1134,12 @@ where
                 }
             }
             // This connection's private navigation answers (#482), off the shared
-            // bus: the LSP worker's nav task sends hover/definition/references
-            // results here. Drop a superseded answer (the user issued a newer
-            // request of the same kind since) and, once handshaken, write the
-            // rest to this socket alone. `nav_reply_tx` is held by this task for
-            // the connection's lifetime, so this branch never yields `None` — no
-            // guard is needed and it cannot busy-loop.
+            // bus: the LSP worker's nav task sends hover/definition/references/
+            // document-symbol results here. Drop a superseded answer (the user
+            // issued a newer request of the same kind since) and, once
+            // handshaken, write the rest to this socket alone. `nav_reply_tx` is
+            // held by this task for the connection's lifetime, so this branch
+            // never yields `None` — no guard is needed and it cannot busy-loop.
             nav_reply = nav_reply_rx.recv() => {
                 if let Some(msg) = nav_reply {
                     if handshaken && nav_gate.is_current(&msg) {
@@ -1238,8 +1253,9 @@ where
     let inbound = handles.inbound.clone();
     let state = handles.state.clone();
     // This connection's clone of the LSP worker's nav-request sender (#482), so
-    // its hover/definition/references answers return to this socket alone. `None`
-    // when LSP is not armed. Cloned before `daemon.run()` consumes the daemon.
+    // its hover/definition/references/document-symbol answers return to this
+    // socket alone. `None` when LSP is not armed. Cloned before `daemon.run()`
+    // consumes the daemon.
     let nav_requests = daemon.nav_request_sender();
     // Drop the spare handles so the dispatch loop ends once the connection's
     // `inbound` clone is dropped at EOF.
@@ -1493,10 +1509,10 @@ impl Daemon {
 
     /// A clone of the LSP worker's navigation-request sender, or `None` when LSP
     /// is not armed (#482). Each connection takes one so its hover/definition/
-    /// references answers return to that socket alone; the dispatch loop keeps
-    /// the original ([`Core::nav_requests`]) alive for the daemon's lifetime so
-    /// the worker's nav channel does not close as clients come and go. Must be
-    /// read before [`Daemon::run`] consumes the daemon.
+    /// references/document-symbol answers return to that socket alone; the
+    /// dispatch loop keeps the original ([`Core::nav_requests`]) alive for the
+    /// daemon's lifetime so the worker's nav channel does not close as clients
+    /// come and go. Must be read before [`Daemon::run`] consumes the daemon.
     fn nav_request_sender(&self) -> Option<mpsc::Sender<NavRequest>> {
         self.core.nav_requests.clone()
     }
@@ -1569,10 +1585,11 @@ impl Core {
             // messages (`OpenFile`/`SaveFile`/`RequestDiff`) likewise never
             // reach it — they are answered per connection by `request_reply`,
             // request/response back to that socket, not on the broadcast bus.
-            // Navigation requests (hover/definition/references) are also answered
-            // per connection (#482): `serve_connection` forwards them straight to
-            // the LSP worker with the connection's private reply channel, so they
-            // never pass through here either. Neither does the handshake:
+            // Navigation requests (hover/definition/references/document-symbol)
+            // are also answered per connection (#482): `serve_connection`
+            // forwards them straight to the LSP worker with the connection's
+            // private reply channel, so they never pass through here either.
+            // Neither does the handshake:
             // `serve_connection` answers `Hello` per connection (#473) — the
             // `Welcome` must reach exactly one socket, and a version mismatch
             // closes only that connection. These arms are a defensive no-op
@@ -1590,7 +1607,8 @@ impl Core {
             | ClientMessage::RequestDiff { .. }
             | ClientMessage::HoverRequest { .. }
             | ClientMessage::DefinitionRequest { .. }
-            | ClientMessage::ReferencesRequest { .. } => {}
+            | ClientMessage::ReferencesRequest { .. }
+            | ClientMessage::DocumentSymbolRequest { .. } => {}
         }
     }
 
@@ -3306,6 +3324,35 @@ mod tests {
         .expect("a hover response must arrive within the timeout")
     }
 
+    /// A document-symbol request `ClientMessage` at `id`. No `Position` field,
+    /// unlike the other navigation requests.
+    fn document_symbol_request_frame(id: u64) -> Vec<u8> {
+        encode_frame(&ClientMessage::DocumentSymbolRequest {
+            id: NavRequestId(id),
+            path: "a.rs".to_string(),
+        })
+        .expect("encode DocumentSymbolRequest")
+    }
+
+    /// Read framed messages until a `DocumentSymbolResponse` arrives, returning
+    /// its id. Same tolerance/bound discipline as [`read_hover_response_id`].
+    async fn read_document_symbol_response_id<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        decoder: &mut FrameDecoder,
+    ) -> NavRequestId {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match read_daemon_message(reader, decoder).await {
+                    DaemonMessage::Welcome { .. } => continue,
+                    DaemonMessage::DocumentSymbolResponse { id, .. } => return id,
+                    other => panic!("unexpected frame before document_symbol response: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("a document_symbol response must arrive within the timeout")
+    }
+
     /// Assert no further frame arrives within `dur` — the discriminator between
     /// per-connection routing and the old broadcast: a leaked response would show
     /// up here. The connection stays open (its writer is held), so a quiet socket
@@ -3379,6 +3426,10 @@ mod tests {
             path: "a.rs".to_string(),
             position: pos,
         });
+        gate.record(&ClientMessage::DocumentSymbolRequest {
+            id: NavRequestId(4),
+            path: "a.rs".to_string(),
+        });
 
         // Each operation matches only its own latest id — no cross-talk.
         assert!(gate.is_current(&DaemonMessage::HoverResponse {
@@ -3393,10 +3444,19 @@ mod tests {
             id: NavRequestId(3),
             locations: vec![],
         }));
+        assert!(gate.is_current(&DaemonMessage::DocumentSymbolResponse {
+            id: NavRequestId(4),
+            symbols: vec![],
+        }));
         // A hover answer carrying the definition's id does not match hover.
         assert!(!gate.is_current(&DaemonMessage::HoverResponse {
             id: NavRequestId(2),
             content: None,
+        }));
+        // A document-symbol answer carrying the references' id does not match.
+        assert!(!gate.is_current(&DaemonMessage::DocumentSymbolResponse {
+            id: NavRequestId(3),
+            symbols: vec![],
         }));
     }
 
@@ -3602,5 +3662,122 @@ mod tests {
             "only the latest hover answer is written; the superseded one is dropped"
         );
         assert_quiet(&mut c_reader, &mut decoder, Duration::from_millis(300)).await;
+    }
+
+    /// The document-symbol pair (#526) must not inherit the #482 broadcast bug:
+    /// two connections sharing one dispatch loop and one off-loop LSP worker
+    /// each receive only their own `DocumentSymbolResponse`.
+    #[tokio::test]
+    async fn test_document_symbol_response_routes_to_requesting_connection_only() {
+        let (daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
+        let _dispatch = tokio::spawn(daemon.run());
+
+        // Fake off-loop LSP worker: echo each document-symbol request's id back
+        // on ITS OWN reply channel — the routing the real worker performs,
+        // minus a server.
+        let (nav_tx, mut nav_rx) = mpsc::channel::<NavRequest>(16);
+        let _worker = tokio::spawn(async move {
+            while let Some(req) = nav_rx.recv().await {
+                if let NavRequest::DocumentSymbol { id, reply, .. } = req {
+                    let _ = reply
+                        .send(DaemonMessage::DocumentSymbolResponse {
+                            id,
+                            symbols: vec![],
+                        })
+                        .await;
+                }
+            }
+        });
+
+        let (client_a, server_a) = tokio::io::duplex(64 * 1024);
+        let (mut ca_reader, mut ca_writer) = tokio::io::split(client_a);
+        let (sa_reader, sa_writer) = tokio::io::split(server_a);
+        let _conn_a = {
+            let (inbound, events, state, nav) = (
+                handles.inbound.clone(),
+                handles.subscribe(),
+                handles.state.clone(),
+                nav_tx.clone(),
+            );
+            tokio::spawn(async move {
+                serve_connection(
+                    sa_reader,
+                    sa_writer,
+                    inbound,
+                    events,
+                    state,
+                    Some(nav),
+                    None,
+                )
+                .await
+            })
+        };
+
+        let (client_b, server_b) = tokio::io::duplex(64 * 1024);
+        let (mut cb_reader, mut cb_writer) = tokio::io::split(client_b);
+        let (sb_reader, sb_writer) = tokio::io::split(server_b);
+        let _conn_b = {
+            let (inbound, events, state, nav) = (
+                handles.inbound.clone(),
+                handles.subscribe(),
+                handles.state.clone(),
+                nav_tx.clone(),
+            );
+            tokio::spawn(async move {
+                serve_connection(
+                    sb_reader,
+                    sb_writer,
+                    inbound,
+                    events,
+                    state,
+                    Some(nav),
+                    None,
+                )
+                .await
+            })
+        };
+
+        let mut da = FrameDecoder::new();
+        let mut db = FrameDecoder::new();
+
+        // Handshake both connections.
+        ca_writer.write_all(&hello_frame()).await.expect("A Hello");
+        ca_writer.flush().await.expect("flush A Hello");
+        assert!(matches!(
+            read_daemon_message(&mut ca_reader, &mut da).await,
+            DaemonMessage::Welcome { .. }
+        ));
+        cb_writer.write_all(&hello_frame()).await.expect("B Hello");
+        cb_writer.flush().await.expect("flush B Hello");
+        assert!(matches!(
+            read_daemon_message(&mut cb_reader, &mut db).await,
+            DaemonMessage::Welcome { .. }
+        ));
+
+        // A asks for document symbols id=100, B for id=200.
+        ca_writer
+            .write_all(&document_symbol_request_frame(100))
+            .await
+            .expect("A sends document_symbol");
+        ca_writer.flush().await.expect("flush A document_symbol");
+        cb_writer
+            .write_all(&document_symbol_request_frame(200))
+            .await
+            .expect("B sends document_symbol");
+        cb_writer.flush().await.expect("flush B document_symbol");
+
+        // Each connection receives only its own answer, and nothing else.
+        assert_eq!(
+            read_document_symbol_response_id(&mut ca_reader, &mut da).await,
+            NavRequestId(100),
+            "connection A must receive its own document_symbol answer"
+        );
+        assert_eq!(
+            read_document_symbol_response_id(&mut cb_reader, &mut db).await,
+            NavRequestId(200),
+            "connection B must receive its own document_symbol answer"
+        );
+        assert_quiet(&mut ca_reader, &mut da, Duration::from_millis(300)).await;
+        assert_quiet(&mut cb_reader, &mut db, Duration::from_millis(300)).await;
     }
 }

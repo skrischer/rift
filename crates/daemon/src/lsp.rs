@@ -19,15 +19,16 @@
 //!   worktree-relative path and server id for full-set-per-`(file, server)`
 //!   replace. A crashed server's replacement publishes under a fresh id, so
 //!   the worker clears the dead id's sets when the registry prunes it (#427).
-//! - **navigation requests** (#195, #482): [`NavRequest`] carries hover /
-//!   definition / references requests from a connection to the worker, each
-//!   tagged with the requesting connection's private `reply` channel. The worker
-//!   finds the first capable server via the registry, spawns a task that issues
-//!   the typed LSP request, and sends the rift-typed [`DaemonMessage`] response
-//!   straight back on that connection's `reply` channel — never onto the shared
-//!   bus, so with two clients attached one client's answer cannot reach the
-//!   other (#482). The worker is stateless for nav; drop-stale discipline is
-//!   enforced per connection at the connection, keyed by [`NavRequestId`].
+//! - **navigation requests** (#195, #482, #526): [`NavRequest`] carries hover /
+//!   definition / references / document-symbol requests from a connection to
+//!   the worker, each tagged with the requesting connection's private `reply`
+//!   channel. The worker finds the first capable server via the registry,
+//!   spawns a task that issues the typed LSP request, and sends the rift-typed
+//!   [`DaemonMessage`] response straight back on that connection's `reply`
+//!   channel — never onto the shared bus, so with two clients attached one
+//!   client's answer cannot reach the other (#482). The worker is stateless
+//!   for nav; drop-stale discipline is enforced per connection at the
+//!   connection, keyed by [`NavRequestId`].
 //!
 //! The dispatch loop never blocks on server I/O: spawning, initialization, and
 //! stdio all live on the registry's own tasks; the loop only forwards change
@@ -117,6 +118,13 @@ pub enum NavRequest {
         id: NavRequestId,
         path: String,
         position: Position,
+        reply: mpsc::Sender<DaemonMessage>,
+    },
+    /// Document-symbol request (#526): no [`Position`], since the symbol tree
+    /// covers the whole file at `path`, not a cursor location.
+    DocumentSymbol {
+        id: NavRequestId,
+        path: String,
         reply: mpsc::Sender<DaemonMessage>,
     },
 }
@@ -588,6 +596,31 @@ impl LspWorker {
                     }
                 });
             }
+            NavRequest::DocumentSymbol { id, path, reply } => {
+                let Some(requester) = self.find_capable_server(&path, NavCap::DocumentSymbol)
+                else {
+                    return;
+                };
+                let abs_path = root.join(&path);
+                tokio::spawn(async move {
+                    let abs_path2 = abs_path.clone();
+                    let text = tokio::task::spawn_blocking(move || {
+                        rift_lsp::nav::read_text_from_disk(&abs_path2).unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default();
+                    match requester.document_symbols(&abs_path, &text).await {
+                        Ok(symbols) => {
+                            let _ = reply
+                                .send(DaemonMessage::DocumentSymbolResponse { id, symbols })
+                                .await;
+                        }
+                        Err(err) => {
+                            warn!(%err, "document_symbol request failed");
+                        }
+                    }
+                });
+            }
         }
     }
 
@@ -620,15 +653,17 @@ enum NavCap {
     Hover,
     Definition,
     References,
+    DocumentSymbol,
 }
 
 impl NavCap {
     fn check(self, caps: &ServerCapabilities) -> bool {
-        use rift_lsp::nav::{has_definition, has_hover, has_references};
+        use rift_lsp::nav::{has_definition, has_document_symbol, has_hover, has_references};
         match self {
             NavCap::Hover => has_hover(caps),
             NavCap::Definition => has_definition(caps),
             NavCap::References => has_references(caps),
+            NavCap::DocumentSymbol => has_document_symbol(caps),
         }
     }
 }

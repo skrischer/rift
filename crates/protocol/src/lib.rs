@@ -15,7 +15,7 @@ pub use frame::{encode_frame, FrameDecoder, FrameError, MAX_FRAME_LEN};
 /// is wire-compatible in one direction. The message set is pinned by the
 /// fingerprint test beside `PROTOCOL_FINGERPRINT` below, so a message-set
 /// change without a bump cannot pass CI.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Pinned fingerprint of the protocol message set, checked by the
 /// `fingerprint_tests` module: an FNV-1a hash over the serde-visible surface
@@ -25,7 +25,7 @@ pub const PROTOCOL_VERSION: u32 = 5;
 /// [`PROTOCOL_VERSION`] above and re-pin this value (the failing test prints
 /// the new fingerprint).
 #[cfg(test)]
-const PROTOCOL_FINGERPRINT: u64 = 0xd70d_0705_67c9_04cf;
+const PROTOCOL_FINGERPRINT: u64 = 0x46b2_8349_f34f_a78b;
 
 /// Messages the client sends to the daemon.
 ///
@@ -172,6 +172,16 @@ pub enum ClientMessage {
         id: NavRequestId,
         path: String,
         position: Position,
+    },
+    /// Document-symbol request: ask the daemon for the outline of the whole
+    /// file at `path` (relative to the worktree root). Unlike the other
+    /// navigation requests this carries no [`Position`] — the symbol tree
+    /// covers the entire document, not a cursor location. `id` correlates the
+    /// [`DaemonMessage::DocumentSymbolResponse`] reply, same drop-stale
+    /// discipline as `HoverRequest`/`DefinitionRequest`/`ReferencesRequest`.
+    DocumentSymbolRequest {
+        id: NavRequestId,
+        path: String,
     },
     /// Source-control diff request (`docs/spec-source-control.md`): pull a
     /// structured diff of `path`'s current on-disk content against its blob at
@@ -447,6 +457,14 @@ pub enum DaemonMessage {
         id: NavRequestId,
         locations: Vec<NavLocation>,
     },
+    /// Reply to [`ClientMessage::DocumentSymbolRequest`]. `id` echoes the
+    /// request's [`NavRequestId`]. `symbols` is the file's outline flattened
+    /// to a depth-tagged list (see [`DocumentSymbolEntry`]); empty when the
+    /// server has no symbols for the file (silent no-op, not an error).
+    DocumentSymbolResponse {
+        id: NavRequestId,
+        symbols: Vec<DocumentSymbolEntry>,
+    },
     /// The reply to a [`ClientMessage::RequestDiff`]: `path`'s structured diff
     /// against HEAD, or a [`FileDiffPayload`] sentinel when the daemon cannot
     /// produce one (binary content on either side, or a diff exceeding the
@@ -682,7 +700,8 @@ pub struct Position {
 }
 
 /// An opaque monotonically-increasing request identifier for the navigation
-/// request/response family (hover, go-to-definition, find-references).
+/// request/response family (hover, go-to-definition, find-references,
+/// document symbols).
 ///
 /// Every navigation [`ClientMessage`] variant carries one `NavRequestId`; the
 /// matching [`DaemonMessage`] reply echoes it unchanged so the client can:
@@ -742,6 +761,67 @@ pub struct HoverContent {
     pub markdown: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<Range>,
+}
+
+/// One symbol in a file's outline, returned by the daemon in response to a
+/// [`ClientMessage::DocumentSymbolRequest`]. Serves both the editor's
+/// breadcrumb (enclosing symbol at the cursor) and the outline panel
+/// (`docs/spec-editor-chrome.md`).
+///
+/// LSP servers report symbols either as a hierarchical tree (`DocumentSymbol`,
+/// nested via `children`) or a flat list (`SymbolInformation`, no nesting);
+/// `crates/lsp` normalizes both shapes into this single flat, depth-tagged
+/// list so `crates/protocol` never sees the two LSP variants. `depth` is the
+/// symbol's nesting depth (`0` = top-level), reconstructed from the LSP
+/// `children` tree by a pre-order flatten; a flat-shape (`SymbolInformation`)
+/// response carries no hierarchy, so every entry there is `depth` `0`.
+/// `selection_range` is the sub-span that should be selected/revealed when the
+/// symbol is picked (e.g. just the identifier) and is contained by `range`;
+/// a flat-shape response has no independent selection range, so
+/// `selection_range` falls back to `range`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentSymbolEntry {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub range: Range,
+    pub selection_range: Range,
+    pub depth: u32,
+}
+
+/// A symbol's kind, mirroring LSP's `SymbolKind` enum. rift's own type,
+/// deliberately independent of `lsp-types` — the same precedent as
+/// [`Diagnostic`]/[`DiagnosticSeverity`] — so `crates/protocol` stays
+/// dependency-light and serialization-agnostic; `crates/lsp` translates the
+/// LSP integer enum into this on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolKind {
+    File,
+    Module,
+    Namespace,
+    Package,
+    Class,
+    Method,
+    Property,
+    Field,
+    Constructor,
+    Enum,
+    Interface,
+    Function,
+    Variable,
+    Constant,
+    String,
+    Number,
+    Boolean,
+    Array,
+    Object,
+    Key,
+    Null,
+    EnumMember,
+    Struct,
+    Event,
+    Operator,
+    TypeParameter,
 }
 
 /// The payload of a [`DaemonMessage::FileDiff`]: either a structured line diff
@@ -2119,6 +2199,162 @@ mod tests {
         let parsed: DaemonMessage =
             serde_json::from_str(&json).expect("deserialize empty ReferencesResponse");
         assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_document_symbol_request_roundtrip_preserves_id_and_path() {
+        // No `Position` field, unlike the other navigation requests — a
+        // document-symbol request covers the whole file.
+        let msg = ClientMessage::DocumentSymbolRequest {
+            id: NavRequestId(10),
+            path: "src/main.rs".to_owned(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize DocumentSymbolRequest");
+        assert!(json.contains(r#""type":"document_symbol_request""#));
+        assert!(!json.contains("position"));
+        let parsed: ClientMessage =
+            serde_json::from_str(&json).expect("deserialize DocumentSymbolRequest");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_document_symbol_response_roundtrip_preserves_symbols() {
+        let msg = DaemonMessage::DocumentSymbolResponse {
+            id: NavRequestId(11),
+            symbols: vec![
+                DocumentSymbolEntry {
+                    name: "Foo".to_owned(),
+                    kind: SymbolKind::Struct,
+                    range: Range {
+                        start: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 3,
+                            character: 1,
+                        },
+                    },
+                    selection_range: Range {
+                        start: Position {
+                            line: 0,
+                            character: 7,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 10,
+                        },
+                    },
+                    depth: 0,
+                },
+                DocumentSymbolEntry {
+                    name: "bar".to_owned(),
+                    kind: SymbolKind::Field,
+                    range: Range {
+                        start: Position {
+                            line: 1,
+                            character: 4,
+                        },
+                        end: Position {
+                            line: 1,
+                            character: 12,
+                        },
+                    },
+                    selection_range: Range {
+                        start: Position {
+                            line: 1,
+                            character: 4,
+                        },
+                        end: Position {
+                            line: 1,
+                            character: 7,
+                        },
+                    },
+                    depth: 1,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&msg).expect("serialize DocumentSymbolResponse");
+        assert!(json.contains(r#""type":"document_symbol_response""#));
+        let parsed: DaemonMessage =
+            serde_json::from_str(&json).expect("deserialize DocumentSymbolResponse");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_document_symbol_response_empty_symbols_is_silent_no_op() {
+        let msg = DaemonMessage::DocumentSymbolResponse {
+            id: NavRequestId(12),
+            symbols: vec![],
+        };
+        let json = serde_json::to_string(&msg).expect("serialize empty DocumentSymbolResponse");
+        assert!(json.contains(r#""symbols":[]"#));
+        let parsed: DaemonMessage =
+            serde_json::from_str(&json).expect("deserialize empty DocumentSymbolResponse");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_symbol_kind_roundtrips_every_variant() {
+        let kinds = [
+            SymbolKind::File,
+            SymbolKind::Module,
+            SymbolKind::Namespace,
+            SymbolKind::Package,
+            SymbolKind::Class,
+            SymbolKind::Method,
+            SymbolKind::Property,
+            SymbolKind::Field,
+            SymbolKind::Constructor,
+            SymbolKind::Enum,
+            SymbolKind::Interface,
+            SymbolKind::Function,
+            SymbolKind::Variable,
+            SymbolKind::Constant,
+            SymbolKind::String,
+            SymbolKind::Number,
+            SymbolKind::Boolean,
+            SymbolKind::Array,
+            SymbolKind::Object,
+            SymbolKind::Key,
+            SymbolKind::Null,
+            SymbolKind::EnumMember,
+            SymbolKind::Struct,
+            SymbolKind::Event,
+            SymbolKind::Operator,
+            SymbolKind::TypeParameter,
+        ];
+        for kind in kinds {
+            let json = serde_json::to_string(&kind).expect("serialize SymbolKind");
+            let parsed: SymbolKind = serde_json::from_str(&json).expect("deserialize SymbolKind");
+            assert_eq!(parsed, kind);
+        }
+    }
+
+    #[test]
+    fn test_symbol_kind_unknown_variant_is_rejected() {
+        let result: Result<SymbolKind, _> = serde_json::from_str(r#""bogus_kind""#);
+        assert!(
+            result.is_err(),
+            "unknown SymbolKind variant must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_document_symbol_entry_missing_field_is_rejected() {
+        // A malformed entry missing `depth` must not silently default — every
+        // field is required, mirroring the other nav wire types.
+        let json = r#"{
+            "name": "Foo",
+            "kind": "struct",
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 3 } },
+            "selection_range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 3 } }
+        }"#;
+        let result: Result<DocumentSymbolEntry, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "malformed DocumentSymbolEntry (missing depth) must not deserialize"
+        );
     }
 
     #[test]
