@@ -145,15 +145,18 @@
 //! discarded by id comparison in [`EditorView::apply_definition_response`] and
 //! [`EditorView::apply_hover_response`].
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::path::Path;
+use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
 use flume::Sender;
 use gpui::{
-    div, px, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement as _, Render, SharedString, Styled as _, Subscription, Window,
+    canvas, div, px, App, AppContext as _, Bounds, ClickEvent, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, Hsla, InteractiveElement as _, IntoElement, MouseButton,
+    MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels, Render, SharedString, Styled as _,
+    Subscription, Window,
 };
 use gpui_component::dialog::AlertDialog;
 use gpui_component::dock::{Panel, PanelEvent};
@@ -165,10 +168,11 @@ use gpui_component::menu::PopupMenu;
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::text::markdown;
 use gpui_component::ActiveTheme as _;
+use gpui_component::RopeExt as _;
 use gpui_component::WindowExt as _;
 use rift_protocol::{
-    ClientMessage, Diagnostic, DiagnosticSeverity, HoverContent, NavLocation, NavRequestId,
-    Position, Range,
+    ClientMessage, Diagnostic, DiagnosticSeverity, DocumentSymbolEntry, HoverContent, NavLocation,
+    NavRequestId, Position, Range,
 };
 
 /// Stable, distinct dock-panel identity for the editor (`Panel::panel_name`).
@@ -252,6 +256,29 @@ const BACK_STACK_MAX: usize = 50;
 /// flooding the LSP on fast cursor movement.
 const HOVER_MOUSE_DEBOUNCE: Duration = Duration::from_millis(500);
 
+/// Height of the breadcrumb bar under the editor tab strip
+/// (`docs/spec-editor-chrome.md` §1: mono path segments + enclosing symbol).
+const BREADCRUMB_HEIGHT: Pixels = px(30.0);
+
+/// Diameter of a gutter severity dot (`docs/spec-editor-chrome.md`).
+const GUTTER_DOT_SIZE: Pixels = px(7.0);
+
+/// Left inset of the gutter severity dot from the editor content's left edge —
+/// placed left of the line-number column.
+const GUTTER_DOT_LEFT: Pixels = px(3.0);
+
+/// Corner radius of the inline diagnostic card (`docs/spec-editor-chrome.md`
+/// §1: "radius 8").
+const CARD_RADIUS: Pixels = px(8.0);
+
+/// Conservative height estimate for the inline diagnostic card, used only to
+/// decide whether it fits below the cursor line or must flip above it.
+const CARD_ESTIMATED_HEIGHT: Pixels = px(56.0);
+
+/// Separator glyph between breadcrumb segments (U+203A, single right-pointing
+/// angle quotation mark — not an emoji).
+const BREADCRUMB_SEPARATOR: &str = "\u{203A}";
+
 // ── Internal state types ──────────────────────────────────────────────────────
 
 /// What a tab is currently showing.
@@ -287,6 +314,23 @@ enum JumpListKind {
     References,
 }
 
+/// Owned render data for the inline diagnostic card shown under the cursor
+/// line (`docs/spec-editor-chrome.md`). Gathered from the tab's diagnostics
+/// and the input widget's layout so the `InputState` read borrow is released
+/// before the card element is built.
+struct InlineCard {
+    /// Content-relative top offset of the card.
+    top: Pixels,
+    /// Content-relative left offset (the cursor line's text start).
+    left: Pixels,
+    /// The severity color of the primary diagnostic (the card's glyph).
+    color: Hsla,
+    /// The diagnostic message.
+    message: SharedString,
+    /// The muted `source`/`code` suffix, if either is present.
+    detail: Option<SharedString>,
+}
+
 // ── Public decision type ───────────────────────────────────────────────────────
 
 /// The decision an external (snapshot-`mtime`) change to the open path forces.
@@ -317,6 +361,12 @@ struct EditorTab {
     path: String,
     input: Entity<InputState>,
     _input_change: Subscription,
+    /// Fires on every `InputState` notify (cursor move, scroll, blink, edit) —
+    /// the only signal for a cursor move, which emits no `InputEvent`. Keeps
+    /// the breadcrumb symbol, gutter dots, and inline card tracking the cursor
+    /// and viewport, and re-syncs the widget's diagnostic set when the cursor
+    /// line changes (`docs/spec-editor-chrome.md`).
+    _input_notify: Subscription,
     load_state: TabLoadState,
     save_state: SaveState,
     /// Whether this tab's buffer has unsaved edits.
@@ -386,6 +436,26 @@ struct EditorTab {
     /// The kind of results currently in `jump_list`. `None` when `jump_list`
     /// is `None` (the two fields are always set/cleared together).
     jump_list_kind: Option<JumpListKind>,
+
+    /// The cached, flattened document-symbol tree for this tab's file, fetched
+    /// once per open and per buffer-change debounce (never per keystroke). The
+    /// breadcrumb resolves the enclosing symbol at the cursor against this
+    /// cache client-side (`docs/spec-editor-chrome.md`).
+    symbols: Vec<DocumentSymbolEntry>,
+    /// The id of the most recent document-symbol request this tab dispatched.
+    /// Mirrors `latest_def_id`'s drop-stale discipline.
+    latest_symbol_id: Option<NavRequestId>,
+
+    /// This tab's own copy of the inline diagnostics (the source of truth for
+    /// the gutter dots and the inline card). The widget's own diagnostic set
+    /// is a *filtered* view of this — every entry except those on the cursor
+    /// line, so the cursor line's diagnostic renders only as the app's inline
+    /// card and never also as the widget's hover popover (one diagnostic, one
+    /// surface — `docs/spec-editor-chrome.md`).
+    diagnostics: Vec<Diagnostic>,
+    /// The cursor's current line, tracked so a line change (not every notify)
+    /// re-syncs the widget's suppressed diagnostic set.
+    cursor_line: u32,
 }
 
 // ── Main view ─────────────────────────────────────────────────────────────────
@@ -420,6 +490,17 @@ pub struct EditorView {
     /// each request records its issuing tab on that tab's own `latest_*_id`
     /// field (`docs/spec-editor-tabs.md`, #351).
     nav_id: u64,
+
+    /// The editor content area's window-space bounds, captured each frame by a
+    /// `canvas` overlay and read back on the next frame. The app-side gutter
+    /// dots and inline card are positioned via the input widget's
+    /// `range_to_bounds` (window coordinates, correct through soft-wrap and
+    /// folding); this converts those window coordinates into content-relative
+    /// offsets for the overlay children (`docs/spec-editor-chrome.md` — "the
+    /// pinned widget has no gutter decoration API"). `None` until the first
+    /// paint. One-frame lag matches `range_to_bounds`, which also reads the
+    /// previous frame's layout, so the two stay consistent.
+    content_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 impl EditorView {
@@ -447,6 +528,7 @@ impl EditorView {
             buffer_change_tx,
             nav_tx,
             nav_id: 0,
+            content_bounds: Rc::new(Cell::new(None)),
         }
     }
 
@@ -475,10 +557,12 @@ impl EditorView {
         let input = cx.new(|cx| InputState::new(window, cx));
         let index = self.tabs.len();
         let input_change = Self::subscribe_dirty(&input, index, cx);
+        let input_notify = Self::observe_input(&input, cx);
         self.tabs.push(EditorTab {
             path,
             input,
             _input_change: input_change,
+            _input_notify: input_notify,
             load_state: TabLoadState::Loading,
             save_state: SaveState::Idle,
             dirty: false,
@@ -498,6 +582,10 @@ impl EditorView {
             back_stack: VecDeque::new(),
             jump_list: None,
             jump_list_kind: None,
+            symbols: Vec::new(),
+            latest_symbol_id: None,
+            diagnostics: Vec::new(),
+            cursor_line: 0,
         });
         self.arm_loading(index, true, window, cx);
         index
@@ -533,6 +621,13 @@ impl EditorView {
         tab.latest_hover_id = None;
         tab.latest_ref_id = None;
         tab.pending_restore = None;
+        // The content is about to be replaced, so the cached symbol tree and
+        // diagnostics no longer describe it; a fresh document-symbol request
+        // rides the completed load, and diagnostics are re-pushed by the daemon.
+        tab.symbols = Vec::new();
+        tab.latest_symbol_id = None;
+        tab.diagnostics = Vec::new();
+        tab.cursor_line = 0;
 
         if rebuild_input {
             let language = language_for_path(&tab.path);
@@ -546,6 +641,7 @@ impl EditorView {
                     })
             });
             tab._input_change = Self::subscribe_dirty(&tab.input, index, cx);
+            tab._input_notify = Self::observe_input(&tab.input, cx);
         }
 
         tab.generation = tab.generation.wrapping_add(1);
@@ -664,6 +760,35 @@ impl EditorView {
         })
     }
 
+    /// Observe an `InputState` so the editor re-renders on cursor moves and
+    /// scrolls — a cursor move emits no [`InputEvent`], only a bare notify, so
+    /// [`Self::subscribe_dirty`] alone would never see it. The breadcrumb's
+    /// enclosing symbol, the gutter dots, and the inline card all track the
+    /// cursor and viewport, so they must repaint on any such notify. When the
+    /// cursor *line* changes, the widget's suppressed diagnostic set is
+    /// re-synced so exactly the new cursor line's diagnostic is withheld from
+    /// the widget popover (`docs/spec-editor-chrome.md`).
+    ///
+    /// The tab is resolved by the observed entity's id, not a captured index,
+    /// so a tab close that shifts indices cannot misroute this callback.
+    fn observe_input(input: &Entity<InputState>, cx: &mut Context<Self>) -> Subscription {
+        cx.observe(input, move |this, observed, cx| {
+            let Some(index) = this
+                .tabs
+                .iter()
+                .position(|t| t.input.entity_id() == observed.entity_id())
+            else {
+                return;
+            };
+            let new_line = observed.read(cx).cursor_position().line;
+            if this.tabs[index].cursor_line != new_line {
+                this.tabs[index].cursor_line = new_line;
+                this.sync_widget_diagnostics(index, cx);
+            }
+            cx.notify();
+        })
+    }
+
     /// Arm (or re-arm) the debounced live-buffer feed for the tab at `index`
     /// (#189).
     fn arm_buffer_feed(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -708,6 +833,11 @@ impl EditorView {
                     {
                         tracing::debug!(error = %e, %path, "failed to enqueue live-buffer feed");
                     }
+                    // Refresh the symbol cache against the buffer just fed to
+                    // the LSP — one request per change settle, so the
+                    // breadcrumb tracks edits without a per-keystroke request
+                    // (`docs/spec-editor-chrome.md`).
+                    this.dispatch_document_symbol_request(index);
                 });
             });
         })
@@ -776,7 +906,30 @@ impl EditorView {
         let Some(index) = self.tab_index_for_path(path) else {
             return;
         };
-        let editor_items: Vec<EditorDiagnostic> = items.iter().map(to_editor_diagnostic).collect();
+        self.tabs[index].diagnostics = items.to_vec();
+        self.sync_widget_diagnostics(index, cx);
+        cx.notify();
+    }
+
+    /// Push the tab's diagnostics into the widget's own diagnostic set, minus
+    /// every entry on the cursor line. The cursor line's diagnostic is shown
+    /// by the app's inline card instead, so withholding it here keeps the
+    /// widget's mouse-hover `DiagnosticPopover` from rendering the same
+    /// diagnostic a second time (`docs/spec-editor-chrome.md` — "one
+    /// diagnostic never renders twice"). Every other line keeps its squiggle
+    /// and hover popover. Re-run whenever the diagnostics or the cursor line
+    /// change.
+    fn sync_widget_diagnostics(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let suppressed_line = tab.cursor_line;
+        let editor_items: Vec<EditorDiagnostic> = tab
+            .diagnostics
+            .iter()
+            .filter(|d| d.range.start.line != suppressed_line)
+            .map(to_editor_diagnostic)
+            .collect();
         self.tabs[index].input.update(cx, |input, cx| {
             if let Some(set) = input.diagnostics_mut() {
                 set.clear();
@@ -784,7 +937,6 @@ impl EditorView {
             }
             cx.notify();
         });
-        cx.notify();
     }
 
     // ── Buffer state accessors ────────────────────────────────────────────
@@ -870,6 +1022,10 @@ impl EditorView {
         } else if let Some(cursor) = self.tabs[index].pending_restore.take() {
             self.restore_cursor_after_reload(index, cursor, window, cx);
         }
+
+        // Seed the breadcrumb/outline symbol cache for the freshly loaded file
+        // (`docs/spec-editor-chrome.md`): one request per open.
+        self.dispatch_document_symbol_request(index);
 
         cx.notify();
     }
@@ -1242,6 +1398,35 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Dispatch a `DocumentSymbolRequest` for the tab at `index`
+    /// (`docs/spec-editor-chrome.md`).
+    ///
+    /// Unlike the cursor-scoped nav requests this carries no position: the
+    /// symbol tree covers the whole file, and the breadcrumb resolves the
+    /// enclosing symbol against the cached tree client-side. Called on open
+    /// and on the buffer-change debounce — one request per settle, never per
+    /// keystroke — so the cache stays current without flooding the daemon.
+    /// A no-op unless the tab is loaded.
+    fn dispatch_document_symbol_request(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        if !matches!(tab.load_state, TabLoadState::Loaded) {
+            return;
+        }
+        let path = tab.path.clone();
+        self.nav_id = self.nav_id.wrapping_add(1);
+        let id = NavRequestId(self.nav_id);
+        self.tabs[index].latest_symbol_id = Some(id);
+
+        if let Err(e) = self.nav_tx.try_send(ClientMessage::DocumentSymbolRequest {
+            id,
+            path: path.clone(),
+        }) {
+            tracing::debug!(error = %e, %path, "failed to enqueue document-symbol request");
+        }
+    }
+
     /// Arm (or re-arm) the mouse-rest debounce timer for hover on the active
     /// tab (#197).
     ///
@@ -1372,6 +1557,32 @@ impl EditorView {
                 .collect(),
         );
         self.tabs[index].jump_list_kind = Some(JumpListKind::References);
+        cx.notify();
+    }
+
+    /// Apply a `DocumentSymbolResponse` from the daemon
+    /// (`docs/spec-editor-chrome.md`).
+    ///
+    /// Matched to whichever tab's `latest_symbol_id` equals `id` (drop-stale
+    /// discipline, mirroring the other nav responses). The flattened tree
+    /// replaces the tab's cache; the breadcrumb resolves the enclosing symbol
+    /// against it on the next render. An empty list is a valid answer (the
+    /// server found no symbols) and simply clears the cache.
+    pub fn apply_document_symbol_response(
+        &mut self,
+        id: NavRequestId,
+        symbols: Vec<DocumentSymbolEntry>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|t| t.latest_symbol_id == Some(id))
+        else {
+            tracing::debug!(?id, "dropping stale document-symbol response");
+            return;
+        };
+        self.tabs[index].symbols = symbols;
         cx.notify();
     }
 
@@ -1861,6 +2072,132 @@ impl Render for EditorView {
                 .child(markdown(md_source))
         });
 
+        // ── Breadcrumb + gutter/card overlays (docs/spec-editor-chrome.md) ──
+        //
+        // The breadcrumb reads the cached document-symbol tree and the cursor;
+        // the gutter dots and inline card read this tab's own diagnostics. All
+        // positioning uses the input widget's `range_to_bounds` (window-space,
+        // correct through soft-wrap and folding — the naive `row * line_height`
+        // mapping would be wrong) converted to editor-content-relative offsets
+        // via the previous frame's captured content bounds. Values are gathered
+        // into owned primitives here so the `InputState` read borrow is dropped
+        // before the elements (and the `cx.listener` closures below) are built.
+        let mono_font = cx.theme().mono_font_family.clone();
+        let mono_size = cx.theme().mono_font_size;
+        let crumb_path_color = cx.theme().muted_foreground;
+        let crumb_symbol_color = cx.theme().foreground;
+        let crumb_bg = cx.theme().secondary;
+        let crumb_border = cx.theme().border;
+        let card_bg = cx.theme().popover;
+        let card_border = cx.theme().border;
+        let card_fg = cx.theme().foreground;
+        let card_muted = cx.theme().muted_foreground;
+        let sev_error = cx.theme().danger;
+        let sev_warning = cx.theme().warning;
+        let sev_info = cx.theme().info;
+        let sev_hint = cx.theme().muted_foreground;
+        let mut current_line_color = cx.theme().accent;
+        current_line_color.a = 0.10;
+        let severity_color = |severity: DiagnosticSeverity| -> Hsla {
+            match severity {
+                DiagnosticSeverity::Error => sev_error,
+                DiagnosticSeverity::Warning => sev_warning,
+                DiagnosticSeverity::Information => sev_info,
+                DiagnosticSeverity::Hint => sev_hint,
+            }
+        };
+
+        // Breadcrumb segments: mono path pieces then the enclosing-symbol chain.
+        let path_segments: Vec<SharedString> = path_breadcrumb_segments(&tab.path)
+            .into_iter()
+            .map(SharedString::from)
+            .collect();
+
+        // Overlay geometry (owned): gutter dots, current-line bar (top, height),
+        // card.
+        let mut gutter_dots: Vec<(Pixels, Hsla)> = Vec::new();
+        let mut current_line: Option<(Pixels, Pixels)> = None;
+        let mut inline_card: Option<InlineCard> = None;
+        let mut symbol_segments: Vec<SharedString> = Vec::new();
+        {
+            let input_state = tab.input.read(cx);
+            let cursor = input_state.cursor_position();
+            for symbol in enclosing_symbol_chain(&tab.symbols, cursor.line, cursor.character) {
+                symbol_segments.push(SharedString::from(symbol.name.clone()));
+            }
+
+            if let (Some(content), Some(line_height), Some(visible)) = (
+                self.content_bounds.get(),
+                input_state.line_height(),
+                input_state.visible_row_range(),
+            ) {
+                let text = input_state.text();
+                let origin = content.origin;
+
+                for buffer_row in visible.clone() {
+                    let line = buffer_row as u32;
+                    let Some(primary) = primary_diagnostic_on_line(&tab.diagnostics, line) else {
+                        continue;
+                    };
+                    let offset = text.line_start_offset(buffer_row);
+                    if let Some(bounds) = input_state.range_to_bounds(&(offset..offset)) {
+                        let y_rel = bounds.origin.y - origin.y;
+                        let dot_top = y_rel + (line_height - GUTTER_DOT_SIZE) / 2.0;
+                        gutter_dots.push((dot_top, severity_color(primary.severity)));
+                    }
+                }
+
+                let cursor_row = cursor.line as usize;
+                if visible.contains(&cursor_row) {
+                    let offset = text.line_start_offset(cursor_row);
+                    if let Some(bounds) = input_state.range_to_bounds(&(offset..offset)) {
+                        let y_rel = bounds.origin.y - origin.y;
+                        current_line = Some((y_rel, line_height));
+                        if let Some(primary) =
+                            primary_diagnostic_on_line(&tab.diagnostics, cursor.line)
+                        {
+                            let x_rel = bounds.origin.x - origin.x;
+                            let below = y_rel + line_height;
+                            // Flip the card above the line when it would spill
+                            // past the content's bottom edge.
+                            let top = if below + CARD_ESTIMATED_HEIGHT > content.size.height {
+                                (y_rel - CARD_ESTIMATED_HEIGHT).max(px(0.0))
+                            } else {
+                                below
+                            };
+                            inline_card = Some(InlineCard {
+                                top,
+                                left: x_rel,
+                                color: severity_color(primary.severity),
+                                message: SharedString::from(primary.message.clone()),
+                                detail: diagnostic_detail(primary),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let breadcrumb_bar = div()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(px(6.0))
+            .h(BREADCRUMB_HEIGHT)
+            .px(px(10.0))
+            .bg(crumb_bg)
+            .border_b_1()
+            .border_color(crumb_border)
+            .font_family(mono_font)
+            .text_size(mono_size)
+            .overflow_hidden()
+            .children(breadcrumb_children(
+                &path_segments,
+                &symbol_segments,
+                crumb_path_color,
+                crumb_symbol_color,
+            ));
+
         let read_only = tab.read_only;
 
         // Tab bar (#352, #354): one Tab per open file, showing its name, a
@@ -1993,7 +2330,8 @@ impl Render for EditorView {
                 // the cursor position.
                 this.arm_hover_debounce(cx);
             }))
-            .child(tab_bar);
+            .child(tab_bar)
+            .child(breadcrumb_bar);
 
         if let Some((text, color)) = banner {
             root = root.child(
@@ -2074,10 +2412,100 @@ impl Render for EditorView {
             );
         }
 
-        // Editor area: the input widget plus any overlays (jump-list, hover
-        // popover). Overlays are children rendered *after* the input so they
-        // paint on top without needing z-index (child order = paint order).
-        let mut editor_area = div().flex_1().min_h_0().relative().child(input_widget);
+        // Editor area: the input widget plus any overlays (gutter dots, inline
+        // card, jump-list, hover popover). Overlays are children rendered
+        // *after* the input so they paint on top without needing z-index (child
+        // order = paint order). `overflow_hidden` clips the overlays to the
+        // viewport; the widget's own popovers are `deferred` and so escape it.
+        //
+        // The leading `canvas` captures this area's window bounds each frame
+        // (read back next frame) so the app-side overlays can convert the input
+        // widget's window-space `range_to_bounds` into content-relative offsets.
+        let content_bounds = self.content_bounds.clone();
+        let mut editor_area = div()
+            .flex_1()
+            .min_h_0()
+            .relative()
+            .overflow_hidden()
+            .child(
+                canvas(
+                    move |bounds, _window, _cx| content_bounds.set(Some(bounds)),
+                    |_bounds, _prepaint, _window, _cx| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(input_widget);
+
+        // Current-line highlight: a faint full-width bar under the cursor row.
+        // The widget itself only brightens the line number, so this supplies
+        // the line highlight the design calls for (`docs/spec-editor-chrome.md`).
+        if let Some((top, height)) = current_line {
+            editor_area = editor_area.child(
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .top(top)
+                    .h(height)
+                    .bg(current_line_color),
+            );
+        }
+
+        // Gutter severity dots: one per visible diagnostic line, left of the
+        // line-number column, colored by the line's most severe diagnostic.
+        for (top, color) in gutter_dots {
+            editor_area = editor_area.child(
+                div()
+                    .absolute()
+                    .left(GUTTER_DOT_LEFT)
+                    .top(top)
+                    .size(GUTTER_DOT_SIZE)
+                    .rounded_full()
+                    .bg(color),
+            );
+        }
+
+        // Inline diagnostic card for the cursor line's primary diagnostic. The
+        // widget's own `DiagnosticPopover` is withheld for this line (see
+        // `sync_widget_diagnostics`), so the diagnostic renders exactly once.
+        if let Some(card) = inline_card {
+            let mut body = div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(div().text_color(card_fg).child(card.message));
+            if let Some(detail) = card.detail {
+                body = body.child(div().text_color(card_muted).child(detail));
+            }
+            editor_area = editor_area.child(
+                div()
+                    .absolute()
+                    .top(card.top)
+                    .left(card.left)
+                    .max_w(px(520.0))
+                    .flex()
+                    .items_start()
+                    .gap(px(8.0))
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .bg(card_bg)
+                    .border_1()
+                    .border_color(card_border)
+                    .rounded(CARD_RADIUS)
+                    .shadow_md()
+                    .text_xs()
+                    .child(
+                        div()
+                            .mt(px(3.0))
+                            .flex_shrink_0()
+                            .size(GUTTER_DOT_SIZE)
+                            .rounded_full()
+                            .bg(card.color),
+                    )
+                    .child(body),
+            );
+        }
 
         if let Some(jump_list_el) = jump_list_element {
             editor_area = editor_area.child(jump_list_el);
@@ -2202,6 +2630,111 @@ fn language_for_path(path: &str) -> String {
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.to_ascii_lowercase())
         .unwrap_or_else(|| "text".to_owned())
+}
+
+/// Whether the zero-based `(line, character)` cursor position falls within
+/// `range` (inclusive of both endpoints — a cursor resting on a symbol's
+/// closing brace still counts as enclosed).
+fn position_in_range(range: &Range, line: u32, character: u32) -> bool {
+    let after_start =
+        line > range.start.line || (line == range.start.line && character >= range.start.character);
+    let before_end =
+        line < range.end.line || (line == range.end.line && character <= range.end.character);
+    after_start && before_end
+}
+
+/// The chain of symbols enclosing the cursor, outermost first (ascending
+/// `depth`) — the breadcrumb's symbol tail (`docs/spec-editor-chrome.md`).
+///
+/// Symbols in a document-symbol tree nest properly, so every entry whose range
+/// contains the cursor is an ancestor of the next deeper one; sorting the
+/// containing entries by `depth` reconstructs the enclosing path (e.g.
+/// `impl Foo` then `fn render`). Empty when the cursor is inside no symbol.
+fn enclosing_symbol_chain(
+    symbols: &[DocumentSymbolEntry],
+    line: u32,
+    character: u32,
+) -> Vec<&DocumentSymbolEntry> {
+    let mut chain: Vec<&DocumentSymbolEntry> = symbols
+        .iter()
+        .filter(|s| position_in_range(&s.range, line, character))
+        .collect();
+    chain.sort_by_key(|s| s.depth);
+    chain
+}
+
+/// Severity ordering used to pick the most severe diagnostic on a line
+/// (`Error` highest). Drives both the gutter dot's color and the inline card's
+/// choice of primary diagnostic.
+fn severity_rank(severity: DiagnosticSeverity) -> u8 {
+    match severity {
+        DiagnosticSeverity::Error => 3,
+        DiagnosticSeverity::Warning => 2,
+        DiagnosticSeverity::Information => 1,
+        DiagnosticSeverity::Hint => 0,
+    }
+}
+
+/// The most severe diagnostic starting on `line`, or `None` when the line
+/// carries none. Ties keep the first in document order. Used for the inline
+/// card's primary diagnostic and the gutter dot's color for the line.
+fn primary_diagnostic_on_line(diagnostics: &[Diagnostic], line: u32) -> Option<&Diagnostic> {
+    diagnostics
+        .iter()
+        .filter(|d| d.range.start.line == line)
+        .max_by_key(|d| severity_rank(d.severity))
+}
+
+/// Split a root-relative (or absolute out-of-root) path into its breadcrumb
+/// segments, dropping empty pieces from a leading slash or a trailing one.
+fn path_breadcrumb_segments(path: &str) -> Vec<&str> {
+    path.split('/').filter(|s| !s.is_empty()).collect()
+}
+
+/// The muted `source`/`code` suffix for a diagnostic's inline card, or `None`
+/// when the server supplied neither. `source` and `code` are joined as
+/// `source(code)` (e.g. `rustc(E0308)`); a lone one stands alone.
+fn diagnostic_detail(diagnostic: &Diagnostic) -> Option<SharedString> {
+    match (&diagnostic.source, &diagnostic.code) {
+        (Some(source), Some(code)) => Some(SharedString::from(format!("{source}({code})"))),
+        (Some(source), None) => Some(SharedString::from(source.clone())),
+        (None, Some(code)) => Some(SharedString::from(code.clone())),
+        (None, None) => None,
+    }
+}
+
+/// Build the breadcrumb's interleaved segment elements: the mono path pieces
+/// (muted) then the enclosing-symbol chain (foreground), each pair joined by a
+/// separator glyph. Kept separate from `render` so it stays a pure mapping
+/// from owned strings to elements.
+fn breadcrumb_children(
+    path_segments: &[SharedString],
+    symbol_segments: &[SharedString],
+    path_color: Hsla,
+    symbol_color: Hsla,
+) -> Vec<gpui::Div> {
+    let separator = |color: Hsla| {
+        div()
+            .text_color(color)
+            .child(SharedString::from(BREADCRUMB_SEPARATOR))
+    };
+    let mut out: Vec<gpui::Div> = Vec::new();
+    let mut first = true;
+    for segment in path_segments {
+        if !first {
+            out.push(separator(path_color));
+        }
+        out.push(div().text_color(path_color).child(segment.clone()));
+        first = false;
+    }
+    for segment in symbol_segments {
+        if !first {
+            out.push(separator(path_color));
+        }
+        out.push(div().text_color(symbol_color).child(segment.clone()));
+        first = false;
+    }
+    out
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -3314,6 +3847,263 @@ mod tests {
         let editor = to_editor_diagnostic(&proto_diag(DiagnosticSeverity::Warning, None, None));
         assert!(editor.source.is_none());
         assert!(editor.code.is_none());
+    }
+
+    // --- breadcrumb + gutter + inline card (editor chrome) ---
+
+    fn diag_at_line(line: u32, severity: DiagnosticSeverity) -> Diagnostic {
+        Diagnostic {
+            range: Range {
+                start: Position { line, character: 0 },
+                end: Position { line, character: 3 },
+            },
+            severity,
+            message: format!("issue on {line}"),
+            source: None,
+            code: None,
+        }
+    }
+
+    fn sym(name: &str, depth: u32, start: (u32, u32), end: (u32, u32)) -> DocumentSymbolEntry {
+        let range = Range {
+            start: Position {
+                line: start.0,
+                character: start.1,
+            },
+            end: Position {
+                line: end.0,
+                character: end.1,
+            },
+        };
+        DocumentSymbolEntry {
+            name: name.to_owned(),
+            kind: rift_protocol::SymbolKind::Function,
+            range,
+            selection_range: range,
+            depth,
+        }
+    }
+
+    #[test]
+    fn test_position_in_range_covers_interior_and_both_boundaries() {
+        let range = Range {
+            start: Position {
+                line: 2,
+                character: 4,
+            },
+            end: Position {
+                line: 5,
+                character: 8,
+            },
+        };
+        // Interior line, any column.
+        assert!(position_in_range(&range, 3, 0));
+        // Exactly on the start and end positions (inclusive).
+        assert!(position_in_range(&range, 2, 4));
+        assert!(position_in_range(&range, 5, 8));
+        // Just before the start and just after the end.
+        assert!(!position_in_range(&range, 2, 3));
+        assert!(!position_in_range(&range, 5, 9));
+        assert!(!position_in_range(&range, 1, 100));
+        assert!(!position_in_range(&range, 6, 0));
+    }
+
+    #[test]
+    fn test_enclosing_symbol_chain_returns_ancestors_outermost_first() {
+        // impl block (depth 0) containing a fn (depth 1) containing a closure
+        // (depth 2); the flattened list is deliberately out of depth order.
+        let symbols = vec![
+            sym("fn render", 1, (2, 4), (8, 5)),
+            sym("impl View", 0, (1, 0), (20, 1)),
+            sym("|event|", 2, (4, 8), (6, 9)),
+            sym("fn other", 1, (10, 4), (15, 5)),
+        ];
+        let chain: Vec<&str> = enclosing_symbol_chain(&symbols, 5, 0)
+            .into_iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(chain, vec!["impl View", "fn render", "|event|"]);
+    }
+
+    #[test]
+    fn test_enclosing_symbol_chain_is_empty_outside_every_symbol() {
+        let symbols = vec![sym("fn render", 1, (2, 4), (8, 5))];
+        assert!(enclosing_symbol_chain(&symbols, 100, 0).is_empty());
+        assert!(enclosing_symbol_chain(&[], 5, 0).is_empty());
+    }
+
+    #[test]
+    fn test_severity_rank_orders_error_above_hint() {
+        assert!(
+            severity_rank(DiagnosticSeverity::Error) > severity_rank(DiagnosticSeverity::Warning)
+        );
+        assert!(
+            severity_rank(DiagnosticSeverity::Warning)
+                > severity_rank(DiagnosticSeverity::Information)
+        );
+        assert!(
+            severity_rank(DiagnosticSeverity::Information)
+                > severity_rank(DiagnosticSeverity::Hint)
+        );
+    }
+
+    #[test]
+    fn test_primary_diagnostic_on_line_picks_the_most_severe_on_that_line() {
+        let diagnostics = vec![
+            diag_at_line(3, DiagnosticSeverity::Warning),
+            diag_at_line(3, DiagnosticSeverity::Error),
+            diag_at_line(7, DiagnosticSeverity::Error),
+        ];
+        let primary = primary_diagnostic_on_line(&diagnostics, 3).expect("line 3 has diagnostics");
+        assert_eq!(primary.severity, DiagnosticSeverity::Error);
+        assert!(
+            primary_diagnostic_on_line(&diagnostics, 4).is_none(),
+            "a line with no diagnostic yields None"
+        );
+    }
+
+    #[test]
+    fn test_path_breadcrumb_segments_drops_empty_pieces() {
+        assert_eq!(
+            path_breadcrumb_segments("crates/app/src/editor.rs"),
+            vec!["crates", "app", "src", "editor.rs"]
+        );
+        // Leading and trailing slashes (absolute out-of-root path) yield no
+        // empty segments.
+        assert_eq!(
+            path_breadcrumb_segments("/home/user/lib.rs"),
+            vec!["home", "user", "lib.rs"]
+        );
+        assert!(path_breadcrumb_segments("").is_empty());
+    }
+
+    #[test]
+    fn test_diagnostic_detail_joins_source_and_code() {
+        assert_eq!(
+            diagnostic_detail(&proto_diag(
+                DiagnosticSeverity::Error,
+                Some("rustc"),
+                Some("E0308")
+            ))
+            .as_deref(),
+            Some("rustc(E0308)")
+        );
+        assert_eq!(
+            diagnostic_detail(&proto_diag(DiagnosticSeverity::Error, Some("rustc"), None))
+                .as_deref(),
+            Some("rustc")
+        );
+        assert_eq!(
+            diagnostic_detail(&proto_diag(DiagnosticSeverity::Error, None, Some("E0308")))
+                .as_deref(),
+            Some("E0308")
+        );
+        assert!(diagnostic_detail(&proto_diag(DiagnosticSeverity::Error, None, None)).is_none());
+    }
+
+    /// A document-symbol response is cached on the tab whose in-flight id it
+    /// echoes, feeding the breadcrumb's enclosing-symbol lookup.
+    #[gpui::test]
+    fn test_apply_document_symbol_response_caches_on_the_requesting_tab(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    editor.tabs[a].load_state = TabLoadState::Loaded;
+                    editor.active = Some(a);
+                    editor.tabs[a].latest_symbol_id = Some(NavRequestId(1));
+
+                    editor.apply_document_symbol_response(
+                        NavRequestId(1),
+                        vec![sym("fn main", 0, (0, 0), (3, 1))],
+                        cx,
+                    );
+                    assert_eq!(editor.tabs[a].symbols.len(), 1);
+                    assert_eq!(editor.tabs[a].symbols[0].name, "fn main");
+                });
+            })
+            .unwrap();
+    }
+
+    /// A response whose id matches no tab's `latest_symbol_id` is dropped
+    /// (drop-stale discipline shared with the other nav responses).
+    #[gpui::test]
+    fn test_stale_document_symbol_response_is_dropped(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    editor.tabs[a].load_state = TabLoadState::Loaded;
+                    editor.active = Some(a);
+                    editor.tabs[a].latest_symbol_id = Some(NavRequestId(1));
+
+                    editor.apply_document_symbol_response(
+                        NavRequestId(2),
+                        vec![sym("fn main", 0, (0, 0), (3, 1))],
+                        cx,
+                    );
+                    assert!(
+                        editor.tabs[a].symbols.is_empty(),
+                        "a stale-id response must not populate the cache"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// The cursor line's diagnostic is withheld from the widget's own
+    /// diagnostic set (it renders as the app's inline card instead), while the
+    /// tab keeps the full set for the gutter dots — "one diagnostic never
+    /// renders twice".
+    #[gpui::test]
+    fn test_cursor_line_diagnostic_is_suppressed_from_the_widget_set(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    editor.tabs[a].load_state = TabLoadState::Loaded;
+                    editor.active = Some(a);
+                    editor.tabs[a].cursor_line = 0;
+
+                    let items = vec![
+                        diag_at_line(0, DiagnosticSeverity::Error),
+                        diag_at_line(10, DiagnosticSeverity::Warning),
+                    ];
+                    editor.set_diagnostics_for_path("a.rs", &items, cx);
+
+                    // The tab's own copy keeps both (gutter dots use it).
+                    assert_eq!(editor.tabs[a].diagnostics.len(), 2);
+                    // The widget set drops the cursor line (line 0) — only the
+                    // line-10 diagnostic remains for the widget's squiggle/popover.
+                    let widget_len = editor.tabs[a]
+                        .input
+                        .read(cx)
+                        .diagnostics()
+                        .map(gpui_component::highlighter::DiagnosticSet::len)
+                        .unwrap_or(0);
+                    assert_eq!(widget_len, 1, "the cursor line's diagnostic is withheld");
+
+                    // Moving the cursor to line 10 re-syncs: line 10 is now
+                    // withheld and line 0 returns to the widget set.
+                    editor.tabs[a].cursor_line = 10;
+                    editor.sync_widget_diagnostics(a, cx);
+                    let widget_len = editor.tabs[a]
+                        .input
+                        .read(cx)
+                        .diagnostics()
+                        .map(gpui_component::highlighter::DiagnosticSet::len)
+                        .unwrap_or(0);
+                    assert_eq!(widget_len, 1);
+                    assert_eq!(editor.tabs[a].diagnostics.len(), 2);
+                });
+            })
+            .unwrap();
     }
 
     // --- navigation back-stack (#196) ---

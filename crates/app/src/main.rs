@@ -1970,12 +1970,14 @@ async fn consume_daemon_messages(
                 let _ = editor.buffer_tx.send(msg);
             }
             // --- nav replies -> editor (every mode) ---
-            // Definition, hover, and references responses route to the editor's
-            // nav reply channel; the workspace's `nav_rx` loop dispatches each
-            // to the correct `apply_*` method on the GPUI side (#196, #197, #198).
+            // Definition, hover, references, and document-symbol responses route
+            // to the editor's nav reply channel; the workspace's `nav_rx` loop
+            // dispatches each to the correct `apply_*` method on the GPUI side
+            // (#196, #197, #198, editor-chrome breadcrumb).
             msg @ (DaemonMessage::DefinitionResponse { .. }
             | DaemonMessage::HoverResponse { .. }
-            | DaemonMessage::ReferencesResponse { .. }) => {
+            | DaemonMessage::ReferencesResponse { .. }
+            | DaemonMessage::DocumentSymbolResponse { .. }) => {
                 let _ = editor.nav_tx.send(msg);
             }
             // --- language-server health -> composite status line (every mode) ---
