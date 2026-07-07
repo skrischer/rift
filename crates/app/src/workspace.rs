@@ -481,8 +481,10 @@ impl WorkspaceView {
         // Nav reply stream -> editor: `DefinitionResponse` routes to
         // `apply_definition_response`; `HoverResponse` routes to
         // `apply_hover_response` (#197); `ReferencesResponse` routes to
-        // `apply_references_response` (#198). Routed through this view's weak
-        // handle so a closed window ends the loop gracefully.
+        // `apply_references_response` (#198); `DocumentSymbolResponse` routes to
+        // `apply_document_symbol_response` (editor-chrome breadcrumb). Routed
+        // through this view's weak handle so a closed window ends the loop
+        // gracefully.
         {
             cx.spawn_in(window, async move |this, cx| loop {
                 let Ok(msg) = nav_rx.recv_async().await else {
@@ -498,6 +500,9 @@ impl WorkspaceView {
                         }
                         DaemonMessage::ReferencesResponse { id, locations } => {
                             editor.apply_references_response(id, locations, cx);
+                        }
+                        DaemonMessage::DocumentSymbolResponse { id, symbols } => {
+                            editor.apply_document_symbol_response(id, symbols, cx);
                         }
                         _ => {}
                     });
