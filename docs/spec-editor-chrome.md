@@ -166,3 +166,17 @@ None.
   Non-blocking adoptions: #420 (not #423) as the dialog pattern, diagnostic
   double-surface suppression, capability advertisement + Flat-shape
   fallbacks, gutter overlay render strategy.
+- 2026-07-07 (#530): the outline panel is opt-in, added to (and removed from)
+  the left dock's existing `TabPanel` at runtime via `DockArea::add_panel`/
+  `remove_panel` (a `ToggleOutline` command), rather than always-mounted
+  alongside the explorer with only a whole-dock toggle (the `ToggleExplorer`/
+  `ToggleProblems`/`ToggleSourceControl` precedent) — the spec calls for a
+  *palette toggle specific to the outline panel*, and gpui-component's
+  `DockArea` has no API to switch which tab is active within an
+  already-mounted `TabPanel`, so add/remove is the mechanism that gives the
+  outline panel its own show/hide affordance without forking the dock. Kind
+  glyphs are single ASCII letters (theme-token colored by a 4-bucket
+  category), not icon-asset glyphs — matching the file tree's own precedent
+  of text glyphs over `IconName` assets (`crate::file_tree`'s directory
+  twisty), since the shipped binary does not embed gpui-component's SVG
+  icon set.

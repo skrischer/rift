@@ -59,6 +59,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use flume::{Receiver, Sender};
@@ -68,7 +69,7 @@ use gpui::{
     SharedString, Styled as _, Window, WindowBounds,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::dock::{DockArea, DockItem, DockPlacement};
+use gpui_component::dock::{DockArea, DockItem, DockPlacement, PanelView};
 use gpui_component::{ActiveTheme as _, IconName, Root, Sizable as _};
 use rift_protocol::{ClientMessage, DaemonMessage, LspServerState};
 use rift_terminal::{SessionView, SessionViewEvent};
@@ -79,6 +80,7 @@ use crate::command_palette::{CommandPalette, OpenCommandPalette};
 use crate::diff_view::DiffView;
 use crate::editor::EditorView;
 use crate::file_tree::{FileTree, FileTreeEvent};
+use crate::outline_panel::{OutlinePanel, OutlinePanelEvent};
 use crate::problems_panel::{ProblemsPanel, ProblemsPanelEvent};
 use crate::settings::{OpenSettings, SettingsView};
 use crate::source_control::{SourceControlEvent, SourceControlPanel};
@@ -111,6 +113,16 @@ const WINDOW_STATE_SAVE_DEBOUNCE: Duration = Duration::from_millis(200);
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = rift, no_json)]
 pub struct ToggleExplorer;
+
+/// Toggle the outline panel (left dock, alongside the explorer) shown/hidden
+/// (`docs/spec-editor-chrome.md`, issue #530). Unlike `ToggleExplorer` this
+/// does not toggle the whole left dock's open state — the outline panel is a
+/// second tab added to (or removed from) the left dock's `TabPanel` via
+/// `DockArea::add_panel`/`remove_panel`, opening the dock too when shown. The
+/// activity-rail icon for this is a phase-21 follow-up.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct ToggleOutline;
 
 /// Toggle the problems dock (bottom, home to the problems panel, #342)
 /// hidden/shown.
@@ -229,6 +241,19 @@ pub struct WorkspaceView {
     // `--all-targets` build.
     #[allow(dead_code)]
     problems_panel: Entity<ProblemsPanel>,
+    /// The outline panel (`docs/spec-editor-chrome.md`, #530): a virtualized
+    /// read of the active editor tab's document-symbol cache, toggled into
+    /// the left dock alongside `file_tree` by `toggle_outline`, which reads
+    /// this field. The jump-to-location wiring subscribes to the local
+    /// `outline_panel` value at construction time instead.
+    outline_panel: Entity<OutlinePanel>,
+    /// Whether the outline panel is currently added to the left dock's
+    /// `TabPanel` (`ToggleOutline`, #530) — `add_panel`/`remove_panel` carry
+    /// no query API, so this is the source of truth `toggle_outline` flips.
+    /// Starts `false`: the outline panel is opt-in via the palette, not
+    /// shown by default (the rail icon that would surface it is a phase-21
+    /// follow-up).
+    outline_open: bool,
     /// Language-server health for the composite status line's LSP segment
     /// (`docs/spec-status-line.md`), keyed by stable server name and folded
     /// from the daemon's `LspStatus` push (replayed behind Welcome). Read
@@ -579,6 +604,10 @@ impl WorkspaceView {
         let source_control = cx.new(|cx| SourceControlPanel::new(file_tree.clone(), cx));
         let diff_view = cx.new(|cx| DiffView::new(request_diff_tx, cx));
         let problems_panel = cx.new(|cx| ProblemsPanel::new(file_tree.clone(), cx));
+        // Reads (never mutates) the editor's active-tab document-symbol cache
+        // (`docs/spec-editor-chrome.md`, #530) — the same cache the
+        // breadcrumb resolves the enclosing symbol against (#527).
+        let outline_panel = cx.new(|cx| OutlinePanel::new(editor.clone(), cx));
 
         // Open-diff wiring (#338): selecting a changed file in the
         // source-control panel opens its diff in the diff view — the clean
@@ -608,6 +637,20 @@ impl WorkspaceView {
             window,
             |this, _panel, event: &ProblemsPanelEvent, window, cx| {
                 let ProblemsPanelEvent::OpenLocation { path, range } = event;
+                this.editor.update(cx, |editor, cx| {
+                    editor.open_at_range(path.clone(), *range, window, cx);
+                });
+            },
+        )
+        .detach();
+
+        // Jump-to-location (#530): selecting an outline row emits
+        // `OpenLocation`, routed the same way the problems panel's is above.
+        cx.subscribe_in(
+            &outline_panel,
+            window,
+            |this, _panel, event: &OutlinePanelEvent, window, cx| {
+                let OutlinePanelEvent::OpenLocation { path, range } = event;
                 this.editor.update(cx, |editor, cx| {
                     editor.open_at_range(path.clone(), *range, window, cx);
                 });
@@ -712,6 +755,8 @@ impl WorkspaceView {
             editor,
             session_view,
             problems_panel,
+            outline_panel,
+            outline_open: false,
             lsp: BTreeMap::new(),
             diff_view,
             open_file_tx,
@@ -834,6 +879,29 @@ impl WorkspaceView {
         self.dock_area.update(cx, |dock_area, cx| {
             dock_area.toggle_dock(DockPlacement::Left, window, cx);
         });
+    }
+
+    /// Toggle the outline panel shown/hidden in the left dock (#530): adds it
+    /// as a tab alongside the explorer (opening the dock too, since
+    /// `DockArea::add_panel` does not do that for an already-existing dock)
+    /// or removes it, per `outline_open`'s current state — the panel-level
+    /// counterpart to `toggle_explorer`'s whole-dock toggle.
+    fn toggle_outline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let opening = !self.outline_open;
+        let panel: Arc<dyn PanelView> = Arc::new(self.outline_panel.clone());
+        self.dock_area.update(cx, |dock_area, cx| {
+            if opening {
+                dock_area.add_panel(panel, DockPlacement::Left, None, window, cx);
+                if let Some(left_dock) = dock_area.left_dock().cloned() {
+                    left_dock.update(cx, |dock, cx| {
+                        dock.set_open(true, window, cx);
+                    });
+                }
+            } else {
+                dock_area.remove_panel(panel, DockPlacement::Left, window, cx);
+            }
+        });
+        self.outline_open = opening;
     }
 
     /// Toggle the problems dock (bottom) hidden/shown (issue #358).
@@ -1140,6 +1208,9 @@ impl Render for WorkspaceView {
             .bg(cx.theme().background)
             .on_action(cx.listener(|this, _: &ToggleExplorer, window, cx| {
                 this.toggle_explorer(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleOutline, window, cx| {
+                this.toggle_outline(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleProblems, window, cx| {
                 this.toggle_problems(window, cx);
@@ -1653,6 +1724,108 @@ mod tests {
                 assert!(
                     !dock_area.read(cx).is_dock_open(DockPlacement::Left, cx),
                     "ToggleExplorer hides the explorer dock"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Shell command action (`docs/spec-editor-chrome.md`, #530):
+    /// `ToggleOutline` adds the outline panel as a second tab in the left
+    /// dock — opening it if collapsed, unlike a plain `DockArea::add_panel`,
+    /// which does not — and removes it again on a second toggle, leaving the
+    /// explorer tab untouched throughout.
+    #[gpui::test]
+    fn test_toggle_outline_adds_and_removes_the_outline_tab_and_opens_the_dock(
+        cx: &mut TestAppContext,
+    ) {
+        // `DockItem::Tabs { items, .. }` is a construction-time snapshot: only
+        // `DockItem::add_panel` (`&mut self`) keeps it in sync, while
+        // `DockItem::remove_panel` (`&self`) mutates just the live
+        // `TabPanel.panels` it delegates to — so `items` is reliable right
+        // after an add but stale after a remove. `left_tab_names` (add) and
+        // `left_active_tab_name` (remove, via the live `TabPanel`) are each
+        // used only where they are accurate.
+        fn left_tab_names(dock_area: &Entity<DockArea>, cx: &App) -> Vec<&'static str> {
+            let left = dock_area.read(cx).left_dock().expect("left dock exists");
+            match left.read(cx).panel() {
+                DockItem::Tabs { items, .. } => {
+                    items.iter().map(|item| item.panel_name(cx)).collect()
+                }
+                other => panic!("expected the left dock to hold tabs, got {other:?}"),
+            }
+        }
+
+        fn left_active_tab_name(dock_area: &Entity<DockArea>, cx: &App) -> Option<&'static str> {
+            let left = dock_area.read(cx).left_dock().expect("left dock exists");
+            match left.read(cx).panel() {
+                DockItem::Tabs { view, .. } => view
+                    .read(cx)
+                    .active_panel(cx)
+                    .map(|panel| panel.panel_name(cx)),
+                other => panic!("expected the left dock to hold tabs, got {other:?}"),
+            }
+        }
+
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let session_view = cx.new(|cx| SessionView::new(cx).0);
+                workspace =
+                    Some(cx.new(|cx| {
+                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
+                    }));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+
+        window
+            .update(cx, |_, window, cx| {
+                let dock_area = workspace.read(cx).dock_area.clone();
+
+                assert_eq!(
+                    left_tab_names(&dock_area, cx),
+                    vec![crate::file_tree::FILE_TREE_PANEL_NAME],
+                    "the outline panel is not shown by default"
+                );
+
+                // Collapse the left dock first, to prove ToggleOutline opens
+                // it rather than merely adding an invisible tab.
+                workspace.update(cx, |view, cx| {
+                    view.toggle_explorer(window, cx);
+                });
+                assert!(!dock_area.read(cx).is_dock_open(DockPlacement::Left, cx));
+
+                workspace.update(cx, |view, cx| {
+                    view.toggle_outline(window, cx);
+                });
+                assert!(
+                    dock_area.read(cx).is_dock_open(DockPlacement::Left, cx),
+                    "ToggleOutline opens the left dock"
+                );
+                assert_eq!(
+                    left_tab_names(&dock_area, cx),
+                    vec![
+                        crate::file_tree::FILE_TREE_PANEL_NAME,
+                        crate::outline_panel::OUTLINE_PANEL_NAME,
+                    ],
+                    "ToggleOutline adds the outline panel beside the explorer"
+                );
+                assert_eq!(
+                    left_active_tab_name(&dock_area, cx),
+                    Some(crate::outline_panel::OUTLINE_PANEL_NAME),
+                    "adding the outline panel activates its tab"
+                );
+
+                workspace.update(cx, |view, cx| {
+                    view.toggle_outline(window, cx);
+                });
+                assert_eq!(
+                    left_active_tab_name(&dock_area, cx),
+                    Some(crate::file_tree::FILE_TREE_PANEL_NAME),
+                    "a second ToggleOutline removes the outline panel, leaving the explorer active"
                 );
             })
             .unwrap();

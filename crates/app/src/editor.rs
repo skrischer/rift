@@ -986,6 +986,16 @@ impl EditorView {
         })
     }
 
+    /// The active tab's cached, flattened document-symbol tree
+    /// (`docs/spec-editor-chrome.md`) — empty when no tab is open or the
+    /// server has not answered yet. Feeds the outline panel (#530); the
+    /// breadcrumb reads the same cache via [`enclosing_symbol_chain`].
+    pub fn active_document_symbols(&self) -> &[DocumentSymbolEntry] {
+        self.active_tab()
+            .map(|tab| tab.symbols.as_slice())
+            .unwrap_or(&[])
+    }
+
     // ── Load ──────────────────────────────────────────────────────────────
 
     /// Render a `FileContent` reply: find the tab awaiting it (matching path,
@@ -2650,7 +2660,11 @@ fn position_in_range(range: &Range, line: u32, character: u32) -> bool {
 /// contains the cursor is an ancestor of the next deeper one; sorting the
 /// containing entries by `depth` reconstructs the enclosing path (e.g.
 /// `impl Foo` then `fn render`). Empty when the cursor is inside no symbol.
-fn enclosing_symbol_chain(
+///
+/// `pub(crate)`: also the outline panel's "selection follows cursor" signal
+/// (`crate::outline_panel`, `docs/spec-editor-chrome.md`) — one source of
+/// truth for "what symbol is the cursor inside", shared with the breadcrumb.
+pub(crate) fn enclosing_symbol_chain(
     symbols: &[DocumentSymbolEntry],
     line: u32,
     character: u32,

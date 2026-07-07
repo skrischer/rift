@@ -14,8 +14,8 @@ use gpui::Action;
 
 use crate::editor::{FindReferences, GoToDefinition, Save, ShowHover};
 use crate::workspace::{
-    FocusTerminal, NewSession, RefreshKeyTables, SwitchSession, ToggleExplorer, ToggleProblems,
-    ToggleSourceControl, ZoomActivePanel,
+    FocusTerminal, NewSession, RefreshKeyTables, SwitchSession, ToggleExplorer, ToggleOutline,
+    ToggleProblems, ToggleSourceControl, ZoomActivePanel,
 };
 use crate::{
     SelectCatppuccinMochaTheme, SelectDefaultDarkTheme, SelectDefaultLightTheme, ToggleThemeMode,
@@ -60,6 +60,7 @@ pub const COMMANDS: &[Command] = &[
         Box::new(FindReferences)
     }),
     Command::new("Toggle Explorer", None, || Box::new(ToggleExplorer)),
+    Command::new("Toggle Outline", None, || Box::new(ToggleOutline)),
     Command::new("Toggle Problems", None, || Box::new(ToggleProblems)),
     Command::new("Toggle Source Control", None, || {
         Box::new(ToggleSourceControl)
@@ -117,6 +118,7 @@ mod tests {
                 "Show Hover",
                 "Find References",
                 "Toggle Explorer",
+                "Toggle Outline",
                 "Toggle Problems",
                 "Toggle Source Control",
                 "Focus Terminal",

@@ -250,6 +250,7 @@ mod tests {
             matched_names("toggle"),
             vec![
                 "Toggle Explorer",
+                "Toggle Outline",
                 "Toggle Problems",
                 "Toggle Source Control",
                 "Toggle Light/Dark Theme"
