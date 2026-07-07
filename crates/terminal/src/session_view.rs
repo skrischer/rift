@@ -602,6 +602,26 @@ impl SessionView {
         self.ssh_label = label.into();
     }
 
+    /// The `user@host` label, read by the title bar's connection group
+    /// (#511, `docs/spec-cockpit-chrome.md`) — the same value this view's own
+    /// statusbar renders.
+    pub fn ssh_label(&self) -> &str {
+        &self.ssh_label
+    }
+
+    /// The attached tmux session name (fed by the layout stream), read by the
+    /// title bar's connection group (#511).
+    pub fn session_name(&self) -> &str {
+        &self.session_name
+    }
+
+    /// The SSH/tmux connection lifecycle state, read by the title bar's
+    /// connection group (#511) to render the same status dot this view's own
+    /// statusbar shows.
+    pub fn connection_status(&self) -> ConnectionStatus {
+        self.connection_status
+    }
+
     /// Apply an absolute font size, notifying every live pane and arming the
     /// debounced window-state capture (#225) — the shared choke point for
     /// both the `Ctrl+=`/`Ctrl+-` zoom and the settings surface's font-scale
@@ -1566,15 +1586,9 @@ impl Render for SessionView {
         // Connection indicator, driven by the SSH lifecycle channel. Theme
         // tokens per the design contract (`docs/spec-connection-robustness.md`):
         // connected = success, connecting/reconnecting = warning, not
-        // connected = muted.
-        let (status_label, status_color) = match self.connection_status {
-            ConnectionStatus::Connecting => ("connecting", cx.theme().warning),
-            ConnectionStatus::Connected => ("connected", cx.theme().success),
-            ConnectionStatus::Reconnecting | ConnectionStatus::SshReconnecting { .. } => {
-                ("reconnecting", cx.theme().warning)
-            }
-            ConnectionStatus::Disconnected => ("disconnected", cx.theme().muted_foreground),
-        };
+        // connected = muted — shared with the title bar's connection group
+        // (#511) via `ConnectionStatus::status_dot`.
+        let (status_label, status_color) = self.connection_status.status_dot(cx);
 
         // SSH-outage danger banner (#476): only the SSH-level engine's state
         // shows it; a daemon-stream recovery (plain `Reconnecting`, #475)

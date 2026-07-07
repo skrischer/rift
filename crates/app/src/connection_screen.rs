@@ -28,6 +28,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{h_flex, v_flex, ActiveTheme, Icon, IconName};
 
 use crate::recents::{self, RecentConnection};
+use crate::title_bar;
 
 /// Connect card width (design contract: "card ~470px").
 const CARD_WIDTH: f32 = 470.0;
@@ -780,19 +781,27 @@ impl Render for ConnectionScreen {
                     })),
             );
 
+        // The custom title bar (#511, `docs/spec-cockpit-chrome.md`): the
+        // Connection screen's "not connected" group — no settings gear here,
+        // the settings surface needs a live `SessionView` that does not exist
+        // before a connection succeeds (#366).
+        let title_bar = title_bar::render(title_bar::ConnectionGroup::not_connected(cx), None, cx);
+
         div()
             .size_full()
-            .bg(cx.theme().background)
             .flex()
-            .items_center()
-            .justify_center()
+            .flex_col()
+            .bg(cx.theme().background)
+            .child(title_bar)
             .child(
-                v_flex()
-                    .items_center()
-                    .gap(px(24.0))
-                    .child(render_logo(cx))
-                    .child(card)
-                    .children(recents_section),
+                div().flex_1().flex().items_center().justify_center().child(
+                    v_flex()
+                        .items_center()
+                        .gap(px(24.0))
+                        .child(render_logo(cx))
+                        .child(card)
+                        .children(recents_section),
+                ),
             )
     }
 }

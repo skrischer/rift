@@ -12,7 +12,7 @@ use std::thread;
 
 use anyhow::{Context as _, Result};
 use gpui::*;
-use gpui_component::Root;
+use gpui_component::{Root, TitleBar};
 use rift_app::connection_screen::{
     ConnectError, ConnectRequest, ConnectionScreen, ConnectionScreenEvent,
 };
@@ -426,13 +426,28 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(window_bounds),
-                titlebar: Some(TitlebarOptions {
-                    title: Some(title.into()),
-                    ..Default::default()
-                }),
+                // Custom 38px title bar (#511, `docs/spec-cockpit-chrome.md`):
+                // `TitleBar::title_bar_options()` hides the native OS chrome
+                // (`appears_transparent: true`) and leaves `title: None` — the
+                // window's taskbar/alt-tab name is set explicitly below
+                // instead, since the OS title text no longer renders anywhere.
+                titlebar: Some(TitleBar::title_bar_options()),
+                // Client-side decorations (Wayland only; a no-op under X11 and
+                // Windows, where `appears_transparent` above already governs
+                // the chrome) — mirrors gpui-component's own story reference
+                // so a compositor never draws a redundant server-side bar
+                // behind the custom one.
+                #[cfg(target_os = "linux")]
+                window_background: WindowBackgroundAppearance::Transparent,
+                #[cfg(target_os = "linux")]
+                window_decorations: Some(WindowDecorations::Client),
                 ..Default::default()
             },
             |window, cx| {
+                // The OS-level window title (taskbar/alt-tab) — no longer
+                // carried by `titlebar.title` now that the native bar is
+                // hidden; the custom bar shows the wordmark instead.
+                window.set_window_title(title);
                 // The Connection screen (#477) is the startup state on every
                 // launch (no auto-connect, per the spec's gate decision): the
                 // Shell renders it first, and only builds the session

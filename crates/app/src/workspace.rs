@@ -64,10 +64,11 @@ use flume::{Receiver, Sender};
 use gpui::{
     div, point, px, size, App, AppContext as _, Axis, Bounds, Context, Entity, FocusHandle,
     Focusable, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
-    Styled as _, Window, WindowBounds,
+    SharedString, Styled as _, Window, WindowBounds,
 };
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dock::{DockArea, DockItem, DockPlacement};
-use gpui_component::{ActiveTheme as _, Root};
+use gpui_component::{ActiveTheme as _, IconName, Root, Sizable as _};
 use rift_protocol::{ClientMessage, DaemonMessage};
 use rift_terminal::{SessionView, SessionViewEvent};
 use tracing::{debug, warn};
@@ -81,6 +82,7 @@ use crate::settings::{OpenSettings, SettingsView};
 use crate::source_control::{SourceControlEvent, SourceControlPanel};
 use crate::status_bar;
 use crate::terminal_panel::TerminalPanel;
+use crate::title_bar;
 use crate::window_state;
 use crate::{
     SelectCatppuccinMochaTheme, SelectDefaultDarkTheme, SelectDefaultLightTheme, ToggleThemeMode,
@@ -982,8 +984,34 @@ impl Focusable for WorkspaceView {
 
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // The dock shell fills the window under the current OS chrome; the
-        // `flex_col` mirrors `examples/dock.rs` at the pinned gpui-component rev.
+        // The custom title bar (#511, `docs/spec-cockpit-chrome.md`): the
+        // connection group reads the live `SessionView` fields the terminal
+        // crate's own statusbar shows, so the two never disagree. The
+        // settings gear dispatches through the same `open_settings` path as
+        // the `OpenSettings` action below.
+        let connection = {
+            let session = self.session_view.read(cx);
+            let (_, dot_color) = session.connection_status().status_dot(cx);
+            let label = SharedString::from(format!(
+                "{} \u{b7} session {}",
+                session.ssh_label(),
+                session.session_name()
+            ));
+            title_bar::ConnectionGroup { dot_color, label }
+        };
+        let settings_button = Button::new("title-bar-settings")
+            .ghost()
+            .xsmall()
+            .icon(IconName::Settings)
+            .on_click(cx.listener(|this, _event, window, cx| {
+                this.open_settings(window, cx);
+            }))
+            .into_any_element();
+        let title_bar = title_bar::render(connection, Some(settings_button), cx);
+
+        // The dock shell fills the window below the custom title bar (the
+        // native OS chrome is gone, #511); the `flex_col` mirrors
+        // `examples/dock.rs` at the pinned gpui-component rev.
         // The status bar (#347, #348, `docs/spec-status-bar.md`) is a plain
         // `flex_col` sibling below the dock — bottom chrome, not a dock `Panel` —
         // reading the file tree's mirrored `WorktreeModel` inline (repainted by
@@ -1077,6 +1105,7 @@ impl Render for WorkspaceView {
                     this.select_theme(CATPPUCCIN_MOCHA_THEME_NAME, window, cx);
                 }),
             )
+            .child(title_bar)
             .child(self.dock_area.clone())
             .child(status_bar)
             .children(sheet_layer)
