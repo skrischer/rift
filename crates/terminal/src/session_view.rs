@@ -8,7 +8,7 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::popover::Popover;
 use gpui_component::tab::{Tab, TabBar};
-use gpui_component::{h_flex, v_flex, ActiveTheme, Icon, IconName, Sizable};
+use gpui_component::{h_flex, v_flex, white, ActiveTheme, Icon, IconName, Sizable};
 use termy_terminal_ui::TmuxSnapshot;
 use tracing::debug;
 
@@ -42,11 +42,21 @@ const SESSION_SWITCHER_WIDTH: f32 = 260.0;
 /// Height of one session row (and the new-session footer row) in the switcher.
 const SESSION_SWITCHER_ROW_HEIGHT: f32 = 30.0;
 
+/// A tmux layout snapshot paired with the per-pane `is_shell` flags (#510).
+/// termy's `TmuxPaneState` is a vendored upstream type that cannot carry the
+/// daemon-evaluated `is_shell` flag, so it rides beside the snapshot keyed by
+/// tmux pane id (`%N`). A pane absent from the map reads as non-shell (process
+/// glyph) — the legacy tmux path, which has no daemon flag, sends an empty map.
+pub struct SessionSnapshot {
+    pub snapshot: TmuxSnapshot,
+    pub pane_is_shell: HashMap<String, bool>,
+}
+
 pub struct TerminalHandle {
     pub pane_output_tx: flume::Sender<PaneOutput>,
     pub input_rx: flume::Receiver<PaneInput>,
     pub size_changed_rx: flume::Receiver<TermSize>,
-    pub snapshot_tx: flume::Sender<TmuxSnapshot>,
+    pub snapshot_tx: flume::Sender<SessionSnapshot>,
     pub tmux_command_rx: flume::Receiver<String>,
     pub subscription_tx: flume::Sender<SubscriptionUpdate>,
     pub capture_request_rx: flume::Receiver<CaptureRequest>,
@@ -102,6 +112,12 @@ struct WindowState {
     index: i32,
     is_active: bool,
     pane_ids: Vec<String>,
+    /// Whether this window's active pane is sitting at its shell (tmux's own
+    /// `#{==:#{pane_current_command},#{b:default-shell}}`, #510) — drives the
+    /// tab's type glyph: shell → prompt glyph, anything else → process glyph.
+    /// Defaults to `false` (process glyph) when the flag is unavailable (the
+    /// legacy tmux path, or a window with no active pane in the snapshot).
+    is_shell: bool,
 }
 
 /// An in-progress inline window rename. `window_id` targets the tmux window;
@@ -220,17 +236,37 @@ fn aggregate_activity(activities: impl Iterator<Item = PaneActivity>) -> (PaneAc
     (dominant, active_count)
 }
 
-/// Catppuccin Mocha dot color for a window's dominant [`PaneActivity`], reusing
-/// the connection-indicator palette (hardcoded literals, not gpui-component theme
-/// tokens): busy is green, attention is peach. `Free` returns `None` so an idle
-/// window draws no dot and does not compete for attention. GPUI-free (`Hsla` is a
-/// plain value) so the mapping is unit-testable without an app context
-/// (`docs/spec-pane-activity-indicators.md`).
-fn activity_dot_color(activity: PaneActivity) -> Option<Hsla> {
+/// Which shape a window tab's fixed state slot renders for a dominant
+/// [`PaneActivity`]. Busy and attention are deliberately distinct shapes and
+/// sizes (a small success dot vs a danger "!"-badge) so a glance tells them
+/// apart (`docs/spec-cockpit-chrome.md`); `Idle` draws nothing but the slot
+/// reserves its width so the lane stays aligned across tabs. GPUI-free so the
+/// mapping is unit-testable without an app context; the render layer supplies
+/// the theme colors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabStateSlot {
+    Idle,
+    Busy,
+    Attention,
+}
+
+fn tab_state_slot(activity: PaneActivity) -> TabStateSlot {
     match activity {
-        PaneActivity::Free => None,
-        PaneActivity::Busy => Some(rgb(0xa6e3a1).into()),
-        PaneActivity::Attention => Some(rgb(0xfab387).into()),
+        PaneActivity::Free => TabStateSlot::Idle,
+        PaneActivity::Busy => TabStateSlot::Busy,
+        PaneActivity::Attention => TabStateSlot::Attention,
+    }
+}
+
+/// The tab type glyph for a window whose active pane is (or is not) at its
+/// shell: a terminal-prompt glyph for a shell, a process glyph otherwise.
+/// Agent-agnostic — the distinction rides tmux's own `is_shell` flag (#510),
+/// never any command taxonomy or agent-name list.
+fn type_glyph(is_shell: bool) -> IconName {
+    if is_shell {
+        IconName::SquareTerminal
+    } else {
+        IconName::Cpu
     }
 }
 
@@ -310,7 +346,7 @@ impl SessionView {
         let (pane_output_tx, pane_output_rx) = flume::unbounded::<PaneOutput>();
         let (input_tx, input_rx) = flume::unbounded::<PaneInput>();
         let (size_changed_tx, size_changed_rx) = flume::unbounded();
-        let (snapshot_tx, snapshot_rx) = flume::unbounded::<TmuxSnapshot>();
+        let (snapshot_tx, snapshot_rx) = flume::unbounded::<SessionSnapshot>();
         let (tmux_command_tx, tmux_command_rx) = flume::unbounded::<String>();
         let (subscription_tx, subscription_rx) = flume::unbounded::<SubscriptionUpdate>();
         let (capture_request_tx, capture_request_rx) = flume::unbounded::<CaptureRequest>();
@@ -773,8 +809,13 @@ impl SessionView {
         }
     }
 
-    fn apply_snapshot(&mut self, snapshot: TmuxSnapshot, cx: &mut Context<Self>) {
+    fn apply_snapshot(&mut self, session_snapshot: SessionSnapshot, cx: &mut Context<Self>) {
         use std::collections::HashSet;
+
+        let SessionSnapshot {
+            snapshot,
+            pane_is_shell,
+        } = session_snapshot;
 
         let snapshot_pane_ids: HashSet<&str> = snapshot
             .windows
@@ -883,12 +924,24 @@ impl SessionView {
                 }
             }
 
+            // The window's type glyph tracks its active pane's shell state; a
+            // pane missing from the map (legacy path, or no active pane) reads
+            // as non-shell. The flag refreshes on the layout-snapshot cadence,
+            // so the glyph flips when a process starts or exits in that pane.
+            let is_shell = window
+                .active_pane_id
+                .as_ref()
+                .and_then(|id| pane_is_shell.get(id))
+                .copied()
+                .unwrap_or(false);
+
             new_windows.push(WindowState {
                 id: window.id.clone(),
                 name: window.name.clone(),
                 index: window.index,
                 is_active: window.is_active,
                 pane_ids,
+                is_shell,
             });
         }
 
@@ -1607,13 +1660,17 @@ impl Render for SessionView {
         };
 
         let selected_index = self.windows.iter().position(|w| w.is_active).unwrap_or(0);
-        // Tab affordances reuse the theme tokens; the close glyph idles muted and
-        // reddens on hover, the new-window glyph idles muted and brightens.
+        // Tab affordances reuse the theme tokens (zero hardcoded hex): the index
+        // caption and type glyph idle muted, the busy dot is success-tinted, the
+        // attention badge is danger with a white "!", the close x reddens on
+        // hover, and the new-window glyph brightens.
+        let muted = cx.theme().muted_foreground;
+        let success = cx.theme().success;
+        let danger = cx.theme().danger;
         let close_idle = cx.theme().muted_foreground;
         let close_hover = cx.theme().danger;
         let new_idle = cx.theme().muted_foreground;
         let new_hover = cx.theme().foreground;
-        let activity_count_color = cx.theme().muted_foreground;
 
         // Fold each window's panes to its `(dominant, active_count)` before the tab
         // loop: `window_activity` reads `self.panes` while the loop below borrows
@@ -1626,12 +1683,15 @@ impl Render for SessionView {
             window_activities.push(self.window_activity(&w.id, cx));
         }
 
-        // One Tab per window. Single click selects the window, double click opens
-        // an inline rename input in place of the label; this dispatch lives on the
+        // One Tab per window, rendered to the design anatomy (`docs/spec-cockpit-chrome.md`):
+        // muted index caption, type glyph (prompt vs process, from tmux's own
+        // `is_shell`), name, and a fixed state slot (busy dot / attention badge /
+        // empty). Single click selects the window, double click opens an inline
+        // rename input in place of the anatomy; this dispatch lives on the
         // per-`Tab` `on_click` (not the bar) because it needs the click count to
-        // tell the two apart. The per-tab "x" suffix and middle-click both kill
-        // the window (own mouse-down + stop_propagation so they do not also
-        // select); the editing tab shows the input instead and omits the "x".
+        // tell the two apart. The close x (fading in over the state slot on hover)
+        // and middle-click both kill the window (own mouse-down + stop_propagation
+        // so they do not also select); the editing tab shows the input instead.
         let mut tabs: Vec<Tab> = Vec::with_capacity(self.windows.len());
         for (ix, (w, &(dominant, active_count))) in
             self.windows.iter().zip(&window_activities).enumerate()
@@ -1656,15 +1716,89 @@ impl Render for SessionView {
                         .child(Input::new(&input).xsmall()),
                 ),
                 None => {
-                    let label = SharedString::from(format!("{}: {}", w.index, w.name));
+                    // Anatomy child: muted index caption (mono, a numeric), the
+                    // type glyph, then the window name (Inter 13/500, inheriting
+                    // the tab's fg so the active tab reads brighter).
+                    let inner = h_flex()
+                        .gap(px(6.0))
+                        .items_center()
+                        .child(
+                            div()
+                                .font_family("JetBrainsMono Nerd Font Mono")
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(muted)
+                                .child(SharedString::from(w.index.to_string())),
+                        )
+                        .child(Icon::new(type_glyph(w.is_shell)).size_3().text_color(muted))
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(SharedString::from(w.name.clone())),
+                        );
+
+                    // Fixed state slot (busy dot / attention "!"-badge / empty),
+                    // sharing its lane with the close x — the x fades in on tab
+                    // hover and the state fades out, so hovering never shifts the
+                    // layout and an idle tab reserves the same lane.
+                    let group_name = SharedString::from(format!("window-tab-{}", w.id));
+                    let state = match tab_state_slot(dominant) {
+                        TabStateSlot::Idle => div().into_any_element(),
+                        TabStateSlot::Busy => {
+                            let mut busy = h_flex()
+                                .gap(px(3.0))
+                                .items_center()
+                                .child(div().size(px(7.0)).rounded_full().bg(success));
+                            // Count only when more than one pane is busy — a lone
+                            // busy pane needs no "1".
+                            if active_count > 1 {
+                                busy = busy.child(
+                                    div()
+                                        .font_family("JetBrainsMono Nerd Font Mono")
+                                        .text_size(px(11.0))
+                                        .text_color(muted)
+                                        .child(SharedString::from(active_count.to_string())),
+                                );
+                            }
+                            busy.into_any_element()
+                        }
+                        TabStateSlot::Attention => h_flex()
+                            .size(px(16.0))
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(danger)
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    // The same white the gpui-component `Badge`
+                                    // uses for its text — a filled-badge contrast
+                                    // choice, not a themed palette color.
+                                    .text_color(white())
+                                    .child("!"),
+                            )
+                            .into_any_element(),
+                    };
+
                     let close_target = w.id.clone();
-                    let middle_target = w.id.clone();
                     let close = div()
                         .id(("tab-close", ix))
-                        .px(px(4.0))
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .invisible()
+                        .group_hover(group_name.clone(), |s| s.visible())
                         .text_color(close_idle)
                         .hover(move |this| this.text_color(close_hover))
-                        .child("x")
+                        .child(Icon::new(IconName::Close).size_3())
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
@@ -1677,39 +1811,39 @@ impl Render for SessionView {
                                 cx.stop_propagation();
                             }),
                         );
-                    let mut tab = Tab::new().label(label).suffix(close).on_mouse_down(
-                        MouseButton::Middle,
-                        cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
-                            if let Err(e) = this
-                                .tmux_command_tx
-                                .try_send(format!("kill-window -t {}", middle_target))
-                            {
-                                debug!(error = %e, "failed to send kill-window command");
-                            }
-                            cx.stop_propagation();
-                        }),
-                    );
-                    // Activity indicator as a prefix (before the label, opposite the
-                    // close "x" suffix): a compact dot for the window's dominant
-                    // pane state, plus the busy-or-attention pane count when > 0. A
-                    // free window shows neither, so an idle single-pane window stays
-                    // clean (`docs/spec-pane-activity-indicators.md`).
-                    if let Some(dot_color) = activity_dot_color(dominant) {
-                        let mut indicator = h_flex()
-                            .gap(px(4.0))
-                            .items_center()
-                            .child(div().size(px(8.0)).rounded_full().bg(dot_color));
-                        if active_count > 0 {
-                            indicator = indicator.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(activity_count_color)
-                                    .child(SharedString::from(active_count.to_string())),
-                            );
-                        }
-                        tab = tab.prefix(indicator);
-                    }
-                    tab
+
+                    let suffix = div()
+                        .relative()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .min_w(px(16.0))
+                        .h_full()
+                        .child(
+                            div()
+                                .group_hover(group_name.clone(), |s| s.invisible())
+                                .child(state),
+                        )
+                        .child(close);
+
+                    let middle_target = w.id.clone();
+                    Tab::new()
+                        .group(group_name)
+                        .child(inner)
+                        .suffix(suffix)
+                        .on_mouse_down(
+                            MouseButton::Middle,
+                            cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
+                                if let Err(e) = this
+                                    .tmux_command_tx
+                                    .try_send(format!("kill-window -t {}", middle_target))
+                                {
+                                    debug!(error = %e, "failed to send kill-window command");
+                                }
+                                cx.stop_propagation();
+                            }),
+                        )
                 }
             };
 
@@ -1948,13 +2082,13 @@ impl Render for SessionView {
 #[cfg(test)]
 mod tests {
     use super::{
-        activity_dot_color, aggregate_activity, grid_size_for, kill_pane_command, quote_tmux_name,
+        aggregate_activity, grid_size_for, kill_pane_command, quote_tmux_name,
         reconnect_banner_message, resize_direction, select_pane_command, split_command,
-        PaneActivity, SessionListItem, SessionView, TermSize, TerminalHandle, DEFAULT_FONT_SIZE,
-        MAX_FONT_SIZE, MIN_FONT_SIZE,
+        tab_state_slot, PaneActivity, SessionListItem, SessionView, TabStateSlot, TermSize,
+        TerminalHandle, DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE,
     };
     use gpui::{
-        px, rgb, size, AnyWindowHandle, App, AppContext as _, Entity, SharedString, TestAppContext,
+        px, size, AnyWindowHandle, App, AppContext as _, Entity, SharedString, TestAppContext,
     };
     use gpui_component::input::InputState;
 
@@ -2091,16 +2225,17 @@ mod tests {
     }
 
     #[test]
-    fn test_activity_dot_color_free_has_no_dot() {
-        assert_eq!(activity_dot_color(PaneActivity::Free), None);
+    fn test_tab_state_slot_free_is_idle() {
+        assert_eq!(tab_state_slot(PaneActivity::Free), TabStateSlot::Idle);
     }
 
     #[test]
-    fn test_activity_dot_color_busy_and_attention_are_distinct_palette_literals() {
-        let busy = activity_dot_color(PaneActivity::Busy);
-        let attention = activity_dot_color(PaneActivity::Attention);
-        assert_eq!(busy, Some(rgb(0xa6e3a1).into()));
-        assert_eq!(attention, Some(rgb(0xfab387).into()));
+    fn test_tab_state_slot_busy_and_attention_are_distinct_shapes() {
+        let busy = tab_state_slot(PaneActivity::Busy);
+        let attention = tab_state_slot(PaneActivity::Attention);
+        assert_eq!(busy, TabStateSlot::Busy);
+        assert_eq!(attention, TabStateSlot::Attention);
+        // Distinct shapes so the dot and the "!"-badge never read alike.
         assert_ne!(busy, attention);
     }
 

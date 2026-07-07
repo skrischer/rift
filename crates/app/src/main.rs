@@ -23,8 +23,8 @@ use rift_logging::{
 };
 use rift_terminal::{
     CaptureRequest, CaptureResult, ConnectionStatus, KeyTableQueryResult, PaneInput, PaneOutput,
-    SelectWindow, SessionListItem, SessionSwitchRequest, SessionView, SubscriptionUpdate, TermSize,
-    TERMINAL_KEY_CONTEXT,
+    SelectWindow, SessionListItem, SessionSnapshot, SessionSwitchRequest, SessionView,
+    SubscriptionUpdate, TermSize, TERMINAL_KEY_CONTEXT,
 };
 use tracing::{debug, error, info, warn};
 
@@ -48,7 +48,7 @@ struct PtyChannels {
     pane_output_tx: flume::Sender<PaneOutput>,
     input_rx: flume::Receiver<PaneInput>,
     size_changed_rx: flume::Receiver<TermSize>,
-    snapshot_tx: flume::Sender<termy_terminal_ui::TmuxSnapshot>,
+    snapshot_tx: flume::Sender<SessionSnapshot>,
     tmux_command_rx: flume::Receiver<String>,
     subscription_tx: flume::Sender<SubscriptionUpdate>,
     capture_request_rx: flume::Receiver<CaptureRequest>,
@@ -1461,7 +1461,12 @@ async fn run_legacy_terminal(
     let initial_snapshot = tmux_client
         .refresh_snapshot()
         .context("failed to get initial tmux snapshot")?;
-    let _ = snapshot_tx.send(initial_snapshot);
+    // Legacy tmux path: termy's snapshot has no daemon-evaluated `is_shell`
+    // flag, so the map is empty and every window renders the process glyph.
+    let _ = snapshot_tx.send(SessionSnapshot {
+        snapshot: initial_snapshot,
+        pane_is_shell: std::collections::HashMap::new(),
+    });
 
     let tmux_for_input = std::sync::Arc::new(tmux_client);
     let tmux_for_resize = tmux_for_input.clone();
@@ -1537,7 +1542,10 @@ async fn run_legacy_terminal(
                 }
                 TmuxNotification::NeedsRefresh => {
                     if let Ok(snapshot) = tmux_for_poll.refresh_snapshot() {
-                        let _ = snapshot_tx.send(snapshot);
+                        let _ = snapshot_tx.send(SessionSnapshot {
+                            snapshot,
+                            pane_is_shell: std::collections::HashMap::new(),
+                        });
                     }
                 }
                 TmuxNotification::SubscriptionChanged {
@@ -2137,7 +2145,7 @@ fn spawn_nav_bridge(
 /// reverse path (input, resize, commands, capture) runs through the bridge tasks.
 struct TerminalSinks {
     pane_output_tx: flume::Sender<PaneOutput>,
-    snapshot_tx: flume::Sender<termy_terminal_ui::TmuxSnapshot>,
+    snapshot_tx: flume::Sender<SessionSnapshot>,
     capture_result_tx: flume::Sender<CaptureResult>,
     key_table_result_tx: flume::Sender<KeyTableQueryResult>,
     session_list_tx: flume::Sender<Vec<SessionListItem>>,
@@ -2352,9 +2360,10 @@ fn bytes_to_string(bytes: Vec<u8>) -> String {
     String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
-/// Build the render layer's [`termy_terminal_ui::TmuxSnapshot`] from the daemon's
-/// protocol layout. The render `apply_snapshot` replaces its whole model from
-/// this, so a `LayoutSnapshot` and a `LayoutUpdate` map identically. Window and
+/// Build the render layer's [`SessionSnapshot`] (a `termy_terminal_ui::TmuxSnapshot`
+/// paired with the per-pane `is_shell` flags termy's type cannot carry, #510) from
+/// the daemon's protocol layout. The render `apply_snapshot` replaces its whole
+/// model from this, so a `LayoutSnapshot` and a `LayoutUpdate` map identically. Window and
 /// pane ids take tmux's native `@N` / `%N` form, matching the command targets the
 /// session view embeds and the `%N` pane ids on `PaneOutput`. The tab number
 /// (`TmuxWindowState::index`) carries the daemon's real tmux `window_index`
@@ -2365,8 +2374,17 @@ fn bytes_to_string(bytes: Vec<u8>) -> String {
 fn layout_to_snapshot(
     session: String,
     windows: Vec<rift_protocol::WindowLayout>,
-) -> termy_terminal_ui::TmuxSnapshot {
+) -> SessionSnapshot {
     use termy_terminal_ui::{TmuxPaneState, TmuxSnapshot, TmuxWindowState};
+
+    // termy's `TmuxPaneState` cannot carry the daemon's `is_shell` flag (#510),
+    // so it rides beside the snapshot keyed by the same tmux pane id (`%N`) the
+    // render layer targets. Built before `windows` is consumed below.
+    let pane_is_shell = windows
+        .iter()
+        .flat_map(|window| window.panes.iter())
+        .map(|pane| (format!("%{}", pane.pane_id), pane.is_shell))
+        .collect();
 
     let windows = windows
         .into_iter()
@@ -2412,10 +2430,13 @@ fn layout_to_snapshot(
         })
         .collect();
 
-    TmuxSnapshot {
-        session_name: session,
-        session_id: None,
-        windows,
+    SessionSnapshot {
+        snapshot: TmuxSnapshot {
+            session_name: session,
+            session_id: None,
+            windows,
+        },
+        pane_is_shell,
     }
 }
 
@@ -2715,11 +2736,36 @@ mod tests {
 
         let snapshot = layout_to_snapshot("rift".to_owned(), windows);
 
-        let indices: Vec<i32> = snapshot.windows.iter().map(|w| w.index).collect();
+        let indices: Vec<i32> = snapshot.snapshot.windows.iter().map(|w| w.index).collect();
         assert_eq!(
             indices,
             vec![0, 2],
             "the tab index must be the real tmux window_index, not array position"
         );
+    }
+
+    #[test]
+    fn test_layout_to_snapshot_maps_is_shell_by_pane_id() {
+        // Each pane's daemon-evaluated `is_shell` flag (#510) must ride the
+        // paired map keyed by the same `%N` pane id the render layer targets,
+        // since termy's `TmuxPaneState` cannot carry it.
+        let mut window = window_layout(0, 0);
+        window.panes[0].is_shell = true;
+        window.panes.push(rift_protocol::PaneLayout {
+            pane_id: 7,
+            active: false,
+            left: 0,
+            top: 0,
+            width: 80,
+            height: 24,
+            current_path: String::new(),
+            current_command: "vim".to_owned(),
+            is_shell: false,
+        });
+
+        let snapshot = layout_to_snapshot("rift".to_owned(), vec![window]);
+
+        assert_eq!(snapshot.pane_is_shell.get("%0"), Some(&true));
+        assert_eq!(snapshot.pane_is_shell.get("%7"), Some(&false));
     }
 }

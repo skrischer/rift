@@ -14,7 +14,7 @@ pub use keytable::{
 };
 pub use pane_view::{PaneActivity, PaneView};
 pub use session_view::{
-    SessionView, SessionViewEvent, TerminalHandle, MAX_FONT_SIZE, MIN_FONT_SIZE,
+    SessionSnapshot, SessionView, SessionViewEvent, TerminalHandle, MAX_FONT_SIZE, MIN_FONT_SIZE,
 };
 pub use statusline::{
     mutates_status_options, parse_status_options, parse_style, parse_style_runs, truncate_runs,
