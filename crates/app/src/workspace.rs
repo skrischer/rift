@@ -223,6 +223,12 @@ pub struct WorkspaceChannels {
     /// Diff pull requests: the root-relative path of a changed file to diff
     /// (#338). The tokio side turns each into a `ClientMessage::RequestDiff`.
     pub request_diff_tx: Sender<String>,
+    /// Git write ops the source-control panel emits — `StageFile`,
+    /// `UnstageFile`, `DiscardFile`, `Commit` (#546). The tokio side forwards
+    /// each onto the protocol verbatim; the daemon's `ok`/`error` reply is not
+    /// echoed into state, the resulting git change arrives on the push
+    /// recompute (`docs/spec-source-control-write.md`).
+    pub git_op_tx: Sender<ClientMessage>,
 }
 
 /// The composed app root.
@@ -338,6 +344,7 @@ impl WorkspaceView {
             buffer_change_tx,
             nav_tx,
             request_diff_tx,
+            git_op_tx,
         } = channels;
 
         let file_tree = cx.new(|_| FileTree::new());
@@ -619,7 +626,8 @@ impl WorkspaceView {
         // Reads (never mutates) the file tree's mirrored `WorktreeModel` for its
         // git status — the existing client git-status model, not a re-derived
         // copy (`docs/spec-source-control.md`).
-        let source_control = cx.new(|cx| SourceControlPanel::new(file_tree.clone(), cx));
+        let source_control =
+            cx.new(|cx| SourceControlPanel::new(file_tree.clone(), git_op_tx, window, cx));
         let diff_view = cx.new(|cx| DiffView::new(request_diff_tx, cx));
         let problems_panel = cx.new(|cx| ProblemsPanel::new(file_tree.clone(), cx));
         // Reads (never mutates) the editor's active-tab document-symbol cache
@@ -1492,6 +1500,7 @@ mod tests {
         let (buffer_change_tx, _buffer_change_rx) = flume::unbounded();
         let (nav_tx, _nav_request_rx) = flume::unbounded();
         let (request_diff_tx, _request_diff_rx) = flume::unbounded();
+        let (git_op_tx, _git_op_rx) = flume::unbounded();
         WorkspaceChannels {
             worktree_rx,
             buffer_rx,
@@ -1503,6 +1512,7 @@ mod tests {
             buffer_change_tx,
             nav_tx,
             request_diff_tx,
+            git_op_tx,
         }
     }
 
