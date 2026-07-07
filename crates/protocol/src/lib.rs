@@ -15,7 +15,7 @@ pub use frame::{encode_frame, FrameDecoder, FrameError, MAX_FRAME_LEN};
 /// is wire-compatible in one direction. The message set is pinned by the
 /// fingerprint test beside `PROTOCOL_FINGERPRINT` below, so a message-set
 /// change without a bump cannot pass CI.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Pinned fingerprint of the protocol message set, checked by the
 /// `fingerprint_tests` module: an FNV-1a hash over the serde-visible surface
@@ -25,7 +25,7 @@ pub const PROTOCOL_VERSION: u32 = 6;
 /// [`PROTOCOL_VERSION`] above and re-pin this value (the failing test prints
 /// the new fingerprint).
 #[cfg(test)]
-const PROTOCOL_FINGERPRINT: u64 = 0x46b2_8349_f34f_a78b;
+const PROTOCOL_FINGERPRINT: u64 = 0x6313_30a3_4d24_c08d;
 
 /// Messages the client sends to the daemon.
 ///
@@ -195,6 +195,64 @@ pub enum ClientMessage {
     /// inflight per path).
     RequestDiff {
         path: String,
+    },
+    /// Stage the whole file at `path` (relative to the worktree root): write its
+    /// current worktree content into the index — `git add` semantics (add for
+    /// an untracked path; autocrlf filters per gix's pipeline for a tracked
+    /// one). The daemon answers with exactly one [`DaemonMessage::GitOpResult`]
+    /// carrying [`GitWriteOp::StageFile`]. The resulting status/line-total
+    /// change is never echoed in the reply — it arrives through the existing
+    /// push-only git recompute ([`DaemonMessage::UpdateGitStatus`] /
+    /// [`DaemonMessage::RepoState`]), the protocol's one source of truth for
+    /// git state (`docs/spec-source-control-write.md`).
+    StageFile {
+        path: String,
+    },
+    /// Unstage the whole file at `path`: restore its index entry from HEAD
+    /// (remove from the index for a path newly added with no HEAD entry). The
+    /// daemon answers with one [`DaemonMessage::GitOpResult`] carrying
+    /// [`GitWriteOp::UnstageFile`]; state converges via the push recompute,
+    /// same as [`ClientMessage::StageFile`].
+    UnstageFile {
+        path: String,
+    },
+    /// Stage exactly one hunk of `path`'s worktree-vs-HEAD diff, identified by
+    /// `hunk_id` — the [`hunk_fingerprint`] of the [`DiffHunk`] the client
+    /// last received from [`ClientMessage::RequestDiff`]. The daemon
+    /// recomputes the file's current hunks fresh and verifies `hunk_id`
+    /// matches one of them before applying: a stale id (the worktree changed
+    /// since the diff was pushed) or a content-changed id (same shape,
+    /// different text) is rejected with a clean error, never fuzzily applied.
+    /// Application targets the index via decompose-and-reapply against the
+    /// already-staged subset (`docs/spec-source-control-write.md`); a
+    /// divergent index (external `git add`, staged-then-edited) is also
+    /// rejected, naming file-level staging as the fallback. Answered with one
+    /// [`DaemonMessage::GitOpResult`] carrying [`GitWriteOp::StageHunk`].
+    StageHunk {
+        path: String,
+        hunk_id: u64,
+    },
+    /// Discard the worktree edits to `path`: restore its worktree content from
+    /// the index — checkout-file semantics (unstaged edits reverted, staged
+    /// content kept; an untracked path, absent from the index, is removed).
+    /// **Destructive.** The client gates this behind an explicit confirm
+    /// dialog (the #420 pattern) and never batches it — one request per file.
+    /// Answered with one [`DaemonMessage::GitOpResult`] carrying
+    /// [`GitWriteOp::DiscardFile`].
+    DiscardFile {
+        path: String,
+    },
+    /// Commit the currently staged index: build a tree from it (gix
+    /// `tree-editor`), commit with `parents = [HEAD]`, author/committer from
+    /// the repo's git config. An empty `message` or a NOTHING-STAGED index
+    /// (index tree equals HEAD tree — an index is never literally empty in a
+    /// non-empty repo) is rejected with a clean error, never a partial
+    /// commit. A transient `index.lock` (a live agent writing concurrently)
+    /// gets one bounded retry before erroring. Answered with one
+    /// [`DaemonMessage::GitOpResult`] carrying [`GitWriteOp::Commit`] — not
+    /// path-keyed, unlike the other write ops.
+    Commit {
+        message: String,
     },
     Hello {
         version: u32,
@@ -473,6 +531,24 @@ pub enum DaemonMessage {
     FileDiff {
         path: String,
         diff: FileDiffPayload,
+    },
+    /// The reply to every source-control write request
+    /// ([`ClientMessage::StageFile`], [`ClientMessage::UnstageFile`],
+    /// [`ClientMessage::StageHunk`], [`ClientMessage::DiscardFile`],
+    /// [`ClientMessage::Commit`]): whether `op` succeeded, or `error` — a
+    /// human-readable reason — when it did not. This is the **only** signal
+    /// the write path returns over the wire; the resulting state change
+    /// (staged/unstaged status, working-tree line totals, branch/
+    /// ahead-behind) is never echoed here — it arrives through the existing
+    /// push-only git recompute ([`UpdateGitStatus`](DaemonMessage::UpdateGitStatus)
+    /// / [`RepoState`](DaemonMessage::RepoState)), keeping one source of
+    /// truth for git state instead of two (`docs/spec-source-control-write.md`).
+    /// `error` is omitted on success.
+    GitOpResult {
+        op: GitWriteOp,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     Welcome {
         version: u32,
@@ -875,6 +951,69 @@ pub enum DiffLineKind {
     Add,
     /// Present only on the old (HEAD) side.
     Remove,
+}
+
+/// Which write operation a [`DaemonMessage::GitOpResult`] answers, echoing
+/// enough of the originating [`ClientMessage`] to correlate the reply to it —
+/// `path` for the file-level ops, `path` plus `hunk_id` for hunk staging, no
+/// fields for [`GitWriteOp::Commit`] (a repo-level op, not path-keyed).
+/// Tagged by `kind` on the wire, mirroring [`FileDiffPayload`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GitWriteOp {
+    StageFile { path: String },
+    UnstageFile { path: String },
+    StageHunk { path: String, hunk_id: u64 },
+    DiscardFile { path: String },
+    Commit,
+}
+
+/// The FNV-1a fingerprint of a [`DiffHunk`], serving as `hunk_id` on
+/// [`ClientMessage::StageHunk`] — the deploy.rs fingerprint pattern
+/// (`crates/ssh/src/deploy.rs::binary_fingerprint`; hand-rolled rather than a
+/// hashing crate dependency for one function), hashed over the hunk's header
+/// numbers (`old_start`/`old_len`/`new_start`/`new_len`, little-endian) and
+/// every line's kind plus content, each line terminated by a delimiter byte
+/// so no ambiguity arises between adjacent lines. A same-shape edit (an
+/// identical header, different line text) therefore yields a different id.
+/// Not cryptographic — only stability and low collision odds across a
+/// single file's hunks matter, matching the deploy fingerprint's own
+/// tradeoff.
+///
+/// The client computes this from the [`DiffHunk`] it already holds (the last
+/// [`ClientMessage::RequestDiff`] reply) when the user stages a hunk; the
+/// daemon recomputes the file's current worktree-vs-HEAD hunks and verifies
+/// the id matches one of them before applying — a stale or content-changed
+/// id is rejected, never fuzzily applied (`docs/spec-source-control-write.md`).
+pub fn hunk_fingerprint(hunk: &DiffHunk) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x100_0000_01b3;
+    const LINE_DELIMITER: u8 = 0x0a;
+
+    fn step(hash: &mut u64, byte: u8) {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
+
+    let mut hash = FNV_OFFSET;
+    for n in [hunk.old_start, hunk.old_len, hunk.new_start, hunk.new_len] {
+        for byte in n.to_le_bytes() {
+            step(&mut hash, byte);
+        }
+    }
+    for line in &hunk.lines {
+        let kind_tag: u8 = match line.kind {
+            DiffLineKind::Context => 0,
+            DiffLineKind::Add => 1,
+            DiffLineKind::Remove => 2,
+        };
+        step(&mut hash, kind_tag);
+        for byte in line.content.as_bytes() {
+            step(&mut hash, *byte);
+        }
+        step(&mut hash, LINE_DELIMITER);
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -2638,6 +2777,281 @@ mod tests {
             err.is_err(),
             "unknown diff payload kind must not deserialize"
         );
+    }
+
+    // ---- Source-control write round-trip tests (docs/spec-source-control-write.md) ----
+
+    #[test]
+    fn test_stage_file_roundtrip_preserves_path() {
+        let msg = ClientMessage::StageFile {
+            path: "src/main.rs".to_owned(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize StageFile");
+        assert_eq!(json, r#"{"type":"stage_file","path":"src/main.rs"}"#);
+        let parsed: ClientMessage = serde_json::from_str(&json).expect("deserialize StageFile");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_stage_file_missing_path_is_rejected() {
+        let err = serde_json::from_str::<ClientMessage>(r#"{"type":"stage_file"}"#);
+        assert!(
+            err.is_err(),
+            "stage_file without a path must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_unstage_file_roundtrip_preserves_path() {
+        let msg = ClientMessage::UnstageFile {
+            path: "src/main.rs".to_owned(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize UnstageFile");
+        assert_eq!(json, r#"{"type":"unstage_file","path":"src/main.rs"}"#);
+        let parsed: ClientMessage = serde_json::from_str(&json).expect("deserialize UnstageFile");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_unstage_file_missing_path_is_rejected() {
+        let err = serde_json::from_str::<ClientMessage>(r#"{"type":"unstage_file"}"#);
+        assert!(
+            err.is_err(),
+            "unstage_file without a path must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_stage_hunk_roundtrip_preserves_path_and_hunk_id() {
+        let msg = ClientMessage::StageHunk {
+            path: "src/main.rs".to_owned(),
+            hunk_id: 0x1234_5678_9abc_def0,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize StageHunk");
+        assert!(json.contains(r#""type":"stage_hunk""#));
+        assert!(json.contains(r#""path":"src/main.rs""#));
+        assert!(json.contains(&format!(r#""hunk_id":{}"#, 0x1234_5678_9abc_def0u64)));
+        let parsed: ClientMessage = serde_json::from_str(&json).expect("deserialize StageHunk");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_stage_hunk_missing_hunk_id_is_rejected() {
+        let err = serde_json::from_str::<ClientMessage>(r#"{"type":"stage_hunk","path":"a.rs"}"#);
+        assert!(
+            err.is_err(),
+            "stage_hunk without a hunk_id must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_discard_file_roundtrip_preserves_path() {
+        let msg = ClientMessage::DiscardFile {
+            path: "src/main.rs".to_owned(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize DiscardFile");
+        assert_eq!(json, r#"{"type":"discard_file","path":"src/main.rs"}"#);
+        let parsed: ClientMessage = serde_json::from_str(&json).expect("deserialize DiscardFile");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_discard_file_missing_path_is_rejected() {
+        let err = serde_json::from_str::<ClientMessage>(r#"{"type":"discard_file"}"#);
+        assert!(
+            err.is_err(),
+            "discard_file without a path must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_commit_roundtrip_preserves_message() {
+        let msg = ClientMessage::Commit {
+            message: "fix: handle malformed frame".to_owned(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize Commit");
+        assert_eq!(
+            json,
+            r#"{"type":"commit","message":"fix: handle malformed frame"}"#
+        );
+        let parsed: ClientMessage = serde_json::from_str(&json).expect("deserialize Commit");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_commit_missing_message_is_rejected() {
+        let err = serde_json::from_str::<ClientMessage>(r#"{"type":"commit"}"#);
+        assert!(
+            err.is_err(),
+            "commit without a message must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_git_op_result_ok_roundtrip_for_each_write_op() {
+        // One representative op per GitWriteOp variant, success case: `error`
+        // must be omitted on the wire, never serialized as `null`.
+        for op in [
+            GitWriteOp::StageFile {
+                path: "a.rs".to_owned(),
+            },
+            GitWriteOp::UnstageFile {
+                path: "a.rs".to_owned(),
+            },
+            GitWriteOp::StageHunk {
+                path: "a.rs".to_owned(),
+                hunk_id: 42,
+            },
+            GitWriteOp::DiscardFile {
+                path: "a.rs".to_owned(),
+            },
+            GitWriteOp::Commit,
+        ] {
+            let msg = DaemonMessage::GitOpResult {
+                op: op.clone(),
+                ok: true,
+                error: None,
+            };
+            let json = serde_json::to_string(&msg).expect("serialize GitOpResult");
+            assert!(json.contains(r#""type":"git_op_result""#));
+            assert!(
+                !json.contains("error"),
+                "error must be omitted on success: {json}"
+            );
+            let parsed: DaemonMessage =
+                serde_json::from_str(&json).expect("deserialize GitOpResult");
+            assert_eq!(parsed, msg);
+        }
+    }
+
+    #[test]
+    fn test_git_op_result_error_roundtrip_carries_message() {
+        let msg = DaemonMessage::GitOpResult {
+            op: GitWriteOp::Commit,
+            ok: false,
+            error: Some("nothing staged".to_owned()),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize GitOpResult error");
+        assert!(json.contains(r#""kind":"commit""#));
+        assert!(json.contains(r#""ok":false"#));
+        assert!(json.contains(r#""error":"nothing staged""#));
+        let parsed: DaemonMessage =
+            serde_json::from_str(&json).expect("deserialize GitOpResult error");
+        assert_eq!(parsed, msg);
+        match parsed {
+            DaemonMessage::GitOpResult { op, ok, error } => {
+                assert_eq!(op, GitWriteOp::Commit);
+                assert!(!ok);
+                assert_eq!(error.as_deref(), Some("nothing staged"));
+            }
+            other => panic!("expected GitOpResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_git_write_op_stage_hunk_roundtrip_preserves_path_and_hunk_id() {
+        let op = GitWriteOp::StageHunk {
+            path: "src/lib.rs".to_owned(),
+            hunk_id: 7,
+        };
+        let json = serde_json::to_string(&op).expect("serialize GitWriteOp::StageHunk");
+        assert_eq!(
+            json,
+            r#"{"kind":"stage_hunk","path":"src/lib.rs","hunk_id":7}"#
+        );
+        let parsed: GitWriteOp =
+            serde_json::from_str(&json).expect("deserialize GitWriteOp::StageHunk");
+        assert_eq!(parsed, op);
+    }
+
+    #[test]
+    fn test_git_write_op_kind_tag_is_rejected_when_unknown() {
+        let err = serde_json::from_str::<GitWriteOp>(r#"{"kind":"frobnicate"}"#);
+        assert!(
+            err.is_err(),
+            "unknown git write op kind must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_git_op_result_missing_ok_field_is_rejected() {
+        let err = serde_json::from_str::<DaemonMessage>(
+            r#"{"type":"git_op_result","op":{"kind":"commit"}}"#,
+        );
+        assert!(
+            err.is_err(),
+            "git_op_result without an ok field must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_hunk_fingerprint_is_deterministic() {
+        let hunk = sample_hunk();
+        assert_eq!(hunk_fingerprint(&hunk), hunk_fingerprint(&hunk));
+    }
+
+    #[test]
+    fn test_hunk_fingerprint_differs_for_different_headers() {
+        let mut moved = sample_hunk();
+        moved.old_start += 1;
+        moved.new_start += 1;
+        assert_ne!(hunk_fingerprint(&sample_hunk()), hunk_fingerprint(&moved));
+    }
+
+    #[test]
+    fn test_hunk_fingerprint_differs_for_same_shape_content_change() {
+        // Same header, same line count and kinds, different text: a same-shape
+        // content edit must still change the fingerprint (spec-review finding
+        // 2 — a stale id must never be fuzzily matched by shape alone).
+        let mut edited = sample_hunk();
+        edited.lines[2].content = "TWO_EDITED".to_owned();
+        assert_ne!(hunk_fingerprint(&sample_hunk()), hunk_fingerprint(&edited));
+    }
+
+    #[test]
+    fn test_hunk_fingerprint_differs_for_line_kind_change() {
+        // Same header and same text content, different role (e.g. context vs
+        // add): the kind must be part of the hash, not just the text.
+        let mut retagged = sample_hunk();
+        retagged.lines[0].kind = DiffLineKind::Add;
+        assert_ne!(
+            hunk_fingerprint(&sample_hunk()),
+            hunk_fingerprint(&retagged)
+        );
+    }
+
+    #[test]
+    fn test_hunk_fingerprint_no_line_boundary_ambiguity() {
+        // Two hunks whose concatenated line content is identical but split
+        // differently across lines must not collide — the per-line delimiter
+        // must prevent boundary-shifting collisions.
+        let joined = DiffHunk {
+            old_start: 1,
+            old_len: 1,
+            new_start: 1,
+            new_len: 1,
+            lines: vec![DiffLine {
+                kind: DiffLineKind::Context,
+                content: "ab".to_owned(),
+            }],
+        };
+        let split = DiffHunk {
+            old_start: 1,
+            old_len: 1,
+            new_start: 1,
+            new_len: 1,
+            lines: vec![
+                DiffLine {
+                    kind: DiffLineKind::Context,
+                    content: "a".to_owned(),
+                },
+                DiffLine {
+                    kind: DiffLineKind::Context,
+                    content: "b".to_owned(),
+                },
+            ],
+        };
+        assert_ne!(hunk_fingerprint(&joined), hunk_fingerprint(&split));
     }
 
     // ---- Session-list round-trip tests (docs/spec-session-switch.md) --------

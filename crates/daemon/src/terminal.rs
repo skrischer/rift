@@ -379,6 +379,10 @@ impl Attach {
             // `RequestDiff` (source-control diff, #335) is likewise not a
             // terminal message; its daemon-side handler lands in a follow-on
             // issue — until then it is silently dropped here too.
+            // The source-control write ops (stage/unstage/discard/commit/
+            // stage-hunk, #543) are not terminal messages either; their
+            // `gix`-backed handlers land in follow-on issues (#544, #545) —
+            // silently dropped here in the meantime, same convention.
             ClientMessage::Input { .. }
             | ClientMessage::Attach { .. }
             | ClientMessage::OpenFile { .. }
@@ -390,6 +394,11 @@ impl Attach {
             | ClientMessage::ReferencesRequest { .. }
             | ClientMessage::DocumentSymbolRequest { .. }
             | ClientMessage::RequestDiff { .. }
+            | ClientMessage::StageFile { .. }
+            | ClientMessage::UnstageFile { .. }
+            | ClientMessage::StageHunk { .. }
+            | ClientMessage::DiscardFile { .. }
+            | ClientMessage::Commit { .. }
             | ClientMessage::Hello { .. } => {}
         }
         Ok(())
