@@ -388,8 +388,9 @@ struct MinimapPaint {
     /// Per-sample maximum line length (characters). Length `min(total, samples)`;
     /// empty for an empty buffer. Painted as horizontal marks scaled across the
     /// strip height, width proportional to the sample's share of the longest
-    /// line.
-    samples: Vec<u32>,
+    /// line. A cheap ref-count clone of the tab's cached [`EditorTab::minimap_samples`]
+    /// — derived once per text change, not rescanned per render.
+    samples: Rc<[u32]>,
     /// Diagnostic marks: `(line-ratio 0..1, severity color)`, painted full-width
     /// over the length marks so problems stand out at a glance.
     diag_marks: Vec<(f32, Hsla)>,
@@ -527,6 +528,19 @@ struct EditorTab {
     /// The cursor's current line, tracked so a line change (not every notify)
     /// re-syncs the widget's suppressed diagnostic set.
     cursor_line: u32,
+
+    /// This tab's cached minimap line-length marks — the widest character count
+    /// per downsampled block of source lines, capped at [`MINIMAP_SAMPLES`].
+    /// Derived once per load and per buffer `Change` (never per render), so a
+    /// large focused buffer is not rescanned on every cursor blink or scroll —
+    /// the marks change only when the text does (`docs/spec-editor-chrome.md`:
+    /// derive marks once, redraw on damage only). `Rc<[u32]>` so `render` hands
+    /// a cheap ref-count clone to the strip's paint closure, not a data copy.
+    /// Character count (`Rope::line_len`) deliberately substitutes for
+    /// gpui-component's shaped `LineLayout` cache, which is `pub(crate)` and thus
+    /// inaccessible from this crate; it still honors the strip's "not a
+    /// pixel-perfect code render" intent.
+    minimap_samples: Rc<[u32]>,
 }
 
 // ── Main view ─────────────────────────────────────────────────────────────────
@@ -672,6 +686,7 @@ impl EditorView {
             latest_symbol_id: None,
             diagnostics: Vec::new(),
             cursor_line: 0,
+            minimap_samples: Rc::from([]),
         });
         self.arm_loading(index, true, window, cx);
         index
@@ -713,6 +728,7 @@ impl EditorView {
         tab.latest_symbol_id = None;
         tab.diagnostics = Vec::new();
         tab.cursor_line = 0;
+        tab.minimap_samples = Rc::from([]);
 
         if rebuild_input {
             let language = language_for_path(&tab.path);
@@ -840,9 +856,30 @@ impl EditorView {
                     tab.dirty = true;
                     cx.notify();
                 }
+                // Re-derive the minimap marks now the text changed — never per
+                // render, so a blink or scroll does not rescan the buffer.
+                this.recompute_minimap_samples(index, cx);
                 this.arm_buffer_feed(index, cx);
             }
         })
+    }
+
+    /// Re-derive the tab at `index`'s cached minimap line-length marks from its
+    /// current buffer. Called on load and on every buffer `Change`, never per
+    /// render, so a large focused buffer is not rescanned on every cursor blink
+    /// or scroll frame (`docs/spec-editor-chrome.md`: derive marks once, redraw
+    /// on damage only).
+    fn recompute_minimap_samples(&mut self, index: usize, cx: &Context<Self>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let samples: Rc<[u32]> = {
+            let input_state = tab.input.read(cx);
+            let text = input_state.text();
+            let total = text.lines_len();
+            sample_line_lengths(total, |row| text.line_len(row) as u32, MINIMAP_SAMPLES).into()
+        };
+        self.tabs[index].minimap_samples = samples;
     }
 
     /// Observe an `InputState` so the editor re-renders on cursor moves and
@@ -1111,6 +1148,9 @@ impl EditorView {
         self.tabs[index].dirty = false;
         self.tabs[index].save_state = SaveState::Idle;
         self.tabs[index].load_state = TabLoadState::Loaded;
+        // Derive the minimap marks for the freshly loaded content up front, so
+        // the strip is correct on the first frame rather than a frame late.
+        self.recompute_minimap_samples(index, cx);
 
         if let Some(range) = self.tabs[index].pending_jump.take() {
             self.apply_jump_range(index, &range, window, cx);
@@ -2424,23 +2464,22 @@ impl Render for EditorView {
 
         // ── Minimap marks strip (docs/spec-editor-chrome.md) ──
         //
-        // Owned render data for the strip on the editor's right edge:
-        // downsampled line-length marks, diagnostic marks by line ratio, and the
-        // viewport slab. Gathered under this tab's `InputState` read borrow and
-        // moved into the strip's `canvas` paint closure below, so the borrow is
-        // released before painting. Explicitly NOT a pixel-perfect code render:
-        // marks are capped at `MINIMAP_SAMPLES`, positioned by ratio, redrawn
-        // only on damage.
+        // Owned render data for the strip on the editor's right edge: the
+        // downsampled line-length marks (a cheap ref-count clone of the tab's
+        // cached `minimap_samples` — derived on text change, never rescanned
+        // here), plus the diagnostic marks and viewport slab, whose ratios are
+        // O(diagnostics) / O(1) to gather under this tab's `InputState` read
+        // borrow. Moved into the strip's `canvas` paint closure below, so the
+        // borrow is released before painting. Explicitly NOT a pixel-perfect
+        // code render: marks are capped at `MINIMAP_SAMPLES`, positioned by
+        // ratio, redrawn only on damage.
         let mut minimap_mark_color = cx.theme().muted_foreground;
         minimap_mark_color.a = 0.55;
         let mut minimap_slab_color = cx.theme().accent;
         minimap_slab_color.a = 0.20;
         let minimap_data = {
             let input_state = tab.input.read(cx);
-            let text = input_state.text();
-            let total = text.lines_len();
-            let samples =
-                sample_line_lengths(total, |row| text.line_len(row) as u32, MINIMAP_SAMPLES);
+            let total = input_state.text().lines_len();
             let diag_marks: Vec<(f32, Hsla)> = if total == 0 {
                 Vec::new()
             } else {
@@ -2457,7 +2496,7 @@ impl Render for EditorView {
                 None => (0.0, 0.0),
             };
             MinimapPaint {
-                samples,
+                samples: Rc::clone(&tab.minimap_samples),
                 diag_marks,
                 slab_top,
                 slab_bottom,
