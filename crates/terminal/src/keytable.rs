@@ -200,9 +200,8 @@ impl Default for PrefixOptions {
 /// Parse `show-options -A` output into [`PrefixOptions`], overriding the tmux
 /// defaults for any of `prefix`, `prefix2`, `repeat-time` that appear. Each line
 /// is `name value` (a trailing `*` on `name` marks a value inherited from a
-/// higher scope, per `-A`, and is stripped before matching — same convention as
-/// [`crate::statusline::parse_status_options`]); unrelated options and
-/// unparseable values are ignored.
+/// higher scope, per `-A`, and is stripped before matching); unrelated options
+/// and unparseable values are ignored.
 pub fn parse_options(output: &str) -> PrefixOptions {
     let mut options = PrefixOptions::default();
     for line in output.lines() {
@@ -547,9 +546,6 @@ pub fn mutates_bindings(command: &str) -> bool {
 /// literal, double quotes allow backslash escapes, and a bare backslash escapes
 /// the next character. Returns the unescaped token and the byte offset just past
 /// it, or `None` at end of input.
-///
-/// `pub(crate)` so [`crate::statusline`]'s `show-options` parser shares one
-/// tmux-quoting-aware lexer instead of a second implementation.
 pub(crate) fn lex_token(line: &str, start: usize) -> Option<(String, usize)> {
     let bytes = line.as_bytes();
     let mut i = start;

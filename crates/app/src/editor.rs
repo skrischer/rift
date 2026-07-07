@@ -823,6 +823,17 @@ impl EditorView {
         self.active_tab().is_some_and(|t| t.read_only)
     }
 
+    /// The active tab's zero-based cursor `(line, column)` for the composite
+    /// status line's Ln/Col segment (`docs/spec-status-line.md`), or `None`
+    /// when no tab is open. `column` is a UTF-8 scalar offset (the editor's own
+    /// `cursor_position` convention); the status line renders both 1-based.
+    pub fn cursor_position(&self, cx: &App) -> Option<(u32, u32)> {
+        self.active_tab().map(|tab| {
+            let pos = tab.input.read(cx).cursor_position();
+            (pos.line, pos.character)
+        })
+    }
+
     // ── Load ──────────────────────────────────────────────────────────────
 
     /// Render a `FileContent` reply: find the tab awaiting it (matching path,

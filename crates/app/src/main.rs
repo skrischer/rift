@@ -97,9 +97,9 @@ struct EditorChannels {
     buffer_tx: flume::Sender<rift_protocol::DaemonMessage>,
     /// Nav replies routed to the editor: `DefinitionResponse` (#196).
     nav_tx: flume::Sender<rift_protocol::DaemonMessage>,
-    /// `StatusLineReply` routed to the workspace's mirrored-status-line render
-    /// model (#221, `docs/spec-tmux-statusline-mirroring.md`).
-    status_line_tx: flume::Sender<rift_protocol::DaemonMessage>,
+    /// `LspStatus` pushes routed to the workspace's composite status line
+    /// language-server health segment (`docs/spec-status-line.md`).
+    lsp_status_tx: flume::Sender<rift_protocol::DaemonMessage>,
     /// Root-relative paths to open, emitted by the tree (or the editor's
     /// auto-reload); each becomes an `OpenFile` request.
     open_file_rx: flume::Receiver<String>,
@@ -586,7 +586,7 @@ impl Shell {
         let (worktree_tx, worktree_rx) = flume::unbounded();
         let (buffer_tx, buffer_rx) = flume::unbounded();
         let (nav_daemon_tx, nav_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
-        let (status_line_tx, status_line_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
+        let (lsp_status_tx, lsp_status_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
         let (open_file_tx, open_file_rx) = flume::unbounded::<String>();
         let (save_file_tx, save_file_rx) = flume::unbounded::<rift_protocol::ClientMessage>();
         let (buffer_change_tx, buffer_change_rx) =
@@ -646,7 +646,7 @@ impl Shell {
                 worktree_tx,
                 buffer_tx,
                 nav_tx: nav_daemon_tx,
-                status_line_tx,
+                lsp_status_tx,
                 open_file_rx,
                 save_file_rx,
                 buffer_change_rx,
@@ -695,7 +695,7 @@ impl Shell {
                     worktree_rx,
                     buffer_rx,
                     nav_rx,
-                    status_line_rx,
+                    lsp_status_rx,
                     diff_rx,
                     open_file_tx,
                     save_file_tx,
@@ -1978,14 +1978,13 @@ async fn consume_daemon_messages(
             | DaemonMessage::ReferencesResponse { .. }) => {
                 let _ = editor.nav_tx.send(msg);
             }
-            // --- mirrored status line -> workspace render model (every mode) ---
-            // Sent unprompted on attach, again on the daemon's own
-            // `status-interval` cadence, and after a mirrored-option-mutating
-            // dispatch (#219); forwarded regardless of whether the app's
-            // `RIFT_STATUSLINE_MIRROR` toggle is on — the render layer decides
-            // whether to use it (#221).
-            msg @ DaemonMessage::StatusLineReply { .. } => {
-                let _ = editor.status_line_tx.send(msg);
+            // --- language-server health -> composite status line (every mode) ---
+            // Push-only lifecycle transitions (starting/running/crashed), keyed
+            // by the server's stable name; replayed once per known server behind
+            // Welcome so a (re)attaching client sees current health without
+            // waiting for the next transition (`docs/spec-status-line.md`).
+            msg @ DaemonMessage::LspStatus { .. } => {
+                let _ = editor.lsp_status_tx.send(msg);
             }
             // --- diff reply -> diff view (every mode) ---
             // The reply to a `RequestDiff`: forward to the diff view, which
@@ -2203,11 +2202,10 @@ fn spawn_resize_bridge(
 /// Forward raw tmux commands (the session view's window/pane affordances) onto
 /// the protocol as [`rift_protocol::ClientMessage::TmuxCommand`]; the daemon runs
 /// them verbatim. A command that could mutate the mirrored key table or the
-/// prefix/repeat options (`keytable::mutates_bindings`), or a mirrored
-/// status-line option (`statusline::mutates_status_options`), is followed, on
-/// this same task, by the matching refresh request(s) — sequential `send`s on
-/// one task land in program order on the shared write queue, so each refresh
-/// is guaranteed to reach the daemon after the mutation it is refreshing for.
+/// prefix/repeat options (`keytable::mutates_bindings`) is followed, on this
+/// same task, by the matching key-table refresh request — sequential `send`s on
+/// one task land in program order on the shared write queue, so the refresh is
+/// guaranteed to reach the daemon after the mutation it is refreshing for.
 /// Issuing a refresh from a separate channel/task (as the render layer used
 /// to) gave no such ordering guarantee.
 fn spawn_command_bridge(client_rx: DaemonClientWatch, cmd_rx: flume::Receiver<String>) {
@@ -2216,23 +2214,19 @@ fn spawn_command_bridge(client_rx: DaemonClientWatch, cmd_rx: flume::Receiver<St
         while let Ok(cmd) = cmd_rx.recv_async().await {
             debug!(cmd = %cmd, "sending tmux command (daemon)");
             let refresh_key_table = rift_terminal::keytable::mutates_bindings(&cmd);
-            let refresh_status_line = rift_terminal::statusline::mutates_status_options(&cmd);
             let client = client_rx.borrow().clone();
             if client
                 .send(ClientMessage::TmuxCommand { cmd })
                 .await
                 .is_err()
             {
-                // Dropped mid-outage; skip the follow-up refreshes too — the
-                // daemon re-queries key table and status line unprompted on
-                // the reconnect's re-Attach.
+                // Dropped mid-outage; skip the follow-up refresh too — the
+                // daemon re-queries the key table unprompted on the
+                // reconnect's re-Attach.
                 continue;
             }
-            if refresh_key_table && client.send(ClientMessage::QueryKeyTable).await.is_err() {
-                continue;
-            }
-            if refresh_status_line {
-                let _ = client.send(ClientMessage::QueryStatusLine).await;
+            if refresh_key_table {
+                let _ = client.send(ClientMessage::QueryKeyTable).await;
             }
         }
     });
@@ -2486,7 +2480,7 @@ mod tests {
         let (worktree_tx, _) = flume::unbounded();
         let (buffer_tx, _) = flume::unbounded();
         let (nav_reply_tx, _) = flume::unbounded();
-        let (status_line_tx, _) = flume::unbounded();
+        let (lsp_status_tx, _) = flume::unbounded();
         let (open_file_tx, open_file_rx) = flume::unbounded();
         let (save_file_tx, save_file_rx) = flume::unbounded();
         let (buffer_change_tx, buffer_change_rx) = flume::unbounded();
@@ -2514,7 +2508,7 @@ mod tests {
                 worktree_tx,
                 buffer_tx,
                 nav_tx: nav_reply_tx,
-                status_line_tx,
+                lsp_status_tx,
                 open_file_rx,
                 save_file_rx,
                 buffer_change_rx,

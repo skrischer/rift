@@ -42,6 +42,12 @@ pub struct WorktreeModel {
     branch: Option<String>,
     /// Ahead/behind vs the upstream (`None` = no upstream / no repo).
     ahead_behind: Option<AheadBehind>,
+    /// Working-tree line totals vs HEAD (`git diff HEAD --numstat` semantics
+    /// plus untracked text additions), streamed on `RepoState` (#520) and read
+    /// by the composite status line's `+N −M` segment (#521). Both `0` on a
+    /// clean worktree, so the segment hides itself.
+    lines_added: u32,
+    lines_removed: u32,
     /// Whether a `RepoState` has arrived since the last completed snapshot.
     /// The daemon only emits `RepoState` for git-repo roots, so while this is
     /// `false` (startup, not connected, non-repo root) there is no repo-level
@@ -114,6 +120,8 @@ impl WorktreeModel {
         self.git.clear();
         self.branch = None;
         self.ahead_behind = None;
+        self.lines_added = 0;
+        self.lines_removed = 0;
         self.repo_state_received = false;
         // Same reasoning for diagnostics: the daemon replays the full live error
         // set right behind every snapshot (`write_snapshot`, #177), so drop the
@@ -181,12 +189,20 @@ impl WorktreeModel {
         }
     }
 
-    /// Apply the repo-level git state: current branch and ahead/behind. Replaces
-    /// the held values wholesale (the daemon sends the full repo state, not a
-    /// delta).
-    pub fn apply_repo_state(&mut self, branch: Option<String>, ahead_behind: Option<AheadBehind>) {
+    /// Apply the repo-level git state: current branch, ahead/behind, and the
+    /// working-tree line totals vs HEAD (#520). Replaces the held values
+    /// wholesale (the daemon sends the full repo state, not a delta).
+    pub fn apply_repo_state(
+        &mut self,
+        branch: Option<String>,
+        ahead_behind: Option<AheadBehind>,
+        lines_added: u32,
+        lines_removed: u32,
+    ) {
         self.branch = branch;
         self.ahead_behind = ahead_behind;
+        self.lines_added = lines_added;
+        self.lines_removed = lines_removed;
         self.repo_state_received = true;
     }
 
@@ -241,6 +257,12 @@ impl WorktreeModel {
     /// Ahead/behind vs the upstream, or `None` when there is no upstream / repo.
     pub fn ahead_behind(&self) -> Option<AheadBehind> {
         self.ahead_behind
+    }
+
+    /// Working-tree line totals vs HEAD: `(added, removed)`. Both `0` on a
+    /// clean worktree (#520/#521).
+    pub fn line_totals(&self) -> (u32, u32) {
+        (self.lines_added, self.lines_removed)
     }
 
     /// Whether a `RepoState` has arrived since the last completed snapshot.
@@ -518,7 +540,7 @@ mod tests {
             )],
             vec![],
         );
-        model.apply_repo_state(Some("stale".into()), None);
+        model.apply_repo_state(Some("stale".into()), None, 0, 0);
 
         model.apply_snapshot_chunk("/proj".into(), vec![file("early.rs", 1)], true);
         assert_eq!(model.git_status("early.rs"), None);
@@ -536,14 +558,14 @@ mod tests {
         let mut model = WorktreeModel::default();
         // Even a fully empty repo state (detached HEAD, no upstream) counts as
         // received: the daemon only emits it for repo roots.
-        model.apply_repo_state(None, None);
+        model.apply_repo_state(None, None, 0, 0);
         assert!(model.repo_state_received());
     }
 
     #[test]
     fn test_repo_state_received_after_snapshot_completion_is_reset() {
         let mut model = WorktreeModel::default();
-        model.apply_repo_state(Some("main".into()), None);
+        model.apply_repo_state(Some("main".into()), None, 0, 0);
 
         // A new snapshot (e.g. a reattach, possibly onto a non-repo root)
         // wipes the repo-level claim along with the rest of the git
@@ -553,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_repo_state_stores_branch_and_ahead_behind() {
+    fn test_apply_repo_state_stores_branch_ahead_behind_and_line_totals() {
         let mut model = WorktreeModel::default();
         model.apply_repo_state(
             Some("main".into()),
@@ -561,6 +583,8 @@ mod tests {
                 ahead: 2,
                 behind: 1,
             }),
+            12,
+            3,
         );
         assert_eq!(model.branch(), Some("main"));
         assert_eq!(
@@ -570,11 +594,25 @@ mod tests {
                 behind: 1
             })
         );
+        assert_eq!(model.line_totals(), (12, 3));
 
-        // Detached / no upstream replaces wholesale.
-        model.apply_repo_state(None, None);
+        // Detached / no upstream / clean worktree replaces wholesale.
+        model.apply_repo_state(None, None, 0, 0);
         assert_eq!(model.branch(), None);
         assert_eq!(model.ahead_behind(), None);
+        assert_eq!(model.line_totals(), (0, 0));
+    }
+
+    #[test]
+    fn test_snapshot_completion_resets_line_totals() {
+        let mut model = WorktreeModel::default();
+        model.apply_repo_state(Some("main".into()), None, 7, 4);
+        assert_eq!(model.line_totals(), (7, 4));
+
+        // A fresh snapshot wipes the repo-level line totals along with the rest
+        // of the git decoration; the replay behind it re-delivers them.
+        model.apply_snapshot_chunk("/proj".into(), vec![file("a.rs", 1)], true);
+        assert_eq!(model.line_totals(), (0, 0));
     }
 
     #[test]
@@ -589,7 +627,7 @@ mod tests {
             )],
             vec![],
         );
-        model.apply_repo_state(Some("main".into()), None);
+        model.apply_repo_state(Some("main".into()), None, 0, 0);
 
         // A new snapshot (e.g. on reattach) drops the prior git decoration and
         // repo state; the daemon re-sends the full git status right behind it.
@@ -639,6 +677,8 @@ mod tests {
                 ahead: 1,
                 behind: 0,
             }),
+            0,
+            0,
         );
 
         // Incremental: dirty.rs gets staged (moves to the index side); loose.rs

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -14,7 +14,7 @@ use tracing::debug;
 
 use crate::keytable::{self, KeyTable, PrefixOptions};
 use crate::layout::{self, LayoutNode};
-use crate::pane_view::{measure_cell_size, statusbar_height, PaneActivity, PaneView};
+use crate::pane_view::{measure_cell_size, PaneActivity, PaneView};
 use crate::{
     CaptureRequest, CaptureResult, ConnectionStatus, KeyTableQueryResult, PaneInput, PaneOutput,
     SelectWindow, SessionListItem, SessionSwitchRequest, SubscriptionUpdate, TermSize,
@@ -37,6 +37,11 @@ const PANE_HEADER_HEIGHT: f32 = 32.0;
 /// fallback needs it; OSC-133 and bell transitions stay event-driven (they
 /// re-render via the per-pane observation) (`docs/spec-pane-activity-indicators.md`).
 const ACTIVITY_IDLE_TICK: Duration = Duration::from_millis(1000);
+/// How long the transient grid-size overlay stays visible after a resize
+/// (`docs/spec-status-line.md`: the grid readout is resize feedback like an
+/// OSD, not persistent status). The idle tick (>= this cadence) re-renders and
+/// clears it once the deadline passes — no dedicated timer.
+const RESIZE_OVERLAY_DURATION: Duration = Duration::from_millis(900);
 /// Width of the session-switcher popover content
 /// (`docs/spec-session-switch.md` UI contract).
 const SESSION_SWITCHER_WIDTH: f32 = 260.0;
@@ -125,6 +130,22 @@ struct WindowState {
     /// Defaults to `false` (process glyph) when the flag is unavailable (the
     /// legacy tmux path, or a window with no active pane in the snapshot).
     is_shell: bool,
+}
+
+/// One window as the app's composite status line renders it
+/// (`docs/spec-status-line.md`): the `index:name` chip, whether it is the
+/// active window (rendered on a surface chip), and its folded pane activity
+/// (a dot on busy/attention windows). Built by [`SessionView::status_windows`]
+/// so the app reads a plain snapshot instead of reaching into the terminal's
+/// live pane/window state. Clicks route back through
+/// [`SessionView::select_window`] (the existing tmux command channel).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusWindow {
+    pub id: String,
+    pub index: i32,
+    pub name: String,
+    pub is_active: bool,
+    pub activity: PaneActivity,
 }
 
 /// An in-progress inline window rename. `window_id` targets the tmux window;
@@ -363,9 +384,12 @@ pub struct SessionView {
     /// area's measured element bounds — not the window viewport — so the
     /// client tracks the terminal panel inside the dock split (#424).
     client_grid_size: TermSize,
+    /// While set and unexpired, the transient grid-size overlay shows near the
+    /// terminal after a resize (`docs/spec-status-line.md`); `None` (or past the
+    /// deadline) hides it. Set by the pane-area grid observer on a size change.
+    resize_overlay_deadline: Option<Instant>,
     ssh_label: SharedString,
     session_name: SharedString,
-    working_directory: Option<String>,
     connection_status: ConnectionStatus,
     /// The mirrored tmux key-table lookup and prefix/repeat options, pushed
     /// down to every pane and refreshed in place via
@@ -375,10 +399,13 @@ pub struct SessionView {
     key_table: Arc<KeyTable>,
     prefix_options: PrefixOptions,
     /// Requests a key-table refresh (forwarded to `TerminalHandle`'s
-    /// `key_table_request_rx`), driven by the statusbar's explicit refresh
-    /// affordance. A dispatched binding-mutating command's refresh is issued
-    /// server-side instead, ordered after the mutation on the same seam
-    /// (`spawn_command_bridge` in `crates/app`) — not carried on this channel.
+    /// `key_table_request_rx`), driven by the command palette's "Refresh tmux
+    /// key tables" entry via [`Self::request_key_table_refresh`] (the escape
+    /// hatch the keytable-mirroring spec mandates, relocated off the removed
+    /// statusbar in `docs/spec-status-line.md`). A dispatched binding-mutating
+    /// command's refresh is issued server-side instead, ordered after the
+    /// mutation on the same seam (`spawn_command_bridge` in `crates/app`) — not
+    /// carried on this channel.
     key_table_request_tx: flume::Sender<()>,
     /// The host's tmux session list (`docs/spec-session-switch.md`), replaced
     /// wholesale by every `SessionListReply` (explicit refresh or the daemon's
@@ -632,9 +659,9 @@ impl SessionView {
             focus_handle: cx.focus_handle(),
             needs_focus: true,
             client_grid_size: TermSize { cols: 80, rows: 24 },
+            resize_overlay_deadline: None,
             ssh_label,
             session_name: SharedString::default(),
-            working_directory: None,
             connection_status: ConnectionStatus::Connecting,
             key_table: Arc::new(KeyTable::default()),
             prefix_options: PrefixOptions::default(),
@@ -891,7 +918,6 @@ impl SessionView {
 
         let mut new_windows = Vec::with_capacity(snapshot.windows.len());
         let mut active_pane_id = None;
-        let mut active_cwd = None;
 
         for window in &snapshot.windows {
             let pane_ids: Vec<String> = window.panes.iter().map(|p| p.id.clone()).collect();
@@ -899,11 +925,6 @@ impl SessionView {
 
             if is_active_window {
                 active_pane_id = window.active_pane_id.clone();
-                if let Some(pane) = window.panes.iter().find(|p| p.is_active) {
-                    if !pane.current_path.is_empty() {
-                        active_cwd = Some(pane.current_path.clone());
-                    }
-                }
             }
 
             for pane_state in &window.panes {
@@ -1022,9 +1043,6 @@ impl SessionView {
             self.needs_focus = true;
         }
         self.active_pane_id = active_pane_id;
-        if let Some(cwd) = active_cwd {
-            self.working_directory = Some(cwd);
-        }
 
         self.layout = snapshot
             .windows
@@ -1058,6 +1076,60 @@ impl SessionView {
             })
         });
         aggregate_activity(activities)
+    }
+
+    /// The window list the app's composite status line renders
+    /// (`docs/spec-status-line.md`): one [`StatusWindow`] per window in tab
+    /// order, each carrying its `index:name`, active flag, and folded pane
+    /// activity (the dominant of its panes). Read live so create/close/rename/
+    /// select/activity reflect on the next render without a refresh.
+    pub fn status_windows(&self, cx: &App) -> Vec<StatusWindow> {
+        self.windows
+            .iter()
+            .map(|w| StatusWindow {
+                id: w.id.clone(),
+                index: w.index,
+                name: w.name.clone(),
+                is_active: w.is_active,
+                activity: self.window_activity(&w.id, cx).0,
+            })
+            .collect()
+    }
+
+    /// Whether the focused pane is mid-chord after the tmux prefix, for the
+    /// composite status line's transient PREFIX indicator. Reads the active
+    /// pane's own prefix state (`crate::prefix`); `false` when no pane is
+    /// active or the chord has been dispatched/cancelled.
+    pub fn prefix_pending(&self, cx: &App) -> bool {
+        self.active_pane_id
+            .as_ref()
+            .and_then(|id| self.panes.get(id))
+            .is_some_and(|entry| entry.entity.read(cx).prefix_pending())
+    }
+
+    /// Select `window_id` through the existing tmux command channel
+    /// (`select-window`), acknowledging its bell attention locally so the badge
+    /// clears without waiting for the confirming snapshot — the same path the
+    /// tab-bar click and `Alt+1..9` take. Called by the composite status line's
+    /// window-list click (`docs/spec-status-line.md`).
+    pub fn select_window(&self, window_id: &str, cx: &mut Context<Self>) {
+        if let Err(e) = self
+            .tmux_command_tx
+            .try_send(format!("select-window -t {window_id}"))
+        {
+            debug!(error = %e, "failed to send window switch command");
+        }
+        self.acknowledge_window_attention(window_id, cx);
+    }
+
+    /// Request a manual key-table refresh (the escape hatch the
+    /// keytable-mirroring spec mandates), driven by the command palette's
+    /// "Refresh tmux key tables" entry (`docs/spec-status-line.md`). Forwards on
+    /// the same `key_table_request_tx` the removed statusbar affordance used.
+    pub fn request_key_table_refresh(&self) {
+        if let Err(e) = self.key_table_request_tx.try_send(()) {
+            debug!(error = %e, "failed to send key-table refresh request");
+        }
     }
 
     /// Acknowledge bell attention on every pane of `window_id`, immediately.
@@ -1721,34 +1793,20 @@ impl Render for SessionView {
         let font_size = self.font_size;
         let cell_size = measure_cell_size(window, font_size);
 
-        let (grid_size, pane_cwd, pane_command, prefix_pending) = self
-            .active_pane_id
-            .as_ref()
-            .and_then(|id| self.panes.get(id))
-            .map(|entry| {
-                let pane = entry.entity.read(cx);
-                (
-                    pane.grid_size(),
-                    pane.working_directory().map(String::from),
-                    pane.current_command().map(String::from),
-                    pane.prefix_pending(),
+        // The transient grid-size overlay (`docs/spec-status-line.md`): the
+        // client grid, shown near the terminal for a moment after a resize and
+        // hidden once the deadline passes. Session name, cwd, connection dot,
+        // and PREFIX no longer live here — they relocated to the title bar, the
+        // pane headers, and the app's composite status line respectively.
+        let resize_overlay = self
+            .resize_overlay_deadline
+            .filter(|deadline| Instant::now() < *deadline)
+            .map(|_| {
+                format!(
+                    "{}x{}",
+                    self.client_grid_size.cols, self.client_grid_size.rows
                 )
-            })
-            .unwrap_or((TermSize { cols: 0, rows: 0 }, None, None, false));
-
-        let cwd = pane_cwd
-            .or_else(|| self.working_directory.clone())
-            .unwrap_or_default();
-        let command = pane_command.unwrap_or_default();
-
-        let size_label = format!("{}x{}", grid_size.cols, grid_size.rows);
-
-        // Connection indicator, driven by the SSH lifecycle channel. Theme
-        // tokens per the design contract (`docs/spec-connection-robustness.md`):
-        // connected = success, connecting/reconnecting = warning, not
-        // connected = muted — shared with the title bar's connection group
-        // (#511) via `ConnectionStatus::status_dot`.
-        let (status_label, status_color) = self.connection_status.status_dot(cx);
+            });
 
         // SSH-outage danger banner (#476): only the SSH-level engine's state
         // shows it; a daemon-stream recovery (plain `Reconnecting`, #475)
@@ -2005,7 +2063,7 @@ impl Render for SessionView {
         let entity = cx.entity().clone();
         let grid_observer = canvas(
             move |bounds: Bounds<Pixels>, _window: &mut Window, cx: &mut App| {
-                entity.update(cx, |view: &mut Self, _cx| {
+                entity.update(cx, |view: &mut Self, cx| {
                     // Reserve the stacked pane headers from the reported grid so
                     // a vertical split never clips its bottom rows (#424): the
                     // worst-case column loses one header per pane stacked in it.
@@ -2019,6 +2077,13 @@ impl Render for SessionView {
                     if grid != view.client_grid_size {
                         view.client_grid_size = grid;
                         let _ = view.size_changed_tx.try_send(grid);
+                        // Surface the transient grid readout near the terminal;
+                        // notify so at least one more frame paints it even for a
+                        // single discrete resize. The idle tick clears it once
+                        // the deadline passes (no dedicated timer).
+                        view.resize_overlay_deadline =
+                            Some(Instant::now() + RESIZE_OVERLAY_DURATION);
+                        cx.notify();
                     }
                 });
             },
@@ -2027,70 +2092,24 @@ impl Render for SessionView {
         .absolute()
         .size_full();
 
-        let statusbar = h_flex()
-            .id("statusbar")
-            .justify_between()
-            .w_full()
-            .h(statusbar_height())
-            .bg(cx.theme().tab_bar)
-            .border_t_1()
-            .border_color(cx.theme().border)
-            // Statusbar stays fixed-size; font zoom only scales terminal content,
-            // and the bar has a fixed height that larger text would overflow.
-            .text_size(px(DEFAULT_FONT_SIZE))
-            .text_color(cx.theme().muted_foreground)
-            .font_family("JetBrainsMono Nerd Font Mono")
-            .px(px(12.0))
-            // Left slot: connection / session / window info (Phase 2d fields land here).
-            .child(
-                h_flex()
-                    .gap(px(16.0))
-                    .child(
-                        h_flex()
-                            .gap(px(6.0))
-                            .child(div().size(px(8.0)).rounded_full().bg(status_color))
-                            .child(SharedString::from(status_label)),
-                    )
-                    // Plain session name — the switcher popover itself now
-                    // anchors to the title bar's connection group (#512,
-                    // `docs/spec-cockpit-chrome.md`); the statusbar keeps a
-                    // non-interactive label.
-                    .children((!self.session_name.is_empty()).then(|| self.session_name.clone()))
-                    .child(self.ssh_label.clone())
-                    .children((!cwd.is_empty()).then(|| SharedString::from(cwd.clone()))),
-            )
-            // Right slot: command / git status (Phase 2d fields land here).
-            .child(
-                h_flex()
-                    .gap(px(16.0))
-                    // Pending-prefix indicator (tmux key-table mirroring): shown
-                    // while the focused pane is capturing the chord key after the
-                    // configured prefix; clears on dispatch/cancel (Escape or any
-                    // unbound chord key falls through the state machine back to
-                    // idle — see `crate::prefix`).
-                    .children(
-                        prefix_pending.then(|| div().text_color(rgb(0xf9e2af)).child("PREFIX")),
-                    )
-                    // Explicit key-table refresh trigger (tmux key-table
-                    // mirroring): re-queries `list-keys`/`show-options` on
-                    // click — the manual escape hatch alongside the automatic
-                    // attach and binding-mutating-dispatch triggers.
-                    .child(
-                        div()
-                            .id("refresh-key-table")
-                            .cursor_pointer()
-                            .hover(|s| s.text_color(new_hover))
-                            .child("refresh keys")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _event: &MouseDownEvent, _window, _cx| {
-                                    let _ = this.key_table_request_tx.try_send(());
-                                }),
-                            ),
-                    )
-                    .children((!command.is_empty()).then(|| SharedString::from(command.clone())))
-                    .child(SharedString::from(size_label)),
-            );
+        // Transient grid-size overlay (`docs/spec-status-line.md`): a small
+        // pill near the terminal's bottom-right, shown briefly after a resize.
+        let resize_overlay = resize_overlay.map(|label| {
+            div()
+                .absolute()
+                .bottom(px(8.0))
+                .right(px(8.0))
+                .px(px(8.0))
+                .py(px(2.0))
+                .rounded(px(4.0))
+                .bg(cx.theme().tab_bar)
+                .border_1()
+                .border_color(cx.theme().border)
+                .text_size(px(11.0))
+                .text_color(cx.theme().muted_foreground)
+                .font_family("JetBrainsMono Nerd Font Mono")
+                .child(SharedString::from(label))
+        });
 
         let mut root = div()
             .relative()
@@ -2121,14 +2140,15 @@ impl Render for SessionView {
             .child(tab_bar)
             .child(
                 div()
+                    .relative()
                     .flex()
                     .flex_1()
                     .min_h_0()
                     .w_full()
                     .child(pane_area)
-                    .child(grid_observer),
-            )
-            .child(statusbar);
+                    .child(grid_observer)
+                    .children(resize_overlay),
+            );
 
         // While dragging a border, a full-window overlay captures all mouse
         // events (`occlude`) so the underlying pane does not start a text

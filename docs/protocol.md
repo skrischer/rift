@@ -13,9 +13,9 @@ discriminator. The authoritative definitions live in `crates/protocol/src/lib.rs
 
 ```json
 // client → daemon
-{ "type": "hello",   "version": 4 }
+{ "type": "hello",   "version": 5 }
 // daemon → client
-{ "type": "welcome", "version": 4 }
+{ "type": "welcome", "version": 5 }
 ```
 
 `version` is the wire `PROTOCOL_VERSION`, independent of the crate semver.
@@ -50,9 +50,12 @@ binary, never by tolerating it (`docs/spec-connection-robustness.md`).
   a healthy concurrent connection's stream (relevant for the shared stable+dev
   daemon).
 
-History: version 4 adds `RepoState`'s `lines_added`/`lines_removed`
-working-tree line totals and the `LspStatus` push (`docs/spec-status-line.md`);
-version 3 adds the session-list pair `query_session_list` /
+History: version 5 removes the tmux status-line CONTENT mirror pair
+`query_status_line` / `status_line_reply` (superseded by the composite status
+line's native segments, `docs/spec-status-line.md`); version 4 adds
+`RepoState`'s `lines_added`/`lines_removed` working-tree line totals and the
+`LspStatus` push (`docs/spec-status-line.md`); version 3 adds the session-list
+pair `query_session_list` /
 `session_list_reply` (`docs/spec-session-switch.md`); version 2 pins the
 message set as of the connection-robustness phase (fingerprint test
 introduced); version 1 was the original handshake constant, carried but never
@@ -73,7 +76,6 @@ streams pane bytes and layout state back.
 { "type": "tmux_command", "cmd": "split-window -h" }
 { "type": "capture_pane", "pane_id": 3, "start": "-", "end": "-128", "join": false }
 { "type": "query_key_table" }
-{ "type": "query_status_line" }
 { "type": "query_session_list" }
 ```
 
@@ -98,19 +100,6 @@ streams pane bytes and layout state back.
   explicitly: on a user-triggered refresh, or after dispatching a
   binding-mutating bound command (`bind-key`/`unbind-key`/`source-file`, or
   `set-option` touching `prefix`/`prefix2`/`repeat-time`).
-- `query_status_line` asks the daemon to (re-)query the tmux status-line
-  mirror (`docs/spec-tmux-statusline-mirroring.md`): the `status-*` option set
-  via `show-options -A` (session-resolved — includes values inherited from
-  the global scope) plus the server-side-expanded `status-left`/`status-right`
-  segments via `display-message -p '#{T:...}'` (tmux's own format engine,
-  never re-implemented client-side; the raw option value is never
-  interpolated into a command line). The daemon answers with exactly one
-  `status_line_reply` — a **request/response** exchange, same sibling
-  convention as `query_key_table`. The daemon also issues this query
-  unprompted on `attach`/reconnect and again on its own `status-interval`
-  cadence, so the client only sends `query_status_line` explicitly: on a
-  user-triggered refresh, or after dispatching a bound command that sets a
-  mirrored `status-*` option.
 - `query_session_list` asks the daemon to (re-)run `list-sessions` for the
   session switcher (`docs/spec-session-switch.md`). The daemon answers with
   exactly one `session_list_reply` — a **request/response** exchange, same
@@ -131,7 +120,6 @@ streams pane bytes and layout state back.
 { "type": "layout_update",   "session": "rift", "windows": [ <window>, ... ] }
 { "type": "terminal_exit",   "session": "rift", "reason": "server exited" }
 { "type": "key_table_reply", "list_keys": "bind-key -T prefix c new-window\n...", "options": "prefix C-b\nrepeat-time 500\n..." }
-{ "type": "status_line_reply", "options": "status-interval 15\nstatus-left-length 10\n...", "status_left": "no-myhost-80-", "status_right": "#[fg=green]01:49#[default]" }
 { "type": "session_list_reply", "sessions": [{ "id": 0, "name": "rift", "windows": 3, "attached": true }] }
 ```
 
@@ -178,15 +166,6 @@ streams pane bytes and layout state back.
   daemon** — the client parses both with `rift_terminal::keytable` into the
   mirrored key-table lookup and prefix/repeat options. This is tmux's own
   config text, not pane content.
-- `status_line_reply` is the reply to `query_status_line` (and the unprompted
-  attach-time/`status-interval` queries): `options` is the raw `show-options
-  -A` output, newline-joined and tmux-decoded, for the client to parse with
-  `rift_terminal::statusline::parse_status_options`; `status_left`/
-  `status_right` are the already-expanded segments from the two
-  `display-message -p '#{T:...}'` fetches — tmux's own format evaluation,
-  never re-implemented client-side, and still carrying their `#[...]` style
-  runs unparsed. None of this is interpreted by the daemon — it is tmux's
-  own config, not pane content.
 - `session_list_reply` is the reply to `query_session_list` (and the
   unprompted churn-driven re-queries): every tmux session on the server,
   parsed daemon-side from a tab-separated `list-sessions` format with the
@@ -473,11 +452,10 @@ the fingerprint (see Versioning policy above); the fingerprint test enforces
 this mechanically.
 
 Most paths are **push-only** (structure and decoration: worktree, git,
-diagnostics — "push is the source of truth"). The seven request/response
+diagnostics — "push is the source of truth"). The request/response
 exceptions are deliberate and scoped: `capture_pane` / `pane_capture` for
 pre-attach scrollback; `query_key_table` / `key_table_reply` for the tmux
-key-table mirror; `query_status_line` / `status_line_reply` for the tmux
-status-line mirror (sibling pattern to the key-table one);
+key-table mirror;
 `query_session_list` / `session_list_reply` for the session switcher (same
 sibling pattern, plus unprompted churn-driven pushes); the **buffer
 channel** (`open_file` → `file_content`, `save_file` → `save_result` /

@@ -57,6 +57,11 @@ gpui-component-assets = { workspace = true, optional = true }
 rust-embed = { version = "8", optional = true, features = ["debug-embed"] }
 tokio.workspace = true
 flume.workspace = true
+# Client-local wall clock for the composite status line's minute clock
+# (`docs/spec-status-line.md`). Already in the graph via gpui / gpui-component
+# (with the default `clock` feature), so this direct edge adds no new crate to
+# Cargo.lock — declared here only to use `chrono::Local` directly.
+chrono = "0.4"
 # GPUI-side timeout for the buffer-channel open request (`smol::Timer`; the
 # tokio timer does not fire on the GPUI executor — docs/patterns.md).
 smol.workspace = true
