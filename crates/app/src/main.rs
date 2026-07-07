@@ -117,6 +117,12 @@ struct EditorChannels {
     /// Root-relative paths to diff, emitted by the source-control panel on
     /// selection; each becomes a `RequestDiff` request.
     request_diff_rx: flume::Receiver<String>,
+    /// Git write ops the source-control panel emits (#546) — `StageFile`,
+    /// `UnstageFile`, `DiscardFile`, `Commit`; forwarded onto the protocol
+    /// verbatim by the git-op bridge. Push-only from the panel's side: the
+    /// daemon's `GitOpResult` reply is not routed back, the resulting state
+    /// arrives on the worktree stream as `UpdateGitStatus` / `RepoState`.
+    git_op_rx: flume::Receiver<rift_protocol::ClientMessage>,
 }
 
 /// The reconnect engine's cross-attempt state (#476): `watch` channels whose
@@ -595,6 +601,7 @@ impl Shell {
         let (nav_request_tx, nav_request_rx) = flume::unbounded::<rift_protocol::ClientMessage>();
         let (diff_tx, diff_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
         let (request_diff_tx, request_diff_rx) = flume::unbounded::<String>();
+        let (git_op_tx, git_op_rx) = flume::unbounded::<rift_protocol::ClientMessage>();
         // Fires once when the session pipeline this attempt spawned ends —
         // orderly exit, a canceled reconnect, or a non-retryable failure
         // (`run_session_with_reconnect`'s `end_reason`) — so the Shell can
@@ -654,6 +661,7 @@ impl Shell {
                 nav_request_rx,
                 diff_tx,
                 request_diff_rx,
+                git_op_rx,
             };
 
             let key_exists = ssh.key.exists();
@@ -703,6 +711,7 @@ impl Shell {
                     buffer_change_tx,
                     nav_tx: nav_request_tx,
                     request_diff_tx,
+                    git_op_tx,
                 },
                 state_path,
                 window,
@@ -973,7 +982,8 @@ fn drain_render_backlog(ch: &PtyChannels, editor: &EditorChannels, watches: &Eng
         + editor.save_file_rx.drain().count()
         + editor.buffer_change_rx.drain().count()
         + editor.nav_request_rx.drain().count()
-        + editor.request_diff_rx.drain().count();
+        + editor.request_diff_rx.drain().count()
+        + editor.git_op_rx.drain().count();
     if dropped > 0 {
         debug!(
             dropped,
@@ -1055,7 +1065,8 @@ async fn run_ssh_session(
         spawn_save_file_bridge(client_rx.clone(), editor.save_file_rx.clone());
         spawn_buffer_change_bridge(client_rx.clone(), editor.buffer_change_rx.clone());
         spawn_nav_bridge(client_rx.clone(), editor.nav_request_rx.clone());
-        spawn_request_diff_bridge(client_rx, editor.request_diff_rx.clone());
+        spawn_request_diff_bridge(client_rx.clone(), editor.request_diff_rx.clone());
+        spawn_git_op_bridge(client_rx, editor.git_op_rx.clone());
         tokio::spawn(async move {
             consume_daemon_messages(&client, None, &editor).await;
         });
@@ -1225,7 +1236,12 @@ async fn run_daemon_terminal(
     // Diff pull reverse path (#338): the source-control panel's selection becomes
     // a `RequestDiff`. The `FileDiff` reply returns via `consume_daemon_messages`
     // on `editor.diff_tx`.
-    spawn_request_diff_bridge(client_rx, editor.request_diff_rx.clone());
+    spawn_request_diff_bridge(client_rx.clone(), editor.request_diff_rx.clone());
+    // Git write-op reverse path (#546): the source-control panel's stage /
+    // unstage / discard / commit actions forward verbatim. Push-only from here —
+    // the resulting git change returns on the worktree stream, not as a routed
+    // reply.
+    spawn_git_op_bridge(client_rx, editor.git_op_rx.clone());
 
     // Forward path: fold the daemon stream into the render channels (pane output,
     // layout snapshots, capture replies), the file tree, and the editor. Blocks
@@ -2061,6 +2077,26 @@ fn spawn_request_diff_bridge(
     });
 }
 
+/// Forward the source-control panel's git write ops onto the protocol (#546):
+/// each `StageFile` / `UnstageFile` / `DiscardFile` / `Commit` the panel built
+/// is sent verbatim. Push-only from the panel's side — the daemon answers with
+/// a `GitOpResult` (`ok`/`error`), but the resulting state change arrives on
+/// the worktree stream (`UpdateGitStatus` / `RepoState`), the one source of
+/// truth for git state, so no reply is routed back here. Ends when the
+/// render-side channel closes.
+fn spawn_git_op_bridge(
+    client_rx: DaemonClientWatch,
+    git_op_rx: flume::Receiver<rift_protocol::ClientMessage>,
+) {
+    tokio::spawn(async move {
+        while let Ok(msg) = git_op_rx.recv_async().await {
+            debug!(op = ?msg, "sending git write op");
+            let client = client_rx.borrow().clone();
+            let _ = client.send(msg).await;
+        }
+    });
+}
+
 /// Forward the editor's save requests onto the protocol as
 /// [`rift_protocol::ClientMessage::SaveFile`] writes (#188). Each is the whole
 /// open buffer plus its base `mtime`; the daemon answers with a `SaveResult` or a
@@ -2463,6 +2499,7 @@ mod tests {
         buffer_change_tx: flume::Sender<rift_protocol::ClientMessage>,
         nav_tx: flume::Sender<rift_protocol::ClientMessage>,
         request_diff_tx: flume::Sender<String>,
+        git_op_tx: flume::Sender<rift_protocol::ClientMessage>,
     }
 
     fn backlog_harness() -> BacklogHarness {
@@ -2490,6 +2527,7 @@ mod tests {
         let (nav_tx, nav_request_rx) = flume::unbounded();
         let (diff_tx, _) = flume::unbounded();
         let (request_diff_tx, request_diff_rx) = flume::unbounded();
+        let (git_op_tx, git_op_rx) = flume::unbounded();
         BacklogHarness {
             ch: PtyChannels {
                 pane_output_tx,
@@ -2518,6 +2556,7 @@ mod tests {
                 nav_request_rx,
                 diff_tx,
                 request_diff_rx,
+                git_op_rx,
             },
             watches: EngineWatches {
                 session: tokio::sync::watch::channel("rift".to_string()).0,
@@ -2535,6 +2574,7 @@ mod tests {
             buffer_change_tx,
             nav_tx,
             request_diff_tx,
+            git_op_tx,
         }
     }
 
@@ -2596,6 +2636,11 @@ mod tests {
         h.request_diff_tx
             .send("src/main.rs".into())
             .expect("send diff request");
+        h.git_op_tx
+            .send(rift_protocol::ClientMessage::StageFile {
+                path: "src/main.rs".into(),
+            })
+            .expect("send git op");
 
         drain_render_backlog(&h.ch, &h.editor, &h.watches);
 
@@ -2610,6 +2655,7 @@ mod tests {
         assert!(h.editor.buffer_change_rx.is_empty());
         assert!(h.editor.nav_request_rx.is_empty());
         assert!(h.editor.request_diff_rx.is_empty());
+        assert!(h.editor.git_op_rx.is_empty());
     }
 
     #[test]
