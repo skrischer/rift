@@ -545,6 +545,16 @@ fn wire_diff_hunk(hunk: rift_explorer::DiffHunk) -> rift_protocol::DiffHunk {
     }
 }
 
+/// The protocol [`rift_protocol::hunk_fingerprint`] of an explorer hunk — the
+/// single source of truth for a hunk's `hunk_id`, shared with the client (which
+/// computes it over the wire [`rift_protocol::DiffHunk`] it received). The
+/// `StageHunk` handler recomputes it over the file's fresh worktree-vs-HEAD
+/// hunks to resolve a request's `hunk_id` back to a concrete hunk before
+/// applying; a stale or content-changed id matches nothing and is rejected.
+pub(crate) fn hunk_fingerprint(hunk: &rift_explorer::DiffHunk) -> u64 {
+    rift_protocol::hunk_fingerprint(&wire_diff_hunk(hunk.clone()))
+}
+
 /// Map an explorer diff line role onto its wire code (1:1).
 fn wire_diff_line_kind(kind: rift_explorer::DiffLineKind) -> rift_protocol::DiffLineKind {
     match kind {
@@ -1035,8 +1045,8 @@ where
                                 snapshot_sent = write_snapshot(&mut writer, &state).await?;
                             }
                         }
-                        // The file-level source-control write ops (#544) are
-                        // per-connection request/response, exactly like the
+                        // The source-control write ops (#544, hunk staging #545)
+                        // are per-connection request/response, exactly like the
                         // buffer/diff channels above: apply the op against the
                         // confined worktree root and write the single
                         // `GitOpResult` straight back to this socket. The
@@ -1046,6 +1056,7 @@ where
                         ClientMessage::StageFile { .. }
                         | ClientMessage::UnstageFile { .. }
                         | ClientMessage::DiscardFile { .. }
+                        | ClientMessage::StageHunk { .. }
                         | ClientMessage::Commit { .. } => {
                             let reply = git_write::reply(&state, msg).await;
                             let frame = encode_frame(&reply)?;
@@ -1057,16 +1068,8 @@ where
                         // single loop (one document model + servers for the
                         // daemon), not per connection. Push-only — no reply here;
                         // diagnostics return on the shared broadcast bus.
-                        //
-                        // Hunk staging (#545) is parked here too, pending its
-                        // `gix`-backed handler — the same "forward to the shared
-                        // loop, no-op for now" convention the navigation channel
-                        // used between #193 and #298/#482. `Core::dispatch`'s
-                        // defensive no-op arm absorbs it until then; no
-                        // `GitOpResult` is sent yet.
                         ClientMessage::BufferChanged { .. }
-                        | ClientMessage::BufferClosed { .. }
-                        | ClientMessage::StageHunk { .. } => {
+                        | ClientMessage::BufferClosed { .. } => {
                             if inbound.send(msg).await.is_err() {
                                 // Dispatch loop gone; nothing left to serve.
                                 break 'serve;
@@ -1621,14 +1624,10 @@ impl Core {
             // closes only that connection. These arms are a defensive no-op
             // should one arrive here anyway.
             //
-            // The file-level source-control write ops (#544) are answered per
-            // connection by `git_write::reply` (request/response back to that
-            // socket), so they never reach this loop either; their arms below
-            // are a defensive no-op. Hunk staging (`StageHunk`, #545) DOES reach
-            // this loop — `serve_connection` still forwards it alongside the
-            // live-buffer feed — and is absorbed as a silent no-op pending its
-            // `gix`-backed handler, same as `HoverRequest` et al. were between
-            // #193 and #298/#482.
+            // The source-control write ops (#544, hunk staging #545) are
+            // answered per connection by `git_write::reply` (request/response
+            // back to that socket), so they never reach this loop; their arms
+            // below are a defensive no-op.
             ClientMessage::Hello { .. }
             | ClientMessage::Attach { .. }
             | ClientMessage::Input { .. }

@@ -1,5 +1,5 @@
 //! The daemon's source-control write service: applies a stage / unstage /
-//! discard / commit request and answers with exactly one
+//! discard / stage-hunk / commit request and answers with exactly one
 //! [`DaemonMessage::GitOpResult`], confined to the watched worktree root.
 //!
 //! This is the daemon side of the source-control write channel
@@ -34,10 +34,10 @@ enum FileOp {
 }
 
 /// Apply the write op in `msg` against the watched worktree root and produce its
-/// [`DaemonMessage::GitOpResult`]. Called only with the four file-level write
-/// ops (`StageFile` / `UnstageFile` / `DiscardFile` / `Commit`); any other
-/// variant is answered as a failed op rather than a panic so a stray message can
-/// never take the connection down.
+/// [`DaemonMessage::GitOpResult`]. Called only with the source-control write
+/// ops (`StageFile` / `UnstageFile` / `DiscardFile` / `StageHunk` / `Commit`);
+/// any other variant is answered as a failed op rather than a panic so a stray
+/// message can never take the connection down.
 pub(crate) async fn reply(state: &watch::Receiver<State>, msg: ClientMessage) -> DaemonMessage {
     // The borrow is released before any `await`: the canonical root is cloned
     // out up front, then the git I/O runs unborrowed (like `request_reply`).
@@ -66,6 +66,13 @@ pub(crate) async fn reply(state: &watch::Receiver<State>, msg: ClientMessage) ->
             let op = GitWriteOp::DiscardFile { path: path.clone() };
             finish(op, run_file(root, path, FileOp::Discard).await)
         }
+        ClientMessage::StageHunk { path, hunk_id } => {
+            let op = GitWriteOp::StageHunk {
+                path: path.clone(),
+                hunk_id,
+            };
+            finish(op, run_hunk(root, path, hunk_id).await)
+        }
         ClientMessage::Commit { message } => {
             finish(GitWriteOp::Commit, run_commit(root, message).await)
         }
@@ -91,6 +98,41 @@ async fn run_file(root: PathBuf, path: String, op: FileOp) -> Result<(), String>
     .await
     .map_err(|e| format!("git op task failed: {e}"))?
     .map_err(|e| e.to_string())
+}
+
+/// Stage one hunk on a blocking thread (`gix` diff + index mutation is
+/// CPU/disk-bound). The file's fresh worktree-vs-HEAD hunks are recomputed and
+/// `hunk_id` is resolved back to a concrete hunk via the protocol fingerprint
+/// (the single id source shared with the client); a stale or content-changed id
+/// matches none and is rejected. The resolved hunk drives the explorer's
+/// decompose-and-reapply against the index.
+async fn run_hunk(root: PathBuf, path: String, hunk_id: u64) -> Result<(), String> {
+    if let Err(err) = buffer::resolve(&root, &path) {
+        return Err(format!("invalid path: {err}"));
+    }
+    let relative = PathBuf::from(&path);
+    tokio::task::spawn_blocking(move || {
+        let hunks =
+            match rift_explorer::compute_diff(&root, &relative).map_err(|e| e.to_string())? {
+                rift_explorer::FileDiff::Hunks(hunks) => hunks,
+                rift_explorer::FileDiff::Binary | rift_explorer::FileDiff::TooLarge => {
+                    return Err(format!(
+                        "cannot stage a hunk of a binary or oversized file: {path}"
+                    ));
+                }
+            };
+        let selected = hunks
+            .iter()
+            .find(|&hunk| crate::hunk_fingerprint(hunk) == hunk_id)
+            .ok_or_else(|| {
+                format!(
+                    "the selected hunk is stale (the file changed since the diff was shown): {path}"
+                )
+            })?;
+        rift_explorer::stage_hunk(&root, &relative, selected).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("git op task failed: {e}"))?
 }
 
 /// Run the commit on a blocking thread. Commit carries no path, so there is
@@ -290,6 +332,89 @@ mod tests {
         .await;
         let error = assert_failed(reply);
         assert!(error.contains("nothing staged"), "got {error}");
+    }
+
+    /// A repo with a committed 20-line file, so a two-hunk worktree edit is
+    /// possible for the hunk-staging wiring tests.
+    fn init_multi_line_repo(tag: &str) -> TempDir {
+        let tmp = init_repo(tag);
+        let mut content = String::new();
+        for n in 1..=20 {
+            content.push_str(&format!("l{n:02}\n"));
+        }
+        std::fs::write(tmp.path.join("multi.txt"), content).expect("write");
+        git(&tmp.path, &["add", "multi.txt"]);
+        git(&tmp.path, &["commit", "-q", "-m", "add multi"]);
+        tmp
+    }
+
+    /// Two far-apart edits (lines 2 and 18) in `multi.txt`, so its diff is two
+    /// distinct hunks.
+    fn write_two_hunk_worktree(root: &Path) {
+        let mut lines: Vec<String> = (1..=20).map(|n| format!("l{n:02}")).collect();
+        lines[1] = "SECOND".to_owned();
+        lines[17] = "EIGHTEEN".to_owned();
+        std::fs::write(root.join("multi.txt"), format!("{}\n", lines.join("\n"))).expect("write");
+    }
+
+    #[tokio::test]
+    async fn test_stage_hunk_replies_ok_and_stages_one_hunk() {
+        let repo = init_multi_line_repo("stage-hunk-ok");
+        write_two_hunk_worktree(&repo.path);
+        let hunks = match rift_explorer::compute_diff(&repo.path, Path::new("multi.txt"))
+            .expect("compute diff")
+        {
+            rift_explorer::FileDiff::Hunks(hunks) => hunks,
+            other => panic!("expected hunks, got {other:?}"),
+        };
+        assert_eq!(hunks.len(), 2);
+        let hunk_id = crate::hunk_fingerprint(&hunks[0]);
+        let state = state_for(&repo.path);
+
+        let reply = reply(
+            &state,
+            ClientMessage::StageHunk {
+                path: "multi.txt".into(),
+                hunk_id,
+            },
+        )
+        .await;
+        assert_ok(
+            reply,
+            GitWriteOp::StageHunk {
+                path: "multi.txt".into(),
+                hunk_id,
+            },
+        );
+        // One hunk staged: the file is Modified on both the index (this hunk) and
+        // worktree (the other hunk) sides.
+        assert_eq!(
+            rift_explorer::GitStatus::compute(&repo.path)
+                .expect("status")
+                .get(Path::new("multi.txt")),
+            Some(rift_explorer::GitEntryStatus {
+                index: rift_explorer::GitStatusCode::Modified,
+                worktree: rift_explorer::GitStatusCode::Modified,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stage_hunk_unknown_id_replies_stale_error() {
+        let repo = init_multi_line_repo("stage-hunk-stale");
+        write_two_hunk_worktree(&repo.path);
+        let state = state_for(&repo.path);
+
+        let reply = reply(
+            &state,
+            ClientMessage::StageHunk {
+                path: "multi.txt".into(),
+                hunk_id: 0xdead_beef_dead_beef,
+            },
+        )
+        .await;
+        let error = assert_failed(reply);
+        assert!(error.contains("stale"), "got {error}");
     }
 
     #[tokio::test]

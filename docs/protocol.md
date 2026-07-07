@@ -543,12 +543,13 @@ adding stage / unstage / discard / commit and hunk-level stage. Specified by
 
 The protocol types and `hunk_fingerprint` are defined in #543. The
 daemon-side `gix`-backed handlers (`crates/daemon`/`crates/explorer`) for
-`stage_file` / `unstage_file` / `discard_file` / `commit` are a follow-on
-issue (#544); `stage_hunk`'s decompose-and-reapply algorithm is a further
-follow-on (#545). Until then the daemon accepts and silently drops these
-five request variants (the same "defensive no-op, pending a follow-on issue"
-convention the navigation channel used between #193 and #298/#482) — no
-`git_op_result` is sent for them yet.
+`stage_file` / `unstage_file` / `discard_file` / `commit` landed in #544, and
+`stage_hunk`'s decompose-and-reapply algorithm in #545. All five requests are
+now answered per connection by `git_write::reply` (request/response back to
+the requesting socket) with exactly one `git_op_result`; `stage_hunk` resolves
+its `hunk_id` back to a concrete hunk via `hunk_fingerprint` over the file's
+freshly recomputed worktree-vs-HEAD hunks, so a stale or content-changed id
+matches nothing and is rejected.
 
 ## Rules
 
