@@ -73,6 +73,7 @@ use rift_protocol::{ClientMessage, DaemonMessage};
 use rift_terminal::{SessionView, SessionViewEvent};
 use tracing::{debug, warn};
 
+use crate::activity_rail;
 use crate::command_palette::{CommandPalette, OpenCommandPalette};
 use crate::diff_view::DiffView;
 use crate::editor::EditorView;
@@ -1009,6 +1010,25 @@ impl Render for WorkspaceView {
             .into_any_element();
         let title_bar = title_bar::render(connection, Some(settings_button), cx);
 
+        // The activity rail (#513, `docs/spec-cockpit-chrome.md`): active
+        // state tracks live dock visibility and the badges read the same
+        // `WorktreeModel` the status bar reads below — both live views over
+        // one model, no separate rail-owned state.
+        let rail = {
+            let model = self.file_tree.read(cx).model();
+            let dock_area = self.dock_area.read(cx);
+            activity_rail::render(
+                activity_rail::RailState {
+                    explorer_open: dock_area.is_dock_open(DockPlacement::Left, cx),
+                    source_control_open: dock_area.is_dock_open(DockPlacement::Right, cx),
+                    problems_open: dock_area.is_dock_open(DockPlacement::Bottom, cx),
+                    changed_count: model.git_statuses().len(),
+                    worst_diagnostic: activity_rail::worst_severity(model.all_diagnostics()),
+                },
+                cx,
+            )
+        };
+
         // The dock shell fills the window below the custom title bar (the
         // native OS chrome is gone, #511); the `flex_col` mirrors
         // `examples/dock.rs` at the pinned gpui-component rev.
@@ -1106,7 +1126,14 @@ impl Render for WorkspaceView {
                 }),
             )
             .child(title_bar)
-            .child(self.dock_area.clone())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .size_full()
+                    .child(rail)
+                    .child(self.dock_area.clone()),
+            )
             .child(status_bar)
             .children(sheet_layer)
             .children(dialog_layer)
