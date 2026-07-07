@@ -29,9 +29,16 @@
 //! square per hunk, and a Split|Unified segmented toggle whose preference is
 //! persisted in the window-state store (`crate::window_state`) — mirroring
 //! `crate::set_theme_mode_persisted`'s "apply, then best-effort persist"
-//! shape. `Split` only selects the toggle state in this issue; the actual
-//! split renderer is issue #548's scope, so both modes render the existing
-//! unified rows for now. Each hunk header row also carries a `+ Stage hunk`
+//! shape. The `Split` mode (issue #548) renders the same hunks as two aligned
+//! columns: per-side line-number gutters, add/delete tints, hatched
+//! [`gpui::pattern_slash`] filler rows on the side a change block does not
+//! reach, and word-level intra-line emphasis computed client-side by a
+//! token-level longest-common-subsequence over each changed line pair. The
+//! split row *structure* is flattened once per reply alongside the unified
+//! rows ([`flatten_split_rows`]); the LCS runs only for the VISIBLE changed
+//! pairs inside the virtual-list render callback, so no full re-diff happens
+//! per scroll frame (`docs/spec-source-control-write.md`). Each hunk header row
+//! also carries a `+ Stage hunk`
 //! ghost button wired to [`rift_protocol::ClientMessage::StageHunk`] with the
 //! hunk's own fingerprint — the daemon (`crates/daemon/src/git_write.rs`)
 //! recomputes and verifies it before applying, so a stale id is rejected
@@ -46,8 +53,8 @@ use std::rc::Rc;
 
 use flume::Sender;
 use gpui::{
-    div, px, AnyElement, App, Context, EventEmitter, FocusHandle, Focusable, Hsla, IntoElement,
-    ParentElement as _, Pixels, Render, SharedString, Size, Styled as _, Window,
+    div, pattern_slash, px, AnyElement, App, Context, EventEmitter, FocusHandle, Focusable, Hsla,
+    IntoElement, ParentElement as _, Pixels, Render, SharedString, Size, Styled as _, Window,
 };
 use gpui_component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_component::dock::{Panel, PanelEvent};
@@ -193,6 +200,284 @@ fn flatten_hunks(hunks: Vec<DiffHunk>) -> (Vec<DiffRow>, Vec<HunkSummary>) {
     (rows, summaries)
 }
 
+/// One side (old/HEAD or new/worktree) of a [`SplitRow::Pair`]: a real diff
+/// line with its per-side line number, kind, and content. A `None` side of a
+/// pair is a filler (hatched), not a [`SplitCell`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SplitCell {
+    kind: DiffLineKind,
+    /// 1-based line number on this side (old-side for the left cell, new-side
+    /// for the right cell).
+    line_number: u32,
+    content: String,
+}
+
+/// One flattened row of the side-by-side split view: a hunk header (rendered
+/// full-width, identically to the unified view) or a pair of optional sides. A
+/// context line pairs both sides with identical content; a change block pairs
+/// the i-th removed line with the i-th added line, and the longer side's
+/// surplus lines pair with a `None` (hatched filler) on the other side. Derived
+/// once per reply by [`flatten_split_rows`], never re-derived per frame — the
+/// word-level emphasis over a `(Remove, Add)` pair is the only per-frame work,
+/// and only for visible rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SplitRow {
+    HunkHeader {
+        hunk_id: u64,
+        old_start: u32,
+        old_len: u32,
+        new_start: u32,
+        new_len: u32,
+    },
+    Pair {
+        left: Option<SplitCell>,
+        right: Option<SplitCell>,
+    },
+}
+
+/// Emit one [`SplitRow::Pair`] per line of a change block, pairing the i-th
+/// removed line with the i-th added line and padding the shorter side with
+/// `None` (a hatched filler). Drains both buffers by value (no clone) so the
+/// caller's accumulators are empty for the next block.
+fn flush_change_block(
+    rows: &mut Vec<SplitRow>,
+    removes: &mut Vec<SplitCell>,
+    adds: &mut Vec<SplitCell>,
+) {
+    let removes = std::mem::take(removes);
+    let adds = std::mem::take(adds);
+    let paired = removes.len().max(adds.len());
+    let mut removes = removes.into_iter();
+    let mut adds = adds.into_iter();
+    for _ in 0..paired {
+        rows.push(SplitRow::Pair {
+            left: removes.next(),
+            right: adds.next(),
+        });
+    }
+}
+
+/// Flatten hunks into the split view's row sequence: one full-width header per
+/// hunk, then context lines paired on both sides and change blocks paired
+/// removed-to-added with filler padding ([`flush_change_block`]). Line numbers
+/// are walked exactly as [`flatten_hunks`] does. Pure and GPUI-free so it is
+/// unit-testable headless; borrows the hunks so [`DiffViewState::from_payload`]
+/// can still hand them to [`flatten_hunks`] afterwards without a clone.
+fn flatten_split_rows(hunks: &[DiffHunk]) -> Vec<SplitRow> {
+    let mut rows = Vec::new();
+    for hunk in hunks {
+        rows.push(SplitRow::HunkHeader {
+            hunk_id: hunk_fingerprint(hunk),
+            old_start: hunk.old_start,
+            old_len: hunk.old_len,
+            new_start: hunk.new_start,
+            new_len: hunk.new_len,
+        });
+
+        let mut old_line = hunk.old_start;
+        let mut new_line = hunk.new_start;
+        let mut removes: Vec<SplitCell> = Vec::new();
+        let mut adds: Vec<SplitCell> = Vec::new();
+        for line in &hunk.lines {
+            match line.kind {
+                DiffLineKind::Context => {
+                    flush_change_block(&mut rows, &mut removes, &mut adds);
+                    rows.push(SplitRow::Pair {
+                        left: Some(SplitCell {
+                            kind: DiffLineKind::Context,
+                            line_number: old_line,
+                            content: line.content.clone(),
+                        }),
+                        right: Some(SplitCell {
+                            kind: DiffLineKind::Context,
+                            line_number: new_line,
+                            content: line.content.clone(),
+                        }),
+                    });
+                    old_line += 1;
+                    new_line += 1;
+                }
+                DiffLineKind::Remove => {
+                    removes.push(SplitCell {
+                        kind: DiffLineKind::Remove,
+                        line_number: old_line,
+                        content: line.content.clone(),
+                    });
+                    old_line += 1;
+                }
+                DiffLineKind::Add => {
+                    adds.push(SplitCell {
+                        kind: DiffLineKind::Add,
+                        line_number: new_line,
+                        content: line.content.clone(),
+                    });
+                    new_line += 1;
+                }
+            }
+        }
+        flush_change_block(&mut rows, &mut removes, &mut adds);
+    }
+    rows
+}
+
+/// One coalesced run of a changed line's content, tagged with whether it
+/// differs from the paired line ([`word_emphasis`]). Adjacent tokens of the
+/// same `emphasized` state are merged into a single span so a line renders as a
+/// handful of elements, not one per token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EmphasisSpan {
+    text: String,
+    emphasized: bool,
+}
+
+/// Product-of-token-counts ceiling above which [`word_emphasis`] skips the LCS
+/// and falls back to a single un-emphasized span per side — a guard against a
+/// pathological minified line making the per-frame DP expensive. The row tint
+/// still conveys add/remove; only the intra-line highlight is dropped.
+const MAX_EMPHASIS_TOKENS: usize = 512;
+
+/// The character class a token coalesces on: word runs and whitespace runs each
+/// collapse into one token; every other character is its own token, giving
+/// word-level granularity for code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CharClass {
+    Word,
+    Space,
+    Other,
+}
+
+fn char_class(c: char) -> CharClass {
+    if c.is_alphanumeric() || c == '_' {
+        CharClass::Word
+    } else if c.is_whitespace() {
+        CharClass::Space
+    } else {
+        CharClass::Other
+    }
+}
+
+/// Split a line into word/whitespace/other tokens for the word-level LCS.
+/// Consecutive word characters and consecutive whitespace each form one token;
+/// every other character stands alone.
+fn tokenize(s: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut class: Option<CharClass> = None;
+    for (i, c) in s.char_indices() {
+        let this = char_class(c);
+        let extends = matches!(
+            (class, this),
+            (Some(CharClass::Word), CharClass::Word) | (Some(CharClass::Space), CharClass::Space)
+        );
+        if extends {
+            continue;
+        }
+        if let Some(start) = start {
+            tokens.push(&s[start..i]);
+        }
+        start = Some(i);
+        class = Some(this);
+    }
+    if let Some(start) = start {
+        tokens.push(&s[start..]);
+    }
+    tokens
+}
+
+/// Append `text` to `spans`, merging into the previous span when it carries the
+/// same `emphasized` state so runs stay coalesced.
+fn push_span(spans: &mut Vec<EmphasisSpan>, text: &str, emphasized: bool) {
+    if let Some(last) = spans.last_mut() {
+        if last.emphasized == emphasized {
+            last.text.push_str(text);
+            return;
+        }
+    }
+    spans.push(EmphasisSpan {
+        text: text.to_owned(),
+        emphasized,
+    });
+}
+
+/// Word-level intra-line emphasis for a `(removed, added)` line pair: a
+/// token-level longest-common-subsequence marks the tokens unique to the old
+/// side (emphasized in the removed line) and unique to the new side (emphasized
+/// in the added line); shared tokens render plain. Returns `(old_spans,
+/// new_spans)`. Pure and GPUI-free so it is unit-testable headless. Falls back
+/// to a single un-emphasized span per side when either side is empty or the
+/// token product exceeds [`MAX_EMPHASIS_TOKENS`].
+fn word_emphasis(old: &str, new: &str) -> (Vec<EmphasisSpan>, Vec<EmphasisSpan>) {
+    let old_tokens = tokenize(old);
+    let new_tokens = tokenize(new);
+    let n = old_tokens.len();
+    let m = new_tokens.len();
+
+    let plain = || {
+        let old_spans = if old.is_empty() {
+            Vec::new()
+        } else {
+            vec![EmphasisSpan {
+                text: old.to_owned(),
+                emphasized: false,
+            }]
+        };
+        let new_spans = if new.is_empty() {
+            Vec::new()
+        } else {
+            vec![EmphasisSpan {
+                text: new.to_owned(),
+                emphasized: false,
+            }]
+        };
+        (old_spans, new_spans)
+    };
+
+    if n == 0 || m == 0 || n.saturating_mul(m) > MAX_EMPHASIS_TOKENS {
+        return plain();
+    }
+
+    // LCS length DP, filled bottom-up on a flat (n+1)x(m+1) grid.
+    let stride = m + 1;
+    let mut dp = vec![0u16; (n + 1) * stride];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            let cell = if old_tokens[i] == new_tokens[j] {
+                dp[(i + 1) * stride + (j + 1)] + 1
+            } else {
+                dp[(i + 1) * stride + j].max(dp[i * stride + (j + 1)])
+            };
+            dp[i * stride + j] = cell;
+        }
+    }
+
+    let mut old_spans = Vec::new();
+    let mut new_spans = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if old_tokens[i] == new_tokens[j] {
+            push_span(&mut old_spans, old_tokens[i], false);
+            push_span(&mut new_spans, new_tokens[j], false);
+            i += 1;
+            j += 1;
+        } else if dp[(i + 1) * stride + j] >= dp[i * stride + (j + 1)] {
+            push_span(&mut old_spans, old_tokens[i], true);
+            i += 1;
+        } else {
+            push_span(&mut new_spans, new_tokens[j], true);
+            j += 1;
+        }
+    }
+    while i < n {
+        push_span(&mut old_spans, old_tokens[i], true);
+        i += 1;
+    }
+    while j < m {
+        push_span(&mut new_spans, new_tokens[j], true);
+        j += 1;
+    }
+    (old_spans, new_spans)
+}
+
 /// The diff view's current display state for the open path. `Empty` (no file
 /// selected yet) and `Loading` (request sent, reply not yet in) render a
 /// placeholder identically to the sentinels — never a partial/garbled render.
@@ -202,6 +487,10 @@ enum DiffViewState {
     Loading,
     Hunks {
         rows: Vec<DiffRow>,
+        /// The same hunks flattened for the side-by-side split renderer (#548),
+        /// derived once alongside `rows` — the active `view_mode` selects which
+        /// of the two the virtual list walks.
+        split_rows: Vec<SplitRow>,
         /// One summary per hunk, in the same order as their
         /// [`DiffRow::HunkHeader`]s — feeds the header's `+n -m` total and
         /// mini hunk squares (#547).
@@ -218,8 +507,13 @@ impl DiffViewState {
     fn from_payload(payload: FileDiffPayload) -> Self {
         match payload {
             FileDiffPayload::Hunks { hunks } => {
+                let split_rows = flatten_split_rows(&hunks);
                 let (rows, hunks) = flatten_hunks(hunks);
-                Self::Hunks { rows, hunks }
+                Self::Hunks {
+                    rows,
+                    split_rows,
+                    hunks,
+                }
             }
             FileDiffPayload::Binary => Self::Binary,
             FileDiffPayload::TooLarge => Self::TooLarge,
@@ -439,11 +733,52 @@ impl DiffView {
             .into_any_element()
     }
 
-    /// Render one row: a hunk's `@@ ... @@` header (with its `+ Stage hunk`
-    /// ghost button, #547), or one line with its old/new line numbers, a
-    /// +/-/space marker, and add/remove/context styling from theme tokens
-    /// (`success`/`danger`, mirroring the file tree's git-status decoration —
-    /// no diff-specific tokens invented).
+    /// Render a hunk's `@@ ... @@` header row with its `+ Stage hunk` ghost
+    /// button (#547). Shared by the unified ([`Self::render_row`]) and split
+    /// ([`Self::render_split_row`]) views — the header spans the full width in
+    /// both, so a hunk is stageable regardless of the active mode.
+    fn render_hunk_header(
+        hunk_id: u64,
+        old_start: u32,
+        old_len: u32,
+        new_start: u32,
+        new_len: u32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .h(ROW_HEIGHT)
+            .items_center()
+            .justify_between()
+            .px(px(8.0))
+            .bg(cx.theme().muted)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .child(format!(
+                        "@@ -{old_start},{old_len} +{new_start},{new_len} @@"
+                    )),
+            )
+            .child(
+                Button::new(SharedString::from(format!("diff-stage-hunk-{hunk_id}")))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Plus)
+                    .label("Stage hunk")
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        cx.stop_propagation();
+                        this.stage_hunk(hunk_id);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// Render one unified row: a hunk header ([`Self::render_hunk_header`]) or
+    /// one line with its old/new line numbers, a +/-/space marker, and add/
+    /// remove/context styling from theme tokens (`success`/`danger`, mirroring
+    /// the file tree's git-status decoration — no diff-specific tokens
+    /// invented).
     fn render_row(row: &DiffRow, cx: &mut Context<Self>) -> AnyElement {
         match row {
             DiffRow::HunkHeader {
@@ -452,36 +787,7 @@ impl DiffView {
                 old_len,
                 new_start,
                 new_len,
-            } => {
-                let hunk_id = *hunk_id;
-                h_flex()
-                    .h(ROW_HEIGHT)
-                    .items_center()
-                    .justify_between()
-                    .px(px(8.0))
-                    .bg(cx.theme().muted)
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .child(format!(
-                                "@@ -{old_start},{old_len} +{new_start},{new_len} @@"
-                            )),
-                    )
-                    .child(
-                        Button::new(SharedString::from(format!("diff-stage-hunk-{hunk_id}")))
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Plus)
-                            .label("Stage hunk")
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                cx.stop_propagation();
-                                this.stage_hunk(hunk_id);
-                            })),
-                    )
-                    .into_any_element()
-            }
+            } => Self::render_hunk_header(*hunk_id, *old_start, *old_len, *new_start, *new_len, cx),
             DiffRow::Line {
                 kind,
                 old_line,
@@ -536,6 +842,137 @@ impl DiffView {
                     .into_any_element()
             }
         }
+    }
+
+    /// Render one split row: a full-width hunk header, or a pair of side-by-
+    /// side cells. A `(Remove, Add)` pair gets word-level emphasis
+    /// ([`word_emphasis`]) computed here — visible rows only, so no full re-diff
+    /// per scroll frame; every other pairing (context, or a change block's
+    /// filler side) renders plain.
+    fn render_split_row(row: &SplitRow, cx: &mut Context<Self>) -> AnyElement {
+        match row {
+            SplitRow::HunkHeader {
+                hunk_id,
+                old_start,
+                old_len,
+                new_start,
+                new_len,
+            } => Self::render_hunk_header(*hunk_id, *old_start, *old_len, *new_start, *new_len, cx),
+            SplitRow::Pair { left, right } => {
+                let (left_spans, right_spans) = match (left, right) {
+                    (Some(l), Some(r))
+                        if l.kind == DiffLineKind::Remove && r.kind == DiffLineKind::Add =>
+                    {
+                        let (ls, rs) = word_emphasis(&l.content, &r.content);
+                        (Some(ls), Some(rs))
+                    }
+                    _ => (None, None),
+                };
+                div()
+                    .h(ROW_HEIGHT)
+                    .flex()
+                    .child(Self::render_split_side(
+                        left.as_ref(),
+                        left_spans,
+                        false,
+                        cx,
+                    ))
+                    .child(Self::render_split_side(
+                        right.as_ref(),
+                        right_spans,
+                        true,
+                        cx,
+                    ))
+                    .into_any_element()
+            }
+        }
+    }
+
+    /// Render one side of a split row: a hatched filler when `cell` is `None`,
+    /// otherwise a tinted line with its own line-number gutter, a +/-/space
+    /// marker, and either coalesced emphasis spans (when `spans` is `Some`) or
+    /// plain truncated content. `is_new` (the right/worktree column) draws the
+    /// vertical divider between the two columns.
+    fn render_split_side(
+        cell: Option<&SplitCell>,
+        spans: Option<Vec<EmphasisSpan>>,
+        is_new: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut side = div().flex_1().min_w_0().h_full();
+        if is_new {
+            side = side.border_l_1().border_color(cx.theme().border);
+        }
+
+        let Some(cell) = cell else {
+            // Filler: a faint hatch marks "no line on this side" (#548).
+            return side
+                .bg(pattern_slash(
+                    cx.theme().muted_foreground.opacity(0.12),
+                    4.0,
+                    4.0,
+                ))
+                .into_any_element();
+        };
+
+        let (bg, marker, emph_bg): (Hsla, &str, Hsla) = match cell.kind {
+            DiffLineKind::Add => (
+                cx.theme().success.opacity(0.14),
+                "+",
+                cx.theme().success.opacity(0.30),
+            ),
+            DiffLineKind::Remove => (
+                cx.theme().danger.opacity(0.14),
+                "-",
+                cx.theme().danger.opacity(0.30),
+            ),
+            DiffLineKind::Context => (cx.theme().background, " ", cx.theme().background),
+        };
+
+        let content = match spans {
+            Some(spans) => h_flex()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .children(spans.into_iter().map(|span| {
+                    let mut el = div().flex_none().child(span.text);
+                    if span.emphasized {
+                        el = el.bg(emph_bg).rounded(px(2.0));
+                    }
+                    el
+                }))
+                .into_any_element(),
+            None => div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .child(cell.content.clone())
+                .into_any_element(),
+        };
+
+        side.flex()
+            .items_center()
+            .bg(bg)
+            .font_family(cx.theme().mono_font_family.clone())
+            .text_xs()
+            .text_color(cx.theme().foreground)
+            .child(
+                div()
+                    .w(LINE_NUMBER_WIDTH)
+                    .flex_shrink_0()
+                    .px(px(4.0))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(cell.line_number.to_string()),
+            )
+            .child(
+                div()
+                    .w(px(14.0))
+                    .flex_shrink_0()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(marker),
+            )
+            .child(content)
+            .into_any_element()
     }
 
     /// The fixed header above the scrollable diff (#547, §4): the open
@@ -686,7 +1123,7 @@ impl Render for DiffView {
             return Self::placeholder("Select a changed file to view its diff", cx);
         };
 
-        let (rows, hunks) = match &self.state {
+        let (rows, split_rows, hunks) = match &self.state {
             DiffViewState::Empty => {
                 return Self::placeholder("Select a changed file to view its diff", cx)
             }
@@ -696,11 +1133,21 @@ impl Render for DiffView {
             DiffViewState::Hunks { rows, .. } if rows.is_empty() => {
                 return Self::placeholder("No changes", cx)
             }
-            DiffViewState::Hunks { rows, hunks } => (rows, hunks),
+            DiffViewState::Hunks {
+                rows,
+                split_rows,
+                hunks,
+            } => (rows, split_rows, hunks),
         };
 
+        let use_split = self.view_mode == DiffViewMode::Split;
+        let row_count = if use_split {
+            split_rows.len()
+        } else {
+            rows.len()
+        };
         let item_sizes: Rc<Vec<Size<Pixels>>> = Rc::new(
-            rows.iter()
+            (0..row_count)
                 .map(|_| Size::new(px(0.0), ROW_HEIGHT))
                 .collect(),
         );
@@ -718,12 +1165,27 @@ impl Render for DiffView {
                         "diff-view-list",
                         item_sizes,
                         move |this, visible_range, _window, cx| {
-                            let DiffViewState::Hunks { rows, .. } = &this.state else {
+                            let DiffViewState::Hunks {
+                                rows, split_rows, ..
+                            } = &this.state
+                            else {
                                 return Vec::new();
                             };
-                            visible_range
-                                .filter_map(|ix| rows.get(ix).map(|row| Self::render_row(row, cx)))
-                                .collect::<Vec<_>>()
+                            if use_split {
+                                visible_range
+                                    .filter_map(|ix| {
+                                        split_rows
+                                            .get(ix)
+                                            .map(|row| Self::render_split_row(row, cx))
+                                    })
+                                    .collect::<Vec<_>>()
+                            } else {
+                                visible_range
+                                    .filter_map(|ix| {
+                                        rows.get(ix).map(|row| Self::render_row(row, cx))
+                                    })
+                                    .collect::<Vec<_>>()
+                            }
                         },
                     )
                     .track_scroll(&self.scroll_handle),
@@ -930,6 +1392,263 @@ mod tests {
         assert_ne!(summaries_a[0].hunk_id, summaries_b[0].hunk_id);
     }
 
+    // --- flatten_split_rows (#548) ---
+
+    #[test]
+    fn test_flatten_split_context_line_pairs_both_sides() {
+        let hunk = DiffHunk {
+            old_start: 1,
+            old_len: 1,
+            new_start: 1,
+            new_len: 1,
+            lines: vec![line(DiffLineKind::Context, "a1")],
+        };
+        let rows = flatten_split_rows(&[hunk]);
+        assert_eq!(rows.len(), 2, "one header + one context pair");
+        assert_eq!(
+            rows[1],
+            SplitRow::Pair {
+                left: Some(SplitCell {
+                    kind: DiffLineKind::Context,
+                    line_number: 1,
+                    content: "a1".into(),
+                }),
+                right: Some(SplitCell {
+                    kind: DiffLineKind::Context,
+                    line_number: 1,
+                    content: "a1".into(),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn test_flatten_split_replacement_pairs_remove_with_add() {
+        // a1 / (a2 -> b2) / a3 — the removed and added line land on the same row,
+        // left and right, so the split view shows them opposite each other.
+        let hunk = DiffHunk {
+            old_start: 1,
+            old_len: 3,
+            new_start: 1,
+            new_len: 3,
+            lines: vec![
+                line(DiffLineKind::Context, "a1"),
+                line(DiffLineKind::Remove, "a2"),
+                line(DiffLineKind::Add, "b2"),
+                line(DiffLineKind::Context, "a3"),
+            ],
+        };
+        let rows = flatten_split_rows(&[hunk]);
+        assert_eq!(rows.len(), 4, "header + ctx + change pair + ctx");
+        assert_eq!(
+            rows[2],
+            SplitRow::Pair {
+                left: Some(SplitCell {
+                    kind: DiffLineKind::Remove,
+                    line_number: 2,
+                    content: "a2".into(),
+                }),
+                right: Some(SplitCell {
+                    kind: DiffLineKind::Add,
+                    line_number: 2,
+                    content: "b2".into(),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn test_flatten_split_unequal_change_block_pads_shorter_side_with_filler() {
+        // Two removed lines, one added: the second removed line pairs with a
+        // filler (None) on the added side.
+        let hunk = DiffHunk {
+            old_start: 1,
+            old_len: 2,
+            new_start: 1,
+            new_len: 1,
+            lines: vec![
+                line(DiffLineKind::Remove, "r1"),
+                line(DiffLineKind::Remove, "r2"),
+                line(DiffLineKind::Add, "a1"),
+            ],
+        };
+        let rows = flatten_split_rows(&[hunk]);
+        assert_eq!(rows.len(), 3, "header + two paired rows");
+        assert_eq!(
+            rows[1],
+            SplitRow::Pair {
+                left: Some(SplitCell {
+                    kind: DiffLineKind::Remove,
+                    line_number: 1,
+                    content: "r1".into(),
+                }),
+                right: Some(SplitCell {
+                    kind: DiffLineKind::Add,
+                    line_number: 1,
+                    content: "a1".into(),
+                }),
+            }
+        );
+        assert_eq!(
+            rows[2],
+            SplitRow::Pair {
+                left: Some(SplitCell {
+                    kind: DiffLineKind::Remove,
+                    line_number: 2,
+                    content: "r2".into(),
+                }),
+                right: None,
+            },
+            "the surplus removed line pairs with a filler"
+        );
+    }
+
+    #[test]
+    fn test_flatten_split_pure_addition_fillers_the_old_side() {
+        let hunk = DiffHunk {
+            old_start: 0,
+            old_len: 0,
+            new_start: 1,
+            new_len: 2,
+            lines: vec![
+                line(DiffLineKind::Add, "new1"),
+                line(DiffLineKind::Add, "new2"),
+            ],
+        };
+        let rows = flatten_split_rows(&[hunk]);
+        assert_eq!(rows.len(), 3);
+        for (row, expected) in rows[1..].iter().zip([("new1", 1u32), ("new2", 2u32)]) {
+            assert_eq!(
+                row,
+                &SplitRow::Pair {
+                    left: None,
+                    right: Some(SplitCell {
+                        kind: DiffLineKind::Add,
+                        line_number: expected.1,
+                        content: expected.0.into(),
+                    }),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn test_flatten_split_pure_deletion_fillers_the_new_side() {
+        let hunk = DiffHunk {
+            old_start: 1,
+            old_len: 2,
+            new_start: 0,
+            new_len: 0,
+            lines: vec![
+                line(DiffLineKind::Remove, "d1"),
+                line(DiffLineKind::Remove, "d2"),
+            ],
+        };
+        let rows = flatten_split_rows(&[hunk]);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[1],
+            SplitRow::Pair {
+                left: Some(SplitCell {
+                    kind: DiffLineKind::Remove,
+                    line_number: 1,
+                    content: "d1".into(),
+                }),
+                right: None,
+            }
+        );
+    }
+
+    // --- tokenize / word_emphasis (#548) ---
+
+    fn reconstruct(spans: &[EmphasisSpan]) -> String {
+        spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    fn emphasized_text(spans: &[EmphasisSpan]) -> String {
+        spans
+            .iter()
+            .filter(|s| s.emphasized)
+            .map(|s| s.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn test_tokenize_splits_words_whitespace_and_punctuation() {
+        assert_eq!(
+            tokenize("foo bar_baz(x)"),
+            vec!["foo", " ", "bar_baz", "(", "x", ")"]
+        );
+    }
+
+    #[test]
+    fn test_tokenize_empty_string_yields_no_tokens() {
+        assert!(tokenize("").is_empty());
+    }
+
+    #[test]
+    fn test_word_emphasis_identical_lines_have_no_emphasis() {
+        let (old, new) = word_emphasis("let x = 1;", "let x = 1;");
+        assert_eq!(emphasized_text(&old), "");
+        assert_eq!(emphasized_text(&new), "");
+        assert_eq!(reconstruct(&old), "let x = 1;");
+        assert_eq!(reconstruct(&new), "let x = 1;");
+    }
+
+    #[test]
+    fn test_word_emphasis_single_changed_word_emphasizes_only_that_token() {
+        let (old, new) = word_emphasis("let x = 1;", "let y = 1;");
+        assert_eq!(emphasized_text(&old), "x", "only the old token differs");
+        assert_eq!(emphasized_text(&new), "y", "only the new token differs");
+        assert_eq!(reconstruct(&old), "let x = 1;");
+        assert_eq!(reconstruct(&new), "let y = 1;");
+    }
+
+    #[test]
+    fn test_word_emphasis_pure_insertion_emphasizes_only_the_new_tokens() {
+        let (old, new) = word_emphasis("foo", "foo bar");
+        assert_eq!(emphasized_text(&old), "");
+        assert_eq!(emphasized_text(&new), " bar");
+        assert_eq!(reconstruct(&new), "foo bar");
+    }
+
+    #[test]
+    fn test_word_emphasis_empty_old_falls_back_to_plain_new() {
+        let (old, new) = word_emphasis("", "added");
+        assert!(old.is_empty(), "an empty side has no spans");
+        assert_eq!(
+            new,
+            vec![EmphasisSpan {
+                text: "added".into(),
+                emphasized: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_word_emphasis_over_token_cap_falls_back_to_plain() {
+        // Far past MAX_EMPHASIS_TOKENS: the two sides are wholly different, yet
+        // the guard returns one un-emphasized span per side instead of running
+        // the DP.
+        let old: String = (0..30).map(|i| format!("w{i} ")).collect();
+        let new: String = (0..30).map(|i| format!("v{i} ")).collect();
+        let (old_spans, new_spans) = word_emphasis(&old, &new);
+        assert_eq!(
+            old_spans,
+            vec![EmphasisSpan {
+                text: old.clone(),
+                emphasized: false,
+            }]
+        );
+        assert_eq!(
+            new_spans,
+            vec![EmphasisSpan {
+                text: new.clone(),
+                emphasized: false,
+            }]
+        );
+    }
+
     // --- DiffViewState::from_payload ---
 
     #[test]
@@ -944,9 +1663,15 @@ mod tests {
             }],
         };
         match DiffViewState::from_payload(payload) {
-            DiffViewState::Hunks { rows, hunks } => {
+            DiffViewState::Hunks {
+                rows,
+                split_rows,
+                hunks,
+            } => {
                 assert_eq!(rows.len(), 2);
                 assert_eq!(hunks.len(), 1);
+                // One header + one context line, paired on both sides.
+                assert_eq!(split_rows.len(), 2);
             }
             other => panic!("expected Hunks state, got {other:?}"),
         }
@@ -957,9 +1682,14 @@ mod tests {
         // Empty `hunks` means "identical to HEAD", not a sentinel — the render
         // path shows "No changes" for this, distinct from binary/too-large.
         match DiffViewState::from_payload(FileDiffPayload::Hunks { hunks: vec![] }) {
-            DiffViewState::Hunks { rows, hunks } => {
+            DiffViewState::Hunks {
+                rows,
+                split_rows,
+                hunks,
+            } => {
                 assert!(rows.is_empty());
                 assert!(hunks.is_empty());
+                assert!(split_rows.is_empty());
             }
             other => panic!("expected an empty Hunks state, got {other:?}"),
         }
