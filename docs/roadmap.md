@@ -24,13 +24,13 @@
 | 5 | LSP navigation (hover / go-to-definition / references) | [spec-lsp-navigation.md](spec-lsp-navigation.md) | [LSP navigation](https://github.com/skrischer/rift/milestone/15) |
 | 6 | Terminal streaming (VTE-location spike first) | [archive/spec-terminal-streaming.md](archive/spec-terminal-streaming.md) | [Terminal streaming](https://github.com/skrischer/rift/milestone/16) |
 | 7 | tmux key-table mirroring | [spec-tmux-keytable-mirroring.md](spec-tmux-keytable-mirroring.md) | [Key-table mirroring](https://github.com/skrischer/rift/milestone/17) |
-| 8 | tmux status-line mirroring | [spec-tmux-statusline-mirroring.md](spec-tmux-statusline-mirroring.md) | [Status-line mirroring](https://github.com/skrischer/rift/milestone/18) |
+| 8 | tmux status-line mirroring | [archive/spec-tmux-statusline-mirroring.md](archive/spec-tmux-statusline-mirroring.md) | [Status-line mirroring](https://github.com/skrischer/rift/milestone/18) |
 | 9 | Window-state persistence | [spec-window-state-persistence.md](spec-window-state-persistence.md) | [Window-state persistence](https://github.com/skrischer/rift/milestone/19) |
 | 10 | IDE shell — dock + resizable panels | [spec-ide-shell.md](spec-ide-shell.md) | [Phase 100](https://github.com/skrischer/rift/milestone/24) |
 | 11 | Explorer panel — decoration, reveal, keyboard nav | [spec-explorer-panel.md](spec-explorer-panel.md) | [Phase 110](https://github.com/skrischer/rift/milestone/25) |
 | 12 | Source-control panel + visual diff | [spec-source-control.md](spec-source-control.md) | [Phase 120](https://github.com/skrischer/rift/milestone/26) |
 | 13 | Problems panel — project-wide diagnostics | [spec-problems-panel.md](spec-problems-panel.md) | [Phase 130](https://github.com/skrischer/rift/milestone/27) |
-| 14 | Status bar — branch, ahead/behind, diagnostic counts | [spec-status-bar.md](spec-status-bar.md) | [Phase 140](https://github.com/skrischer/rift/milestone/28) |
+| 14 | Status bar — branch, ahead/behind, diagnostic counts | [archive/spec-status-bar.md](archive/spec-status-bar.md) | [Phase 140](https://github.com/skrischer/rift/milestone/28) |
 | 15 | Editor tabs — multiple open files | [spec-editor-tabs.md](spec-editor-tabs.md) | [Phase 150](https://github.com/skrischer/rift/milestone/29) |
 | 16 | Command palette | [spec-command-palette.md](spec-command-palette.md) | [Phase 160](https://github.com/skrischer/rift/milestone/30) |
 | 17 | Theme & settings | [spec-theme-settings.md](spec-theme-settings.md) | [Phase 170](https://github.com/skrischer/rift/milestone/31) |
