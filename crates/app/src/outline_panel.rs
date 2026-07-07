@@ -623,9 +623,14 @@ mod tests {
             .update(cx, |_, window, cx| {
                 editor.update(cx, |editor, cx| {
                     editor.begin_open(path.to_owned(), false, window, cx);
+                    // 60 blank lines: `set_cursor_position` clamps to the
+                    // last valid line, so a single-line buffer would silently
+                    // clamp every test cursor move here back to line 0 —
+                    // wide enough content lets the fixture symbol ranges
+                    // (well under line 60) exercise real line numbers.
                     editor.load(
                         path.to_owned(),
-                        "fn main() {}".to_owned(),
+                        "\n".repeat(60),
                         SystemTime::now(),
                         window,
                         cx,

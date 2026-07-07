@@ -1738,12 +1738,30 @@ mod tests {
     fn test_toggle_outline_adds_and_removes_the_outline_tab_and_opens_the_dock(
         cx: &mut TestAppContext,
     ) {
+        // `DockItem::Tabs { items, .. }` is a construction-time snapshot: only
+        // `DockItem::add_panel` (`&mut self`) keeps it in sync, while
+        // `DockItem::remove_panel` (`&self`) mutates just the live
+        // `TabPanel.panels` it delegates to — so `items` is reliable right
+        // after an add but stale after a remove. `left_tab_names` (add) and
+        // `left_active_tab_name` (remove, via the live `TabPanel`) are each
+        // used only where they are accurate.
         fn left_tab_names(dock_area: &Entity<DockArea>, cx: &App) -> Vec<&'static str> {
             let left = dock_area.read(cx).left_dock().expect("left dock exists");
             match left.read(cx).panel() {
                 DockItem::Tabs { items, .. } => {
                     items.iter().map(|item| item.panel_name(cx)).collect()
                 }
+                other => panic!("expected the left dock to hold tabs, got {other:?}"),
+            }
+        }
+
+        fn left_active_tab_name(dock_area: &Entity<DockArea>, cx: &App) -> Option<&'static str> {
+            let left = dock_area.read(cx).left_dock().expect("left dock exists");
+            match left.read(cx).panel() {
+                DockItem::Tabs { view, .. } => view
+                    .read(cx)
+                    .active_panel(cx)
+                    .map(|panel| panel.panel_name(cx)),
                 other => panic!("expected the left dock to hold tabs, got {other:?}"),
             }
         }
@@ -1795,14 +1813,19 @@ mod tests {
                     ],
                     "ToggleOutline adds the outline panel beside the explorer"
                 );
+                assert_eq!(
+                    left_active_tab_name(&dock_area, cx),
+                    Some(crate::outline_panel::OUTLINE_PANEL_NAME),
+                    "adding the outline panel activates its tab"
+                );
 
                 workspace.update(cx, |view, cx| {
                     view.toggle_outline(window, cx);
                 });
                 assert_eq!(
-                    left_tab_names(&dock_area, cx),
-                    vec![crate::file_tree::FILE_TREE_PANEL_NAME],
-                    "a second ToggleOutline removes the outline panel again"
+                    left_active_tab_name(&dock_area, cx),
+                    Some(crate::file_tree::FILE_TREE_PANEL_NAME),
+                    "a second ToggleOutline removes the outline panel, leaving the explorer active"
                 );
             })
             .unwrap();
