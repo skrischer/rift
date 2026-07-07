@@ -380,9 +380,10 @@ impl Attach {
             // terminal message; its daemon-side handler lands in a follow-on
             // issue — until then it is silently dropped here too.
             // The source-control write ops (stage/unstage/discard/commit/
-            // stage-hunk, #543) are not terminal messages either; their
-            // `gix`-backed handlers land in follow-on issues (#544, #545) —
-            // silently dropped here in the meantime, same convention.
+            // stage-hunk) are not terminal messages either: the file-level ops
+            // are answered per connection by `git_write::reply` (#544) and hunk
+            // staging is parked on the shared loop (#545) — neither reaches the
+            // terminal task, so both are a defensive no-op here.
             ClientMessage::Input { .. }
             | ClientMessage::Attach { .. }
             | ClientMessage::OpenFile { .. }
