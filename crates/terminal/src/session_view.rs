@@ -27,10 +27,11 @@ pub const MIN_FONT_SIZE: f32 = 8.0;
 /// Upper bound of the whole-client font size (see [`MIN_FONT_SIZE`]).
 pub const MAX_FONT_SIZE: f32 = 40.0;
 const FONT_SIZE_STEP: f32 = 1.0;
-/// Width of the always-visible pane sidebar. The tmux client size no longer
-/// subtracts it: the client grid is derived from the pane area's measured
-/// bounds, which the sidebar (a flex sibling) is already outside of.
-const PANE_SIDEBAR_WIDTH: f32 = 160.0;
+/// Height of each pane's header row (type glyph, command title, cwd, running
+/// pill, split/zoom actions). Reserved from the reported tmux grid so stacked
+/// panes never clip their bottom rows (see [`max_vertical_pane_count`] and the
+/// #424 client-sizing invariant).
+const PANE_HEADER_HEIGHT: f32 = 32.0;
 /// Recurring re-render cadence that ages the per-pane output-recency fallback
 /// from busy back to free for the window-tab aggregate. Only the recency
 /// fallback needs it; OSC-133 and bell transitions stay event-driven (they
@@ -97,6 +98,12 @@ pub struct TerminalHandle {
 struct PaneEntry {
     entity: Entity<PaneView>,
     pty_tx: flume::Sender<Vec<u8>>,
+    /// Whether this pane is sitting at its shell (tmux's own
+    /// `#{==:#{pane_current_command},#{b:default-shell}}`, #510) — drives the
+    /// pane header's type glyph. Refreshed from every snapshot; defaults to
+    /// `false` (process glyph) when the flag is unavailable (the legacy tmux
+    /// path, which sends an empty map).
+    is_shell: bool,
     /// Keeps `SessionView`'s observation of this pane's activity alive for the
     /// pane's lifetime. A background pane's own `cx.notify()` re-renders only
     /// its own subtree, so the parent must observe it to refresh the tab-bar
@@ -171,7 +178,7 @@ fn resize_direction(horizontal: bool, delta_positive: bool) -> &'static str {
     }
 }
 
-/// tmux `split-window` command for the sidebar's split controls. The visual
+/// tmux `split-window` command for a pane header's split controls. The visual
 /// divider is inverted vs. tmux's naming: a side-by-side split (vertical `|`
 /// divider) is tmux `-h`; a stacked split (horizontal `-` divider) is `-v`.
 fn split_command(side_by_side: bool, pane: &str) -> String {
@@ -184,9 +191,60 @@ fn select_pane_command(pane: &str) -> String {
     format!("select-pane -t {}", pane)
 }
 
-/// tmux `kill-pane` command closing the given pane.
-fn kill_pane_command(pane: &str) -> String {
-    format!("kill-pane -t {}", pane)
+/// tmux `resize-pane -Z` command toggling the given pane's zoom (full-window)
+/// state — the pane header's zoom control.
+fn zoom_pane_command(pane: &str) -> String {
+    format!("resize-pane -Z -t {}", pane)
+}
+
+/// Rewrite a home-anchored absolute path to a `~`-relative one for display
+/// (`/home/<user>/x` or `/root/x` -> `~/x`), leaving any other path unchanged.
+/// Pure string math on the tmux-reported `pane_current_path` — no filesystem
+/// access and no remote `$HOME` lookup — so it stays agent-agnostic and
+/// unit-testable.
+fn home_relative(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("/root") {
+        if rest.is_empty() || rest.starts_with('/') {
+            return format!("~{rest}");
+        }
+    }
+    if let Some(rest) = path.strip_prefix("/home/") {
+        return match rest.find('/') {
+            Some(slash) => format!("~{}", &rest[slash..]),
+            None if !rest.is_empty() => "~".to_string(),
+            None => path.to_string(),
+        };
+    }
+    path.to_string()
+}
+
+/// The largest number of panes stacked vertically along any path through the
+/// layout tree — the count of pane headers that share a single column's height
+/// in the worst case. A vertical split (`horizontal == false`, rows stacked)
+/// sums its children; a horizontal split (columns side by side) takes the max;
+/// a leaf is one. Drives the header-row reservation in [`grid_size_for`] so no
+/// column clips its bottom rows (the #424 invariant). GPUI-free so the
+/// per-shape recursion is unit-testable.
+fn max_vertical_pane_count(node: &LayoutNode) -> usize {
+    match node {
+        LayoutNode::Pane(_) => 1,
+        LayoutNode::Split {
+            horizontal: true,
+            children,
+        } => children
+            .iter()
+            .map(|(_, child)| max_vertical_pane_count(child))
+            .max()
+            .unwrap_or(1),
+        LayoutNode::Split {
+            horizontal: false,
+            children,
+        } => children
+            .iter()
+            .map(|(_, child)| max_vertical_pane_count(child))
+            .sum::<usize>()
+            .max(1),
+    }
 }
 
 /// The SSH-outage danger banner's body line (design contract in
@@ -197,13 +255,18 @@ fn reconnect_banner_message(ssh_label: &str, retry: u32) -> String {
     format!("reconnecting to {ssh_label} — retry {retry}")
 }
 
-/// Whole-cell grid dimensions that fit the given pane-area bounds, clamped to
-/// at least 1x1 so a degenerate (collapsed) layout never reports a zero-sized
-/// tmux client. GPUI-free math so the floor/clamp behaviour is unit-testable.
-fn grid_size_for(area: Size<Pixels>, cell: Size<Pixels>) -> TermSize {
+/// Whole-cell grid dimensions that fit the given pane-area bounds after
+/// reserving `reserved_height` for the stacked pane headers, clamped to at
+/// least 1x1 so a degenerate (collapsed) layout never reports a zero-sized
+/// tmux client. Reserving the header rows before the floor is the #424 grid
+/// reconciliation: tmux then lays panes out in the rows that actually fit
+/// below their headers, so a stacked split never clips its bottom rows.
+/// GPUI-free math so the floor/clamp behaviour is unit-testable.
+fn grid_size_for(area: Size<Pixels>, cell: Size<Pixels>, reserved_height: Pixels) -> TermSize {
+    let usable_height = (area.height - reserved_height).max(px(0.0));
     TermSize {
         cols: ((area.width / cell.width).floor() as usize).max(1),
-        rows: ((area.height / cell.height).floor() as usize).max(1),
+        rows: ((usable_height / cell.height).floor() as usize).max(1),
     }
 }
 
@@ -844,8 +907,12 @@ impl SessionView {
             }
 
             for pane_state in &window.panes {
+                // Each pane's own shell flag (not just the window's active pane)
+                // feeds its header type glyph; absent from the map -> non-shell.
+                let pane_shell = pane_is_shell.get(&pane_state.id).copied().unwrap_or(false);
                 if self.panes.contains_key(&pane_state.id) {
-                    if let Some(entry) = self.panes.get(&pane_state.id) {
+                    if let Some(entry) = self.panes.get_mut(&pane_state.id) {
+                        entry.is_shell = pane_shell;
                         entry.entity.update(cx, |pv, cx| {
                             pv.set_tmux_size(pane_state.width, pane_state.height);
                             // Push the window-active flag into the pane's tracker
@@ -917,6 +984,7 @@ impl SessionView {
                         PaneEntry {
                             entity,
                             pty_tx,
+                            is_shell: pane_shell,
                             _activity_subscription: activity_subscription,
                         },
                     );
@@ -1123,13 +1191,18 @@ impl SessionView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match node {
-            LayoutNode::Pane(id) => {
-                if let Some(entry) = self.panes.get(id) {
-                    entry.entity.clone().into_any_element()
-                } else {
-                    div().flex_grow().into_any_element()
+            LayoutNode::Pane(id) => match self.panes.get(id) {
+                Some(entry) => {
+                    let pane = entry.entity.clone();
+                    let header = self.render_pane_header(id, cx);
+                    v_flex()
+                        .size_full()
+                        .child(header)
+                        .child(div().flex_1().min_h_0().child(pane))
+                        .into_any_element()
                 }
-            }
+                None => div().flex_grow().into_any_element(),
+            },
             LayoutNode::Split {
                 horizontal,
                 children,
@@ -1430,146 +1503,174 @@ impl SessionView {
             )
     }
 
-    /// The per-window pane sidebar: a fixed-width column listing the active
-    /// window's panes. A row click focuses its pane (`select-pane`), the row
-    /// `x` closes it (`kill-pane`), and the header splits the active pane
-    /// side-by-side (`|` -> `split-window -h`) or stacked (`-` ->
-    /// `split-window -v`). Every control only emits a tmux command; the next
+    /// The 32px header above each pane: type glyph (from tmux's own `is_shell`,
+    /// #510), the `pane_current_command` title (mono), a home-relative cwd
+    /// (muted mono), a "running" pill while the pane is busy — hidden when free
+    /// (attention is unreachable for a visible pane under the #428 gating) — and
+    /// split-h / split-v / zoom controls that each emit a tmux command over the
+    /// shared command seam. The bg lifts for the active pane; a click anywhere
+    /// on the header focuses the pane (`select-pane`), replacing the removed
+    /// sidebar's mouse pane-select. Every control only emits a command; the next
     /// snapshot redraws the result.
-    fn render_pane_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let bg = cx.theme().tab_bar;
-        let border = cx.theme().border;
+    fn render_pane_header(&self, pane_id: &str, cx: &mut Context<Self>) -> AnyElement {
+        let Some(entry) = self.panes.get(pane_id) else {
+            return div().into_any_element();
+        };
+        let pane = entry.entity.read(cx);
+        let command = pane.current_command().unwrap_or("").to_string();
+        let cwd = pane
+            .working_directory()
+            .map(home_relative)
+            .unwrap_or_default();
+        // The pill tracks the pane's own busy state; attention never surfaces on
+        // a visible pane (its window is active, so the tracker suppresses it).
+        let running = matches!(pane.activity(), PaneActivity::Busy);
+        let is_shell = entry.is_shell;
+        let is_active = self.active_pane_id.as_deref() == Some(pane_id);
+
+        let tab_bar = cx.theme().tab_bar;
         let active_bg = cx.theme().list_active;
         let fg = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
+        let border = cx.theme().border;
+        let success = cx.theme().success;
 
-        let active_pane = self.active_pane_id.as_deref();
-        let rows: Vec<(String, String, bool)> = self
-            .windows
-            .iter()
-            .find(|w| w.is_active)
-            .map(|w| w.pane_ids.as_slice())
-            .unwrap_or(&[])
-            .iter()
-            .map(|id| {
-                let label = self
-                    .panes
-                    .get(id)
-                    .and_then(|entry| entry.entity.read(cx).current_command().map(str::to_string))
-                    .filter(|cmd| !cmd.is_empty())
-                    .unwrap_or_else(|| id.clone());
-                let is_active = active_pane == Some(id.as_str());
-                (id.clone(), label, is_active)
-            })
-            .collect();
+        let header_bg = if is_active { active_bg } else { tab_bar };
+        // `pane_current_command` is normally populated; fall back to the pane id
+        // only so the title is never blank.
+        let title = if command.is_empty() {
+            pane_id.to_string()
+        } else {
+            command
+        };
+        let focus_target = pane_id.to_string();
 
-        // Visual "|" splits side-by-side (tmux `-h`); visual "-" stacks (tmux
-        // `-v`) -- the naming is inverted vs. the divider orientation.
-        let split_side = active_pane.map(|id| split_command(true, id));
-        let split_stack = active_pane.map(|id| split_command(false, id));
+        let info = h_flex()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .gap(px(8.0))
+            .child(Icon::new(type_glyph(is_shell)).size_3().text_color(muted))
+            .child(
+                div()
+                    .flex_none()
+                    .font_family("JetBrainsMono Nerd Font Mono")
+                    .text_size(px(13.0))
+                    .text_color(fg)
+                    .child(SharedString::from(title)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_family("JetBrainsMono Nerd Font Mono")
+                    .text_size(px(12.0))
+                    .text_color(muted)
+                    .child(SharedString::from(cwd)),
+            )
+            .children(running.then(|| {
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(div().size(px(7.0)).rounded_full().bg(success))
+                    .child(
+                        div()
+                            .font_family("JetBrainsMono Nerd Font Mono")
+                            .text_size(px(11.0))
+                            .text_color(muted)
+                            .child("running"),
+                    )
+            }));
 
-        let header = h_flex()
+        let actions = h_flex()
             .flex_none()
+            .items_center()
+            .gap(px(2.0))
+            .child(self.header_action(
+                IconName::PanelRight,
+                split_command(true, pane_id),
+                muted,
+                fg,
+                active_bg,
+                cx,
+            ))
+            .child(self.header_action(
+                IconName::PanelBottom,
+                split_command(false, pane_id),
+                muted,
+                fg,
+                active_bg,
+                cx,
+            ))
+            .child(self.header_action(
+                IconName::Maximize,
+                zoom_pane_command(pane_id),
+                muted,
+                fg,
+                active_bg,
+                cx,
+            ));
+
+        h_flex()
+            .flex_none()
+            .h(px(PANE_HEADER_HEIGHT))
             .w_full()
-            .gap(px(4.0))
+            .items_center()
+            .gap(px(8.0))
             .px(px(8.0))
-            .py(px(6.0))
+            .bg(header_bg)
             .border_b_1()
             .border_color(border)
-            .child(self.sidebar_button("|", split_side, fg, muted, active_bg, cx))
-            .child(self.sidebar_button("-", split_stack, fg, muted, active_bg, cx));
-
-        let mut list = v_flex().w_full().flex_1().min_h_0();
-        for (id, label, is_active) in rows {
-            let select_id = id.clone();
-            let row_bg = if is_active { active_bg } else { bg };
-            let row_fg = if is_active { fg } else { muted };
-            let row = h_flex()
-                .w_full()
-                .gap(px(6.0))
-                .px(px(8.0))
-                .py(px(4.0))
-                .bg(row_bg)
-                .text_color(row_fg)
-                .hover(|s| s.bg(active_bg).text_color(fg))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _event: &MouseDownEvent, _window, _cx| {
-                        if let Err(e) = this
-                            .tmux_command_tx
-                            .try_send(select_pane_command(&select_id))
-                        {
-                            debug!(error = %e, "failed to send select-pane command");
-                        }
-                    }),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .child(SharedString::from(label)),
-                )
-                .child(self.sidebar_button(
-                    "x",
-                    Some(kill_pane_command(&id)),
-                    fg,
-                    muted,
-                    active_bg,
-                    cx,
-                ));
-            list = list.child(row);
-        }
-
-        v_flex()
-            .flex_none()
-            .w(px(PANE_SIDEBAR_WIDTH))
-            .h_full()
-            .bg(bg)
-            .border_r_1()
-            .border_color(border)
-            .text_size(px(DEFAULT_FONT_SIZE))
-            .font_family("JetBrainsMono Nerd Font Mono")
-            .child(header)
-            .child(list)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _event: &MouseDownEvent, _window, _cx| {
+                    if let Err(e) = this
+                        .tmux_command_tx
+                        .try_send(select_pane_command(&focus_target))
+                    {
+                        debug!(error = %e, "failed to send select-pane command");
+                    }
+                }),
+            )
+            .child(info)
+            .child(actions)
             .into_any_element()
     }
 
-    /// A square glyph button for the pane sidebar. With a command it emits that
-    /// command on click and stops propagation so a parent row does not also act;
-    /// without one it renders dimmed and inert (no active pane to target).
-    fn sidebar_button(
+    /// A square icon button in a pane header. Emits its tmux command on click
+    /// and stops propagation so the header's own focus click does not also fire.
+    /// The icon inherits the button's text color, so it dims idle (`muted`) and
+    /// brightens to `hover_fg` on hover.
+    fn header_action(
         &self,
-        glyph: &'static str,
-        command: Option<String>,
-        fg: Hsla,
+        icon: IconName,
+        command: String,
         muted: Hsla,
+        hover_fg: Hsla,
         hover_bg: Hsla,
         cx: &mut Context<Self>,
     ) -> Div {
-        let button = div()
+        div()
             .flex()
             .flex_none()
             .items_center()
             .justify_center()
-            .size(px(20.0))
+            .size(px(22.0))
             .rounded(px(4.0))
-            .child(glyph);
-        match command {
-            Some(command) => button
-                .text_color(muted)
-                .hover(|s| s.bg(hover_bg).text_color(fg))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
-                        if let Err(e) = this.tmux_command_tx.try_send(command.clone()) {
-                            debug!(error = %e, command = %command, "failed to send sidebar command");
-                        }
-                        cx.stop_propagation();
-                    }),
-                ),
-            None => button.text_color(muted.opacity(0.4)),
-        }
+            .text_color(muted)
+            .hover(|s| s.bg(hover_bg).text_color(hover_fg))
+            .child(Icon::new(icon).size_3())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
+                    if let Err(e) = this.tmux_command_tx.try_send(command.clone()) {
+                        debug!(error = %e, command = %command, "failed to send pane-header command");
+                    }
+                    cx.stop_propagation();
+                }),
+            )
     }
 }
 
@@ -1893,10 +1994,11 @@ impl Render for SessionView {
         };
 
         // The tmux client is sized from the pane area's measured bounds — the
-        // flex slot next to the sidebar, below the tab bar, above the statusbar —
-        // never from the window viewport: with the editor split open, the
-        // terminal panel only gets a slice of the window, and a viewport-derived
-        // grid would overshoot and clip/mis-wrap every pane (#424). The canvas
+        // flex slot below the tab bar and above the statusbar, minus the stacked
+        // pane headers — never from the window viewport: with the editor split
+        // open, the terminal panel only gets a slice of the window, and a
+        // viewport-derived grid would overshoot and clip/mis-wrap every pane
+        // (#424). The canvas
         // overlays the pane area (absolute, zero layout impact) and its prepaint
         // sees the post-layout bounds each frame, so a dock-splitter drag
         // re-sends the client resize as the panel geometry changes.
@@ -1904,7 +2006,16 @@ impl Render for SessionView {
         let grid_observer = canvas(
             move |bounds: Bounds<Pixels>, _window: &mut Window, cx: &mut App| {
                 entity.update(cx, |view: &mut Self, _cx| {
-                    let grid = grid_size_for(bounds.size, cell_size);
+                    // Reserve the stacked pane headers from the reported grid so
+                    // a vertical split never clips its bottom rows (#424): the
+                    // worst-case column loses one header per pane stacked in it.
+                    let header_rows = view
+                        .layout
+                        .as_ref()
+                        .map(max_vertical_pane_count)
+                        .unwrap_or(1);
+                    let reserved = px(PANE_HEADER_HEIGHT * header_rows as f32);
+                    let grid = grid_size_for(bounds.size, cell_size, reserved);
                     if grid != view.client_grid_size {
                         view.client_grid_size = grid;
                         let _ = view.size_changed_tx.try_send(grid);
@@ -2011,20 +2122,11 @@ impl Render for SessionView {
             .child(
                 div()
                     .flex()
-                    .flex_row()
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .child(self.render_pane_sidebar(cx))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .child(pane_area)
-                            .child(grid_observer),
-                    ),
+                    .child(pane_area)
+                    .child(grid_observer),
             )
             .child(statusbar);
 
@@ -2082,11 +2184,12 @@ impl Render for SessionView {
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_activity, grid_size_for, kill_pane_command, quote_tmux_name,
+        aggregate_activity, grid_size_for, home_relative, max_vertical_pane_count, quote_tmux_name,
         reconnect_banner_message, resize_direction, select_pane_command, split_command,
-        tab_state_slot, PaneActivity, SessionListItem, SessionView, TabStateSlot, TermSize,
-        TerminalHandle, DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE,
+        tab_state_slot, zoom_pane_command, PaneActivity, SessionListItem, SessionView,
+        TabStateSlot, TermSize, TerminalHandle, DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE,
     };
+    use crate::layout::LayoutNode;
     use gpui::{
         px, size, AnyWindowHandle, App, AppContext as _, Entity, SharedString, TestAppContext,
     };
@@ -2095,7 +2198,11 @@ mod tests {
     #[test]
     fn test_grid_size_for_exact_multiple_returns_full_grid() {
         assert_eq!(
-            grid_size_for(size(px(800.0), px(600.0)), size(px(10.0), px(20.0))),
+            grid_size_for(
+                size(px(800.0), px(600.0)),
+                size(px(10.0), px(20.0)),
+                px(0.0)
+            ),
             TermSize { cols: 80, rows: 30 }
         );
     }
@@ -2103,7 +2210,11 @@ mod tests {
     #[test]
     fn test_grid_size_for_partial_cells_floors_to_whole_cells() {
         assert_eq!(
-            grid_size_for(size(px(805.0), px(619.0)), size(px(10.0), px(20.0))),
+            grid_size_for(
+                size(px(805.0), px(619.0)),
+                size(px(10.0), px(20.0)),
+                px(0.0)
+            ),
             TermSize { cols: 80, rows: 30 }
         );
     }
@@ -2111,8 +2222,34 @@ mod tests {
     #[test]
     fn test_grid_size_for_collapsed_area_clamps_to_one_by_one() {
         assert_eq!(
-            grid_size_for(size(px(0.0), px(0.0)), size(px(10.0), px(20.0))),
+            grid_size_for(size(px(0.0), px(0.0)), size(px(10.0), px(20.0)), px(0.0)),
             TermSize { cols: 1, rows: 1 }
+        );
+    }
+
+    #[test]
+    fn test_grid_size_for_reserves_header_rows_before_flooring() {
+        // 600px tall at 20px cells is 30 rows without headers; reserving two
+        // 32px headers (64px) leaves 536px -> 26 rows. Columns are unaffected.
+        assert_eq!(
+            grid_size_for(
+                size(px(800.0), px(600.0)),
+                size(px(10.0), px(20.0)),
+                px(64.0)
+            ),
+            TermSize { cols: 80, rows: 26 }
+        );
+    }
+
+    #[test]
+    fn test_grid_size_for_reserve_exceeding_height_clamps_rows_to_one() {
+        assert_eq!(
+            grid_size_for(
+                size(px(800.0), px(40.0)),
+                size(px(10.0), px(20.0)),
+                px(64.0)
+            ),
+            TermSize { cols: 80, rows: 1 }
         );
     }
 
@@ -2159,8 +2296,81 @@ mod tests {
     }
 
     #[test]
-    fn test_kill_pane_command_targets_pane() {
-        assert_eq!(kill_pane_command("%7"), "kill-pane -t %7");
+    fn test_zoom_pane_command_targets_pane() {
+        assert_eq!(zoom_pane_command("%7"), "resize-pane -Z -t %7");
+    }
+
+    #[test]
+    fn test_home_relative_rewrites_home_prefix() {
+        assert_eq!(home_relative("/home/dev/proj"), "~/proj");
+        assert_eq!(home_relative("/home/dev/a/b"), "~/a/b");
+        assert_eq!(home_relative("/home/dev"), "~");
+    }
+
+    #[test]
+    fn test_home_relative_rewrites_root_prefix() {
+        assert_eq!(home_relative("/root"), "~");
+        assert_eq!(home_relative("/root/src"), "~/src");
+    }
+
+    #[test]
+    fn test_home_relative_leaves_other_paths_unchanged() {
+        assert_eq!(home_relative("/var/log"), "/var/log");
+        // A path that merely starts with the literal "/root" text is not home.
+        assert_eq!(home_relative("/rootfs/x"), "/rootfs/x");
+    }
+
+    #[test]
+    fn test_max_vertical_pane_count_single_pane_is_one() {
+        assert_eq!(max_vertical_pane_count(&LayoutNode::Pane("%0".into())), 1);
+    }
+
+    #[test]
+    fn test_max_vertical_pane_count_vertical_split_sums_children() {
+        // Two panes stacked -> two headers share the column height.
+        let node = LayoutNode::Split {
+            horizontal: false,
+            children: vec![
+                (0.5, LayoutNode::Pane("%0".into())),
+                (0.5, LayoutNode::Pane("%1".into())),
+            ],
+        };
+        assert_eq!(max_vertical_pane_count(&node), 2);
+    }
+
+    #[test]
+    fn test_max_vertical_pane_count_horizontal_split_takes_max() {
+        // Side-by-side columns -> one header per column height, not the sum.
+        let node = LayoutNode::Split {
+            horizontal: true,
+            children: vec![
+                (0.5, LayoutNode::Pane("%0".into())),
+                (0.5, LayoutNode::Pane("%1".into())),
+            ],
+        };
+        assert_eq!(max_vertical_pane_count(&node), 1);
+    }
+
+    #[test]
+    fn test_max_vertical_pane_count_row_over_pane_is_two() {
+        // | A | B |  over  C  -> each column stacks two headers.
+        let node = LayoutNode::Split {
+            horizontal: false,
+            children: vec![
+                (
+                    0.5,
+                    LayoutNode::Split {
+                        horizontal: true,
+                        children: vec![
+                            (0.5, LayoutNode::Pane("%0".into())),
+                            (0.5, LayoutNode::Pane("%1".into())),
+                        ],
+                    },
+                ),
+                (0.5, LayoutNode::Pane("%2".into())),
+            ],
+        };
+        assert_eq!(max_vertical_pane_count(&node), 2);
     }
 
     #[test]
