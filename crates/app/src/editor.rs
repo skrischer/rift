@@ -63,11 +63,15 @@
 //! The auto-reload keeps the tab's `InputState` entity and restores the
 //! pre-reload cursor once the fresh content lands ([`EditorTab::pending_restore`],
 //! #432), so watching an agent edit the open file does not yank the viewport
-//! to the top on every write. The conflict banner offers two working
-//! remedies (#433): "Reload from disk" discards the buffer's edits via the
-//! auto-reload path, and "Keep mine" force-saves the buffer rebased onto the
-//! on-disk `mtime` observed when the conflict surfaced
-//! ([`EditorTab::conflict_disk_mtime`]).
+//! to the top on every write. The conflict surfaces as a `gpui-component`
+//! `AlertDialog` on the active tab (`docs/spec-editor-chrome.md`, #532 —
+//! upgrading the #433 inline banner to the #420 confirm-dialog pattern) with
+//! the same two working remedies: "Reload from disk" (primary) discards the
+//! buffer's edits via the auto-reload path, and "Keep mine" (secondary)
+//! force-saves the buffer rebased onto the on-disk `mtime` observed when the
+//! conflict surfaced ([`EditorTab::conflict_disk_mtime`]). A background
+//! tab's conflict pops the same dialog once the user switches to it
+//! ([`EditorView::activate_tab`]).
 //!
 //! # Live-buffer feed (#189)
 //!
@@ -160,7 +164,7 @@ use gpui::{
     MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels, Point, Render, SharedString, Size,
     Styled as _, Subscription, Window,
 };
-use gpui_component::dialog::AlertDialog;
+use gpui_component::dialog::{AlertDialog, DialogButtonProps};
 use gpui_component::dock::{Panel, PanelEvent};
 use gpui_component::highlighter::{
     Diagnostic as EditorDiagnostic, DiagnosticSeverity as EditorSeverity,
@@ -1278,11 +1282,14 @@ impl EditorView {
     /// Apply a `SaveConflict` reply: the daemon refused the write. Routed to
     /// whichever tab holds `path`; a no-op if no tab holds it. `disk_mtime`
     /// (the current on-disk value the daemon reported) is recorded so the
-    /// banner's "Keep mine" remedy can rebase a forced save onto it (#433).
+    /// dialog's "Keep mine" remedy can rebase a forced save onto it (#433).
+    /// Opens the conflict dialog (#532) when the conflicted tab is the
+    /// active one.
     pub fn apply_save_conflict(
         &mut self,
         path: String,
         disk_mtime: SystemTime,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(index) = self.tab_index_for_path(&path) else {
@@ -1292,17 +1299,20 @@ impl EditorView {
         self.tabs[index].conflict_disk_mtime = Some(disk_mtime);
         self.tabs[index].save_generation = self.tabs[index].save_generation.wrapping_add(1);
         cx.notify();
+        if self.active == Some(index) {
+            self.open_conflict_dialog(window, cx);
+        }
     }
 
-    // ── Conflict remedies (#433) ──────────────────────────────────────────
+    // ── Conflict remedies (#433, dialog #532) ─────────────────────────────
 
     /// Resolve the active tab's conflict by re-reading the file from disk,
-    /// discarding the buffer's unsaved edits (banner action "Reload from
-    /// disk"). Reuses the auto-reload path: the input entity survives
-    /// (`rebuild_input: false`) and the cursor is restored once the fresh
-    /// content lands (#432). The live buffer reverts to disk-backed — the
-    /// discarded edits must not linger as the LSP's source of truth. A no-op
-    /// unless the active tab is in conflict.
+    /// discarding the buffer's unsaved edits (the conflict dialog's primary
+    /// "Reload from disk" action). Reuses the auto-reload path: the input
+    /// entity survives (`rebuild_input: false`) and the cursor is restored
+    /// once the fresh content lands (#432). The live buffer reverts to
+    /// disk-backed — the discarded edits must not linger as the LSP's
+    /// source of truth. A no-op unless the active tab is in conflict.
     fn reload_active_from_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.active else {
             return;
@@ -1321,13 +1331,13 @@ impl EditorView {
     }
 
     /// Resolve the active tab's conflict by force-saving the buffer over the
-    /// on-disk version (banner action "Keep mine"). Rebases the tab's base
-    /// `mtime` onto the on-disk `mtime` observed when the conflict surfaced,
-    /// so the daemon's stale-base check passes — an explicit user decision,
-    /// never a silent clobber: if the file changed on disk *again* since the
-    /// conflict was recorded, the daemon still refuses and the conflict
-    /// re-surfaces with the fresh `disk_mtime`. A no-op unless the active
-    /// tab is in conflict.
+    /// on-disk version (the conflict dialog's secondary "Keep mine" action).
+    /// Rebases the tab's base `mtime` onto the on-disk `mtime` observed when
+    /// the conflict surfaced, so the daemon's stale-base check passes — an
+    /// explicit user decision, never a silent clobber: if the file changed
+    /// on disk *again* since the conflict was recorded, the daemon still
+    /// refuses and the conflict re-surfaces with the fresh `disk_mtime`. A
+    /// no-op unless the active tab is in conflict.
     fn keep_mine_active(&mut self, cx: &mut Context<Self>) {
         let Some(index) = self.active else {
             return;
@@ -1339,6 +1349,61 @@ impl EditorView {
             self.tabs[index].base_mtime = Some(disk_mtime);
         }
         self.save(cx);
+    }
+
+    /// Open the file-changed-on-disk conflict dialog for the active tab
+    /// (`docs/spec-editor-chrome.md`, #532): a `gpui-component` `AlertDialog`
+    /// on the #420 confirm-dialog pattern, replacing the #433 inline banner.
+    /// The primary "Reload from disk" and secondary "Keep mine" buttons wire
+    /// to the same two remedies the banner offered
+    /// ([`reload_active_from_disk`]/[`keep_mine_active`]). Triggered wherever
+    /// the active tab's conflict is (re)armed —
+    /// [`note_external_change_for_path`], [`apply_save_conflict`], and
+    /// switching onto an already-conflicted tab via [`activate_tab`] — and a
+    /// no-op if a dialog is already showing (so a further external write
+    /// before the user answers does not stack a second one) or the active
+    /// tab is not actually in conflict.
+    fn open_conflict_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let Some(index) = self.active else {
+            return;
+        };
+        if !matches!(self.tabs[index].save_state, SaveState::Conflict) {
+            return;
+        }
+        let path = self.tabs[index].path.clone();
+        let name = path.rsplit('/').next().unwrap_or(&path).to_owned();
+        let entity = cx.entity();
+
+        window.open_alert_dialog(cx, move |alert: AlertDialog, _, _| {
+            let entity_ok = entity.clone();
+            let entity_cancel = entity.clone();
+            alert
+                .title("File changed on disk")
+                .description(SharedString::from(format!(
+                    "\"{name}\" was changed on disk while you had unsaved edits open."
+                )))
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Reload from disk")
+                        .cancel_text("Keep mine")
+                        .show_cancel(true)
+                        .on_ok(move |_, window, cx| {
+                            entity_ok.update(cx, |view, cx| {
+                                view.reload_active_from_disk(window, cx);
+                            });
+                            true
+                        })
+                        .on_cancel(move |_, _window, cx| {
+                            entity_cancel.update(cx, |view, cx| {
+                                view.keep_mine_active(cx);
+                            });
+                            true
+                        }),
+                )
+        });
     }
 
     // ── Concurrent external change ────────────────────────────────────────
@@ -1399,6 +1464,9 @@ impl EditorView {
                 self.tabs[index].save_state = SaveState::Conflict;
                 self.tabs[index].conflict_disk_mtime = Some(snapshot_mtime);
                 cx.notify();
+                if self.active == Some(index) {
+                    self.open_conflict_dialog(window, cx);
+                }
             }
         }
     }
@@ -1974,6 +2042,12 @@ impl EditorView {
 
     /// Activate the tab at `index` (tab-bar click) and move focus to its
     /// buffer. A no-op if `index` is out of range or already active.
+    ///
+    /// Switching onto a tab that already carries a background conflict (a
+    /// dirty tab another open tab's external edit surfaced while it was
+    /// inactive, #353) opens the conflict dialog (#532) for it — the same
+    /// affordance the newly-conflicted case gets, since a background
+    /// conflict has no other visible indicator once it becomes active.
     pub fn activate_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index >= self.tabs.len() || self.active == Some(index) {
             return;
@@ -1982,6 +2056,7 @@ impl EditorView {
         self.tabs[index].input.update(cx, |input, cx| {
             input.focus(window, cx);
         });
+        self.open_conflict_dialog(window, cx);
         cx.notify();
     }
 
@@ -2176,15 +2251,15 @@ impl Render for EditorView {
                 .into_any_element();
         }
 
-        // One-line save-outcome banner. The conflict case renders its own
-        // banner below with working remedies (#433) instead of a plain
-        // message.
+        // One-line save-outcome banner. The conflict case surfaces as its own
+        // modal dialog (#532, opened imperatively wherever the active tab's
+        // conflict is armed — see `open_conflict_dialog`) instead of inline
+        // chrome here.
         let banner: Option<(String, gpui::Hsla)> = match &tab.save_state {
             SaveState::Idle | SaveState::Conflict => None,
             SaveState::Saving => Some(("Saving\u{2026}".to_owned(), cx.theme().muted_foreground)),
             SaveState::Failed => Some(("Save failed".to_owned(), cx.theme().danger)),
         };
-        let has_conflict = matches!(tab.save_state, SaveState::Conflict);
 
         // Build the `Input` widget. The context-menu builder is called each
         // time the user right-clicks; it receives a fresh `PopupMenu`.
@@ -2665,58 +2740,6 @@ impl Render for EditorView {
                     .text_color(color)
                     .bg(cx.theme().muted)
                     .child(text),
-            );
-        }
-
-        // Conflict banner with working remedies (#433): "Reload from disk"
-        // replaces the buffer with the on-disk version; "Keep mine"
-        // force-saves the buffer over it (rebased onto the observed disk
-        // `mtime`).
-        if has_conflict {
-            let border = cx.theme().border;
-            let action_fg = cx.theme().foreground;
-            let action_hover_bg = cx.theme().list_hover;
-            let action = move |id: &'static str, label: &'static str| {
-                div()
-                    .id(id)
-                    .flex_shrink_0()
-                    .px(px(6.0))
-                    .border_1()
-                    .border_color(border)
-                    .rounded(px(3.0))
-                    .text_color(action_fg)
-                    .cursor_pointer()
-                    .hover(move |this| this.bg(action_hover_bg))
-                    .child(label)
-            };
-            root = root.child(
-                div()
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .px(px(8.0))
-                    .py(px(4.0))
-                    .text_xs()
-                    .bg(cx.theme().muted)
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_color(cx.theme().danger)
-                            .child("Changed on disk since you opened it"),
-                    )
-                    .child(action("conflict-reload", "Reload from disk").on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _event: &MouseDownEvent, window, cx| {
-                            this.reload_active_from_disk(window, cx);
-                        }),
-                    ))
-                    .child(action("conflict-keep-mine", "Keep mine").on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
-                            this.keep_mine_active(cx);
-                        }),
-                    )),
             );
         }
 
@@ -4180,11 +4203,16 @@ mod tests {
             .unwrap();
     }
 
-    // --- conflict banner remedies (#433) ---
+    // --- conflict remedies + dialog (#433, #532) ---
 
     /// Acceptance (#433): "Reload from disk" on a dirty buffer in conflict
     /// re-reads the file — the buffer's edits are discarded, the conflict
     /// clears, and the daemon's LSP source of truth reverts to disk-backed.
+    ///
+    /// Uses `cx.update_window` rather than `window.update`: the conflict now
+    /// also opens the dialog (#532), which reads/updates the same `Root`
+    /// entity `WindowHandle<Root>::update` already leases — nesting the two
+    /// double-leases and panics (the #354 tests document the same gotcha).
     #[gpui::test]
     fn test_reload_from_disk_on_conflict_replaces_content_and_clears_conflict(
         cx: &mut TestAppContext,
@@ -4192,38 +4220,37 @@ mod tests {
         let (editor, window, open_file_rx, _save_file_rx, buffer_change_rx) =
             build_test_editor_full(cx);
 
-        window
-            .update(cx, |_, window, cx| {
-                editor.update(cx, |editor, cx| {
-                    let a = editor.push_tab("a.rs".into(), false, window, cx);
-                    editor.active = Some(a);
-                    editor.load("a.rs".into(), "disk v1".into(), at(100), window, cx);
-                    editor.tabs[a].dirty = true; // unsaved edits
+        cx.update_window(window.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let a = editor.push_tab("a.rs".into(), false, window, cx);
+                editor.active = Some(a);
+                editor.load("a.rs".into(), "disk v1".into(), at(100), window, cx);
+                editor.tabs[a].dirty = true; // unsaved edits
 
-                    editor.note_external_change_for_path("a.rs", at(200), window, cx);
-                    assert!(matches!(editor.tabs[a].save_state, SaveState::Conflict));
+                editor.note_external_change_for_path("a.rs", at(200), window, cx);
+                assert!(matches!(editor.tabs[a].save_state, SaveState::Conflict));
 
-                    editor.reload_active_from_disk(window, cx);
-                    assert!(
-                        matches!(editor.tabs[a].load_state, TabLoadState::Loading),
-                        "the reload must re-arm the load"
-                    );
+                editor.reload_active_from_disk(window, cx);
+                assert!(
+                    matches!(editor.tabs[a].load_state, TabLoadState::Loading),
+                    "the reload must re-arm the load"
+                );
 
-                    editor.load("a.rs".into(), "disk v2".into(), at(200), window, cx);
-                    assert!(
-                        matches!(editor.tabs[a].save_state, SaveState::Idle),
-                        "the conflict must clear on reload"
-                    );
-                    assert!(!editor.tabs[a].dirty, "the reloaded buffer starts clean");
-                    assert!(editor.tabs[a].conflict_disk_mtime.is_none());
-                    assert_eq!(
-                        editor.tabs[a].input.read(cx).value().to_string(),
-                        "disk v2",
-                        "the buffer must hold the on-disk content"
-                    );
-                });
-            })
-            .unwrap();
+                editor.load("a.rs".into(), "disk v2".into(), at(200), window, cx);
+                assert!(
+                    matches!(editor.tabs[a].save_state, SaveState::Idle),
+                    "the conflict must clear on reload"
+                );
+                assert!(!editor.tabs[a].dirty, "the reloaded buffer starts clean");
+                assert!(editor.tabs[a].conflict_disk_mtime.is_none());
+                assert_eq!(
+                    editor.tabs[a].input.read(cx).value().to_string(),
+                    "disk v2",
+                    "the buffer must hold the on-disk content"
+                );
+            });
+        })
+        .unwrap();
 
         assert_eq!(
             open_file_rx
@@ -4244,6 +4271,9 @@ mod tests {
     /// force-saves the buffer rebased onto the on-disk `mtime` observed when
     /// the conflict surfaced, so the daemon's stale-base check passes; the
     /// `SaveResult` reply then clears the conflict and commits the new base.
+    ///
+    /// `cx.update_window` — see the note on the reload test above (#532's
+    /// dialog open shares the same `Root`-double-lease gotcha).
     #[gpui::test]
     fn test_keep_mine_on_conflict_saves_with_observed_disk_mtime_and_clears_conflict(
         cx: &mut TestAppContext,
@@ -4251,36 +4281,35 @@ mod tests {
         let (editor, window, _open_file_rx, save_file_rx, _buffer_change_rx) =
             build_test_editor_full(cx);
 
-        window
-            .update(cx, |_, window, cx| {
-                editor.update(cx, |editor, cx| {
-                    let a = editor.push_tab("a.rs".into(), false, window, cx);
-                    editor.active = Some(a);
-                    editor.load("a.rs".into(), "mine".into(), at(100), window, cx);
-                    editor.tabs[a].dirty = true;
+        cx.update_window(window.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let a = editor.push_tab("a.rs".into(), false, window, cx);
+                editor.active = Some(a);
+                editor.load("a.rs".into(), "mine".into(), at(100), window, cx);
+                editor.tabs[a].dirty = true;
 
-                    editor.note_external_change_for_path("a.rs", at(200), window, cx);
-                    assert!(matches!(editor.tabs[a].save_state, SaveState::Conflict));
-                    assert_eq!(editor.tabs[a].conflict_disk_mtime, Some(at(200)));
+                editor.note_external_change_for_path("a.rs", at(200), window, cx);
+                assert!(matches!(editor.tabs[a].save_state, SaveState::Conflict));
+                assert_eq!(editor.tabs[a].conflict_disk_mtime, Some(at(200)));
 
-                    editor.keep_mine_active(cx);
-                    assert!(
-                        matches!(editor.tabs[a].save_state, SaveState::Saving),
-                        "keep-mine must dispatch a save"
-                    );
+                editor.keep_mine_active(cx);
+                assert!(
+                    matches!(editor.tabs[a].save_state, SaveState::Saving),
+                    "keep-mine must dispatch a save"
+                );
 
-                    // The daemon accepts (base matches disk) and replies.
-                    editor.apply_save_result("a.rs".into(), at(300), cx);
-                    assert!(
-                        matches!(editor.tabs[a].save_state, SaveState::Idle),
-                        "the conflict is resolved once the forced save lands"
-                    );
-                    assert!(!editor.tabs[a].dirty);
-                    assert_eq!(editor.tabs[a].base_mtime, Some(at(300)));
-                    assert!(editor.tabs[a].conflict_disk_mtime.is_none());
-                });
-            })
-            .unwrap();
+                // The daemon accepts (base matches disk) and replies.
+                editor.apply_save_result("a.rs".into(), at(300), cx);
+                assert!(
+                    matches!(editor.tabs[a].save_state, SaveState::Idle),
+                    "the conflict is resolved once the forced save lands"
+                );
+                assert!(!editor.tabs[a].dirty);
+                assert_eq!(editor.tabs[a].base_mtime, Some(at(300)));
+                assert!(editor.tabs[a].conflict_disk_mtime.is_none());
+            });
+        })
+        .unwrap();
 
         match save_file_rx
             .try_recv()
@@ -4306,29 +4335,161 @@ mod tests {
     /// A daemon `SaveConflict` reply records its `disk_mtime` so "Keep mine"
     /// can rebase onto it — including the re-conflict round when the file
     /// changed on disk *again* between the conflict and the click.
+    ///
+    /// `cx.update_window` — see the note on the reload test above (#532's
+    /// dialog open shares the same `Root`-double-lease gotcha).
     #[gpui::test]
     fn test_apply_save_conflict_records_disk_mtime_for_keep_mine(cx: &mut TestAppContext) {
         let (editor, window, _open_file_rx) = build_test_editor(cx);
 
-        window
-            .update(cx, |_, window, cx| {
-                editor.update(cx, |editor, cx| {
-                    let a = editor.push_tab("a.rs".into(), false, window, cx);
-                    editor.active = Some(a);
-                    editor.load("a.rs".into(), "mine".into(), at(100), window, cx);
-                    editor.tabs[a].dirty = true;
+        cx.update_window(window.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let a = editor.push_tab("a.rs".into(), false, window, cx);
+                editor.active = Some(a);
+                editor.load("a.rs".into(), "mine".into(), at(100), window, cx);
+                editor.tabs[a].dirty = true;
 
-                    editor.apply_save_conflict("a.rs".into(), at(250), cx);
+                editor.apply_save_conflict("a.rs".into(), at(250), window, cx);
 
-                    assert!(matches!(editor.tabs[a].save_state, SaveState::Conflict));
-                    assert_eq!(
-                        editor.tabs[a].conflict_disk_mtime,
-                        Some(at(250)),
-                        "the reply's disk mtime must be recorded for keep-mine"
-                    );
-                });
-            })
-            .unwrap();
+                assert!(matches!(editor.tabs[a].save_state, SaveState::Conflict));
+                assert_eq!(
+                    editor.tabs[a].conflict_disk_mtime,
+                    Some(at(250)),
+                    "the reply's disk mtime must be recorded for keep-mine"
+                );
+            });
+        })
+        .unwrap();
+    }
+
+    /// Acceptance (#532): "Dirty buffer + external edit -> dialog" — a dirty
+    /// active buffer conflicting with an external edit opens the
+    /// file-changed-on-disk dialog, upgrading the #433 inline banner.
+    #[gpui::test]
+    fn test_dirty_buffer_conflict_via_external_change_opens_the_conflict_dialog(
+        cx: &mut TestAppContext,
+    ) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let a = editor.push_tab("a.rs".into(), false, window, cx);
+                editor.active = Some(a);
+                editor.load("a.rs".into(), "mine".into(), at(100), window, cx);
+                editor.tabs[a].dirty = true;
+
+                editor.note_external_change_for_path("a.rs", at(200), window, cx);
+            });
+
+            assert!(
+                window.has_active_dialog(cx),
+                "a dirty buffer conflicting with an external edit must open the conflict dialog"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Acceptance (#532): a `SaveConflict` reply for the active tab opens
+    /// the same dialog as the external-change path above.
+    #[gpui::test]
+    fn test_apply_save_conflict_opens_the_conflict_dialog_for_the_active_tab(
+        cx: &mut TestAppContext,
+    ) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let a = editor.push_tab("a.rs".into(), false, window, cx);
+                editor.active = Some(a);
+                editor.load("a.rs".into(), "mine".into(), at(100), window, cx);
+                editor.tabs[a].dirty = true;
+
+                editor.apply_save_conflict("a.rs".into(), at(250), window, cx);
+            });
+
+            assert!(
+                window.has_active_dialog(cx),
+                "a SaveConflict reply for the active tab must open the conflict dialog"
+            );
+        })
+        .unwrap();
+    }
+
+    /// A background tab's conflict (#353 routing: the addressed path is not
+    /// the active tab) must not interrupt the user with a dialog for a tab
+    /// they are not looking at — but switching onto it surfaces the same
+    /// dialog, since a background conflict otherwise has no visible
+    /// indicator once it becomes active (the #433 banner had the same
+    /// render-reactive behavior).
+    #[gpui::test]
+    fn test_background_tab_conflict_opens_no_dialog_until_activated(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            let a = editor.update(cx, |editor, cx| {
+                let a = editor.push_tab("a.rs".into(), false, window, cx);
+                let b = editor.push_tab("b.rs".into(), false, window, cx);
+                editor.tabs[a].load_state = TabLoadState::Loaded;
+                editor.tabs[a].base_mtime = Some(at(100));
+                editor.tabs[a].dirty = true;
+                editor.tabs[b].load_state = TabLoadState::Loaded;
+                editor.tabs[b].base_mtime = Some(at(100));
+                editor.active = Some(b);
+
+                editor.note_external_change_for_path("a.rs", at(200), window, cx);
+                assert!(matches!(editor.tabs[a].save_state, SaveState::Conflict));
+                a
+            });
+
+            assert!(
+                !window.has_active_dialog(cx),
+                "a's background conflict must not interrupt b, the active tab"
+            );
+
+            editor.update(cx, |editor, cx| {
+                editor.activate_tab(a, window, cx);
+            });
+
+            assert!(
+                window.has_active_dialog(cx),
+                "switching onto a's now-active conflict must open the dialog"
+            );
+        })
+        .unwrap();
+    }
+
+    /// A further external write while the conflict dialog is already open
+    /// (rebasing the recorded disk mtime, e.g. an agent keeps editing before
+    /// the user answers) must not stack a second dialog on top of it.
+    #[gpui::test]
+    fn test_conflict_dialog_does_not_stack_on_a_repeated_external_write(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let a = editor.push_tab("a.rs".into(), false, window, cx);
+                editor.active = Some(a);
+                editor.load("a.rs".into(), "mine".into(), at(100), window, cx);
+                editor.tabs[a].dirty = true;
+
+                editor.note_external_change_for_path("a.rs", at(200), window, cx);
+            });
+            assert!(window.has_active_dialog(cx));
+
+            editor.update(cx, |editor, cx| {
+                editor.note_external_change_for_path("a.rs", at(300), window, cx);
+            });
+
+            // A single close must clear the dialog state entirely — if the
+            // repeated write had stacked a second dialog, one close would
+            // still leave `has_active_dialog` true.
+            window.close_dialog(cx);
+            assert!(
+                !window.has_active_dialog(cx),
+                "the repeated external write must not have stacked a second dialog"
+            );
+        })
+        .unwrap();
     }
 
     /// The remedies only act on a tab that is actually in conflict — outside
