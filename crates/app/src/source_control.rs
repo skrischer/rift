@@ -170,7 +170,9 @@ fn status_color(code: GitStatusCode, cx: &App) -> Hsla {
 
 /// Split a root-relative path into `(file_name, parent_dir)` for the two-tone
 /// path column — the basename in the foreground, the directory muted after it.
-fn split_name_dir(path: &str) -> (&str, &str) {
+/// `pub(crate)` so the diff view's header (#547) reuses the same split
+/// instead of re-deriving it.
+pub(crate) fn split_name_dir(path: &str) -> (&str, &str) {
     match path.rsplit_once('/') {
         Some((dir, name)) => (name, dir),
         None => (path, ""),
