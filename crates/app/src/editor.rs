@@ -279,6 +279,24 @@ const CARD_ESTIMATED_HEIGHT: Pixels = px(56.0);
 /// angle quotation mark — not an emoji).
 const BREADCRUMB_SEPARATOR: &str = "\u{203A}";
 
+/// Maximum number of code lines the hover card's code block shows before it
+/// truncates (`docs/spec-editor-chrome.md` §3: "signature + truncated
+/// preview"). Keeps a large signature or module preview from dominating the
+/// card while still surfacing the essential signature.
+const HOVER_CODE_MAX_LINES: usize = 12;
+
+/// Marker line appended to a truncated hover code preview (U+2026 horizontal
+/// ellipsis — not an emoji).
+const HOVER_TRUNCATION_MARKER: &str = "\u{2026}";
+
+/// Keyboard hint shown on the hover card's "Definition" action, matching the
+/// `GoToDefinition` binding advertised by the command registry.
+const HOVER_DEFINITION_HINT: &str = "F12";
+
+/// Keyboard hint shown on the hover card's "References" action, matching the
+/// `FindReferences` binding advertised by the command registry.
+const HOVER_REFERENCES_HINT: &str = "Shift+F12";
+
 // ── Internal state types ──────────────────────────────────────────────────────
 
 /// What a tab is currently showing.
@@ -2057,29 +2075,155 @@ impl Render for EditorView {
                     .separator()
             });
 
-        // Hover popover (#197): rendered as an absolutely-positioned overlay
-        // just above the cursor line when `hover_content` is set.
+        // Hover card (#197, restyled to `docs/spec-editor-chrome.md` §3):
+        // rendered as an absolutely-positioned overlay pinned to the bottom of
+        // the editor area when `hover_content` is set. Anchoring/dismissal
+        // mechanics stay owned by the open papercut #486 — this only restyles
+        // the card's contents into the §3 anatomy:
+        //   - a code block (the leading fenced signature + truncated preview),
+        //   - a hairline,
+        //   - a doc body (the prose markdown after the code),
+        //   - an action row wiring the existing GoToDefinition / FindReferences
+        //     actions with keyboard hints.
+        // Rename is consciously OMITTED (LSP rename is post-v1; no dead
+        // controls) per the spec's prior-decision log.
         //
-        // Theme tokens used: `popover` (background), `border`, `foreground`,
-        // `muted_foreground`. No `card` field (does not exist), no `z_index`
-        // method (not in GPUI) — layering is via child render order (the
-        // popover child is added *after* the editor area so it paints on top).
+        // Theme tokens used: `popover` (background), `secondary` (code block),
+        // `muted` (kbd chip), `list_hover` (action hover), `border`,
+        // `foreground`, `muted_foreground`. Layering is via child render order
+        // (this child is added *after* the editor area so it paints on top).
         let hover_popover_element = tab.hover_content.as_ref().map(|content| {
-            let md_source = content.markdown.clone();
-            div()
+            let parts = parse_hover_markdown(&content.markdown);
+            let popover_bg = cx.theme().popover;
+            let border = cx.theme().border;
+            let fg = cx.theme().foreground;
+            let muted = cx.theme().muted_foreground;
+            let code_bg = cx.theme().secondary;
+            let kbd_bg = cx.theme().muted;
+            let action_hover_bg = cx.theme().list_hover;
+            let mono = cx.theme().mono_font_family.clone();
+            let mono_size = cx.theme().mono_font_size;
+
+            let mut card = div()
                 .absolute()
                 .bottom(px(0.0))
                 .left(px(0.0))
                 .right(px(0.0))
-                .bg(cx.theme().popover)
+                .flex()
+                .flex_col()
+                .bg(popover_bg)
                 .border_t_1()
-                .border_color(cx.theme().border)
+                .border_color(border)
                 .shadow_md()
-                .p(px(8.0))
                 .text_xs()
-                .text_color(cx.theme().foreground)
-                .overflow_hidden()
-                .child(markdown(md_source))
+                .text_color(fg)
+                .overflow_hidden();
+
+            // Code block: the symbol's signature plus a truncated preview,
+            // rendered as mono lines on the `secondary` surface.
+            if let Some(code) = &parts.code {
+                let (lines, truncated) = truncate_code_preview(code, HOVER_CODE_MAX_LINES);
+                let mut block = div()
+                    .flex()
+                    .flex_col()
+                    .px(px(10.0))
+                    .py(px(8.0))
+                    .bg(code_bg)
+                    .font_family(mono.clone())
+                    .text_size(mono_size)
+                    .text_color(fg);
+                for line in lines {
+                    block = block.child(div().child(SharedString::from(line.to_owned())));
+                }
+                if truncated {
+                    block = block.child(div().text_color(muted).child(HOVER_TRUNCATION_MARKER));
+                }
+                card = card.child(block);
+            }
+
+            // Hairline between the code block and the doc body — only drawn
+            // when both sections are present.
+            if parts.code.is_some() && parts.doc.is_some() {
+                card = card.child(div().h(px(1.0)).bg(border));
+            }
+
+            // Doc body: the prose that follows the signature, rendered through
+            // the shared markdown renderer.
+            if let Some(doc) = &parts.doc {
+                card = card.child(div().px(px(10.0)).py(px(8.0)).child(markdown(doc.clone())));
+            }
+
+            // Action row: Definition (F12) and References (Shift+F12) wired to
+            // the existing nav actions. A small mono chip carries the keyboard
+            // hint, matching the command registry's advertised bindings. The
+            // leading `\u{203A}` on Definition echoes the design's go-to arrow;
+            // References carries no synthetic glyph (the artboard's icon has no
+            // embedded asset, per the outline panel's text-glyph precedent).
+            let kbd_chip = move |text: &'static str| {
+                div()
+                    .flex_shrink_0()
+                    .px(px(4.0))
+                    .rounded(px(3.0))
+                    .bg(kbd_bg)
+                    .text_color(muted)
+                    .font_family(mono.clone())
+                    .child(text)
+            };
+            let definition_action = div()
+                .id("hover-action-definition")
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .px(px(6.0))
+                .py(px(2.0))
+                .rounded(px(4.0))
+                .cursor_pointer()
+                .hover(move |this| this.bg(action_hover_bg))
+                .child(
+                    div()
+                        .text_color(muted)
+                        .child(SharedString::from(BREADCRUMB_SEPARATOR)),
+                )
+                .child(div().text_color(fg).child("Definition"))
+                .child(kbd_chip(HOVER_DEFINITION_HINT))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
+                        this.dispatch_definition_request(cx);
+                    }),
+                );
+            let references_action = div()
+                .id("hover-action-references")
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .px(px(6.0))
+                .py(px(2.0))
+                .rounded(px(4.0))
+                .cursor_pointer()
+                .hover(move |this| this.bg(action_hover_bg))
+                .child(div().text_color(fg).child("References"))
+                .child(kbd_chip(HOVER_REFERENCES_HINT))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
+                        this.dispatch_references_request(cx);
+                    }),
+                );
+
+            card.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .border_t_1()
+                    .border_color(border)
+                    .child(definition_action)
+                    .child(div().text_color(muted).child("\u{00B7}"))
+                    .child(references_action),
+            )
         });
 
         // ── Breadcrumb + gutter/card overlays (docs/spec-editor-chrome.md) ──
@@ -2749,6 +2893,100 @@ fn breadcrumb_children(
         first = false;
     }
     out
+}
+
+/// The two anatomical sections of an LSP hover, split from its markdown for
+/// the hover card (`docs/spec-editor-chrome.md` §3).
+///
+/// LSP servers format hover text as a leading fenced code block (the symbol's
+/// signature, sometimes preceded by its module path), an optional thematic
+/// break, then the documentation prose. This splits that into the code the
+/// card renders in its code block and the prose it renders in its doc body.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HoverParts {
+    /// The joined contents of the leading fenced code block(s) with the fence
+    /// markers stripped, or `None` when the hover carries no leading fence.
+    code: Option<String>,
+    /// The documentation prose after the code (and any hairline), as markdown,
+    /// or `None` when the hover is only a signature.
+    doc: Option<String>,
+}
+
+/// Whether a trimmed line is a markdown thematic break (`---`, `***`, or
+/// `___`, three or more of a single marker), i.e. the hairline separating a
+/// signature from its docs in an LSP hover.
+fn is_thematic_break(trimmed: &str) -> bool {
+    for marker in ['-', '*', '_'] {
+        if trimmed.len() >= 3 && trimmed.chars().all(|c| c == marker) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Join `lines` into a single string, dropping leading and trailing blank
+/// lines, or `None` when every line is blank.
+fn join_trimmed_lines(lines: &[&str]) -> Option<String> {
+    let start = lines.iter().position(|l| !l.trim().is_empty())?;
+    let end = lines.iter().rposition(|l| !l.trim().is_empty())?;
+    Some(lines[start..=end].join("\n"))
+}
+
+/// Split an LSP hover's markdown into its code and doc sections
+/// (`docs/spec-editor-chrome.md` §3).
+///
+/// Leading fenced code blocks (their contents, fences stripped) form the code
+/// section; the first non-blank line outside a fence ends it. A thematic-break
+/// hairline there is consumed; any other content begins the doc body. Plain
+/// (unfenced) hover text has no code section and is all doc. An unterminated
+/// fence degrades gracefully: its remaining lines become the code section and
+/// there is no doc.
+fn parse_hover_markdown(markdown: &str) -> HoverParts {
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut code_lines: Vec<&str> = Vec::new();
+    let mut in_fence = false;
+    let mut doc_start: Option<usize> = None;
+
+    for (i, raw) in lines.iter().enumerate() {
+        let trimmed = raw.trim();
+        if in_fence {
+            if trimmed.starts_with("```") {
+                in_fence = false;
+            } else {
+                code_lines.push(raw);
+            }
+            continue;
+        }
+        if trimmed.starts_with("```") {
+            in_fence = true;
+            continue;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+        // First non-blank content outside a fence: the code section is done.
+        // Consume a hairline; otherwise the doc body starts at this line.
+        doc_start = Some(if is_thematic_break(trimmed) { i + 1 } else { i });
+        break;
+    }
+
+    let code = join_trimmed_lines(&code_lines);
+    let doc = doc_start.and_then(|start| join_trimmed_lines(lines.get(start..).unwrap_or(&[])));
+    HoverParts { code, doc }
+}
+
+/// Truncate a hover code block to at most `max_lines`, returning the lines to
+/// render and whether truncation occurred (so the caller can append an
+/// ellipsis marker). `max_lines` of 0 is treated as 1 to always keep the
+/// signature line.
+fn truncate_code_preview(code: &str, max_lines: usize) -> (Vec<&str>, bool) {
+    let cap = max_lines.max(1);
+    let all: Vec<&str> = code.lines().collect();
+    if all.len() > cap {
+        (all[..cap].to_vec(), true)
+    } else {
+        (all, false)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -4297,6 +4535,115 @@ mod tests {
         let g2 = gen;
         assert_ne!(g1, g2);
         assert!(g2 > g1);
+    }
+
+    // --- hover card anatomy (#528, docs/spec-editor-chrome.md §3) ---
+
+    #[test]
+    fn test_parse_hover_markdown_code_and_doc_split() {
+        // A rust-analyzer-style hover: a fenced signature, a hairline, prose.
+        let md = "```rust\npub fn foo(x: i32) -> i32\n```\n\n---\n\nAdds one to `x`.";
+        let parts = parse_hover_markdown(md);
+        assert_eq!(parts.code.as_deref(), Some("pub fn foo(x: i32) -> i32"));
+        assert_eq!(parts.doc.as_deref(), Some("Adds one to `x`."));
+    }
+
+    #[test]
+    fn test_parse_hover_markdown_joins_multiple_leading_fences() {
+        // rust-analyzer often emits the module path and the signature as two
+        // separate fences before the docs; both belong in the code section.
+        let md = "```rust\nstd::string\n```\n\n```rust\npub struct String\n```\n\n---\n\nA UTF-8 string.";
+        let parts = parse_hover_markdown(md);
+        assert_eq!(
+            parts.code.as_deref(),
+            Some("std::string\npub struct String")
+        );
+        assert_eq!(parts.doc.as_deref(), Some("A UTF-8 string."));
+    }
+
+    #[test]
+    fn test_parse_hover_markdown_plaintext_is_all_doc() {
+        // Plaintext hover (no fences): everything is the doc body, no code.
+        let md = "just some hover text\nover two lines";
+        let parts = parse_hover_markdown(md);
+        assert_eq!(parts.code, None);
+        assert_eq!(
+            parts.doc.as_deref(),
+            Some("just some hover text\nover two lines")
+        );
+    }
+
+    #[test]
+    fn test_parse_hover_markdown_code_only_has_no_doc() {
+        // A signature with no documentation: code present, doc absent.
+        let md = "```rust\npub const N: usize\n```";
+        let parts = parse_hover_markdown(md);
+        assert_eq!(parts.code.as_deref(), Some("pub const N: usize"));
+        assert_eq!(parts.doc, None);
+    }
+
+    #[test]
+    fn test_parse_hover_markdown_unterminated_fence_is_graceful() {
+        // Malformed: a fence that never closes must not panic; its lines become
+        // the code section and there is no doc.
+        let md = "```rust\npub fn foo()\nlet unterminated = true;";
+        let parts = parse_hover_markdown(md);
+        assert_eq!(
+            parts.code.as_deref(),
+            Some("pub fn foo()\nlet unterminated = true;")
+        );
+        assert_eq!(parts.doc, None);
+    }
+
+    #[test]
+    fn test_parse_hover_markdown_empty_is_empty() {
+        let parts = parse_hover_markdown("");
+        assert_eq!(parts, HoverParts::default());
+    }
+
+    #[test]
+    fn test_parse_hover_markdown_prose_without_hairline_is_doc() {
+        // Some servers omit the thematic break; the first prose line after the
+        // fence still begins the doc body and is not dropped.
+        let md = "```rust\npub fn foo()\n```\nInline docs, no hairline.";
+        let parts = parse_hover_markdown(md);
+        assert_eq!(parts.code.as_deref(), Some("pub fn foo()"));
+        assert_eq!(parts.doc.as_deref(), Some("Inline docs, no hairline."));
+    }
+
+    #[test]
+    fn test_is_thematic_break_recognizes_markers() {
+        assert!(is_thematic_break("---"));
+        assert!(is_thematic_break("***"));
+        assert!(is_thematic_break("___"));
+        assert!(is_thematic_break("-----"));
+        assert!(!is_thematic_break("--"));
+        assert!(!is_thematic_break("- item"));
+        assert!(!is_thematic_break("code"));
+    }
+
+    #[test]
+    fn test_truncate_code_preview_caps_long_blocks() {
+        let code = "l1\nl2\nl3\nl4\nl5";
+        let (lines, truncated) = truncate_code_preview(code, 3);
+        assert_eq!(lines, vec!["l1", "l2", "l3"]);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn test_truncate_code_preview_keeps_short_blocks() {
+        let code = "l1\nl2";
+        let (lines, truncated) = truncate_code_preview(code, 12);
+        assert_eq!(lines, vec!["l1", "l2"]);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn test_truncate_code_preview_zero_cap_keeps_signature() {
+        // A zero cap is clamped to one line so the signature never vanishes.
+        let (lines, truncated) = truncate_code_preview("sig\nmore", 0);
+        assert_eq!(lines, vec!["sig"]);
+        assert!(truncated);
     }
 
     // --- jump-list overlay dismissal (#485) ---
