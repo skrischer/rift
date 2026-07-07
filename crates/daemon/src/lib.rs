@@ -7,12 +7,12 @@ mod diff;
 pub mod lsp;
 mod terminal;
 
-use lsp::{document_changes, BufferEvent, LspDiagnostics, LspWorker, NavRequest};
+use lsp::{document_changes, BufferEvent, LspDiagnostics, LspStatusEvent, LspWorker, NavRequest};
 use rift_explorer::{Change, Entry, GitStatus, Snapshot, Watcher};
 use rift_lsp::{DocumentChange, DocumentSelector};
 use rift_protocol::{
-    encode_frame, ClientMessage, DaemonMessage, Diagnostic, EntryKind, FrameDecoder, NavRequestId,
-    WorktreeEntry, PROTOCOL_VERSION,
+    encode_frame, ClientMessage, DaemonMessage, Diagnostic, EntryKind, FrameDecoder,
+    LspServerState, NavRequestId, WorktreeEntry, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -43,6 +43,13 @@ pub struct State {
     /// removed) so the map only ever holds live diagnostics. Replayed per
     /// connection alongside the worktree and git snapshots.
     pub diagnostics: BTreeMap<DiagnosticKey, Vec<Diagnostic>>,
+    /// Latest lifecycle state per language server name (issue #520), e.g.
+    /// `"rust-analyzer" -> Running`. Unlike `diagnostics`, an entry is never
+    /// removed once a server has been observed — a server that has ever
+    /// started is always exactly one of `starting`/`running`/`crashed`, never
+    /// absent. Replayed per connection alongside the worktree, git, and
+    /// diagnostics snapshots.
+    pub lsp_status: BTreeMap<String, LspServerState>,
 }
 
 /// Map key for [`State::diagnostics`]: a worktree-relative path paired with the
@@ -80,6 +87,10 @@ pub struct Daemon {
     /// then pends forever (never fires) so the loop is unaffected when LSP is
     /// off.
     lsp_diagnostics: Option<mpsc::Receiver<LspDiagnostics>>,
+    /// Lifecycle transitions from the off-loop LSP worker (issue #520), polled
+    /// as a dispatch branch alongside `lsp_diagnostics`. Same `None`-until-armed
+    /// discipline.
+    lsp_status: Option<mpsc::Receiver<LspStatusEvent>>,
     core: Core,
 }
 
@@ -139,6 +150,7 @@ pub fn channels(event_capacity: usize, inbound_capacity: usize) -> (Daemon, Hand
         inbound: inbound_rx,
         worktree: None,
         lsp_diagnostics: None,
+        lsp_status: None,
         core: Core {
             events: events_tx.clone(),
             state: state_tx,
@@ -426,6 +438,18 @@ async fn next_lsp_diagnostics(
     }
 }
 
+/// Receive the next lifecycle transition from the off-loop LSP worker (issue
+/// #520), or pend forever when LSP is not armed (so the `select!` branch
+/// never fires).
+async fn next_lsp_status(
+    rx: &mut Option<mpsc::Receiver<LspStatusEvent>>,
+) -> Option<LspStatusEvent> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Map an explorer entry onto its wire representation. Paths cross the
 /// boundary lossily as UTF-8 (`to_string_lossy`) — the protocol is JSON today,
 /// so a non-UTF-8 path cannot round-trip regardless.
@@ -537,7 +561,32 @@ fn repo_state_message(repo: &rift_explorer::RepoState) -> DaemonMessage {
             ahead: ab.ahead,
             behind: ab.behind,
         }),
+        lines_added: repo.lines_added,
+        lines_removed: repo.lines_removed,
     }
+}
+
+/// Build the `LspStatus` message from a translated lifecycle event.
+fn lsp_status_message(event: &LspStatusEvent) -> DaemonMessage {
+    DaemonMessage::LspStatus {
+        server: event.server.clone(),
+        state: event.state,
+    }
+}
+
+/// Replay the full held LSP health map as one `LspStatus` message per server
+/// name — the full state a freshly attached connection needs, the LSP-health
+/// analogue of `diagnostics_snapshot_messages`.
+fn lsp_status_snapshot_messages(
+    lsp_status: &BTreeMap<String, LspServerState>,
+) -> Vec<DaemonMessage> {
+    lsp_status
+        .iter()
+        .map(|(server, state)| DaemonMessage::LspStatus {
+            server: server.clone(),
+            state: *state,
+        })
+        .collect()
 }
 
 /// Diff `old` git status against `new`, producing the incremental messages that
@@ -1140,6 +1189,10 @@ async fn write_snapshot<W: AsyncWrite + Unpin>(
         // `(path, server)` — alongside the tree and git decoration. Incremental
         // updates then ride the bus.
         messages.extend(diagnostics_snapshot_messages(&guard.diagnostics));
+        // Replay the held LSP health map (issue #520) too, so a (re)attaching
+        // client sees current server health without waiting for the next
+        // transition. Incremental updates then ride the bus.
+        messages.extend(lsp_status_snapshot_messages(&guard.lsp_status));
         messages
     };
     write_messages(writer, &messages).await?;
@@ -1423,8 +1476,11 @@ impl Daemon {
         let (doc_tx, doc_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
         let (buffer_tx, buffer_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
         let (diag_tx, diag_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
+        let (status_tx, status_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
         let (nav_req_tx, nav_req_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
-        let worker = LspWorker::new(root, selector, doc_rx, buffer_rx, diag_tx, nav_req_rx);
+        let worker = LspWorker::new(
+            root, selector, doc_rx, buffer_rx, diag_tx, status_tx, nav_req_rx,
+        );
         tokio::spawn(worker.run());
         self.core.doc_changes = Some(doc_tx);
         self.core.buffer_events = Some(buffer_tx);
@@ -1433,6 +1489,7 @@ impl Daemon {
         // (#482). The dispatch loop no longer forwards nav itself.
         self.core.nav_requests = Some(nav_req_tx);
         self.lsp_diagnostics = Some(diag_rx);
+        self.lsp_status = Some(status_rx);
     }
 
     /// A clone of the LSP worker's navigation-request sender, or `None` when LSP
@@ -1455,6 +1512,7 @@ impl Daemon {
             mut inbound,
             mut worktree,
             mut lsp_diagnostics,
+            mut lsp_status,
             mut core,
         } = self;
         loop {
@@ -1473,6 +1531,11 @@ impl Daemon {
                     Some(diagnostics) => core.apply_diagnostics(diagnostics),
                     // The LSP worker ended; stop polling the closed channel.
                     None => lsp_diagnostics = None,
+                },
+                status = next_lsp_status(&mut lsp_status) => match status {
+                    Some(status) => core.apply_lsp_status(status),
+                    // The LSP worker ended; stop polling the closed channel.
+                    None => lsp_status = None,
                 },
             }
         }
@@ -1620,6 +1683,19 @@ impl Core {
             } else {
                 state.diagnostics.insert(key, diagnostics.items);
             }
+        });
+        let _ = self.events.send(message);
+    }
+
+    /// Fold one language server's lifecycle transition into the `State` and
+    /// onto the event bus (issue #520). Unlike `apply_diagnostics`, the entry
+    /// is never removed — a server that has ever transitioned is always
+    /// exactly one of `starting`/`running`/`crashed`, so the map only ever
+    /// grows (by distinct server name) or overwrites its current state.
+    fn apply_lsp_status(&mut self, event: LspStatusEvent) {
+        let message = lsp_status_message(&event);
+        self.state.send_modify(|state| {
+            state.lsp_status.insert(event.server, event.state);
         });
         let _ = self.events.send(message);
     }
@@ -2950,6 +3026,55 @@ mod tests {
     }
 
     #[test]
+    fn test_git_delta_messages_repo_state_carries_line_totals() {
+        let repo = init_git_repo("delta-totals");
+        write_file(&repo.path.join("tracked.txt"), "v2\nextra\n");
+        let status = GitStatus::compute(&repo.path).expect("compute");
+
+        let messages = git_delta_messages(None, &status);
+        let totals = messages
+            .iter()
+            .find_map(|m| match m {
+                DaemonMessage::RepoState {
+                    lines_added,
+                    lines_removed,
+                    ..
+                } => Some((*lines_added, *lines_removed)),
+                _ => None,
+            })
+            .expect("a RepoState");
+        assert_eq!(totals, (2, 1));
+    }
+
+    #[test]
+    fn test_git_delta_messages_totals_only_change_still_emits_repo_state() {
+        // The per-file porcelain code stays `Modified` on both sides, so no
+        // `UpdateGitStatus` delta fires — but the line totals differ, and
+        // `RepoState`'s `PartialEq` covers them, so it must still re-emit
+        // (the recompute-driven "+N -M updates on the recompute cadence"
+        // acceptance behavior).
+        let repo = init_git_repo("delta-totals-only");
+        write_file(&repo.path.join("tracked.txt"), "v2\n");
+        let old = GitStatus::compute(&repo.path).expect("old");
+        write_file(&repo.path.join("tracked.txt"), "v2\nv3\nv4\n");
+        let new = GitStatus::compute(&repo.path).expect("new");
+
+        let messages = git_delta_messages(Some(&old), &new);
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, DaemonMessage::UpdateGitStatus { .. })),
+            "the porcelain code is unchanged, so no per-file delta: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, DaemonMessage::RepoState { .. })),
+            "the line totals changed, so RepoState must still re-emit: {messages:?}"
+        );
+    }
+
+    #[test]
     fn test_git_delta_messages_no_change_is_empty() {
         let repo = init_git_repo("delta-none");
         let a = GitStatus::compute(&repo.path).expect("a");
@@ -2990,6 +3115,44 @@ mod tests {
             entry.status.worktree,
             rift_protocol::GitStatusCode::Modified
         );
+    }
+
+    #[test]
+    fn test_lsp_status_message_carries_server_and_state() {
+        let event = LspStatusEvent {
+            server: "rust-analyzer".to_string(),
+            state: LspServerState::Crashed,
+        };
+        assert_eq!(
+            lsp_status_message(&event),
+            DaemonMessage::LspStatus {
+                server: "rust-analyzer".to_string(),
+                state: LspServerState::Crashed,
+            }
+        );
+    }
+
+    #[test]
+    fn test_lsp_status_snapshot_messages_one_per_server() {
+        let mut lsp_status = BTreeMap::new();
+        lsp_status.insert("rust-analyzer".to_string(), LspServerState::Running);
+        lsp_status.insert("some-linter".to_string(), LspServerState::Crashed);
+
+        let messages = lsp_status_snapshot_messages(&lsp_status);
+        assert_eq!(messages.len(), 2);
+        assert!(messages.contains(&DaemonMessage::LspStatus {
+            server: "rust-analyzer".to_string(),
+            state: LspServerState::Running,
+        }));
+        assert!(messages.contains(&DaemonMessage::LspStatus {
+            server: "some-linter".to_string(),
+            state: LspServerState::Crashed,
+        }));
+    }
+
+    #[test]
+    fn test_lsp_status_snapshot_messages_empty_map_yields_no_messages() {
+        assert!(lsp_status_snapshot_messages(&BTreeMap::new()).is_empty());
     }
 
     /// Drain framed messages off a connection until no message arrives within

@@ -13,9 +13,9 @@ discriminator. The authoritative definitions live in `crates/protocol/src/lib.rs
 
 ```json
 // client → daemon
-{ "type": "hello",   "version": 3 }
+{ "type": "hello",   "version": 4 }
 // daemon → client
-{ "type": "welcome", "version": 3 }
+{ "type": "welcome", "version": 4 }
 ```
 
 `version` is the wire `PROTOCOL_VERSION`, independent of the crate semver.
@@ -50,7 +50,9 @@ binary, never by tolerating it (`docs/spec-connection-robustness.md`).
   a healthy concurrent connection's stream (relevant for the shared stable+dev
   daemon).
 
-History: version 3 adds the session-list pair `query_session_list` /
+History: version 4 adds `RepoState`'s `lines_added`/`lines_removed`
+working-tree line totals and the `LspStatus` push (`docs/spec-status-line.md`);
+version 3 adds the session-list pair `query_session_list` /
 `session_list_reply` (`docs/spec-session-switch.md`); version 2 pins the
 message set as of the connection-robustness phase (fingerprint test
 introduced); version 1 was the original handshake constant, carried but never
@@ -228,13 +230,25 @@ their own phases (explorer / git-status); summarized here for completeness:
 { "type": "worktree_snapshot", "root": "/home/dev/project", "entries": [ ... ], "final_chunk": true }
 { "type": "update_worktree",   "added": [ ... ], "changed": [ ... ], "removed": ["src/old.rs"] }
 { "type": "update_git_status", "changed": [ ... ], "cleared": ["was_dirty.rs"] }
-{ "type": "repo_state",        "branch": "main", "ahead_behind": { "ahead": 2, "behind": 1 } }
+{ "type": "repo_state",        "branch": "main", "ahead_behind": { "ahead": 2, "behind": 1 }, "lines_added": 12, "lines_removed": 3 }
 ```
 
 > `state_update` (`{ "sessions": [...] }`) was the scaffolding placeholder for
 > session/layout state. It was superseded by `layout_snapshot` / `layout_update`
 > and **removed** together with the throwaway spike wiring when the daemon took
 > ownership of the tmux session (#204).
+
+`repo_state.lines_added`/`lines_removed` are the working-tree line totals
+(`docs/spec-status-line.md`): `git diff HEAD --numstat` semantics — current
+worktree content vs `HEAD`, regardless of staging — plus untracked text file
+additions, computed with `gix` on the same debounced recompute tick as the
+rest of this message (no dedicated timer). A rename diffs the destination
+path's worktree content against its rewrite **source** blob rather than the
+(nonexistent) `HEAD` entry at the new path, so a pure rename contributes
+`0`/`0`. Per-file work is capped and a binary file is skipped (mirroring the
+source-control diff channel's sentinels below) — one oversized or binary file
+contributes nothing rather than failing the whole recompute. Both fields are
+always present (`0` on a clean worktree), never optional.
 
 ## Diagnostics
 
@@ -243,6 +257,25 @@ their own phases (explorer / git-status); summarized here for completeness:
 ```
 
 `diagnostics` is keyed by `path` (relative to the worktree root, the same key space as the worktree entries) and by `server` (the daemon-assigned id of the publishing language server). `items` is the complete current set that server reports for the file, replacing whatever it last reported — an empty `items` clears that server's diagnostics for the file while leaving other servers' sets intact. `source` and `code` are omitted when the server provides neither. The diagnostic types are rift's own (`Diagnostic` / `Range` / `Position` / `DiagnosticSeverity`); `lsp-types` does not cross the protocol boundary. Push-only — the client never requests diagnostics.
+
+## Language server health (`docs/spec-status-line.md`)
+
+```json
+{ "type": "lsp_status", "server": "rust-analyzer", "state": "running" }
+```
+
+`lsp_status` is keyed by `server` — the server's **stable name** (the binary,
+e.g. `"rust-analyzer"`), NOT the per-spawn server id `diagnostics` keys by: a
+restart mints a fresh internal id, but the status-line health dot asks "is my
+rust-analyzer OK", which is name-scoped. `state` is one of `starting` /
+`running` / `crashed` — there is no `stopped`, since a server the daemon has
+observed is never deliberately stopped while a client is attached. Emitted by
+the daemon's LSP registry around its observe cycle: `starting` when a
+(re)start is triggered, `running` once the `initialize` handshake completes,
+`crashed` once a dead instance is pruned (detected on the next observe after
+the server exits) or a (re)start attempt fails. Push-only, and replayed once
+per known server behind `welcome` so a (re)attaching client sees current
+health immediately.
 
 ### Live-buffer feed (`spec-editor.md`, cut C)
 

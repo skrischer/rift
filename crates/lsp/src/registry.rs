@@ -61,6 +61,24 @@ struct Backoff {
     delay: Duration,
 }
 
+/// A language server's lifecycle transition, keyed by its stable
+/// [`ServerName`] rather than a per-spawn [`ServerId`] — a restart mints a
+/// fresh id, but "is my rust-analyzer OK" is a name-scoped question
+/// (`docs/spec-status-line.md`). Mirrors `rift_protocol::LspServerState`
+/// one-to-one; kept as its own type so this crate's lifecycle bookkeeping
+/// does not otherwise depend on the wire enum's exact shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerLifecycle {
+    /// A (re)start was just triggered; the `initialize` handshake has not
+    /// completed yet.
+    Starting,
+    /// The server is alive and has completed its `initialize` handshake.
+    Running,
+    /// The server's main loop ended (exit, crash, or transport failure), or a
+    /// (re)start attempt failed outright (missing binary, spawn/init error).
+    Crashed,
+}
+
 /// The lazy, per-language server registry.
 ///
 /// Holds the running servers, the language → ids index, and the restart-backoff
@@ -82,6 +100,10 @@ pub struct Registry {
     /// Ids pruned from the store since the last [`Registry::take_pruned`] —
     /// dead instances whose diagnostics a downstream consumer may still hold.
     pruned: Vec<ServerId>,
+    /// Lifecycle transitions since the last [`Registry::take_lifecycle_events`]
+    /// (issue #520): a name-keyed health signal, distinct from `pruned` (which
+    /// is id-keyed, for the diagnostics-clearing consumer).
+    lifecycle: Vec<(ServerName, ServerLifecycle)>,
     /// Cloned into each spawned server's router so its diagnostics reach the
     /// daemon consumer.
     diagnostics_tx: mpsc::UnboundedSender<(ServerId, PublishDiagnosticsParams)>,
@@ -115,6 +137,7 @@ impl Registry {
             missing_logged: HashSet::new(),
             backoff: HashMap::new(),
             pruned: Vec::new(),
+            lifecycle: Vec::new(),
             diagnostics_tx,
         }
     }
@@ -213,6 +236,8 @@ impl Registry {
             return None;
         }
 
+        self.lifecycle
+            .push((spec.binary, ServerLifecycle::Starting));
         match self.start(spec).await {
             Ok(id) => {
                 // The backoff is NOT cleared here: a successful `initialize` is
@@ -220,11 +245,13 @@ impl Registry {
                 // crash-loops at runtime must stay throttled, so the backoff
                 // clears only once the instance outlives the liveness window —
                 // decided in `note_exit` when it is pruned (issue #273).
+                self.lifecycle.push((spec.binary, ServerLifecycle::Running));
                 Some(id)
             }
             Err(LspError::Spawn { .. }) => {
                 self.log_missing_once(spec.binary);
                 self.bump_backoff(spec.binary);
+                self.lifecycle.push((spec.binary, ServerLifecycle::Crashed));
                 None
             }
             Err(error) => {
@@ -235,6 +262,7 @@ impl Registry {
                     "failed to start language server; will retry on the next matching change"
                 );
                 self.bump_backoff(spec.binary);
+                self.lifecycle.push((spec.binary, ServerLifecycle::Crashed));
                 None
             }
         }
@@ -292,6 +320,8 @@ impl Registry {
                     ids.retain(|other| *other != id);
                 }
                 self.pruned.push(id);
+                self.lifecycle
+                    .push((server.name(), ServerLifecycle::Crashed));
                 let alive = now.saturating_duration_since(server.started_at());
                 self.note_exit(server.name(), alive);
                 info!(
@@ -328,6 +358,18 @@ impl Registry {
     /// updates for the dead ids' paths (issue #427).
     pub fn take_pruned(&mut self) -> Vec<ServerId> {
         std::mem::take(&mut self.pruned)
+    }
+
+    /// Drain the lifecycle transitions recorded since the last call (issue
+    /// #520): `Starting`/`Running` around each (re)start attempted by
+    /// [`Registry::observe`], `Crashed` for a dead instance [`prune_dead`]
+    /// just removed or a (re)start attempt that failed outright. Order is
+    /// preserved (oldest first) so a consumer folding these into a health
+    /// map never applies a stale transition after a fresher one.
+    ///
+    /// [`prune_dead`]: Registry::prune_dead
+    pub fn take_lifecycle_events(&mut self) -> Vec<(ServerName, ServerLifecycle)> {
+        std::mem::take(&mut self.lifecycle)
     }
 
     /// Log a missing binary at most once per binary name.
@@ -531,5 +573,62 @@ mod tests {
             !reg.backoff.contains_key(binary),
             "a server that stayed up clears its backoff"
         );
+    }
+
+    // --- lifecycle events (issue #520) ---
+
+    #[tokio::test]
+    async fn test_observe_failed_start_pushes_starting_then_crashed() {
+        let mut reg = registry(MISSING);
+        reg.observe(Path::new("a.rs")).await;
+        let events = reg.take_lifecycle_events();
+        assert_eq!(
+            events,
+            vec![
+                (MISSING[0].binary, ServerLifecycle::Starting),
+                (MISSING[0].binary, ServerLifecycle::Crashed),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_take_lifecycle_events_drains_and_clears() {
+        let mut reg = registry(MISSING);
+        reg.observe(Path::new("a.rs")).await;
+        assert!(!reg.take_lifecycle_events().is_empty());
+        // Drained: a second call without a new observe yields nothing.
+        assert!(reg.take_lifecycle_events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_observe_reused_live_server_pushes_no_lifecycle_event() {
+        // `MISSING` never actually starts, so this exercises the backoff-skip
+        // path instead: re-observing inside the backoff window must not push
+        // a fresh `Starting`/`Crashed` pair — only the first attempt does.
+        let mut reg = registry(MISSING);
+        reg.observe(Path::new("a.rs")).await;
+        reg.take_lifecycle_events();
+        reg.observe(Path::new("a.rs")).await;
+        assert!(
+            reg.take_lifecycle_events().is_empty(),
+            "a throttled re-observe must not push another transition"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_two_servers_same_language_push_independent_lifecycle_events() {
+        let mut reg = registry(TWO_SAME_LANGUAGE);
+        reg.observe(Path::new("lib.rs")).await;
+        let events = reg.take_lifecycle_events();
+        for spec in TWO_SAME_LANGUAGE {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|(name, _)| *name == spec.binary)
+                    .count(),
+                2,
+                "each binary gets its own Starting + Crashed pair"
+            );
+        }
     }
 }
