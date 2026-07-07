@@ -13,9 +13,9 @@ discriminator. The authoritative definitions live in `crates/protocol/src/lib.rs
 
 ```json
 // client → daemon
-{ "type": "hello",   "version": 6 }
+{ "type": "hello",   "version": 7 }
 // daemon → client
-{ "type": "welcome", "version": 6 }
+{ "type": "welcome", "version": 7 }
 ```
 
 `version` is the wire `PROTOCOL_VERSION`, independent of the crate semver.
@@ -50,7 +50,9 @@ binary, never by tolerating it (`docs/spec-connection-robustness.md`).
   a healthy concurrent connection's stream (relevant for the shared stable+dev
   daemon).
 
-History: version 6 adds the navigation channel's `document_symbol_request` /
+History: version 7 adds the source-control write channel — `stage_file` /
+`unstage_file` / `stage_hunk` / `discard_file` / `commit`, each answered by
+one `git_op_result` (`docs/spec-source-control-write.md`); version 6 adds the navigation channel's `document_symbol_request` /
 `document_symbol_response` pair (`docs/spec-editor-chrome.md`); version 5 removes the tmux status-line CONTENT mirror pair
 `query_status_line` / `status_line_reply` (superseded by the composite status
 line's native segments, `docs/spec-status-line.md`); version 4 adds
@@ -486,6 +488,68 @@ the path is confined to the worktree root exactly like a buffer write (no
 out-of-root carve-out), and the compute runs off the async I/O path via
 `spawn_blocking`.
 
+## Source-control write channel
+
+The write channel is the **sixth request/response family in the protocol**,
+adding stage / unstage / discard / commit and hunk-level stage. Specified by
+`docs/spec-source-control-write.md`.
+
+```json
+// client → daemon
+{ "type": "stage_file",   "path": "src/main.rs" }
+{ "type": "unstage_file", "path": "src/main.rs" }
+{ "type": "stage_hunk",   "path": "src/main.rs", "hunk_id": 1234567890123456789 }
+{ "type": "discard_file", "path": "src/main.rs" }
+{ "type": "commit",       "message": "fix: handle malformed frame" }
+// daemon → client
+{ "type": "git_op_result", "op": { "kind": "stage_file", "path": "src/main.rs" }, "ok": true }
+{ "type": "git_op_result", "op": { "kind": "commit" }, "ok": false, "error": "nothing staged" }
+```
+
+- `stage_file` / `unstage_file` / `discard_file` carry only `path` (relative
+  to the worktree root, the same key space as `WorktreeEntry::path`).
+  `stage_file` writes the current worktree blob into the index (`git add`
+  semantics); `unstage_file` restores the index entry from HEAD;
+  `discard_file` restores the worktree file from the index (checkout-file
+  semantics — unstaged edits reverted, staged content kept; an untracked
+  path is removed). `discard_file` is **destructive**: the client gates it
+  behind an explicit confirm dialog (the #420 pattern) and never batches it.
+- `stage_hunk` carries `path` plus `hunk_id` — the FNV-1a fingerprint (the
+  deploy.rs pattern, `crates/protocol::hunk_fingerprint`) of the `DiffHunk`
+  the client last received from `request_diff`, hashed over the hunk's
+  header numbers and every line's kind and content. The daemon recomputes
+  the file's current hunks fresh and verifies `hunk_id` matches one of them
+  before applying — a stale id (worktree changed since the diff was pushed)
+  or a content-changed id (same shape, different text) is rejected, never
+  fuzzily applied. Application is decompose-and-reapply against the index's
+  already-staged subset; an externally-divergent index is rejected with a
+  clean error naming file-level staging as the fallback.
+- `commit` carries `message` — the whole commit message, no diff of prior
+  state. An empty message or a NOTHING-STAGED index (index tree equals HEAD
+  tree) is rejected with a clean error, never a partial commit.
+- `git_op_result` is the **single reply shape for all five requests**: `op`
+  echoes enough of the request to correlate the reply (tagged by `kind`,
+  mirroring `FileDiffPayload`) — `path` for the file-level ops, `path` +
+  `hunk_id` for `stage_hunk`, no fields for `commit` (a repo-level op, not
+  path-keyed); `ok` is whether the operation succeeded; `error` is a
+  human-readable reason, present only on failure (omitted, never `null`, on
+  success). This is the **only** signal the write path returns over the
+  wire — the resulting state change (staged/unstaged status, working-tree
+  line totals, branch/ahead-behind) is never echoed here; it arrives through
+  the existing push-only git recompute (`update_git_status` / `repo_state`),
+  keeping one source of truth for git state instead of two.
+
+### Daemon-side implementation notes
+
+The protocol types and `hunk_fingerprint` are defined in #543. The
+daemon-side `gix`-backed handlers (`crates/daemon`/`crates/explorer`) for
+`stage_file` / `unstage_file` / `discard_file` / `commit` are a follow-on
+issue (#544); `stage_hunk`'s decompose-and-reapply algorithm is a further
+follow-on (#545). Until then the daemon accepts and silently drops these
+five request variants (the same "defensive no-op, pending a follow-on issue"
+convention the navigation channel used between #193 and #298/#482) — no
+`git_op_result` is sent for them yet.
+
 ## Rules
 
 All message types live in `crates/protocol/`. Adding a new message type is a
@@ -507,9 +571,12 @@ channel** (`open_file` → `file_content`, `save_file` → `save_result` /
 (`hover_request` → `hover_response`, `definition_request` →
 `definition_response`, `references_request` → `references_response`,
 `document_symbol_request` → `document_symbol_response`) for LSP pull
-queries; and the **diff channel** (`request_diff` → `file_diff`) for the
-source-control panel's review diff. The push-only rule governs structure and
-decoration, never request/response pairs.
+queries; the **diff channel** (`request_diff` → `file_diff`) for the
+source-control panel's review diff; and the **write channel**
+(`stage_file` / `unstage_file` / `stage_hunk` / `discard_file` / `commit` →
+one `git_op_result` each) for the source-control panel's mutating
+operations. The push-only rule governs structure and decoration, never
+request/response pairs.
 
 The protocol may migrate to MessagePack if JSON serialization becomes a bottleneck.
 Keep message types serialization-agnostic (derive `serde::Serialize` +

@@ -1039,8 +1039,21 @@ where
                         // single loop (one document model + servers for the
                         // daemon), not per connection. Push-only — no reply here;
                         // diagnostics return on the shared broadcast bus.
+                        //
+                        // The source-control write ops (stage/unstage/discard/
+                        // commit/stage-hunk, #543) are parked here too, pending
+                        // their `gix`-backed handlers (#544, #545) — the same
+                        // "forward to the shared loop, no-op for now" convention
+                        // the navigation channel used between #193 and #298/#482.
+                        // `Core::dispatch`'s defensive no-op arm absorbs them
+                        // until then; no `GitOpResult` is sent yet.
                         ClientMessage::BufferChanged { .. }
-                        | ClientMessage::BufferClosed { .. } => {
+                        | ClientMessage::BufferClosed { .. }
+                        | ClientMessage::StageFile { .. }
+                        | ClientMessage::UnstageFile { .. }
+                        | ClientMessage::StageHunk { .. }
+                        | ClientMessage::DiscardFile { .. }
+                        | ClientMessage::Commit { .. } => {
                             if inbound.send(msg).await.is_err() {
                                 // Dispatch loop gone; nothing left to serve.
                                 break 'serve;
@@ -1594,6 +1607,13 @@ impl Core {
             // `Welcome` must reach exactly one socket, and a version mismatch
             // closes only that connection. These arms are a defensive no-op
             // should one arrive here anyway.
+            //
+            // The source-control write ops (#543) DO reach this loop —
+            // `serve_connection` forwards them here alongside the live-buffer
+            // feed — but their `gix`-backed handlers land in follow-on issues
+            // (#544 file ops, #545 hunk staging), so they are absorbed as a
+            // silent no-op for now, same as `HoverRequest` et al. were between
+            // #193 and #298/#482.
             ClientMessage::Hello { .. }
             | ClientMessage::Attach { .. }
             | ClientMessage::Input { .. }
@@ -1608,7 +1628,12 @@ impl Core {
             | ClientMessage::HoverRequest { .. }
             | ClientMessage::DefinitionRequest { .. }
             | ClientMessage::ReferencesRequest { .. }
-            | ClientMessage::DocumentSymbolRequest { .. } => {}
+            | ClientMessage::DocumentSymbolRequest { .. }
+            | ClientMessage::StageFile { .. }
+            | ClientMessage::UnstageFile { .. }
+            | ClientMessage::StageHunk { .. }
+            | ClientMessage::DiscardFile { .. }
+            | ClientMessage::Commit { .. } => {}
         }
     }
 
