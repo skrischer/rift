@@ -78,10 +78,11 @@ use tracing::{debug, warn};
 use crate::activity_rail;
 use crate::command_palette::{CommandPalette, OpenCommandPalette};
 use crate::diff_view::DiffView;
-use crate::editor::EditorView;
+use crate::editor::{EditorEvent, EditorView};
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::outline_panel::{OutlinePanel, OutlinePanelEvent};
 use crate::problems_panel::{ProblemsPanel, ProblemsPanelEvent};
+use crate::results_panel::{ResultsPanel, ResultsPanelEvent};
 use crate::settings::{OpenSettings, SettingsView};
 use crate::source_control::{SourceControlEvent, SourceControlPanel};
 use crate::status_bar;
@@ -254,6 +255,23 @@ pub struct WorkspaceView {
     /// shown by default (the rail icon that would surface it is a phase-21
     /// follow-up).
     outline_open: bool,
+    /// The results panel (`docs/spec-editor-chrome.md` §3, #529): the right-dock
+    /// list of find-references / multi-target go-to-definition results. Toggled
+    /// into the right dock on demand by [`WorkspaceView::show_results_panel`]
+    /// when the editor emits [`EditorEvent::ShowResults`]. The jump-to-location
+    /// and close wiring subscribes to the local `results_panel` value at
+    /// construction time instead.
+    results_panel: Entity<ResultsPanel>,
+    /// Whether the results panel is currently added to the right dock — the
+    /// source of truth its show/hide toggles flip (`add_panel`/`remove_panel`
+    /// carry no query API). Starts `false`: the panel is opened only by a nav
+    /// result, never by default.
+    results_open: bool,
+    /// Whether [`WorkspaceView::show_results_panel`] was the one to open the
+    /// (collapsed-by-default) right dock — so closing the panel re-collapses it
+    /// only when the panel is why it opened, leaving a user-opened source-control
+    /// dock alone.
+    results_opened_dock: bool,
     /// Language-server health for the composite status line's LSP segment
     /// (`docs/spec-status-line.md`), keyed by stable server name and folded
     /// from the daemon's `LspStatus` push (replayed behind Welcome). Read
@@ -608,6 +626,9 @@ impl WorkspaceView {
         // (`docs/spec-editor-chrome.md`, #530) — the same cache the
         // breadcrumb resolves the enclosing symbol against (#527).
         let outline_panel = cx.new(|cx| OutlinePanel::new(editor.clone(), cx));
+        // The right-dock results panel (`docs/spec-editor-chrome.md` §3, #529):
+        // fed by the editor's nav responses, opened on demand.
+        let results_panel = cx.new(ResultsPanel::new);
 
         // Open-diff wiring (#338): selecting a changed file in the
         // source-control panel opens its diff in the diff view — the clean
@@ -654,6 +675,51 @@ impl WorkspaceView {
                 this.editor.update(cx, |editor, cx| {
                     editor.open_at_range(path.clone(), *range, window, cx);
                 });
+            },
+        )
+        .detach();
+
+        // Results panel (#529): the editor emits `ShowResults` when a
+        // find-references / multi-target definition response lands — feed the
+        // panel and open it in the right dock — and `CloseResults` when Escape
+        // closes it from the editor. Mirrors the panel-toggle wiring above.
+        cx.subscribe_in(
+            &editor,
+            window,
+            |this, _editor, event: &EditorEvent, window, cx| match event {
+                EditorEvent::ShowResults {
+                    kind,
+                    symbol,
+                    locations,
+                } => {
+                    this.results_panel.update(cx, |panel, cx| {
+                        panel.set_results(*kind, symbol.clone(), locations.clone(), cx);
+                    });
+                    this.show_results_panel(window, cx);
+                }
+                EditorEvent::CloseResults => {
+                    this.hide_results_panel(window, cx);
+                }
+            },
+        )
+        .detach();
+
+        // Jump-to-location (#529): selecting a result row emits `OpenLocation`
+        // with the full `NavLocation` (preserving the out-of-root read-only
+        // carve-out, unlike the problems/outline panels' in-worktree jumps);
+        // its × affordance emits `Close`, hiding the panel.
+        cx.subscribe_in(
+            &results_panel,
+            window,
+            |this, _panel, event: &ResultsPanelEvent, window, cx| match event {
+                ResultsPanelEvent::OpenLocation { location } => {
+                    this.editor.update(cx, |editor, cx| {
+                        editor.jump_to_nav_location(location.clone(), window, cx);
+                    });
+                }
+                ResultsPanelEvent::Close => {
+                    this.hide_results_panel(window, cx);
+                }
             },
         )
         .detach();
@@ -757,6 +823,9 @@ impl WorkspaceView {
             problems_panel,
             outline_panel,
             outline_open: false,
+            results_panel,
+            results_open: false,
+            results_opened_dock: false,
             lsp: BTreeMap::new(),
             diff_view,
             open_file_tx,
@@ -902,6 +971,66 @@ impl WorkspaceView {
             }
         });
         self.outline_open = opening;
+    }
+
+    /// Show the results panel in the right dock (`docs/spec-editor-chrome.md`
+    /// §3, #529): add it as a tab (opening the dock, since `DockArea::add_panel`
+    /// does not do that for an already-existing dock) and remember whether we
+    /// were the one to open the dock, so [`WorkspaceView::hide_results_panel`]
+    /// can re-collapse it only when the panel is why it opened. A no-op layout
+    /// change when the panel is already shown (a fresh nav result just repaints
+    /// the already-visible panel).
+    fn show_results_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.results_open {
+            return;
+        }
+        let was_open = self
+            .dock_area
+            .read(cx)
+            .is_dock_open(DockPlacement::Right, cx);
+        let panel: Arc<dyn PanelView> = Arc::new(self.results_panel.clone());
+        self.dock_area.update(cx, |dock_area, cx| {
+            dock_area.add_panel(panel, DockPlacement::Right, None, window, cx);
+            if let Some(right_dock) = dock_area.right_dock().cloned() {
+                right_dock.update(cx, |dock, cx| {
+                    dock.set_open(true, window, cx);
+                });
+            }
+        });
+        self.results_opened_dock = !was_open;
+        self.results_open = true;
+        // `add_panel` moves keyboard focus to the new tab; hand it back to the
+        // editor buffer so a following `Escape` reaches the editor key context.
+        self.editor.update(cx, |editor, cx| {
+            editor.focus_active_input(window, cx);
+        });
+    }
+
+    /// Hide the results panel: remove it from the right dock, re-collapse the
+    /// dock if this panel is why it opened, clear the panel's data, and tell the
+    /// editor so its `Escape` gate stays in sync (#529). A no-op when the panel
+    /// is not shown.
+    fn hide_results_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.results_open {
+            return;
+        }
+        let collapse = self.results_opened_dock;
+        let panel: Arc<dyn PanelView> = Arc::new(self.results_panel.clone());
+        self.dock_area.update(cx, |dock_area, cx| {
+            dock_area.remove_panel(panel, DockPlacement::Right, window, cx);
+            if collapse {
+                if let Some(right_dock) = dock_area.right_dock().cloned() {
+                    right_dock.update(cx, |dock, cx| {
+                        dock.set_open(false, window, cx);
+                    });
+                }
+            }
+        });
+        self.results_open = false;
+        self.results_opened_dock = false;
+        self.results_panel.update(cx, |panel, cx| panel.clear(cx));
+        self.editor
+            .update(cx, |editor, _cx| editor.mark_results_closed());
     }
 
     /// Toggle the problems dock (bottom) hidden/shown (issue #358).
@@ -1826,6 +1955,77 @@ mod tests {
                     left_active_tab_name(&dock_area, cx),
                     Some(crate::file_tree::FILE_TREE_PANEL_NAME),
                     "a second ToggleOutline removes the outline panel, leaving the explorer active"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Results panel (`docs/spec-editor-chrome.md` §3, #529): showing it adds
+    /// its tab to the right dock and opens the (collapsed-by-default) dock;
+    /// hiding it removes the tab and re-collapses the dock, since the panel is
+    /// why the dock opened. The live inner `TabPanel` (not the stale
+    /// construction-time `DockItem::Tabs { items }` snapshot) is read to see the
+    /// added tab, per the outline test's note.
+    #[gpui::test]
+    fn test_show_and_hide_results_panel_toggles_the_right_dock(cx: &mut TestAppContext) {
+        fn right_top_active(dock_area: &Entity<DockArea>, cx: &App) -> Option<&'static str> {
+            let right = dock_area.read(cx).right_dock().expect("right dock exists");
+            match right.read(cx).panel() {
+                DockItem::Split { items, .. } => match items.first() {
+                    Some(DockItem::Tabs { view, .. }) => {
+                        view.read(cx).active_panel(cx).map(|p| p.panel_name(cx))
+                    }
+                    other => panic!("expected the first split item to be tabs, got {other:?}"),
+                },
+                other => panic!("expected the right dock to hold a split, got {other:?}"),
+            }
+        }
+
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let session_view = cx.new(|cx| SessionView::new(cx).0);
+                workspace =
+                    Some(cx.new(|cx| {
+                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
+                    }));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+
+        window
+            .update(cx, |_, window, cx| {
+                let dock_area = workspace.read(cx).dock_area.clone();
+                assert!(
+                    !dock_area.read(cx).is_dock_open(DockPlacement::Right, cx),
+                    "right dock starts collapsed"
+                );
+
+                workspace.update(cx, |view, cx| view.show_results_panel(window, cx));
+                assert!(
+                    dock_area.read(cx).is_dock_open(DockPlacement::Right, cx),
+                    "showing the results panel opens the right dock"
+                );
+                assert!(workspace.read(cx).results_open);
+                assert_eq!(
+                    right_top_active(&dock_area, cx),
+                    Some(crate::results_panel::RESULTS_PANEL_NAME),
+                    "the results tab becomes active in the right dock"
+                );
+
+                workspace.update(cx, |view, cx| view.hide_results_panel(window, cx));
+                assert!(
+                    !dock_area.read(cx).is_dock_open(DockPlacement::Right, cx),
+                    "hiding re-collapses the right dock it opened"
+                );
+                assert!(!workspace.read(cx).results_open);
+                assert_ne!(
+                    right_top_active(&dock_area, cx),
+                    Some(crate::results_panel::RESULTS_PANEL_NAME),
+                    "the results tab is removed on hide"
                 );
             })
             .unwrap();

@@ -98,8 +98,9 @@
 //! is.
 //!
 //! When a `DefinitionResponse` carries multiple targets (e.g. Rust trait impls)
-//! a transient inline jump-list is rendered so the user can click the desired
-//! destination.
+//! the editor emits [`EditorEvent::ShowResults`] so the workspace opens the
+//! right-dock results panel (`docs/spec-editor-chrome.md` §3, #529) with the
+//! targets; the user clicks the desired destination there.
 //!
 //! # Find-references (#198)
 //!
@@ -108,9 +109,10 @@
 //!   dispatches [`ClientMessage::ReferencesRequest`] at the cursor position.
 //! - **Context-menu "Find References"**: same dispatch path.
 //!
-//! The response is applied by [`EditorView::apply_references_response`]. The
-//! results are shown in the same transient inline jump-list the multi-target
-//! definition path uses, so the UX (click-to-jump, back-nav) is identical.
+//! The response is applied by [`EditorView::apply_references_response`], which
+//! emits [`EditorEvent::ShowResults`] so the workspace opens the right-dock
+//! results panel — the same surface the multi-target definition path uses, so
+//! the UX (click-to-jump, back-nav) is identical (#529).
 //!
 //! Stale-response discipline mirrors the definition and hover paths: a
 //! response is matched to whichever tab's `latest_*_id` equals the response's
@@ -175,6 +177,8 @@ use rift_protocol::{
     NavRequestId, Position, Range,
 };
 
+use crate::results_panel::ResultsKind;
+
 /// Stable, distinct dock-panel identity for the editor (`Panel::panel_name`).
 /// Once shipped this must not change — it is the persisted panel identifier.
 pub const EDITOR_PANEL_NAME: &str = "editor";
@@ -217,12 +221,12 @@ pub struct ShowHover;
 #[action(namespace = rift, no_json)]
 pub struct FindReferences;
 
-/// Dismiss the transient references/definitions jump-list overlay without
-/// selecting an entry (#485). Bound to `Escape` in `main.rs`, scoped to the
-/// editor key context; a left click outside the overlay dismisses it too.
+/// Close the references/definitions results panel (`docs/spec-editor-chrome.md`
+/// §3, #529). Bound to `Escape` in `main.rs`, scoped to the editor key context;
+/// propagates when the panel is not open so `Escape` keeps its other meanings.
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = rift, no_json)]
-pub struct DismissJumpList;
+pub struct CloseResultsPanel;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -317,19 +321,23 @@ enum SaveState {
     Failed,
 }
 
-/// One entry in the inline jump-list shown for multi-target definition
-/// responses (e.g. Rust trait method impls) and for find-references results.
-struct JumpEntry {
-    location: NavLocation,
-}
-
-/// The kind of results currently shown in the inline jump-list. Used to
-/// render an appropriate header line in the jump-list overlay.
-enum JumpListKind {
-    /// Multi-target definition results (Rust trait impls etc.).
-    Definitions,
-    /// Find-references results.
-    References,
+/// Events the editor emits for the workspace to route to the right-dock results
+/// panel (`docs/spec-editor-chrome.md` §3, #529). The panel owns both nav
+/// overlay consumers — find-references and multi-target go-to-definition — so
+/// these carry the result set to it and signal when the editor closed it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EditorEvent {
+    /// A references or multi-target definition response arrived: show it in the
+    /// results panel. `symbol` is the searched token (for the chip and the
+    /// per-match highlight), `None` when it could not be resolved.
+    ShowResults {
+        kind: ResultsKind,
+        symbol: Option<SharedString>,
+        locations: Vec<NavLocation>,
+    },
+    /// The user closed the results panel from the editor (Escape); the
+    /// workspace hides the panel.
+    CloseResults,
 }
 
 /// Owned render data for the inline diagnostic card shown under the cursor
@@ -448,12 +456,12 @@ struct EditorTab {
     /// so `GoBack` can reopen it the same way.
     back_stack: VecDeque<(String, EditorPosition, bool)>,
 
-    /// Transient inline jump-list for a multi-target definition response or
-    /// find-references results, scoped to this tab.
-    jump_list: Option<Vec<JumpEntry>>,
-    /// The kind of results currently in `jump_list`. `None` when `jump_list`
-    /// is `None` (the two fields are always set/cleared together).
-    jump_list_kind: Option<JumpListKind>,
+    /// The token under the cursor when this tab last dispatched a definition or
+    /// references request — carried into the results panel as the search-context
+    /// chip and the per-match highlight when the response lands
+    /// (`docs/spec-editor-chrome.md` §3, #529). `None` when no identifier sat at
+    /// the request cursor.
+    nav_symbol: Option<SharedString>,
 
     /// The cached, flattened document-symbol tree for this tab's file, fetched
     /// once per open and per buffer-change debounce (never per keystroke). The
@@ -519,6 +527,13 @@ pub struct EditorView {
     /// paint. One-frame lag matches `range_to_bounds`, which also reads the
     /// previous frame's layout, so the two stay consistent.
     content_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+
+    /// Whether the right-dock results panel is currently showing this editor's
+    /// nav results (`docs/spec-editor-chrome.md` §3, #529). Set when a response
+    /// is emitted to the panel; cleared when the editor closes it (Escape) or
+    /// the workspace reports the panel closed ([`EditorView::mark_results_closed`]).
+    /// Gates whether `Escape` consumes the keystroke or propagates it.
+    results_visible: bool,
 }
 
 impl EditorView {
@@ -547,6 +562,7 @@ impl EditorView {
             nav_tx,
             nav_id: 0,
             content_bounds: Rc::new(Cell::new(None)),
+            results_visible: false,
         }
     }
 
@@ -598,8 +614,7 @@ impl EditorView {
             pending_jump: None,
             pending_restore: None,
             back_stack: VecDeque::new(),
-            jump_list: None,
-            jump_list_kind: None,
+            nav_symbol: None,
             symbols: Vec::new(),
             latest_symbol_id: None,
             diagnostics: Vec::new(),
@@ -633,8 +648,7 @@ impl EditorView {
         tab.base_mtime = None;
         tab.conflict_disk_mtime = None;
         tab.dirty = false;
-        tab.jump_list = None;
-        tab.jump_list_kind = None;
+        tab.nav_symbol = None;
         tab.hover_content = None;
         tab.latest_hover_id = None;
         tab.latest_ref_id = None;
@@ -1319,6 +1333,10 @@ impl EditorView {
         // before the DefinitionRequest.
         self.flush_buffer_feed_if_dirty(index, cx);
 
+        // Capture the searched token now (the response carries no symbol text);
+        // a multi-target reply hands it to the results panel (#529).
+        self.tabs[index].nav_symbol = self.symbol_at_cursor(index, cx);
+
         let position = self.cursor_to_protocol(index, cx);
         self.nav_id = self.nav_id.wrapping_add(1);
         let id = NavRequestId(self.nav_id);
@@ -1344,6 +1362,17 @@ impl EditorView {
             line: pos.line,
             character: pos.character,
         }
+    }
+
+    /// The identifier token under the tab at `index`'s cursor, for the results
+    /// panel's search-context chip and per-match highlight (#529). `None` when
+    /// the cursor sits on no identifier. Read from the live buffer so it matches
+    /// the position the nav request is dispatched at.
+    fn symbol_at_cursor(&self, index: usize, cx: &Context<Self>) -> Option<SharedString> {
+        let input = self.tabs[index].input.read(cx);
+        let pos = input.cursor_position();
+        let text = input.value().to_string();
+        word_at(&text, pos.line, pos.character).map(SharedString::from)
     }
 
     /// Dispatch a `HoverRequest` for the active tab's cursor position (#197).
@@ -1389,10 +1418,9 @@ impl EditorView {
     /// (#198).
     ///
     /// Mirrors [`Self::dispatch_definition_request`]: performs flush-before-
-    /// dispatch, increments `nav_id`, records the tab's `latest_ref_id`, and
-    /// clears any stale jump-list from a previous request. Results are shown
-    /// in the same transient inline jump-list the multi-target definition
-    /// path uses. A no-op unless a tab is loaded.
+    /// dispatch, captures the searched token, increments `nav_id`, and records
+    /// the tab's `latest_ref_id`. The response opens the right-dock results
+    /// panel (#529). A no-op unless a tab is loaded.
     fn dispatch_references_request(&mut self, cx: &mut Context<Self>) {
         let Some(index) = self.active else {
             return;
@@ -1406,10 +1434,9 @@ impl EditorView {
         // LSP must see the live buffer before the `ReferencesRequest` arrives.
         self.flush_buffer_feed_if_dirty(index, cx);
 
-        // Clear any previous jump-list so a stale list is not visible while
-        // the daemon is in flight.
-        self.tabs[index].jump_list = None;
-        self.tabs[index].jump_list_kind = None;
+        // Capture the searched token now for the results panel's chip and
+        // per-match highlight (#529); the response carries no symbol text.
+        self.tabs[index].nav_symbol = self.symbol_at_cursor(index, cx);
 
         let position = self.cursor_to_protocol(index, cx);
         self.nav_id = self.nav_id.wrapping_add(1);
@@ -1498,7 +1525,7 @@ impl EditorView {
     /// Matched to whichever tab's `latest_def_id` equals `id` (drop-stale
     /// discipline generalized across tabs: no match means every issuing tab
     /// has moved on, so the response is dropped). A single target jumps
-    /// directly; multiple targets show that tab's inline jump-list.
+    /// directly; multiple targets open the right-dock results panel (#529).
     pub fn apply_definition_response(
         &mut self,
         id: NavRequestId,
@@ -1521,14 +1548,15 @@ impl EditorView {
                 self.jump_to_location(source_index, target, window, cx);
             }
             _ => {
-                // Multiple targets (e.g. Rust trait impls): show the jump-list.
-                self.tabs[source_index].jump_list = Some(
-                    targets
-                        .into_iter()
-                        .map(|l| JumpEntry { location: l })
-                        .collect(),
-                );
-                self.tabs[source_index].jump_list_kind = Some(JumpListKind::Definitions);
+                // Multiple targets (e.g. Rust trait impls): open the results
+                // panel in the right dock (#529).
+                let symbol = self.tabs[source_index].nav_symbol.clone();
+                self.results_visible = true;
+                cx.emit(EditorEvent::ShowResults {
+                    kind: ResultsKind::Definitions,
+                    symbol,
+                    locations: targets,
+                });
                 cx.notify();
             }
         }
@@ -1558,9 +1586,8 @@ impl EditorView {
     ///
     /// Matched to whichever tab's `latest_ref_id` equals `id` (drop-stale
     /// discipline, mirroring definition and hover). An empty target list is a
-    /// silent no-op (the server found no references). A non-empty list
-    /// populates that tab's inline jump-list with `JumpListKind::References`
-    /// so the render layer shows the "references" header.
+    /// silent no-op (the server found no references). A non-empty list opens
+    /// the right-dock results panel via [`EditorEvent::ShowResults`] (#529).
     pub fn apply_references_response(
         &mut self,
         id: NavRequestId,
@@ -1578,13 +1605,14 @@ impl EditorView {
             return;
         }
 
-        self.tabs[index].jump_list = Some(
-            targets
-                .into_iter()
-                .map(|l| JumpEntry { location: l })
-                .collect(),
-        );
-        self.tabs[index].jump_list_kind = Some(JumpListKind::References);
+        // Open the results panel in the right dock (#529).
+        let symbol = self.tabs[index].nav_symbol.clone();
+        self.results_visible = true;
+        cx.emit(EditorEvent::ShowResults {
+            kind: ResultsKind::References,
+            symbol,
+            locations: targets,
+        });
         cx.notify();
     }
 
@@ -1739,46 +1767,81 @@ impl EditorView {
         }
     }
 
-    /// Select a jump-list entry by index and navigate to it. Called from the
-    /// click handler on the inline jump-list items rendered in `Render`;
-    /// always acts on the active tab, since only the active tab's jump-list
-    /// is ever rendered/clickable.
-    pub fn select_jump_entry(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(active) = self.active else {
-            return;
-        };
-        let Some(list) = self.tabs[active].jump_list.take() else {
-            return;
-        };
-        self.tabs[active].jump_list_kind = None;
-        if let Some(entry) = list.into_iter().nth(index) {
-            self.jump_to_location(active, entry.location, window, cx);
+    /// Jump to a full [`NavLocation`] from the results panel (#529), preserving
+    /// its out-of-root read-only carve-out (unlike [`Self::open_at_range`],
+    /// which only serves in-worktree targets). Routes through the same
+    /// [`Self::jump_to_location`] back-stack machinery, then returns keyboard
+    /// focus to the landed buffer so a following `Escape` reaches the editor
+    /// key context and closes the panel.
+    pub fn jump_to_nav_location(
+        &mut self,
+        location: NavLocation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.active {
+            Some(source_index) => self.jump_to_location(source_index, location, window, cx),
+            None => {
+                // No tab open yet — nothing to record as a back-entry; open-or-
+                // switch straight to the destination, mirroring the None branch
+                // of `open_at_range`.
+                let read_only = location.out_of_root;
+                let path = location.path.clone();
+                let is_new = self.open_or_switch(
+                    location.path,
+                    read_only,
+                    Some(location.range),
+                    None,
+                    window,
+                    cx,
+                );
+                if is_new {
+                    if let Err(e) = self.open_file_tx.try_send(path.clone()) {
+                        tracing::debug!(error = %e, %path, "failed to enqueue results-panel open");
+                    }
+                }
+            }
+        }
+        if let Some(active) = self.active {
+            self.tabs[active].input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
         }
     }
 
-    /// Dismiss the active tab's jump-list overlay without selecting an entry
-    /// (#485). Both dismiss paths land here: `Escape` (via the
-    /// [`DismissJumpList`] action) and a left click outside the overlay (the
-    /// root mouse-down handler; clicks inside the overlay stop propagation
-    /// before reaching it). Hands focus back to the editor buffer so the
-    /// keyboard keeps working where the user was. Returns `false` when no
-    /// overlay was visible, so the action handler can let `Escape` propagate
-    /// to any other meaning instead of swallowing it.
-    fn dismiss_jump_list(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(active) = self.active else {
-            return false;
-        };
-        let tab = &mut self.tabs[active];
-        if tab.jump_list.is_none() {
+    /// Close the results panel from the editor (Escape). Returns `false` when
+    /// the panel is not open, so the action handler lets `Escape` propagate to
+    /// any other meaning instead of swallowing it. When open, clears the flag,
+    /// emits [`EditorEvent::CloseResults`] for the workspace to hide the panel,
+    /// and reports `true`.
+    fn close_results_panel(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.results_visible {
             return false;
         }
-        tab.jump_list = None;
-        tab.jump_list_kind = None;
-        tab.input.update(cx, |input, cx| {
-            input.focus(window, cx);
-        });
+        self.results_visible = false;
+        cx.emit(EditorEvent::CloseResults);
         cx.notify();
         true
+    }
+
+    /// Reset the results-visible flag when the workspace reports the panel was
+    /// closed elsewhere (its × affordance), keeping the editor's `Escape` gate
+    /// in sync. Idempotent.
+    pub fn mark_results_closed(&mut self) {
+        self.results_visible = false;
+    }
+
+    /// Move keyboard focus to the active tab's buffer (or the editor's fallback
+    /// handle while no tab is open). The workspace calls this after opening the
+    /// results panel, whose `add_panel` steals focus, so a following `Escape`
+    /// still reaches the editor key context (#529).
+    pub fn focus_active_input(&self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.active_tab() {
+            Some(tab) => tab.input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            }),
+            None => self.focus_handle.focus(window, cx),
+        }
     }
 
     // ── Tab bar: switch / close (#352, #354) ──────────────────────────────
@@ -1933,6 +1996,7 @@ impl Focusable for EditorView {
 }
 
 impl EventEmitter<PanelEvent> for EditorView {}
+impl EventEmitter<EditorEvent> for EditorView {}
 
 impl Panel for EditorView {
     fn panel_name(&self) -> &'static str {
@@ -1995,66 +2059,6 @@ impl Render for EditorView {
             SaveState::Failed => Some(("Save failed".to_owned(), cx.theme().danger)),
         };
         let has_conflict = matches!(tab.save_state, SaveState::Conflict);
-
-        // Inline jump-list for multi-target definition responses and find-references
-        // results (#196, #198). The header label differs by kind; entries are
-        // identical in both cases (path:line + preview, click to jump).
-        let jump_list_element = tab.jump_list.as_ref().map(|list| {
-            let header = match tab.jump_list_kind {
-                Some(JumpListKind::References) => "References — click to jump:",
-                Some(JumpListKind::Definitions) | None => "Multiple definitions — click to jump:",
-            };
-            let entries: Vec<_> = list
-                .iter()
-                .enumerate()
-                .map(|(i, entry)| {
-                    let preview = entry.location.line_preview.clone().unwrap_or_default();
-                    let path = entry.location.path.clone();
-                    let line = entry.location.range.start.line + 1;
-                    let label = format!("{path}:{line}  {preview}");
-                    div()
-                        .px(px(8.0))
-                        .py(px(2.0))
-                        .text_xs()
-                        .text_color(cx.theme().foreground)
-                        .cursor_pointer()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
-                                this.select_jump_entry(i, window, cx);
-                            }),
-                        )
-                        .child(label)
-                })
-                .collect();
-
-            div()
-                .absolute()
-                .top(px(0.0))
-                .left(px(0.0))
-                .right(px(0.0))
-                .bg(cx.theme().popover)
-                .border_b_1()
-                .border_color(cx.theme().border)
-                .shadow_md()
-                // Swallow left clicks inside the overlay (#485): an entry's
-                // own handler has already run (children dispatch first in the
-                // bubble phase); stopping here keeps the click from reaching
-                // the root's click-outside dismissal and from moving the text
-                // cursor in the input underneath.
-                .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-                    cx.stop_propagation();
-                })
-                .child(
-                    div()
-                        .px(px(8.0))
-                        .py(px(4.0))
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(header),
-                )
-                .children(entries)
-        });
 
         // Build the `Input` widget. The context-menu builder is called each
         // time the user right-clicks; it receives a fresh `PopupMenu`.
@@ -2442,17 +2446,17 @@ impl Render for EditorView {
             .on_action(cx.listener(|this, _: &FindReferences, _window, cx| {
                 this.dispatch_references_request(cx);
             }))
-            .on_action(cx.listener(|this, _: &DismissJumpList, window, cx| {
-                // Escape dismisses the jump-list overlay (#485). With no
-                // overlay visible the keystroke propagates on, keeping any
-                // other Escape meaning intact.
-                if !this.dismiss_jump_list(window, cx) {
+            .on_action(cx.listener(|this, _: &CloseResultsPanel, _window, cx| {
+                // Escape closes the results panel (#529). With no panel open the
+                // keystroke propagates on, keeping any other Escape meaning
+                // intact.
+                if !this.close_results_panel(cx) {
                     cx.propagate();
                 }
             }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
                     // Dismiss any visible hover popover on click and cancel any
                     // in-flight hover request so a delayed response does not
                     // re-open the popover after the user clicked away.
@@ -2464,11 +2468,6 @@ impl Render for EditorView {
                             cx.notify();
                         }
                     }
-                    // Click-outside dismissal for the jump-list overlay
-                    // (#485): clicks inside the overlay stop propagation
-                    // before reaching this bubble-phase handler, so any left
-                    // click landing here is outside it.
-                    this.dismiss_jump_list(window, cx);
                     if event.modifiers.secondary() {
                         // Cursor is already at the clicked position (InputState
                         // processed the event first in its own update cycle).
@@ -2661,14 +2660,10 @@ impl Render for EditorView {
             );
         }
 
-        if let Some(jump_list_el) = jump_list_element {
-            editor_area = editor_area.child(jump_list_el);
-        }
-
-        // Hover popover (#197): rendered last so it paints above the editor
-        // and the jump-list. Uses absolute positioning anchored to the bottom
-        // of the editor area — this positions the popover below the current
-        // viewport and above any status bars, matching VS Code's hover panel.
+        // Hover popover (#197): rendered last so it paints above the editor.
+        // Uses absolute positioning anchored to the bottom of the editor area —
+        // this positions the popover below the current viewport and above any
+        // status bars, matching VS Code's hover panel.
         if let Some(popover) = hover_popover_element {
             editor_area = editor_area.child(popover);
         }
@@ -2721,6 +2716,41 @@ fn find_open_tab_index<'a>(
     path: &str,
 ) -> Option<usize> {
     open_paths.position(|p| p == path)
+}
+
+/// The identifier token straddling `(line, character)` in `text`, for the
+/// results panel's search-context chip (#529). A token is a maximal run of
+/// alphanumeric-or-underscore Unicode scalar values; `character` is a
+/// zero-based scalar offset into the line (the editor's cursor convention). The
+/// cursor sitting at a token's trailing edge (offset == token end) still
+/// resolves that token, matching how a double-click or `Shift+F12` lands there.
+/// `None` when the position falls on no token (out-of-range line, past the line
+/// end, or on a non-word character with no adjacent word char).
+fn word_at(text: &str, line: u32, character: u32) -> Option<String> {
+    let line_str = text.lines().nth(line as usize)?;
+    let chars: Vec<char> = line_str.chars().collect();
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let cursor = character as usize;
+
+    // The token may be the run at the cursor, or (when the cursor rests just
+    // past a token) the run ending immediately to its left.
+    let anchor = if chars.get(cursor).is_some_and(|&c| is_word(c)) {
+        cursor
+    } else if cursor > 0 && chars.get(cursor - 1).is_some_and(|&c| is_word(c)) {
+        cursor - 1
+    } else {
+        return None;
+    };
+
+    let mut start = anchor;
+    while start > 0 && chars.get(start - 1).is_some_and(|&c| is_word(c)) {
+        start -= 1;
+    }
+    let mut end = anchor + 1;
+    while chars.get(end).is_some_and(|&c| is_word(c)) {
+        end += 1;
+    }
+    Some(chars[start..end].iter().collect())
 }
 
 /// Decide whether closing a tab must prompt for confirmation before
@@ -4661,14 +4691,49 @@ mod tests {
         }
     }
 
-    /// Acceptance (#485): dismissing the visible jump-list overlay (Escape /
-    /// click-outside both land in `dismiss_jump_list`) clears it without
-    /// jumping and hands focus back to the editor buffer.
+    // --- word_at (search-context token) ---
+
+    #[test]
+    fn test_word_at_resolves_the_identifier_under_the_cursor() {
+        let text = "let value = other;\nfn run() {}";
+        // Inside the token, and at its trailing edge (cursor just past it).
+        assert_eq!(word_at(text, 0, 4).as_deref(), Some("value"));
+        assert_eq!(word_at(text, 0, 9).as_deref(), Some("value"));
+        // A token on the second line resolves against that line only.
+        assert_eq!(word_at(text, 1, 4).as_deref(), Some("run"));
+    }
+
+    #[test]
+    fn test_word_at_handles_unicode_and_malformed_positions() {
+        // A multibyte identifier resolves whole (scalar offsets, not bytes).
+        assert_eq!(word_at("café x", 0, 0).as_deref(), Some("café"));
+        // On an operator with spaces on both sides — no token.
+        assert_eq!(word_at("let x = 1;", 0, 6), None);
+        // Past the line end, an out-of-range line, and an empty buffer.
+        assert_eq!(word_at("abc", 0, 99), None);
+        assert_eq!(word_at("abc", 5, 0), None);
+        assert_eq!(word_at("", 0, 0), None);
+    }
+
+    // --- results-panel wiring (#529) ---
+
+    /// A find-references response opens the results panel: it marks the editor's
+    /// results-visible flag and emits a single `ShowResults` carrying the kind,
+    /// the searched symbol, and every location.
     #[gpui::test]
-    fn test_dismiss_jump_list_with_visible_overlay_clears_it_and_focuses_editor(
-        cx: &mut TestAppContext,
-    ) {
+    fn test_apply_references_response_opens_the_results_panel(cx: &mut TestAppContext) {
         let (editor, window, _open_file_rx) = build_test_editor(cx);
+        let events: Rc<std::cell::RefCell<Vec<EditorEvent>>> = Rc::new(Default::default());
+
+        {
+            let sink = events.clone();
+            cx.update(|cx| {
+                cx.subscribe(&editor, move |_editor, event: &EditorEvent, _cx| {
+                    sink.borrow_mut().push(event.clone());
+                })
+                .detach();
+            });
+        }
 
         window
             .update(cx, |_, window, cx| {
@@ -4676,59 +4741,164 @@ mod tests {
                     let a = editor.push_tab("a.rs".into(), false, window, cx);
                     editor.tabs[a].load_state = TabLoadState::Loaded;
                     editor.active = Some(a);
-
-                    // Populate the overlay the way the real flow does: a
-                    // references response matching the tab's in-flight id.
                     editor.tabs[a].latest_ref_id = Some(NavRequestId(1));
+                    editor.tabs[a].nav_symbol = Some("foo".into());
                     editor.apply_references_response(
                         NavRequestId(1),
                         vec![jump_target("a.rs", 1), jump_target("b.rs", 2)],
                         cx,
                     );
-                    assert!(editor.tabs[a].jump_list.is_some(), "overlay is visible");
-                });
-
-                // Focus sits elsewhere; the dismissal must hand it back to
-                // the editor buffer.
-                let elsewhere = cx.focus_handle();
-                window.focus(&elsewhere, cx);
-
-                editor.update(cx, |editor, cx| {
                     assert!(
-                        editor.dismiss_jump_list(window, cx),
-                        "a visible overlay reports dismissed"
+                        editor.results_visible,
+                        "a references response opens the panel"
                     );
-                    assert!(editor.tabs[0].jump_list.is_none());
-                    assert!(editor.tabs[0].jump_list_kind.is_none());
                 });
-
-                let input_handle = editor.read(cx).tabs[0].input.focus_handle(cx);
-                assert!(
-                    window.focused(cx).is_some_and(|f| f == input_handle),
-                    "dismissal must return focus to the editor buffer"
-                );
             })
             .unwrap();
+
+        let events = events.borrow();
+        assert_eq!(events.len(), 1, "exactly one ShowResults is emitted");
+        match &events[0] {
+            EditorEvent::ShowResults {
+                kind,
+                symbol,
+                locations,
+            } => {
+                assert_eq!(*kind, ResultsKind::References);
+                assert_eq!(symbol.as_deref(), Some("foo"));
+                assert_eq!(locations.len(), 2);
+            }
+            other => panic!("expected ShowResults, got {other:?}"),
+        }
     }
 
-    /// With no overlay visible `dismiss_jump_list` reports `false`, so the
-    /// Escape action handler propagates the keystroke instead of swallowing
-    /// it — with or without an open tab.
+    /// A multi-target definition response opens the panel; a single-target one
+    /// jumps in place and emits no panel event.
     #[gpui::test]
-    fn test_dismiss_jump_list_without_overlay_reports_nothing_dismissed(cx: &mut TestAppContext) {
+    fn test_definition_response_multi_opens_panel_single_jumps(cx: &mut TestAppContext) {
         let (editor, window, _open_file_rx) = build_test_editor(cx);
+        let events: Rc<std::cell::RefCell<Vec<EditorEvent>>> = Rc::new(Default::default());
+
+        {
+            let sink = events.clone();
+            cx.update(|cx| {
+                cx.subscribe(&editor, move |_editor, event: &EditorEvent, _cx| {
+                    sink.borrow_mut().push(event.clone());
+                })
+                .detach();
+            });
+        }
 
         window
             .update(cx, |_, window, cx| {
                 editor.update(cx, |editor, cx| {
-                    assert!(!editor.dismiss_jump_list(window, cx), "no tab open");
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    editor.tabs[a].load_state = TabLoadState::Loaded;
+                    editor.active = Some(a);
+
+                    // Multi-target (same file, so no cross-file open): opens the panel.
+                    editor.tabs[a].latest_def_id = Some(NavRequestId(1));
+                    editor.apply_definition_response(
+                        NavRequestId(1),
+                        vec![jump_target("a.rs", 1), jump_target("a.rs", 5)],
+                        window,
+                        cx,
+                    );
+                    assert!(editor.results_visible, "multiple targets open the panel");
+
+                    // Single target: jumps in place, no panel.
+                    editor.mark_results_closed();
+                    editor.tabs[a].latest_def_id = Some(NavRequestId(2));
+                    editor.apply_definition_response(
+                        NavRequestId(2),
+                        vec![jump_target("a.rs", 9)],
+                        window,
+                        cx,
+                    );
+                    assert!(
+                        !editor.results_visible,
+                        "a single target jumps without opening the panel"
+                    );
+                });
+            })
+            .unwrap();
+
+        let events = events.borrow();
+        assert_eq!(
+            events.len(),
+            1,
+            "only the multi-target response opens the panel"
+        );
+        assert!(matches!(
+            events[0],
+            EditorEvent::ShowResults {
+                kind: ResultsKind::Definitions,
+                ..
+            }
+        ));
+    }
+
+    /// `close_results_panel` consumes `Escape` only while the panel is open
+    /// (emitting `CloseResults`), and `mark_results_closed` keeps the flag in
+    /// sync when the workspace closes the panel via its × affordance.
+    #[gpui::test]
+    fn test_close_results_panel_gates_escape_and_syncs_with_the_workspace(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+        let events: Rc<std::cell::RefCell<Vec<EditorEvent>>> = Rc::new(Default::default());
+
+        {
+            let sink = events.clone();
+            cx.update(|cx| {
+                cx.subscribe(&editor, move |_editor, event: &EditorEvent, _cx| {
+                    sink.borrow_mut().push(event.clone());
+                })
+                .detach();
+            });
+        }
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    // No panel open: Escape propagates (reports nothing closed).
+                    assert!(!editor.close_results_panel(cx), "nothing to close");
 
                     let a = editor.push_tab("a.rs".into(), false, window, cx);
                     editor.tabs[a].load_state = TabLoadState::Loaded;
                     editor.active = Some(a);
-                    assert!(!editor.dismiss_jump_list(window, cx), "no overlay visible");
+
+                    editor.tabs[a].latest_ref_id = Some(NavRequestId(1));
+                    editor.apply_references_response(
+                        NavRequestId(1),
+                        vec![jump_target("a.rs", 1)],
+                        cx,
+                    );
+                    assert!(
+                        editor.close_results_panel(cx),
+                        "an open panel is closed and consumes Escape"
+                    );
+                    assert!(!editor.results_visible);
+                    // Idempotent: a second Escape now propagates.
+                    assert!(!editor.close_results_panel(cx));
+
+                    // A workspace-side (× affordance) close keeps the flag synced.
+                    editor.tabs[a].latest_ref_id = Some(NavRequestId(2));
+                    editor.apply_references_response(
+                        NavRequestId(2),
+                        vec![jump_target("a.rs", 1)],
+                        cx,
+                    );
+                    assert!(editor.results_visible);
+                    editor.mark_results_closed();
+                    assert!(!editor.results_visible);
                 });
             })
             .unwrap();
+
+        // ShowResults (open) → CloseResults (editor Escape) → ShowResults (reopen).
+        let events = events.borrow();
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[0], EditorEvent::ShowResults { .. }));
+        assert!(matches!(events[1], EditorEvent::CloseResults));
+        assert!(matches!(events[2], EditorEvent::ShowResults { .. }));
     }
 }
