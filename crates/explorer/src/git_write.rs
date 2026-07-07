@@ -32,7 +32,8 @@ use gix::bstr::{BStr, BString};
 use gix::index::entry::{Flags, Mode, Stage, Stat};
 use gix::objs::tree::EntryKind;
 
-use crate::{ExplorerError, Result};
+use crate::diff::{diff_bytes, head_blob, read_worktree, split_lines};
+use crate::{DiffHunk, ExplorerError, FileDiff, Result};
 
 /// How long to wait before the single retry when `.git/index.lock` is already
 /// held (a live agent writing concurrently) before the op errors out.
@@ -169,6 +170,183 @@ pub fn commit(root: &Path, message: &str) -> Result<()> {
     repo.commit("HEAD", message, tree_id, parents)
         .map_err(git_err("commit"))?;
     Ok(())
+}
+
+/// Stage exactly one hunk of `relative`'s worktree-vs-HEAD diff — the
+/// decompose-and-reapply algorithm (`docs/spec-source-control-write.md`). The
+/// displayed hunks are worktree-vs-HEAD while the write target is the index,
+/// so the bases are reconciled against the HEAD blob:
+///
+/// 1. recompute the file's current worktree-vs-HEAD hunks fresh and locate
+///    `selected` among them (verifying content identity — a hunk that no longer
+///    matches is rejected as stale, never fuzzily applied);
+/// 2. recover the already-staged subset `S` by diffing index-vs-HEAD and
+///    require every `S` hunk to decompose into a whole current hunk (an index
+///    modified externally / staged-then-edited does not decompose and is
+///    rejected, naming file-level staging as the fallback);
+/// 3. the new index content is `apply(HEAD, S ∪ {selected})` — real HEAD /
+///    worktree line bytes are spliced by the hunks' line numbers, so the
+///    trailing-newline (`\ No newline at end of file`) case round-trips exactly.
+///
+/// When the resulting content equals the whole worktree file (the selected hunk
+/// was the last unstaged one), staging is delegated to [`stage_file`] so index
+/// filters and a staged deletion are handled identically to whole-file staging.
+/// This keeps every hunk stageable after the first and never mis-addresses a
+/// divergent index.
+pub fn stage_hunk(root: &Path, relative: &Path, selected: &DiffHunk) -> Result<()> {
+    let repo = open(root)?;
+    let rela = rela_path(relative);
+    let mut index = repo.open_index().map_err(git_err("open index"))?;
+
+    let head_bytes = head_blob(&repo, relative)?;
+    let worktree_bytes = read_worktree(root, relative)?;
+    let (index_bytes, index_mode) = match index.entry_by_path(rela.as_ref()) {
+        Some(entry) => (read_blob(&repo, entry.id, relative)?, Some(entry.mode)),
+        None => (Vec::new(), None),
+    };
+
+    // (1) The file's current hunks. Binary / oversized content has no line
+    // hunks to stage.
+    let current = match diff_bytes(&head_bytes, &worktree_bytes, relative)? {
+        FileDiff::Hunks(hunks) => hunks,
+        FileDiff::Binary | FileDiff::TooLarge => {
+            return Err(ExplorerError::GitError(format!(
+                "cannot stage a hunk of a binary or oversized file: {}",
+                relative.display()
+            )));
+        }
+    };
+    let selected_index = current
+        .iter()
+        .position(|hunk| hunk == selected)
+        .ok_or_else(|| {
+            ExplorerError::GitError(format!(
+                "the selected hunk is no longer part of {}'s changes (the file changed \
+             since the diff was computed)",
+                relative.display()
+            ))
+        })?;
+
+    // (2) The already-staged subset S (index-vs-HEAD), decomposed into whole
+    // current hunks. Any staged change that is not a whole current hunk means
+    // the index diverged from a plain hunk-by-hunk history.
+    let staged = match diff_bytes(&head_bytes, &index_bytes, relative)? {
+        FileDiff::Hunks(hunks) => hunks,
+        FileDiff::Binary | FileDiff::TooLarge => {
+            return Err(divergent_index_error(relative));
+        }
+    };
+    let mut applied = vec![false; current.len()];
+    for staged_hunk in &staged {
+        match current.iter().position(|hunk| same_edit(hunk, staged_hunk)) {
+            Some(idx) => applied[idx] = true,
+            None => return Err(divergent_index_error(relative)),
+        }
+    }
+
+    // (3) new content = apply(HEAD, S ∪ {selected}).
+    applied[selected_index] = true;
+    let target = apply_hunk_subset(&head_bytes, &worktree_bytes, &current, &applied);
+
+    // The selected hunk was the last unstaged one: the index would now match the
+    // whole worktree file. Delegate to `stage_file` so autocrlf/clean filters
+    // and a staged deletion are handled exactly as whole-file staging is.
+    if target == worktree_bytes {
+        return stage_file(root, relative);
+    }
+
+    let mode = index_mode
+        .or_else(|| head_entry_mode(&repo, relative).ok().flatten())
+        .unwrap_or(Mode::FILE);
+    let blob = repo
+        .write_blob(&target)
+        .map_err(git_err("write hunk blob"))?;
+    set_index_entry(&mut index, rela.as_ref(), blob.detach(), mode);
+    index.remove_tree();
+    write_index(&mut index)
+}
+
+/// Whether two hunks encode the same edit. `S` (index-vs-HEAD) and the current
+/// hunks (worktree-vs-HEAD) share the HEAD-relative old side, but their new-side
+/// *positions* differ (index vs worktree line numbering), so `new_start` is
+/// excluded — the old-side region plus the line sequence (kind + content) and
+/// new-side length fully identify the edit.
+fn same_edit(a: &DiffHunk, b: &DiffHunk) -> bool {
+    a.old_start == b.old_start
+        && a.old_len == b.old_len
+        && a.new_len == b.new_len
+        && a.lines == b.lines
+}
+
+/// Apply the `applied`-selected subset of `hunks` to `head`, producing the new
+/// blob content. Each hunk's old-side region (`[old_start-1, +old_len)` into
+/// `head`'s lines) is replaced by the worktree new-side region
+/// (`[new_start-1, +new_len)`) when selected, or copied unchanged from `head`
+/// when not. Real line bytes are spliced (never reconstructed from the hunk's
+/// newline-stripped content), so terminators — including a missing final
+/// newline — survive exactly. Applying every hunk reproduces `worktree` byte
+/// for byte.
+fn apply_hunk_subset(
+    head: &[u8],
+    worktree: &[u8],
+    hunks: &[DiffHunk],
+    applied: &[bool],
+) -> Vec<u8> {
+    let head_lines = split_lines(head);
+    let worktree_lines = split_lines(worktree);
+    let mut out = Vec::with_capacity(worktree.len().max(head.len()));
+    let mut cursor = 0usize;
+    for (i, hunk) in hunks.iter().enumerate() {
+        let before_start = hunk.old_start.saturating_sub(1) as usize;
+        let before_len = hunk.old_len as usize;
+        for &line in &head_lines[cursor..before_start] {
+            out.extend_from_slice(line);
+        }
+        if applied[i] {
+            let after_start = hunk.new_start.saturating_sub(1) as usize;
+            let after_len = hunk.new_len as usize;
+            for &line in &worktree_lines[after_start..after_start + after_len] {
+                out.extend_from_slice(line);
+            }
+        } else {
+            for &line in &head_lines[before_start..before_start + before_len] {
+                out.extend_from_slice(line);
+            }
+        }
+        cursor = before_start + before_len;
+    }
+    for &line in &head_lines[cursor..] {
+        out.extend_from_slice(line);
+    }
+    out
+}
+
+/// The index mode HEAD records for `relative`, or `None` when the path is new to
+/// HEAD — the mode fallback for a synthesized partial-stage blob whose path has
+/// no index entry yet.
+fn head_entry_mode(repo: &gix::Repository, relative: &Path) -> Result<Option<Mode>> {
+    let head_tree = repo
+        .head_tree_id_or_empty()
+        .map_err(git_err("head tree"))?
+        .object()
+        .map_err(git_err("read head tree"))?
+        .try_into_tree()
+        .map_err(git_err("head is not a tree"))?;
+    Ok(head_tree
+        .lookup_entry_by_path(relative)
+        .map_err(|e| path_err("head lookup", relative, e))?
+        .map(|entry| kind_to_mode(entry.mode().kind())))
+}
+
+/// The rejection returned when the staged index does not decompose into whole
+/// current hunks — its message names file-level staging as the fallback.
+fn divergent_index_error(relative: &Path) -> ExplorerError {
+    ExplorerError::GitError(format!(
+        "cannot stage a single hunk of {}: its staged changes were not made \
+         hunk-by-hunk (an external `git add` or a staged-then-edited file). \
+         Stage the whole file instead.",
+        relative.display()
+    ))
 }
 
 /// Build a tree object from every entry in `index` via the tree editor, seeded
@@ -749,6 +927,214 @@ mod tests {
             Path::new("tracked.txt"),
             "restored to the index target"
         );
+    }
+
+    /// The file's current worktree-vs-HEAD hunks — the client's view, the pool a
+    /// `selected` hunk is drawn from.
+    fn hunks_of(root: &Path, rel: &str) -> Vec<DiffHunk> {
+        match crate::compute_diff(root, Path::new(rel)).expect("compute diff") {
+            FileDiff::Hunks(hunks) => hunks,
+            other => panic!("expected Hunks, got {other:?}"),
+        }
+    }
+
+    /// The exact bytes staged for `rel` (the index blob), read raw via
+    /// `git cat-file` — no smudge filters, so trailing-newline state is exact.
+    fn staged_blob(root: &Path, rel: &str) -> Vec<u8> {
+        git(root, &["cat-file", "blob", &format!(":{rel}")]).stdout
+    }
+
+    /// A repo with a committed 20-line file (`multi.txt`, lines `l01..l20`), the
+    /// base for the multi-hunk staging fixtures.
+    fn init_multi_hunk_repo(tag: &str) -> TempDir {
+        let tmp = init_repo(tag);
+        let mut content = String::new();
+        for n in 1..=20 {
+            content.push_str(&format!("l{n:02}\n"));
+        }
+        write(&tmp.path.join("multi.txt"), content.as_bytes());
+        git(&tmp.path, &["add", "multi.txt"]);
+        git(&tmp.path, &["commit", "-q", "-m", "add multi"]);
+        tmp
+    }
+
+    #[test]
+    fn test_stage_one_hunk_of_two_lands_only_that_hunk() {
+        // Two far-apart edits (lines 2 and 18) form two hunks. Staging the first
+        // must land exactly it: the index gets line 2's edit, line 18 stays HEAD.
+        let repo = init_multi_hunk_repo("hunk-first");
+        let mut lines: Vec<String> = (1..=20).map(|n| format!("l{n:02}")).collect();
+        lines[1] = "SECOND".to_owned();
+        lines[17] = "EIGHTEEN".to_owned();
+        let worktree = format!("{}\n", lines.join("\n"));
+        write(&repo.path.join("multi.txt"), worktree.as_bytes());
+
+        let hunks = hunks_of(&repo.path, "multi.txt");
+        assert_eq!(hunks.len(), 2, "two far-apart edits are two hunks");
+
+        stage_hunk(&repo.path, Path::new("multi.txt"), &hunks[0]).expect("stage first hunk");
+
+        let mut expected: Vec<String> = (1..=20).map(|n| format!("l{n:02}")).collect();
+        expected[1] = "SECOND".to_owned(); // only the first hunk applied
+        let expected = format!("{}\n", expected.join("\n"));
+        assert_eq!(
+            staged_blob(&repo.path, "multi.txt"),
+            expected.as_bytes(),
+            "index carries only the first hunk"
+        );
+        // The second hunk is still fully stageable afterwards.
+        let after = hunks_of(&repo.path, "multi.txt");
+        assert_eq!(after.len(), 2, "both hunks still render against HEAD");
+    }
+
+    #[test]
+    fn test_stage_both_hunks_in_sequence_lands_both_exactly() {
+        // Stage hunk A, then hunk B: after both, the index equals the whole
+        // worktree, and each landed exactly (the decompose-and-reapply keeps the
+        // first staged hunk while adding the second).
+        let repo = init_multi_hunk_repo("hunk-sequence");
+        let mut lines: Vec<String> = (1..=20).map(|n| format!("l{n:02}")).collect();
+        lines[1] = "SECOND".to_owned();
+        lines[17] = "EIGHTEEN".to_owned();
+        let worktree = format!("{}\n", lines.join("\n"));
+        write(&repo.path.join("multi.txt"), worktree.as_bytes());
+
+        let hunks = hunks_of(&repo.path, "multi.txt");
+        stage_hunk(&repo.path, Path::new("multi.txt"), &hunks[0]).expect("stage hunk A");
+        // Recompute fresh (the client re-pulls the diff) and stage the other one.
+        let hunks = hunks_of(&repo.path, "multi.txt");
+        stage_hunk(&repo.path, Path::new("multi.txt"), &hunks[1]).expect("stage hunk B");
+
+        assert_eq!(
+            staged_blob(&repo.path, "multi.txt"),
+            worktree.as_bytes(),
+            "both hunks staged: index equals the worktree"
+        );
+        assert_eq!(
+            entry(&repo.path, "multi.txt"),
+            Some(crate::GitEntryStatus {
+                index: GitStatusCode::Modified,
+                worktree: GitStatusCode::Unmodified,
+            }),
+            "the file is fully staged, worktree side clean"
+        );
+    }
+
+    #[test]
+    fn test_stage_hunk_preserves_trailing_newline_of_unstaged_region() {
+        // A file whose last line loses its final newline in the worktree, plus a
+        // first-line edit — two adjacent hunks. Staging ONLY the first must keep
+        // HEAD's trailing newline on the untouched last line.
+        let repo = init_repo("hunk-keep-eol");
+        // Twelve lines so the first-line edit and the trailing-newline drop are
+        // more than 2*context apart and stay two distinct hunks.
+        write(
+            &repo.path.join("eol.txt"),
+            b"a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n",
+        );
+        git(&repo.path, &["add", "eol.txt"]);
+        git(&repo.path, &["commit", "-q", "-m", "add eol"]);
+        // line 1 a->A, and drop the final newline after l.
+        write(
+            &repo.path.join("eol.txt"),
+            b"A\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl",
+        );
+
+        let hunks = hunks_of(&repo.path, "eol.txt");
+        assert_eq!(
+            hunks.len(),
+            2,
+            "the edit and the newline drop are two hunks"
+        );
+
+        stage_hunk(&repo.path, Path::new("eol.txt"), &hunks[0]).expect("stage first hunk");
+
+        assert_eq!(
+            staged_blob(&repo.path, "eol.txt"),
+            b"A\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n",
+            "the unstaged last-line region keeps HEAD's trailing newline"
+        );
+    }
+
+    #[test]
+    fn test_stage_hunk_drops_trailing_newline_when_that_hunk_is_selected() {
+        // The mirror of the above: staging ONLY the newline-drop hunk (the last
+        // one) must produce an index blob with no final newline, while the first
+        // line stays at HEAD.
+        let repo = init_repo("hunk-drop-eol");
+        write(
+            &repo.path.join("eol.txt"),
+            b"a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n",
+        );
+        git(&repo.path, &["add", "eol.txt"]);
+        git(&repo.path, &["commit", "-q", "-m", "add eol"]);
+        write(
+            &repo.path.join("eol.txt"),
+            b"A\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl",
+        );
+
+        let hunks = hunks_of(&repo.path, "eol.txt");
+        stage_hunk(&repo.path, Path::new("eol.txt"), &hunks[1]).expect("stage last hunk");
+
+        assert_eq!(
+            staged_blob(&repo.path, "eol.txt"),
+            b"a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl",
+            "the selected newline-drop hunk lands; the first line stays HEAD"
+        );
+    }
+
+    #[test]
+    fn test_stage_hunk_of_untracked_file_stages_whole_file() {
+        // An untracked file diffs as a single add hunk; staging it makes the
+        // index match the whole worktree, delegating to whole-file staging.
+        let repo = init_repo("hunk-untracked");
+        write(&repo.path.join("fresh.txt"), b"one\ntwo\nthree\n");
+
+        let hunks = hunks_of(&repo.path, "fresh.txt");
+        assert_eq!(hunks.len(), 1, "an untracked file is one add hunk");
+
+        stage_hunk(&repo.path, Path::new("fresh.txt"), &hunks[0]).expect("stage hunk");
+
+        assert_eq!(porcelain_xy(&repo.path, "fresh.txt").as_deref(), Some("A "));
+        assert_eq!(staged_blob(&repo.path, "fresh.txt"), b"one\ntwo\nthree\n");
+    }
+
+    #[test]
+    fn test_stage_stale_hunk_is_rejected() {
+        // Grab a hunk, then change the worktree so it no longer matches: staging
+        // the now-stale hunk is rejected, never fuzzily applied.
+        let repo = init_repo("hunk-stale");
+        write(&repo.path.join("tracked.txt"), b"one\nTWO\nthree\n");
+        let stale = hunks_of(&repo.path, "tracked.txt")[0].clone();
+        // The worktree moves on before the stage lands.
+        write(&repo.path.join("tracked.txt"), b"one\nDIFFERENT\nthree\n");
+
+        let err = stage_hunk(&repo.path, Path::new("tracked.txt"), &stale)
+            .expect_err("stale hunk rejected");
+        assert!(err.to_string().contains("no longer part"), "got {err}");
+        // The index was left untouched (still clean on the staged side).
+        assert!(
+            entry(&repo.path, "tracked.txt").map(|s| s.index) != Some(GitStatusCode::Modified),
+            "a rejected stale stage must not mutate the index"
+        );
+    }
+
+    #[test]
+    fn test_stage_hunk_on_divergent_index_is_rejected_with_file_level_hint() {
+        // Staged-then-edited: the staged content is not a whole current hunk, so
+        // the index does not decompose — reject with the file-level fallback hint.
+        let repo = init_repo("hunk-divergent");
+        write(&repo.path.join("tracked.txt"), b"one\nSTAGED\nthree\n");
+        git(&repo.path, &["add", "tracked.txt"]); // index: line 2 -> STAGED
+        write(&repo.path.join("tracked.txt"), b"one\nEDITED\nthree\n"); // worktree diverges
+
+        let current = hunks_of(&repo.path, "tracked.txt");
+        assert_eq!(current.len(), 1);
+
+        let err = stage_hunk(&repo.path, Path::new("tracked.txt"), &current[0])
+            .expect_err("divergent index rejected");
+        let err = err.to_string();
+        assert!(err.contains("Stage the whole file"), "got {err}");
     }
 
     #[test]

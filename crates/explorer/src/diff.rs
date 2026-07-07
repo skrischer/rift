@@ -117,7 +117,7 @@ pub(crate) fn compute_rewrite(
 
 /// Read `relative`'s current worktree content under `root`, or empty when the
 /// path is absent (a deleted file diffs to empty on the new side).
-fn read_worktree(root: &Path, relative: &Path) -> Result<Vec<u8>> {
+pub(crate) fn read_worktree(root: &Path, relative: &Path) -> Result<Vec<u8>> {
     match std::fs::read(root.join(relative)) {
         Ok(bytes) => Ok(bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -131,7 +131,7 @@ fn read_worktree(root: &Path, relative: &Path) -> Result<Vec<u8>> {
 /// Diff two byte buffers into a [`FileDiff`], applying the size/binary
 /// sentinels before attempting a line diff. `relative` is used only for error
 /// messages.
-fn diff_bytes(old_bytes: &[u8], new_bytes: &[u8], relative: &Path) -> Result<FileDiff> {
+pub(crate) fn diff_bytes(old_bytes: &[u8], new_bytes: &[u8], relative: &Path) -> Result<FileDiff> {
     if old_bytes.len().max(new_bytes.len()) > MAX_SIDE_BYTES {
         return Ok(FileDiff::TooLarge);
     }
@@ -162,7 +162,7 @@ fn diff_bytes(old_bytes: &[u8], new_bytes: &[u8], relative: &Path) -> Result<Fil
 
 /// Read `relative`'s blob content at HEAD, or an empty `Vec` when HEAD is
 /// unborn or the path does not exist there (an added/untracked file).
-fn head_blob(repo: &gix::Repository, relative: &Path) -> Result<Vec<u8>> {
+pub(crate) fn head_blob(repo: &gix::Repository, relative: &Path) -> Result<Vec<u8>> {
     let tree_id = repo
         .head_tree_id_or_empty()
         .map_err(|e| ExplorerError::GitError(format!("head tree: {e}")))?;
@@ -255,6 +255,31 @@ fn line_kind(kind: GixDiffLineKind) -> DiffLineKind {
         GixDiffLineKind::Add => DiffLineKind::Add,
         GixDiffLineKind::Remove => DiffLineKind::Remove,
     }
+}
+
+/// Split `bytes` into lines the exact way `gix`'s line diff tokenizes them
+/// (`gix-imara-diff`'s `ByteLines`): break after every `\n`, keeping the
+/// terminator on its line, and emit a final unterminated line for trailing
+/// content. Empty input yields no lines. Because the line indexing is
+/// identical to the tokenizer that produced a [`DiffHunk`]'s header numbers,
+/// slicing a real buffer by those numbers reconstructs bytes exactly —
+/// including the `\ No newline at end of file` case, where the last line
+/// carries no terminator. Used by the hunk-staging reapply to splice real
+/// HEAD / worktree line bytes rather than reconstructing from the hunk's
+/// newline-stripped [`DiffLine`] content.
+pub(crate) fn split_lines(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    for (i, &byte) in bytes.iter().enumerate() {
+        if byte == b'\n' {
+            lines.push(&bytes[start..=i]);
+            start = i + 1;
+        }
+    }
+    if start < bytes.len() {
+        lines.push(&bytes[start..]);
+    }
+    lines
 }
 
 /// Strip a hunk line's trailing line terminator. The bytes are guaranteed
@@ -500,6 +525,21 @@ mod tests {
                 .expect("compute"),
         );
         assert!(hunks.is_empty(), "a pure rename must yield no hunks");
+    }
+
+    #[test]
+    fn test_split_lines_matches_git_line_model_including_trailing_newline() {
+        // The tokenizer keeps the terminator on each line, emits a final
+        // unterminated line for trailing content, and yields nothing for empty
+        // input — the exact model `gix`'s hunk headers are numbered against.
+        assert_eq!(split_lines(b""), Vec::<&[u8]>::new());
+        assert_eq!(split_lines(b"a\nb\n"), vec![&b"a\n"[..], &b"b\n"[..]]);
+        assert_eq!(split_lines(b"a\nb"), vec![&b"a\n"[..], &b"b"[..]]);
+        assert_eq!(split_lines(b"\n"), vec![&b"\n"[..]]);
+        // Concatenating the split is byte-identical to the source (the reapply
+        // relies on this to round-trip exactly).
+        let src = b"one\r\ntwo\nthree";
+        assert_eq!(split_lines(src).concat(), src);
     }
 
     #[test]
