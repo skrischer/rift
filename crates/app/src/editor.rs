@@ -155,10 +155,10 @@ use std::time::{Duration, SystemTime};
 
 use flume::Sender;
 use gpui::{
-    canvas, div, px, App, AppContext as _, Bounds, ClickEvent, Context, Entity, EventEmitter,
+    canvas, div, fill, px, App, AppContext as _, Bounds, ClickEvent, Context, Entity, EventEmitter,
     FocusHandle, Focusable, Hsla, InteractiveElement as _, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels, Render, SharedString, Styled as _,
-    Subscription, Window,
+    MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels, Point, Render, SharedString, Size,
+    Styled as _, Subscription, Window,
 };
 use gpui_component::dialog::AlertDialog;
 use gpui_component::dock::{Panel, PanelEvent};
@@ -301,6 +301,26 @@ const HOVER_DEFINITION_HINT: &str = "F12";
 /// `FindReferences` binding advertised by the command registry.
 const HOVER_REFERENCES_HINT: &str = "Shift+F12";
 
+/// Width of the minimap marks strip on the editor's right edge
+/// (`docs/spec-editor-chrome.md`: "~14px").
+const MINIMAP_WIDTH: Pixels = px(14.0);
+
+/// Maximum number of line-length sample rows painted in the minimap. Caps the
+/// per-render work so a very large buffer stays cheap — the strip is only a few
+/// hundred pixels tall, so more samples than this add no visible detail
+/// (`docs/spec-editor-chrome.md`: marks are downsampled, not a pixel render).
+const MINIMAP_SAMPLES: usize = 1024;
+
+/// Height in pixels of a diagnostic mark painted over the minimap strip.
+const MINIMAP_DIAG_MARK_HEIGHT: f32 = 2.0;
+
+/// Minimum height in pixels of the minimap viewport slab, so it stays visible
+/// even when the buffer is far taller than the viewport.
+const MINIMAP_SLAB_MIN_HEIGHT: f32 = 6.0;
+
+/// Horizontal inset in pixels of the line-length marks from the strip's edges.
+const MINIMAP_MARK_INSET: f32 = 2.0;
+
 // ── Internal state types ──────────────────────────────────────────────────────
 
 /// What a tab is currently showing.
@@ -355,6 +375,31 @@ struct InlineCard {
     message: SharedString,
     /// The muted `source`/`code` suffix, if either is present.
     detail: Option<SharedString>,
+}
+
+/// Owned render data for the minimap marks strip on the editor's right edge
+/// (`docs/spec-editor-chrome.md`). Gathered under the `InputState` read borrow
+/// in [`EditorView::render`] and moved into the strip's `canvas` paint closure,
+/// so the borrow is released before painting. Deliberately NOT a pixel-perfect
+/// code render: line-length marks are downsampled to at most [`MINIMAP_SAMPLES`]
+/// rows, diagnostics and the viewport slab are positioned by line ratio, and the
+/// whole strip repaints only when the editor is damaged (a GPUI notify).
+struct MinimapPaint {
+    /// Per-sample maximum line length (characters). Length `min(total, samples)`;
+    /// empty for an empty buffer. Painted as horizontal marks scaled across the
+    /// strip height, width proportional to the sample's share of the longest
+    /// line.
+    samples: Vec<u32>,
+    /// Diagnostic marks: `(line-ratio 0..1, severity color)`, painted full-width
+    /// over the length marks so problems stand out at a glance.
+    diag_marks: Vec<(f32, Hsla)>,
+    /// The viewport slab as `(top, bottom)` fractions of the strip height; the
+    /// slab is skipped when `bottom <= top` (no laid-out viewport yet).
+    slab_top: f32,
+    slab_bottom: f32,
+    /// Color of the line-length marks (subtle) and of the viewport slab.
+    mark_color: Hsla,
+    slab_color: Hsla,
 }
 
 // ── Public decision type ───────────────────────────────────────────────────────
@@ -528,6 +573,13 @@ pub struct EditorView {
     /// previous frame's layout, so the two stay consistent.
     content_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 
+    /// The minimap strip's window-space bounds, captured each frame by its
+    /// `canvas` paint closure and read back on the next mouse-down to translate
+    /// a click into a target line (`docs/spec-editor-chrome.md`:
+    /// "click-to-jump"). `None` until the first paint; the one-frame lag is
+    /// harmless because the strip's geometry barely moves between frames.
+    minimap_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+
     /// Whether the right-dock results panel is currently showing this editor's
     /// nav results (`docs/spec-editor-chrome.md` §3, #529). Set when a response
     /// is emitted to the panel; cleared when the editor closes it (Escape) or
@@ -562,6 +614,7 @@ impl EditorView {
             nav_tx,
             nav_id: 0,
             content_bounds: Rc::new(Cell::new(None)),
+            minimap_bounds: Rc::new(Cell::new(None)),
             results_visible: false,
         }
     }
@@ -1738,6 +1791,39 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Jump the active tab to the minimap-clicked line (`docs/spec-editor-chrome.md`:
+    /// "click-to-jump"). `click_y` is the window-space vertical position of the
+    /// click; the strip's captured bounds turn it into a 0..1 ratio, then a
+    /// target line. The jump lands the caret at that line's start via
+    /// `InputState::set_cursor_position`, which scrolls it into view — the only
+    /// public scroll seam this gpui-component pin exposes (there is no
+    /// scroll-offset setter), so a minimap click both scrolls to and selects the
+    /// clicked line, matching the ctrl+click / nav jumps that already move the
+    /// caret. The position is clamped to a valid line, and the rope layer clamps
+    /// the column, so an out-of-range click still lands somewhere sane.
+    fn minimap_jump(&mut self, click_y: Pixels, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.active else {
+            return;
+        };
+        let Some(bounds) = self.minimap_bounds.get() else {
+            return;
+        };
+        let strip_height = f32::from(bounds.size.height);
+        if strip_height <= 0.0 {
+            return;
+        }
+        let ratio = (f32::from(click_y) - f32::from(bounds.origin.y)) / strip_height;
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        tab.input.update(cx, |input, cx| {
+            let total = input.text().lines_len();
+            let target = minimap_click_line(ratio, total);
+            input.set_cursor_position(EditorPosition::new(target as u32, 0), window, cx);
+        });
+        cx.notify();
+    }
+
     /// Unwind the active tab's most recent jump: pop its back-stack and
     /// open-or-switch to the saved (path, position, read_only) — an
     /// already-open tab (same file or a different one still open) just
@@ -2336,6 +2422,50 @@ impl Render for EditorView {
             }
         }
 
+        // ── Minimap marks strip (docs/spec-editor-chrome.md) ──
+        //
+        // Owned render data for the strip on the editor's right edge:
+        // downsampled line-length marks, diagnostic marks by line ratio, and the
+        // viewport slab. Gathered under this tab's `InputState` read borrow and
+        // moved into the strip's `canvas` paint closure below, so the borrow is
+        // released before painting. Explicitly NOT a pixel-perfect code render:
+        // marks are capped at `MINIMAP_SAMPLES`, positioned by ratio, redrawn
+        // only on damage.
+        let mut minimap_mark_color = cx.theme().muted_foreground;
+        minimap_mark_color.a = 0.55;
+        let mut minimap_slab_color = cx.theme().accent;
+        minimap_slab_color.a = 0.20;
+        let minimap_data = {
+            let input_state = tab.input.read(cx);
+            let text = input_state.text();
+            let total = text.lines_len();
+            let samples =
+                sample_line_lengths(total, |row| text.line_len(row) as u32, MINIMAP_SAMPLES);
+            let diag_marks: Vec<(f32, Hsla)> = if total == 0 {
+                Vec::new()
+            } else {
+                tab.diagnostics
+                    .iter()
+                    .map(|d| {
+                        let ratio = (d.range.start.line as f32 / total as f32).clamp(0.0, 1.0);
+                        (ratio, severity_color(d.severity))
+                    })
+                    .collect()
+            };
+            let (slab_top, slab_bottom) = match input_state.visible_row_range() {
+                Some(visible) => minimap_slab_fracs(visible.start, visible.end, total),
+                None => (0.0, 0.0),
+            };
+            MinimapPaint {
+                samples,
+                diag_marks,
+                slab_top,
+                slab_bottom,
+                mark_color: minimap_mark_color,
+                slab_color: minimap_slab_color,
+            }
+        };
+
         let breadcrumb_bar = div()
             .flex()
             .flex_shrink_0()
@@ -2578,6 +2708,7 @@ impl Render for EditorView {
         let mut editor_area = div()
             .flex_1()
             .min_h_0()
+            .min_w_0()
             .relative()
             .overflow_hidden()
             .child(
@@ -2668,7 +2799,49 @@ impl Render for EditorView {
             editor_area = editor_area.child(popover);
         }
 
-        root.child(editor_area).into_any_element()
+        // Minimap marks strip on the editor's right edge, beside the widget's
+        // scrollbar (`docs/spec-editor-chrome.md`). A single `canvas` paints the
+        // downsampled line-length marks, the diagnostic marks, and the viewport
+        // slab in one pass — no second text render — and records its bounds for
+        // click-to-jump. The click handler jumps the view to the clicked line;
+        // `stop_propagation` keeps a strip click from reaching the outer
+        // ctrl+click-to-definition handler.
+        let minimap_bounds = self.minimap_bounds.clone();
+        let minimap_strip = div()
+            .id("editor-minimap")
+            .flex_shrink_0()
+            .w(MINIMAP_WIDTH)
+            .relative()
+            .bg(cx.theme().secondary)
+            .border_l_1()
+            .border_color(cx.theme().border)
+            .child(
+                canvas(
+                    |_bounds, _window, _cx| {},
+                    move |bounds, _prepaint, window, _cx| {
+                        paint_minimap(bounds, &minimap_data, &minimap_bounds, window);
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.minimap_jump(event.position.y, window, cx);
+                    cx.stop_propagation();
+                }),
+            );
+
+        let editor_row = div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_row()
+            .child(editor_area)
+            .child(minimap_strip);
+
+        root.child(editor_row).into_any_element()
     }
 }
 
@@ -2871,6 +3044,144 @@ fn primary_diagnostic_on_line(diagnostics: &[Diagnostic], line: u32) -> Option<&
         .iter()
         .filter(|d| d.range.start.line == line)
         .max_by_key(|d| severity_rank(d.severity))
+}
+
+// ── Minimap helpers (docs/spec-editor-chrome.md) ────────────────────────────────
+
+/// Downsample the buffer's per-line lengths into at most `samples` marks for the
+/// minimap strip. Each returned entry is the widest line length over the block
+/// of source lines it covers, so a dense region reads as a longer mark than a
+/// sparse one. Returns `min(total_lines, samples)` entries (empty for an empty
+/// buffer), keeping the per-render cost bounded regardless of file size — the
+/// strip is only a few hundred pixels tall, so more marks add no visible detail.
+fn sample_line_lengths(
+    total_lines: usize,
+    line_len: impl Fn(usize) -> u32,
+    samples: usize,
+) -> Vec<u32> {
+    if total_lines == 0 || samples == 0 {
+        return Vec::new();
+    }
+    let n = total_lines.min(samples);
+    let mut out = vec![0u32; n];
+    for row in 0..total_lines {
+        // `row < total_lines` and `n <= total_lines`, so `bucket < n`.
+        let bucket = row * n / total_lines;
+        let len = line_len(row);
+        if len > out[bucket] {
+            out[bucket] = len;
+        }
+    }
+    out
+}
+
+/// The viewport slab's `(top, bottom)` position as fractions of the minimap
+/// height, from the visible row range and the buffer's total line count. Both
+/// fractions are clamped to `0..1`, and `bottom` never precedes `top`. Returns
+/// `(0, 1)` for an empty buffer (the whole file is "visible").
+fn minimap_slab_fracs(visible_start: usize, visible_end: usize, total_lines: usize) -> (f32, f32) {
+    if total_lines == 0 {
+        return (0.0, 1.0);
+    }
+    let total = total_lines as f32;
+    let top = (visible_start as f32 / total).clamp(0.0, 1.0);
+    let bottom = (visible_end as f32 / total).clamp(0.0, 1.0);
+    (top, bottom.max(top))
+}
+
+/// The buffer line a minimap click at `click_ratio` (0..1 down the strip) maps
+/// to. Clamped to a valid line index; returns `0` for an empty buffer.
+fn minimap_click_line(click_ratio: f32, total_lines: usize) -> usize {
+    if total_lines == 0 {
+        return 0;
+    }
+    let line = (click_ratio.clamp(0.0, 1.0) * total_lines as f32) as usize;
+    line.min(total_lines - 1)
+}
+
+/// Paint the minimap strip into `bounds`: the downsampled line-length marks, the
+/// diagnostic marks (full-width, by line ratio, over the length marks), and the
+/// viewport slab — in one pass, no second text render. Also records `bounds` for
+/// the next mouse-down's click-to-jump. All positions are derived by ratio, so
+/// the strip is correct at any height without re-shaping any text.
+fn paint_minimap(
+    bounds: Bounds<Pixels>,
+    data: &MinimapPaint,
+    bounds_cell: &Rc<Cell<Option<Bounds<Pixels>>>>,
+    window: &mut Window,
+) {
+    bounds_cell.set(Some(bounds));
+
+    let origin_x = f32::from(bounds.origin.x);
+    let origin_y = f32::from(bounds.origin.y);
+    let width = f32::from(bounds.size.width);
+    let height = f32::from(bounds.size.height);
+    if width <= 0.0 || height <= 0.0 {
+        return;
+    }
+
+    // Line-length marks: one bar per sample, scaled across the full height, its
+    // width proportional to the sample's share of the longest line.
+    let sample_count = data.samples.len();
+    if sample_count > 0 {
+        let max_len = data.samples.iter().copied().max().unwrap_or(0).max(1) as f32;
+        let inset = MINIMAP_MARK_INSET.min(width / 4.0);
+        let available = (width - inset * 2.0).max(1.0);
+        let row_height = (height / sample_count as f32).max(1.0);
+        for (i, &len) in data.samples.iter().enumerate() {
+            if len == 0 {
+                continue;
+            }
+            let mark_width = (available * (len as f32 / max_len)).max(1.0);
+            let y = origin_y + height * i as f32 / sample_count as f32;
+            let mark = Bounds {
+                origin: Point {
+                    x: px(origin_x + inset),
+                    y: px(y),
+                },
+                size: Size {
+                    width: px(mark_width),
+                    height: px(row_height),
+                },
+            };
+            window.paint_quad(fill(mark, data.mark_color));
+        }
+    }
+
+    // Diagnostic marks: full-width, positioned by line ratio, painted on top so
+    // problems stand out against the length marks.
+    for &(ratio, color) in &data.diag_marks {
+        let y = origin_y + height * ratio;
+        let mark = Bounds {
+            origin: Point {
+                x: px(origin_x),
+                y: px(y),
+            },
+            size: Size {
+                width: px(width),
+                height: px(MINIMAP_DIAG_MARK_HEIGHT),
+            },
+        };
+        window.paint_quad(fill(mark, color));
+    }
+
+    // Viewport slab: only when there is a laid-out viewport to show.
+    if data.slab_bottom > data.slab_top {
+        let slab_y = origin_y + height * data.slab_top;
+        let slab_height =
+            (height * (data.slab_bottom - data.slab_top)).max(MINIMAP_SLAB_MIN_HEIGHT);
+        let slab = Bounds {
+            origin: Point {
+                x: px(origin_x),
+                y: px(slab_y),
+            },
+            size: Size {
+                width: px(width),
+                height: px(slab_height),
+            },
+        };
+        window.paint_quad(fill(slab, data.slab_color));
+    }
 }
 
 /// Split a root-relative (or absolute out-of-root) path into its breadcrumb
@@ -3292,6 +3603,55 @@ mod tests {
     #[test]
     fn test_close_needs_confirm_is_false_for_a_clean_tab() {
         assert!(!close_needs_confirm(false));
+    }
+
+    // --- minimap marks strip (docs/spec-editor-chrome.md) ---
+
+    #[test]
+    fn test_sample_line_lengths_is_one_to_one_when_under_the_cap() {
+        let lengths = [3u32, 0, 10, 5];
+        let out = sample_line_lengths(lengths.len(), |row| lengths[row], 100);
+        assert_eq!(out, vec![3, 0, 10, 5]);
+    }
+
+    #[test]
+    fn test_sample_line_lengths_takes_the_max_per_bucket_when_downsampled() {
+        // Four lines into two buckets: rows 0..1 -> bucket 0, rows 2..3 -> 1.
+        let lengths = [3u32, 10, 4, 7];
+        let out = sample_line_lengths(lengths.len(), |row| lengths[row], 2);
+        assert_eq!(out, vec![10, 7]);
+    }
+
+    #[test]
+    fn test_sample_line_lengths_is_empty_for_an_empty_buffer() {
+        assert!(sample_line_lengths(0, |_| 0, 100).is_empty());
+        assert!(sample_line_lengths(5, |_| 1, 0).is_empty());
+    }
+
+    #[test]
+    fn test_minimap_slab_fracs_maps_the_visible_range() {
+        let (top, bottom) = minimap_slab_fracs(25, 50, 100);
+        assert!((top - 0.25).abs() < f32::EPSILON);
+        assert!((bottom - 0.50).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_minimap_slab_fracs_clamps_and_handles_empty() {
+        // Over-range end clamps to 1.0; empty buffer spans the whole strip.
+        let (top, bottom) = minimap_slab_fracs(90, 200, 100);
+        assert!((bottom - 1.0).abs() < f32::EPSILON);
+        assert!(bottom >= top);
+        assert_eq!(minimap_slab_fracs(0, 0, 0), (0.0, 1.0));
+    }
+
+    #[test]
+    fn test_minimap_click_line_maps_ratio_to_line() {
+        assert_eq!(minimap_click_line(0.0, 100), 0);
+        assert_eq!(minimap_click_line(0.5, 100), 50);
+        // Ratio 1.0 and beyond clamp to the last line; empty buffer stays 0.
+        assert_eq!(minimap_click_line(1.0, 100), 99);
+        assert_eq!(minimap_click_line(1.5, 100), 99);
+        assert_eq!(minimap_click_line(0.5, 0), 0);
     }
 
     // --- stale positional index across close_tab (PR #401 review) ---
