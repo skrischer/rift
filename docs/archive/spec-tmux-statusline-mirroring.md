@@ -1,8 +1,9 @@
 # Spec: Phase 8 — tmux status-line config mirroring
 
-> Status: READY
+> Status: COMPLETED
 > Created: 2026-06-05 (refreshed 2026-06-12 by /loopkit:plan — Phase 8 planning cycle)
-> Completed: —
+> Completed: 2026-07-07
+> Superseded by: [spec-status-line.md](../spec-status-line.md)
 
 Render the user's tmux status-line configuration (`status-left`, `status-right`, styles) in rift's native statusbar, so a `.tmux.conf` status setup is honored instead of being silently dropped under control mode. The refresh replaces the originally planned client-side format interpreter with **server-side expansion: tmux itself evaluates the format strings** (`display-message -p '#{T:…}'`) with the format engine's own fidelity — except `#()` shell-command insertions, which one-shot expansion cannot run (see Constraints) — and rift parses only the style runs (`#[fg=…,bg=…,attrs]`) and color tokens in the expanded output into GPUI-styled text. The mirror renders the **left and right segments only**; the bar's center window list is not mirrored — rift's tab bar already owns window presentation.
 
@@ -105,6 +106,7 @@ Each issue references this spec path. A PR may only merge if it closes an issue 
 
 Decisions made during implementation. Added as work progresses.
 
+- 2026-07-07: Archived as `COMPLETED`, superseded by `spec-status-line.md` (phase 22, #522). The composite status line's one-bar design overturns this spec's "native default + opt-in mirror" decision (ratified 2026-06-05/2026-06-12): the phase-8 tmux status-line CONTENT mirror — the `QueryStatusLine`/`StatusLineReply` protocol pair, the daemon query bundle, and the style-run parser below — is fully removed rather than implemented. The keytable mirroring path (`spec-tmux-keytable-mirroring.md`) is unaffected — parallel machinery, not shared. See `spec-status-line.md`'s Prior decisions for the full rationale.
 - 2026-06-05: Spec created. Spun out of the Phase 2d statusbar discussion: under `tmux -CC` the user's `status-*` config is queryable but never rendered, so it is currently ignored. Phase 2d's native statusbar stays the default source of truth; this spec adds an opt-in mode that mirrors the tmux status-line config instead. Sibling to the tmux key-table mirroring DRAFT (same "surface a hidden tmux config primitive" pattern).
 - 2026-06-12: Refreshed by `/loopkit:plan` (loop mode — roadmap Phase 8). The central change: the client-side format-DSL interpreter ("documented subset") is **superseded by server-side expansion** — tmux evaluates its own formats via `display-message -p` and rift's client-side surface shrinks to a style-run/color parser. Recorded constraint-determined: reuse of the Phase 7 `show-options`/refresh machinery and request/response seam, the env-var toggle, expansion-context targeting validated in the first issue, and the queue edge behind #212. The 2026-06-05 product decisions (native-default + opt-in mirror, read-only, exclusive modes) stand unchanged. No genuinely-open decisions remain for the gate — it is acceptance + prerequisites only.
 - 2026-06-12: Spec-acceptance gate. No genuinely-open decisions (the 2026-06-05 product decisions stand); the developer accepted the spec and confirmed human prerequisites as none. Spec flipped `DRAFT → READY`.
