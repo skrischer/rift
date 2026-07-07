@@ -35,12 +35,13 @@
 use std::path::{Path, PathBuf};
 
 use lsp_types::{
-    GotoDefinitionParams, GotoDefinitionResponse, HoverContents, HoverParams, Location,
-    MarkedString, Position as LspPosition, Range as LspRange, ReferenceContext, ReferenceParams,
-    ServerCapabilities, TextDocumentIdentifier, TextDocumentPositionParams, Url,
+    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
+    GotoDefinitionResponse, HoverContents, HoverParams, Location, MarkedString,
+    Position as LspPosition, Range as LspRange, ReferenceContext, ReferenceParams,
+    ServerCapabilities, SymbolInformation, TextDocumentIdentifier, TextDocumentPositionParams, Url,
     WorkDoneProgressParams,
 };
-use rift_protocol::{HoverContent, NavLocation, Position, Range};
+use rift_protocol::{DocumentSymbolEntry, HoverContent, NavLocation, Position, Range, SymbolKind};
 use tracing::debug;
 
 use crate::server::Server;
@@ -309,6 +310,118 @@ fn location_to_nav(
     })
 }
 
+/// Translate a `DocumentSymbolResponse` (either LSP shape) into rift's flat,
+/// depth-tagged [`DocumentSymbolEntry`] list.
+///
+/// `DocumentSymbolResponse::Nested` (`DocumentSymbol`, with `children`) is
+/// flattened by a pre-order walk that assigns each symbol's nesting `depth`
+/// (`0` = top-level) as it recurses. `DocumentSymbolResponse::Flat`
+/// (`SymbolInformation`, no nesting) carries no hierarchy: every entry is
+/// `depth` `0`, and `selection_range` falls back to `range` — the flat shape
+/// has no separate LSP field for it. `text`/`encoding` translate every
+/// symbol's `range`/`selection_range` the same way navigation locations are
+/// translated (offset-encoding discipline).
+pub fn document_symbol_response_to_protocol(
+    response: DocumentSymbolResponse,
+    text: &str,
+    encoding: PositionEncoding,
+) -> Vec<DocumentSymbolEntry> {
+    match response {
+        DocumentSymbolResponse::Nested(symbols) => {
+            let mut out = Vec::new();
+            flatten_document_symbols(symbols, 0, text, encoding, &mut out);
+            out
+        }
+        DocumentSymbolResponse::Flat(infos) => infos
+            .into_iter()
+            .map(|info| flat_symbol_to_protocol(info, text, encoding))
+            .collect(),
+    }
+}
+
+/// Pre-order flatten of a `DocumentSymbol` tree into `out`, tagging each
+/// symbol with its nesting `depth` (`base_depth` for this level; children go
+/// in at `base_depth + 1`).
+fn flatten_document_symbols(
+    symbols: Vec<DocumentSymbol>,
+    base_depth: u32,
+    text: &str,
+    encoding: PositionEncoding,
+    out: &mut Vec<DocumentSymbolEntry>,
+) {
+    for symbol in symbols {
+        out.push(DocumentSymbolEntry {
+            name: symbol.name,
+            kind: symbol_kind_to_protocol(symbol.kind),
+            range: lsp_range_to_rift(symbol.range, text, encoding),
+            selection_range: lsp_range_to_rift(symbol.selection_range, text, encoding),
+            depth: base_depth,
+        });
+        if let Some(children) = symbol.children {
+            flatten_document_symbols(children, base_depth + 1, text, encoding, out);
+        }
+    }
+}
+
+/// Translate a flat-shape `SymbolInformation` entry. No independent selection
+/// range or container nesting on this LSP shape: `selection_range` falls back
+/// to `range`, `depth` is fixed at `0` (`docs/spec-editor-chrome.md` — "Flat
+/// fallbacks: selection_range = range, depth from container nesting" is
+/// satisfied trivially here since a flat list reports no container chain to
+/// derive a depth from).
+fn flat_symbol_to_protocol(
+    info: SymbolInformation,
+    text: &str,
+    encoding: PositionEncoding,
+) -> DocumentSymbolEntry {
+    let range = lsp_range_to_rift(info.location.range, text, encoding);
+    DocumentSymbolEntry {
+        name: info.name,
+        kind: symbol_kind_to_protocol(info.kind),
+        range,
+        selection_range: range,
+        depth: 0,
+    }
+}
+
+/// Translate an `lsp_types::SymbolKind` to rift's own [`SymbolKind`].
+///
+/// Falls back to [`SymbolKind::Variable`] for a code outside LSP's defined
+/// range (`1..=26`) — a spec-violating server response, never expected in
+/// practice but handled without a panic, mirroring `translate_severity`'s
+/// fallback discipline for `DiagnosticSeverity` (`crates/daemon/src/lsp.rs`).
+fn symbol_kind_to_protocol(kind: lsp_types::SymbolKind) -> SymbolKind {
+    match kind {
+        lsp_types::SymbolKind::FILE => SymbolKind::File,
+        lsp_types::SymbolKind::MODULE => SymbolKind::Module,
+        lsp_types::SymbolKind::NAMESPACE => SymbolKind::Namespace,
+        lsp_types::SymbolKind::PACKAGE => SymbolKind::Package,
+        lsp_types::SymbolKind::CLASS => SymbolKind::Class,
+        lsp_types::SymbolKind::METHOD => SymbolKind::Method,
+        lsp_types::SymbolKind::PROPERTY => SymbolKind::Property,
+        lsp_types::SymbolKind::FIELD => SymbolKind::Field,
+        lsp_types::SymbolKind::CONSTRUCTOR => SymbolKind::Constructor,
+        lsp_types::SymbolKind::ENUM => SymbolKind::Enum,
+        lsp_types::SymbolKind::INTERFACE => SymbolKind::Interface,
+        lsp_types::SymbolKind::FUNCTION => SymbolKind::Function,
+        lsp_types::SymbolKind::VARIABLE => SymbolKind::Variable,
+        lsp_types::SymbolKind::CONSTANT => SymbolKind::Constant,
+        lsp_types::SymbolKind::STRING => SymbolKind::String,
+        lsp_types::SymbolKind::NUMBER => SymbolKind::Number,
+        lsp_types::SymbolKind::BOOLEAN => SymbolKind::Boolean,
+        lsp_types::SymbolKind::ARRAY => SymbolKind::Array,
+        lsp_types::SymbolKind::OBJECT => SymbolKind::Object,
+        lsp_types::SymbolKind::KEY => SymbolKind::Key,
+        lsp_types::SymbolKind::NULL => SymbolKind::Null,
+        lsp_types::SymbolKind::ENUM_MEMBER => SymbolKind::EnumMember,
+        lsp_types::SymbolKind::STRUCT => SymbolKind::Struct,
+        lsp_types::SymbolKind::EVENT => SymbolKind::Event,
+        lsp_types::SymbolKind::OPERATOR => SymbolKind::Operator,
+        lsp_types::SymbolKind::TYPE_PARAMETER => SymbolKind::TypeParameter,
+        _ => SymbolKind::Variable,
+    }
+}
+
 // ── NavRequester ─────────────────────────────────────────────────────────────
 
 /// Wraps a `Server` handle with capability-checked navigation requests.
@@ -450,6 +563,38 @@ impl<'a> NavRequester<'a> {
             None => vec![],
         })
     }
+
+    /// Issue a `textDocument/documentSymbol` request.
+    ///
+    /// Returns an empty `Vec` when the server does not advertise
+    /// document-symbol capability or when it responds with no symbols.
+    pub async fn document_symbols(
+        &self,
+        path: &Path,
+        text: &str,
+    ) -> Result<Vec<DocumentSymbolEntry>> {
+        let caps = self.server.capabilities();
+        if !has_document_symbol(caps) {
+            debug!(
+                server = self.server.name(),
+                "document_symbols: server does not advertise capability, skipping"
+            );
+            return Ok(vec![]);
+        }
+
+        let uri = path_to_uri(path)?;
+        let params = DocumentSymbolParams {
+            text_document: TextDocumentIdentifier { uri },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let result = self.server.request_document_symbol(params).await?;
+        Ok(match result {
+            Some(response) => document_symbol_response_to_protocol(response, text, self.encoding),
+            None => vec![],
+        })
+    }
 }
 
 // ── OwnedNavRequester ────────────────────────────────────────────────────────
@@ -569,6 +714,31 @@ impl OwnedNavRequester {
             None => vec![],
         })
     }
+
+    /// Issue a `textDocument/documentSymbol` request. Returns empty when the
+    /// server does not advertise document-symbol capability or responds with
+    /// no symbols.
+    pub async fn document_symbols(
+        mut self,
+        path: &Path,
+        text: &str,
+    ) -> Result<Vec<DocumentSymbolEntry>> {
+        use async_lsp::LanguageServer;
+        if !has_document_symbol(&self.caps) {
+            return Ok(vec![]);
+        }
+        let uri = path_to_uri(path)?;
+        let params = DocumentSymbolParams {
+            text_document: TextDocumentIdentifier { uri },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: Default::default(),
+        };
+        let result = self.socket.document_symbol(params).await?;
+        Ok(match result {
+            Some(response) => document_symbol_response_to_protocol(response, text, self.encoding),
+            None => vec![],
+        })
+    }
 }
 
 // ── Routing helper ────────────────────────────────────────────────────────────
@@ -594,6 +764,14 @@ pub fn has_definition(caps: &ServerCapabilities) -> bool {
 pub fn has_references(caps: &ServerCapabilities) -> bool {
     matches!(
         caps.references_provider,
+        Some(lsp_types::OneOf::Left(true)) | Some(lsp_types::OneOf::Right(_))
+    )
+}
+
+/// Whether `caps` advertises document-symbol support.
+pub fn has_document_symbol(caps: &ServerCapabilities) -> bool {
+    matches!(
+        caps.document_symbol_provider,
         Some(lsp_types::OneOf::Left(true)) | Some(lsp_types::OneOf::Right(_))
     )
 }
@@ -862,5 +1040,303 @@ mod tests {
             PositionEncoding::from_capabilities(&caps),
             PositionEncoding::Utf8
         );
+    }
+
+    // ── Document symbols (#526) ──────────────────────────────────────────────
+
+    #[test]
+    fn test_has_document_symbol_left_true() {
+        let caps = ServerCapabilities {
+            document_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+            ..ServerCapabilities::default()
+        };
+        assert!(has_document_symbol(&caps));
+    }
+
+    #[test]
+    fn test_has_document_symbol_left_false() {
+        let caps = ServerCapabilities {
+            document_symbol_provider: Some(lsp_types::OneOf::Left(false)),
+            ..ServerCapabilities::default()
+        };
+        assert!(!has_document_symbol(&caps));
+    }
+
+    #[test]
+    fn test_has_document_symbol_none() {
+        assert!(!has_document_symbol(&ServerCapabilities::default()));
+    }
+
+    #[test]
+    fn test_symbol_kind_to_protocol_maps_every_lsp_kind() {
+        let cases: &[(lsp_types::SymbolKind, SymbolKind)] = &[
+            (lsp_types::SymbolKind::FILE, SymbolKind::File),
+            (lsp_types::SymbolKind::MODULE, SymbolKind::Module),
+            (lsp_types::SymbolKind::NAMESPACE, SymbolKind::Namespace),
+            (lsp_types::SymbolKind::PACKAGE, SymbolKind::Package),
+            (lsp_types::SymbolKind::CLASS, SymbolKind::Class),
+            (lsp_types::SymbolKind::METHOD, SymbolKind::Method),
+            (lsp_types::SymbolKind::PROPERTY, SymbolKind::Property),
+            (lsp_types::SymbolKind::FIELD, SymbolKind::Field),
+            (lsp_types::SymbolKind::CONSTRUCTOR, SymbolKind::Constructor),
+            (lsp_types::SymbolKind::ENUM, SymbolKind::Enum),
+            (lsp_types::SymbolKind::INTERFACE, SymbolKind::Interface),
+            (lsp_types::SymbolKind::FUNCTION, SymbolKind::Function),
+            (lsp_types::SymbolKind::VARIABLE, SymbolKind::Variable),
+            (lsp_types::SymbolKind::CONSTANT, SymbolKind::Constant),
+            (lsp_types::SymbolKind::STRING, SymbolKind::String),
+            (lsp_types::SymbolKind::NUMBER, SymbolKind::Number),
+            (lsp_types::SymbolKind::BOOLEAN, SymbolKind::Boolean),
+            (lsp_types::SymbolKind::ARRAY, SymbolKind::Array),
+            (lsp_types::SymbolKind::OBJECT, SymbolKind::Object),
+            (lsp_types::SymbolKind::KEY, SymbolKind::Key),
+            (lsp_types::SymbolKind::NULL, SymbolKind::Null),
+            (lsp_types::SymbolKind::ENUM_MEMBER, SymbolKind::EnumMember),
+            (lsp_types::SymbolKind::STRUCT, SymbolKind::Struct),
+            (lsp_types::SymbolKind::EVENT, SymbolKind::Event),
+            (lsp_types::SymbolKind::OPERATOR, SymbolKind::Operator),
+            (
+                lsp_types::SymbolKind::TYPE_PARAMETER,
+                SymbolKind::TypeParameter,
+            ),
+        ];
+        for &(lsp_kind, expected) in cases {
+            assert_eq!(symbol_kind_to_protocol(lsp_kind), expected);
+        }
+    }
+
+    /// A nested `DocumentSymbol` tree fixture: a struct with two children (a
+    /// field and a method), the method with its own nested child. Exercises
+    /// the pre-order flatten and depth assignment across three levels.
+    #[allow(deprecated)]
+    fn nested_fixture() -> DocumentSymbolResponse {
+        let inner = DocumentSymbol {
+            name: "helper".to_owned(),
+            detail: None,
+            kind: lsp_types::SymbolKind::VARIABLE,
+            tags: None,
+            deprecated: None,
+            range: LspRange {
+                start: LspPosition {
+                    line: 2,
+                    character: 8,
+                },
+                end: LspPosition {
+                    line: 2,
+                    character: 20,
+                },
+            },
+            selection_range: LspRange {
+                start: LspPosition {
+                    line: 2,
+                    character: 8,
+                },
+                end: LspPosition {
+                    line: 2,
+                    character: 14,
+                },
+            },
+            children: None,
+        };
+        let method = DocumentSymbol {
+            name: "render".to_owned(),
+            detail: None,
+            kind: lsp_types::SymbolKind::METHOD,
+            tags: None,
+            deprecated: None,
+            range: LspRange {
+                start: LspPosition {
+                    line: 1,
+                    character: 4,
+                },
+                end: LspPosition {
+                    line: 3,
+                    character: 5,
+                },
+            },
+            selection_range: LspRange {
+                start: LspPosition {
+                    line: 1,
+                    character: 7,
+                },
+                end: LspPosition {
+                    line: 1,
+                    character: 13,
+                },
+            },
+            children: Some(vec![inner]),
+        };
+        let field = DocumentSymbol {
+            name: "bar".to_owned(),
+            detail: None,
+            kind: lsp_types::SymbolKind::FIELD,
+            tags: None,
+            deprecated: None,
+            range: LspRange {
+                start: LspPosition {
+                    line: 4,
+                    character: 4,
+                },
+                end: LspPosition {
+                    line: 4,
+                    character: 12,
+                },
+            },
+            selection_range: LspRange {
+                start: LspPosition {
+                    line: 4,
+                    character: 4,
+                },
+                end: LspPosition {
+                    line: 4,
+                    character: 7,
+                },
+            },
+            children: None,
+        };
+        let root = DocumentSymbol {
+            name: "Foo".to_owned(),
+            detail: None,
+            kind: lsp_types::SymbolKind::STRUCT,
+            tags: None,
+            deprecated: None,
+            range: LspRange {
+                start: LspPosition {
+                    line: 0,
+                    character: 0,
+                },
+                end: LspPosition {
+                    line: 5,
+                    character: 1,
+                },
+            },
+            selection_range: LspRange {
+                start: LspPosition {
+                    line: 0,
+                    character: 7,
+                },
+                end: LspPosition {
+                    line: 0,
+                    character: 10,
+                },
+            },
+            children: Some(vec![method, field]),
+        };
+        DocumentSymbolResponse::Nested(vec![root])
+    }
+
+    #[test]
+    fn test_document_symbol_nested_shape_flattens_with_depth() {
+        let text = "struct Foo {\n    fn render() {\n        helper();\n    }\n    bar: u32,\n}\n";
+        let entries =
+            document_symbol_response_to_protocol(nested_fixture(), text, PositionEncoding::Utf16);
+
+        assert_eq!(entries.len(), 4, "root + method + nested + field");
+        // Pre-order: root, then method, then method's child, then field.
+        assert_eq!(entries[0].name, "Foo");
+        assert_eq!(entries[0].depth, 0);
+        assert_eq!(entries[0].kind, SymbolKind::Struct);
+        assert_eq!(entries[1].name, "render");
+        assert_eq!(entries[1].depth, 1);
+        assert_eq!(entries[2].name, "helper");
+        assert_eq!(entries[2].depth, 2, "nested under render, two levels deep");
+        assert_eq!(entries[3].name, "bar");
+        assert_eq!(entries[3].depth, 1, "sibling of render, back at depth 1");
+
+        // A nested symbol's selection_range is independent of (narrower than)
+        // its range — carried through, not collapsed to range.
+        assert_ne!(entries[0].range, entries[0].selection_range);
+    }
+
+    #[test]
+    fn test_document_symbol_nested_shape_empty_list_returns_empty() {
+        let entries = document_symbol_response_to_protocol(
+            DocumentSymbolResponse::Nested(vec![]),
+            "",
+            PositionEncoding::Utf16,
+        );
+        assert!(entries.is_empty());
+    }
+
+    /// The flat `SymbolInformation` shape fixture: older servers, or ones that
+    /// ignore `hierarchical_document_symbol_support`, report symbols this way.
+    #[allow(deprecated)]
+    fn flat_fixture() -> DocumentSymbolResponse {
+        let uri = Url::parse("file:///tmp/test.rs").expect("valid test URI");
+        DocumentSymbolResponse::Flat(vec![
+            SymbolInformation {
+                name: "Foo".to_owned(),
+                kind: lsp_types::SymbolKind::STRUCT,
+                tags: None,
+                deprecated: None,
+                location: Location {
+                    uri: uri.clone(),
+                    range: LspRange {
+                        start: LspPosition {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: LspPosition {
+                            line: 5,
+                            character: 1,
+                        },
+                    },
+                },
+                container_name: None,
+            },
+            SymbolInformation {
+                name: "bar".to_owned(),
+                kind: lsp_types::SymbolKind::FIELD,
+                tags: None,
+                deprecated: None,
+                location: Location {
+                    uri,
+                    range: LspRange {
+                        start: LspPosition {
+                            line: 4,
+                            character: 4,
+                        },
+                        end: LspPosition {
+                            line: 4,
+                            character: 12,
+                        },
+                    },
+                },
+                container_name: Some("Foo".to_owned()),
+            },
+        ])
+    }
+
+    #[test]
+    fn test_document_symbol_flat_shape_falls_back_selection_range_and_zero_depth() {
+        let text = "struct Foo {\n\n\n\n    bar: u32,\n}\n";
+        let entries =
+            document_symbol_response_to_protocol(flat_fixture(), text, PositionEncoding::Utf16);
+
+        assert_eq!(entries.len(), 2);
+        for entry in &entries {
+            assert_eq!(
+                entry.depth, 0,
+                "the flat shape reports no hierarchy: every entry is depth 0"
+            );
+            assert_eq!(
+                entry.range, entry.selection_range,
+                "the flat shape has no independent selection range: falls back to range"
+            );
+        }
+        assert_eq!(entries[0].name, "Foo");
+        assert_eq!(entries[0].kind, SymbolKind::Struct);
+        assert_eq!(entries[1].name, "bar");
+        assert_eq!(entries[1].kind, SymbolKind::Field);
+    }
+
+    #[test]
+    fn test_document_symbol_flat_shape_empty_list_returns_empty() {
+        let entries = document_symbol_response_to_protocol(
+            DocumentSymbolResponse::Flat(vec![]),
+            "",
+            PositionEncoding::Utf16,
+        );
+        assert!(entries.is_empty());
     }
 }

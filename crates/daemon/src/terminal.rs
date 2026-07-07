@@ -373,8 +373,9 @@ impl Attach {
             // (`OpenFile`/`SaveFile`) and the live-buffer feed (`BufferChanged`/
             // `BufferClosed`, #189) are not terminal messages — they are routed to
             // the per-connection buffer service or the shared LSP loop, not here.
-            // Navigation requests (hover/definition/references, #193) are handled
-            // by the shared dispatch loop and LSP worker — never the terminal task.
+            // Navigation requests (hover/definition/references/document-symbol,
+            // #193, #526) are handled by the shared dispatch loop and LSP worker
+            // — never the terminal task.
             // `RequestDiff` (source-control diff, #335) is likewise not a
             // terminal message; its daemon-side handler lands in a follow-on
             // issue — until then it is silently dropped here too.
@@ -387,6 +388,7 @@ impl Attach {
             | ClientMessage::HoverRequest { .. }
             | ClientMessage::DefinitionRequest { .. }
             | ClientMessage::ReferencesRequest { .. }
+            | ClientMessage::DocumentSymbolRequest { .. }
             | ClientMessage::RequestDiff { .. }
             | ClientMessage::Hello { .. } => {}
         }

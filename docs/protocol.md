@@ -13,9 +13,9 @@ discriminator. The authoritative definitions live in `crates/protocol/src/lib.rs
 
 ```json
 // client → daemon
-{ "type": "hello",   "version": 5 }
+{ "type": "hello",   "version": 6 }
 // daemon → client
-{ "type": "welcome", "version": 5 }
+{ "type": "welcome", "version": 6 }
 ```
 
 `version` is the wire `PROTOCOL_VERSION`, independent of the crate semver.
@@ -50,7 +50,8 @@ binary, never by tolerating it (`docs/spec-connection-robustness.md`).
   a healthy concurrent connection's stream (relevant for the shared stable+dev
   daemon).
 
-History: version 5 removes the tmux status-line CONTENT mirror pair
+History: version 6 adds the navigation channel's `document_symbol_request` /
+`document_symbol_response` pair (`docs/spec-editor-chrome.md`); version 5 removes the tmux status-line CONTENT mirror pair
 `query_status_line` / `status_line_reply` (superseded by the composite status
 line's native segments, `docs/spec-status-line.md`); version 4 adds
 `RepoState`'s `lines_added`/`lines_removed` working-tree line totals and the
@@ -309,8 +310,9 @@ content on the structure path was the wrong design). Specified by `spec-editor.m
 ## Navigation channel
 
 The navigation channel is the **third request/response family in the protocol**,
-adding hover, go-to-definition, and find-references. Specified by
-`docs/spec-lsp-navigation.md`.
+adding hover, go-to-definition, find-references, and document symbols.
+Specified by `docs/spec-lsp-navigation.md` (hover/definition/references) and
+`docs/spec-editor-chrome.md` (document symbols).
 
 ### Request-id correlation convention
 
@@ -335,15 +337,18 @@ convention is deferred — it is additive either way.
 ### Client → daemon
 
 ```json
-{ "type": "hover_request",      "id": 1, "path": "src/main.rs", "position": { "line": 5, "character": 10 } }
-{ "type": "definition_request", "id": 2, "path": "src/main.rs", "position": { "line": 5, "character": 10 } }
-{ "type": "references_request", "id": 3, "path": "src/main.rs", "position": { "line": 5, "character": 10 } }
+{ "type": "hover_request",           "id": 1, "path": "src/main.rs", "position": { "line": 5, "character": 10 } }
+{ "type": "definition_request",      "id": 2, "path": "src/main.rs", "position": { "line": 5, "character": 10 } }
+{ "type": "references_request",      "id": 3, "path": "src/main.rs", "position": { "line": 5, "character": 10 } }
+{ "type": "document_symbol_request", "id": 4, "path": "src/main.rs" }
 ```
 
 - `path` is relative to the worktree root — the same key space as worktree
   entries. `position` uses the same `Position` type as `Diagnostics` (one
   convention, never two). `id` is the correlation key; a monotonically
   increasing `u64` counter starting at `0` is the canonical client choice.
+- `document_symbol_request` carries no `position`: the symbol tree covers the
+  whole file at `path`, not a cursor location.
 
 ### Daemon → client
 
@@ -359,6 +364,13 @@ convention is deferred — it is additive either way.
 // references_response: empty locations = no references found (silent no-op)
 { "type": "references_response", "id": 3, "locations": [{ "path": "src/main.rs", "range": {...}, "line_preview": "    foo(x)" }] }
 { "type": "references_response", "id": 3, "locations": [] }
+
+// document_symbol_response: empty symbols = no symbols found (silent no-op)
+{ "type": "document_symbol_response", "id": 4, "symbols": [
+  { "name": "Foo", "kind": "struct", "range": {...}, "selection_range": {...}, "depth": 0 },
+  { "name": "bar", "kind": "field",  "range": {...}, "selection_range": {...}, "depth": 1 }
+] }
+{ "type": "document_symbol_response", "id": 4, "symbols": [] }
 ```
 
 - `id` echoes the request's `NavRequestId` — always present on responses.
@@ -374,18 +386,50 @@ convention is deferred — it is additive either way.
 - `line_preview` is a trimmed source line for jump-list display; omitted when
   the daemon cannot read the file (never an error path).
 - `range` in `hover_content` is omitted when the server does not supply it.
+- `document_symbol_response`'s `symbols` is the file's outline flattened to a
+  depth-tagged list, serving both the editor breadcrumb (enclosing symbol at
+  the cursor) and the outline panel (`docs/spec-editor-chrome.md`). LSP
+  servers report symbols either as a hierarchical tree (`DocumentSymbol`,
+  nested via `children`) or a flat list (`SymbolInformation`, no nesting);
+  `crates/lsp` normalizes both into this one shape so the wire (and
+  `crates/protocol`) never sees the two LSP variants. `depth` is the nesting
+  depth (`0` = top-level), reconstructed from the LSP `children` tree by a
+  pre-order flatten; a flat-shape response has no hierarchy, so every entry
+  is `depth` `0`. `selection_range` is the sub-span to select/reveal when the
+  symbol is picked (e.g. just the identifier); a flat-shape response has no
+  independent selection range, so it falls back to `range`. `kind` is rift's
+  own `SymbolKind` enum, mirroring LSP's `SymbolKind` the same way
+  `DiagnosticSeverity` mirrors LSP's diagnostic severities.
 
-### Daemon-side implementation notes (follow-on issues)
+### Daemon-side implementation notes
 
-The navigation channel types are defined in `crates/protocol` (#193).
-Daemon routing (the LSP request path in `crates/lsp` and `crates/daemon`) is
-wired in follow-on issues. Until then, navigation requests received by the
-daemon are absorbed by the shared dispatch loop's defensive no-op arm.
+The navigation channel types are defined in `crates/protocol` (#193). Daemon
+routing (the LSP request path in `crates/lsp` and `crates/daemon`) is wired
+for hover/definition/references (#298, #299) and document symbols (#526):
+each request is forwarded off the shared dispatch loop to the off-loop LSP
+worker, which finds the first capable server, issues the typed LSP request,
+and replies straight back on the requesting connection's own reply
+channel — never onto the shared broadcast bus, so with two clients attached
+one client's request can neither leak into nor cancel the other's navigation
+UI (#482, #554). A request the daemon cannot route (LSP not armed, or the
+worker's queue is full) is a silent no-op; the shared dispatch loop's
+defensive no-op arm covers any navigation message that reaches it anyway
+(the connection layer is the only intended path).
 
 The daemon owns **offset-encoding translation**: LSP servers default to UTF-16
 offsets; `crates/protocol`'s `Position` speaks rift's own position (UTF-8
 character offset), and `crates/lsp` translates against the document text it
-already syncs — the client and protocol never see UTF-16.
+already syncs — the client and protocol never see UTF-16. Document symbols
+carry no `Position` on the wire, but their `range`/`selection_range` fields
+still go through the same translation, since the underlying LSP `Range`s use
+the negotiated encoding regardless of which request produced them.
+
+The lsp crate declares `hierarchical_document_symbol_support: true` in its
+`textDocument.documentSymbol` client capability at `initialize`, so servers
+that support both shapes prefer the hierarchical `DocumentSymbol` tree; the
+flat `SymbolInformation` shape (older servers, or ones that ignore the
+capability) is normalized the same way, with `selection_range` falling back
+to `range` and `depth` fixed at `0` (no container nesting is reported).
 
 ## Source-control diff channel
 
@@ -461,8 +505,9 @@ sibling pattern, plus unprompted churn-driven pushes); the **buffer
 channel** (`open_file` → `file_content`, `save_file` → `save_result` /
 `save_conflict`) for file content; the **navigation channel**
 (`hover_request` → `hover_response`, `definition_request` →
-`definition_response`, `references_request` → `references_response`) for LSP
-pull queries; and the **diff channel** (`request_diff` → `file_diff`) for the
+`definition_response`, `references_request` → `references_response`,
+`document_symbol_request` → `document_symbol_response`) for LSP pull
+queries; and the **diff channel** (`request_diff` → `file_diff`) for the
 source-control panel's review diff. The push-only rule governs structure and
 decoration, never request/response pairs.
 

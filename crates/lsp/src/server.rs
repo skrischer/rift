@@ -17,9 +17,10 @@
 //! state transition (`docs/spec-daemon-lsp.md`, the supervision risk row).
 //!
 //! Navigation requests (`textDocument/hover`, `textDocument/definition`,
-//! `textDocument/references`) are also issued through this handle. The server's
-//! `ServerCapabilities` are stored after initialization so callers can perform
-//! a capability check before dispatching — see the [`crate::nav`] module.
+//! `textDocument/references`, `textDocument/documentSymbol`) are also issued
+//! through this handle. The server's `ServerCapabilities` are stored after
+//! initialization so callers can perform a capability check before
+//! dispatching — see the [`crate::nav`] module.
 
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -32,10 +33,11 @@ use async_lsp::tracing::TracingLayer;
 use async_lsp::{LanguageServer, ServerSocket};
 use lsp_types::{
     ClientCapabilities, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, GotoDefinitionParams,
-    GotoDefinitionResponse, HoverParams, InitializeParams, InitializedParams,
-    PublishDiagnosticsParams, ReferenceParams, ServerCapabilities, TextDocumentClientCapabilities,
-    TextDocumentSyncClientCapabilities, Url, WindowClientCapabilities, WorkspaceFolder,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbolClientCapabilities,
+    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
+    HoverParams, InitializeParams, InitializedParams, PublishDiagnosticsParams, ReferenceParams,
+    ServerCapabilities, TextDocumentClientCapabilities, TextDocumentSyncClientCapabilities, Url,
+    WindowClientCapabilities, WorkspaceFolder,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
@@ -148,6 +150,14 @@ impl Server {
         params: ReferenceParams,
     ) -> Result<Option<Vec<lsp_types::Location>>> {
         Ok(self.socket.clone().references(params).await?)
+    }
+
+    /// Issue a `textDocument/documentSymbol` request and await the response.
+    pub async fn request_document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        Ok(self.socket.clone().document_symbol(params).await?)
     }
 
     /// A handle to send notifications to this server (e.g. `did_open`,
@@ -309,9 +319,11 @@ impl Server {
     /// root. Capabilities are the minimal set the v1 diagnostics + navigation
     /// paths need: work-done progress (servers that gate work on it), declaring
     /// `textDocument/didSave` so a server honors save notifications and re-runs
-    /// its save-triggered checks (#272), and declaring hover/definition/
+    /// its save-triggered checks (#272), declaring hover/definition/
     /// references support so servers that need explicit client capability
-    /// declaration enable those features.
+    /// declaration enable those features, and declaring
+    /// `hierarchical_document_symbol_support` so a server capable of both
+    /// document-symbol shapes prefers the nested tree (#526).
     ///
     /// The server's `ServerCapabilities` from `InitializeResult` are stored so
     /// the navigation layer can check them before dispatching requests.
@@ -335,6 +347,16 @@ impl Server {
                                 lsp_types::MarkupKind::PlainText,
                             ]),
                             ..lsp_types::HoverClientCapabilities::default()
+                        }),
+                        // Declares hierarchical support so a server that can
+                        // report either shape (rust-analyzer, gopls) prefers
+                        // the nested `DocumentSymbol` tree; `crates/lsp::nav`
+                        // normalizes the flat `SymbolInformation` shape too,
+                        // for servers that ignore this and reply flat anyway
+                        // (`docs/spec-editor-chrome.md`).
+                        document_symbol: Some(DocumentSymbolClientCapabilities {
+                            hierarchical_document_symbol_support: Some(true),
+                            ..DocumentSymbolClientCapabilities::default()
                         }),
                         ..TextDocumentClientCapabilities::default()
                     }),
