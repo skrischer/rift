@@ -133,6 +133,18 @@ pub enum FileTreeEvent {
     RevealActiveRequested,
 }
 
+/// Which placeholder the panel shows instead of the tree
+/// (`docs/spec-explorer-parity.md`) — see [`FileTree::empty_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyState {
+    /// No snapshot has arrived yet: startup, connecting, or a non-repo root
+    /// the daemon has not resolved (`model.root()` is `None`).
+    Loading,
+    /// A snapshot arrived and the root has no entries (`model.root()` is
+    /// `Some`, `model.is_empty()` is `true`).
+    EmptyRoot,
+}
+
 /// One rendered row: an entry's path, kind, nesting depth, and decoration
 /// (git status + diagnostic severity, rolled up onto directories; the
 /// `ignored` flag straight from the model). Built by [`FileTree::visible_rows`]
@@ -507,6 +519,21 @@ impl FileTree {
     fn click_dir(&mut self, path: &str) {
         self.selected = Some(path.to_owned());
         self.toggle_dir(path);
+    }
+
+    /// Which placeholder the panel shows in place of the tree, or `None` when
+    /// there are rows to render (`docs/spec-explorer-parity.md`). Distinguishes
+    /// "no snapshot has arrived yet" from "connected, but the root is
+    /// genuinely empty" — the single prior "No files" branch conflated the
+    /// two, which read as an error during ordinary startup.
+    fn empty_state(&self) -> Option<EmptyState> {
+        if self.model.root().is_none() {
+            Some(EmptyState::Loading)
+        } else if self.model.is_empty() {
+            Some(EmptyState::EmptyRoot)
+        } else {
+            None
+        }
     }
 
     /// Whether every directory the model currently knows about is collapsed
@@ -1072,15 +1099,24 @@ impl Render for FileTree {
         // closure, doubling the tree walk on every single paint.
         self.refresh_row_cache();
 
-        // Empty state: no snapshot yet (or an empty root). Keep it quiet — the
-        // panel is a passive mirror, not an action surface.
-        let content = if self.row_cache.is_empty() {
+        // Empty state: distinguish "no snapshot yet" from "connected, empty
+        // root" (`docs/spec-explorer-parity.md`) — a single conflated "No
+        // files" branch used to read as an error during ordinary startup.
+        // Keep it quiet — the panel is a passive mirror, not an action surface.
+        let content = if let Some(state) = self.empty_state() {
+            let message = match state {
+                EmptyState::Loading => "Loading\u{2026}",
+                EmptyState::EmptyRoot => "Empty folder",
+            };
             div()
                 .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
                 .p(px(8.0))
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
-                .child("No files")
+                .child(message)
                 .into_any_element()
         } else {
             // One uniform row height per item — the size vector the virtual
@@ -1294,6 +1330,30 @@ mod tests {
         assert_eq!(FileTree::display_name("src/net/tcp.rs"), "tcp.rs");
         assert_eq!(FileTree::display_name("README.md"), "README.md");
         assert_eq!(FileTree::display_name("src"), "src");
+    }
+
+    #[test]
+    fn test_empty_state_with_no_snapshot_yet_is_loading() {
+        // A fresh tree has never received a snapshot, so `model.root()` is
+        // still `None` — startup / connecting, not a genuinely empty root.
+        let tree = FileTree::new();
+        assert_eq!(tree.empty_state(), Some(EmptyState::Loading));
+    }
+
+    #[test]
+    fn test_empty_state_with_an_empty_root_snapshot_is_empty_root() {
+        // A complete snapshot arrived (`root()` is `Some`) but it carried no
+        // entries — a genuinely empty root, distinct from still loading.
+        let tree = seed(vec![]);
+        assert!(tree.model().root().is_some());
+        assert!(tree.model().is_empty());
+        assert_eq!(tree.empty_state(), Some(EmptyState::EmptyRoot));
+    }
+
+    #[test]
+    fn test_empty_state_with_populated_entries_is_none() {
+        let tree = seed(vec![file("README.md")]);
+        assert_eq!(tree.empty_state(), None);
     }
 
     #[test]
