@@ -2215,6 +2215,20 @@ impl Panel for EditorView {
 
 // ── Render ────────────────────────────────────────────────────────────────────
 
+/// The code editor surface's background/foreground colors, read live from the
+/// active theme (`docs/spec-editor.md`, #598) — never hardcoded, so the
+/// surface tracks a runtime theme switch (`ActiveTheme::theme`) exactly like
+/// every other panel. `gpui_component::input::Input`'s own code-editor
+/// background falls back to `cx.theme().highlight_theme` — a Zed-style syntax
+/// theme populated only from a `ThemeConfig`'s `highlight` block — and rift's
+/// Catppuccin Mocha config carries none, so that fallback stays pinned to
+/// gpui-component's built-in *light* default regardless of rift's active dark
+/// mode. Sourcing the surface's colors from `ThemeColor` here instead (already
+/// correctly dark under Catppuccin Mocha) sidesteps that gap.
+fn editor_surface_colors(cx: &App) -> (Hsla, Hsla) {
+    (cx.theme().background, cx.theme().foreground)
+}
+
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // No tab open yet: show a centered status message.
@@ -2268,9 +2282,19 @@ impl Render for EditorView {
         // div below. `.disabled` blocks all key events and edit operations in
         // the `InputState`, enforcing the out-of-root read-only contract
         // (#196/#301).
+        //
+        // `.bg` / `.text_color` explicitly wire the surface to
+        // [`editor_surface_colors`] — `StyledExt::refine_style` (applied last
+        // in `Input::render`) lets them win over gpui-component's own
+        // code-editor background/foreground defaults. Gutter, line-number,
+        // and selection colors already read `cx.theme()` inside the widget
+        // itself and need no override.
+        let (surface_bg, surface_fg) = editor_surface_colors(cx);
         let input_widget = Input::new(&tab.input)
             .font_family(cx.theme().mono_font_family.clone())
             .text_size(cx.theme().mono_font_size)
+            .bg(surface_bg)
+            .text_color(surface_fg)
             .size_full()
             .disabled(tab.read_only)
             .context_menu(|menu: PopupMenu, _window, _cx| {
@@ -3420,6 +3444,37 @@ mod tests {
     fn test_language_for_path_lowercases_extension() {
         assert_eq!(language_for_path("MAIN.RS"), "rs");
         assert_eq!(language_for_path("Config.TOML"), "toml");
+    }
+
+    // --- editor surface theme wiring (#598) ---
+
+    /// Under rift's active Catppuccin Mocha theme, the code editor surface's
+    /// colors must be the live theme's dark tokens (never a light default or
+    /// a hardcoded value) and must move with a runtime theme switch.
+    #[gpui::test]
+    fn test_editor_surface_colors_are_dark_under_catppuccin_and_follow_a_theme_switch(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::apply_theme(cx);
+            assert!(cx.theme().is_dark());
+
+            let (dark_bg, dark_fg) = editor_surface_colors(cx);
+            assert_eq!(dark_bg, cx.theme().background);
+            assert_eq!(dark_fg, cx.theme().foreground);
+
+            gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
+            assert!(!cx.theme().is_dark());
+
+            let (light_bg, light_fg) = editor_surface_colors(cx);
+            assert_eq!(light_bg, cx.theme().background);
+            assert_eq!(light_fg, cx.theme().foreground);
+            assert_ne!(
+                light_bg, dark_bg,
+                "editor surface background must track a runtime theme switch"
+            );
+        });
     }
 
     // --- concurrent-write decision (#188) ---
