@@ -5,6 +5,7 @@ pub mod keytable;
 pub mod layout;
 pub mod pane_view;
 pub mod prefix;
+mod search;
 mod session_view;
 
 pub use keytable::{
