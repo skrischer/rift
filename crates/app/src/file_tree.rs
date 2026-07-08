@@ -73,9 +73,29 @@ const ROW_RADIUS: Pixels = px(5.0);
 /// letter), from the artboard's row density.
 const ROW_SLOT_GAP: Pixels = px(6.0);
 
-/// Height of the `EXPLORER` header band, matching the composite status
-/// line's 28px band (`status_bar.rs`) for a consistent chrome rhythm.
-const HEADER_HEIGHT: Pixels = px(28.0);
+/// Height of the `EXPLORER` header band, from the "Explorer — Redesign"
+/// artboard's measured 38px header (`docs/spec-explorer-redesign.md`) —
+/// replacing the shipped 28px, which matched the status line's band instead
+/// of the artboard's own rhythm.
+const HEADER_HEIGHT: Pixels = px(38.0);
+
+/// Left padding inside the header band, from the artboard's measured header
+/// inset (asymmetric with [`HEADER_PADDING_RIGHT`] — the artboard gives the
+/// `EXPLORER` label more room than the action cluster).
+const HEADER_PADDING_LEFT: Pixels = px(14.0);
+
+/// Right padding inside the header band, from the artboard's measured header
+/// inset.
+const HEADER_PADDING_RIGHT: Pixels = px(12.0);
+
+/// Gap between action-row slots in the header, from the artboard's action
+/// row, replacing the shipped 2px.
+const HEADER_ACTION_GAP: Pixels = px(12.0);
+
+/// Horizontal padding inside the workspace-root (`RIFT`) row, from the
+/// artboard's measured root-row inset — wider than a tree row's padding
+/// since the root row carries no reserved icon slot.
+const ROOT_ROW_PADDING_X: Pixels = px(12.0);
 
 /// Base horizontal indent at depth 0, before any per-level indent is added —
 /// the artboard's indent lanes start at 8px, not flush against the row edge.
@@ -847,28 +867,35 @@ impl FileTree {
         path.rsplit('/').next().unwrap_or(path)
     }
 
-    /// The in-panel header band above the tree (`docs/spec-explorer-parity.md`):
-    /// an uppercase, muted `EXPLORER` label on a subtle elevated surface with
-    /// a bottom hairline, plus a right-aligned action row. Ships exactly the
-    /// two actions that map to a real client capability — collapse-all /
-    /// expand-all (a toggle reflecting `all_dirs_collapsed`) and reveal-active
-    /// — and consciously omits the design's *new file* and *refresh* glyphs
-    /// (no client capability yet: file-ops are deferred, and the tree is
-    /// push-reactive so a manual refresh is redundant; see the spec's prior
-    /// decisions).
+    /// The in-panel header band above the tree
+    /// (`docs/spec-explorer-redesign.md`): an uppercase, bold, muted
+    /// `EXPLORER` label at the artboard's 11px label style, flush against
+    /// the panel surface (no distinct elevated tint — the artboard's header
+    /// sits transparent over the panel, only a bottom hairline separates
+    /// it) with a right-aligned action row. Ships exactly the two actions
+    /// that map to a real client capability — collapse-all / expand-all (a
+    /// toggle reflecting `all_dirs_collapsed`) and reveal-active — and
+    /// consciously omits the artboard's *search/filter* (Phase 31) and *new
+    /// file* (Phase 30) glyphs (no client capability yet; see the spec's
+    /// prior decisions).
     ///
     /// Both actions render as `Button::label` text glyphs, not `IconName`
     /// icons: the shipping `rift` binary does not embed gpui-component's SVG
     /// icon assets (only the dev-only `gallery` binary enables
     /// `gpui-component-assets`, see `crates/app/Cargo.toml`), so an
     /// `IconName` icon would render blank here. A Unicode glyph renders
-    /// reliably either way, mirroring the tree's own disclosure twisty.
+    /// reliably either way, mirroring the tree's own disclosure twisty. Each
+    /// button is `compact()`, giving it gpui-component's fixed `min_w_5`
+    /// (20px) icon-button footprint — a fixed-width slot Phase 28 can drop a
+    /// real icon into with no re-layout, reusing the widget's own affordance
+    /// rather than a hand-rolled wrapper.
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let all_collapsed = self.all_dirs_collapsed();
 
         let collapse_toggle = Button::new("file-tree-collapse-toggle")
             .ghost()
             .xsmall()
+            .compact()
             .label(if all_collapsed {
                 "\u{229E}"
             } else {
@@ -887,6 +914,7 @@ impl FileTree {
         let reveal_active = Button::new("file-tree-reveal-active")
             .ghost()
             .xsmall()
+            .compact()
             .label("\u{2316}")
             .tooltip("Reveal active file")
             .on_click(cx.listener(|_this, _event, _window, cx| {
@@ -898,38 +926,45 @@ impl FileTree {
             .items_center()
             .justify_between()
             .h(HEADER_HEIGHT)
-            .px(px(8.0))
-            .bg(cx.theme().secondary)
+            .pl(HEADER_PADDING_LEFT)
+            .pr(HEADER_PADDING_RIGHT)
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
                 div()
-                    .text_xs()
+                    .text_size(px(11.0))
+                    .font_weight(FontWeight::BOLD)
                     .text_color(cx.theme().muted_foreground)
                     .child("EXPLORER"),
             )
             .child(
                 h_flex()
-                    .gap(px(2.0))
+                    .gap(HEADER_ACTION_GAP)
                     .child(collapse_toggle)
                     .child(reveal_active),
             )
     }
 
     /// The workspace-root row (`RIFT` in the design) below the header
-    /// (`docs/spec-explorer-parity.md`): the leaf of `model.root()`'s
-    /// absolute path, uppercased, with a disclosure chevron that mirrors and
-    /// drives the collapse-all/expand-all state. Neutral — no label, no
-    /// chevron, not clickable — while `root()` is `None`: no snapshot has
-    /// arrived yet, so there is nothing to name or toggle.
+    /// (`docs/spec-explorer-redesign.md`): the leaf of `model.root()`'s
+    /// absolute path, uppercased and bold at the artboard's 12px label
+    /// style, with a disclosure chevron that mirrors and drives the
+    /// collapse-all/expand-all state, re-densified to the artboard's row
+    /// height, padding, and slot gap (shared with [`FileTree::render_row`]'s
+    /// [`ROW_HEIGHT`] / [`ROW_SLOT_GAP`]) and its own measured background
+    /// tint, which gives the row a subtle band against the panel surface.
+    /// Neutral — no label, no chevron, not clickable — while `root()` is
+    /// `None`: no snapshot has arrived yet, so there is nothing to name or
+    /// toggle.
     fn render_root_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(root) = self.model.root() else {
             return h_flex()
                 .flex_shrink_0()
                 .items_center()
                 .h(ROW_HEIGHT)
-                .px(px(8.0))
-                .gap(px(4.0))
+                .px(ROOT_ROW_PADDING_X)
+                .gap(ROW_SLOT_GAP)
+                .bg(cx.theme().background)
                 .child(div().w(px(12.0)).flex_shrink_0())
                 .into_any_element();
         };
@@ -946,13 +981,19 @@ impl FileTree {
             .flex_shrink_0()
             .items_center()
             .h(ROW_HEIGHT)
-            .px(px(8.0))
-            .gap(px(4.0))
-            .text_sm()
+            .px(ROOT_ROW_PADDING_X)
+            .gap(ROW_SLOT_GAP)
+            .bg(cx.theme().background)
+            .text_size(px(12.0))
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().list_hover))
             .child(div().w(px(12.0)).flex_shrink_0().child(chevron.to_string()))
-            .child(div().text_color(cx.theme().foreground).child(label))
+            .child(
+                div()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(cx.theme().foreground)
+                    .child(label),
+            )
             .on_click(cx.listener(|this, _event, _window, cx| {
                 this.toggle_collapse_all();
                 cx.notify();
@@ -1182,7 +1223,10 @@ impl Render for FileTree {
         // Empty state: distinguish "no snapshot yet" from "connected, empty
         // root" (`docs/spec-explorer-parity.md`) — a single conflated "No
         // files" branch used to read as an error during ordinary startup.
-        // Keep it quiet — the panel is a passive mirror, not an action surface.
+        // Restyled to the redesign's rhythm (`docs/spec-explorer-redesign.md`):
+        // still quiet, centered, muted, and carrying no action surface — just
+        // more generous breathing room than the shipped 8px, matching the
+        // redesign's less cramped density.
         let content = if let Some(state) = self.empty_state() {
             let message = match state {
                 EmptyState::Loading => "Loading\u{2026}",
@@ -1193,7 +1237,7 @@ impl Render for FileTree {
                 .flex()
                 .items_center()
                 .justify_center()
-                .p(px(8.0))
+                .p(px(16.0))
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
                 .child(message)
@@ -1437,6 +1481,25 @@ mod tests {
         assert_eq!(ICON_SLOT_WIDTH, px(14.0));
         assert_eq!(DIAGNOSTIC_DOT_SIZE, px(7.0));
         assert_eq!(GIT_LETTER_SLOT_WIDTH, px(12.0));
+    }
+
+    // --- header band + action row, workspace-root row density (#654,
+    // `docs/spec-explorer-redesign.md`) ---
+
+    #[test]
+    fn test_header_and_root_row_constants_match_the_redesigned_artboard() {
+        // A grep-friendly lock on the redesigned chrome: layout pixels, not
+        // theme tokens, replacing the shipped 28px header (which matched the
+        // status line, not the artboard) and the 8px/4px header and root-row
+        // padding/gap.
+        assert_eq!(HEADER_HEIGHT, px(38.0));
+        assert_eq!(HEADER_PADDING_LEFT, px(14.0));
+        assert_eq!(HEADER_PADDING_RIGHT, px(12.0));
+        assert_eq!(HEADER_ACTION_GAP, px(12.0));
+        assert_eq!(ROOT_ROW_PADDING_X, px(12.0));
+        // The root row shares the row-anatomy step's slot gap rather than
+        // introducing its own — the artboard measures the same 6px.
+        assert_eq!(ROW_SLOT_GAP, px(6.0));
     }
 
     #[test]
