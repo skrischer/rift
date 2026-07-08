@@ -930,7 +930,7 @@ repeat-time not-a-number
 
         let alt_left = keystroke("left", mods(false, true, false), None);
         let key = keystroke_to_tmux_key(&alt_left).expect("M-Left maps");
-        assert!(table.get("root", &key).unwrap().repeat == false);
+        assert!(!table.get("root", &key).unwrap().repeat);
         assert_eq!(table.get("root", &key).unwrap().command, "select-pane -L");
     }
 
