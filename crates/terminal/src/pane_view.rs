@@ -719,7 +719,7 @@ impl PaneView {
     /// Clear this pane's unacknowledged bell attention back to its underlying
     /// busy/free state. Called by the window layer when the user selects this
     /// pane's window locally (tab click, Alt+1..9), so the badge clears without
-    /// waiting for the confirming snapshot (`docs/spec-pane-activity-indicators.md`).
+    /// waiting for the confirming snapshot (`docs/spec-pane-activity-v2.md`).
     pub fn acknowledge_attention(&mut self) {
         self.activity.acknowledge();
     }
@@ -727,7 +727,7 @@ impl PaneView {
     /// Record whether this pane's window is the session's active window, from
     /// the snapshot's `is_active` flag. While active, a bell never raises
     /// attention; the activation edge acknowledges any pending attention
-    /// (`docs/spec-pane-activity-indicators.md`).
+    /// (`docs/spec-pane-activity-v2.md`).
     pub fn set_window_active(&mut self, active: bool) {
         self.activity.set_window_active(active);
     }
