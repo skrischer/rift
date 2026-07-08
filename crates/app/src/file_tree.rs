@@ -14,20 +14,26 @@
 //! file.
 //!
 //! Bounded to **navigate + open + decorate**, plus inline rename (artboard
-//! **State C**, `docs/spec-explorer-file-ops.md`, #675): selecting a file
-//! emits [`FileTreeEvent::OpenFile`] carrying its root-relative path — the
-//! clean signal the editor surface (#187) subscribes to. Rows carry git status
+//! **State C**, `docs/spec-explorer-file-ops.md`, #675) and the context-menu
+//! write group (artboard **State D**, #676): selecting a file emits
+//! [`FileTreeEvent::OpenFile`] carrying its root-relative path — the clean
+//! signal the editor surface (#187) subscribes to. Rows carry git status
 //! and diagnostic severity from the model, rolled up onto ancestor directories
 //! (`compute_rollup`, #329) so a collapsed folder still surfaces a
 //! modified/errored descendant; a deleted tracked file, whose own row is gone,
-//! rolls its status up onto surviving ancestors the same way (#480). Create /
-//! delete / move stay a later slice of the same phase — see
+//! rolls its status up onto surviving ancestors the same way (#480). Move
+//! (drag & drop) stays a later slice of the same phase — see
 //! `docs/spec-explorer-file-ops.md`. Selecting changes no tmux pane/window
 //! state — this is a pure GUI surface, agent-agnostic by construction (it only
 //! ever reads file paths, kinds, git status, diagnostics, and the `ignored`
-//! flag; it never inspects pane processes or file contents). A rename is user
-//! intent over the filesystem, sent as a [`FileTreeEvent::RenameRequested`]
-//! for `workspace.rs` to forward — no different in kind from any other write.
+//! flag; it never inspects pane processes or file contents). A rename,
+//! create, or delete is user intent over the filesystem, sent as a
+//! [`FileTreeEvent::RenameRequested`] / [`FileTreeEvent::CreateRequested`] /
+//! [`FileTreeEvent::DeleteRequested`] for `workspace.rs` to forward — no
+//! different in kind from any other write. *New File…* / *New Folder…* reuse
+//! the State-C inline-editor mechanism for a transient, not-yet-real row;
+//! *Delete* is gated behind the `#420` destructive confirm-dialog pattern,
+//! never batched.
 //!
 //! Implements `gpui-component`'s `Panel` trait directly (`docs/spec-ide-shell.md`,
 //! issue #323), so it can be mounted as a dock panel once the shell adopts
@@ -44,14 +50,16 @@ use gpui::{
     MouseDownEvent, ParentElement as _, Pixels, Render, ScrollStrategy, SharedString, Size,
     StatefulInteractiveElement as _, Styled as _, Subscription, Window,
 };
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_component::dialog::{AlertDialog, DialogButtonProps};
 use gpui_component::dock::{Panel, PanelEvent};
 use gpui_component::input::{
     Escape, Input, InputEvent, InputState, MoveToStart, SelectToNextWordEnd,
 };
 use gpui_component::menu::{ContextMenuExt as _, PopupMenu};
 use gpui_component::{
-    h_flex, v_virtual_list, ActiveTheme as _, Icon, IconName, Sizable as _, VirtualListScrollHandle,
+    h_flex, v_virtual_list, ActiveTheme as _, Icon, IconName, Sizable as _,
+    VirtualListScrollHandle, WindowExt as _,
 };
 use rift_protocol::{
     DiagnosticSeverity, EntryKind, FileOp, FileOpError, GitEntryStatus, GitStatusCode,
@@ -217,6 +225,28 @@ pub struct CollapseAll;
 #[action(namespace = rift, no_json)]
 pub struct StartRename;
 
+/// Start creating a new file inline under the selected row's target
+/// directory (artboard **State D**, `docs/spec-explorer-file-ops.md`, #676):
+/// a directory targets itself, a file targets its parent — see
+/// [`FileTree::create_target_dir`]. Dispatched by the row context menu's
+/// "New File…" item; pointer-only, not bound to a key.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct NewFile;
+
+/// Same as [`NewFile`] but creates a directory. Dispatched by the row
+/// context menu's "New Folder…" item; pointer-only, not bound to a key.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct NewFolder;
+
+/// Delete the selected row, gated behind the destructive confirm dialog
+/// (the `#420` pattern, artboard **State D**). Dispatched by the row context
+/// menu's "Delete" item; pointer-only, not bound to a key.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct DeleteSelected;
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// The GPUI key context the tree establishes around its root, so the
@@ -230,7 +260,7 @@ pub const FILE_TREE_KEY_CONTEXT: &str = "FileTree";
 /// [`WorktreeModel`] entries); the editor resolves it against the daemon root
 /// when it issues its read request. Only files emit this — selecting a directory
 /// toggles its expansion instead.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FileTreeEvent {
     /// A file was selected; open it. `path` is root-relative.
     OpenFile { path: String },
@@ -258,6 +288,19 @@ pub enum FileTreeEvent {
     /// shape as `OpenFile` above. The tree never sends the request itself:
     /// it has no protocol channel of its own (`docs/spec-explorer-file-ops.md`).
     RenameRequested { from: String, to: String },
+    /// The context menu's "New File…" / "New Folder…" inline editor
+    /// committed (artboard **State D**, #676): create a `kind` entry at
+    /// `path` (root-relative). `workspace.rs`'s existing `file_tree`
+    /// subscription turns this into a `ClientMessage::CreateFile` /
+    /// `CreateDir` on `file_op_tx` — the same shape as `RenameRequested`
+    /// above. The tree never sends the request itself.
+    CreateRequested { path: String, kind: EntryKind },
+    /// The row context menu's "Delete" item, after the destructive confirm
+    /// dialog (the `#420` pattern) was confirmed (artboard **State D**,
+    /// #676). `workspace.rs`'s existing `file_tree` subscription turns this
+    /// into a `ClientMessage::DeletePath` on `file_op_tx`. Never batched —
+    /// one event per confirmed delete.
+    DeleteRequested { path: String },
 }
 
 /// Which placeholder the panel shows instead of the tree
@@ -289,6 +332,12 @@ struct Row {
     git_status: Option<GitRollupStatus>,
     /// `None` means no descendant (or the file itself) carries a diagnostic.
     severity: Option<DiagnosticSeverity>,
+    /// `true` for the single transient row [`insert_create_row`] inserts for
+    /// the active create editor (artboard **State D**, #676) — not a real
+    /// model entry. `false` for every row [`FileTree::visible_rows`] builds
+    /// from the model. [`FileTree::render_row`] checks this to swap in
+    /// [`FileTree::render_create_row`].
+    is_pending_create: bool,
 }
 
 /// A directory's or file's rolled-up git status, ordered by the roll-up's
@@ -593,6 +642,17 @@ fn rename_target(path: &str, new_name: &str) -> String {
     }
 }
 
+/// Join a target directory (root-relative, empty for the worktree root) with
+/// a new entry's typed `name` — the create editor's counterpart to
+/// [`rename_target`], generalized to a possibly-empty (root) parent.
+fn join_dir(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
 /// Short, user-facing text for a [`FileOpError`] the rename editor re-opens
 /// on. Only [`FileOpError::AlreadyExists`] and [`FileOpError::InvalidPath`]
 /// ever reach the editor (`FileTree::apply_file_op_result`'s guard); the other
@@ -605,6 +665,48 @@ fn describe_file_op_error(error: FileOpError) -> &'static str {
         FileOpError::PermissionDenied => "Permission denied",
         FileOpError::Io => "Rename failed",
     }
+}
+
+/// The destructive delete confirm dialog's message for `name` (a row's
+/// display name) of `kind` — names the path, and warns "and its contents"
+/// for a directory (the `#420` pattern, artboard **State D**,
+/// `docs/spec-explorer-file-ops.md`).
+fn describe_delete(name: &str, kind: &EntryKind) -> String {
+    match kind {
+        EntryKind::Dir => format!("Delete \"{name}\" and its contents? This cannot be undone."),
+        EntryKind::File => format!("Delete \"{name}\"? This cannot be undone."),
+    }
+}
+
+/// Insert a synthetic transient row for the active create editor into
+/// `rows` (an already-built plain visible-row list): the first child of
+/// `create.parent` (or the very first row for the worktree root,
+/// `create.parent` empty) — "a transient inline input row under the target
+/// directory" (`docs/spec-explorer-file-ops.md`). A parent no longer present
+/// in `rows` (collapsed again, or removed from the model between the editor
+/// opening and this render) falls back to appending at the end, rather than
+/// silently dropping the editor's row.
+fn insert_create_row(rows: &mut Vec<Row>, create: &CreateEditor) {
+    let (index, depth) = if create.parent.is_empty() {
+        (0, 0)
+    } else {
+        match row_index(rows, &create.parent) {
+            Some(i) => (i + 1, rows[i].depth + 1),
+            None => (rows.len(), 0),
+        }
+    };
+    rows.insert(
+        index,
+        Row {
+            path: String::new(),
+            kind: create.kind.clone(),
+            depth,
+            ignored: false,
+            git_status: None,
+            severity: None,
+            is_pending_create: true,
+        },
+    );
 }
 
 /// Per-tree inline rename editor state (artboard **State C**,
@@ -622,6 +724,29 @@ struct RenameEditor {
     /// Set by an `AlreadyExists` / `InvalidPath` `FileOpResult` reply: shown
     /// inline beside the (re-seeded) input, which keeps the just-typed name
     /// rather than reverting to the original.
+    error: Option<String>,
+}
+
+/// Per-tree inline create editor state (artboard **State D**,
+/// `docs/spec-explorer-file-ops.md`, #676): the "New File…" / "New Folder…"
+/// context-menu items open one of these, seeding a fresh, blank-named
+/// `gpui-component` `InputState` — reusing the same mechanism as
+/// [`RenameEditor`], just with a target *directory* instead of an existing
+/// row's own path (there is nothing to rename yet). [`FileTree::render_row`]
+/// renders the transient row [`insert_create_row`] inserts into the cache;
+/// only one entry can be created at a time.
+struct CreateEditor {
+    /// The target directory (root-relative; empty for the worktree root) the
+    /// new entry is created under — [`FileTree::create_target_dir`]'s result
+    /// at the moment the editor opened.
+    parent: String,
+    /// Whether committing sends `CreateFile` or `CreateDir`.
+    kind: EntryKind,
+    /// Seeded blank at open (or the just-typed name on an error re-open) —
+    /// reused `InputState`, never forked.
+    input: Entity<InputState>,
+    /// Set by an `AlreadyExists` / `InvalidPath` `FileOpResult` reply: shown
+    /// inline beside the (re-seeded) input.
     error: Option<String>,
 }
 
@@ -666,6 +791,13 @@ pub struct FileTree {
     /// Keeps the rename input's `PressEnter` subscription alive for as long
     /// as `rename` is `Some`; dropped (replaced by `None`) alongside it.
     _rename_input_sub: Option<Subscription>,
+    /// The active inline create editor (artboard **State D**, #676), if
+    /// any — mirrors `rename` above, but for the "New File…"/"New Folder…"
+    /// transient row instead of an existing row's own name.
+    create: Option<CreateEditor>,
+    /// Keeps the create input's `PressEnter` subscription alive, mirroring
+    /// `_rename_input_sub`.
+    _create_input_sub: Option<Subscription>,
     /// Armed by a successful create/rename `FileOpResult`
     /// (`FileTree::apply_file_op_result`): the new path to select + reveal
     /// the moment the matching `UpdateWorktree` `added` entry arrives (the
@@ -690,6 +822,8 @@ impl FileTree {
             cache_dirty: true,
             rename: None,
             _rename_input_sub: None,
+            create: None,
+            _create_input_sub: None,
             pending_reveal: None,
         }
     }
@@ -961,17 +1095,200 @@ impl FileTree {
         }
     }
 
+    /// The root-relative directory a create targets ([`NewFile`] /
+    /// [`NewFolder`]): the selected row's own path when it is a directory,
+    /// its parent when it is a file (matching [`reveal_in_terminal_dir`]'s
+    /// target resolution, but root-relative — the model's own key space —
+    /// instead of absolute), or the worktree root (`String::new()`) with
+    /// nothing selected or a selection the model no longer has.
+    fn create_target_dir(&self) -> String {
+        let Some(selected) = self.selected.as_deref() else {
+            return String::new();
+        };
+        match self.model.get(selected) {
+            Some(entry) if entry.kind == EntryKind::Dir => selected.to_owned(),
+            Some(_) => selected
+                .rsplit_once('/')
+                .map(|(parent, _)| parent.to_owned())
+                .unwrap_or_default(),
+            None => String::new(),
+        }
+    }
+
+    /// Start creating a new `kind` entry inline under the selected row's
+    /// target directory (artboard **State D**, [`NewFile`] / [`NewFolder`]):
+    /// cancels any active rename first — only one inline editor is ever open
+    /// at a time — then opens a blank create editor targeting
+    /// [`FileTree::create_target_dir`]. A no-op before any snapshot has
+    /// arrived (`model.root()` is `None`) — there is no tree to create into.
+    fn start_create(&mut self, kind: EntryKind, window: &mut Window, cx: &mut Context<Self>) {
+        if self.model.root().is_none() {
+            return;
+        }
+        self.cancel_rename();
+        let parent = self.create_target_dir();
+        self.open_create_editor(parent, kind, String::new(), None, window, cx);
+    }
+
+    /// Open (or re-open) the inline create editor targeting `parent`, seeded
+    /// with `seed_name` and an optional inline `error` (set on an error
+    /// re-open). Expands `parent` if it was collapsed, so the transient row
+    /// [`insert_create_row`] adds is actually visible. Mirrors
+    /// [`FileTree::open_rename_editor`]'s focus/subscribe mechanics — reused
+    /// `InputState`, never forked — but seeds no selection: a blank or
+    /// just-typed name has nothing worth pre-selecting the way an existing
+    /// name's extension does.
+    fn open_create_editor(
+        &mut self,
+        parent: String,
+        kind: EntryKind,
+        seed_name: String,
+        error: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !parent.is_empty() && self.collapsed.remove(&parent) {
+            self.cache_dirty = true;
+        }
+
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(seed_name));
+        let sub = cx.subscribe_in(
+            &input,
+            window,
+            |this, _input, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    this.commit_create(window, cx);
+                }
+            },
+        );
+
+        let focus_target = input.clone();
+        window.on_next_frame(move |window, cx| {
+            focus_target.update(cx, |state, cx| state.focus(window, cx));
+        });
+
+        self.create = Some(CreateEditor {
+            parent,
+            kind,
+            input,
+            error,
+        });
+        self._create_input_sub = Some(sub);
+        self.cache_dirty = true;
+        cx.notify();
+    }
+
+    /// Commit the active create editor's typed value (`Enter`): closes the
+    /// editor immediately (optimistic, mirroring
+    /// [`FileTree::commit_rename`]), then emits
+    /// [`FileTreeEvent::CreateRequested`] for `workspace.rs` to forward as a
+    /// `CreateFile` / `CreateDir`. A no-op send (editor still closes) for a
+    /// blank name or a name containing `/` (a single path segment at a time
+    /// — nesting under the target directory is all this affordance covers;
+    /// deeper structure is created one level at a time, same as any file
+    /// manager).
+    fn commit_create(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.create.take() else {
+            return;
+        };
+        self._create_input_sub = None;
+        self.cache_dirty = true;
+
+        let typed = editor.input.read(cx).value().trim().to_owned();
+        if !typed.is_empty() && !typed.contains('/') {
+            let path = join_dir(&editor.parent, &typed);
+            cx.emit(FileTreeEvent::CreateRequested {
+                path,
+                kind: editor.kind,
+            });
+        }
+        cx.notify();
+    }
+
+    /// Cancel the active create editor (`Escape`): closes it with no send.
+    fn cancel_create(&mut self) {
+        if self.create.take().is_some() {
+            self._create_input_sub = None;
+            self.cache_dirty = true;
+        }
+    }
+
+    /// Re-open the create editor after an `AlreadyExists` / `InvalidPath`
+    /// `FileOpResult` reply for a create request that targeted `path`
+    /// (root-relative): re-derives the target directory and typed name from
+    /// `path` alone, mirroring the rename arm's reply-echo reconstruction —
+    /// no local state needs to survive the optimistic close.
+    fn reopen_create_editor(
+        &mut self,
+        kind: EntryKind,
+        path: &str,
+        error: FileOpError,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let parent = path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent.to_owned())
+            .unwrap_or_default();
+        let seed_name = Self::display_name(path).to_owned();
+        let message = describe_file_op_error(error).to_owned();
+        self.open_create_editor(parent, kind, seed_name, Some(message), window, cx);
+    }
+
+    /// Open the destructive delete confirm dialog for the selected row (the
+    /// `#420` pattern used by `SourceControlPanel::confirm_discard` and the
+    /// editor's dirty-close dialog, artboard **State D**, [`DeleteSelected`]):
+    /// confirming emits [`FileTreeEvent::DeleteRequested`] for
+    /// `workspace.rs` to forward as a `DeletePath`; cancelling leaves the
+    /// entry untouched. Never batched — one dialog, one path. A no-op with
+    /// nothing selected or a selection the model no longer has.
+    fn confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        let Some(entry) = self.model.get(&path) else {
+            return;
+        };
+        let name = Self::display_name(&path).to_owned();
+        let kind = entry.kind.clone();
+        let entity = cx.entity();
+
+        window.open_alert_dialog(cx, move |alert: AlertDialog, _, _| {
+            let entity = entity.clone();
+            let path = path.clone();
+            alert
+                .title("Delete")
+                .description(SharedString::from(describe_delete(&name, &kind)))
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Delete")
+                        .ok_variant(ButtonVariant::Danger)
+                        .cancel_text("Cancel")
+                        .show_cancel(true)
+                        .on_ok(move |_, _window, cx| {
+                            entity.update(cx, |_this, cx| {
+                                cx.emit(FileTreeEvent::DeleteRequested { path: path.clone() });
+                            });
+                            true
+                        }),
+                )
+        });
+    }
+
     /// Route a `FileOpResult` reply to UX transitions only — never mutates
     /// `WorktreeModel` (the single writer is `UpdateWorktree`,
     /// `docs/spec-explorer-file-ops.md`'s single-writer rule). A successful
     /// create/rename arms [`FileTree::pending_reveal`] with the new path. An
     /// `AlreadyExists` / `InvalidPath` reply to a `Rename` re-opens the
     /// editor for `from` (the file, unmoved — the op failed) seeded with
-    /// `to`'s basename (the name the user just typed) and the error text,
-    /// reconstructed entirely from the reply's own echo — no local state had
-    /// to survive the optimistic close. Any other error, or a reply for an
-    /// op this issue's client surfaces don't yet drive (create/delete —
-    /// `docs/spec-explorer-file-ops.md`'s later slices), is a no-op here.
+    /// `to`'s basename (the name the user just typed) and the error text; a
+    /// same-shaped `CreateFile` / `CreateDir` failure re-opens the create
+    /// editor via [`FileTree::apply_create_result`]. Both reconstruct their
+    /// editor entirely from the reply's own echo — no local state had to
+    /// survive the optimistic close. `Delete` carries no UX transition of
+    /// its own here: the confirm dialog already dismissed on click, and the
+    /// row's disappearance arrives through the ordinary `UpdateWorktree`
+    /// push, same as every other op's tree-structure change.
     pub(crate) fn apply_file_op_result(
         &mut self,
         op: FileOp,
@@ -994,12 +1311,39 @@ impl FileTree {
                     self.open_rename_editor(from, seed_name, Some(message), window, cx);
                 }
             }
-            FileOp::CreateFile { path } | FileOp::CreateDir { path } => {
-                if ok {
-                    self.pending_reveal = Some(path);
-                }
+            FileOp::CreateFile { path } => {
+                self.apply_create_result(EntryKind::File, path, ok, error, window, cx);
+            }
+            FileOp::CreateDir { path } => {
+                self.apply_create_result(EntryKind::Dir, path, ok, error, window, cx);
             }
             FileOp::Delete { .. } => {}
+        }
+    }
+
+    /// The `FileOp::CreateFile` / `FileOp::CreateDir` arm of
+    /// [`FileTree::apply_file_op_result`] (artboard **State D**): a success
+    /// arms [`FileTree::pending_reveal`]; an `AlreadyExists` / `InvalidPath`
+    /// reply re-opens the create editor via
+    /// [`FileTree::reopen_create_editor`] — the same "legible error, typed
+    /// name preserved" contract the rename arm gives (the milestone QA
+    /// gate's "a name collision is refused with a legible error").
+    fn apply_create_result(
+        &mut self,
+        kind: EntryKind,
+        path: String,
+        ok: bool,
+        error: Option<FileOpError>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if ok {
+            self.pending_reveal = Some(path);
+        } else if matches!(
+            error,
+            Some(FileOpError::AlreadyExists) | Some(FileOpError::InvalidPath)
+        ) {
+            self.reopen_create_editor(kind, &path, error.expect("matched Some above"), window, cx);
         }
     }
 
@@ -1120,10 +1464,17 @@ impl FileTree {
     /// is set; a no-op otherwise. The single path that calls
     /// [`FileTree::visible_rows`] — `render()` calls this once per paint instead
     /// of deriving the visible-row list itself, and the virtual list's row
-    /// closure only ever reads the resulting [`FileTree::row_cache`].
+    /// closure only ever reads the resulting [`FileTree::row_cache`]. When a
+    /// create editor is active, [`insert_create_row`] adds its transient row
+    /// on top of the model-derived list (artboard **State D**, #676) — the
+    /// model itself is never touched by a create, only this render-time cache.
     fn refresh_row_cache(&mut self) {
         if self.cache_dirty {
-            self.row_cache = self.visible_rows();
+            let mut rows = self.visible_rows();
+            if let Some(create) = &self.create {
+                insert_create_row(&mut rows, create);
+            }
+            self.row_cache = rows;
             self.cache_dirty = false;
         }
     }
@@ -1168,6 +1519,7 @@ impl FileTree {
                 ignored: entry.ignored,
                 git_status: decoration.git_status,
                 severity: decoration.severity,
+                is_pending_create: false,
             });
 
             if entry.kind == EntryKind::Dir && self.collapsed.contains(path) {
@@ -1410,6 +1762,19 @@ impl FileTree {
                 .into_any_element();
         }
 
+        // Inline create (artboard State D, #676): the transient "New
+        // File…"/"New Folder…" row [`insert_create_row`] adds to the cache
+        // renders the same way — reusing the identical mechanism, just with
+        // no existing path to match against (there is only ever one, flagged
+        // by `Row::is_pending_create`).
+        if row.is_pending_create {
+            if let Some(editor) = self.create.as_ref() {
+                return self
+                    .render_create_row(indent, twisty, icon_slot, editor, cx)
+                    .into_any_element();
+            }
+        }
+
         let name = Self::display_name(&row.path).to_owned();
         let path = row.path.clone();
 
@@ -1526,11 +1891,14 @@ impl FileTree {
         // `gpui-component`'s `ContextMenuExt`/`PopupMenu` — the same widget
         // `editor.rs` already ships its right-click menu with. Label-only (no
         // `IconName`: the product binary does not embed `gpui-component`'s
-        // icon assets, see the module doc). Lists exactly the client-capable
-        // top group, in artboard order; the write-actions group is a later
-        // phase (daemon write path does not exist yet). "Open" reuses the
-        // shipped `OpenSelected` action rather than a new one, so it also
-        // keeps that action's existing `Enter` binding hint.
+        // icon assets, see the module doc). Lists the client-capable top
+        // group in artboard order, then the write group (artboard **State
+        // D**, `docs/spec-explorer-file-ops.md`, #676) behind a separator:
+        // *New File…* / *New Folder…* open the create editor targeting this
+        // row (`FileTree::start_create`); *Rename* reuses the shipped
+        // `StartRename` action (State C), same as "Open" reuses
+        // `OpenSelected`; *Delete* opens the destructive confirm dialog.
+        // Drag & drop (move) is a later slice of the same phase.
         root.on_click(cx.listener(move |this, _event, _window, cx| {
             if is_dir {
                 this.click_dir(&path);
@@ -1551,6 +1919,11 @@ impl FileTree {
                 .menu("Copy relative path", Box::new(CopyRelativePath))
                 .menu("Reveal in terminal", Box::new(RevealInTerminal))
                 .menu("Collapse all", Box::new(CollapseAll))
+                .separator()
+                .menu("New File...", Box::new(NewFile))
+                .menu("New Folder...", Box::new(NewFolder))
+                .menu("Rename", Box::new(StartRename))
+                .menu("Delete", Box::new(DeleteSelected))
         })
         .into_any_element()
     }
@@ -1581,6 +1954,53 @@ impl FileTree {
 
         div()
             .id(SharedString::from(format!("{}-rename", row.path)))
+            .flex()
+            .items_center()
+            .h(ROW_HEIGHT)
+            .py(ROW_BLOCK_PADDING_Y)
+            .pl(indent)
+            .pr(px(8.0))
+            .gap(ROW_SLOT_GAP)
+            .rounded(ROW_RADIUS)
+            .text_sm()
+            .child(twisty)
+            .child(icon_slot)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&editor.input).small()),
+            )
+            .children(trailing)
+    }
+
+    /// The rendering of the transient create row [`insert_create_row`] adds
+    /// to the cache (artboard **State D**, #676): chevron + icon slot
+    /// unchanged (the icon reflects `editor.kind` via the synthetic row's own
+    /// `kind`), the name slot is `editor.input`, and — on an error re-open —
+    /// the inline message in the trailing lane. Mirrors
+    /// [`FileTree::render_rename_row`]; no click / context-menu handlers,
+    /// matching that row's "not yet a real entry" affordance.
+    fn render_create_row(
+        &self,
+        indent: Pixels,
+        twisty: Div,
+        icon_slot: Div,
+        editor: &CreateEditor,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let trailing = editor.error.as_ref().map(|message| {
+            div()
+                .flex_none()
+                .max_w(px(120.0))
+                .truncate()
+                .text_xs()
+                .text_color(cx.theme().danger)
+                .child(SharedString::from(message.clone()))
+        });
+
+        div()
+            .id("file-tree-create-row")
             .flex()
             .items_center()
             .h(ROW_HEIGHT)
@@ -1793,14 +2213,33 @@ impl Render for FileTree {
             .on_action(cx.listener(|this, _: &StartRename, window, cx| {
                 this.start_rename(window, cx);
             }))
-            // `Escape` while the rename input has focus: `InputState::escape`
-            // propagates the action (it is not in `clean_on_escape` mode), so
-            // it bubbles here to close the editor with no send. A no-op (and
-            // re-propagated) when nothing is being renamed, so an ancestor
-            // gets a chance at a plain Escape too.
+            // Context-menu write group (artboard State D,
+            // `docs/spec-explorer-file-ops.md`, #676): `NewFile`/`NewFolder`
+            // open the create editor under the selected row's target
+            // directory; `DeleteSelected` opens the destructive confirm
+            // dialog. Dispatched only by the row context menu — no key
+            // binding in `main.rs`, matching `RevealInTree`/`CollapseAll`.
+            .on_action(cx.listener(|this, _: &NewFile, window, cx| {
+                this.start_create(EntryKind::File, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewFolder, window, cx| {
+                this.start_create(EntryKind::Dir, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DeleteSelected, window, cx| {
+                this.confirm_delete(window, cx);
+            }))
+            // `Escape` while the rename or create input has focus:
+            // `InputState::escape` propagates the action (it is not in
+            // `clean_on_escape` mode), so it bubbles here to close whichever
+            // editor is open with no send. A no-op (and re-propagated) when
+            // neither is active, so an ancestor gets a chance at a plain
+            // Escape too.
             .on_action(cx.listener(|this, _: &Escape, _window, cx| {
                 if this.rename.is_some() {
                     this.cancel_rename();
+                    cx.notify();
+                } else if this.create.is_some() {
+                    this.cancel_create();
                     cx.notify();
                 } else {
                     cx.propagate();
@@ -2935,6 +3374,7 @@ mod tests {
             ignored: false,
             git_status: None,
             severity: None,
+            is_pending_create: false,
         }
     }
 
@@ -3235,6 +3675,31 @@ mod tests {
     }
 
     #[test]
+    fn test_join_dir_under_a_nested_parent() {
+        assert_eq!(join_dir("src", "lib.rs"), "src/lib.rs");
+    }
+
+    #[test]
+    fn test_join_dir_at_the_root_has_no_parent_prefix() {
+        assert_eq!(join_dir("", "README.md"), "README.md");
+    }
+
+    #[test]
+    fn test_describe_delete_of_a_directory_warns_about_its_contents() {
+        assert_eq!(
+            describe_delete("src", &EntryKind::Dir),
+            "Delete \"src\" and its contents? This cannot be undone."
+        );
+    }
+
+    #[test]
+    fn test_describe_delete_of_a_file_omits_the_contents_warning() {
+        let message = describe_delete("main.rs", &EntryKind::File);
+        assert_eq!(message, "Delete \"main.rs\"? This cannot be undone.");
+        assert!(!message.contains("contents"));
+    }
+
+    #[test]
     fn test_describe_file_op_error_is_distinct_per_variant() {
         let messages = [
             describe_file_op_error(FileOpError::AlreadyExists),
@@ -3249,6 +3714,42 @@ mod tests {
             messages.len(),
             "every reason reads distinctly"
         );
+    }
+
+    // --- create_target_dir (pure derivation over model + selection) --------
+
+    #[test]
+    fn test_create_target_dir_of_a_selected_directory_is_itself() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs")]);
+        tree.selected = Some("src".into());
+        assert_eq!(tree.create_target_dir(), "src");
+    }
+
+    #[test]
+    fn test_create_target_dir_of_a_selected_file_is_its_parent() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs")]);
+        tree.selected = Some("src/main.rs".into());
+        assert_eq!(tree.create_target_dir(), "src");
+    }
+
+    #[test]
+    fn test_create_target_dir_of_a_selected_top_level_file_is_the_root() {
+        let mut tree = seed(vec![file("README.md")]);
+        tree.selected = Some("README.md".into());
+        assert_eq!(tree.create_target_dir(), "");
+    }
+
+    #[test]
+    fn test_create_target_dir_with_nothing_selected_is_the_root() {
+        let tree = seed(vec![dir("src"), file("README.md")]);
+        assert_eq!(tree.create_target_dir(), "");
+    }
+
+    #[test]
+    fn test_create_target_dir_of_a_stale_selection_is_the_root() {
+        let mut tree = seed(vec![file("a.rs")]);
+        tree.selected = Some("gone.rs".into());
+        assert_eq!(tree.create_target_dir(), "");
     }
 
     // --- inline rename editor (artboard State C, `docs/spec-explorer-file-ops.md`, #675) ---
@@ -3627,6 +4128,442 @@ mod tests {
                 "only AlreadyExists/InvalidPath re-open the editor"
             );
         });
+    }
+
+    // --- context-menu write group: inline create editor (artboard State D,
+    // `docs/spec-explorer-file-ops.md`, #676) ---
+
+    #[gpui::test]
+    fn test_start_create_with_a_directory_selected_opens_editor_under_itself(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tree, window) = open_tree(cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut().apply_snapshot_chunk(
+                        "/proj".into(),
+                        vec![dir("src"), file("src/main.rs")],
+                        true,
+                    );
+                    tree.selected = Some("src".into());
+                    tree.start_create(EntryKind::File, window, cx);
+                });
+            })
+            .expect("start create");
+
+        cx.update(|cx| {
+            let tree = tree.read(cx);
+            let editor = tree.create.as_ref().expect("create editor opened");
+            assert_eq!(editor.parent, "src");
+            assert_eq!(editor.kind, EntryKind::File);
+            assert_eq!(editor.input.read(cx).value().as_ref(), "");
+            assert!(editor.error.is_none());
+
+            let row = tree
+                .row_cache
+                .iter()
+                .find(|r| r.is_pending_create)
+                .expect("transient row inserted");
+            assert_eq!(row.depth, 1, "one level deeper than its parent \"src\"");
+        });
+    }
+
+    #[gpui::test]
+    fn test_start_create_with_a_file_selected_targets_its_parent(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut().apply_snapshot_chunk(
+                        "/proj".into(),
+                        vec![dir("src"), file("src/main.rs")],
+                        true,
+                    );
+                    tree.selected = Some("src/main.rs".into());
+                    tree.start_create(EntryKind::Dir, window, cx);
+                });
+            })
+            .expect("start create");
+
+        cx.update(|cx| {
+            let tree = tree.read(cx);
+            let editor = tree.create.as_ref().expect("create editor opened");
+            assert_eq!(editor.parent, "src");
+            assert_eq!(editor.kind, EntryKind::Dir);
+        });
+    }
+
+    #[gpui::test]
+    fn test_start_create_with_nothing_selected_targets_the_root(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut()
+                        .apply_snapshot_chunk("/proj".into(), vec![file("a.rs")], true);
+                    tree.start_create(EntryKind::File, window, cx);
+                });
+            })
+            .expect("start create");
+
+        cx.update(|cx| {
+            let tree = tree.read(cx);
+            let editor = tree.create.as_ref().expect("create editor opened");
+            assert_eq!(editor.parent, "");
+
+            let index = tree
+                .row_cache
+                .iter()
+                .position(|r| r.is_pending_create)
+                .expect("transient row inserted");
+            assert_eq!(index, 0, "the root's transient row leads the list");
+            assert_eq!(tree.row_cache[index].depth, 0);
+        });
+    }
+
+    #[gpui::test]
+    fn test_start_create_expands_a_collapsed_target_directory(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut().apply_snapshot_chunk(
+                        "/proj".into(),
+                        vec![dir("src"), file("src/main.rs")],
+                        true,
+                    );
+                    tree.toggle_dir("src");
+                    assert!(tree.is_collapsed("src"));
+                    tree.selected = Some("src".into());
+                    tree.start_create(EntryKind::File, window, cx);
+                });
+            })
+            .expect("start create");
+
+        cx.update(|cx| {
+            assert!(
+                !tree.read(cx).is_collapsed("src"),
+                "the target expands so the transient row is visible"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn test_start_create_cancels_an_active_rename(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut().apply_snapshot_chunk(
+                        "/proj".into(),
+                        vec![file("src/main.rs")],
+                        true,
+                    );
+                    tree.selected = Some("src/main.rs".into());
+                    tree.start_rename(window, cx);
+                    assert!(tree.rename.is_some());
+                    tree.start_create(EntryKind::File, window, cx);
+                });
+            })
+            .expect("start create");
+
+        cx.update(|cx| {
+            let tree = tree.read(cx);
+            assert!(tree.rename.is_none(), "only one inline editor at a time");
+            assert!(tree.create.is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn test_start_create_before_any_snapshot_is_a_noop(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.start_create(EntryKind::File, window, cx);
+                });
+            })
+            .expect("start create");
+
+        cx.update(|cx| {
+            assert!(tree.read(cx).create.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn test_commit_create_emits_create_requested_and_closes_editor(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        let events = subscribe_events(&tree, cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut()
+                        .apply_snapshot_chunk("/proj".into(), vec![dir("src")], true);
+                    tree.selected = Some("src".into());
+                    tree.start_create(EntryKind::File, window, cx);
+                    tree.create
+                        .as_ref()
+                        .expect("editor open")
+                        .input
+                        .update(cx, |input, cx| {
+                            input.set_value("new.rs", window, cx);
+                        });
+                    tree.commit_create(window, cx);
+                });
+            })
+            .expect("commit create");
+
+        cx.update(|cx| {
+            assert!(
+                tree.read(cx).create.is_none(),
+                "the editor closes immediately on commit"
+            );
+        });
+        assert_eq!(
+            events.borrow().as_slice(),
+            [FileTreeEvent::CreateRequested {
+                path: "src/new.rs".into(),
+                kind: EntryKind::File,
+            }]
+        );
+    }
+
+    #[gpui::test]
+    fn test_commit_create_dir_at_the_root_emits_create_requested_with_dir_kind(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tree, window) = open_tree(cx);
+        let events = subscribe_events(&tree, cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut()
+                        .apply_snapshot_chunk("/proj".into(), vec![file("a.rs")], true);
+                    tree.start_create(EntryKind::Dir, window, cx);
+                    tree.create
+                        .as_ref()
+                        .expect("editor open")
+                        .input
+                        .update(cx, |input, cx| {
+                            input.set_value("newdir", window, cx);
+                        });
+                    tree.commit_create(window, cx);
+                });
+            })
+            .expect("commit create");
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            [FileTreeEvent::CreateRequested {
+                path: "newdir".into(),
+                kind: EntryKind::Dir,
+            }]
+        );
+    }
+
+    #[gpui::test]
+    fn test_commit_create_with_blank_name_sends_nothing(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        let events = subscribe_events(&tree, cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut()
+                        .apply_snapshot_chunk("/proj".into(), vec![dir("src")], true);
+                    tree.selected = Some("src".into());
+                    tree.start_create(EntryKind::File, window, cx);
+                    tree.create
+                        .as_ref()
+                        .expect("editor open")
+                        .input
+                        .update(cx, |input, cx| {
+                            input.set_value("   ", window, cx);
+                        });
+                    tree.commit_create(window, cx);
+                });
+            })
+            .expect("commit create");
+
+        assert!(
+            events.borrow().is_empty(),
+            "a blank name sends no CreateFile/CreateDir"
+        );
+    }
+
+    #[gpui::test]
+    fn test_commit_create_with_slash_in_name_sends_nothing(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        let events = subscribe_events(&tree, cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut()
+                        .apply_snapshot_chunk("/proj".into(), vec![dir("src")], true);
+                    tree.selected = Some("src".into());
+                    tree.start_create(EntryKind::File, window, cx);
+                    tree.create
+                        .as_ref()
+                        .expect("editor open")
+                        .input
+                        .update(cx, |input, cx| {
+                            input.set_value("nested/new.rs", window, cx);
+                        });
+                    tree.commit_create(window, cx);
+                });
+            })
+            .expect("commit create");
+
+        assert!(
+            events.borrow().is_empty(),
+            "a typed `/` is refused client-side; nesting is a later slice"
+        );
+    }
+
+    #[gpui::test]
+    fn test_cancel_create_closes_editor_with_no_event(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        let events = subscribe_events(&tree, cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut()
+                        .apply_snapshot_chunk("/proj".into(), vec![dir("src")], true);
+                    tree.selected = Some("src".into());
+                    tree.start_create(EntryKind::File, window, cx);
+                    tree.cancel_create();
+                    cx.notify();
+                });
+            })
+            .expect("cancel create");
+
+        cx.update(|cx| {
+            assert!(tree.read(cx).create.is_none());
+        });
+        assert!(events.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    fn test_apply_file_op_result_ok_create_file_arms_pending_reveal(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.apply_file_op_result(
+                        FileOp::CreateFile {
+                            path: "src/new.rs".into(),
+                        },
+                        true,
+                        None,
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .expect("apply file op result");
+
+        cx.update(|cx| {
+            let tree = tree.read(cx);
+            assert!(tree.create.is_none());
+            assert_eq!(tree.pending_reveal.as_deref(), Some("src/new.rs"));
+        });
+    }
+
+    #[gpui::test]
+    fn test_apply_file_op_result_already_exists_create_dir_reopens_editor_with_error(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tree, window) = open_tree(cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.apply_file_op_result(
+                        FileOp::CreateDir {
+                            path: "src/newdir".into(),
+                        },
+                        false,
+                        Some(FileOpError::AlreadyExists),
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .expect("apply file op result");
+
+        cx.update(|cx| {
+            let tree = tree.read(cx);
+            let editor = tree
+                .create
+                .as_ref()
+                .expect("an AlreadyExists reply re-opens the create editor");
+            assert_eq!(editor.parent, "src");
+            assert_eq!(editor.kind, EntryKind::Dir);
+            assert_eq!(editor.input.read(cx).value().as_ref(), "newdir");
+            assert!(editor.error.is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn test_apply_file_op_result_not_found_does_not_reopen_the_create_editor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tree, window) = open_tree(cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.apply_file_op_result(
+                        FileOp::CreateFile {
+                            path: "src/new.rs".into(),
+                        },
+                        false,
+                        Some(FileOpError::NotFound),
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .expect("apply file op result");
+
+        cx.update(|cx| {
+            assert!(tree.read(cx).create.is_none());
+        });
+    }
+
+    // --- context-menu write group: destructive delete (artboard State D,
+    // `docs/spec-explorer-file-ops.md`, #676) ---
+
+    #[gpui::test]
+    fn test_confirm_delete_with_nothing_selected_opens_no_dialog(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.confirm_delete(window, cx);
+                });
+                assert!(!window.has_active_dialog(cx));
+            })
+            .expect("confirm delete");
+    }
+
+    #[gpui::test]
+    fn test_confirm_delete_with_a_selection_opens_the_confirm_dialog(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tree, window) = open_tree(cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut().apply_snapshot_chunk(
+                        "/proj".into(),
+                        vec![file("src/main.rs")],
+                        true,
+                    );
+                    tree.selected = Some("src/main.rs".into());
+                    tree.confirm_delete(window, cx);
+                });
+                assert!(window.has_active_dialog(cx));
+            })
+            .expect("confirm delete");
     }
 
     // --- pending-reveal (`docs/spec-explorer-file-ops.md`, #675) -----------

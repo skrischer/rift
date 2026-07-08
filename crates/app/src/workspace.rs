@@ -82,7 +82,7 @@ use gpui_component::dialog::{AlertDialog, DialogButtonProps};
 use gpui_component::dock::{Dock, DockArea, DockItem, DockPlacement, PanelView};
 use gpui_component::notification::Notification;
 use gpui_component::{ActiveTheme as _, IconName, Root, Sizable as _, WindowExt as _};
-use rift_protocol::{ClientMessage, DaemonMessage, LspServerState};
+use rift_protocol::{ClientMessage, DaemonMessage, EntryKind, LspServerState};
 use rift_terminal::{SessionView, SessionViewEvent};
 use tracing::{debug, warn};
 
@@ -410,8 +410,11 @@ impl WorkspaceView {
         // a structural `new-window -c <dir>` on the shipped tmux command
         // channel; no new protocol message. `RenameRequested`
         // (`docs/spec-explorer-file-ops.md`, #675) is the tree's inline-rename
-        // commit: turned into a `ClientMessage::RenamePath` on `file_op_tx` —
-        // the tree itself holds no protocol channel.
+        // commit: turned into a `ClientMessage::RenamePath` on `file_op_tx`.
+        // `CreateRequested` / `DeleteRequested` (`docs/spec-explorer-file-ops.md`,
+        // #676 — the context-menu write group) turn into
+        // `ClientMessage::CreateFile` / `CreateDir` / `DeletePath` the same
+        // way. The tree itself holds no protocol channel.
         {
             let file_op_tx = file_op_tx.clone();
             cx.subscribe_in(
@@ -439,6 +442,22 @@ impl WorkspaceView {
                             to: to.clone(),
                         }) {
                             debug!(error = %e, %from, %to, "failed to enqueue rename");
+                        }
+                    }
+                    FileTreeEvent::CreateRequested { path, kind } => {
+                        let op = match kind {
+                            EntryKind::File => ClientMessage::CreateFile { path: path.clone() },
+                            EntryKind::Dir => ClientMessage::CreateDir { path: path.clone() },
+                        };
+                        if let Err(e) = file_op_tx.try_send(op) {
+                            debug!(error = %e, %path, "failed to enqueue create");
+                        }
+                    }
+                    FileTreeEvent::DeleteRequested { path } => {
+                        if let Err(e) =
+                            file_op_tx.try_send(ClientMessage::DeletePath { path: path.clone() })
+                        {
+                            debug!(error = %e, %path, "failed to enqueue delete");
                         }
                     }
                 },
