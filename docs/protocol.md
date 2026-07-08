@@ -50,7 +50,9 @@ binary, never by tolerating it (`docs/spec-connection-robustness.md`).
   a healthy concurrent connection's stream (relevant for the shared stable+dev
   daemon).
 
-History: version 7 adds the source-control write channel — `stage_file` /
+History: version 8 adds the buffer channel's typed error replies `open_error` /
+`save_error`, each carrying a `BufferErrorReason` (`docs/spec-v1-hardening.md`);
+version 7 adds the source-control write channel — `stage_file` /
 `unstage_file` / `stage_hunk` / `discard_file` / `commit`, each answered by
 one `git_op_result` (`docs/spec-source-control-write.md`); version 6 adds the navigation channel's `document_symbol_request` /
 `document_symbol_response` pair (`docs/spec-editor-chrome.md`); version 5 removes the tmux status-line CONTENT mirror pair
@@ -291,6 +293,8 @@ content on the structure path was the wrong design). Specified by `spec-editor.m
 { "type": "file_content",  "path": "src/main.rs", "content": "...", "mtime":      { "secs_since_epoch": 5, "nanos_since_epoch": 7 } }
 { "type": "save_result",   "path": "src/main.rs", "mtime":      { "secs_since_epoch": 9, "nanos_since_epoch": 0 } }
 { "type": "save_conflict", "path": "src/main.rs", "disk_mtime": { "secs_since_epoch": 9, "nanos_since_epoch": 0 } }
+{ "type": "open_error",    "path": "assets/logo.png", "reason": "binary" }
+{ "type": "save_error",    "path": "src/main.rs",     "reason": "permission_denied" }
 ```
 
 - `open_file` is the read request: it carries only the `path` (relative to the
@@ -308,6 +312,17 @@ content on the structure path was the wrong design). Specified by `spec-editor.m
   as the worktree entry's `mtime` (#107), so the base read on the structure path
   can be compared against a save on the buffer path — the concurrent-write
   detector. They are not independently sampled clock values.
+- `open_error` / `save_error` are the **typed failure replies** (version 8): the
+  daemon refused the read or write and answers immediately, so the editor renders
+  the specific reason at once instead of waiting out its own open/save timeout.
+  Each carries the `path` and a `reason` from the rift-owned `BufferErrorReason`
+  enum — `binary`, `not_utf8`, `permission_denied`, `not_found`, `too_large`, or
+  `io` (no `std::io` type crosses the wire, mirroring how `DiagnosticSeverity` /
+  `SymbolKind` mirror LSP types). `open_error` replaces `file_content` on a failed
+  read (including a file over the daemon's read-size cap → `too_large`);
+  `save_error` is distinct from `save_conflict` — the latter is a deliberate
+  stale-base rejection, the former an I/O failure where the write did not land.
+  No content is delivered and no write happens.
 
 ## Navigation channel
 
