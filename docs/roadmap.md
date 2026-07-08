@@ -48,6 +48,8 @@
 | 29 | Explorer context menu — right-click action framework over the tree; ships the client-capable actions (open, reveal, copy path / relative path, reveal-in-terminal, collapse-all) | — | — |
 | 30 | Explorer file operations — create / rename / delete / move via a daemon write path, surfaced through the context menu + inline rename + drag & drop | — | — |
 | 31 | Explorer search & filter — in-panel fuzzy narrowing, jump-to-file quick-open, multi-select, keyboard-first navigation | — | — |
+| 32 | Session management — glanceable always-visible session list (see every session at once, click to jump), rename / reorder / kill / new operations; extends the phase-19 switcher (switch + new, click-to-open popover) into a full management surface | — | — |
+| 33 | Post-connect session picker — connect to the host first, then pick or create a session from the live list; de-hardcode the fixed default session name ("rift") baked into the connect card | — | — |
 
 A phase gets a Spec link once `/loopkit:plan` drafts it, and a Milestone link once
 it is `READY`. The milestone (open/closed + issue progress) is where status lives.
@@ -147,13 +149,51 @@ PR, never edited from here):
 Backing prior art: "Explorer overhaul — prior-art index (Phases 27–31)" in
 [prior-art.md](prior-art.md).
 
+## Session management (phases 32–33)
+
+Seeded 2026-07-08 from idea sparring (research mode: websearch). The shipped tmux
+session support — the phase-19 switcher, relocated into the phase-21 title-bar
+connection group — is **switch + new only**, behind a click-to-open popover;
+phase 19 explicitly deferred killing sessions from the picker (destructive) and
+never covered rename-in-UI or reorder. The connection screen (phase 20) still
+requires a session name up front — `DEFAULT_SESSION = "rift"` on the connect card
+(`crates/app/src/connection_screen.rs`), chosen before the SSH connect — with no
+"connect first, then pick from a live list" flow. This block turns tmux sessions
+into a first-class, manageable surface.
+
+Ordering is a chain: **32 (management surface + operations)** is the foundation
+**33 (post-connect picker)** reuses — 33 wires the same live list + create path
+into the connect flow, so 32 precedes 33.
+
+Foundation impact (authored and ratified in each phase's `/loopkit:plan` spec
+PR, never edited from here):
+
+- Phase 32 — `protocol` gains session-management messages (rename / kill) — a
+  deliberate, reviewed API extension (`docs/protocol.md`) mirroring phase 19's
+  `QuerySessionList` / `SessionListReply`; the daemon serves them via tmux
+  `rename-session` / `kill-session` under the existing correlated-command
+  mechanism (the same shape as phase-19's `new-session -A` create path).
+  **Reorder** is client-side ordering persisted locally (the window-state store
+  pattern, phase 9) — tmux has no native session order — so it needs no protocol
+  change. Killing the attached session surfaces the existing `TerminalExit` path.
+- Phase 33 — the connection flow evolves: the Connection screen's Session field
+  becomes optional and default-less, and a session-picker step sits between
+  connect and cockpit (connect to the host → live list → pick / create). This is
+  a deliberate change to the phase-20 "Connection screen is the startup state"
+  contract; whether it also touches `architecture.md`'s connection-flow section
+  is settled in phase 33's spec PR. De-hardcoding the fixed `"rift"` default is
+  part of this phase.
+
+Backing prior art: "Session management & post-connect picker — prior-art index
+(Phases 32–33)" in [prior-art.md](prior-art.md).
+
 ## Tracks (tooling/DX, not product phases)
 
 - **Dogfooding fixes** — living papercut backlog: [spec-dogfooding-fixes.md](spec-dogfooding-fixes.md), grouped by the [`papercut` label](https://github.com/skrischer/rift/labels/papercut); never completes.
 - **Dogfooding channels** — [spec-dogfooding-channels.md](spec-dogfooding-channels.md), [milestone 12](https://github.com/skrischer/rift/milestone/12).
 - **Logging & diagnostics** — professional debug logging for the dev and stable channels: [spec-logging-diagnostics.md](spec-logging-diagnostics.md), [milestone 20](https://github.com/skrischer/rift/milestone/20); prior-art survey in [prior-art.md](prior-art.md) Category 10. Issues are immediately workable (parallel track, no queue edge).
 - **Daemon re-deploy** — a changed same-version daemon binary takes effect on the next relaunch (atomic replace + pidfile restart of the shared daemon): [spec-daemon-redeploy.md](spec-daemon-redeploy.md), [milestone 23](https://github.com/skrischer/rift/milestone/23). Graduated from the reverted papercut #268, after live QA exposed the `ETXTBSY` / reattach-stale seams.
-- **Visual UI harness** — give the coding agent eyes on the real rift / rift-gallery UI plus deterministic E2E (show UI bugs, check design parity against the Paper contract). Two ordered phases, specs/milestones created at planning: **(1) gpui Linux/WSLg headless renderer** — implement the one missing `PlatformHeadlessRenderer` impl for off-macOS (offscreen wgpu texture + readback), unblocking `capture_screenshot` on rift's platforms; **(2) visual/E2E harness** — `capture_screenshot` + `TestAppContext` driving over a named snapshot registry (rift views + gallery components), Paper-MCP diff, optional CI pixel baseline. Foundation impact (Phase 1, ratified in its `/loopkit:plan` spec, never edited from here): an **additive `[patch]` fork** of `gpui` on the frozen `4bee412` base — not a commit bump, so no API churn — redirecting every gpui consumer (rift, gpui-component, `termy_terminal_ui`) to the fork, with a **mandatory single-`gpui`-invariant trial** before landing; pin-mechanics precedent in [archive/spec-gpui-rev-bump.md](archive/spec-gpui-rev-bump.md). Backing prior art: "Visual UI harness — prior-art index" in [prior-art.md](prior-art.md).
+- **Visual UI harness** — give the coding agent eyes on the real rift / rift-gallery UI plus deterministic E2E (show UI bugs, check design parity against the Paper contract). Two ordered phases: **(1) gpui Linux/WSLg headless renderer** ([spec](spec-gpui-headless-renderer.md) · [milestone 44](https://github.com/skrischer/rift/milestone/44)) — implement the one missing `PlatformHeadlessRenderer` impl for off-macOS (offscreen wgpu texture + readback), unblocking `capture_screenshot` on rift's platforms; **(2) visual/E2E harness** — `capture_screenshot` + `TestAppContext` driving over a named snapshot registry (rift views + gallery components), Paper-MCP diff, optional CI pixel baseline. Foundation impact (Phase 1, ratified in its `/loopkit:plan` spec, never edited from here): an **additive `[patch]` fork** of `gpui` on the frozen `4bee412` base — not a commit bump, so no API churn — redirecting every gpui consumer (rift, gpui-component, `termy_terminal_ui`) to the fork, with a **mandatory single-`gpui`-invariant trial** before landing; pin-mechanics precedent in [archive/spec-gpui-rev-bump.md](archive/spec-gpui-rev-bump.md). Backing prior art: "Visual UI harness — prior-art index" in [prior-art.md](prior-art.md).
 - Completed meta tracks (workflow automation, planning automation, pane & window management, terminal interaction fixes, component gallery, gpui rev bump investigation) live in [archive/](archive/) and their closed milestones. The gpui rev bump investigation (milestone 22) concluded **NO-GO for now**: the candidate rev breaks the single-`gpui` invariant via the `termy_terminal_ui` fork's bare `gpui` pin — see [archive/spec-gpui-rev-bump.md](archive/spec-gpui-rev-bump.md) decision log for the full findings and the ordered prerequisite steps.
 
 ## North star
