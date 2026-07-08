@@ -43,86 +43,73 @@ impl EventListener for Listener {
     }
 }
 
-/// Output-recency idle window for the activity fallback: a pane without a
-/// trusted OSC-133 marker reads [`PaneActivity::Busy`] while it produced
-/// output within this window, then ages back to [`PaneActivity::Free`]. When
-/// a trusted OSC-133 marker is present it wins and this fallback is bypassed
-/// (`docs/spec-pane-activity-indicators.md`).
-const ACTIVITY_IDLE_WINDOW: Duration = Duration::from_millis(1500);
-
-/// How long output may keep flowing past the most recent OSC-133 marker before
-/// marker trust ages out and the output-recency fallback resumes. Markers
-/// stopping while output continues means a program without shell integration
-/// took over the pane; without aging, its frozen [`CommandPhase`] would stick
-/// the activity state for the pane's remaining lifetime (#491). A fresh marker
-/// restores OSC-133 authority.
-const OSC133_TRUST_WINDOW: Duration = Duration::from_secs(10);
-
-/// Per-pane activity classification derived agent-agnostically from the pane
-/// byte stream. Precedence: attention > busy > free
-/// (`docs/spec-pane-activity-indicators.md`).
+/// Per-pane activity classification derived agent-agnostically from structural
+/// process state (the tmux foreground-process flag, the client alternate-screen
+/// mode, the OSC-133 phase) plus the terminal bell. Precedence:
+/// attention > busy > free (`docs/spec-pane-activity-v2.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneActivity {
-    /// At a shell prompt or otherwise not working.
+    /// At a shell prompt or otherwise not running a command.
     Free,
-    /// A foreground command is running (OSC-133 `Executing`, or recent output
-    /// via the fallback) — stays busy while the process is silent.
+    /// A foreground command is running — stays busy across the command's silent
+    /// phases (a running agent reads busy whether working or thinking).
     Busy,
     /// The pane rang the terminal bell and the user has not acknowledged it.
     Attention,
 }
 
+/// Whether a pane is busy (a foreground command is running), from its structural
+/// inputs. Authority is ordered: the tmux foreground-process flag first, then a
+/// client-side structural fallback where that flag is unavailable (legacy path).
+///
+/// - `is_shell == Some(true)` — the foreground process is the login shell: free.
+/// - `is_shell == Some(false)` — a command is running: busy.
+/// - `is_shell == None` — the flag is unavailable; fall back to the client
+///   structural signals: busy if a full-screen TUI is on the alternate screen
+///   or the OSC-133 phase is `Executing`.
+///
+/// GPUI-free and byte-flow-free so it is unit-testable in isolation
+/// (`docs/spec-pane-activity-v2.md`).
+fn classify_busy(is_shell: Option<bool>, alt_screen: bool, osc_executing: bool) -> bool {
+    match is_shell {
+        Some(true) => false,
+        Some(false) => true,
+        None => alt_screen || osc_executing,
+    }
+}
+
 /// Mutable per-pane activity signals folded into a [`PaneActivity`]. Kept free
-/// of GPUI so the state machine is unit-testable in isolation. Busy/free is read
-/// from the pane's OSC-133 [`CommandPhase`] while the most recent marker is
-/// trusted (see [`Self::osc133_trusted`]), otherwise from the output-recency
-/// fallback; the terminal bell overlays attention.
+/// of GPUI so the state machine is unit-testable in isolation. Busy/free is a
+/// pure function of the structural inputs (see [`classify_busy`]); this tracker
+/// holds the pane's foreground-process flag and overlays the terminal bell as
+/// attention (`docs/spec-pane-activity-v2.md`).
 #[derive(Debug, Default)]
 struct ActivityTracker {
-    /// Timestamp of the most recent OSC-133 marker. While trusted
-    /// ([`Self::osc133_trusted`]) OSC-133 is authoritative for busy/free;
-    /// otherwise the output-recency fallback carries it.
-    last_osc133: Option<Instant>,
+    /// The pane's tmux foreground-process flag (#510), pushed down from the
+    /// snapshot via [`Self::set_foreground_shell`]: `Some(false)` a command is
+    /// running, `Some(true)` at the shell, `None` unavailable (legacy path).
+    is_shell: Option<bool>,
     /// Unacknowledged terminal-bell attention. Set by [`Self::on_bell`], cleared
     /// by [`Self::acknowledge`].
     attention: bool,
     /// Whether this pane's window is the session's active window, pushed down
     /// from the window layer via [`Self::set_window_active`]. Gates bell raises:
     /// a bell in the window the user is looking at never raises attention
-    /// (`docs/spec-pane-activity-indicators.md`).
+    /// (`docs/spec-pane-activity-v2.md`).
     window_active: bool,
-    /// Timestamp of the most recent PTY output, for the recency fallback.
-    last_output: Option<Instant>,
 }
 
 impl ActivityTracker {
-    /// Record that the pane emitted output (feeds the recency fallback).
-    fn on_output(&mut self, now: Instant) {
-        self.last_output = Some(now);
-    }
-
-    /// Record that an OSC-133 marker was observed; OSC-133 is authoritative for
-    /// busy/free while its trust window holds (see [`Self::osc133_trusted`]).
-    fn on_osc133(&mut self, now: Instant) {
-        self.last_osc133 = Some(now);
-    }
-
-    /// Whether the OSC-133 [`CommandPhase`] is currently authoritative: a
-    /// marker has been seen and output has not kept flowing for more than
-    /// [`OSC133_TRUST_WINDOW`] past it. Output outrunning the markers by the
-    /// whole window means shell integration no longer drives the pane, so
-    /// busy/free falls back to output recency until a new marker arrives.
-    fn osc133_trusted(&self) -> bool {
-        let Some(marker) = self.last_osc133 else {
-            return false;
-        };
-        self.last_output
-            .is_none_or(|output| output.saturating_duration_since(marker) < OSC133_TRUST_WINDOW)
+    /// Record the pane's tmux foreground-process flag — the authoritative
+    /// busy/free signal (`None` on the legacy path, where the client fallback
+    /// applies).
+    fn set_foreground_shell(&mut self, is_shell: Option<bool>) {
+        self.is_shell = is_shell;
     }
 
     /// Raise unacknowledged attention (the pane rang the terminal bell).
     /// Suppressed while the pane's window is active — the user is already
-    /// looking at it (`docs/spec-pane-activity-indicators.md`).
+    /// looking at it (`docs/spec-pane-activity-v2.md`).
     fn on_bell(&mut self) {
         if !self.window_active {
             self.attention = true;
@@ -145,25 +132,20 @@ impl ActivityTracker {
         }
     }
 
-    /// Classify the pane's activity for the given command `phase` and clock.
-    fn state(&self, phase: CommandPhase, now: Instant) -> PaneActivity {
+    /// Classify the pane's activity from its structural inputs, overlaying an
+    /// unacknowledged bell as attention.
+    fn state(&self, alt_screen: bool, osc_executing: bool) -> PaneActivity {
         if self.attention {
             return PaneActivity::Attention;
         }
-        self.underlying(phase, now)
+        self.underlying(alt_screen, osc_executing)
     }
 
     /// The pane's busy/free state ignoring any unacknowledged bell — the state
     /// the active window surfaces, so a bell arriving there never flashes
-    /// attention (`docs/spec-pane-activity-indicators.md`).
-    fn underlying(&self, phase: CommandPhase, now: Instant) -> PaneActivity {
-        let busy = if self.osc133_trusted() {
-            matches!(phase, CommandPhase::Executing)
-        } else {
-            self.last_output
-                .is_some_and(|last| now.saturating_duration_since(last) < ACTIVITY_IDLE_WINDOW)
-        };
-        if busy {
+    /// attention (`docs/spec-pane-activity-v2.md`).
+    fn underlying(&self, alt_screen: bool, osc_executing: bool) -> PaneActivity {
+        if classify_busy(self.is_shell, alt_screen, osc_executing) {
             PaneActivity::Busy
         } else {
             PaneActivity::Free
@@ -272,8 +254,9 @@ pub struct PaneView {
     prefix_options: PrefixOptions,
     /// Prefix chord capture/repeat state for this pane's `on_key_down`.
     prefix_engine: PrefixEngine,
-    /// Agent-agnostic activity signals (OSC-133 lifecycle, terminal bell, output
-    /// recency) folded into a [`PaneActivity`] via [`Self::activity`].
+    /// Agent-agnostic activity signals (the tmux foreground-process flag, the
+    /// alternate-screen mode, the OSC-133 phase, the terminal bell) folded into
+    /// a [`PaneActivity`] via [`Self::activity`].
     activity: ActivityTracker,
 }
 
@@ -357,10 +340,6 @@ impl PaneView {
                             for event in term_events {
                                 view.handle_term_event(event, cx);
                             }
-                            // A processed PTY batch means the pane produced
-                            // output; feeds the recency fallback for panes
-                            // without OSC-133 shell integration.
-                            view.activity.on_output(Instant::now());
                             cx.notify();
                         })
                     });
@@ -706,20 +685,35 @@ impl PaneView {
         &self.command_lifecycle
     }
 
+    /// The pane's structural busy/free inputs read live: alternate-screen mode
+    /// (a full-screen foreground TUI) from the client `Term`, and whether the
+    /// OSC-133 phase is `Executing`. Fed to the [`ActivityTracker`], which
+    /// prefers the tmux foreground-process flag and falls back to these only on
+    /// the legacy path (`docs/spec-pane-activity-v2.md`).
+    fn structural_activity_inputs(&self) -> (bool, bool) {
+        let alt_screen = {
+            let term = self.terminal.lock().expect("term lock poisoned");
+            term.mode().contains(TermMode::ALT_SCREEN)
+        };
+        let osc_executing = self.command_lifecycle.phase == CommandPhase::Executing;
+        (alt_screen, osc_executing)
+    }
+
     /// This pane's current activity state (attention > busy > free), derived
-    /// agent-agnostically from OSC-133 lifecycle, the terminal bell, and output
-    /// recency (`docs/spec-pane-activity-indicators.md`).
+    /// agent-agnostically from the tmux foreground-process flag (with an
+    /// alternate-screen / OSC-133 fallback on the legacy path) and the terminal
+    /// bell (`docs/spec-pane-activity-v2.md`).
     pub fn activity(&self) -> PaneActivity {
-        self.activity
-            .state(self.command_lifecycle.phase, Instant::now())
+        let (alt_screen, osc_executing) = self.structural_activity_inputs();
+        self.activity.state(alt_screen, osc_executing)
     }
 
     /// This pane's underlying busy/free state with any unacknowledged bell
     /// suppressed — what the active window surfaces, so a bell arriving between
-    /// snapshots never flashes its tab (`docs/spec-pane-activity-indicators.md`).
+    /// snapshots never flashes its tab (`docs/spec-pane-activity-v2.md`).
     pub fn underlying_activity(&self) -> PaneActivity {
-        self.activity
-            .underlying(self.command_lifecycle.phase, Instant::now())
+        let (alt_screen, osc_executing) = self.structural_activity_inputs();
+        self.activity.underlying(alt_screen, osc_executing)
     }
 
     /// Clear this pane's unacknowledged bell attention back to its underlying
@@ -736,6 +730,15 @@ impl PaneView {
     /// (`docs/spec-pane-activity-indicators.md`).
     pub fn set_window_active(&mut self, active: bool) {
         self.activity.set_window_active(active);
+    }
+
+    /// Record this pane's tmux foreground-process flag (#510) from the snapshot,
+    /// the authoritative busy/free signal: `Some(false)` a command is running
+    /// (busy), `Some(true)` at the shell (free), `None` unavailable (the client
+    /// structural fallback applies). Pushed down alongside `set_window_active`
+    /// (`docs/spec-pane-activity-v2.md`).
+    pub fn set_foreground_shell(&mut self, is_shell: Option<bool>) {
+        self.activity.set_foreground_shell(is_shell);
     }
 
     fn pixel_to_grid(&self, pos: Point<Pixels>) -> (usize, usize) {
@@ -809,22 +812,18 @@ impl PaneView {
             OscEvent::ShellPromptStart => {
                 debug!("OSC 133;A: shell prompt start");
                 self.command_lifecycle.prompt_start();
-                self.activity.on_osc133(Instant::now());
             }
             OscEvent::ShellCommandStart => {
                 debug!("OSC 133;B: command input start");
                 self.command_lifecycle.command_start();
-                self.activity.on_osc133(Instant::now());
             }
             OscEvent::ShellCommandExecuting => {
                 debug!("OSC 133;C: command executing");
                 self.command_lifecycle.command_executing();
-                self.activity.on_osc133(Instant::now());
             }
             OscEvent::ShellCommandFinished(code) => {
                 debug!(?code, "OSC 133;D: command finished");
                 self.command_lifecycle.command_finished(code);
-                self.activity.on_osc133(Instant::now());
             }
             _ => {}
         }
@@ -1740,84 +1739,128 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn test_activity_default_is_free() {
-        // No OSC-133, no output yet: the recency fallback reports free.
+        // No foreground-process flag and no structural signal: free.
         let tracker = ActivityTracker::default();
-        assert_eq!(
-            tracker.state(CommandPhase::Idle, Instant::now()),
-            PaneActivity::Free
-        );
+        assert_eq!(tracker.state(false, false), PaneActivity::Free);
     }
 
     #[::core::prelude::v1::test]
-    fn test_activity_osc133_phase_map() {
-        // With OSC-133 present, only `Executing` is busy; every other phase is
-        // free (`match phase { Executing => Busy, _ => Free }`).
+    fn test_classify_busy_shell_true_is_always_free() {
+        // A shell prompt reads free regardless of any client structural signal.
+        for &alt in &[false, true] {
+            for &osc in &[false, true] {
+                assert!(!classify_busy(Some(true), alt, osc), "alt={alt} osc={osc}");
+            }
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_classify_busy_shell_false_is_always_busy() {
+        // A running foreground command reads busy regardless of alt-screen/OSC.
+        for &alt in &[false, true] {
+            for &osc in &[false, true] {
+                assert!(classify_busy(Some(false), alt, osc), "alt={alt} osc={osc}");
+            }
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_classify_busy_legacy_none_follows_structural_fallback() {
+        // Legacy path (no is_shell): busy iff a full-screen TUI (alt-screen) or
+        // an executing OSC-133 command is present.
+        assert!(!classify_busy(None, false, false));
+        assert!(classify_busy(None, true, false));
+        assert!(classify_busy(None, false, true));
+        assert!(classify_busy(None, true, true));
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_activity_all_input_combinations_match_classifier() {
+        // Every (is_shell, alt_screen, osc_executing, attention) combination
+        // folds to: an unacknowledged bell overlays attention, otherwise the
+        // pure classifier decides busy/free.
+        for is_shell in [Some(true), Some(false), None] {
+            for &alt in &[false, true] {
+                for &osc in &[false, true] {
+                    for &attention in &[false, true] {
+                        let mut tracker = ActivityTracker::default();
+                        tracker.set_foreground_shell(is_shell);
+                        if attention {
+                            tracker.on_bell();
+                        }
+                        let expected = if attention {
+                            PaneActivity::Attention
+                        } else if classify_busy(is_shell, alt, osc) {
+                            PaneActivity::Busy
+                        } else {
+                            PaneActivity::Free
+                        };
+                        assert_eq!(
+                            tracker.state(alt, osc),
+                            expected,
+                            "is_shell={is_shell:?} alt={alt} osc={osc} attention={attention}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_activity_silent_but_running_stays_busy() {
+        // Regression: a foreground command that emits no output stays busy. With
+        // byte-flow removed there is no recency decay, so it never ages to free
+        // (the old 1500 ms window no longer applies).
         let mut tracker = ActivityTracker::default();
-        let now = Instant::now();
-        tracker.on_osc133(now);
-        assert_eq!(tracker.state(CommandPhase::Idle, now), PaneActivity::Free);
-        assert_eq!(
-            tracker.state(CommandPhase::PromptShown, now),
-            PaneActivity::Free
-        );
-        assert_eq!(
-            tracker.state(CommandPhase::CommandInput, now),
-            PaneActivity::Free
-        );
-        assert_eq!(
-            tracker.state(CommandPhase::Executing, now),
-            PaneActivity::Busy
-        );
+        tracker.set_foreground_shell(Some(false));
+        assert_eq!(tracker.state(false, false), PaneActivity::Busy);
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_activity_byte_burst_never_sets_busy_on_free_shell() {
+        // Regression: a shell at its prompt has no output-driven path to busy —
+        // a redraw burst (mouse reports, a window-select repaint) cannot flip it,
+        // because the derivation reads only the structural inputs, never bytes.
+        let mut tracker = ActivityTracker::default();
+        tracker.set_foreground_shell(Some(true));
+        assert_eq!(tracker.state(false, false), PaneActivity::Free);
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_activity_bare_shell_reads_free() {
+        // Regression: a never-ran / freshly-split / exited-to-prompt pane reads
+        // free, and stays free under any incidental client structural noise.
+        let mut tracker = ActivityTracker::default();
+        tracker.set_foreground_shell(Some(true));
+        assert_eq!(tracker.state(false, false), PaneActivity::Free);
+        assert_eq!(tracker.state(true, true), PaneActivity::Free);
     }
 
     #[::core::prelude::v1::test]
     fn test_activity_bell_raises_attention_and_acknowledge_clears() {
         let mut tracker = ActivityTracker::default();
-        let now = Instant::now();
-        tracker.on_osc133(now);
+        tracker.set_foreground_shell(Some(false));
 
         tracker.on_bell();
-        // Attention overlays both the free and busy underlying phases.
-        assert_eq!(
-            tracker.state(CommandPhase::Idle, now),
-            PaneActivity::Attention
-        );
-        assert_eq!(
-            tracker.state(CommandPhase::Executing, now),
-            PaneActivity::Attention
-        );
+        // Attention overlays the underlying busy state.
+        assert_eq!(tracker.state(false, false), PaneActivity::Attention);
 
         tracker.acknowledge();
-        // Cleared back to the underlying phase-derived state.
-        assert_eq!(tracker.state(CommandPhase::Idle, now), PaneActivity::Free);
-        assert_eq!(
-            tracker.state(CommandPhase::Executing, now),
-            PaneActivity::Busy
-        );
+        // Cleared back to the underlying structural state (busy: a command runs).
+        assert_eq!(tracker.state(false, false), PaneActivity::Busy);
     }
 
     #[::core::prelude::v1::test]
     fn test_activity_underlying_ignores_unacknowledged_bell() {
-        // The active window reads `underlying`: an unacknowledged bell still
-        // surfaces attention via `state`, but `underlying` reports the busy/free
-        // beneath it so a bell in the active window never flashes its tab.
+        // The active window reads `underlying`: an unacknowledged bell surfaces
+        // attention via `state`, but `underlying` reports the busy/free beneath
+        // it so a bell in the active window never flashes its tab.
         let mut tracker = ActivityTracker::default();
-        let now = Instant::now();
-        tracker.on_osc133(now);
+        tracker.set_foreground_shell(Some(false));
         tracker.on_bell();
 
-        assert_eq!(
-            tracker.state(CommandPhase::Idle, now),
-            PaneActivity::Attention
-        );
-        assert_eq!(
-            tracker.underlying(CommandPhase::Idle, now),
-            PaneActivity::Free
-        );
-        assert_eq!(
-            tracker.underlying(CommandPhase::Executing, now),
-            PaneActivity::Busy
-        );
+        assert_eq!(tracker.state(false, false), PaneActivity::Attention);
+        assert_eq!(tracker.underlying(false, false), PaneActivity::Busy);
     }
 
     #[::core::prelude::v1::test]
@@ -1826,20 +1869,15 @@ mod tests {
         // already looking at it, so no stale attention flag survives leaving
         // the window.
         let mut tracker = ActivityTracker::default();
-        let now = Instant::now();
-        tracker.on_osc133(now);
+        tracker.set_foreground_shell(Some(true));
         tracker.set_window_active(true);
 
         tracker.on_bell();
-        assert_eq!(tracker.state(CommandPhase::Idle, now), PaneActivity::Free);
-        assert_eq!(
-            tracker.state(CommandPhase::Executing, now),
-            PaneActivity::Busy
-        );
+        assert_eq!(tracker.state(false, false), PaneActivity::Free);
 
         // Leaving the window afterwards must not resurface the suppressed bell.
         tracker.set_window_active(false);
-        assert_eq!(tracker.state(CommandPhase::Idle, now), PaneActivity::Free);
+        assert_eq!(tracker.state(false, false), PaneActivity::Free);
     }
 
     #[::core::prelude::v1::test]
@@ -1848,157 +1886,15 @@ mod tests {
         // window acknowledges it (viewing is the acknowledgement), and a later
         // deactivation does not re-raise it.
         let mut tracker = ActivityTracker::default();
-        let now = Instant::now();
-        tracker.on_osc133(now);
+        tracker.set_foreground_shell(Some(true));
 
         tracker.on_bell();
-        assert_eq!(
-            tracker.state(CommandPhase::Idle, now),
-            PaneActivity::Attention
-        );
+        assert_eq!(tracker.state(false, false), PaneActivity::Attention);
 
         tracker.set_window_active(true);
-        assert_eq!(tracker.state(CommandPhase::Idle, now), PaneActivity::Free);
+        assert_eq!(tracker.state(false, false), PaneActivity::Free);
 
         tracker.set_window_active(false);
-        assert_eq!(tracker.state(CommandPhase::Idle, now), PaneActivity::Free);
-    }
-
-    #[::core::prelude::v1::test]
-    fn test_activity_recency_fallback_busy_within_window_free_after() {
-        // No OSC-133 marker: busy while output is within the idle window, then
-        // ages back to free once the window elapses.
-        let mut tracker = ActivityTracker::default();
-        let base = Instant::now();
-        tracker.on_output(base);
-
-        assert_eq!(tracker.state(CommandPhase::Idle, base), PaneActivity::Busy);
-        assert_eq!(
-            tracker.state(
-                CommandPhase::Idle,
-                base + ACTIVITY_IDLE_WINDOW - Duration::from_millis(1)
-            ),
-            PaneActivity::Busy
-        );
-        assert_eq!(
-            tracker.state(CommandPhase::Idle, base + ACTIVITY_IDLE_WINDOW),
-            PaneActivity::Free
-        );
-        assert_eq!(
-            tracker.state(
-                CommandPhase::Idle,
-                base + ACTIVITY_IDLE_WINDOW + Duration::from_secs(1)
-            ),
-            PaneActivity::Free
-        );
-
-        // New output after the window has elapsed re-arms busy.
-        let later = base + ACTIVITY_IDLE_WINDOW + Duration::from_secs(1);
-        tracker.on_output(later);
-        assert_eq!(tracker.state(CommandPhase::Idle, later), PaneActivity::Busy);
-    }
-
-    #[::core::prelude::v1::test]
-    fn test_activity_osc133_overrides_recency() {
-        // Once OSC-133 is seen it is authoritative: recent output no longer
-        // forces busy, and a silent `Executing` command stays busy past the
-        // recency window (the "busy while thinking" outcome).
-        let mut tracker = ActivityTracker::default();
-        let base = Instant::now();
-        tracker.on_output(base);
-        tracker.on_osc133(base);
-
-        assert_eq!(tracker.state(CommandPhase::Idle, base), PaneActivity::Free);
-        assert_eq!(
-            tracker.state(
-                CommandPhase::Executing,
-                base + ACTIVITY_IDLE_WINDOW + Duration::from_secs(5)
-            ),
-            PaneActivity::Busy
-        );
-    }
-
-    #[::core::prelude::v1::test]
-    fn test_activity_markers_stop_output_continues_follows_recency() {
-        // Markers stop while output keeps flowing (a program without shell
-        // integration took over the pane): once output outruns the last marker
-        // by the trust window, the frozen phase no longer sticks and busy/free
-        // follows output recency again (#491).
-        let mut tracker = ActivityTracker::default();
-        let base = Instant::now();
-        tracker.on_osc133(base);
-        tracker.on_output(base);
-
-        // Within the trust window OSC-133 stays authoritative: flowing output
-        // does not force busy over a non-executing phase.
-        let inside = base + OSC133_TRUST_WINDOW - Duration::from_millis(1);
-        tracker.on_output(inside);
-        assert_eq!(
-            tracker.state(CommandPhase::Idle, inside),
-            PaneActivity::Free
-        );
-
-        // Output continues past the trust window with no new marker: the
-        // recency fallback governs, so the pane reads busy while output flows.
-        let outside = base + OSC133_TRUST_WINDOW;
-        tracker.on_output(outside);
-        assert_eq!(
-            tracker.state(CommandPhase::Idle, outside),
-            PaneActivity::Busy
-        );
-
-        // And ages back to free once output stops — in both frozen-phase
-        // directions, including a phase stuck at `Executing`.
-        let idle = outside + ACTIVITY_IDLE_WINDOW;
-        assert_eq!(tracker.state(CommandPhase::Idle, idle), PaneActivity::Free);
-        assert_eq!(
-            tracker.state(CommandPhase::Executing, idle),
-            PaneActivity::Free
-        );
-    }
-
-    #[::core::prelude::v1::test]
-    fn test_activity_marker_resumes_restores_osc133_authority() {
-        // After marker trust has aged out, a fresh OSC-133 marker makes the
-        // command phase authoritative again.
-        let mut tracker = ActivityTracker::default();
-        let base = Instant::now();
-        tracker.on_osc133(base);
-        let stale = base + OSC133_TRUST_WINDOW + Duration::from_secs(1);
-        tracker.on_output(stale);
-        assert_eq!(tracker.state(CommandPhase::Idle, stale), PaneActivity::Busy);
-
-        tracker.on_osc133(stale);
-        assert_eq!(tracker.state(CommandPhase::Idle, stale), PaneActivity::Free);
-        assert_eq!(
-            tracker.state(
-                CommandPhase::Executing,
-                stale + ACTIVITY_IDLE_WINDOW + Duration::from_secs(5)
-            ),
-            PaneActivity::Busy
-        );
-    }
-
-    #[::core::prelude::v1::test]
-    fn test_activity_silent_executing_command_keeps_marker_trust() {
-        // Output that stops within the trust window does not age the marker:
-        // a silent `Executing` command stays busy far past both windows (the
-        // "busy while thinking" outcome), and clock time alone never expires
-        // the trust.
-        let mut tracker = ActivityTracker::default();
-        let base = Instant::now();
-        tracker.on_osc133(base);
-        tracker.on_output(base + Duration::from_millis(100));
-
-        let much_later =
-            base + OSC133_TRUST_WINDOW + ACTIVITY_IDLE_WINDOW + Duration::from_secs(60);
-        assert_eq!(
-            tracker.state(CommandPhase::Executing, much_later),
-            PaneActivity::Busy
-        );
-        assert_eq!(
-            tracker.state(CommandPhase::Idle, much_later),
-            PaneActivity::Free
-        );
+        assert_eq!(tracker.state(false, false), PaneActivity::Free);
     }
 }
