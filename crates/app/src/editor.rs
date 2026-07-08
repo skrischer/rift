@@ -2220,11 +2220,18 @@ impl Panel for EditorView {
 /// surface tracks a runtime theme switch (`ActiveTheme::theme`) exactly like
 /// every other panel. `gpui_component::input::Input`'s own code-editor
 /// background falls back to `cx.theme().highlight_theme` — a Zed-style syntax
-/// theme populated only from a `ThemeConfig`'s `highlight` block — and rift's
-/// Catppuccin Mocha config carries none, so that fallback stays pinned to
-/// gpui-component's built-in *light* default regardless of rift's active dark
-/// mode. Sourcing the surface's colors from `ThemeColor` here instead (already
-/// correctly dark under Catppuccin Mocha) sidesteps that gap.
+/// theme populated from a `ThemeConfig`'s `highlight` block
+/// (`assets/themes/catppuccin-mocha.json`, added for #598) — so without that
+/// block the fallback stayed pinned to gpui-component's built-in *light*
+/// default regardless of rift's active dark mode, and every Tree-sitter token
+/// with no explicit `syntax` entry rendered with `highlight_theme`'s light
+/// default text color too (`element.rs`'s `SyntaxColors::style` falls back to
+/// `HighlightStyle::default()`, `color: None`, which resolves to whatever
+/// base run color the widget was given). Sourcing the surface's
+/// background/foreground from `ThemeColor` here — already correctly dark
+/// under Catppuccin Mocha — fixes the surface and doubles as that base run
+/// color for every unstyled token, independent of the `highlight` block ever
+/// being complete or present at all.
 fn editor_surface_colors(cx: &App) -> (Hsla, Hsla) {
     (cx.theme().background, cx.theme().foreground)
 }
@@ -2286,9 +2293,11 @@ impl Render for EditorView {
         // `.bg` / `.text_color` explicitly wire the surface to
         // [`editor_surface_colors`] — `StyledExt::refine_style` (applied last
         // in `Input::render`) lets them win over gpui-component's own
-        // code-editor background/foreground defaults. Gutter, line-number,
-        // and selection colors already read `cx.theme()` inside the widget
-        // itself and need no override.
+        // code-editor background/foreground defaults, and `.text_color` is
+        // also the base run color every Tree-sitter token without its own
+        // `syntax` entry in the `highlight` block resolves to. Gutter,
+        // line-number, and selection colors already read `cx.theme()` inside
+        // the widget itself and need no override.
         let (surface_bg, surface_fg) = editor_surface_colors(cx);
         let input_widget = Input::new(&tab.input)
             .font_family(cx.theme().mono_font_family.clone())
@@ -3474,6 +3483,61 @@ mod tests {
                 light_bg, dark_bg,
                 "editor surface background must track a runtime theme switch"
             );
+        });
+    }
+
+    /// WCAG 2.1 relative luminance of an sRGB color (used only by
+    /// [`contrast_ratio`] below).
+    fn relative_luminance(color: Hsla) -> f32 {
+        let rgba = color.to_rgb();
+        let channel = |c: f32| {
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(rgba.r) + 0.7152 * channel(rgba.g) + 0.0722 * channel(rgba.b)
+    }
+
+    /// WCAG 2.1 contrast ratio between two colors — 1.0 (no contrast) to 21.0
+    /// (black on white). `4.5` is the AA threshold for normal text.
+    fn contrast_ratio(a: Hsla, b: Hsla) -> f32 {
+        let (l1, l2) = (relative_luminance(a), relative_luminance(b));
+        let (lighter, darker) = if l1 > l2 { (l1, l2) } else { (l2, l1) };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    /// Regression test for #598: without a `highlight` block in
+    /// `catppuccin-mocha.json`, `cx.theme().highlight_theme` stayed pinned to
+    /// gpui-component's built-in light default, so every Tree-sitter syntax
+    /// token rendered at near-zero contrast on the editor's dark background.
+    /// Asserts the most common source-level tokens meet WCAG AA (4.5:1)
+    /// against the editor's own dark `editor.background`.
+    #[gpui::test]
+    fn test_editor_syntax_colors_meet_wcag_aa_contrast_under_catppuccin(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::apply_theme(cx);
+            assert!(cx.theme().is_dark());
+
+            let style = &cx.theme().highlight_theme.style;
+            let bg = style
+                .editor_background
+                .expect("Catppuccin Mocha's highlight block must set editor.background");
+
+            for token in ["function", "string", "keyword", "type", "property", "constant"] {
+                let color = style
+                    .syntax
+                    .style(token)
+                    .and_then(|s| s.color)
+                    .unwrap_or(cx.theme().foreground);
+                let ratio = contrast_ratio(color, bg);
+                assert!(
+                    ratio >= 4.5,
+                    "token `{token}` contrast {ratio:.2}:1 against the editor background is below WCAG AA 4.5:1"
+                );
+            }
         });
     }
 
