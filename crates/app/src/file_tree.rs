@@ -4532,17 +4532,22 @@ mod tests {
     // --- context-menu write group: destructive delete (artboard State D,
     // `docs/spec-explorer-file-ops.md`, #676) ---
 
+    // Both tests below use `cx.update_window` rather than `window.update`:
+    // the latter (`WindowHandle<Root>::update`) leases the `Root` entity for
+    // the whole closure, and `has_active_dialog` reads that same `Root`
+    // internally — nesting the two double-leases and panics (mirrors the
+    // pattern `editor.rs`'s `test_closing_a_clean_tab_...` documents).
+
     #[gpui::test]
     fn test_confirm_delete_with_nothing_selected_opens_no_dialog(cx: &mut gpui::TestAppContext) {
         let (tree, window) = open_tree(cx);
-        window
-            .update(cx, |_, window, cx| {
-                tree.update(cx, |tree, cx| {
-                    tree.confirm_delete(window, cx);
-                });
-                assert!(!window.has_active_dialog(cx));
-            })
-            .expect("confirm delete");
+        cx.update_window(window.into(), |_, window, cx| {
+            tree.update(cx, |tree, cx| {
+                tree.confirm_delete(window, cx);
+            });
+            assert!(!window.has_active_dialog(cx));
+        })
+        .expect("confirm delete");
     }
 
     #[gpui::test]
@@ -4550,20 +4555,19 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         let (tree, window) = open_tree(cx);
-        window
-            .update(cx, |_, window, cx| {
-                tree.update(cx, |tree, cx| {
-                    tree.model_mut().apply_snapshot_chunk(
-                        "/proj".into(),
-                        vec![file("src/main.rs")],
-                        true,
-                    );
-                    tree.selected = Some("src/main.rs".into());
-                    tree.confirm_delete(window, cx);
-                });
-                assert!(window.has_active_dialog(cx));
-            })
-            .expect("confirm delete");
+        cx.update_window(window.into(), |_, window, cx| {
+            tree.update(cx, |tree, cx| {
+                tree.model_mut().apply_snapshot_chunk(
+                    "/proj".into(),
+                    vec![file("src/main.rs")],
+                    true,
+                );
+                tree.selected = Some("src/main.rs".into());
+                tree.confirm_delete(window, cx);
+            });
+            assert!(window.has_active_dialog(cx));
+        })
+        .expect("confirm delete");
     }
 
     // --- pending-reveal (`docs/spec-explorer-file-ops.md`, #675) -----------
