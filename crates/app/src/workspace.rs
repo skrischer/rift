@@ -72,8 +72,9 @@ use gpui::{
     SharedString, Styled as _, Window, WindowBounds,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::dialog::{AlertDialog, DialogButtonProps};
 use gpui_component::dock::{Dock, DockArea, DockItem, DockPlacement, PanelView};
-use gpui_component::{ActiveTheme as _, IconName, Root, Sizable as _};
+use gpui_component::{ActiveTheme as _, IconName, Root, Sizable as _, WindowExt as _};
 use rift_protocol::{ClientMessage, DaemonMessage, LspServerState};
 use rift_terminal::{SessionView, SessionViewEvent};
 use tracing::{debug, warn};
@@ -844,7 +845,49 @@ impl WorkspaceView {
         {
             let session_view = session_view.clone();
             let window_state_path = window_state_path.clone();
+            let editor = editor.clone();
             window.on_window_should_close(cx, move |window, cx| {
+                // Unsaved-changes guard (`docs/spec-v1-hardening.md`): a dirty
+                // editor tab must not be silently lost on quit. If any tab has
+                // unsaved edits, keep the window open (`false`) and raise the
+                // aggregated confirm/discard dialog — the same `AlertDialog`
+                // the per-tab close flow uses (`EditorView::confirm_close_tab`),
+                // at workspace scope. Confirming discards every dirty tab and
+                // closes the window; the window-state save still runs on that
+                // eventual clean close, exactly as on a clean quit below.
+                let dirty_count = editor.read(cx).dirty_tab_count();
+                if dirty_count > 0 {
+                    // Guard against stacking a second dialog when the OS fires
+                    // `should_close` again while one is already up (mirrors
+                    // `EditorView::open_conflict_dialog`).
+                    if !window.has_active_dialog(cx) {
+                        let session_view = session_view.clone();
+                        let window_state_path = window_state_path.clone();
+                        let message = unsaved_quit_message(dirty_count);
+                        window.open_alert_dialog(cx, move |alert: AlertDialog, _, _| {
+                            let session_view = session_view.clone();
+                            let window_state_path = window_state_path.clone();
+                            let message = message.clone();
+                            alert
+                                .title("Unsaved Changes")
+                                .description(message)
+                                .button_props(
+                                    DialogButtonProps::default()
+                                        .ok_text("Discard and quit")
+                                        .cancel_text("Cancel")
+                                        .show_cancel(true)
+                                        .on_ok(move |_, window, cx| {
+                                            if let Some(path) = &window_state_path {
+                                                save_window_state(path, window, &session_view, cx);
+                                            }
+                                            window.remove_window();
+                                            true
+                                        }),
+                                )
+                        });
+                    }
+                    return false;
+                }
                 if let Some(path) = &window_state_path {
                     save_window_state(path, window, &session_view, cx);
                 }
@@ -1169,6 +1212,20 @@ fn save_window_state(path: &Path, window: &Window, session_view: &Entity<Session
     }
 }
 
+/// The aggregated window-close confirm dialog's message for `count` dirty tabs
+/// (`docs/spec-v1-hardening.md`). `count` is always `>= 1` at the call site
+/// (the guard only opens the dialog when a tab is dirty); singular vs plural
+/// keeps the copy natural.
+fn unsaved_quit_message(count: usize) -> SharedString {
+    if count == 1 {
+        SharedString::from("1 file has unsaved changes. Discard it and quit?")
+    } else {
+        SharedString::from(format!(
+            "{count} files have unsaved changes. Discard them and quit?"
+        ))
+    }
+}
+
 /// Convert the platform's active displays into the store's plain `Rect`s for
 /// [`window_state::clamp_bounds`] — `window_state` is deliberately GPUI-free
 /// (its own module doc), so this seam does the one conversion GPUI-side
@@ -1471,7 +1528,6 @@ mod tests {
     use super::*;
     use gpui::{Axis, TestAppContext};
     use gpui_component::dock::{DockPlacement, Panel};
-    use gpui_component::WindowExt as _;
 
     // --- window-state restore decision (#225) --------------------------------
     // Headless: `initial_window_bounds` and the types it returns
@@ -1485,6 +1541,25 @@ mod tests {
             width,
             height,
         }
+    }
+
+    // --- unsaved-changes window-close guard message (spec-v1-hardening) -------
+
+    #[test]
+    fn test_unsaved_quit_message_is_singular_for_one_dirty_tab() {
+        let message = unsaved_quit_message(1);
+        assert!(message.contains("1 file has"), "singular copy: {message}");
+        assert!(message.contains("Discard it"), "singular copy: {message}");
+    }
+
+    #[test]
+    fn test_unsaved_quit_message_is_plural_and_counts_for_many_dirty_tabs() {
+        let message = unsaved_quit_message(3);
+        assert!(
+            message.contains("3 files have"),
+            "plural copy names the count: {message}"
+        );
+        assert!(message.contains("Discard them"), "plural copy: {message}");
     }
 
     #[test]
