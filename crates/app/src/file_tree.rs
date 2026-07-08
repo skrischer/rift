@@ -53,17 +53,74 @@ use crate::worktree::WorktreeModel;
 /// Once shipped this must not change — it is the persisted panel identifier.
 pub const FILE_TREE_PANEL_NAME: &str = "explorer";
 
-/// Fixed row height for every tree entry. The virtual list needs a height per
-/// item; a uniform row keeps the size vector trivial to build and the scroll
-/// math exact.
-const ROW_HEIGHT: Pixels = px(22.0);
+/// Fixed row height for every tree entry, from the "Explorer — Redesign"
+/// artboard's row density (`docs/spec-explorer-redesign.md`) — the 4px
+/// [`ROW_BLOCK_PADDING_Y`] top and bottom plus the row's line height,
+/// replacing the shipped 22px. The virtual list needs a height per item; a
+/// uniform row keeps the size vector trivial to build and the scroll math
+/// exact.
+const ROW_HEIGHT: Pixels = px(28.0);
 
-/// Height of the `EXPLORER` header band, matching the composite status
-/// line's 28px band (`status_bar.rs`) for a consistent chrome rhythm.
-const HEADER_HEIGHT: Pixels = px(28.0);
+/// Vertical padding inside every row (top and bottom), from the artboard's
+/// row density.
+const ROW_BLOCK_PADDING_Y: Pixels = px(4.0);
 
-/// Horizontal indent applied per nesting level, so depth reads visually.
-const INDENT_PER_LEVEL: f32 = 14.0;
+/// Corner radius on a row's hover/selected background, from the artboard's
+/// row density.
+const ROW_RADIUS: Pixels = px(5.0);
+
+/// Gap between every row slot (chevron, icon, name, diagnostic dot, git
+/// letter), from the artboard's row density.
+const ROW_SLOT_GAP: Pixels = px(6.0);
+
+/// Height of the `EXPLORER` header band, from the "Explorer — Redesign"
+/// artboard's measured 38px header (`docs/spec-explorer-redesign.md`) —
+/// replacing the shipped 28px, which matched the status line's band instead
+/// of the artboard's own rhythm.
+const HEADER_HEIGHT: Pixels = px(38.0);
+
+/// Left padding inside the header band, from the artboard's measured header
+/// inset (asymmetric with [`HEADER_PADDING_RIGHT`] — the artboard gives the
+/// `EXPLORER` label more room than the action cluster).
+const HEADER_PADDING_LEFT: Pixels = px(14.0);
+
+/// Right padding inside the header band, from the artboard's measured header
+/// inset.
+const HEADER_PADDING_RIGHT: Pixels = px(12.0);
+
+/// Gap between action-row slots in the header, from the artboard's action
+/// row, replacing the shipped 2px.
+const HEADER_ACTION_GAP: Pixels = px(12.0);
+
+/// Horizontal padding inside the workspace-root (`RIFT`) row, from the
+/// artboard's measured root-row inset — wider than a tree row's padding
+/// since the root row carries no reserved icon slot.
+const ROOT_ROW_PADDING_X: Pixels = px(12.0);
+
+/// Base horizontal indent at depth 0, before any per-level indent is added —
+/// the artboard's indent lanes start at 8px, not flush against the row edge.
+const INDENT_BASE: Pixels = px(8.0);
+
+/// Horizontal indent added per nesting level, from the artboard's indent
+/// lanes (8/24/40/56 — 16px per level over [`INDENT_BASE`]), replacing the
+/// shipped flat 14px-per-level indent.
+const INDENT_PER_LEVEL: f32 = 16.0;
+
+/// Fixed width of the reserved icon slot, between the chevron and the name.
+/// Structure only in this phase — it carries a neutral placeholder, not a
+/// real file-type glyph (Phase 28; `docs/spec-explorer-redesign.md`) — sized
+/// to the artboard's icon glyph so Phase 28 drops icons in with no
+/// re-layout.
+const ICON_SLOT_WIDTH: Pixels = px(14.0);
+
+/// Diameter of the diagnostic-severity dot and the width of its slot in the
+/// trailing cluster, from the artboard's re-spacing (was a 6px dot in an 8px
+/// slot).
+const DIAGNOSTIC_DOT_SIZE: Pixels = px(7.0);
+
+/// Fixed width of the right-aligned git-status-letter slot in the trailing
+/// cluster, from the artboard's re-spacing. Unchanged from the shipped tree.
+const GIT_LETTER_SLOT_WIDTH: Pixels = px(12.0);
 
 // ── Actions ───────────────────────────────────────────────────────────────────
 
@@ -810,28 +867,35 @@ impl FileTree {
         path.rsplit('/').next().unwrap_or(path)
     }
 
-    /// The in-panel header band above the tree (`docs/spec-explorer-parity.md`):
-    /// an uppercase, muted `EXPLORER` label on a subtle elevated surface with
-    /// a bottom hairline, plus a right-aligned action row. Ships exactly the
-    /// two actions that map to a real client capability — collapse-all /
-    /// expand-all (a toggle reflecting `all_dirs_collapsed`) and reveal-active
-    /// — and consciously omits the design's *new file* and *refresh* glyphs
-    /// (no client capability yet: file-ops are deferred, and the tree is
-    /// push-reactive so a manual refresh is redundant; see the spec's prior
-    /// decisions).
+    /// The in-panel header band above the tree
+    /// (`docs/spec-explorer-redesign.md`): an uppercase, bold, muted
+    /// `EXPLORER` label at the artboard's 11px label style, flush against
+    /// the panel surface (no distinct elevated tint — the artboard's header
+    /// sits transparent over the panel, only a bottom hairline separates
+    /// it) with a right-aligned action row. Ships exactly the two actions
+    /// that map to a real client capability — collapse-all / expand-all (a
+    /// toggle reflecting `all_dirs_collapsed`) and reveal-active — and
+    /// consciously omits the artboard's *search/filter* (Phase 31) and *new
+    /// file* (Phase 30) glyphs (no client capability yet; see the spec's
+    /// prior decisions).
     ///
     /// Both actions render as `Button::label` text glyphs, not `IconName`
     /// icons: the shipping `rift` binary does not embed gpui-component's SVG
     /// icon assets (only the dev-only `gallery` binary enables
     /// `gpui-component-assets`, see `crates/app/Cargo.toml`), so an
     /// `IconName` icon would render blank here. A Unicode glyph renders
-    /// reliably either way, mirroring the tree's own disclosure twisty.
+    /// reliably either way, mirroring the tree's own disclosure twisty. Each
+    /// button is `compact()`, giving it gpui-component's fixed `min_w_5`
+    /// (20px) icon-button footprint — a fixed-width slot Phase 28 can drop a
+    /// real icon into with no re-layout, reusing the widget's own affordance
+    /// rather than a hand-rolled wrapper.
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let all_collapsed = self.all_dirs_collapsed();
 
         let collapse_toggle = Button::new("file-tree-collapse-toggle")
             .ghost()
             .xsmall()
+            .compact()
             .label(if all_collapsed {
                 "\u{229E}"
             } else {
@@ -850,6 +914,7 @@ impl FileTree {
         let reveal_active = Button::new("file-tree-reveal-active")
             .ghost()
             .xsmall()
+            .compact()
             .label("\u{2316}")
             .tooltip("Reveal active file")
             .on_click(cx.listener(|_this, _event, _window, cx| {
@@ -861,38 +926,45 @@ impl FileTree {
             .items_center()
             .justify_between()
             .h(HEADER_HEIGHT)
-            .px(px(8.0))
-            .bg(cx.theme().secondary)
+            .pl(HEADER_PADDING_LEFT)
+            .pr(HEADER_PADDING_RIGHT)
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
                 div()
-                    .text_xs()
+                    .text_size(px(11.0))
+                    .font_weight(FontWeight::BOLD)
                     .text_color(cx.theme().muted_foreground)
                     .child("EXPLORER"),
             )
             .child(
                 h_flex()
-                    .gap(px(2.0))
+                    .gap(HEADER_ACTION_GAP)
                     .child(collapse_toggle)
                     .child(reveal_active),
             )
     }
 
     /// The workspace-root row (`RIFT` in the design) below the header
-    /// (`docs/spec-explorer-parity.md`): the leaf of `model.root()`'s
-    /// absolute path, uppercased, with a disclosure chevron that mirrors and
-    /// drives the collapse-all/expand-all state. Neutral — no label, no
-    /// chevron, not clickable — while `root()` is `None`: no snapshot has
-    /// arrived yet, so there is nothing to name or toggle.
+    /// (`docs/spec-explorer-redesign.md`): the leaf of `model.root()`'s
+    /// absolute path, uppercased and bold at the artboard's 12px label
+    /// style, with a disclosure chevron that mirrors and drives the
+    /// collapse-all/expand-all state, re-densified to the artboard's row
+    /// height, padding, and slot gap (shared with [`FileTree::render_row`]'s
+    /// [`ROW_HEIGHT`] / [`ROW_SLOT_GAP`]) and its own measured background
+    /// tint, which gives the row a subtle band against the panel surface.
+    /// Neutral — no label, no chevron, not clickable — while `root()` is
+    /// `None`: no snapshot has arrived yet, so there is nothing to name or
+    /// toggle.
     fn render_root_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(root) = self.model.root() else {
             return h_flex()
                 .flex_shrink_0()
                 .items_center()
                 .h(ROW_HEIGHT)
-                .px(px(8.0))
-                .gap(px(4.0))
+                .px(ROOT_ROW_PADDING_X)
+                .gap(ROW_SLOT_GAP)
+                .bg(cx.theme().background)
                 .child(div().w(px(12.0)).flex_shrink_0())
                 .into_any_element();
         };
@@ -909,13 +981,19 @@ impl FileTree {
             .flex_shrink_0()
             .items_center()
             .h(ROW_HEIGHT)
-            .px(px(8.0))
-            .gap(px(4.0))
-            .text_sm()
+            .px(ROOT_ROW_PADDING_X)
+            .gap(ROW_SLOT_GAP)
+            .bg(cx.theme().background)
+            .text_size(px(12.0))
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().list_hover))
             .child(div().w(px(12.0)).flex_shrink_0().child(chevron.to_string()))
-            .child(div().text_color(cx.theme().foreground).child(label))
+            .child(
+                div()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(cx.theme().foreground)
+                    .child(label),
+            )
             .on_click(cx.listener(|this, _event, _window, cx| {
                 this.toggle_collapse_all();
                 cx.notify();
@@ -935,13 +1013,28 @@ impl FileTree {
         row.kind != EntryKind::Dir || self.collapsed.contains(&row.path)
     }
 
+    /// Horizontal indent for a row at `depth`, from the "Explorer —
+    /// Redesign" artboard's indent lanes: an 8px base (depth 0) plus 16px
+    /// per level, yielding 8/24/40/56 for depths 0-3 — replacing the shipped
+    /// flat `depth * 14px` (no base).
+    fn row_indent(depth: usize) -> Pixels {
+        INDENT_BASE + px(depth as f32 * INDENT_PER_LEVEL)
+    }
+
     /// Render one row as an interactive element. Clicking a directory selects
     /// it and toggles its expansion; clicking a file selects it and emits the
     /// open signal.
+    ///
+    /// Slot order, left to right, every slot `flex_shrink_0` so names and the
+    /// trailing cluster column-align across rows and depths
+    /// (`docs/spec-explorer-redesign.md`): chevron/spacer -> reserved icon
+    /// slot (neutral placeholder; real file-type glyphs are Phase 28) ->
+    /// name (the only flexible slot) -> diagnostic dot -> right-aligned
+    /// git-status letter.
     fn render_row(&self, row: &Row, cx: &mut Context<Self>) -> impl IntoElement {
         let is_dir = row.kind == EntryKind::Dir;
         let is_selected = self.selected.as_deref() == Some(row.path.as_str());
-        let indent = px(row.depth as f32 * INDENT_PER_LEVEL);
+        let indent = Self::row_indent(row.depth);
 
         // Directory disclosure glyph (text, not an icon: the product binary does
         // not embed gpui-component's SVG icon assets, so a glyph renders reliably
@@ -957,6 +1050,26 @@ impl FileTree {
             " "
         };
 
+        // Reserved icon slot: fixed-width structure only, carrying a neutral
+        // placeholder rather than a blank gap (Phase 28 fills it with a real,
+        // language-tinted file-type glyph once the product binary embeds
+        // gpui-component's SVG assets — see the module doc). Same slot for
+        // every row regardless of kind: differentiating it is Phase 28's job.
+        let icon_slot = div()
+            .w(ICON_SLOT_WIDTH)
+            .h(ICON_SLOT_WIDTH)
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .size(px(6.0))
+                    .rounded(px(2.0))
+                    .bg(cx.theme().muted_foreground)
+                    .opacity(0.4),
+            );
+
         let name = Self::display_name(&row.path).to_owned();
         let path = row.path.clone();
 
@@ -967,23 +1080,23 @@ impl FileTree {
         // not). Files, and a currently collapsed directory, always show it.
         let show_decoration = self.row_shows_decoration(row);
 
-        // Diagnostic-severity indicator: a small colored dot, or an empty
-        // same-size spacer when the row is clean or its decoration is
-        // suppressed — keeping every row's layout aligned. Sits in the
-        // trailing cluster, immediately left of the git letter.
-        let severity_dot = row.severity.filter(|_| show_decoration).map(|severity| {
-            let color = match severity {
-                DiagnosticSeverity::Error => cx.theme().danger,
-                DiagnosticSeverity::Warning => cx.theme().warning,
-                DiagnosticSeverity::Information => cx.theme().info,
-                DiagnosticSeverity::Hint => cx.theme().muted_foreground,
-            };
-            div()
-                .size(px(6.0))
-                .flex_shrink_0()
-                .rounded(px(3.0))
-                .bg(color)
-        });
+        // Diagnostic-severity indicator: a small colored dot, always
+        // reserving its slot width so the trailing git-letter lane
+        // column-aligns even on a clean row (an empty, uncolored dot rather
+        // than a spacer div — the artboard's re-spacing).
+        let severity_dot = div()
+            .size(DIAGNOSTIC_DOT_SIZE)
+            .flex_shrink_0()
+            .rounded_full()
+            .when_some(row.severity.filter(|_| show_decoration), |el, severity| {
+                let color = match severity {
+                    DiagnosticSeverity::Error => cx.theme().danger,
+                    DiagnosticSeverity::Warning => cx.theme().warning,
+                    DiagnosticSeverity::Information => cx.theme().info,
+                    DiagnosticSeverity::Hint => cx.theme().muted_foreground,
+                };
+                el.bg(color)
+            });
 
         // Git-status color: tints the name itself, mirroring the roll-up
         // precedence (`conflicted > changed > untracked`).
@@ -998,21 +1111,26 @@ impl FileTree {
             .when_some(git_color, |el, color| el.text_color(color))
             .child(name);
 
-        // Git-status letter: a single glyph in a fixed-width, right-aligned
-        // trailing lane, colored the same as the name tint. `name_el`'s
-        // `flex_1` fills the row's remaining width, so this fixed-width slot
-        // always lands at the same trailing offset — letters column-align
-        // across rows regardless of name length or indent depth.
-        let git_letter = row.git_status.filter(|_| show_decoration).map(|status| {
-            div()
-                .text_xs()
-                .text_color(match status {
+        // Git-status letter: a single glyph in a fixed-width, right-aligned,
+        // centered trailing lane, colored the same as the name tint.
+        // `name_el`'s `flex_1` fills the row's remaining width, so this
+        // fixed-width slot always lands at the same trailing offset —
+        // letters column-align across rows regardless of name length or
+        // indent depth. Always reserves its width, same discipline as the
+        // diagnostic dot above.
+        let git_letter = div()
+            .w(GIT_LETTER_SLOT_WIDTH)
+            .flex_shrink_0()
+            .text_xs()
+            .text_center()
+            .when_some(row.git_status.filter(|_| show_decoration), |el, status| {
+                el.text_color(match status {
                     GitRollupStatus::Conflicted => cx.theme().danger,
                     GitRollupStatus::Changed => cx.theme().warning,
                     GitRollupStatus::Untracked => cx.theme().success,
                 })
                 .child(status.badge())
-        });
+            });
 
         // The row's element id is its path: unique within the tree (the model
         // keys entries by path), so it makes a stable per-row id without a
@@ -1022,9 +1140,11 @@ impl FileTree {
             .flex()
             .items_center()
             .h(ROW_HEIGHT)
+            .py(ROW_BLOCK_PADDING_Y)
             .pl(indent)
             .pr(px(8.0))
-            .gap(px(4.0))
+            .gap(ROW_SLOT_GAP)
+            .rounded(ROW_RADIUS)
             .text_sm()
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().list_hover))
@@ -1032,9 +1152,10 @@ impl FileTree {
             // rather than hidden, once the daemon starts sending them.
             .when(row.ignored, |el| el.opacity(0.55))
             .child(div().w(px(12.0)).flex_shrink_0().child(twisty.to_string()))
+            .child(icon_slot)
             .child(name_el)
-            .child(div().w(px(8.0)).flex_shrink_0().children(severity_dot))
-            .child(div().w(px(12.0)).flex_shrink_0().children(git_letter));
+            .child(severity_dot)
+            .child(git_letter);
 
         if is_selected {
             root = root
@@ -1102,7 +1223,10 @@ impl Render for FileTree {
         // Empty state: distinguish "no snapshot yet" from "connected, empty
         // root" (`docs/spec-explorer-parity.md`) — a single conflated "No
         // files" branch used to read as an error during ordinary startup.
-        // Keep it quiet — the panel is a passive mirror, not an action surface.
+        // Restyled to the redesign's rhythm (`docs/spec-explorer-redesign.md`):
+        // still quiet, centered, muted, and carrying no action surface — just
+        // more generous breathing room than the shipped 8px, matching the
+        // redesign's less cramped density.
         let content = if let Some(state) = self.empty_state() {
             let message = match state {
                 EmptyState::Loading => "Loading\u{2026}",
@@ -1113,7 +1237,7 @@ impl Render for FileTree {
                 .flex()
                 .items_center()
                 .justify_center()
-                .p(px(8.0))
+                .p(px(16.0))
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
                 .child(message)
@@ -1330,6 +1454,52 @@ mod tests {
         assert_eq!(FileTree::display_name("src/net/tcp.rs"), "tcp.rs");
         assert_eq!(FileTree::display_name("README.md"), "README.md");
         assert_eq!(FileTree::display_name("src"), "src");
+    }
+
+    // --- row anatomy / density: reserved icon slot, re-spaced trailing
+    // cluster, redesigned rhythm (#653, `docs/spec-explorer-redesign.md`) ---
+
+    #[test]
+    fn test_row_indent_follows_the_artboards_8_24_40_56_lanes() {
+        assert_eq!(FileTree::row_indent(0), px(8.0));
+        assert_eq!(FileTree::row_indent(1), px(24.0));
+        assert_eq!(FileTree::row_indent(2), px(40.0));
+        assert_eq!(FileTree::row_indent(3), px(56.0));
+    }
+
+    #[test]
+    fn test_row_density_constants_match_the_redesigned_artboard() {
+        // A grep-friendly lock on the redesigned density: layout pixels, not
+        // theme tokens, replacing the shipped 22px row / 14px-per-level
+        // indent / no-base indent / no-radius rows.
+        assert_eq!(ROW_HEIGHT, px(28.0));
+        assert_eq!(ROW_BLOCK_PADDING_Y, px(4.0));
+        assert_eq!(ROW_RADIUS, px(5.0));
+        assert_eq!(ROW_SLOT_GAP, px(6.0));
+        assert_eq!(INDENT_BASE, px(8.0));
+        assert_eq!(INDENT_PER_LEVEL, 16.0);
+        assert_eq!(ICON_SLOT_WIDTH, px(14.0));
+        assert_eq!(DIAGNOSTIC_DOT_SIZE, px(7.0));
+        assert_eq!(GIT_LETTER_SLOT_WIDTH, px(12.0));
+    }
+
+    // --- header band + action row, workspace-root row density (#654,
+    // `docs/spec-explorer-redesign.md`) ---
+
+    #[test]
+    fn test_header_and_root_row_constants_match_the_redesigned_artboard() {
+        // A grep-friendly lock on the redesigned chrome: layout pixels, not
+        // theme tokens, replacing the shipped 28px header (which matched the
+        // status line, not the artboard) and the 8px/4px header and root-row
+        // padding/gap.
+        assert_eq!(HEADER_HEIGHT, px(38.0));
+        assert_eq!(HEADER_PADDING_LEFT, px(14.0));
+        assert_eq!(HEADER_PADDING_RIGHT, px(12.0));
+        assert_eq!(HEADER_ACTION_GAP, px(12.0));
+        assert_eq!(ROOT_ROW_PADDING_X, px(12.0));
+        // The root row shares the row-anatomy step's slot gap rather than
+        // introducing its own — the artboard measures the same 6px.
+        assert_eq!(ROW_SLOT_GAP, px(6.0));
     }
 
     #[test]

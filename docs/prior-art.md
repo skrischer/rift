@@ -562,6 +562,30 @@ headless WSL or the harness runs on the GPU station (the render probe settles it
 Phase 2 — whether "eyes" ship as a screenshot MCP or a `just` recipe, and whether
 CI pixel-baseline diffing is in scope or the harness stays agent-assisted review.
 
+## Session management & post-connect picker — prior-art index (Phases 32–33)
+
+Per-phase prior-art for the session-management block ([roadmap.md](roadmap.md)),
+same shape as the indexes above. Research mode: websearch (2026-07-08) — the two
+genuinely new concerns (a full session-management surface beyond phase 19's
+switch+new, and picking the session AFTER connecting) were topped up with focused
+lookups; the control-mode plumbing resolves against Category 3 already catalogued.
+
+| Phase | Concern | Reference (repo + path) | License | Verdict |
+|---|---|---|---|---|
+| 32 | Glanceable all-sessions surface (see every session at a glance, no click-to-open) | iTerm2 tmux **Dashboard** (Shell > tmux > Dashboard: view all sessions + windows at a glance, rename, switch — the original `-CC` consumer) ([tmux integration](https://iterm2.com/documentation-tmux-integration.html), [menu items](https://iterm2.com/documentation-menu-items.html)); `zellij` session-manager single-screen (create / attach / resurrect) ([tutorial](https://zellij.dev/tutorials/session-management/)) | GPL-2.0 / MIT | **reference (UX)** — iTerm2's Dashboard is the exact "all sessions at a glance + rename + switch" pattern, over the same control-mode stream rift already parses; render it natively from the phase-19 `SessionListReply` (already streamed). AVOID `choose-tree` (invisible to control clients, per the phase-19 spec) |
+| 32 | Session operations — rename / kill / new from the UI | tmux `rename-session` / `kill-session` / `new-session` under `%begin/%end` guards (Category 3 #1); iTerm2 `-CC` (`kill-session`, `rename`; closing a tab kills the session); `zellij` session-manager + [`endoze/zellij-switcher`](https://github.com/endoze/zellij-switcher) (switch / create / rename / kill / resurrect, index quick-switch 1–9) | ISC / GPL-2.0 / MIT | **reuse** (tmux commands over the existing correlated-command mechanism; new `protocol` rename/kill messages, same shape as phase-19) / **reference** (zellij's unified create-or-attach screen + per-row kill/rename affordances) |
+| 32 | Session reorder | tmux window ops (`swap-window` / `move-window` / `renumber-windows`) as the *window*-level analog — tmux has **no** native session order; `zellij-switcher` index quick-switch (1–9) | ISC / MIT | **greenfield — no external precedent for session reorder**: it is client-side ordering persisted locally (the window-state store pattern, phase 9), not a tmux concept. Closest UX analog is terminal tab drag-reorder; drag-to-order vs pin/favorite is a plan-time call |
+| 33 | Post-connect session pick (connect to the host, THEN pick from a live list) | iTerm2 tmux integration — attach the `-CC` server first, the Dashboard / session list then drives which session shows (the pick is post-attach, never a pre-connect requirement) (Category 3 #5); `wezterm` launcher `ShowLauncherArgs { FUZZY\|WORKSPACES }` (fuzzy pick, create-on-select) ([docs](https://wezterm.org/config/lua/keyassignment/SwitchToWorkspace.html)) | GPL-2.0 / MIT | **reference** — rift already runs `QuerySessionList` post-connect (phase 19); this phase moves the *pick* ahead of the cockpit committing to a session, mirroring iTerm2's attach-server-then-Dashboard flow |
+| 33 | De-hardcode the fixed default session + optional session on connect | rift's own Connection screen (`crates/app/src/connection_screen.rs` `DEFAULT_SESSION`) + connect pipeline (`crates/app/src/main.rs`) | — | greenfield — refactor: make the Session field optional / default-less so the post-connect picker (not a baked `"rift"`) resolves the session; no external precedent needed |
+
+Open design decisions deferred to each phase's `/loopkit:plan` spec (never a
+roadmap guess): phase 32 — whether the glanceable surface replaces or complements
+the phase-21 title-bar popover, and whether reorder ships as drag-to-order or a
+pinned/favorite model with local persistence; phase 33 — whether the picker is a
+distinct step between connect and cockpit or an optional-session connect card
+that lands on the picker when the field is left blank, and how a killed / renamed
+session racing the picker is reconciled.
+
 ## Priority reference projects (top 10)
 
 1. **penso/arbor** — Closest existing implementation of rift's exact concept (Rust + GPUI + daemon + SSH outposts + agent state). Read end-to-end before writing any architecture docs.
