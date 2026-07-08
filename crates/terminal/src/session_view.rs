@@ -32,15 +32,11 @@ const FONT_SIZE_STEP: f32 = 1.0;
 /// panes never clip their bottom rows (see [`max_vertical_pane_count`] and the
 /// #424 client-sizing invariant).
 const PANE_HEADER_HEIGHT: f32 = 32.0;
-/// Recurring re-render cadence that ages the per-pane output-recency fallback
-/// from busy back to free for the window-tab aggregate. Only the recency
-/// fallback needs it; OSC-133 and bell transitions stay event-driven (they
-/// re-render via the per-pane observation) (`docs/spec-pane-activity-indicators.md`).
-const ACTIVITY_IDLE_TICK: Duration = Duration::from_millis(1000);
 /// How long the transient grid-size overlay stays visible after a resize
 /// (`docs/spec-status-line.md`: the grid readout is resize feedback like an
-/// OSD, not persistent status). The idle tick (>= this cadence) re-renders and
-/// clears it once the deadline passes — no dedicated timer.
+/// OSD, not persistent status). `resize_client_to_area` arms a matching
+/// one-shot timer that re-renders once the deadline passes, so the overlay
+/// self-clears without a recurring poll.
 const RESIZE_OVERLAY_DURATION: Duration = Duration::from_millis(900);
 /// Width of the session-switcher popover content
 /// (`docs/spec-session-switch.md` UI contract).
@@ -388,6 +384,11 @@ pub struct SessionView {
     /// terminal after a resize (`docs/spec-status-line.md`); `None` (or past the
     /// deadline) hides it. Set by the pane-area grid observer on a size change.
     resize_overlay_deadline: Option<Instant>,
+    /// Bumped on every resize; the deadline-clearing one-shot timer only
+    /// notifies if this still matches its captured value, so a stale timer
+    /// from an earlier resize no-ops once a newer resize has re-armed the
+    /// overlay (mirrors `Editor::hover_move_generation`'s debounce guard).
+    resize_overlay_generation: u64,
     ssh_label: SharedString,
     session_name: SharedString,
     connection_status: ConnectionStatus,
@@ -613,27 +614,6 @@ impl SessionView {
             .detach();
         }
 
-        {
-            // Idle tick: one recurring re-render so the per-window activity
-            // aggregate ages the output-recency fallback from busy back to free.
-            // OSC-133 and bell transitions stay event-driven — they re-render
-            // via the per-pane observation set up in `apply_snapshot`; this tick
-            // only drives the time-based recency decay
-            // (`docs/spec-pane-activity-indicators.md`).
-            cx.spawn(async move |this, cx| loop {
-                smol::Timer::after(ACTIVITY_IDLE_TICK).await;
-                let result = cx.update(|cx| {
-                    this.update(cx, |_view, cx| {
-                        cx.notify();
-                    })
-                });
-                if result.is_err() {
-                    break;
-                }
-            })
-            .detach();
-        }
-
         // Placeholder until the caller feeds the resolved host/user of the
         // actual connection via `set_ssh_label` (#494) — this view has no
         // connection of its own to resolve a default from, so it must not
@@ -660,6 +640,7 @@ impl SessionView {
             needs_focus: true,
             client_grid_size: TermSize { cols: 80, rows: 24 },
             resize_overlay_deadline: None,
+            resize_overlay_generation: 0,
             ssh_label,
             session_name: SharedString::default(),
             connection_status: ConnectionStatus::Connecting,
@@ -783,7 +764,12 @@ impl SessionView {
     /// stable area (or a sub-cell wobble that floors to the same grid) sends
     /// nothing — a dock-layout change that leaves the grid unchanged never spams
     /// the seam (#596).
-    fn resize_client_to_area(&mut self, area: Size<Pixels>, cell: Size<Pixels>) -> bool {
+    fn resize_client_to_area(
+        &mut self,
+        area: Size<Pixels>,
+        cell: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let header_rows = self
             .layout
             .as_ref()
@@ -797,6 +783,19 @@ impl SessionView {
         self.client_grid_size = grid;
         let _ = self.size_changed_tx.try_send(grid);
         self.resize_overlay_deadline = Some(Instant::now() + RESIZE_OVERLAY_DURATION);
+        self.resize_overlay_generation = self.resize_overlay_generation.wrapping_add(1);
+        let generation = self.resize_overlay_generation;
+        cx.spawn(async move |this, cx| {
+            smol::Timer::after(RESIZE_OVERLAY_DURATION).await;
+            cx.update(|cx| {
+                let _ = this.update(cx, |view, cx| {
+                    if view.resize_overlay_generation == generation {
+                        cx.notify();
+                    }
+                });
+            });
+        })
+        .detach();
         true
     }
 
@@ -961,6 +960,11 @@ impl SessionView {
                 // Each pane's own shell flag (not just the window's active pane)
                 // feeds its header type glyph; absent from the map -> non-shell.
                 let pane_shell = pane_is_shell.get(&pane_state.id).copied().unwrap_or(false);
+                // The uncollapsed flag (kept as `Option`) is the authoritative
+                // busy/free signal fed to the pane's activity tracker: `None` on
+                // the legacy path must not read as `false` (busy)
+                // (`docs/spec-pane-activity-v2.md`).
+                let foreground_shell = pane_is_shell.get(&pane_state.id).copied();
                 if self.panes.contains_key(&pane_state.id) {
                     if let Some(entry) = self.panes.get_mut(&pane_state.id) {
                         entry.is_shell = pane_shell;
@@ -974,6 +978,11 @@ impl SessionView {
                             // Alt+1..9, and tmux-side selects clear it uniformly
                             // (`docs/spec-pane-activity-indicators.md`).
                             pv.set_window_active(is_active_window);
+                            // The tmux foreground-process flag (#510) drives the
+                            // pane's busy/free indicator, pushed on every snapshot
+                            // so a process start/exit flips it promptly
+                            // (`docs/spec-pane-activity-v2.md`).
+                            pv.set_foreground_shell(foreground_shell);
                             // CWD is subscription-driven (rift_pane_path); the
                             // snapshot seeds it only at pane creation below.
                             cx.notify();
@@ -1013,6 +1022,7 @@ impl SessionView {
                             pv.set_current_command(pane_state.current_command.clone());
                         }
                         pv.set_window_active(is_active_window);
+                        pv.set_foreground_shell(foreground_shell);
                         pv
                     });
 
@@ -2098,9 +2108,9 @@ impl Render for SessionView {
                 entity.update(cx, |view: &mut Self, cx| {
                     // On a size change: notify so at least one more frame paints
                     // the transient grid readout even for a single discrete
-                    // resize. The idle tick clears the overlay once the deadline
-                    // passes (no dedicated timer).
-                    if view.resize_client_to_area(bounds.size, cell_size) {
+                    // resize. `resize_client_to_area` arms its own one-shot
+                    // timer to clear the overlay once the deadline passes.
+                    if view.resize_client_to_area(bounds.size, cell_size, cx) {
                         cx.notify();
                     }
                 });
@@ -2232,6 +2242,7 @@ mod tests {
         px, size, AnyWindowHandle, App, AppContext as _, Entity, SharedString, TestAppContext,
     };
     use gpui_component::input::InputState;
+    use std::time::Instant;
 
     #[test]
     fn test_grid_size_for_exact_multiple_returns_full_grid() {
@@ -2302,18 +2313,18 @@ mod tests {
             let (session, handle) = session_and_handle(cx);
             let cell = size(px(10.0), px(20.0));
 
-            session.update(cx, |view, _cx| {
+            session.update(cx, |view, cx| {
                 // Initial client grid is 80x24; an area that floors to 80x24
                 // after the reserved 32px header is unchanged -> nothing emitted.
                 // cols: 800/10 = 80; rows: (512 - 32)/20 = 24.
-                assert!(!view.resize_client_to_area(size(px(800.0), px(512.0)), cell));
+                assert!(!view.resize_client_to_area(size(px(800.0), px(512.0)), cell, cx));
 
                 // A taller area floors to 80x34 -> a real change, one emit.
                 // rows: (712 - 32)/20 = 34.
-                assert!(view.resize_client_to_area(size(px(800.0), px(712.0)), cell));
+                assert!(view.resize_client_to_area(size(px(800.0), px(712.0)), cell, cx));
 
                 // The same area again is now the cached grid -> no second emit.
-                assert!(!view.resize_client_to_area(size(px(800.0), px(712.0)), cell));
+                assert!(!view.resize_client_to_area(size(px(800.0), px(712.0)), cell, cx));
             });
 
             let emitted = handle
@@ -2325,6 +2336,41 @@ mod tests {
                 handle.size_changed_rx.try_recv().is_err(),
                 "a stable area emits no further resize"
             );
+        });
+    }
+
+    /// With the recurring activity idle tick removed, the resize overlay must
+    /// self-clear via its own one-shot timer: every real grid change re-arms
+    /// the deadline and bumps the generation guard (so a stale in-flight timer
+    /// from an earlier resize no-ops); a no-op resize (unchanged grid) must not
+    /// spawn a redundant timer.
+    #[gpui::test]
+    fn test_resize_client_to_area_arms_overlay_only_on_real_change(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, _handle) = session_and_handle(cx);
+            let cell = size(px(10.0), px(20.0));
+
+            session.update(cx, |view, cx| {
+                assert_eq!(view.resize_overlay_generation, 0);
+                assert!(view.resize_overlay_deadline.is_none());
+
+                // Unchanged grid (matches the seeded 80x24 default): no overlay,
+                // no generation bump.
+                assert!(!view.resize_client_to_area(size(px(800.0), px(512.0)), cell, cx));
+                assert_eq!(view.resize_overlay_generation, 0);
+                assert!(view.resize_overlay_deadline.is_none());
+
+                // A real change arms the overlay and bumps the generation.
+                assert!(view.resize_client_to_area(size(px(800.0), px(712.0)), cell, cx));
+                assert_eq!(view.resize_overlay_generation, 1);
+                let first_deadline = view.resize_overlay_deadline.expect("overlay armed");
+                assert!(first_deadline > Instant::now());
+
+                // A second real change re-arms with a fresh generation, so the
+                // first timer's captured generation is now stale.
+                assert!(view.resize_client_to_area(size(px(900.0), px(712.0)), cell, cx));
+                assert_eq!(view.resize_overlay_generation, 2);
+            });
         });
     }
 
