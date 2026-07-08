@@ -110,7 +110,10 @@ impl TerminalPalette {
 // xterm 6x6x6 color cube levels (not linear: 0, then 95 + 40 per step).
 const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 
+// Builds an exact xterm RGB color (cube/grayscale ramp, `Indexed >= 16`) — a
+// terminal standard, not a theme palette (docs/spec-settings-theme.md).
 fn rgb_to_hsla(r: u8, g: u8, b: u8) -> Hsla {
+    // color-token-allow: xterm cube/grayscale ramp, exact RGB by standard
     Hsla::from(Rgba {
         r: r as f32 / 255.0,
         g: g as f32 / 255.0,

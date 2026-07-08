@@ -21,8 +21,13 @@ fmt-check:
 test:
     cargo test --workspace --exclude rift-app
 
-# Full CI check (format + lint + test)
-ci: fmt-check lint test
+# Hex->token sweep regression guard (docs/spec-settings-theme.md): fails if a
+# raw color constructor reappears outside a documented allowlist.
+check-color-tokens:
+    ./scripts/check-color-tokens.sh
+
+# Full CI check (format + lint + test + color-token guard)
+ci: fmt-check lint test check-color-tokens
 
 # Create an isolated headless worktree for an agent (off develop, own target, no
 # GPU build). Pass an issue number to flip it to In Progress on the board.

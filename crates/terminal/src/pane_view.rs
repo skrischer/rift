@@ -1485,12 +1485,7 @@ impl Render for PaneView {
 
         let bg_hsla = palette.background();
         let fg_hsla = palette.foreground();
-        let selection_bg = Hsla {
-            h: 0.0,
-            s: 0.0,
-            l: 0.35,
-            a: 1.0,
-        };
+        let selection_bg = cx.theme().selection;
         // Distinct theme-derived highlight colors, not the `selection_bg`
         // alias the search render fields used to carry
         // (`docs/spec-v1-hardening.md`): every match dims yellow, the current
