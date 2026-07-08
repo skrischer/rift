@@ -12,7 +12,7 @@
 
 use gpui::Action;
 
-use crate::editor::{FindReferences, GoToDefinition, Save, ShowHover};
+use crate::editor::{FindReferences, GoToDefinition, GoToLine, Save, ShowHover};
 use crate::workspace::{
     FocusTerminal, NewSession, RefreshKeyTables, SwitchSession, ToggleExplorer, ToggleOutline,
     ToggleProblems, ToggleSourceControl, ZoomActivePanel,
@@ -59,6 +59,7 @@ pub const COMMANDS: &[Command] = &[
     Command::new("Find References", Some("Shift+F12"), || {
         Box::new(FindReferences)
     }),
+    Command::new("Go to Line", Some("Ctrl+G"), || Box::new(GoToLine)),
     Command::new("Toggle Explorer", None, || Box::new(ToggleExplorer)),
     Command::new("Toggle Outline", None, || Box::new(ToggleOutline)),
     Command::new("Toggle Problems", None, || Box::new(ToggleProblems)),
@@ -117,6 +118,7 @@ mod tests {
                 "Go to Definition",
                 "Show Hover",
                 "Find References",
+                "Go to Line",
                 "Toggle Explorer",
                 "Toggle Outline",
                 "Toggle Problems",
@@ -150,6 +152,17 @@ mod tests {
         assert_eq!(save.keybinding_hint, Some("Ctrl+S"));
 
         assert!(find("does not exist").is_none());
+    }
+
+    /// Go to Line (`docs/spec-v1-hardening.md`, #620): registered under the
+    /// display name the palette renders, dispatching the action that opens
+    /// the go-to-line dialog, with the hint matching the `Ctrl+G` binding in
+    /// `main.rs`.
+    #[test]
+    fn test_go_to_line_is_registered_and_dispatches_the_expected_action() {
+        let go_to_line = find("Go to Line").expect("Go to Line is registered");
+        assert!(go_to_line.action().partial_eq(&GoToLine));
+        assert_eq!(go_to_line.keybinding_hint, Some("Ctrl+G"));
     }
 
     /// Theme commands (issue #367): registered under the display names the
