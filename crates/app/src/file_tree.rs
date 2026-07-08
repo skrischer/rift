@@ -43,10 +43,11 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dock::{Panel, PanelEvent};
 use gpui_component::{
-    h_flex, v_virtual_list, ActiveTheme as _, Sizable as _, VirtualListScrollHandle,
+    h_flex, v_virtual_list, ActiveTheme as _, Icon, IconName, Sizable as _, VirtualListScrollHandle,
 };
 use rift_protocol::{DiagnosticSeverity, EntryKind, GitEntryStatus, GitStatusCode};
 
+use crate::file_icons::{self, Glyph};
 use crate::worktree::WorktreeModel;
 
 /// Stable, distinct dock-panel identity for the file tree (`Panel::panel_name`).
@@ -106,11 +107,10 @@ const INDENT_BASE: Pixels = px(8.0);
 /// shipped flat 14px-per-level indent.
 const INDENT_PER_LEVEL: f32 = 16.0;
 
-/// Fixed width of the reserved icon slot, between the chevron and the name.
-/// Structure only in this phase — it carries a neutral placeholder, not a
-/// real file-type glyph (Phase 28; `docs/spec-explorer-redesign.md`) — sized
-/// to the artboard's icon glyph so Phase 28 drops icons in with no
-/// re-layout.
+/// Fixed width of the reserved icon slot, between the chevron and the name —
+/// sized to the artboard's icon glyph (`docs/spec-explorer-redesign.md`).
+/// Renders the mapped file-type / folder glyph ([`file_icons`]); unchanged
+/// from Phase 27 so no row re-layout follows (`docs/spec-explorer-icons.md`).
 const ICON_SLOT_WIDTH: Pixels = px(14.0);
 
 /// Diameter of the diagnostic-severity dot and the width of its slot in the
@@ -1027,34 +1027,45 @@ impl FileTree {
     ///
     /// Slot order, left to right, every slot `flex_shrink_0` so names and the
     /// trailing cluster column-align across rows and depths
-    /// (`docs/spec-explorer-redesign.md`): chevron/spacer -> reserved icon
-    /// slot (neutral placeholder; real file-type glyphs are Phase 28) ->
-    /// name (the only flexible slot) -> diagnostic dot -> right-aligned
-    /// git-status letter.
+    /// (`docs/spec-explorer-redesign.md`): chevron -> reserved icon slot
+    /// (mapped file-type / folder glyph, `crate::file_icons`) -> name (the
+    /// only flexible slot) -> diagnostic dot -> right-aligned git-status
+    /// letter.
     fn render_row(&self, row: &Row, cx: &mut Context<Self>) -> impl IntoElement {
         let is_dir = row.kind == EntryKind::Dir;
+        let is_expanded = is_dir && !self.collapsed.contains(&row.path);
         let is_selected = self.selected.as_deref() == Some(row.path.as_str());
         let indent = Self::row_indent(row.depth);
 
-        // Directory disclosure glyph (text, not an icon: the product binary does
-        // not embed gpui-component's SVG icon assets, so a glyph renders reliably
-        // either way). A file gets a blank spacer of the same width so names
-        // align across kinds.
-        let twisty = if is_dir {
-            if self.collapsed.contains(&row.path) {
-                "\u{203a}" // single right-pointing angle quotation mark
+        // Directory disclosure chevron (right collapsed / down expanded); a
+        // file gets a same-width blank spacer so names align across kinds
+        // (`docs/spec-explorer-icons.md`).
+        let twisty = div().w(px(12.0)).flex_shrink_0().when(is_dir, |el| {
+            let chevron = if is_expanded {
+                IconName::ChevronDown
             } else {
-                "\u{2304}" // down arrowhead
-            }
-        } else {
-            " "
-        };
+                IconName::ChevronRight
+            };
+            el.child(
+                Icon::new(chevron)
+                    .size(px(12.0))
+                    .text_color(cx.theme().muted_foreground),
+            )
+        });
 
-        // Reserved icon slot: fixed-width structure only, carrying a neutral
-        // placeholder rather than a blank gap (Phase 28 fills it with a real,
-        // language-tinted file-type glyph once the product binary embeds
-        // gpui-component's SVG assets — see the module doc). Same slot for
-        // every row regardless of kind: differentiating it is Phase 28's job.
+        // Reserved icon slot: the mapped file-type glyph for a file, or the
+        // open/closed folder glyph for a directory (`crate::file_icons`),
+        // tinted via the mapped theme-token role — never a hardcoded hex.
+        let icon_entry = if is_dir {
+            file_icons::folder_icon_for(is_expanded)
+        } else {
+            file_icons::file_icon_for(Self::display_name(&row.path))
+        };
+        let icon_tint = icon_entry.tint.resolve(cx.theme());
+        let icon_glyph = match icon_entry.glyph {
+            Glyph::Svg(path) => Icon::empty().path(path).text_color(icon_tint),
+            Glyph::Chrome(chrome) => Icon::new(chrome.icon_name()).text_color(icon_tint),
+        };
         let icon_slot = div()
             .w(ICON_SLOT_WIDTH)
             .h(ICON_SLOT_WIDTH)
@@ -1062,13 +1073,7 @@ impl FileTree {
             .flex()
             .items_center()
             .justify_center()
-            .child(
-                div()
-                    .size(px(6.0))
-                    .rounded(px(2.0))
-                    .bg(cx.theme().muted_foreground)
-                    .opacity(0.4),
-            );
+            .child(icon_glyph.size(ICON_SLOT_WIDTH));
 
         let name = Self::display_name(&row.path).to_owned();
         let path = row.path.clone();
@@ -1151,7 +1156,7 @@ impl FileTree {
             // Ignored entries (not yet shown by default — #309) render dimmed
             // rather than hidden, once the daemon starts sending them.
             .when(row.ignored, |el| el.opacity(0.55))
-            .child(div().w(px(12.0)).flex_shrink_0().child(twisty.to_string()))
+            .child(twisty)
             .child(icon_slot)
             .child(name_el)
             .child(severity_dot)

@@ -14,6 +14,7 @@ pub mod command_registry;
 pub mod connection_screen;
 pub mod diff_view;
 pub mod editor;
+pub mod file_icons;
 pub mod file_tree;
 pub mod outline_panel;
 pub mod problems_panel;
