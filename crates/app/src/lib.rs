@@ -78,11 +78,20 @@ pub fn apply_theme(cx: &mut App) {
 /// to `apply_theme` (`docs/spec-theme-settings.md`). `set_theme` already
 /// degrades an unknown persisted name to `DEFAULT_THEME_NAME`; `theme_mode` is
 /// re-applied afterward so a mode toggled independently of the named theme
-/// (`set_theme_mode`) survives a restart too.
+/// (`set_theme_mode`) survives a restart too. A persisted font-family override
+/// (issue #608) is applied last, and only when non-empty — an empty field
+/// means "no override", so the resolved theme's own font stands, exactly like
+/// a fresh store predating these two fields.
 pub fn apply_persisted_theme(state: &window_state::WindowState, cx: &mut App) {
     if register_themes(cx) {
         set_theme(&state.theme_name, None, cx);
         set_theme_mode(state.theme_mode, None, cx);
+        if !state.ui_font_family.is_empty() {
+            set_ui_font(&state.ui_font_family, None, cx);
+        }
+        if !state.mono_font_family.is_empty() {
+            set_mono_font(&state.mono_font_family, None, cx);
+        }
     }
 }
 
@@ -257,6 +266,56 @@ pub fn toggle_theme_mode_persisted(window: Option<&mut Window>, cx: &mut App) {
     set_theme_mode_persisted(mode, window, cx);
 }
 
+// ── Font-family setters (issue #608) ─────────────────────────────────────────
+//
+// The Appearance page's "UI font" / "Editor & terminal font" dropdowns
+// (`crate::settings`) mutate `Theme::global`'s `font_family` /
+// `mono_font_family` directly rather than through `Theme::change` — no
+// `ThemeConfig`/color reapplication is needed, just the one field. `Root`'s
+// own render already reads `cx.theme().font_family` as the whole app's base
+// text style, and every mono-font call site already reads
+// `cx.theme().mono_font_family` (editor, status bar, source control, diff
+// view, outline/results panels, title bar, connection screen), so both take
+// effect live with no further wiring. The raw terminal PTY grid is the one
+// deliberate exception: `rift_terminal`'s `session_view`/`pane_view` pin a
+// Nerd Font mono variant for their icon glyphs and tie cell measurement to
+// it, so they stay off this setting (out of this issue's scope).
+
+/// Switch the UI font family live, without touching any other `Theme` field.
+/// Mirrors [`apply_theme_mode`]'s window-refresh fallback (issue #493): a
+/// `SettingField` setter only ever hands its closure `cx: &mut App`, never a
+/// `Window`, and a plain global mutation does not by itself schedule a
+/// repaint.
+pub fn set_ui_font(name: &str, window: Option<&mut Window>, cx: &mut App) {
+    Theme::global_mut(cx).font_family = SharedString::from(name.to_string());
+    match window {
+        Some(window) => window.refresh(),
+        None => cx.refresh_windows(),
+    }
+}
+
+/// Switch the editor/status-bar/source-control mono font family live, mirroring
+/// [`set_ui_font`]'s shape and refresh fallback.
+pub fn set_mono_font(name: &str, window: Option<&mut Window>, cx: &mut App) {
+    Theme::global_mut(cx).mono_font_family = SharedString::from(name.to_string());
+    match window {
+        Some(window) => window.refresh(),
+        None => cx.refresh_windows(),
+    }
+}
+
+/// [`set_ui_font`], then persists the choice so it survives a restart.
+pub fn set_ui_font_persisted(name: &str, window: Option<&mut Window>, cx: &mut App) {
+    set_ui_font(name, window, cx);
+    persist_best_effort(|path| window_state::save_ui_font_family(path, name));
+}
+
+/// [`set_mono_font`], then persists the choice so it survives a restart.
+pub fn set_mono_font_persisted(name: &str, window: Option<&mut Window>, cx: &mut App) {
+    set_mono_font(name, window, cx);
+    persist_best_effort(|path| window_state::save_mono_font_family(path, name));
+}
+
 // ── Command-palette theme actions ────────────────────────────────────────────
 //
 // Dispatchable, parameterless actions (issue #367, `docs/spec-theme-settings.md`):
@@ -304,8 +363,8 @@ mod tests {
     use crate::window_state::{self, WindowState};
     use crate::{
         apply_persisted_theme, apply_theme, persist_theme_mode_to, persist_theme_to, resolve_theme,
-        set_theme, set_theme_mode, toggle_theme_mode, CATPPUCCIN_MOCHA_THEME_NAME,
-        DEFAULT_LIGHT_THEME_NAME, DEFAULT_THEME_NAME,
+        set_mono_font, set_theme, set_theme_mode, set_ui_font, toggle_theme_mode,
+        CATPPUCCIN_MOCHA_THEME_NAME, DEFAULT_LIGHT_THEME_NAME, DEFAULT_THEME_NAME,
     };
 
     fn theme_config(name: &str, mode: ThemeMode) -> ThemeConfig {
@@ -638,6 +697,98 @@ mod tests {
         assert_eq!(loaded.theme_mode, ThemeMode::Light);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- font-family setters (issue #608) -----------------------------------
+
+    #[gpui::test]
+    fn test_set_ui_font_updates_the_live_theme_font_family(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            apply_theme(cx);
+
+            set_ui_font("Inter", None, cx);
+
+            assert_eq!(cx.theme().font_family.as_ref(), "Inter");
+        });
+    }
+
+    #[gpui::test]
+    fn test_set_mono_font_updates_the_live_theme_mono_font_family(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            apply_theme(cx);
+
+            set_mono_font("Consolas", None, cx);
+
+            assert_eq!(cx.theme().mono_font_family.as_ref(), "Consolas");
+        });
+    }
+
+    /// Same class of regression `test_set_theme_mode_without_a_window_still_refreshes_open_windows`
+    /// guards against (issue #493): `set_ui_font` mutates `Theme::global`
+    /// directly rather than through `Theme::change`, so it needs its own
+    /// window-refresh fallback rather than inheriting one.
+    #[gpui::test]
+    fn test_set_ui_font_without_a_window_still_refreshes_open_windows(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            apply_theme(cx);
+        });
+
+        let render_count = Rc::new(std::cell::Cell::new(0usize));
+        let view_render_count = render_count.clone();
+        let _window = cx.add_window(move |_, _| CountingView {
+            render_count: view_render_count,
+        });
+        assert_eq!(render_count.get(), 1, "window draws once on creation");
+
+        cx.update(|cx| {
+            set_ui_font("Inter", None, cx);
+        });
+
+        assert_eq!(
+            render_count.get(),
+            2,
+            "refresh_windows should schedule a redraw even without a Window handle"
+        );
+    }
+
+    /// A persisted font override (non-empty) is re-applied on restore, over
+    /// whatever the resolved theme's own font would otherwise be.
+    #[gpui::test]
+    fn test_apply_persisted_theme_applies_a_persisted_font_override(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            let state = WindowState {
+                ui_font_family: "Segoe UI".to_string(),
+                mono_font_family: "Cascadia Mono".to_string(),
+                ..WindowState::default()
+            };
+
+            apply_persisted_theme(&state, cx);
+
+            assert_eq!(cx.theme().font_family.as_ref(), "Segoe UI");
+            assert_eq!(cx.theme().mono_font_family.as_ref(), "Cascadia Mono");
+        });
+    }
+
+    /// Empty font fields (a fresh store, or one predating issue #608) leave
+    /// the resolved theme's own font untouched rather than clobbering it with
+    /// an empty family name.
+    #[gpui::test]
+    fn test_apply_persisted_theme_empty_font_fields_leave_the_theme_default(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            let font_before_restore = cx.theme().font_family.clone();
+
+            apply_persisted_theme(&WindowState::default(), cx);
+
+            assert_eq!(cx.theme().font_family, font_before_restore);
+            assert_ne!(cx.theme().font_family.as_ref(), "");
+        });
     }
 
     /// `EditorView`, `TerminalPanel`, `ProblemsPanel`, `SourceControlPanel`, and
