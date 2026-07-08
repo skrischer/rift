@@ -14,26 +14,30 @@
 //! file.
 //!
 //! Bounded to **navigate + open + decorate**, plus inline rename (artboard
-//! **State C**, `docs/spec-explorer-file-ops.md`, #675) and the context-menu
-//! write group (artboard **State D**, #676): selecting a file emits
-//! [`FileTreeEvent::OpenFile`] carrying its root-relative path — the clean
-//! signal the editor surface (#187) subscribes to. Rows carry git status
-//! and diagnostic severity from the model, rolled up onto ancestor directories
-//! (`compute_rollup`, #329) so a collapsed folder still surfaces a
-//! modified/errored descendant; a deleted tracked file, whose own row is gone,
-//! rolls its status up onto surviving ancestors the same way (#480). Move
-//! (drag & drop) stays a later slice of the same phase — see
-//! `docs/spec-explorer-file-ops.md`. Selecting changes no tmux pane/window
+//! **State C**, `docs/spec-explorer-file-ops.md`, #675), the context-menu
+//! write group (artboard **State D**, #676), and drag & drop move (#677):
+//! selecting a file emits [`FileTreeEvent::OpenFile`] carrying its
+//! root-relative path — the clean signal the editor surface (#187)
+//! subscribes to. Rows carry git status and diagnostic severity from the
+//! model, rolled up onto ancestor directories (`compute_rollup`, #329) so a
+//! collapsed folder still surfaces a modified/errored descendant; a deleted
+//! tracked file, whose own row is gone, rolls its status up onto surviving
+//! ancestors the same way (#480). Selecting changes no tmux pane/window
 //! state — this is a pure GUI surface, agent-agnostic by construction (it only
 //! ever reads file paths, kinds, git status, diagnostics, and the `ignored`
 //! flag; it never inspects pane processes or file contents). A rename,
-//! create, or delete is user intent over the filesystem, sent as a
-//! [`FileTreeEvent::RenameRequested`] / [`FileTreeEvent::CreateRequested`] /
-//! [`FileTreeEvent::DeleteRequested`] for `workspace.rs` to forward — no
+//! create, delete, or drag-drop move is user intent over the filesystem, sent
+//! as a [`FileTreeEvent::RenameRequested`] / [`FileTreeEvent::CreateRequested`]
+//! / [`FileTreeEvent::DeleteRequested`] for `workspace.rs` to forward — no
 //! different in kind from any other write. *New File…* / *New Folder…* reuse
 //! the State-C inline-editor mechanism for a transient, not-yet-real row;
 //! *Delete* is gated behind the `#420` destructive confirm-dialog pattern,
-//! never batched.
+//! never batched. Dragging a row onto a directory (or a file, resolving to
+//! its parent) emits the same `RenameRequested` inline rename uses — one
+//! message covers both, the client only decides `to`
+//! (`docs/spec-explorer-file-ops.md`) — refused client-side before it is ever
+//! sent for a no-op same-parent move or a directory dropped into its own
+//! subtree ([`resolve_drop`]).
 //!
 //! Implements `gpui-component`'s `Panel` trait directly (`docs/spec-ide-shell.md`,
 //! issue #323), so it can be mounted as a dock panel once the shell adopts
@@ -675,6 +679,94 @@ fn describe_delete(name: &str, kind: &EntryKind) -> String {
     match kind {
         EntryKind::Dir => format!("Delete \"{name}\" and its contents? This cannot be undone."),
         EntryKind::File => format!("Delete \"{name}\"? This cannot be undone."),
+    }
+}
+
+/// The root-relative directory a drag-drop resolves onto (`docs/spec-explorer-file-ops.md`):
+/// the dropped-on row's own path when it is a directory, or its parent when
+/// it is a file (empty at a top-level file — the worktree root). Mirrors
+/// [`FileTree::create_target_dir`]'s dir-vs-file resolution, generalized to
+/// any row rather than only the selection.
+fn drop_target_dir<'a>(target_kind: &EntryKind, target_path: &'a str) -> &'a str {
+    match target_kind {
+        EntryKind::Dir => target_path,
+        EntryKind::File => target_path
+            .rsplit_once('/')
+            .map_or("", |(parent, _)| parent),
+    }
+}
+
+/// Whether `target_dir` is `dragged_path` itself or a path-separator-bounded
+/// descendant of it — refuses dropping a directory into its own subtree
+/// (`docs/spec-explorer-file-ops.md`). Only ever true for a dragged
+/// directory: a file has no subtree to drop into.
+fn drops_into_own_subtree(dragged_path: &str, dragged_kind: &EntryKind, target_dir: &str) -> bool {
+    *dragged_kind == EntryKind::Dir
+        && (target_dir == dragged_path
+            || target_dir
+                .strip_prefix(dragged_path)
+                .is_some_and(|rest| rest.starts_with('/')))
+}
+
+/// Resolve a drag-drop of `dragged_path` (`dragged_kind`) onto a row
+/// (`target_kind`, `target_path`) into a `RenamePath` pair, or `None` when
+/// the client-side guard refuses it — a no-op move (the resolved target
+/// directory equals the dragged item's current parent) or a directory
+/// dropped into itself or a descendant (`docs/spec-explorer-file-ops.md`).
+/// `to` joins the resolved target directory with the dragged entry's own
+/// basename ([`join_dir`], the same join [`FileTree::commit_create`] uses).
+/// Pure and side-effect free — refused/sent is entirely determined by these
+/// inputs, so both guards are unit-testable without a `Window`/`Context`.
+fn resolve_drop(
+    dragged_path: &str,
+    dragged_kind: &EntryKind,
+    target_kind: &EntryKind,
+    target_path: &str,
+) -> Option<(String, String)> {
+    let target_dir = drop_target_dir(target_kind, target_path);
+    let current_parent = dragged_path.rsplit_once('/').map_or("", |(p, _)| p);
+    if current_parent == target_dir
+        || drops_into_own_subtree(dragged_path, dragged_kind, target_dir)
+    {
+        return None;
+    }
+    let basename = FileTree::display_name(dragged_path);
+    Some((dragged_path.to_owned(), join_dir(target_dir, basename)))
+}
+
+/// The payload a dragged row carries (`docs/spec-explorer-file-ops.md`): its
+/// root-relative `path` and `kind`, read by the drop target's `can_drop` /
+/// `on_drop` handlers via gpui's `on_drag`/`on_drop`. `Clone` — gpui's drag
+/// preview constructor and `drag_over` highlight both receive `&DraggedRow`
+/// and may need an owned copy.
+#[derive(Clone)]
+struct DraggedRow {
+    path: String,
+    kind: EntryKind,
+}
+
+/// The floating preview that follows the cursor while a [`DraggedRow`] is in
+/// flight — the row's display name in a themed pill, the fluent
+/// `on_drag` constructor's required `Entity<W>`. Mirrors `gpui-component`'s
+/// own drag preview (`dock/tab_panel.rs`'s `DragPanel`); theme tokens only,
+/// never a hardcoded hex.
+struct DragPreview {
+    name: SharedString,
+}
+
+impl Render for DragPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("file-tree-drag-preview")
+            .px_2()
+            .py_1()
+            .rounded(ROW_RADIUS)
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .text_sm()
+            .text_color(cx.theme().foreground)
+            .child(self.name.clone())
     }
 }
 
@@ -1347,6 +1439,28 @@ impl FileTree {
         }
     }
 
+    /// Apply a drop of `dragged` onto a row (`target_kind`, `target_path`):
+    /// [`resolve_drop`] resolves the target and refuses the two client-side
+    /// guard cases; a resolved drop emits [`FileTreeEvent::RenameRequested`]
+    /// for `workspace.rs` to forward as a `RenamePath`, the same one message
+    /// inline rename uses — the client only decides `to`
+    /// (`docs/spec-explorer-file-ops.md`). The tree never sends the request
+    /// itself and never mutates `WorktreeModel` here; the row moves once the
+    /// daemon's `UpdateWorktree` push arrives, same as every other file op.
+    fn handle_drop(
+        &mut self,
+        dragged: &DraggedRow,
+        target_kind: &EntryKind,
+        target_path: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((from, to)) =
+            resolve_drop(&dragged.path, &dragged.kind, target_kind, target_path)
+        {
+            cx.emit(FileTreeEvent::RenameRequested { from, to });
+        }
+    }
+
     /// Scroll the selected row into view. The tail shared by [`FileTree::reveal`]
     /// and every keyboard-navigation method below (#431): any selection movement
     /// must keep the selected row on screen — arrow keys used to walk it
@@ -1777,6 +1891,7 @@ impl FileTree {
 
         let name = Self::display_name(&row.path).to_owned();
         let path = row.path.clone();
+        let preview_name = SharedString::from(name.clone());
 
         // Rolled-up decoration (git letter + diagnostic dot) is suppressed on
         // an *expanded* directory: its visible descendants already carry
@@ -1887,6 +2002,41 @@ impl FileTree {
                 .text_color(cx.theme().foreground);
         }
 
+        // Drag & drop move (`docs/spec-explorer-file-ops.md`, #677): every
+        // row is both a drag source (`on_drag`, a themed floating preview
+        // via `DragPreview`) and a drop target (`on_drop`, resolved through
+        // `FileTree::handle_drop` -> `resolve_drop`). `can_drop` mirrors
+        // `resolve_drop`'s own guard (a no-op same-parent move, or a
+        // directory dropped into itself or a descendant) so a refused target
+        // never highlights (`drag_over`) either — the same check `on_drop`
+        // re-applies before ever emitting `RenameRequested`, so a
+        // highlighted target is always one that would actually send.
+        let target_kind = row.kind.clone();
+        let drag_payload = DraggedRow {
+            path: path.clone(),
+            kind: target_kind.clone(),
+        };
+        let can_drop_kind = target_kind.clone();
+        let can_drop_path = path.clone();
+        let drop_kind = target_kind.clone();
+        let drop_path = path.clone();
+        root = root
+            .on_drag(drag_payload, move |_drag, _point, _window, cx| {
+                cx.new(|_| DragPreview {
+                    name: preview_name.clone(),
+                })
+            })
+            .drag_over::<DraggedRow>(|style, _drag, _window, cx| style.bg(cx.theme().list_active))
+            .can_drop(move |drag: &dyn std::any::Any, _window, _cx| {
+                drag.downcast_ref::<DraggedRow>().is_some_and(|dragged| {
+                    resolve_drop(&dragged.path, &dragged.kind, &can_drop_kind, &can_drop_path)
+                        .is_some()
+                })
+            })
+            .on_drop(cx.listener(move |this, drag: &DraggedRow, _window, cx| {
+                this.handle_drop(drag, &drop_kind, &drop_path, cx);
+            }));
+
         // Row context menu (`docs/spec-explorer-context-menu.md`): reuses
         // `gpui-component`'s `ContextMenuExt`/`PopupMenu` — the same widget
         // `editor.rs` already ships its right-click menu with. Label-only (no
@@ -1898,7 +2048,6 @@ impl FileTree {
         // row (`FileTree::start_create`); *Rename* reuses the shipped
         // `StartRename` action (State C), same as "Open" reuses
         // `OpenSelected`; *Delete* opens the destructive confirm dialog.
-        // Drag & drop (move) is a later slice of the same phase.
         root.on_click(cx.listener(move |this, _event, _window, cx| {
             if is_dir {
                 this.click_dir(&path);
@@ -3716,6 +3865,115 @@ mod tests {
         );
     }
 
+    // --- resolve_drop / drop_target_dir / drops_into_own_subtree (drag & drop, #677) ---
+
+    #[test]
+    fn test_drop_target_dir_of_a_directory_is_itself() {
+        assert_eq!(drop_target_dir(&EntryKind::Dir, "src"), "src");
+    }
+
+    #[test]
+    fn test_drop_target_dir_of_a_nested_file_is_its_parent() {
+        assert_eq!(drop_target_dir(&EntryKind::File, "src/main.rs"), "src");
+    }
+
+    #[test]
+    fn test_drop_target_dir_of_a_top_level_file_is_the_root() {
+        assert_eq!(drop_target_dir(&EntryKind::File, "README.md"), "");
+    }
+
+    #[test]
+    fn test_drops_into_own_subtree_is_true_for_a_directory_dropped_on_itself() {
+        assert!(drops_into_own_subtree("src", &EntryKind::Dir, "src"));
+    }
+
+    #[test]
+    fn test_drops_into_own_subtree_is_true_for_a_descendant_directory() {
+        assert!(drops_into_own_subtree("src", &EntryKind::Dir, "src/net"));
+    }
+
+    #[test]
+    fn test_drops_into_own_subtree_is_false_for_a_sibling_directory() {
+        assert!(!drops_into_own_subtree("src", &EntryKind::Dir, "lib"));
+    }
+
+    #[test]
+    fn test_drops_into_own_subtree_is_false_for_a_path_sharing_only_a_text_prefix() {
+        // `src2` shares the `src` text prefix but is not a `src/`-bounded
+        // descendant — the same prefix-vs-substring distinction the
+        // collapse-set guards against.
+        assert!(!drops_into_own_subtree("src", &EntryKind::Dir, "src2"));
+    }
+
+    #[test]
+    fn test_drops_into_own_subtree_is_false_for_a_dragged_file() {
+        // A file has no subtree; dropping it "onto itself" is caught by the
+        // no-op guard instead, not this one.
+        assert!(!drops_into_own_subtree(
+            "src/main.rs",
+            &EntryKind::File,
+            "src/main.rs"
+        ));
+    }
+
+    #[test]
+    fn test_resolve_drop_onto_a_directory_moves_the_dragged_file_there() {
+        assert_eq!(
+            resolve_drop("top.rs", &EntryKind::File, &EntryKind::Dir, "src"),
+            Some(("top.rs".to_owned(), "src/top.rs".to_owned()))
+        );
+    }
+
+    #[test]
+    fn test_resolve_drop_onto_a_file_resolves_to_its_parent_directory() {
+        assert_eq!(
+            resolve_drop("top.rs", &EntryKind::File, &EntryKind::File, "src/main.rs"),
+            Some(("top.rs".to_owned(), "src/top.rs".to_owned()))
+        );
+    }
+
+    #[test]
+    fn test_resolve_drop_refuses_a_same_parent_noop_move() {
+        // `src/lib.rs` dropped on `src` itself: the resolved target
+        // directory is already its current parent.
+        assert_eq!(
+            resolve_drop("src/lib.rs", &EntryKind::File, &EntryKind::Dir, "src"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_drop_refuses_a_directory_dropped_into_its_own_descendant() {
+        assert_eq!(
+            resolve_drop("src", &EntryKind::Dir, &EntryKind::Dir, "src/net"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_drop_refuses_a_directory_dropped_onto_itself() {
+        assert_eq!(
+            resolve_drop("src", &EntryKind::Dir, &EntryKind::Dir, "src"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_drop_moves_a_directory_to_a_sibling_directory() {
+        assert_eq!(
+            resolve_drop("src", &EntryKind::Dir, &EntryKind::Dir, "lib"),
+            Some(("src".to_owned(), "lib/src".to_owned()))
+        );
+    }
+
+    #[test]
+    fn test_resolve_drop_onto_the_worktree_root_from_a_nested_file() {
+        assert_eq!(
+            resolve_drop("src/main.rs", &EntryKind::File, &EntryKind::File, "top.rs"),
+            Some(("src/main.rs".to_owned(), "main.rs".to_owned()))
+        );
+    }
+
     // --- create_target_dir (pure derivation over model + selection) --------
 
     #[test]
@@ -4128,6 +4386,92 @@ mod tests {
                 "only AlreadyExists/InvalidPath re-open the editor"
             );
         });
+    }
+
+    // --- drag & drop move (`FileTree::handle_drop` wiring, #677) -----------
+
+    #[gpui::test]
+    fn test_handle_drop_onto_a_directory_emits_rename_requested(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        let events = subscribe_events(&tree, cx);
+        window
+            .update(cx, |_, _window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut().apply_snapshot_chunk(
+                        "/proj".into(),
+                        vec![dir("src"), file("top.rs")],
+                        true,
+                    );
+                    let dragged = DraggedRow {
+                        path: "top.rs".into(),
+                        kind: EntryKind::File,
+                    };
+                    tree.handle_drop(&dragged, &EntryKind::Dir, "src", cx);
+                });
+            })
+            .expect("handle drop");
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            [FileTreeEvent::RenameRequested {
+                from: "top.rs".into(),
+                to: "src/top.rs".into(),
+            }]
+        );
+    }
+
+    #[gpui::test]
+    fn test_handle_drop_same_parent_noop_sends_nothing(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        let events = subscribe_events(&tree, cx);
+        window
+            .update(cx, |_, _window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut().apply_snapshot_chunk(
+                        "/proj".into(),
+                        vec![dir("src"), file("src/main.rs")],
+                        true,
+                    );
+                    let dragged = DraggedRow {
+                        path: "src/main.rs".into(),
+                        kind: EntryKind::File,
+                    };
+                    // Dropped back on its own parent directory.
+                    tree.handle_drop(&dragged, &EntryKind::Dir, "src", cx);
+                });
+            })
+            .expect("handle drop");
+
+        assert!(events.borrow().is_empty(), "a same-parent drop is a no-op");
+    }
+
+    #[gpui::test]
+    fn test_handle_drop_directory_into_its_own_descendant_sends_nothing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tree, window) = open_tree(cx);
+        let events = subscribe_events(&tree, cx);
+        window
+            .update(cx, |_, _window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut().apply_snapshot_chunk(
+                        "/proj".into(),
+                        vec![dir("src"), dir("src/net")],
+                        true,
+                    );
+                    let dragged = DraggedRow {
+                        path: "src".into(),
+                        kind: EntryKind::Dir,
+                    };
+                    tree.handle_drop(&dragged, &EntryKind::Dir, "src/net", cx);
+                });
+            })
+            .expect("handle drop");
+
+        assert!(
+            events.borrow().is_empty(),
+            "a directory dropped into its own descendant is refused"
+        );
     }
 
     // --- context-menu write group: inline create editor (artboard State D,
