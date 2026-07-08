@@ -110,7 +110,7 @@ struct PaneEntry {
     /// its own subtree, so the parent must observe it to refresh the tab-bar
     /// aggregate live off an OSC-133/bell transition. Dropped with the entry
     /// when the pane leaves the snapshot, so observations never leak across
-    /// snapshots (`docs/spec-pane-activity-indicators.md`).
+    /// snapshots (`docs/spec-pane-activity-v2.md`).
     _activity_subscription: Subscription,
 }
 
@@ -301,7 +301,7 @@ fn activity_rank(activity: PaneActivity) -> u8 {
 /// dominant state by precedence (attention > busy > free) and the number of
 /// panes that are busy or attention. GPUI-free so the precedence and count are
 /// unit-testable in isolation, mirroring the per-pane `ActivityTracker`
-/// (`docs/spec-pane-activity-indicators.md`).
+/// (`docs/spec-pane-activity-v2.md`).
 fn aggregate_activity(activities: impl Iterator<Item = PaneActivity>) -> (PaneActivity, usize) {
     let mut dominant = PaneActivity::Free;
     let mut active_count = 0;
@@ -976,7 +976,7 @@ impl SessionView {
                             // active a bell never raises attention, and activation
                             // acknowledges pending attention, so tab clicks,
                             // Alt+1..9, and tmux-side selects clear it uniformly
-                            // (`docs/spec-pane-activity-indicators.md`).
+                            // (`docs/spec-pane-activity-v2.md`).
                             pv.set_window_active(is_active_window);
                             // The tmux foreground-process flag (#510) drives the
                             // pane's busy/free indicator, pushed on every snapshot
@@ -1030,7 +1030,7 @@ impl SessionView {
                     // re-renders only its own subtree) also re-renders this parent,
                     // keeping a background window's tab aggregate live. The handle
                     // lives in the entry and drops when the pane leaves the snapshot
-                    // (`docs/spec-pane-activity-indicators.md`).
+                    // (`docs/spec-pane-activity-v2.md`).
                     let activity_subscription = cx.observe(&entity, |_this, _pane, cx| cx.notify());
 
                     if let Some(buffered) = self.early_output_buffer.remove(&pane_id) {
@@ -1099,7 +1099,7 @@ impl SessionView {
     /// observed pane transition reflects immediately. The active window never
     /// surfaces attention: its panes' trackers suppress bell raises while the
     /// window is active, and any pane whose flag is momentarily stale is read as
-    /// its underlying busy/free (`docs/spec-pane-activity-indicators.md`).
+    /// its underlying busy/free (`docs/spec-pane-activity-v2.md`).
     pub fn window_activity(&self, window_id: &str, cx: &App) -> (PaneActivity, usize) {
         let Some(window) = self.windows.iter().find(|w| w.id == window_id) else {
             return (PaneActivity::Free, 0);
@@ -1176,7 +1176,7 @@ impl SessionView {
     /// Called from the local window-select paths (tab click, Alt+1..9) so the
     /// attention badge clears without waiting for the confirming snapshot's
     /// round trip through tmux; the snapshot then re-asserts the same state via
-    /// `set_window_active` (`docs/spec-pane-activity-indicators.md`).
+    /// `set_window_active` (`docs/spec-pane-activity-v2.md`).
     fn acknowledge_window_attention(&self, window_id: &str, cx: &mut Context<Self>) {
         let Some(window) = self.windows.iter().find(|w| w.id == window_id) else {
             return;
@@ -1875,7 +1875,7 @@ impl Render for SessionView {
         // loop: `window_activity` reads `self.panes` while the loop below borrows
         // `self.windows`, so pre-computing keeps the two shared borrows from
         // overlapping. Read live here (not cached) so an observed pane transition
-        // reflects on the next render (`docs/spec-pane-activity-indicators.md`).
+        // reflects on the next render (`docs/spec-pane-activity-v2.md`).
         let mut window_activities: Vec<(PaneActivity, usize)> =
             Vec::with_capacity(self.windows.len());
         for w in &self.windows {
@@ -2234,15 +2234,18 @@ mod tests {
     use super::{
         aggregate_activity, grid_size_for, home_relative, max_vertical_pane_count, quote_tmux_name,
         reconnect_banner_message, resize_direction, select_pane_command, split_command,
-        tab_state_slot, zoom_pane_command, PaneActivity, SessionListItem, SessionView,
-        TabStateSlot, TermSize, TerminalHandle, DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE,
+        tab_state_slot, zoom_pane_command, PaneActivity, SessionListItem, SessionSnapshot,
+        SessionView, TabStateSlot, TermSize, TerminalHandle, DEFAULT_FONT_SIZE, MAX_FONT_SIZE,
+        MIN_FONT_SIZE,
     };
     use crate::layout::LayoutNode;
     use gpui::{
         px, size, AnyWindowHandle, App, AppContext as _, Entity, SharedString, TestAppContext,
     };
     use gpui_component::input::InputState;
+    use std::collections::HashMap;
     use std::time::Instant;
+    use termy_terminal_ui::{TmuxPaneState, TmuxSnapshot, TmuxWindowState};
 
     #[test]
     fn test_grid_size_for_exact_multiple_returns_full_grid() {
@@ -2588,6 +2591,84 @@ mod tests {
             view
         });
         (session, handle.expect("handle built by SessionView::new"))
+    }
+
+    /// A minimal one-window, one-pane snapshot with the given `pane_is_shell`
+    /// map, for exercising `apply_snapshot`'s foreground-shell wiring.
+    fn snapshot_with_pane_is_shell(pane_is_shell: HashMap<String, bool>) -> SessionSnapshot {
+        SessionSnapshot {
+            snapshot: TmuxSnapshot {
+                session_name: "rift".to_owned(),
+                session_id: None,
+                windows: vec![TmuxWindowState {
+                    id: "@0".to_owned(),
+                    index: 0,
+                    name: "win".to_owned(),
+                    layout: String::new(),
+                    is_active: true,
+                    automatic_rename: false,
+                    active_pane_id: Some("%0".to_owned()),
+                    panes: vec![TmuxPaneState {
+                        id: "%0".to_owned(),
+                        window_id: "@0".to_owned(),
+                        session_id: "$0".to_owned(),
+                        is_active: true,
+                        left: 0,
+                        top: 0,
+                        width: 80,
+                        height: 24,
+                        cursor_x: 0,
+                        cursor_y: 0,
+                        current_path: String::new(),
+                        current_command: String::new(),
+                    }],
+                }],
+            },
+            pane_is_shell,
+        }
+    }
+
+    /// Regression (`docs/spec-pane-activity-v2.md`): the legacy tmux path
+    /// (`RIFT_TERMINAL_LEGACY`) sends an empty `pane_is_shell` map (`main.rs`).
+    /// `apply_snapshot` must resolve a pane absent from that map to `None`,
+    /// not a collapsed `Some(false)` — otherwise every legacy pane would read
+    /// forced-busy instead of falling back to the client structural
+    /// classifier (alt-screen / OSC-133), which reads free here.
+    #[gpui::test]
+    fn test_apply_snapshot_legacy_empty_map_reads_pane_free_not_busy(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, _handle) = session_and_handle(cx);
+
+            session.update(cx, |view, cx| {
+                view.apply_snapshot(snapshot_with_pane_is_shell(HashMap::new()), cx)
+            });
+
+            let activity = session.read(cx).panes["%0"].entity.read(cx).activity();
+            assert_eq!(
+                activity,
+                PaneActivity::Free,
+                "pane absent from an empty legacy pane_is_shell map must fall \
+                 back to the structural classifier, not read forced-busy"
+            );
+        });
+    }
+
+    /// Same wiring on the daemon-default path: a pane present in the map with
+    /// `is_shell: false` (a command is running) reads busy.
+    #[gpui::test]
+    fn test_apply_snapshot_daemon_path_maps_is_shell_to_busy(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, _handle) = session_and_handle(cx);
+
+            let mut pane_is_shell = HashMap::new();
+            pane_is_shell.insert("%0".to_owned(), false);
+            session.update(cx, |view, cx| {
+                view.apply_snapshot(snapshot_with_pane_is_shell(pane_is_shell), cx)
+            });
+
+            let activity = session.read(cx).panes["%0"].entity.read(cx).activity();
+            assert_eq!(activity, PaneActivity::Busy);
+        });
     }
 
     /// The banner's Cancel action crosses the render seam as exactly one
