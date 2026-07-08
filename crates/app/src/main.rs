@@ -4,6 +4,7 @@
 // GPUI runtime-shader path); off by default so dev keeps its RUST_LOG console.
 #![cfg_attr(feature = "windowed", windows_subsystem = "windows")]
 
+use std::borrow::Cow;
 use std::env;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -221,6 +222,45 @@ fn init_logging() {
     rift_logging::install_panic_hook();
 }
 
+/// Rift's own file-type glyph SVGs (a curated MIT Seti UI subset,
+/// `crates/app/assets/file_icons/`), embedded via `rust-embed`. Kept as a
+/// separate embed target from `gpui_component_assets::Assets` — GPUI's
+/// `AssetSource` is disjoint per path prefix, not merged automatically.
+#[derive(rust_embed::RustEmbed)]
+#[folder = "assets"]
+#[include = "file_icons/**/*.svg"]
+struct RiftFileIcons;
+
+/// Delegating `AssetSource`: serves rift's own `file_icons/*.svg` glyphs from
+/// [`RiftFileIcons`] and hands every other path straight through to
+/// `gpui_component_assets::Assets` unchanged. `with_assets` accepts exactly one
+/// source, so this is the single source registered for the product build;
+/// gpui-component's `IconName` glyphs (activity rail, window controls) keep
+/// resolving through the delegate exactly as before (#597). Routing is by the
+/// `file_icons/` prefix, not trial-and-error fallthrough: gpui-component's own
+/// `Assets::load` returns `Err`, not `Ok(None)`, on a miss, so a fallthrough
+/// attempt would surface the wrong asset source's error on a genuine miss.
+struct RiftAssets;
+
+impl AssetSource for RiftAssets {
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if path.starts_with("file_icons/") {
+            return Ok(RiftFileIcons::get(path).map(|file| file.data));
+        }
+        Assets.load(path)
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        if path.starts_with("file_icons/") {
+            return Ok(RiftFileIcons::iter()
+                .filter(|asset_path| asset_path.starts_with(path))
+                .map(SharedString::from)
+                .collect());
+        }
+        Assets.list(path)
+    }
+}
+
 fn main() {
     // The stable profile keeps debug-assertions on, so GPUI resolves its
     // compile-time CARGO_MANIFEST_DIR paths at runtime (shader sources,
@@ -243,11 +283,13 @@ fn main() {
     );
 
     Application::with_platform(gpui_platform::current_platform(false))
-        // Register gpui-component's icon SVGs so the activity rail and window
-        // controls render their glyphs (blank otherwise — #597). Mirrors
-        // `gallery::run`; the embedding lives in the product build via the
-        // gpui-component-assets + rust-embed `debug-embed` dependencies.
-        .with_assets(Assets)
+        // Register the delegating RiftAssets source: gpui-component's icon SVGs
+        // keep resolving through it exactly as `Assets` alone did (activity
+        // rail / window controls — blank otherwise, #597), and it additionally
+        // serves rift's own vendored file-type glyphs (`file_icons/*.svg`,
+        // #668) so the explorer's icon slot can render real glyphs in the
+        // shipping binary, not only under the dev-only `gallery` feature.
+        .with_assets(RiftAssets)
         .run(|cx: &mut App| {
             gpui_component::init(cx);
             // Restore the persisted theme choice (`docs/spec-theme-settings.md`); a
@@ -2888,5 +2930,26 @@ mod tests {
             .expect("icon asset load must not error")
             .expect("gpui-component icon must be embedded in the product build");
         assert!(!icon.is_empty(), "embedded icon SVG must not be empty");
+    }
+
+    #[test]
+    fn test_rift_file_icon_asset_is_embedded_in_product_build() {
+        use gpui::AssetSource as _;
+
+        use super::RiftAssets;
+
+        // A vendored file-type glyph (`crates/app/assets/file_icons/rust.svg`)
+        // must resolve through the delegating RiftAssets source registered by
+        // `main` (#668), so the explorer's icon slot can render real file-type
+        // glyphs in the shipping binary, not only under the dev-only `gallery`
+        // feature.
+        let icon = RiftAssets
+            .load("file_icons/rust.svg")
+            .expect("file-type icon asset load must not error")
+            .expect("vendored file-type icon must be embedded in the product build");
+        assert!(
+            !icon.is_empty(),
+            "embedded file-type icon SVG must not be empty"
+        );
     }
 }
