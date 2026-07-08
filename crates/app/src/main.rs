@@ -377,6 +377,17 @@ fn main() {
                     gpui_component::input::Redo,
                     Some(rift_app::editor::EDITOR_KEY_CONTEXT),
                 ),
+                // Go to Line (`docs/spec-v1-hardening.md`, #620): Ctrl+G mirrors
+                // VS Code/JetBrains muscle memory. Find/replace needs no binding
+                // here — `gpui-component`'s own `Ctrl+F`/`Cmd+F` (bound in its
+                // "Input" context, `crates/ui/src/input/state.rs`) already opens
+                // it, since the code editor's `InputState` is built with
+                // `.code_editor(...)`, which turns on `searchable` by default.
+                KeyBinding::new(
+                    "ctrl-g",
+                    rift_app::editor::GoToLine,
+                    Some(rift_app::editor::EDITOR_KEY_CONTEXT),
+                ),
             ]);
             // Explorer keyboard navigation (#332): up/down move the selection,
             // left/right collapse/expand (stepping to parent/first-child at the
