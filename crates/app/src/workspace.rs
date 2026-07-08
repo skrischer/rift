@@ -43,6 +43,12 @@
 //!   daemon refused the read/write, surfaced immediately instead of waiting
 //!   out the editor's own `OPEN_TIMEOUT` / `SAVE_TIMEOUT`.
 //!
+//! `daemon_unavailable_rx` is not a `DaemonMessage` and does not come from
+//! `consume_daemon_messages` — no daemon client exists yet when it fires. It
+//! fires from `run_ssh_session` itself (#619) the moment the daemon terminal
+//! is selected but provisioning came back empty, and folds into a persistent
+//! `Root` notification rather than any panel model.
+//!
 //! The reverse path runs through three request channels. `open_file_tx` issues an
 //! `OpenFile` read: when the tree emits [`FileTreeEvent::OpenFile`] (or the editor
 //! auto-reloads), this view tells the editor to begin opening (arming its timeout)
@@ -74,6 +80,7 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dialog::{AlertDialog, DialogButtonProps};
 use gpui_component::dock::{Dock, DockArea, DockItem, DockPlacement, PanelView};
+use gpui_component::notification::Notification;
 use gpui_component::{ActiveTheme as _, IconName, Root, Sizable as _, WindowExt as _};
 use rift_protocol::{ClientMessage, DaemonMessage, LspServerState};
 use rift_terminal::{SessionView, SessionViewEvent};
@@ -193,6 +200,11 @@ const BOTTOM_DOCK_HEIGHT: f32 = 200.0;
 /// remaining right-dock height to the diff view below it.
 const SOURCE_CONTROL_SPLIT_HEIGHT: f32 = 180.0;
 
+/// Notification id marker for the daemon-unavailable banner (#619) — pushing
+/// with this type keeps a repeat signal (e.g. a reconnect that still finds no
+/// daemon) from stacking a second notification instead of replacing the first.
+struct DaemonUnavailableNotification;
+
 /// The flume endpoints the workspace consumes to bridge the daemon stream (run
 /// by the tokio side) onto its GPUI surfaces, plus the request endpoints it emits
 /// `OpenFile` / `SaveFile` on. Handed in at construction so `main.rs` owns the
@@ -233,6 +245,12 @@ pub struct WorkspaceChannels {
     /// echoed into state, the resulting git change arrives on the push
     /// recompute (`docs/spec-source-control-write.md`).
     pub git_op_tx: Sender<ClientMessage>,
+    /// Fires once whenever the tokio side selected the daemon terminal but no
+    /// daemon came up (#619, `docs/spec-v1-hardening.md`): the session still
+    /// runs over the legacy tmux path, but every daemon-backed IDE feature is
+    /// dead. Folded into a persistent, dismissible notification rather than
+    /// only a log line, so the degraded session is visible on screen.
+    pub daemon_unavailable_rx: Receiver<()>,
 }
 
 /// The composed app root.
@@ -349,6 +367,7 @@ impl WorkspaceView {
             nav_tx,
             request_diff_tx,
             git_op_tx,
+            daemon_unavailable_rx,
         } = channels;
 
         let file_tree = cx.new(|_| FileTree::new());
@@ -625,6 +644,34 @@ impl WorkspaceView {
                     view.diff_view.update(cx, |diff_view, cx| {
                         diff_view.apply_file_diff(path, diff, cx);
                     });
+                });
+                if result.is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
+
+        // Daemon-unavailable signal -> a persistent, dismissible notification
+        // (#619): the tokio side selected the daemon terminal but no daemon
+        // came up, so the legacy tmux path is carrying the session with every
+        // daemon-backed feature dead. Pushed through the existing `Root`
+        // notification layer (rendered below in `render`) rather than a new
+        // primitive; a stable id keeps a reconnect's repeat signal from
+        // stacking a second copy. `autohide(false)` plus the notification's own
+        // close button is the "persistent, dismissible" the issue asks for.
+        {
+            cx.spawn_in(window, async move |this, cx| loop {
+                let Ok(()) = daemon_unavailable_rx.recv_async().await else {
+                    break;
+                };
+                let result = this.update_in(cx, |_view, window, cx| {
+                    window.push_notification(
+                        Notification::warning("Daemon unavailable - IDE features disabled")
+                            .id::<DaemonUnavailableNotification>()
+                            .autohide(false),
+                        cx,
+                    );
                 });
                 if result.is_err() {
                     break;
@@ -1628,6 +1675,7 @@ mod tests {
         let (nav_tx, _nav_request_rx) = flume::unbounded();
         let (request_diff_tx, _request_diff_rx) = flume::unbounded();
         let (git_op_tx, _git_op_rx) = flume::unbounded();
+        let (_daemon_unavailable_tx, daemon_unavailable_rx) = flume::unbounded();
         WorkspaceChannels {
             worktree_rx,
             buffer_rx,
@@ -1640,6 +1688,7 @@ mod tests {
             nav_tx,
             request_diff_tx,
             git_op_tx,
+            daemon_unavailable_rx,
         }
     }
 
@@ -2393,6 +2442,69 @@ mod tests {
                 workspace.read(cx).focus_handle(cx),
                 session_view.read(cx).focus_handle(cx),
                 "dismissing settings leaves the terminal focus delegation untouched"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Daemon-unavailable banner (#619, `docs/spec-v1-hardening.md`): the
+    /// tokio side's signal must surface as exactly one `Root` notification,
+    /// a repeat signal (SSH-level reconnect resending it) must replace rather
+    /// than stack a second copy, and the notification must not autohide —
+    /// it stays until the user dismisses it.
+    #[gpui::test]
+    fn test_daemon_unavailable_signal_pushes_one_persistent_notification(cx: &mut TestAppContext) {
+        let (daemon_unavailable_tx, daemon_unavailable_rx) = flume::unbounded();
+        let channels = WorkspaceChannels {
+            daemon_unavailable_rx,
+            ..test_channels()
+        };
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let session_view = cx.new(|cx| SessionView::new(cx).0);
+                workspace =
+                    Some(cx.new(|cx| WorkspaceView::new(session_view, channels, None, window, cx)));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let _workspace = workspace.expect("workspace constructed inside the window callback");
+
+        let _ = daemon_unavailable_tx.send(());
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            assert_eq!(
+                window.notifications(cx).len(),
+                1,
+                "the daemon-unavailable signal must surface exactly one notification"
+            );
+        })
+        .unwrap();
+
+        // Reconnect churn resending the same signal must replace, not stack,
+        // the notification (`DaemonUnavailableNotification`'s stable id).
+        let _ = daemon_unavailable_tx.send(());
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            assert_eq!(
+                window.notifications(cx).len(),
+                1,
+                "a repeat signal must replace, not stack, the notification"
+            );
+        })
+        .unwrap();
+
+        // Persistent (`autohide(false)`): survives past the 5s autohide window
+        // `NotificationList::push` arms for every other notification.
+        cx.background_executor.advance_clock(Duration::from_secs(6));
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            assert_eq!(
+                window.notifications(cx).len(),
+                1,
+                "the banner must not autohide -- it stays until the user dismisses it"
             );
         })
         .unwrap();
