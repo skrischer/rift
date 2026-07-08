@@ -38,7 +38,10 @@
 //!   re-applied, since opening rebuilt its input); a `SaveResult` / `SaveConflict`
 //!   resolves a save on whichever tab holds `path` (commit the new base `mtime`,
 //!   or surface the conflict without losing the buffer) — not necessarily the
-//!   active tab, since a background dirty tab can save concurrently.
+//!   active tab, since a background dirty tab can save concurrently. An
+//!   `OpenError` / `SaveError` (`docs/spec-v1-hardening.md`) names why the
+//!   daemon refused the read/write, surfaced immediately instead of waiting
+//!   out the editor's own `OPEN_TIMEOUT` / `SAVE_TIMEOUT`.
 //!
 //! The reverse path runs through three request channels. `open_file_tx` issues an
 //! `OpenFile` read: when the tree emits [`FileTreeEvent::OpenFile`] (or the editor
@@ -487,12 +490,14 @@ impl WorkspaceView {
         }
 
         // Buffer replies -> editor: `FileContent` loads, `SaveResult` commits the
-        // new base `mtime`, `SaveConflict` surfaces the conflict. Each routed
-        // method ignores a reply for a path no longer open. Routed through this
-        // view's weak handle so a load can be followed by re-pushing the freshly
-        // opened file's inline diagnostics (#189) — the `begin_open` recreated the
-        // input with an empty `DiagnosticSet`, so the open file's existing set must
-        // be re-applied once its content has loaded.
+        // new base `mtime`, `SaveConflict` surfaces the conflict, and the typed
+        // refusals `OpenError` / `SaveError` (`docs/spec-v1-hardening.md`) name
+        // why a read or write was refused. Each routed method ignores a reply
+        // for a path no longer open. Routed through this view's weak handle so
+        // a load can be followed by re-pushing the freshly opened file's inline
+        // diagnostics (#189) — the `begin_open` recreated the input with an
+        // empty `DiagnosticSet`, so the open file's existing set must be
+        // re-applied once its content has loaded.
         {
             cx.spawn_in(window, async move |this, cx| loop {
                 let Ok(msg) = buffer_rx.recv_async().await else {
@@ -511,6 +516,12 @@ impl WorkspaceView {
                         }
                         DaemonMessage::SaveConflict { path, disk_mtime } => {
                             editor.apply_save_conflict(path, disk_mtime, window, cx)
+                        }
+                        DaemonMessage::OpenError { path, reason } => {
+                            editor.apply_open_error(path, reason, cx)
+                        }
+                        DaemonMessage::SaveError { path, reason } => {
+                            editor.apply_save_error(path, reason, cx)
                         }
                         _ => {}
                     });
