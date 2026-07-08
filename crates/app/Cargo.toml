@@ -75,6 +75,12 @@ termy_terminal_ui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# Fuzzy matcher for the explorer filter bar + quick-open
+# (docs/spec-explorer-search.md). The low-level synchronous `Matcher` +
+# `Pattern` API only, not the `nucleo` crate's threaded driver, which would add
+# a background worker/injector with no benefit at this (already in-memory,
+# client-streamed) corpus size.
+nucleo-matcher = "0.3"
 
 [build-dependencies]
 embed-resource = "3"
