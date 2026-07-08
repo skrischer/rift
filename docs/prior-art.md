@@ -536,6 +536,32 @@ file-op message shape, conflict / overwrite semantics, and how a rename racing a
 daemon filesystem event is reconciled; phase 31 — whether quick-open indexes the
 whole project daemon-side (jwalk) or narrows only the already-streamed tree.
 
+## Visual UI harness — prior-art index (tooling track)
+
+> Concern: give the coding agent eyes on the real GPUI UI (rift + rift-gallery)
+> plus deterministic E2E and Paper-design-parity checks. GPUI has **no accessibility
+> tree** (AccessKit unintegrated), so a11y/DOM-based external drivers do not apply —
+> the harness is screenshot/vision-based, driven in-process. Research: 2026-07
+> (websearch). Two phases: (1) a Linux/WSLg gpui headless renderer, (2) the harness.
+
+| Concern (phase) | Reference (repo + path) | License | Verdict |
+|---|---|---|---|
+| Headless offscreen render → PNG, the macOS blueprint to port (Phase 1) | `zed` `crates/gpui_macos/src/metal_renderer.rs` (`MetalHeadlessRenderer`, `render_scene_to_image`); `crates/gpui/src/platform.rs` (`PlatformHeadlessRenderer` trait) | GPL-3.0 | **reference** — port the offscreen-texture + readback pattern to `gpui_wgpu` (wgpu `copy_texture_to_buffer`); Linux already renders via wgpu, `lavapipe` as the headless adapter |
+| gpui fork / pin mechanics (Phase 1) | `rift` [archive/spec-gpui-rev-bump.md](archive/spec-gpui-rev-bump.md) | — | **reference** — the single-`gpui`-invariant + termy-fork precedent; here an **additive** `[patch]` fork on the frozen `4bee412` base (no API churn), single-`gpui` trial mandatory before landing |
+| Deterministic in-process UI driving + capture (Phase 2) | `zed` `crates/zed/src/visual_test_runner.rs` (macOS-only today); gpui `TestAppContext` / `VisualTestContext` / `HeadlessAppContext` (`simulate_*`, `dispatch_action`, `run_until_parked`, `capture_screenshot`) | GPL-3.0 | **reference** — the exact drive-then-capture pattern rift needs, ported off-macOS via Phase 1's renderer; steering already works headless, only capture is gated |
+| Agent "eyes" — screenshot-driven review (Phase 2) | `microsoft/playwright-mcp` (snapshot vs vision modes); `sethbang/mcp-screenshot-server`; `dddabtc/winremote-mcp` | MIT | **adopt** the vision (screenshot) mode; GPUI has no a11y tree so Playwright's cheaper snapshot mode is unavailable — rift lives in vision mode. A screenshot MCP/recipe (`claude mcp add`) gives Claude eyes directly |
+| Screenshot-driven native E2E loop (Phase 2) | Anthropic Computer Use (Xvfb + scrot + `xdotool` reference setup) | — | **reference** — the screenshot→act→screenshot loop; blind coordinate driving is the fallback, in-process `TestAppContext` is preferred (deterministic, needs no a11y) |
+| In-app cross-platform screenshot lib, if not shelling out (Phase 2) | `nashaofu/xcap` (X11 + Wayland + Windows); `grim` (WSLg is Wayland, not `scrot`) | MIT | **reference** — optional, only if the harness produces the shot itself instead of Phase 1's headless capture; else `grim` / ImageMagick `import` |
+| Paper design-parity comparison (Phase 2) | rift `paper-reviewer` agent (Playwright/DOM path); Paper MCP `get_screenshot` / `get_computed_styles` | — | **adopt** the reporting pattern (design ↔ impl diff) but with a **native** GPUI screenshot; the Playwright/DOM path does not apply to a native app |
+| Why not external a11y/DOM drivers (non-goal) | `tauri-pilot` (WebView DOM); FlaUI / WinAppDriver (Windows UIA); AT-SPI / dogtail (Linux) | mixed | **avoid** — all require an accessibility or DOM tree; GPUI exposes none (AccessKit unintegrated), so none can see rift's widgets |
+
+Open design decisions deferred to each phase's `/loopkit:plan` spec (never a
+roadmap guess): Phase 1 — whether the fork commit lands as a human-prerequisite
+push to `skrischer/zed` or an in-loop step, and whether `lavapipe` renders in
+headless WSL or the harness runs on the GPU station (the render probe settles it);
+Phase 2 — whether "eyes" ship as a screenshot MCP or a `just` recipe, and whether
+CI pixel-baseline diffing is in scope or the harness stays agent-assisted review.
+
 ## Priority reference projects (top 10)
 
 1. **penso/arbor** — Closest existing implementation of rift's exact concept (Rust + GPUI + daemon + SSH outposts + agent state). Read end-to-end before writing any architecture docs.
