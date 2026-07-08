@@ -69,7 +69,7 @@ use gpui::{
     SharedString, Styled as _, Window, WindowBounds,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::dock::{DockArea, DockItem, DockPlacement, PanelView};
+use gpui_component::dock::{Dock, DockArea, DockItem, DockPlacement, PanelView};
 use gpui_component::{ActiveTheme as _, IconName, Root, Sizable as _};
 use rift_protocol::{ClientMessage, DaemonMessage, LspServerState};
 use rift_terminal::{SessionView, SessionViewEvent};
@@ -365,16 +365,23 @@ impl WorkspaceView {
         // Open requests originate from the tree's `OpenFile` event: arm the
         // editor's open (and its timeout) and send the path to the tokio side.
         // Selecting a file touches nothing but this — no tmux pane/window state.
+        // The header/root-row `RevealActiveRequested` action (#604) re-triggers
+        // the existing reveal path via the already-present
+        // `reveal_open_file_in_tree` — no new protocol, no new coupling.
         cx.subscribe_in(
             &file_tree,
             window,
-            |this, _tree, event: &FileTreeEvent, window, cx| {
-                let FileTreeEvent::OpenFile { path } = event;
-                this.editor.update(cx, |editor, cx| {
-                    editor.begin_open(path.clone(), false, window, cx);
-                });
-                if let Err(e) = this.open_file_tx.try_send(path.clone()) {
-                    debug!(error = %e, %path, "failed to enqueue open-file request");
+            |this, _tree, event: &FileTreeEvent, window, cx| match event {
+                FileTreeEvent::OpenFile { path } => {
+                    this.editor.update(cx, |editor, cx| {
+                        editor.begin_open(path.clone(), false, window, cx);
+                    });
+                    if let Err(e) = this.open_file_tx.try_send(path.clone()) {
+                        debug!(error = %e, %path, "failed to enqueue open-file request");
+                    }
+                }
+                FileTreeEvent::RevealActiveRequested => {
+                    this.reveal_open_file_in_tree(cx);
                 }
             },
         )
@@ -772,6 +779,35 @@ impl WorkspaceView {
             dock.set_right_dock(right_item, Some(px(RIGHT_DOCK_WIDTH)), false, window, cx);
             dock.set_bottom_dock(bottom_item, Some(px(BOTTOM_DOCK_HEIGHT)), false, window, cx);
         });
+
+        // Terminal reflow on dock layout change (#596): toggling or dragging a
+        // dock resizes the center terminal panel, but gpui-component notifies
+        // only the dock being changed. The terminal is a center sibling — never
+        // an ancestor of that dock — so GPUI never marks it dirty, and its
+        // cached panel prepaint (the pane-area grid observer that pushes the
+        // client resize onto `refresh-client -C`) is reused, leaving tmux at the
+        // old size and the content clipped behind the panels. Observing each
+        // dock and notifying the session forces it to re-render against its new
+        // bounds and re-emit the resize; the observer's own grid dedup keeps a
+        // no-op layout change from spamming the seam.
+        let docks: Vec<Entity<Dock>> = {
+            let dock_area = dock_area.read(cx);
+            [
+                dock_area.left_dock(),
+                dock_area.right_dock(),
+                dock_area.bottom_dock(),
+            ]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect()
+        };
+        for dock in docks {
+            cx.observe(&dock, |this, _dock, cx| {
+                this.session_view.update(cx, |_session, cx| cx.notify());
+            })
+            .detach();
+        }
 
         let command_palette = CommandPalette::new(window, cx);
         let settings_view = SettingsView::new(session_view.clone());
