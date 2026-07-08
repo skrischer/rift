@@ -143,6 +143,34 @@
 //! Clicking anywhere in the editor or moving the mouse out of the popover
 //! dismisses it (clears the active tab's `hover_content`).
 //!
+//! # Find/replace and go-to-line (`docs/spec-v1-hardening.md`, #620)
+//!
+//! Both operate purely client-side over the loaded buffer — no new protocol,
+//! no daemon round-trip.
+//!
+//! **Find/replace** reuses the `gpui-component` `Input` widget's own search
+//! facility rather than rebuilding one: [`arm_loading`] builds each tab's
+//! code-editor `InputState` with `.code_editor(...)`, which turns on
+//! `searchable` by default, so `Ctrl+F`/`Cmd+F` (bound in gpui-component's own
+//! "Input" key context) already opens an inline find/replace bar with
+//! prev/next navigation and replace-one/replace-all. `arm_loading` adds one
+//! explicit gate on top: `.replaceable(!tab.read_only)`, so a read-only
+//! out-of-root or `TooLarge`-placeholder tab still offers find but hides
+//! replace.
+//!
+//! **Go-to-line** has no equivalent built-in widget in this gpui-component
+//! pin, so [`EditorView::open_go_to_line`] opens a light `gpui-component`
+//! `Dialog` with a single line-number `Input` — the "light theme-token
+//! overlay" fallback. `Ctrl+G` (bound in `main.rs`, scoped to the `Editor` key
+//! context), the context-menu "Go to Line" entry, and the command palette all
+//! dispatch [`GoToLine`]. Confirming (OK or Enter) moves the caret to the
+//! requested 1-based line, clamped to the buffer's last line
+//! ([`go_to_line_target`]) so an out-of-range request still lands somewhere
+//! sane — the same clamp-not-reject contract the minimap's click-to-jump
+//! already uses ([`minimap_click_line`]).
+//!
+//! [`arm_loading`]: EditorView::arm_loading
+//!
 //! # Timeout, not a hang
 //!
 //! A daemon refusal (binary / non-UTF-8, path escape) produces *no reply* — the
@@ -164,7 +192,7 @@ use gpui::{
     MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels, Point, Render, SharedString, Size,
     Styled as _, Subscription, Window,
 };
-use gpui_component::dialog::{AlertDialog, DialogButtonProps};
+use gpui_component::dialog::{AlertDialog, Dialog, DialogButtonProps};
 use gpui_component::dock::{Panel, PanelEvent};
 use gpui_component::highlighter::{
     Diagnostic as EditorDiagnostic, DiagnosticSeverity as EditorSeverity,
@@ -224,6 +252,14 @@ pub struct ShowHover;
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = rift, no_json)]
 pub struct FindReferences;
+
+/// Open the go-to-line dialog for the active tab (`docs/spec-v1-hardening.md`,
+/// #620). Dispatched from the `Ctrl+G` keybind (bound in `main.rs`, scoped to
+/// the editor key context) mirroring VS Code/JetBrains muscle memory, and
+/// from the context-menu entry ("Go to Line").
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct GoToLine;
 
 /// Close the references/definitions results panel (`docs/spec-editor-chrome.md`
 /// §3, #529). Bound to `Escape` in `main.rs`, scoped to the editor key context;
@@ -748,6 +784,18 @@ impl EditorView {
 
         if rebuild_input {
             let language = language_for_path(&tab.path);
+            // `code_editor` turns on the widget's own find/replace facility
+            // (`searchable: true`, `Ctrl+F`/`Cmd+F` — `docs/spec-v1-hardening.md`,
+            // #620), which defaults `replaceable: true` too. Explicitly gate
+            // replace off for a read-only tab (out-of-root or `TooLarge`
+            // placeholder, #196/#301): `.disabled(tab.read_only)` on the
+            // rendered `Input` already blocks every direct edit, but the
+            // search panel's replace-all path writes through
+            // `replace_text_in_range_silent` independently of that flag, so
+            // `replaceable` is the widget's own seam for "find is fine here,
+            // replace is not". Find itself stays available — it is read-only
+            // by nature.
+            let read_only = tab.read_only;
             tab.input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .code_editor(language)
@@ -756,6 +804,7 @@ impl EditorView {
                         tab_size: TAB_SIZE,
                         ..Default::default()
                     })
+                    .replaceable(!read_only)
             });
             tab._input_change = Self::subscribe_dirty(&tab.input, index, cx);
             tab._input_notify = Self::observe_input(&tab.input, cx);
@@ -2002,6 +2051,96 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Open the go-to-line dialog for the active tab (`docs/spec-v1-hardening.md`,
+    /// #620): a light `gpui-component` `Dialog` hosting a single-line
+    /// line-number `Input` — no built-in go-to-line widget exists in this
+    /// gpui-component pin, unlike find/replace (`arm_loading`'s
+    /// `.replaceable`), so this is the "light theme-token overlay" fallback
+    /// the spec calls for. Confirming — the OK button, or Enter (the
+    /// `Dialog`'s own `ConfirmDialog` binding, since a single-line `Input`
+    /// propagates `Enter` rather than consuming it) — jumps the caret via
+    /// [`jump_to_line_input`]. Escape (`CancelDialog`) just closes it, no jump.
+    ///
+    /// Re-resolves the tab by path inside `on_ok` rather than closing over
+    /// `index`, the same discipline [`confirm_close_tab`] and the async
+    /// timers in this file already follow: a tab close between opening the
+    /// dialog and the user confirming must not act on a shifted or
+    /// now-missing index. A no-op while another dialog is already open
+    /// (mirrors [`open_conflict_dialog`]'s guard) or no tab is active.
+    /// `EditorView::render` only wires this action's key context once the
+    /// active tab is `Loaded` (the same structural guard [`GoToDefinition`]/
+    /// [`ShowHover`] rely on), so a Loading/Failed active tab never reaches
+    /// this handler.
+    ///
+    /// [`jump_to_line_input`]: Self::jump_to_line_input
+    /// [`confirm_close_tab`]: Self::confirm_close_tab
+    /// [`open_conflict_dialog`]: Self::open_conflict_dialog
+    fn open_go_to_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let Some(index) = self.active else {
+            return;
+        };
+        let path = self.tabs[index].path.clone();
+        let entity = cx.entity();
+        let line_input = cx.new(|cx| InputState::new(window, cx).placeholder("Line number"));
+
+        window.open_dialog(cx, {
+            let line_input = line_input.clone();
+            move |dialog: Dialog, _window, _cx| {
+                let entity = entity.clone();
+                let path = path.clone();
+                let line_input = line_input.clone();
+                dialog
+                    .title("Go to Line")
+                    .w(px(240.0))
+                    .child(Input::new(&line_input))
+                    .on_ok(move |_, window, cx| {
+                        entity.update(cx, |view, cx| {
+                            if let Some(index) = view.tab_index_for_path(&path) {
+                                view.jump_to_line_input(index, &line_input, window, cx);
+                            }
+                        });
+                        true
+                    })
+            }
+        });
+
+        line_input.focus_handle(cx).focus(window, cx);
+    }
+
+    /// Apply the go-to-line dialog's confirmed value (#620): parse
+    /// `line_input`'s text as a 1-based line number and move the tab at
+    /// `index`'s caret there, clamped via [`go_to_line_target`] to the
+    /// buffer's last line so an out-of-range request still lands somewhere
+    /// sane — the same clamp-not-reject contract [`minimap_jump`] already
+    /// uses for its click-to-jump. An empty or non-numeric value is silently
+    /// ignored: the caret stays put rather than jumping to line 0.
+    ///
+    /// [`go_to_line_target`]: go_to_line_target
+    /// [`minimap_jump`]: Self::minimap_jump
+    fn jump_to_line_input(
+        &mut self,
+        index: usize,
+        line_input: &Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(requested) = line_input.read(cx).value().trim().parse::<usize>() else {
+            return;
+        };
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        tab.input.update(cx, |input, cx| {
+            let total = input.text().lines_len();
+            let target = go_to_line_target(requested, total);
+            input.set_cursor_position(EditorPosition::new(target as u32, 0), window, cx);
+        });
+        cx.notify();
+    }
+
     /// Unwind the active tab's most recent jump: pop its back-stack and
     /// open-or-switch to the saved (path, position, read_only) — an
     /// already-open tab (same file or a different one still open) just
@@ -2411,6 +2550,7 @@ impl Render for EditorView {
                 menu.menu("Go to Definition", Box::new(GoToDefinition))
                     .menu("Find References", Box::new(FindReferences))
                     .menu("Show Hover", Box::new(ShowHover))
+                    .menu("Go to Line", Box::new(GoToLine))
                     .separator()
             });
 
@@ -2827,6 +2967,9 @@ impl Render for EditorView {
             }))
             .on_action(cx.listener(|this, _: &FindReferences, _window, cx| {
                 this.dispatch_references_request(cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoToLine, window, cx| {
+                this.open_go_to_line(window, cx);
             }))
             .on_action(cx.listener(|this, _: &CloseResultsPanel, _window, cx| {
                 // Escape closes the results panel (#529). With no panel open the
@@ -3297,6 +3440,18 @@ fn minimap_click_line(click_ratio: f32, total_lines: usize) -> usize {
     }
     let line = (click_ratio.clamp(0.0, 1.0) * total_lines as f32) as usize;
     line.min(total_lines - 1)
+}
+
+/// The 0-based line index a go-to-line dialog's 1-based `requested` line
+/// maps to, for a buffer of `total_lines` lines (#620). `requested == 0` (a
+/// typed `0`, meaningless as a 1-based line) and anything past the last
+/// line both clamp rather than reject — an out-of-range request still
+/// lands somewhere sane, the same clamp-not-reject contract
+/// [`minimap_click_line`] uses. Returns `0` for an empty buffer.
+fn go_to_line_target(requested: usize, total_lines: usize) -> usize {
+    requested
+        .saturating_sub(1)
+        .min(total_lines.saturating_sub(1))
 }
 
 /// Paint the minimap strip into `bounds`: the downsampled line-length marks, the
@@ -3972,6 +4127,31 @@ mod tests {
         assert_eq!(minimap_click_line(0.5, 0), 0);
     }
 
+    // --- go-to-line target clamp (#620) ---
+
+    #[test]
+    fn test_go_to_line_target_converts_a_one_based_request_to_a_zero_based_index() {
+        assert_eq!(go_to_line_target(1, 100), 0);
+        assert_eq!(go_to_line_target(50, 100), 49);
+        assert_eq!(go_to_line_target(100, 100), 99);
+    }
+
+    #[test]
+    fn test_go_to_line_target_clamps_a_request_past_the_last_line() {
+        assert_eq!(go_to_line_target(500, 100), 99);
+    }
+
+    #[test]
+    fn test_go_to_line_target_clamps_a_zero_request_to_the_first_line() {
+        assert_eq!(go_to_line_target(0, 100), 0);
+    }
+
+    #[test]
+    fn test_go_to_line_target_is_zero_for_an_empty_buffer() {
+        assert_eq!(go_to_line_target(5, 0), 0);
+        assert_eq!(go_to_line_target(0, 0), 0);
+    }
+
     // --- stale positional index across close_tab (PR #401 review) ---
 
     #[allow(clippy::type_complexity)] // test-only bundle of the editor's channel senders/receiver
@@ -4132,6 +4312,140 @@ mod tests {
         let (editor, window, open_file_rx, _save_file_rx, _buffer_change_rx) =
             build_test_editor_full(cx);
         (editor, window, open_file_rx)
+    }
+
+    // --- go-to-line dialog (#620) ---
+
+    /// Acceptance (`docs/spec-v1-hardening.md`): "go-to-line moves the cursor
+    /// to the requested line" — the dialog's own OK/Enter path
+    /// (`open_go_to_line`) is exercised end-to-end via `has_active_dialog`;
+    /// this test drives the confirmed-value application
+    /// ([`jump_to_line_input`]) directly against a loaded multi-line buffer.
+    ///
+    /// [`jump_to_line_input`]: EditorView::jump_to_line_input
+    #[gpui::test]
+    fn test_jump_to_line_input_moves_the_cursor_to_the_requested_one_based_line(
+        cx: &mut TestAppContext,
+    ) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let a = editor.push_tab("a.rs".into(), false, window, cx);
+                editor.load(
+                    "a.rs".into(),
+                    "one\ntwo\nthree\nfour".into(),
+                    at(100),
+                    window,
+                    cx,
+                );
+                editor.active = Some(a);
+
+                let line_input = cx.new(|cx| InputState::new(window, cx));
+                line_input.update(cx, |input, cx| {
+                    input.set_value("3", window, cx);
+                });
+
+                editor.jump_to_line_input(a, &line_input, window, cx);
+
+                let cursor = editor.tabs[a].input.read(cx).cursor_position();
+                assert_eq!(
+                    cursor.line, 2,
+                    "1-based line 3 lands on the 0-based line index 2"
+                );
+            });
+        })
+        .unwrap();
+    }
+
+    /// A non-numeric value (empty input, or the dialog dismissed without
+    /// typing anything) must not move the cursor — silently ignored rather
+    /// than jumping to line 0.
+    #[gpui::test]
+    fn test_jump_to_line_input_ignores_a_non_numeric_value(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let a = editor.push_tab("a.rs".into(), false, window, cx);
+                editor.load("a.rs".into(), "one\ntwo\nthree".into(), at(100), window, cx);
+                editor.active = Some(a);
+                editor.tabs[a].input.update(cx, |input, cx| {
+                    input.set_cursor_position(EditorPosition::new(1, 0), window, cx);
+                });
+
+                let line_input = cx.new(|cx| InputState::new(window, cx));
+
+                editor.jump_to_line_input(a, &line_input, window, cx);
+
+                let cursor = editor.tabs[a].input.read(cx).cursor_position();
+                assert_eq!(cursor.line, 1, "an empty value leaves the cursor untouched");
+            });
+        })
+        .unwrap();
+    }
+
+    /// Acceptance: "go-to-line has an affordance" — dispatching `GoToLine`
+    /// for a `Loaded` active tab opens the dialog.
+    #[gpui::test]
+    fn test_open_go_to_line_opens_a_dialog_for_the_loaded_active_tab(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let a = editor.push_tab("a.rs".into(), false, window, cx);
+                editor.tabs[a].load_state = TabLoadState::Loaded;
+                editor.active = Some(a);
+                editor.open_go_to_line(window, cx);
+            });
+
+            assert!(
+                window.has_active_dialog(cx),
+                "GoToLine must open the go-to-line dialog for a loaded tab"
+            );
+        })
+        .unwrap();
+    }
+
+    /// A repeated `GoToLine` dispatch (e.g. the keybind fired twice before
+    /// the first dialog is answered) must not stack a second dialog —
+    /// mirrors `test_conflict_dialog_does_not_stack_on_a_repeated_external_write`.
+    #[gpui::test]
+    fn test_open_go_to_line_does_not_stack_a_second_dialog(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let a = editor.push_tab("a.rs".into(), false, window, cx);
+                editor.tabs[a].load_state = TabLoadState::Loaded;
+                editor.active = Some(a);
+                editor.open_go_to_line(window, cx);
+                editor.open_go_to_line(window, cx);
+            });
+
+            window.close_dialog(cx);
+            assert!(
+                !window.has_active_dialog(cx),
+                "a repeated GoToLine dispatch must not have stacked a second dialog"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Acceptance: with no tab open, `GoToLine` must not panic or open a
+    /// dialog with nothing to jump within.
+    #[gpui::test]
+    fn test_open_go_to_line_is_a_no_op_with_no_active_tab(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.open_go_to_line(window, cx);
+            });
+
+            assert!(!window.has_active_dialog(cx));
+        })
+        .unwrap();
     }
 
     /// Acceptance (#354): "closing a clean tab is immediate" — no confirm
