@@ -36,9 +36,9 @@ use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, px, App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, ParentElement as _, Pixels, Render, ScrollStrategy, SharedString, Size,
-    StatefulInteractiveElement as _, Styled as _, Window,
+    div, px, App, Context, EventEmitter, FocusHandle, Focusable, FontWeight,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, ScrollStrategy,
+    SharedString, Size, StatefulInteractiveElement as _, Styled as _, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dock::{Panel, PanelEvent};
@@ -131,6 +131,18 @@ pub enum FileTreeEvent {
     /// the panel just re-triggers the reveal path the editor-load flow
     /// already drives.
     RevealActiveRequested,
+}
+
+/// Which placeholder the panel shows instead of the tree
+/// (`docs/spec-explorer-parity.md`) — see [`FileTree::empty_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyState {
+    /// No snapshot has arrived yet: startup, connecting, or a non-repo root
+    /// the daemon has not resolved (`model.root()` is `None`).
+    Loading,
+    /// A snapshot arrived and the root has no entries (`model.root()` is
+    /// `Some`, `model.is_empty()` is `true`).
+    EmptyRoot,
 }
 
 /// One rendered row: an entry's path, kind, nesting depth, and decoration
@@ -507,6 +519,21 @@ impl FileTree {
     fn click_dir(&mut self, path: &str) {
         self.selected = Some(path.to_owned());
         self.toggle_dir(path);
+    }
+
+    /// Which placeholder the panel shows in place of the tree, or `None` when
+    /// there are rows to render (`docs/spec-explorer-parity.md`). Distinguishes
+    /// "no snapshot has arrived yet" from "connected, but the root is
+    /// genuinely empty" — the single prior "No files" branch conflated the
+    /// two, which read as an error during ordinary startup.
+    fn empty_state(&self) -> Option<EmptyState> {
+        if self.model.root().is_none() {
+            Some(EmptyState::Loading)
+        } else if self.model.is_empty() {
+            Some(EmptyState::EmptyRoot)
+        } else {
+            None
+        }
     }
 
     /// Whether every directory the model currently knows about is collapsed
@@ -896,6 +923,18 @@ impl FileTree {
             .into_any_element()
     }
 
+    /// Whether `row`'s rolled-up decoration (git letter + diagnostic dot)
+    /// should render. Files, and a currently *collapsed* directory, always
+    /// show it; an *expanded* directory shows nothing rolled-up — its visible
+    /// descendants already carry their own, so an ancestor badge would be
+    /// redundant (`docs/spec-explorer-parity.md`). Render-time gate only:
+    /// `compute_rollup` still folds the status onto every directory
+    /// regardless of its collapse state, so toggling collapse (which already
+    /// dirties the row cache) flips this on the very next render.
+    fn row_shows_decoration(&self, row: &Row) -> bool {
+        row.kind != EntryKind::Dir || self.collapsed.contains(&row.path)
+    }
+
     /// Render one row as an interactive element. Clicking a directory selects
     /// it and toggles its expansion; clicking a file selects it and emits the
     /// open signal.
@@ -921,10 +960,18 @@ impl FileTree {
         let name = Self::display_name(&row.path).to_owned();
         let path = row.path.clone();
 
+        // Rolled-up decoration (git letter + diagnostic dot) is suppressed on
+        // an *expanded* directory: its visible descendants already carry
+        // their own, so an ancestor badge would be redundant noise (design:
+        // collapsed `app` shows `M`, expanded `crates`/`terminal`/`src` do
+        // not). Files, and a currently collapsed directory, always show it.
+        let show_decoration = self.row_shows_decoration(row);
+
         // Diagnostic-severity indicator: a small colored dot, or an empty
-        // same-size spacer when the row (or, for a directory, everything
-        // beneath it) is clean — keeping every row's layout aligned.
-        let severity_dot = row.severity.map(|severity| {
+        // same-size spacer when the row is clean or its decoration is
+        // suppressed — keeping every row's layout aligned. Sits in the
+        // trailing cluster, immediately left of the git letter.
+        let severity_dot = row.severity.filter(|_| show_decoration).map(|severity| {
             let color = match severity {
                 DiagnosticSeverity::Error => cx.theme().danger,
                 DiagnosticSeverity::Warning => cx.theme().warning,
@@ -947,12 +994,16 @@ impl FileTree {
         });
         let name_el = div()
             .flex_1()
+            .when(is_selected, |el| el.font_weight(FontWeight::BOLD))
             .when_some(git_color, |el, color| el.text_color(color))
             .child(name);
 
-        // Git-status badge: a single letter after the name, colored the same
-        // as the name tint.
-        let git_badge = row.git_status.map(|status| {
+        // Git-status letter: a single glyph in a fixed-width, right-aligned
+        // trailing lane, colored the same as the name tint. `name_el`'s
+        // `flex_1` fills the row's remaining width, so this fixed-width slot
+        // always lands at the same trailing offset — letters column-align
+        // across rows regardless of name length or indent depth.
+        let git_letter = row.git_status.filter(|_| show_decoration).map(|status| {
             div()
                 .text_xs()
                 .text_color(match status {
@@ -981,13 +1032,15 @@ impl FileTree {
             // rather than hidden, once the daemon starts sending them.
             .when(row.ignored, |el| el.opacity(0.55))
             .child(div().w(px(12.0)).flex_shrink_0().child(twisty.to_string()))
-            .child(div().w(px(8.0)).flex_shrink_0().children(severity_dot))
             .child(name_el)
-            .children(git_badge);
+            .child(div().w(px(8.0)).flex_shrink_0().children(severity_dot))
+            .child(div().w(px(12.0)).flex_shrink_0().children(git_letter));
 
         if is_selected {
             root = root
                 .bg(cx.theme().list_active)
+                .border_l_2()
+                .border_color(cx.theme().accent)
                 .text_color(cx.theme().foreground);
         }
 
@@ -1046,15 +1099,24 @@ impl Render for FileTree {
         // closure, doubling the tree walk on every single paint.
         self.refresh_row_cache();
 
-        // Empty state: no snapshot yet (or an empty root). Keep it quiet — the
-        // panel is a passive mirror, not an action surface.
-        let content = if self.row_cache.is_empty() {
+        // Empty state: distinguish "no snapshot yet" from "connected, empty
+        // root" (`docs/spec-explorer-parity.md`) — a single conflated "No
+        // files" branch used to read as an error during ordinary startup.
+        // Keep it quiet — the panel is a passive mirror, not an action surface.
+        let content = if let Some(state) = self.empty_state() {
+            let message = match state {
+                EmptyState::Loading => "Loading\u{2026}",
+                EmptyState::EmptyRoot => "Empty folder",
+            };
             div()
                 .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
                 .p(px(8.0))
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
-                .child("No files")
+                .child(message)
                 .into_any_element()
         } else {
             // One uniform row height per item — the size vector the virtual
@@ -1268,6 +1330,30 @@ mod tests {
         assert_eq!(FileTree::display_name("src/net/tcp.rs"), "tcp.rs");
         assert_eq!(FileTree::display_name("README.md"), "README.md");
         assert_eq!(FileTree::display_name("src"), "src");
+    }
+
+    #[test]
+    fn test_empty_state_with_no_snapshot_yet_is_loading() {
+        // A fresh tree has never received a snapshot, so `model.root()` is
+        // still `None` — startup / connecting, not a genuinely empty root.
+        let tree = FileTree::new();
+        assert_eq!(tree.empty_state(), Some(EmptyState::Loading));
+    }
+
+    #[test]
+    fn test_empty_state_with_an_empty_root_snapshot_is_empty_root() {
+        // A complete snapshot arrived (`root()` is `Some`) but it carried no
+        // entries — a genuinely empty root, distinct from still loading.
+        let tree = seed(vec![]);
+        assert!(tree.model().root().is_some());
+        assert!(tree.model().is_empty());
+        assert_eq!(tree.empty_state(), Some(EmptyState::EmptyRoot));
+    }
+
+    #[test]
+    fn test_empty_state_with_populated_entries_is_none() {
+        let tree = seed(vec![file("README.md")]);
+        assert_eq!(tree.empty_state(), None);
     }
 
     #[test]
@@ -2007,6 +2093,50 @@ mod tests {
             .expect("top.rs row");
         assert_eq!(top_row.git_status, None);
         assert_eq!(top_row.severity, None);
+    }
+
+    #[test]
+    fn test_row_shows_decoration_only_on_a_collapsed_dir_not_an_expanded_one() {
+        // Reuses the same seeded rollup as
+        // `test_collapsed_dir_row_carries_the_rolled_up_git_status_and_severity`:
+        // `src` rolls up a changed + errored descendant either way, but
+        // rendering must suppress that rolled-up badge while `src` is
+        // expanded (its child already shows its own) and surface it once
+        // `src` is collapsed.
+        let mut tree = seed(vec![dir("src"), file("src/main.rs"), file("top.rs")]);
+        tree.model_mut().apply_git_update(
+            vec![git_entry(
+                "src/main.rs",
+                GitStatusCode::Unmodified,
+                GitStatusCode::Modified,
+            )],
+            vec![],
+        );
+        tree.model_mut().apply_diagnostics(
+            "src/main.rs".into(),
+            "rust-analyzer".into(),
+            vec![diag(DiagnosticSeverity::Error)],
+        );
+
+        // Expanded: `src`'s row still carries the rolled-up decoration in the
+        // cache (`compute_rollup` is unchanged), but it must not render.
+        let rows = tree.visible_rows();
+        let src_row = rows.iter().find(|r| r.path == "src").expect("src row");
+        assert_eq!(src_row.git_status, Some(GitRollupStatus::Changed));
+        assert!(!tree.row_shows_decoration(src_row));
+
+        // The file itself always shows its own decoration.
+        let file_row = rows
+            .iter()
+            .find(|r| r.path == "src/main.rs")
+            .expect("file row");
+        assert!(tree.row_shows_decoration(file_row));
+
+        // Collapse `src`: the same rolled-up row now renders its decoration.
+        tree.toggle_dir("src");
+        let rows = tree.visible_rows();
+        let src_row = rows.iter().find(|r| r.path == "src").expect("src row");
+        assert!(tree.row_shows_decoration(src_row));
     }
 
     #[test]
