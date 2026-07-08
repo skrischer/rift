@@ -8,15 +8,77 @@ license.workspace = true
 name = "rift"
 path = "src/main.rs"
 
+# Opt-in component gallery dev tool. Gated by `required-features` so the default
+# `cargo build --workspace` and the shipping `rift` binary never compile it.
+[[bin]]
+name = "gallery"
+path = "src/gallery/main.rs"
+required-features = ["gallery"]
+
+[features]
+# Enables the gallery binary and its demo-only dependency. The icon assets
+# (`gpui-component-assets` + rust-embed's `debug-embed`) now ship in the product
+# build too (see `[dependencies]`), so the gallery only adds
+# `gpui-component/tree-sitter-rust`: a single syntax grammar for the code-editor
+# demo (not the umbrella `tree-sitter-languages` set). Charts run on plain f64, so
+# the `decimal` feature is intentionally not enabled.
+gallery = [
+    "gpui-component/tree-sitter-rust",
+]
+# Console-free stable launcher: switches the rift binary to the Windows GUI
+# subsystem (see the cfg_attr in src/main.rs). Off by default so dev launches
+# keep their RUST_LOG console; enabled only by `just promote`.
+windowed = []
+
 [dependencies]
 rift-terminal = { path = "../terminal" }
 rift-ssh = { path = "../ssh" }
+rift-protocol = { path = "../protocol" }
+rift-logging = { path = "../logging" }
 gpui.workspace = true
+gpui_platform.workspace = true
+# `tree-sitter-languages` enables the umbrella set of Tree-sitter grammars so the
+# code editor highlights a file by its extension (the gallery's single
+# `tree-sitter-rust` is a demo-only subset). Enabled here on the product `rift`
+# binary's dependency, not behind the `gallery` feature, so the shipping editor
+# highlights every supported language. `code_editor(<ext>)` resolves the grammar
+# and falls back to plain text for an unknown extension.
+gpui-component = { workspace = true, features = ["tree-sitter-languages"] }
+# Icon SVGs backing gpui-component's `IconName` (activity rail, window controls).
+# Part of the product build so the shipping `rift` binary registers them via
+# `with_assets(Assets)` in `main.rs`. Already in the graph via gpui-component, so
+# this direct edge adds no new crate to Cargo.lock.
+gpui-component-assets = { workspace = true }
+# Not used in code; declared only to enable rust-embed's `debug-embed` feature so
+# gpui-component-assets embeds its icon SVGs in debug builds. Without it rust-embed
+# reads icons from the compile-time path at runtime, which the cross-compiled
+# Windows debug exe cannot find (icons render blank). Already in the graph via
+# gpui-component-assets, so this adds no new crate to Cargo.lock.
+rust-embed = { version = "8", features = ["debug-embed"] }
 tokio.workspace = true
 flume.workspace = true
+# Client-local wall clock for the composite status line's minute clock
+# (`docs/spec-status-line.md`). Already in the graph via gpui / gpui-component
+# (with the default `clock` feature), so this direct edge adds no new crate to
+# Cargo.lock — declared here only to use `chrono::Local` directly.
+chrono = "0.4"
+# GPUI-side timeout for the buffer-channel open request (`smol::Timer`; the
+# tokio timer does not fire on the GPUI executor — docs/patterns.md).
+smol.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+termy_terminal_ui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 
 [build-dependencies]
 embed-resource = "3"
+
+# `test-support` unlocks `#[gpui::test]` / `TestAppContext` for a headless
+# window in the dock panel-tree test (`workspace.rs`) — mirrors how
+# gpui-component's own `crates/ui` tests itself. Dev-only: never reaches the
+# `rift` / `gallery` binaries, which build without `--tests`.
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

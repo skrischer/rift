@@ -1,0 +1,96 @@
+# Spec: Phase 2d — Tab bar + statusbar enrichment
+
+> Status: COMPLETED
+> Created: 2026-05-21
+> Completed: 2026-06-13
+
+Tab bar for tmux window switching and enriched statusbar with live metadata from tmux subscriptions. Completes the tmux integration before Phase 3 (daemon).
+
+## Outcome
+
+- [x] Tab bar renders one tab per tmux window, showing `index: name`, with the active window highlighted
+- [x] Clicking a tab switches to that window (pane layout rebuilds from snapshot)
+- [x] Keyboard shortcut Ctrl+Shift+1..9 switches windows 1..9
+- [x] CWD updates via tmux subscriptions (`refresh-client -B`) instead of snapshot polling
+- [~] Git branch displayed in statusbar — deferred to Phase 3 (daemon-sourced); tmux cannot supply it (see decision log 2026-06-05). The data now lives in `worktree.rs::branch()` via daemon git-status; statusbar rendering folds into future UI work.
+- [x] Pane command name displayed (what's running in the active pane)
+- [x] Session/window name in titlebar or statusbar
+- [x] Connection status indicator (connected/reconnecting/disconnected)
+
+## Scope
+
+### In scope
+
+- Tab bar UI component in SessionView
+- Window switching via tmux `select-window` command
+- Subscription-based CWD tracking (replaces snapshot polling for CWD)
+- Statusbar enrichment with git branch, pane command, session name
+- Connection status indicator
+
+### Out of scope
+
+- Pane zoom handling (`resize-pane -Z`) — was owned by [spec-terminal-interaction-fixes.md](archive/spec-terminal-interaction-fixes.md); dropped before implementation (see [spec-pane-window-management.md](archive/spec-pane-window-management.md))
+- Drag-reorder tabs — tmux owns window order
+- Session switching — single session for now
+- Tab close/create from GUI — now owned by [spec-pane-window-management.md](archive/spec-pane-window-management.md)
+- Adaptive throttling (tmuxy pattern) — add only if performance requires it
+- Mirroring the user's tmux status-line config (`status-left/right/style`) — the native statusbar is the source of truth and deliberately does **not** render the `.tmux.conf` status line. Honoring that config is its own opt-in mode: [spec-tmux-statusline-mirroring.md](spec-tmux-statusline-mirroring.md). The fields here are rift-native, fed from tmux *data* (subscriptions), not from tmux's status format strings.
+
+## Constraints
+
+- Subscriptions require tmux 3.4+ (already a hard requirement from Phase 2a)
+- termy's `TmuxClient` must support subscription registration — verify API or extend
+- Tab bar must not interfere with terminal grid sizing (subtract tab bar height from available space)
+- Inactive window panes stay in memory (VTE state current) but are not rendered
+
+## Prior decisions
+
+| Decision | Rationale | Date |
+|---|---|---|
+| Use termy's TmuxClient directly | Upstream maintained, PR #306 merged, avoids fork | 2026-05-07 |
+| Minimum tmux 3.4+ | Hard requirement for subscriptions | 2026-05-08 |
+| Per-pane VTE in `crates/terminal` | PaneView each has own `Arc<Mutex<Term>>`, managed by SessionView | 2026-05-20 |
+| Snapshot-driven pane lifecycle | Create/remove PaneViews from TmuxSnapshot diffs | 2026-05-20 |
+
+## Tracking
+
+The step decomposition lives as GitHub issues under the milestone — not in this file. This spec owns the design; the issues own progress.
+
+- Milestone: [Phase 2d — Tab bar + statusbar enrichment](https://github.com/skrischer/rift/milestone/1) (closed 2026-06-13)
+- Steps (issues): subscription infrastructure (#15), keyboard window switching (#16), CWD from subscriptions (#17), pane command name (#19), session/window name (#20), connection status (#21) — all merged. Git branch (#18) closed as not-planned, deferred to Phase 3 (daemon-sourced).
+- Done before issue tracking existed: tab bar rendering, click-to-switch (commits 33fea26, 8ca4b0b)
+
+## Verification
+
+- [x] `cargo clippy --workspace -- -D warnings` passes
+- [x] `cargo test --workspace` passes
+- [x] Tab bar visible with correct window names
+- [x] Window switching works via click and keyboard shortcut
+- [x] CWD updates within ~1 second of `cd` command (subscription-driven)
+- [~] Git branch displays correctly in statusbar — deferred to Phase 3 (daemon-sourced); not part of this milestone
+- [x] Pane command name displays correctly
+- [x] Connection status indicator shows connected state
+- [x] Multi-window scenario: create 3 windows, switch between them, all pane content preserved
+- [x] Resize window: tab bar + terminal grid adjust correctly
+
+## Risks and mitigations
+
+| Risk | Mitigation |
+|---|---|
+| termy's TmuxClient may not expose subscription API | Check termy source. If not exposed, contribute upstream or use `send_command()` to register subscriptions directly. |
+| Git branch via tmux subscription format may be slow | Limit subscription update rate (tmux already caps at 1/sec). Alternatively, get git branch from daemon in Phase 3 and use a simple fallback here. |
+| Tab bar height calculation affects terminal grid sizing | Use fixed tab bar height (e.g. 28px). Subtract from available space before grid calculation. Test with resize. |
+| Subscription values may arrive before pane exists | Reuse early output buffer pattern from Phase 2c — buffer subscription values for unknown panes. |
+
+## Decision log
+
+Decisions made during implementation:
+
+- 2026-05-21: Spec created from Phase 2d section of control-mode-roadmap.md. tmux protocol reference extracted to tmux-reference.md.
+- 2026-05-21: Steps 2 (tab bar rendering) and 3 (click-to-switch) already implemented in prior commits (33fea26, 8ca4b0b). Status updated to IN PROGRESS.
+- 2026-06-05: Step 1 (subscription infrastructure, #15) landed: `refresh-client -B` registrations in `main.rs` route `%subscription-changed` through a `flume` channel into `SessionView` (infra + logging only; display deferred to later steps).
+- 2026-06-05: Step 4 (CWD from subscriptions, #17) landed: `rift_pane_path` (`#{pane_current_path}`, scope `%*`) drives per-pane CWD live via `apply_subscription`. Snapshot reduced to seeding initial CWD at pane creation only; the tmux 3.4+ hard requirement makes the snapshot live-fallback redundant.
+- 2026-06-05: Step 5 (git branch, #18) deferred to Phase 3 (daemon-sourced). tmux has no native git variable; the only format-based source is `#(...)` shell expansion, but `#()` jobs only produce output while a status refresh keeps them alive — under the one-shot evaluation a `refresh-client -B` subscription performs, they return empty (verified on the live tmux 3.4 control-mode server: even `#(echo hi)` yields empty). Git branch is filesystem-derived state and belongs to the daemon (the `explorer` crate already computes git status), so #18 moves to Phase 3 rather than shipping a fragile `#()` hack here.
+- 2026-06-05: Step 6 (command from subscriptions, #19) landed: `rift_pane_command` (`#{pane_current_command}`, scope `%*`) drives the per-pane foreground command live via `apply_subscription`, mirroring the #17 CWD pattern. Displayed in the statusbar right slot; the snapshot seeds it at pane creation only.
+- 2026-06-05: Step 7 (session/window name, #20) landed: session name read from `snapshot.session_name` into the statusbar left slot, and the `rift_window_name` (`#{window_name}`, scope `@*`) subscription updates tab labels live on `rename-window`. The active window name stays visible via the selected tab; window switches re-snapshot, so only renames need the subscription.
+- 2026-06-13: Milestone closed. All steps merged except git branch (#18), which was already deferred to Phase 3 on 2026-06-05; #18 closed as not-planned (the daemon git-status layer, Phase 3.3, now owns the branch data in `worktree.rs::branch()` — statusbar rendering folds into future UI work). Spec set COMPLETED and archived; the deferred git-branch outcome is the only unmet item and is tracked by the Phase 3 daemon work, not this milestone.

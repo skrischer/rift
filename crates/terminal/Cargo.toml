@@ -6,9 +6,15 @@ license.workspace = true
 
 [dependencies]
 gpui.workspace = true
+gpui-component.workspace = true
 alacritty_terminal.workspace = true
 flume.workspace = true
 thiserror.workspace = true
 smol.workspace = true
 termy_terminal_ui.workspace = true
 tracing.workspace = true
+
+# `test-support` unlocks `#[gpui::test]` / `TestAppContext` for the font-size
+# entity tests in `session_view.rs` — mirrors `crates/app`'s dev-dependency.
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

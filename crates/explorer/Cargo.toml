@@ -6,3 +6,10 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+ignore.workspace = true
+notify.workspace = true
+# `tree-editor` (on top of the workspace feature set) is the index->tree half of
+# the source-control write path (`git_write::commit`); every other write op uses
+# the index/filter APIs already pulled in by `status`/`dirwalk`.
+gix = { workspace = true, features = ["tree-editor"] }
+tracing.workspace = true

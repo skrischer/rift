@@ -1,0 +1,3982 @@
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+mod buffer;
+mod diff;
+mod git_write;
+pub mod lsp;
+mod terminal;
+
+use lsp::{document_changes, BufferEvent, LspDiagnostics, LspStatusEvent, LspWorker, NavRequest};
+use rift_explorer::{Change, Entry, GitStatus, Snapshot, Watcher};
+use rift_lsp::{DocumentChange, DocumentSelector};
+use rift_protocol::{
+    encode_frame, BufferErrorReason, ClientMessage, DaemonMessage, Diagnostic, EntryKind,
+    FrameDecoder, LspServerState, NavRequestId, WorktreeEntry, PROTOCOL_VERSION,
+};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{broadcast, mpsc, watch};
+use tracing::{error, info, warn};
+
+/// Single source of truth for the daemon's observable worktree/git state.
+///
+/// Held as the value of a `tokio::sync::watch` channel so consumers observe the
+/// latest snapshot without sharing a mutex. The terminal path is not part of
+/// this shared state — each connection drives its own per-client tmux attach
+/// (see [`terminal`]).
+#[derive(Debug, Clone, Default)]
+pub struct State {
+    /// Latest worktree snapshot, present once the initial scan completes.
+    /// Kept current by applying the watcher's change batches in place.
+    pub worktree: Option<Snapshot>,
+    /// Latest git status for the worktree, present when the root is a git
+    /// repository and the first recompute has landed. Replaced wholesale by
+    /// each recompute; the dispatch loop diffs consecutive values to stream
+    /// incremental updates.
+    pub git: Option<GitStatus>,
+    /// Latest diagnostics per `(worktree-relative path, server id)`, mirroring
+    /// LSP's full-set-per-`(file, server)` replace semantics. Each language
+    /// server's published set replaces only its own entry for the file, so a
+    /// linter and a type-checker aggregate without clobbering one another. An
+    /// empty published set clears that server's entry entirely (the key is
+    /// removed) so the map only ever holds live diagnostics. Replayed per
+    /// connection alongside the worktree and git snapshots.
+    pub diagnostics: BTreeMap<DiagnosticKey, Vec<Diagnostic>>,
+    /// Latest lifecycle state per language server name (issue #520), e.g.
+    /// `"rust-analyzer" -> Running`. Unlike `diagnostics`, an entry is never
+    /// removed once a server has been observed — a server that has ever
+    /// started is always exactly one of `starting`/`running`/`crashed`, never
+    /// absent. Replayed per connection alongside the worktree, git, and
+    /// diagnostics snapshots.
+    pub lsp_status: BTreeMap<String, LspServerState>,
+}
+
+/// Map key for [`State::diagnostics`]: a worktree-relative path paired with the
+/// daemon-assigned id of the publishing server, as a string. The per-server
+/// component is what lets two servers' sets for one file coexist.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DiagnosticKey {
+    pub path: String,
+    pub server: String,
+}
+
+/// Internal events from the worktree worker into the dispatch loop.
+enum WorktreeEvent {
+    /// The initial scan completed; this snapshot becomes the `State` worktree.
+    Scanned(Snapshot),
+    /// A coalesced batch of changes against the previously delivered state.
+    Changed(Vec<Change>),
+    /// A fresh full git status (recomputed on a worktree or `.git/` change).
+    /// The dispatch loop diffs it against the held one to emit incrementals.
+    GitRecomputed(GitStatus),
+}
+
+/// Wiring for the daemon's flat dispatch loop.
+///
+/// Inbound `ClientMessage`s arrive on `inbound`; worktree scan/watch events
+/// arrive on `worktree` (when [`Daemon::watch_worktree`] armed one); outbound
+/// `DaemonMessage` events are published on the event bus; the latest `State`
+/// snapshot is observable via the `watch` receiver returned alongside this
+/// struct by [`channels`].
+pub struct Daemon {
+    inbound: mpsc::Receiver<ClientMessage>,
+    worktree: Option<mpsc::Receiver<WorktreeEvent>>,
+    /// Diagnostics translated by the off-loop LSP worker, polled as a dispatch
+    /// branch. `None` until [`Daemon::watch_lsp`] arms the worker; the branch
+    /// then pends forever (never fires) so the loop is unaffected when LSP is
+    /// off.
+    lsp_diagnostics: Option<mpsc::Receiver<LspDiagnostics>>,
+    /// Lifecycle transitions from the off-loop LSP worker (issue #520), polled
+    /// as a dispatch branch alongside `lsp_diagnostics`. Same `None`-until-armed
+    /// discipline.
+    lsp_status: Option<mpsc::Receiver<LspStatusEvent>>,
+    core: Core,
+}
+
+/// The dispatch loop's owned half: the `State` writer and the event
+/// broadcaster. Split from [`Daemon`] so `run` can poll the inbound channels
+/// while a completed branch's handler mutates this.
+struct Core {
+    events: broadcast::Sender<DaemonMessage>,
+    state: watch::Sender<State>,
+    /// Forwards document changes (mapped from worktree `Changed` batches) to the
+    /// off-loop LSP worker. `None` when LSP is not armed; the dispatch loop then
+    /// derives no document changes and the branch is inert.
+    doc_changes: Option<mpsc::Sender<Vec<DocumentChange>>>,
+    /// Forwards the editor's live-buffer events (`BufferChanged` / `BufferClosed`,
+    /// #189) to the off-loop LSP worker — the disk→buffer source-of-truth shift.
+    /// `None` when LSP is not armed; the dispatch loop then drops buffer events.
+    buffer_events: Option<mpsc::Sender<BufferEvent>>,
+    /// The canonical navigation-request sender into the off-loop LSP worker
+    /// (#195, #482). `None` when LSP is not armed. Unlike the disk/buffer feeds
+    /// above, the dispatch loop does not forward nav itself: each connection
+    /// holds its own clone (see [`serve_connection`]) so it can attach its
+    /// private `reply` channel and receive the answer on its own socket alone.
+    /// The dispatch loop keeps this original alive for the daemon's lifetime so
+    /// the worker's nav channel does not close as clients come and go.
+    nav_requests: Option<mpsc::Sender<NavRequest>>,
+}
+
+/// Sender handles for driving a [`Daemon`].
+pub struct Handles {
+    /// Send `ClientMessage`s into the dispatch loop.
+    pub inbound: mpsc::Sender<ClientMessage>,
+    /// Internal publisher handle for the outbound `DaemonMessage` event bus.
+    /// Not public: external callers subscribe via [`Handles::subscribe`] and
+    /// cannot inject events.
+    events: broadcast::Sender<DaemonMessage>,
+    /// Observe the latest `State` snapshot.
+    pub state: watch::Receiver<State>,
+}
+
+impl Handles {
+    /// Subscribe to the daemon's outbound `DaemonMessage` event stream.
+    pub fn subscribe(&self) -> broadcast::Receiver<DaemonMessage> {
+        self.events.subscribe()
+    }
+}
+
+/// Construct a [`Daemon`] and its [`Handles`] over freshly created channels.
+///
+/// `event_capacity` bounds the broadcast backlog; `inbound_capacity` bounds the
+/// inbound mpsc queue.
+pub fn channels(event_capacity: usize, inbound_capacity: usize) -> (Daemon, Handles) {
+    let (inbound_tx, inbound_rx) = mpsc::channel(inbound_capacity);
+    let (events_tx, _events_rx) = broadcast::channel(event_capacity);
+    let (state_tx, state_rx) = watch::channel(State::default());
+
+    let daemon = Daemon {
+        inbound: inbound_rx,
+        worktree: None,
+        lsp_diagnostics: None,
+        lsp_status: None,
+        core: Core {
+            events: events_tx.clone(),
+            state: state_tx,
+            doc_changes: None,
+            buffer_events: None,
+            nav_requests: None,
+        },
+    };
+    let handles = Handles {
+        inbound: inbound_tx,
+        events: events_tx,
+        state: state_rx,
+    };
+    (daemon, handles)
+}
+
+/// Capacities for the channels backing a daemon dispatch loop.
+///
+/// The inbound queue absorbs bursts of `ClientMessage`s while the dispatch loop
+/// drains them; the broadcast backlog bounds how far an outbound writer may lag
+/// before lagged events are dropped. [`serve`] drives a single connection;
+/// [`serve_uds`] shares one dispatch loop across all attached clients, so these
+/// bound the combined queue depth there.
+const SERVE_INBOUND_CAPACITY: usize = 256;
+const SERVE_EVENT_CAPACITY: usize = 256;
+
+/// Read buffer for a single transport read. The transport delivers arbitrary
+/// chunk sizes; the [`FrameDecoder`] reassembles frames regardless of this size.
+const SERVE_READ_BUFFER: usize = 8 * 1024;
+
+/// Per-connection terminal channel bounds. `INBOUND` queues the connection's
+/// terminal `ClientMessage`s for its tmux attach; `OUTBOUND` bounds the attach's
+/// event backlog — the daemon→client flow-control leg, so a flooding pane can
+/// never grow this without bound (its backpressure pauses the pane tmux-side).
+const TERMINAL_INBOUND_CAPACITY: usize = 256;
+const TERMINAL_OUTBOUND_CAPACITY: usize = 256;
+
+/// Per-connection navigation-reply channel bound (#482): the private inbox the
+/// LSP worker's spawned nav tasks send this connection's hover/definition/
+/// references answers to. Nav responses are user-paced (one per hover or click),
+/// so a small buffer absorbs a burst without ever backing up the worker.
+const NAV_REPLY_CAPACITY: usize = 32;
+
+/// Queue depth for worktree events flowing from the blocking worker into the
+/// dispatch loop. Bounds how far the worker may run ahead while the loop is busy.
+const WORKTREE_EVENT_CAPACITY: usize = 64;
+
+/// Queue depth for document-change batches the dispatch loop forwards to the
+/// off-loop LSP worker, and for the diagnostics the worker hands back. Bounds
+/// the in-flight backlog without coupling either side to the other's pace.
+const LSP_CHANNEL_CAPACITY: usize = 64;
+
+/// Entries per `WorktreeSnapshot` chunk. Bounds a single frame's size so a
+/// large tree streams as several frames instead of one giant allocation.
+const SNAPSHOT_CHUNK: usize = 1024;
+
+/// How often the worktree worker, while idle, checks whether the dispatch loop
+/// is gone so it can release the watcher instead of blocking forever.
+const WORKTREE_IDLE_POLL: Duration = Duration::from_millis(500);
+
+/// Scan-then-watch worker. Runs on a blocking thread (`spawn_blocking`): the
+/// initial scan, the watcher's lifetime, and the blocking relay of its change
+/// batches all live here, so the dispatch loop never blocks on filesystem work.
+/// A scan or watch failure is logged and degrades to "no worktree" — the daemon
+/// keeps serving (stderr is the daemon's log sink).
+///
+/// Git watching is not fixed at startup. A root that is not a repository yet is
+/// watched worktree-only while `GitStatus::compute` is re-probed on every tick;
+/// the moment a repository appears (`git init`, or a transient boot-time
+/// unreadability clearing) the worker upgrades in place to git watching against
+/// a fresh baseline (#483). Git mode itself is terminal — a repo that loses its
+/// `.git` just fails recomputes, which the git relay already tolerates (#430).
+fn worktree_worker(root: PathBuf, events: mpsc::Sender<WorktreeEvent>) {
+    loop {
+        let snapshot = match Snapshot::scan(&root) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                error!(root = %root.display(), %err, "worktree scan failed");
+                return;
+            }
+        };
+
+        // Probe for a repository at the root. A successful compute means it is
+        // one, so arm git watching (`with_git_status`) — the `.git/` whitelist
+        // plus a recompute per flush. An error (not a repo yet, or git
+        // unreadable) watches worktree-only (`Watcher::new`) and re-probes until
+        // a repo appears, so a non-repo root still streams its file tree without
+        // spamming per-flush git errors.
+        //
+        // The watcher is armed BEFORE the snapshot/status is delivered: it
+        // registers its watch set synchronously, so once a consumer has observed
+        // the initial state, any later change is guaranteed to produce an event.
+        // The reverse order races — a write right after delivery would precede
+        // the watches and, with no event, the rescan-on-event watcher would never
+        // surface it. The clone is the two-owner boundary: the watcher keeps the
+        // diff baseline, the dispatch loop's `State` gets its own copy.
+        match GitStatus::compute(&root) {
+            Ok(initial_git) => {
+                watch_git_mode(snapshot, initial_git, &events);
+                return;
+            }
+            Err(err) => {
+                info!(root = %root.display(), %err, "no git status; watching worktree only");
+                let (_watcher, changes) = match Watcher::new(snapshot.clone()) {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        error!(%err, "worktree watch failed");
+                        return;
+                    }
+                };
+                if events
+                    .blocking_send(WorktreeEvent::Scanned(snapshot))
+                    .is_err()
+                {
+                    return;
+                }
+                match relay_worktree_until_git(&root, &changes, &events) {
+                    // A repo appeared: drop this worktree-only watcher (end of
+                    // its scope) and loop to arm a git-mode watch on a fresh scan.
+                    RelayOutcome::Upgrade => continue,
+                    // The dispatch loop is gone; the worker is done.
+                    RelayOutcome::Stop => return,
+                }
+            }
+        }
+    }
+}
+
+/// Arm a git-mode watch on the snapshot's root, deliver the initial scan and git
+/// status, then relay change batches and git recomputes until a channel closes
+/// or the dispatch loop is gone. `initial_git` is the already-computed status
+/// delivered right behind the scan — the watcher is armed before either is sent,
+/// the ordering the worker relies on (see [`worktree_worker`]).
+fn watch_git_mode(
+    snapshot: Snapshot,
+    initial_git: GitStatus,
+    events: &mpsc::Sender<WorktreeEvent>,
+) {
+    let (_watcher, changes, git_rx) = match Watcher::with_git_status(snapshot.clone()) {
+        Ok(triple) => triple,
+        Err(err) => {
+            error!(%err, "worktree watch failed");
+            return;
+        }
+    };
+    if events
+        .blocking_send(WorktreeEvent::Scanned(snapshot))
+        .is_err()
+        || events
+            .blocking_send(WorktreeEvent::GitRecomputed(initial_git))
+            .is_err()
+    {
+        return;
+    }
+    relay_events(&changes, &git_rx, events);
+}
+
+/// Relay the watcher's change batches and git-status recomputes into the
+/// dispatch loop until a channel closes or the loop is gone.
+///
+/// The git channel is the primary wait: `with_git_status` emits a recompute on
+/// *every* successful flush, while worktree changes are emitted only on a
+/// non-empty diff and always *before* the flush's git tick. So blocking on the
+/// git tick and then draining the worktree changes already queued preserves the
+/// order (tree update before its git decoration). A flush whose git recompute
+/// fails (e.g. a transient `index.lock`) emits no tick, so the idle-poll timeout
+/// drains the queued worktree changes too — the tree keeps updating while git
+/// status recovers on a later tick (#430). The pre-repository phase has its own
+/// relay ([`relay_worktree_until_git`]); this runs only once a repo exists.
+fn relay_events(
+    changes: &std::sync::mpsc::Receiver<Vec<Change>>,
+    git: &std::sync::mpsc::Receiver<GitStatus>,
+    events: &mpsc::Sender<WorktreeEvent>,
+) {
+    use std::sync::mpsc::RecvTimeoutError;
+    loop {
+        match git.recv_timeout(WORKTREE_IDLE_POLL) {
+            Ok(status) => {
+                // Drain the worktree changes this flush queued before its git
+                // tick, so the tree update precedes the git decoration.
+                if !drain_changes(changes, events) {
+                    return;
+                }
+                if events
+                    .blocking_send(WorktreeEvent::GitRecomputed(status))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // No git tick — either idle, or a flush whose git recompute
+                // failed and emitted none. Its worktree changes are already
+                // queued; relay them so the client tree never stalls on a
+                // failing recompute (#430).
+                if !drain_changes(changes, events) {
+                    return;
+                }
+                if events.is_closed() {
+                    return;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+/// Drain every queued worktree change batch into the dispatch loop. Returns
+/// `false` when the loop is gone (the relay should stop).
+fn drain_changes(
+    changes: &std::sync::mpsc::Receiver<Vec<Change>>,
+    events: &mpsc::Sender<WorktreeEvent>,
+) -> bool {
+    while let Ok(batch) = changes.try_recv() {
+        if events.blocking_send(WorktreeEvent::Changed(batch)).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Why the worktree-only relay ([`relay_worktree_until_git`]) returned: a
+/// repository appeared (upgrade to git watching) or the dispatch loop is gone
+/// (stop the worker).
+enum RelayOutcome {
+    Upgrade,
+    Stop,
+}
+
+/// Relay worktree change batches while the root is not (yet) a git repository,
+/// re-probing `GitStatus::compute` on every tick — each change flush and each
+/// idle poll.
+///
+/// A bare `git init` mutates only `.git/`, which the worktree scan excludes, so
+/// it yields no change batch; the idle-poll re-probe is what catches it (#483).
+/// The probe is a cheap `gix::open` that fails fast on a non-repo, so polling it
+/// each tick is inexpensive. Returns [`RelayOutcome::Upgrade`] the moment a repo
+/// is detected — the caller then arms a git-mode watch against a fresh baseline
+/// — or [`RelayOutcome::Stop`] when the dispatch loop has dropped the channel.
+fn relay_worktree_until_git(
+    root: &Path,
+    changes: &std::sync::mpsc::Receiver<Vec<Change>>,
+    events: &mpsc::Sender<WorktreeEvent>,
+) -> RelayOutcome {
+    use std::sync::mpsc::RecvTimeoutError;
+    loop {
+        match changes.recv_timeout(WORKTREE_IDLE_POLL) {
+            Ok(batch) => {
+                if events.blocking_send(WorktreeEvent::Changed(batch)).is_err() {
+                    return RelayOutcome::Stop;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if events.is_closed() {
+                    return RelayOutcome::Stop;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return RelayOutcome::Stop,
+        }
+        if GitStatus::compute(root).is_ok() {
+            return RelayOutcome::Upgrade;
+        }
+    }
+}
+
+/// Receive the next worktree event, or pend forever when no worktree is armed
+/// (so the `select!` branch never fires).
+async fn next_worktree_event(
+    rx: &mut Option<mpsc::Receiver<WorktreeEvent>>,
+) -> Option<WorktreeEvent> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Receive the next translated diagnostics update from the off-loop LSP worker,
+/// or pend forever when LSP is not armed (so the `select!` branch never fires).
+async fn next_lsp_diagnostics(
+    rx: &mut Option<mpsc::Receiver<LspDiagnostics>>,
+) -> Option<LspDiagnostics> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Receive the next lifecycle transition from the off-loop LSP worker (issue
+/// #520), or pend forever when LSP is not armed (so the `select!` branch
+/// never fires).
+async fn next_lsp_status(
+    rx: &mut Option<mpsc::Receiver<LspStatusEvent>>,
+) -> Option<LspStatusEvent> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Map an explorer entry onto its wire representation. Paths cross the
+/// boundary lossily as UTF-8 (`to_string_lossy`) — the protocol is JSON today,
+/// so a non-UTF-8 path cannot round-trip regardless.
+fn wire_entry(path: &Path, entry: &Entry) -> WorktreeEntry {
+    WorktreeEntry {
+        path: path.to_string_lossy().into_owned(),
+        kind: match entry.kind {
+            rift_explorer::EntryKind::File => EntryKind::File,
+            rift_explorer::EntryKind::Dir => EntryKind::Dir,
+        },
+        ignored: entry.ignored,
+        mtime: entry.mtime,
+    }
+}
+
+/// Fold a change batch into one `UpdateWorktree` message.
+fn update_message(batch: &[Change]) -> DaemonMessage {
+    let mut added = Vec::new();
+    let mut changed = Vec::new();
+    let mut removed = Vec::new();
+    for change in batch {
+        match change {
+            Change::Added { path, entry } => added.push(wire_entry(path, entry)),
+            Change::Changed { path, entry } => changed.push(wire_entry(path, entry)),
+            Change::Removed { path } => removed.push(path.to_string_lossy().into_owned()),
+        }
+    }
+    DaemonMessage::UpdateWorktree {
+        added,
+        changed,
+        removed,
+    }
+}
+
+/// Map an explorer porcelain code onto its protocol wire code (1:1).
+fn wire_git_code(code: rift_explorer::GitStatusCode) -> rift_protocol::GitStatusCode {
+    use rift_explorer::GitStatusCode as E;
+    use rift_protocol::GitStatusCode as P;
+    match code {
+        E::Unmodified => P::Unmodified,
+        E::Modified => P::Modified,
+        E::TypeChange => P::TypeChange,
+        E::Added => P::Added,
+        E::Deleted => P::Deleted,
+        E::Renamed => P::Renamed,
+        E::Copied => P::Copied,
+        E::Unmerged => P::Unmerged,
+        E::Untracked => P::Untracked,
+    }
+}
+
+/// Map an explorer git entry status + its path onto a wire `GitStatusEntry`.
+fn wire_git_entry(
+    path: &Path,
+    status: &rift_explorer::GitEntryStatus,
+) -> rift_protocol::GitStatusEntry {
+    rift_protocol::GitStatusEntry {
+        path: path.to_string_lossy().into_owned(),
+        status: rift_protocol::GitEntryStatus {
+            index: wire_git_code(status.index),
+            worktree: wire_git_code(status.worktree),
+        },
+    }
+}
+
+/// Map an explorer diff outcome onto its wire payload.
+fn wire_diff(diff: rift_explorer::FileDiff) -> rift_protocol::FileDiffPayload {
+    match diff {
+        rift_explorer::FileDiff::Hunks(hunks) => rift_protocol::FileDiffPayload::Hunks {
+            hunks: hunks.into_iter().map(wire_diff_hunk).collect(),
+        },
+        rift_explorer::FileDiff::Binary => rift_protocol::FileDiffPayload::Binary,
+        rift_explorer::FileDiff::TooLarge => rift_protocol::FileDiffPayload::TooLarge,
+    }
+}
+
+/// Map one explorer diff hunk onto its wire representation.
+fn wire_diff_hunk(hunk: rift_explorer::DiffHunk) -> rift_protocol::DiffHunk {
+    rift_protocol::DiffHunk {
+        old_start: hunk.old_start,
+        old_len: hunk.old_len,
+        new_start: hunk.new_start,
+        new_len: hunk.new_len,
+        lines: hunk
+            .lines
+            .into_iter()
+            .map(|line| rift_protocol::DiffLine {
+                kind: wire_diff_line_kind(line.kind),
+                content: line.content,
+            })
+            .collect(),
+    }
+}
+
+/// The protocol [`rift_protocol::hunk_fingerprint`] of an explorer hunk — the
+/// single source of truth for a hunk's `hunk_id`, shared with the client (which
+/// computes it over the wire [`rift_protocol::DiffHunk`] it received). The
+/// `StageHunk` handler recomputes it over the file's fresh worktree-vs-HEAD
+/// hunks to resolve a request's `hunk_id` back to a concrete hunk before
+/// applying; a stale or content-changed id matches nothing and is rejected.
+pub(crate) fn hunk_fingerprint(hunk: &rift_explorer::DiffHunk) -> u64 {
+    rift_protocol::hunk_fingerprint(&wire_diff_hunk(hunk.clone()))
+}
+
+/// Map an explorer diff line role onto its wire code (1:1).
+fn wire_diff_line_kind(kind: rift_explorer::DiffLineKind) -> rift_protocol::DiffLineKind {
+    match kind {
+        rift_explorer::DiffLineKind::Context => rift_protocol::DiffLineKind::Context,
+        rift_explorer::DiffLineKind::Add => rift_protocol::DiffLineKind::Add,
+        rift_explorer::DiffLineKind::Remove => rift_protocol::DiffLineKind::Remove,
+    }
+}
+
+/// Build the `RepoState` message from an explorer repo state.
+fn repo_state_message(repo: &rift_explorer::RepoState) -> DaemonMessage {
+    DaemonMessage::RepoState {
+        branch: repo.branch.clone(),
+        ahead_behind: repo.ahead_behind.map(|ab| rift_protocol::AheadBehind {
+            ahead: ab.ahead,
+            behind: ab.behind,
+        }),
+        lines_added: repo.lines_added,
+        lines_removed: repo.lines_removed,
+    }
+}
+
+/// Build the `LspStatus` message from a translated lifecycle event.
+fn lsp_status_message(event: &LspStatusEvent) -> DaemonMessage {
+    DaemonMessage::LspStatus {
+        server: event.server.clone(),
+        state: event.state,
+    }
+}
+
+/// Replay the full held LSP health map as one `LspStatus` message per server
+/// name — the full state a freshly attached connection needs, the LSP-health
+/// analogue of `diagnostics_snapshot_messages`.
+fn lsp_status_snapshot_messages(
+    lsp_status: &BTreeMap<String, LspServerState>,
+) -> Vec<DaemonMessage> {
+    lsp_status
+        .iter()
+        .map(|(server, state)| DaemonMessage::LspStatus {
+            server: server.clone(),
+            state: *state,
+        })
+        .collect()
+}
+
+/// Diff `old` git status against `new`, producing the incremental messages that
+/// carry `old` to `new`: an `UpdateGitStatus` (entries whose status changed or
+/// appeared in `changed`, paths that went clean in `cleared`) emitted only when
+/// non-empty, plus a `RepoState` emitted only when the repo-level state changed.
+///
+/// With `old = None` this yields the full state — every entry as `changed`, no
+/// `cleared`, and the `RepoState` — which is exactly what a freshly attached
+/// connection needs replayed.
+fn git_delta_messages(old: Option<&GitStatus>, new: &GitStatus) -> Vec<DaemonMessage> {
+    let mut messages = Vec::new();
+    let old_entries = old.map(|g| g.entries());
+
+    let mut changed = Vec::new();
+    for (path, status) in new.entries() {
+        if old_entries.and_then(|entries| entries.get(path)) != Some(status) {
+            changed.push(wire_git_entry(path, status));
+        }
+    }
+    let mut cleared = Vec::new();
+    if let Some(entries) = old_entries {
+        for path in entries.keys() {
+            if !new.entries().contains_key(path) {
+                cleared.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    if !changed.is_empty() || !cleared.is_empty() {
+        messages.push(DaemonMessage::UpdateGitStatus { changed, cleared });
+    }
+
+    if old.map(|g| g.repo()) != Some(new.repo()) {
+        messages.push(repo_state_message(new.repo()));
+    }
+    messages
+}
+
+/// Build the `Diagnostics` message carrying one server's full current set for
+/// one file — the wire form of an [`LspDiagnostics`] update. An empty `items`
+/// clears that server's set for the file, matching LSP's full-set replace.
+fn diagnostics_message(diag: &LspDiagnostics) -> DaemonMessage {
+    DaemonMessage::Diagnostics {
+        path: diag.path.clone(),
+        server: diag.server.clone(),
+        items: diag.items.clone(),
+    }
+}
+
+/// Replay the full held diagnostics set as one `Diagnostics` message per
+/// `(path, server)` — the full state a freshly attached connection needs, the
+/// diagnostics analogue of `git_delta_messages(None, …)`. Only live sets are
+/// held (an empty publish removes its key), so every replayed message is
+/// non-empty.
+fn diagnostics_snapshot_messages(
+    diagnostics: &BTreeMap<DiagnosticKey, Vec<Diagnostic>>,
+) -> Vec<DaemonMessage> {
+    diagnostics
+        .iter()
+        .map(|(key, items)| DaemonMessage::Diagnostics {
+            path: key.path.clone(),
+            server: key.server.clone(),
+            items: items.clone(),
+        })
+        .collect()
+}
+
+/// Split a worktree into chunked `WorktreeSnapshot` messages: every chunk
+/// carries up to [`SNAPSHOT_CHUNK`] entries and only the last one sets
+/// `final_chunk`. An empty tree still yields one (final) message so the client
+/// learns the snapshot is complete.
+fn snapshot_messages(root: &Path, entries: &BTreeMap<PathBuf, Entry>) -> Vec<DaemonMessage> {
+    let root = root.to_string_lossy().into_owned();
+    if entries.is_empty() {
+        return vec![DaemonMessage::WorktreeSnapshot {
+            root,
+            entries: Vec::new(),
+            final_chunk: true,
+        }];
+    }
+
+    let mut messages = Vec::with_capacity(entries.len().div_ceil(SNAPSHOT_CHUNK));
+    let mut iter = entries.iter().peekable();
+    while iter.peek().is_some() {
+        let chunk: Vec<WorktreeEntry> = iter
+            .by_ref()
+            .take(SNAPSHOT_CHUNK)
+            .map(|(path, entry)| wire_entry(path, entry))
+            .collect();
+        let final_chunk = iter.peek().is_none();
+        messages.push(DaemonMessage::WorktreeSnapshot {
+            root: root.clone(),
+            entries: chunk,
+            final_chunk,
+        });
+    }
+    messages
+}
+
+/// Answer a per-connection request/response message (`OpenFile` / `SaveFile`
+/// / `RequestDiff`) against the watched worktree root, producing the reply
+/// `DaemonMessage` for the requesting connection.
+///
+/// The root is the canonicalized [`Snapshot::root`] held in `State` — the same
+/// root the worktree watcher uses, so a relative request path keys the same
+/// space as a worktree entry, and the buffer service confines **writes** to it.
+/// A relative read is confined too; an **absolute** read is the out-of-root
+/// carve-out (a navigation target outside the root, opened read-only) and is
+/// served by [`buffer::read_file`] — writes of an absolute path stay refused.
+/// `RequestDiff` has no such carve-out: it is confined exactly like a write
+/// ([`diff::compute`]). A refused `OpenFile` / `SaveFile` is logged and answered
+/// with a typed [`DaemonMessage::OpenError`] / [`DaemonMessage::SaveError`]
+/// carrying a [`BufferErrorReason`] (mapped from the internal
+/// [`buffer::BufferError`] by [`buffer_error_reason`]), so the editor renders the
+/// specific failure at once instead of waiting out its own open/save timeout. A
+/// `RequestDiff` failure has no error reply in the protocol — it is logged and
+/// dropped. The success/conflict outcomes map directly onto the protocol replies.
+async fn request_reply(
+    state: &watch::Receiver<State>,
+    msg: ClientMessage,
+) -> Option<DaemonMessage> {
+    // The borrow is released before any `await`: the root is cloned out up front
+    // (the snapshot's canonical root), then the file I/O runs unborrowed.
+    let root = {
+        let guard = state.borrow();
+        match guard.worktree.as_ref() {
+            Some(snapshot) => snapshot.root().to_path_buf(),
+            // No worktree scanned yet: there is no root to confine to, so the
+            // request cannot be served. Drop it.
+            None => {
+                warn!("buffer request before the worktree is ready, dropping");
+                return None;
+            }
+        }
+    };
+
+    match msg {
+        ClientMessage::OpenFile { path } => match buffer::read_file(&root, &path).await {
+            Ok((content, mtime)) => Some(DaemonMessage::FileContent {
+                path,
+                content,
+                mtime,
+            }),
+            Err(err) => {
+                warn!(?path, %err, "open_file refused");
+                let reason = buffer_error_reason(&err);
+                Some(DaemonMessage::OpenError { path, reason })
+            }
+        },
+        ClientMessage::SaveFile {
+            path,
+            content,
+            base_mtime,
+        } => match buffer::write_file(&root, &path, &content, base_mtime).await {
+            Ok(buffer::SaveOutcome::Saved(mtime)) => {
+                Some(DaemonMessage::SaveResult { path, mtime })
+            }
+            Ok(buffer::SaveOutcome::Conflict(disk_mtime)) => {
+                Some(DaemonMessage::SaveConflict { path, disk_mtime })
+            }
+            Err(err) => {
+                warn!(?path, %err, "save_file refused");
+                let reason = buffer_error_reason(&err);
+                Some(DaemonMessage::SaveError { path, reason })
+            }
+        },
+        ClientMessage::RequestDiff { path } => match diff::compute(&root, &path).await {
+            Ok(file_diff) => Some(DaemonMessage::FileDiff {
+                path,
+                diff: wire_diff(file_diff),
+            }),
+            Err(err) => {
+                warn!(?path, %err, "request_diff refused");
+                None
+            }
+        },
+        // `request_reply` is only ever called with one of the messages matched
+        // above; any other variant is a caller bug, handled as a no-reply
+        // rather than a panic so a stray message can never take the
+        // connection down.
+        _ => None,
+    }
+}
+
+/// Map an internal [`buffer::BufferError`] onto the wire [`BufferErrorReason`] the
+/// editor renders.
+///
+/// `NotUtf8` and `TooLarge` map directly. A `PathEscape` is a client-side
+/// impossibility (the editor only ever sends worktree-relative or out-of-root
+/// navigation paths), so it collapses to the generic `Io` rather than earning a
+/// distinct wire variant — the spec's decision. An `Io` failure is refined by its
+/// [`std::io::ErrorKind`] into `NotFound` / `PermissionDenied`, falling back to
+/// the generic `Io` for any other kind.
+fn buffer_error_reason(err: &buffer::BufferError) -> BufferErrorReason {
+    match err {
+        buffer::BufferError::NotUtf8(_) => BufferErrorReason::NotUtf8,
+        buffer::BufferError::TooLarge(_) => BufferErrorReason::TooLarge,
+        buffer::BufferError::PathEscape(_) => BufferErrorReason::Io,
+        buffer::BufferError::Io { source, .. } => match source.kind() {
+            std::io::ErrorKind::NotFound => BufferErrorReason::NotFound,
+            std::io::ErrorKind::PermissionDenied => BufferErrorReason::PermissionDenied,
+            _ => BufferErrorReason::Io,
+        },
+    }
+}
+
+/// Convert a navigation `ClientMessage` into the internal [`NavRequest`] the LSP
+/// worker consumes, attaching `reply` — the requesting connection's private
+/// response channel (#482). Returns `None` for any non-navigation message; the
+/// caller only ever passes the four navigation variants, so `None` is a
+/// caller bug handled as a silent drop rather than a panic.
+fn nav_request(msg: ClientMessage, reply: mpsc::Sender<DaemonMessage>) -> Option<NavRequest> {
+    match msg {
+        ClientMessage::HoverRequest { id, path, position } => Some(NavRequest::Hover {
+            id,
+            path,
+            position,
+            reply,
+        }),
+        ClientMessage::DefinitionRequest { id, path, position } => Some(NavRequest::Definition {
+            id,
+            path,
+            position,
+            reply,
+        }),
+        ClientMessage::ReferencesRequest { id, path, position } => Some(NavRequest::References {
+            id,
+            path,
+            position,
+            reply,
+        }),
+        ClientMessage::DocumentSymbolRequest { id, path } => {
+            Some(NavRequest::DocumentSymbol { id, path, reply })
+        }
+        _ => None,
+    }
+}
+
+/// Per-connection drop-stale bookkeeping for the navigation reply path (#482).
+///
+/// A connection issues hover / definition / references / document-symbol
+/// requests with a client-assigned [`NavRequestId`] and receives their
+/// answers on its own reply channel. A slow server can deliver an answer
+/// after the user has moved on and issued a newer request of the same kind;
+/// this gate records the latest id per operation on send
+/// ([`record`](NavStaleGate::record)) and, on receipt, reports whether the
+/// answer still matches ([`is_current`](NavStaleGate::is_current)) — a
+/// superseded answer is dropped before it reaches the socket. Keeping the
+/// state per connection is the fix's core: one client's newer request can no
+/// longer cancel another client's in-flight answer.
+#[derive(Default)]
+struct NavStaleGate {
+    latest_hover: Option<NavRequestId>,
+    latest_definition: Option<NavRequestId>,
+    latest_references: Option<NavRequestId>,
+    latest_document_symbol: Option<NavRequestId>,
+}
+
+impl NavStaleGate {
+    /// Record `msg` (an outbound navigation `ClientMessage`) as this connection's
+    /// latest request of its kind. Non-navigation messages are ignored.
+    fn record(&mut self, msg: &ClientMessage) {
+        match msg {
+            ClientMessage::HoverRequest { id, .. } => self.latest_hover = Some(*id),
+            ClientMessage::DefinitionRequest { id, .. } => self.latest_definition = Some(*id),
+            ClientMessage::ReferencesRequest { id, .. } => self.latest_references = Some(*id),
+            ClientMessage::DocumentSymbolRequest { id, .. } => {
+                self.latest_document_symbol = Some(*id)
+            }
+            _ => {}
+        }
+    }
+
+    /// Report whether `msg` (a navigation response from the worker) still matches
+    /// the latest request of its kind this connection issued. An answer with no
+    /// matching request, or one a newer request has superseded, is stale. Only
+    /// navigation responses ever reach the reply channel, so any other variant is
+    /// treated as current (written through) rather than dropped.
+    fn is_current(&self, msg: &DaemonMessage) -> bool {
+        match msg {
+            DaemonMessage::HoverResponse { id, .. } => self.latest_hover == Some(*id),
+            DaemonMessage::DefinitionResponse { id, .. } => self.latest_definition == Some(*id),
+            DaemonMessage::ReferencesResponse { id, .. } => self.latest_references == Some(*id),
+            DaemonMessage::DocumentSymbolResponse { id, .. } => {
+                self.latest_document_symbol == Some(*id)
+            }
+            _ => true,
+        }
+    }
+}
+
+/// Serve one client connection against an already-running dispatch loop.
+///
+/// Decodes [`ClientMessage`] frames from `reader` into the loop via `inbound`,
+/// writes [`DaemonMessage`] frames from `events` to `writer`, and replays the
+/// current worktree snapshot from `state` straight to this connection right
+/// after the handshake. One call drives one connection; the dispatch loop and
+/// the `State` it owns live outside it, so they persist across reconnects — the
+/// reattach contract.
+///
+/// The handshake is answered per connection (issue #473): every `Hello` gets
+/// `Welcome { version: PROTOCOL_VERSION }` written straight to this socket —
+/// never onto the shared bus, so one client's handshake cannot reach another
+/// connection's stream. Version equality is strict: a matching `Hello`
+/// completes the handshake and is followed by the snapshot replay; a
+/// mismatched one gets the same `Welcome` — the orderly early version signal
+/// for a stale client — and then a clean close, with no state or stream
+/// frames.
+///
+/// The snapshot is delivered per connection — backpressured by the socket —
+/// rather than over the shared `events` bus, whose bounded backlog silently
+/// drops chunks once a large snapshot exceeds its capacity (issue #227). The
+/// bus carries only incremental `UpdateWorktree`s; a lagging writer may still
+/// drop those — the loss is logged and the full snapshot is replayed off-bus
+/// so the client converges rather than staying stale (issue #426). Bus events
+/// are forwarded only once this connection's `Welcome` has been written
+/// (issue #425) — the client requires `Welcome` as its first frame.
+///
+/// Navigation requests (hover/definition/references/document-symbol) are
+/// answered per connection too (#482): each is forwarded to the off-loop LSP
+/// worker over `nav_requests`
+/// carrying this connection's own private `reply` channel, and the worker sends
+/// the answer straight back on it. The answer is written to *this* socket alone,
+/// never onto the shared bus — so with two clients attached (stable + dev share
+/// one daemon) one client's request can neither leak into nor cancel the other's
+/// navigation UI. Drop-stale is enforced per connection by [`NavStaleGate`]: a
+/// slow answer the user has already superseded with a newer request of the same
+/// kind is dropped before it reaches the socket.
+///
+/// `inbound` is a clone of the loop's inbound sender (dropped when the
+/// connection ends); `events` is a fresh subscription to the outbound bus;
+/// `state` observes the latest worktree snapshot; `nav_requests` is this
+/// connection's clone of the LSP worker's request sender (`None` when LSP is not
+/// armed — nav requests are then silently dropped). Returns once the reader
+/// reaches EOF, the dispatch loop is gone, or the event bus closes.
+async fn serve_connection<R, W>(
+    reader: R,
+    mut writer: W,
+    inbound: mpsc::Sender<ClientMessage>,
+    mut events: broadcast::Receiver<DaemonMessage>,
+    mut state: watch::Receiver<State>,
+    nav_requests: Option<mpsc::Sender<NavRequest>>,
+    tmux_server: Option<String>,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut reader = reader;
+    let mut decoder = FrameDecoder::new();
+    let mut buf = vec![0u8; SERVE_READ_BUFFER];
+    // Per-connection replay bookkeeping: the snapshot is sent once, right behind
+    // the `Welcome`. `handshaken` is set by the `Hello` arm below only when the
+    // versions match; it gates the `state` branch so a snapshot landing mid-scan
+    // is never written ahead of the handshake the client waits for, and the
+    // `events` branch so shared bus traffic at connect time can never reach the
+    // socket before the `Welcome` (#425) — the client hard-fails on any
+    // non-`Welcome` first frame.
+    let mut handshaken = false;
+    let mut snapshot_sent = false;
+
+    // This connection's private navigation reply path (#482): the LSP worker's
+    // spawned nav tasks send hover/definition/references/document-symbol
+    // answers here, and only here — never onto the shared bus — so another
+    // attached client can neither see nor cancel them. `nav_gate` tracks the
+    // latest request id per operation for this connection so a superseded
+    // answer is dropped before the socket.
+    let (nav_reply_tx, mut nav_reply_rx) = mpsc::channel::<DaemonMessage>(NAV_REPLY_CAPACITY);
+    let mut nav_gate = NavStaleGate::default();
+
+    // This connection's own tmux attach: terminal `ClientMessage`s are routed to
+    // a dedicated `terminal_task` (each client gets its own `tmux -C` child), and
+    // its outbound events are multiplexed onto this socket alongside the shared
+    // worktree/git stream. Keeping the terminal path per connection is what gives
+    // each rift client an independent attach (per-client size, flow control).
+    let (terminal_in_tx, terminal_in_rx) = mpsc::channel(TERMINAL_INBOUND_CAPACITY);
+    let (terminal_out_tx, mut terminal_out_rx) = mpsc::channel(TERMINAL_OUTBOUND_CAPACITY);
+    let terminal = tokio::spawn(terminal::terminal_task(
+        terminal_in_rx,
+        terminal_out_tx,
+        tmux_server,
+    ));
+    let mut terminal_done = false;
+
+    'serve: loop {
+        tokio::select! {
+            read = reader.read(&mut buf) => {
+                let n = read?;
+                if n == 0 {
+                    // Reader EOF: the client disconnected. End this connection;
+                    // the daemon and its state stay alive for the next attach.
+                    break 'serve;
+                }
+                decoder.push(&buf[..n]);
+                while let Some(msg) = decoder.next_frame::<ClientMessage>()? {
+                    // Terminal messages drive this connection's own tmux attach;
+                    // the buffer-channel requests are answered per connection
+                    // (request/response, replying to this socket); the handshake
+                    // goes to the shared loop.
+                    match msg {
+                        ClientMessage::Attach { .. }
+                        | ClientMessage::Input { .. }
+                        | ClientMessage::ResizePane { .. }
+                        | ClientMessage::TmuxCommand { .. }
+                        | ClientMessage::CapturePane { .. }
+                        | ClientMessage::QueryKeyTable
+                        | ClientMessage::QuerySessionList => {
+                            if terminal_in_tx.send(msg).await.is_err() {
+                                // Terminal task gone; the terminal path is dead,
+                                // but the worktree path can keep serving.
+                                terminal_done = true;
+                            }
+                        }
+                        // The buffer and diff channels are the protocol's
+                        // request/response paths: the reply goes back to *this*
+                        // connection's writer, never onto the shared broadcast
+                        // bus. The worktree root both confine to is the
+                        // canonicalized `Snapshot::root()` held in `State` — the
+                        // same root the worktree watcher uses, so a request path
+                        // keys the same space as a worktree entry.
+                        ClientMessage::OpenFile { .. }
+                        | ClientMessage::SaveFile { .. }
+                        | ClientMessage::RequestDiff { .. } => {
+                            // A refused request (escape, non-UTF-8, I/O error,
+                            // diff compute error) yields no reply — logged in
+                            // `request_reply`.
+                            if let Some(reply) = request_reply(&state, msg).await {
+                                let frame = encode_frame(&reply)?;
+                                writer.write_all(&frame).await?;
+                                writer.flush().await?;
+                            }
+                        }
+                        // The handshake is answered per connection (#473): the
+                        // `Welcome` goes to exactly this socket, never onto the
+                        // shared bus, so one client's handshake — matched or
+                        // not — cannot disturb another connection's stream.
+                        // Version equality is strict: on mismatch the `Welcome`
+                        // carrying the daemon's OWN version is the orderly
+                        // early signal a stale client can act on, and the
+                        // connection closes cleanly without streaming — no
+                        // state, no terminal frames, no mid-stream codec death.
+                        ClientMessage::Hello { version } => {
+                            let welcome = encode_frame(&DaemonMessage::Welcome {
+                                version: PROTOCOL_VERSION,
+                            })?;
+                            writer.write_all(&welcome).await?;
+                            writer.flush().await?;
+                            if version != PROTOCOL_VERSION {
+                                warn!(
+                                    client = version,
+                                    daemon = PROTOCOL_VERSION,
+                                    "protocol version mismatch, closing connection"
+                                );
+                                break 'serve;
+                            }
+                            handshaken = true;
+                            // Everything queued on this connection's bus
+                            // subscription up to here predates the handshake:
+                            // the dispatch loop mutates `State` before each
+                            // broadcast, so it is all contained in the snapshot
+                            // written below. Resubscribe at the bus tail so the
+                            // stale backlog is dropped instead of leaking to
+                            // the socket after the `Welcome` (#425).
+                            events = events.resubscribe();
+                            // Replay the snapshot immediately behind the
+                            // handshake so the client sees `Welcome` then a
+                            // complete tree. If the scan has not finished, the
+                            // `state` branch delivers it once it lands.
+                            if !snapshot_sent {
+                                snapshot_sent = write_snapshot(&mut writer, &state).await?;
+                            }
+                        }
+                        // The source-control write ops (#544, hunk staging #545)
+                        // are per-connection request/response, exactly like the
+                        // buffer/diff channels above: apply the op against the
+                        // confined worktree root and write the single
+                        // `GitOpResult` straight back to this socket. The
+                        // resulting state change is never in the reply — it
+                        // arrives through the existing push git recompute the
+                        // `.git/index` watcher triggers.
+                        ClientMessage::StageFile { .. }
+                        | ClientMessage::UnstageFile { .. }
+                        | ClientMessage::DiscardFile { .. }
+                        | ClientMessage::StageHunk { .. }
+                        | ClientMessage::Commit { .. } => {
+                            let reply = git_write::reply(&state, msg).await;
+                            let frame = encode_frame(&reply)?;
+                            writer.write_all(&frame).await?;
+                            writer.flush().await?;
+                        }
+                        // The live-buffer feed goes to the shared loop: the LSP
+                        // worker that consumes the buffer events lives off that
+                        // single loop (one document model + servers for the
+                        // daemon), not per connection. Push-only — no reply here;
+                        // diagnostics return on the shared broadcast bus.
+                        ClientMessage::BufferChanged { .. }
+                        | ClientMessage::BufferClosed { .. } => {
+                            if inbound.send(msg).await.is_err() {
+                                // Dispatch loop gone; nothing left to serve.
+                                break 'serve;
+                            }
+                        }
+                        // Navigation requests (hover/definition/references/
+                        // document-symbol) are answered per connection (#482):
+                        // forward to the off-loop LSP worker carrying this
+                        // connection's private `reply` channel, and record the
+                        // id as the latest of its kind so a superseded answer is
+                        // drop-stale-gated below. The worker sends the answer
+                        // back on the reply channel (the `nav_reply_rx` branch),
+                        // which writes it to this socket alone — never onto the
+                        // shared bus. When LSP is not armed (`nav_requests` is
+                        // `None`) or the worker's queue is full, the request is
+                        // dropped; "no answer" is a valid nav result and a later
+                        // request re-drives it.
+                        ClientMessage::HoverRequest { .. }
+                        | ClientMessage::DefinitionRequest { .. }
+                        | ClientMessage::ReferencesRequest { .. }
+                        | ClientMessage::DocumentSymbolRequest { .. } => {
+                            nav_gate.record(&msg);
+                            if let Some(nav_requests) = &nav_requests {
+                                if let Some(req) = nav_request(msg, nav_reply_tx.clone()) {
+                                    if let Err(err) = nav_requests.try_send(req) {
+                                        warn!(%err, "dropped navigation request");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            event = events.recv() => {
+                match event {
+                    Ok(msg) => {
+                        // Pre-handshake bus traffic (events broadcast before this
+                        // connection's handshake) is dropped, never written.
+                        // Nothing is lost: the dispatch loop mutates `State`
+                        // before each broadcast, so everything suppressed here is
+                        // already in the snapshot replayed behind the `Welcome`
+                        // (which the `Hello` arm writes per connection, #473 —
+                        // the bus never carries a `Welcome`).
+                        if !handshaken {
+                            continue;
+                        }
+                        let frame = encode_frame(&msg)?;
+                        writer.write_all(&frame).await?;
+                        writer.flush().await?;
+                    }
+                    // The bus carries only incremental updates now; a lagging
+                    // writer drops some. Log the count — never silently — then
+                    // replay the full snapshot (tree + git + diagnostics)
+                    // off-bus so this client converges instead of staying
+                    // permanently stale (#426): a completed snapshot atomically
+                    // replaces the client model, and the retained bus tail
+                    // written after it re-applies idempotently. Pre-handshake
+                    // there is nothing to resync — bus traffic is suppressed
+                    // above and the snapshot follows the `Welcome` anyway.
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "connection lagged, resyncing via snapshot replay");
+                        if handshaken {
+                            snapshot_sent = write_snapshot(&mut writer, &state).await?;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break 'serve,
+                }
+            }
+            changed = state.changed() => {
+                if changed.is_err() {
+                    // The dispatch loop dropped the `State` sender; it is gone.
+                    break 'serve;
+                }
+                if handshaken && !snapshot_sent {
+                    snapshot_sent = write_snapshot(&mut writer, &state).await?;
+                }
+            }
+            terminal_event = terminal_out_rx.recv(), if !terminal_done => {
+                match terminal_event {
+                    // This connection's tmux attach produced an event (pane bytes,
+                    // a layout change, or terminal-path-down): write it to the
+                    // socket alongside the shared worktree/git stream.
+                    Some(msg) => {
+                        let frame = encode_frame(&msg)?;
+                        writer.write_all(&frame).await?;
+                        writer.flush().await?;
+                    }
+                    // The terminal task ended; stop polling its channel so this
+                    // branch cannot busy-loop. The worktree path keeps serving.
+                    None => terminal_done = true,
+                }
+            }
+            // This connection's private navigation answers (#482), off the shared
+            // bus: the LSP worker's nav task sends hover/definition/references/
+            // document-symbol results here. Drop a superseded answer (the user
+            // issued a newer request of the same kind since) and, once
+            // handshaken, write the rest to this socket alone. `nav_reply_tx` is
+            // held by this task for the connection's lifetime, so this branch
+            // never yields `None` — no guard is needed and it cannot busy-loop.
+            nav_reply = nav_reply_rx.recv() => {
+                if let Some(msg) = nav_reply {
+                    if handshaken && nav_gate.is_current(&msg) {
+                        let frame = encode_frame(&msg)?;
+                        writer.write_all(&frame).await?;
+                        writer.flush().await?;
+                    }
+                }
+            }
+        }
+    }
+
+    // End this connection's tmux attach. The task then detaches the control
+    // child (the tmux session persists) and exits.
+    shutdown_terminal(terminal_in_tx, terminal_out_rx, terminal).await;
+
+    Ok(())
+}
+
+/// Tear down a connection's terminal task: drop BOTH channel ends, then join.
+///
+/// Dropping `in_tx` wakes a task parked at `inbound.recv()`; dropping `out_rx`
+/// wakes one parked in `process()` on a full OUTBOUND send (a flooding pane
+/// while the connection stopped draining the channel). Both drops must happen
+/// BEFORE the await — a task parked on a full send is never woken by dropping
+/// the sender alone, so awaiting first would hang the connection forever.
+async fn shutdown_terminal(
+    in_tx: mpsc::Sender<ClientMessage>,
+    out_rx: mpsc::Receiver<DaemonMessage>,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    drop(in_tx);
+    drop(out_rx);
+    let _ = handle.await;
+}
+
+/// Replay the current worktree snapshot to one connection, backpressured by the
+/// socket so no chunk is dropped regardless of tree size. Returns `true` when a
+/// snapshot was written, `false` when none is ready yet. The `watch` borrow is
+/// released before any `await`: the chunked messages are built up front, then
+/// written.
+async fn write_snapshot<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    state: &watch::Receiver<State>,
+) -> anyhow::Result<bool> {
+    let messages = {
+        let guard = state.borrow();
+        let Some(snapshot) = guard.worktree.as_ref() else {
+            return Ok(false);
+        };
+        let mut messages = snapshot_messages(snapshot.root(), snapshot.entries());
+        // Replay the full git status (if any) right behind the tree, so a
+        // (re)attaching client gets the complete git decoration loss-free —
+        // `git_delta_messages(None, …)` is the full set. Incremental updates
+        // then ride the bus.
+        if let Some(git) = guard.git.as_ref() {
+            messages.extend(git_delta_messages(None, git));
+        }
+        // Replay the held diagnostics too, so a (re)attaching client receives
+        // the full live error set — one `Diagnostics` message per
+        // `(path, server)` — alongside the tree and git decoration. Incremental
+        // updates then ride the bus.
+        messages.extend(diagnostics_snapshot_messages(&guard.diagnostics));
+        // Replay the held LSP health map (issue #520) too, so a (re)attaching
+        // client sees current server health without waiting for the next
+        // transition. Incremental updates then ride the bus.
+        messages.extend(lsp_status_snapshot_messages(&guard.lsp_status));
+        messages
+    };
+    write_messages(writer, &messages).await?;
+    Ok(true)
+}
+
+/// Write a sequence of `DaemonMessage` frames to a connection, flushing once at
+/// the end. Each `write_all` is backpressured by the transport, so the whole
+/// sequence arrives intact however many frames it is — the property the
+/// per-connection snapshot relies on.
+async fn write_messages<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    messages: &[DaemonMessage],
+) -> anyhow::Result<()> {
+    for msg in messages {
+        let frame = encode_frame(msg)?;
+        writer.write_all(&frame).await?;
+    }
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Run a daemon over a single byte-stream transport until either side closes.
+///
+/// Spins up a dispatch loop, serves exactly one connection over `reader`/
+/// `writer`, then tears the loop down. With a `worktree_root`, the root is
+/// scanned and watched for the daemon's lifetime (see
+/// [`Daemon::watch_worktree`]). Used by the daemon binary's stdio mode and the
+/// duplex round-trip test. For a long-lived, reattachable daemon that survives
+/// client disconnects, see [`serve_uds`].
+///
+/// Returns once the reader reaches EOF or the writer/event bus closes.
+pub async fn serve<R, W>(reader: R, writer: W, worktree_root: Option<PathBuf>) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let (mut daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
+    if let Some(root) = worktree_root {
+        daemon.watch_worktree(root.clone());
+        daemon.watch_lsp(root, DocumentSelector::builtin());
+    }
+    let events = handles.subscribe();
+    let inbound = handles.inbound.clone();
+    let state = handles.state.clone();
+    // This connection's clone of the LSP worker's nav-request sender (#482), so
+    // its hover/definition/references/document-symbol answers return to this
+    // socket alone. `None` when LSP is not armed. Cloned before `daemon.run()`
+    // consumes the daemon.
+    let nav_requests = daemon.nav_request_sender();
+    // Drop the spare handles so the dispatch loop ends once the connection's
+    // `inbound` clone is dropped at EOF.
+    drop(handles);
+
+    let dispatch = tokio::spawn(daemon.run());
+    // The trailing `None`: production uses the default tmux server for attaches.
+    let result = serve_connection(reader, writer, inbound, events, state, nav_requests, None).await;
+    // `serve_connection` dropped its `inbound` clone on return, so the dispatch
+    // loop has observed channel closure and will join.
+    dispatch.await?;
+    result
+}
+
+/// Derive the pidfile path for a daemon socket: the socket path with a `.pid`
+/// suffix appended (`/run/rift.sock` -> `/run/rift.sock.pid`).
+///
+/// The suffix is appended, not substituted — `Path::with_extension` would turn
+/// `rift.sock` into `rift.pid` and collide across sockets that differ only by
+/// extension. Appending keeps the pidfile uniquely paired with its socket so the
+/// app can stop the running daemon by PID when redeploying a changed binary (spec
+/// `docs/spec-daemon-redeploy.md`, Family A restart).
+fn pidfile_path(socket_path: &Path) -> PathBuf {
+    let mut raw = socket_path.as_os_str().to_owned();
+    raw.push(".pid");
+    PathBuf::from(raw)
+}
+
+/// Removes the daemon's pidfile when the serve loop ends.
+///
+/// Best-effort: a failed unlink is logged, never propagated — the daemon's exit
+/// must not hinge on cleanup, and a leftover pidfile is harmless (the next start
+/// overwrites it). A kill by signal bypasses `Drop`; the stale pidfile is then
+/// reclaimed on the next start, so cleanup here covers only the clean-return path.
+struct PidfileGuard {
+    path: PathBuf,
+}
+
+impl Drop for PidfileGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            warn!(path = %self.path.display(), err = %e, "failed to remove pidfile");
+        }
+    }
+}
+
+/// Run a long-lived daemon that listens on a Unix-domain socket and survives
+/// client disconnects — the reattach contract behind issue #62.
+///
+/// Binds `socket_path`, then accepts connections in a loop, handing each to
+/// [`serve_connection`] against a single shared dispatch loop. Because the loop
+/// and its `State` outlive any one connection, killing the SSH transport ends
+/// only that connection; a reconnect attaches to the same running daemon rather
+/// than spawning a second one.
+///
+/// With a `worktree_root`, the root is scanned and watched for the daemon's
+/// lifetime; every attaching client receives the current snapshot on its
+/// handshake (see [`Daemon::watch_worktree`]).
+///
+/// If a live daemon already owns `socket_path` this returns an error — the
+/// caller must attach via [`connect_relay`], not spawn. A stale socket left by a
+/// crashed daemon is removed and rebound. Transient per-accept errors are logged
+/// and retried (the daemon must not die on FD pressure and leave nothing to
+/// reattach to); the function returns only on a bind failure or process signal.
+///
+/// Once bound, the daemon writes its PID to `<socket_path>.pid` so the app can
+/// stop it by PID when redeploying a changed binary (spec
+/// `docs/spec-daemon-redeploy.md`, Family A restart). The pidfile is best-effort:
+/// a write failure is logged and serving continues; it is removed on clean exit.
+pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> anyhow::Result<()> {
+    if socket_path.exists() {
+        // Distinguish a live daemon from a stale socket: a successful connect
+        // means another instance owns this path, so refuse to bind a second.
+        match UnixStream::connect(socket_path).await {
+            Ok(_) => {
+                anyhow::bail!("daemon already listening on {}", socket_path.display());
+            }
+            // Connect refused/failed: the socket is stale. Remove it and rebind.
+            Err(_) => {
+                let _ = tokio::fs::remove_file(socket_path).await;
+            }
+        }
+    }
+
+    let listener = UnixListener::bind(socket_path)?;
+
+    // Write the pidfile only after a successful bind, so a refused second start
+    // never overwrites the live daemon's pidfile. Best-effort: log and carry on
+    // if the write fails. The guard removes it when this function returns.
+    let pidfile = pidfile_path(socket_path);
+    let _pidfile_guard = match tokio::fs::write(&pidfile, std::process::id().to_string()).await {
+        Ok(()) => Some(PidfileGuard { path: pidfile }),
+        Err(e) => {
+            warn!(path = %pidfile.display(), err = %e, "failed to write pidfile");
+            None
+        }
+    };
+
+    let (mut daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
+    if let Some(root) = worktree_root {
+        daemon.watch_worktree(root.clone());
+        daemon.watch_lsp(root, DocumentSelector::builtin());
+    }
+    // The LSP worker's nav-request sender (#482): each accepted connection gets a
+    // clone so its navigation answers route to its own socket. Grabbed before
+    // `daemon.run()` consumes the daemon, and this original is held for the accept
+    // loop's lifetime — the dispatch loop keeps its own too, so the worker's nav
+    // channel never closes as clients come and go. `None` when LSP is not armed.
+    let nav_requests = daemon.nav_request_sender();
+    // Held for the lifetime of the accept loop, so the dispatch loop and its
+    // `State` stay alive even while no client is attached.
+    let _dispatch = tokio::spawn(daemon.run());
+
+    loop {
+        let (stream, _addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                // A long-lived daemon must not die on a transient accept error
+                // (ECONNABORTED, or EMFILE/ENFILE under FD pressure) — that would
+                // leave nothing to reattach to. Log, back off briefly so a
+                // persistent failure cannot hot-spin, and keep accepting.
+                warn!(err = %e, "accept error");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let (reader, writer) = stream.into_split();
+        let inbound = handles.inbound.clone();
+        let events = handles.subscribe();
+        let state = handles.state.clone();
+        let nav_requests = nav_requests.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                serve_connection(reader, writer, inbound, events, state, nav_requests, None).await
+            {
+                // The active sink (stderr or the rotated file) is the daemon's
+                // log; one failed connection must not stop the daemon.
+                warn!(err = %e, "connection ended with error");
+            }
+        });
+    }
+}
+
+/// Relay raw bytes between `reader`/`writer` and the daemon socket at
+/// `socket_path`, in both directions, until either side closes.
+///
+/// Byte-transparent — the daemon owns the framing, this only shuttles bytes. It
+/// is the remote endpoint the SSH host wires its channel to: the channel carries
+/// `reader`/`writer`, this connects them to the persistent daemon.
+async fn relay<R, W>(mut reader: R, mut writer: W, socket_path: &Path) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let stream = UnixStream::connect(socket_path).await?;
+    let (mut sock_reader, mut sock_writer) = stream.into_split();
+
+    let upstream = async {
+        tokio::io::copy(&mut reader, &mut sock_writer).await?;
+        sock_writer.shutdown().await?;
+        Ok::<(), anyhow::Error>(())
+    };
+    let downstream = async {
+        tokio::io::copy(&mut sock_reader, &mut writer).await?;
+        // Mirror upstream's half-close so no buffered bytes are lost if `writer`
+        // is ever a buffering wrapper; on bare stdout/channel halves it is a flush.
+        writer.shutdown().await?;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    // Whichever direction closes first ends the relay: a closed SSH channel
+    // (upstream EOF) or a daemon that dropped the connection (downstream EOF).
+    tokio::select! {
+        result = upstream => result,
+        result = downstream => result,
+    }
+}
+
+/// Connect the process's stdio to the daemon socket at `socket_path` and relay
+/// between them — the daemon binary's `--connect` mode. Thin [`relay`] wrapper
+/// supplying real stdin/stdout; the SSH host runs this remotely so its channel
+/// reaches the persistent daemon.
+pub async fn connect_relay(socket_path: &Path) -> anyhow::Result<()> {
+    relay(tokio::io::stdin(), tokio::io::stdout(), socket_path).await
+}
+
+/// Return whether a daemon is currently listening on `socket_path`.
+///
+/// A connect probe (no framing, no relay): the SSH host keys its reattach-vs-
+/// spawn decision on this so it never starts a second daemon when one already
+/// owns the socket.
+pub async fn ping(socket_path: &Path) -> bool {
+    UnixStream::connect(socket_path).await.is_ok()
+}
+
+impl Daemon {
+    /// Start owning a worktree: scan `root` and watch it for changes on a
+    /// blocking worker ([`worktree_worker`]), feeding the dispatch loop through
+    /// an internal channel — the scan and watch never run on the loop itself.
+    /// Must be called before [`Daemon::run`], from within a tokio runtime.
+    pub fn watch_worktree(&mut self, root: PathBuf) {
+        let (tx, rx) = mpsc::channel(WORKTREE_EVENT_CAPACITY);
+        tokio::task::spawn_blocking(move || worktree_worker(root, tx));
+        self.worktree = Some(rx);
+    }
+
+    /// Start LSP diagnostics: run a [`LspWorker`] for `root` on its own task,
+    /// off the dispatch loop, wired so document changes (mapped from worktree
+    /// `Changed` batches) flow to it and translated diagnostics flow back into
+    /// the loop. `selector` chooses the language → server table — the built-in
+    /// one in production, a stub-server table in tests. Must be called before
+    /// [`Daemon::run`], from within a tokio runtime.
+    ///
+    /// Language servers are external child processes the worker spawns and
+    /// drives; the dispatch loop only forwards changes and folds the resulting
+    /// diagnostics, never blocking on server I/O.
+    ///
+    /// `root` is canonicalized first so the worker keys diagnostics in the same
+    /// path space as the worktree snapshot: [`Snapshot::scan`] canonicalizes its
+    /// root, so every worktree entry path (and thus the editor's open path) is
+    /// relative to the canonical root. The worker derives a diagnostic's relative
+    /// path by stripping its own root prefix from the server's publish URI; if
+    /// that root is the raw (non-canonical) one, a symlinked or `..`-containing
+    /// path yields a key the client never matches (`push_open_file_diagnostics`
+    /// looks up by the canonical-relative open path → no inline marker, #308).
+    /// Canonicalizing here also makes the daemon's own `didOpen`/`didChange` URIs
+    /// canonical, so they round-trip cleanly with a server (rust-analyzer) that
+    /// canonicalizes paths internally before publishing. A canonicalize failure
+    /// (root gone) falls back to the raw root — the worktree worker would have
+    /// failed the same way and stopped, so no diagnostics flow regardless.
+    pub fn watch_lsp(&mut self, root: PathBuf, selector: DocumentSelector) {
+        let root = root.canonicalize().unwrap_or(root);
+        let (doc_tx, doc_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
+        let (buffer_tx, buffer_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
+        let (diag_tx, diag_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
+        let (status_tx, status_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
+        let (nav_req_tx, nav_req_rx) = mpsc::channel(LSP_CHANNEL_CAPACITY);
+        let worker = LspWorker::new(
+            root, selector, doc_rx, buffer_rx, diag_tx, status_tx, nav_req_rx,
+        );
+        tokio::spawn(worker.run());
+        self.core.doc_changes = Some(doc_tx);
+        self.core.buffer_events = Some(buffer_tx);
+        // Kept as the daemon-lifetime keeper for the worker's nav channel; each
+        // connection receives its own clone via [`Daemon::nav_request_sender`]
+        // (#482). The dispatch loop no longer forwards nav itself.
+        self.core.nav_requests = Some(nav_req_tx);
+        self.lsp_diagnostics = Some(diag_rx);
+        self.lsp_status = Some(status_rx);
+    }
+
+    /// A clone of the LSP worker's navigation-request sender, or `None` when LSP
+    /// is not armed (#482). Each connection takes one so its hover/definition/
+    /// references/document-symbol answers return to that socket alone; the
+    /// dispatch loop keeps the original ([`Core::nav_requests`]) alive for the
+    /// daemon's lifetime so the worker's nav channel does not close as clients
+    /// come and go. Must be read before [`Daemon::run`] consumes the daemon.
+    fn nav_request_sender(&self) -> Option<mpsc::Sender<NavRequest>> {
+        self.core.nav_requests.clone()
+    }
+
+    /// Run the flat dispatch loop until the inbound channel closes.
+    ///
+    /// Each `ClientMessage` and each worktree event is matched directly to a
+    /// handler on [`Core`]. The loop owns the `State` writer and the event
+    /// broadcaster; it ends when every inbound sender is dropped.
+    pub async fn run(self) {
+        let Daemon {
+            mut inbound,
+            mut worktree,
+            mut lsp_diagnostics,
+            mut lsp_status,
+            mut core,
+        } = self;
+        loop {
+            tokio::select! {
+                msg = inbound.recv() => match msg {
+                    Some(msg) => core.dispatch(msg),
+                    None => break,
+                },
+                event = next_worktree_event(&mut worktree) => match event {
+                    Some(event) => core.apply_worktree(event),
+                    // The worker ended (scan failure or shutdown); stop polling
+                    // the closed channel.
+                    None => worktree = None,
+                },
+                diagnostics = next_lsp_diagnostics(&mut lsp_diagnostics) => match diagnostics {
+                    Some(diagnostics) => core.apply_diagnostics(diagnostics),
+                    // The LSP worker ended; stop polling the closed channel.
+                    None => lsp_diagnostics = None,
+                },
+                status = next_lsp_status(&mut lsp_status) => match status {
+                    Some(status) => core.apply_lsp_status(status),
+                    // The LSP worker ended; stop polling the closed channel.
+                    None => lsp_status = None,
+                },
+            }
+        }
+    }
+
+    /// Return the latest `State` snapshot (the `watch` sender's view).
+    pub fn state(&self) -> State {
+        self.core.state.borrow().clone()
+    }
+}
+
+impl Core {
+    /// Route a single `ClientMessage` to its handler.
+    fn dispatch(&mut self, msg: ClientMessage) {
+        match msg {
+            // Live-buffer feed (#189): the editor's `BufferChanged` / `BufferClosed`
+            // reach the shared dispatch loop (routed here by `serve_connection`)
+            // because the LSP worker — the single owner of the document model
+            // and servers — lives off this loop, not per connection.
+            // Forward each to it as a `BufferEvent`; a full queue drops the event
+            // (the next `BufferChanged` re-feeds, so a dropped one only delays
+            // diagnostics, never corrupts the model), and an unarmed LSP drops it.
+            ClientMessage::BufferChanged { path, content } => {
+                self.forward_buffer_event(BufferEvent::Changed { path, content });
+            }
+            ClientMessage::BufferClosed { path } => {
+                self.forward_buffer_event(BufferEvent::Closed { path });
+            }
+            // Terminal/tmux messages never reach the shared dispatch loop:
+            // `serve_connection` routes them to this connection's own
+            // `terminal_task` (per-client attach). The request/response
+            // messages (`OpenFile`/`SaveFile`/`RequestDiff`) likewise never
+            // reach it — they are answered per connection by `request_reply`,
+            // request/response back to that socket, not on the broadcast bus.
+            // Navigation requests (hover/definition/references/document-symbol)
+            // are also answered per connection (#482): `serve_connection`
+            // forwards them straight to the LSP worker with the connection's
+            // private reply channel, so they never pass through here either.
+            // Neither does the handshake:
+            // `serve_connection` answers `Hello` per connection (#473) — the
+            // `Welcome` must reach exactly one socket, and a version mismatch
+            // closes only that connection. These arms are a defensive no-op
+            // should one arrive here anyway.
+            //
+            // The source-control write ops (#544, hunk staging #545) are
+            // answered per connection by `git_write::reply` (request/response
+            // back to that socket), so they never reach this loop; their arms
+            // below are a defensive no-op.
+            ClientMessage::Hello { .. }
+            | ClientMessage::Attach { .. }
+            | ClientMessage::Input { .. }
+            | ClientMessage::ResizePane { .. }
+            | ClientMessage::TmuxCommand { .. }
+            | ClientMessage::CapturePane { .. }
+            | ClientMessage::QueryKeyTable
+            | ClientMessage::QuerySessionList
+            | ClientMessage::OpenFile { .. }
+            | ClientMessage::SaveFile { .. }
+            | ClientMessage::RequestDiff { .. }
+            | ClientMessage::HoverRequest { .. }
+            | ClientMessage::DefinitionRequest { .. }
+            | ClientMessage::ReferencesRequest { .. }
+            | ClientMessage::DocumentSymbolRequest { .. }
+            | ClientMessage::StageFile { .. }
+            | ClientMessage::UnstageFile { .. }
+            | ClientMessage::StageHunk { .. }
+            | ClientMessage::DiscardFile { .. }
+            | ClientMessage::Commit { .. } => {}
+        }
+    }
+
+    /// Forward a live-buffer event to the off-loop LSP worker, dropping it (with a
+    /// log) when the worker's queue is full or LSP is not armed — the same
+    /// non-blocking discipline the disk document-change forward uses.
+    fn forward_buffer_event(&self, event: BufferEvent) {
+        if let Some(buffer_events) = &self.buffer_events {
+            if let Err(err) = buffer_events.try_send(event) {
+                warn!(%err, "dropped live-buffer event");
+            }
+        }
+    }
+
+    /// Fold a worktree event into the `State` and onto the event bus.
+    fn apply_worktree(&mut self, event: WorktreeEvent) {
+        match event {
+            WorktreeEvent::Scanned(snapshot) => {
+                // Store the snapshot; each connection replays it from `State`
+                // per connection (see `serve_connection`), so there is nothing
+                // to broadcast here. The `State` change wakes already-attached
+                // connections that handshook before the scan finished, so they
+                // replay it too.
+                self.state
+                    .send_modify(|state| state.worktree = Some(snapshot));
+            }
+            WorktreeEvent::Changed(batch) => {
+                // Forward the file-level changes to the off-loop LSP worker for
+                // document sync *before* mutating the held snapshot — the send
+                // never blocks the loop on server I/O (the worker owns that).
+                // Only the observed / changed set drives `didOpen` / `didChange`
+                // / `didClose` (spec: no eager whole-tree open), so the initial
+                // `Scanned` snapshot is deliberately not forwarded.
+                if let Some(doc_changes) = &self.doc_changes {
+                    let changes = document_changes(&batch);
+                    if !changes.is_empty() {
+                        // A full queue means the worker is lagging; drop this
+                        // batch rather than block the dispatch loop. The next
+                        // change re-syncs from disk, so a dropped batch only
+                        // delays diagnostics, never corrupts the model.
+                        if let Err(err) = doc_changes.try_send(changes) {
+                            warn!(%err, "dropped document-sync batch");
+                        }
+                    }
+                }
+                self.state.send_modify(|state| {
+                    if let Some(worktree) = &mut state.worktree {
+                        worktree.apply(&batch);
+                    }
+                });
+                let _ = self.events.send(update_message(&batch));
+            }
+            WorktreeEvent::GitRecomputed(new_git) => {
+                // Diff against the held status (built before storing the new one,
+                // so the comparison sees the previous state), then store the new
+                // full status. Each attaching connection replays the full status
+                // from `State`, so even if these incrementals are missed (lagged
+                // bus), a reattach reconciles.
+                let messages = git_delta_messages(self.state.borrow().git.as_ref(), &new_git);
+                self.state.send_modify(|state| state.git = Some(new_git));
+                for msg in messages {
+                    let _ = self.events.send(msg);
+                }
+            }
+        }
+    }
+
+    /// Fold one server's full diagnostic set for a file into the `State` and
+    /// onto the event bus.
+    ///
+    /// Full-set-replace per `(path, server)`: the published set replaces only
+    /// this server's entry for the file, leaving every other server's entry
+    /// intact (the aggregation the spec mandates). An empty set removes the key
+    /// so the held map carries only live diagnostics — which keeps the
+    /// per-connection replay free of stale empty sets. Either way a `Diagnostics`
+    /// message is broadcast (the empty one is how the client clears its set),
+    /// and each attaching connection replays the live map from `State`, so a
+    /// lagged bus reconciles on reattach.
+    fn apply_diagnostics(&mut self, diagnostics: LspDiagnostics) {
+        let message = diagnostics_message(&diagnostics);
+        let key = DiagnosticKey {
+            path: diagnostics.path,
+            server: diagnostics.server,
+        };
+        self.state.send_modify(|state| {
+            if diagnostics.items.is_empty() {
+                state.diagnostics.remove(&key);
+            } else {
+                state.diagnostics.insert(key, diagnostics.items);
+            }
+        });
+        let _ = self.events.send(message);
+    }
+
+    /// Fold one language server's lifecycle transition into the `State` and
+    /// onto the event bus (issue #520). Unlike `apply_diagnostics`, the entry
+    /// is never removed — a server that has ever transitioned is always
+    /// exactly one of `starting`/`running`/`crashed`, so the map only ever
+    /// grows (by distinct server name) or overwrites its current state.
+    fn apply_lsp_status(&mut self, event: LspStatusEvent) {
+        let message = lsp_status_message(&event);
+        self.state.send_modify(|state| {
+            state.lsp_status.insert(event.server, event.state);
+        });
+        let _ = self.events.send(message);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Unique per-test Unix-socket path under the system temp dir — avoids a
+    /// `tempfile` dependency. The pid plus an atomic counter keep concurrent
+    /// tests from colliding; the short name stays under the ~108-byte
+    /// `sockaddr_un` path limit.
+    fn unique_socket_path() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("rift-uds-{}-{}.sock", std::process::id(), n))
+    }
+
+    /// Poll until the daemon socket accepts a connection, so tests don't race the
+    /// `serve_uds` bind. Panics if it never comes up.
+    async fn wait_for_socket(path: &Path) {
+        for _ in 0..100 {
+            if UnixStream::connect(path).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("daemon socket {} never became connectable", path.display());
+    }
+
+    /// Read one framed `DaemonMessage` from `reader`, reassembling across reads.
+    ///
+    /// The decoder is caller-owned and must live for the whole connection: one
+    /// read may deliver several back-to-back frames, and a per-call decoder
+    /// would silently discard the buffered tail along with itself.
+    async fn read_daemon_message<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        decoder: &mut FrameDecoder,
+    ) -> DaemonMessage {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            if let Some(msg) = decoder.next_frame::<DaemonMessage>().expect("decode frame") {
+                return msg;
+            }
+            let n = reader.read(&mut buf).await.expect("read reply");
+            assert!(n > 0, "stream closed before a full frame arrived");
+            decoder.push(&buf[..n]);
+        }
+    }
+
+    /// A framed `Hello` at the current protocol version.
+    fn hello_frame() -> Vec<u8> {
+        encode_frame(&ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+        })
+        .expect("encode Hello")
+    }
+
+    /// A framed `Hello` one version ahead of the daemon's — a mismatched client.
+    fn mismatched_hello_frame() -> Vec<u8> {
+        encode_frame(&ClientMessage::Hello {
+            version: PROTOCOL_VERSION + 1,
+        })
+        .expect("encode mismatched Hello")
+    }
+
+    /// Read `reader` to EOF, panicking if any complete `DaemonMessage` frame
+    /// arrives — the mismatch-close contract: nothing follows the `Welcome`.
+    async fn assert_eof_without_frames<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        decoder: &mut FrameDecoder,
+    ) {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            if let Some(msg) = decoder.next_frame::<DaemonMessage>().expect("decode frame") {
+                panic!("unexpected frame after the mismatch Welcome: {msg:?}");
+            }
+            let n = reader.read(&mut buf).await.expect("read until EOF");
+            if n == 0 {
+                return;
+            }
+            decoder.push(&buf[..n]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_serve_connection_hello_mismatch_replies_welcome_then_closes_without_streaming() {
+        // The version gate (#473): a mismatched `Hello` is answered with the
+        // daemon's OWN version and a clean close — no snapshot, no stream
+        // frames. The worktree scan is awaited in `State` BEFORE the handshake,
+        // so the absent snapshot below proves the gate, not a slow scan.
+        let tmp = TempDir::new("mismatch");
+        write_file(&tmp.path.join("tracked.txt"), "x");
+
+        let (mut daemon, handles) = channels(8, 8);
+        daemon.watch_worktree(tmp.path.clone());
+        let inbound = handles.inbound.clone();
+        let events = handles.subscribe();
+        let mut state = handles.state.clone();
+        let loop_handle = tokio::spawn(daemon.run());
+
+        loop {
+            if state.borrow_and_update().worktree.is_some() {
+                break;
+            }
+            state.changed().await.expect("state sender alive");
+        }
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+        let (server_reader, server_writer) = tokio::io::split(server);
+        let conn = tokio::spawn(async move {
+            serve_connection(
+                server_reader,
+                server_writer,
+                inbound,
+                events,
+                state,
+                None,
+                None,
+            )
+            .await
+        });
+
+        client_writer
+            .write_all(&mismatched_hello_frame())
+            .await
+            .expect("send mismatched Hello");
+        client_writer.flush().await.expect("flush Hello");
+
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(
+            read_daemon_message(&mut client_reader, &mut decoder).await,
+            DaemonMessage::Welcome {
+                version: PROTOCOL_VERSION,
+            },
+            "the mismatch reply must carry the daemon's own version"
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            assert_eof_without_frames(&mut client_reader, &mut decoder),
+        )
+        .await
+        .expect("clean close within the timeout");
+
+        let result = tokio::time::timeout(Duration::from_secs(5), conn)
+            .await
+            .expect("serve_connection returns after the mismatch close")
+            .expect("connection task joins");
+        result.expect("the mismatch close is clean, not an error");
+
+        loop_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_serve_connection_hello_mismatch_does_not_disturb_concurrent_connection() {
+        // The `Welcome` is per connection (#473): a mismatched client's
+        // handshake must never surface on a healthy concurrent connection.
+        // Under the old shared-bus `Welcome`, the mismatched handshake below
+        // would inject a stray `Welcome` into the healthy client's stream.
+        let (daemon, handles) = channels(64, 8);
+        let loop_handle = tokio::spawn(daemon.run());
+
+        // Healthy connection: handshakes at the current version.
+        let (healthy, healthy_srv) = tokio::io::duplex(64 * 1024);
+        let (mut healthy_reader, mut healthy_writer) = tokio::io::split(healthy);
+        let (healthy_srv_reader, healthy_srv_writer) = tokio::io::split(healthy_srv);
+        let healthy_conn = tokio::spawn({
+            let inbound = handles.inbound.clone();
+            let events = handles.subscribe();
+            let state = handles.state.clone();
+            async move {
+                serve_connection(
+                    healthy_srv_reader,
+                    healthy_srv_writer,
+                    inbound,
+                    events,
+                    state,
+                    None,
+                    None,
+                )
+                .await
+            }
+        });
+        healthy_writer
+            .write_all(&hello_frame())
+            .await
+            .expect("send healthy Hello");
+        healthy_writer.flush().await.expect("flush healthy Hello");
+        let mut healthy_decoder = FrameDecoder::new();
+        assert_eq!(
+            read_daemon_message(&mut healthy_reader, &mut healthy_decoder).await,
+            DaemonMessage::Welcome {
+                version: PROTOCOL_VERSION,
+            }
+        );
+
+        // Mismatched connection: drive the full reject cycle (Welcome{own} +
+        // clean close) to completion FIRST, so its handshake has provably been
+        // processed before the healthy stream is asserted below.
+        let (bad, bad_srv) = tokio::io::duplex(64 * 1024);
+        let (mut bad_reader, mut bad_writer) = tokio::io::split(bad);
+        let (bad_srv_reader, bad_srv_writer) = tokio::io::split(bad_srv);
+        let bad_conn = tokio::spawn({
+            let inbound = handles.inbound.clone();
+            let events = handles.subscribe();
+            let state = handles.state.clone();
+            async move {
+                serve_connection(
+                    bad_srv_reader,
+                    bad_srv_writer,
+                    inbound,
+                    events,
+                    state,
+                    None,
+                    None,
+                )
+                .await
+            }
+        });
+        bad_writer
+            .write_all(&mismatched_hello_frame())
+            .await
+            .expect("send mismatched Hello");
+        bad_writer.flush().await.expect("flush mismatched Hello");
+        let mut bad_decoder = FrameDecoder::new();
+        assert_eq!(
+            read_daemon_message(&mut bad_reader, &mut bad_decoder).await,
+            DaemonMessage::Welcome {
+                version: PROTOCOL_VERSION,
+            }
+        );
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            assert_eof_without_frames(&mut bad_reader, &mut bad_decoder),
+        )
+        .await
+        .expect("mismatched connection closes within the timeout");
+        tokio::time::timeout(Duration::from_secs(5), bad_conn)
+            .await
+            .expect("mismatched serve_connection returns")
+            .expect("mismatched connection task joins")
+            .expect("the mismatch close is clean, not an error");
+
+        // The healthy connection's next frame must be exactly the next bus
+        // event — no stray `Welcome` from the mismatched handshake in between.
+        let post = DaemonMessage::UpdateWorktree {
+            added: Vec::new(),
+            changed: Vec::new(),
+            removed: vec!["after-mismatch".to_owned()],
+        };
+        handles
+            .events
+            .send(post.clone())
+            .expect("bus subscriber alive");
+        assert_eq!(
+            read_daemon_message(&mut healthy_reader, &mut healthy_decoder).await,
+            post,
+            "healthy stream must continue undisturbed after a mismatched Hello"
+        );
+
+        drop(healthy_writer);
+        drop(healthy_reader);
+        healthy_conn.abort();
+        loop_handle.abort();
+    }
+
+    #[test]
+    fn test_pidfile_path_appends_pid_suffix_to_socket() {
+        assert_eq!(
+            pidfile_path(Path::new("/run/rift/rift.sock")),
+            PathBuf::from("/run/rift/rift.sock.pid")
+        );
+    }
+
+    #[test]
+    fn test_pidfile_path_appends_rather_than_replaces_extension() {
+        // `with_extension` would yield `/run/rift.pid`; appending keeps the
+        // socket name intact so each socket maps to a distinct pidfile.
+        assert_eq!(
+            pidfile_path(Path::new("/run/rift.sock")),
+            PathBuf::from("/run/rift.sock.pid")
+        );
+        assert_eq!(
+            pidfile_path(Path::new("/run/rift")),
+            PathBuf::from("/run/rift.pid")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serve_uds_writes_pidfile_with_daemon_pid() {
+        let sock = unique_socket_path();
+        let server = tokio::spawn({
+            let sock = sock.clone();
+            async move { serve_uds(&sock, None).await }
+        });
+        wait_for_socket(&sock).await;
+
+        let pidfile = pidfile_path(&sock);
+        let contents = tokio::fs::read_to_string(&pidfile)
+            .await
+            .expect("pidfile written");
+        assert_eq!(contents, std::process::id().to_string());
+
+        server.abort();
+        let _ = tokio::fs::remove_file(&sock).await;
+        let _ = tokio::fs::remove_file(&pidfile).await;
+    }
+
+    #[tokio::test]
+    async fn test_serve_uds_hello_returns_welcome() {
+        let sock = unique_socket_path();
+        let server = tokio::spawn({
+            let sock = sock.clone();
+            async move { serve_uds(&sock, None).await }
+        });
+        wait_for_socket(&sock).await;
+
+        let mut client = UnixStream::connect(&sock).await.expect("connect");
+        let mut decoder = FrameDecoder::new();
+        client.write_all(&hello_frame()).await.expect("send Hello");
+        client.flush().await.expect("flush Hello");
+
+        assert_eq!(
+            read_daemon_message(&mut client, &mut decoder).await,
+            DaemonMessage::Welcome {
+                version: PROTOCOL_VERSION,
+            }
+        );
+
+        server.abort();
+        let _ = tokio::fs::remove_file(&sock).await;
+    }
+
+    #[tokio::test]
+    async fn test_serve_uds_survives_client_disconnect_and_reattaches() {
+        let sock = unique_socket_path();
+        let server = tokio::spawn({
+            let sock = sock.clone();
+            async move { serve_uds(&sock, None).await }
+        });
+        wait_for_socket(&sock).await;
+
+        // First client: handshake, then disconnect by dropping the stream.
+        {
+            let mut c1 = UnixStream::connect(&sock).await.expect("connect 1");
+            let mut d1 = FrameDecoder::new();
+            c1.write_all(&hello_frame()).await.expect("send Hello 1");
+            c1.flush().await.expect("flush 1");
+            assert_eq!(
+                read_daemon_message(&mut c1, &mut d1).await,
+                DaemonMessage::Welcome {
+                    version: PROTOCOL_VERSION,
+                }
+            );
+        }
+
+        // The daemon must still be listening: a second client reattaches and
+        // completes its own handshake against the same running process.
+        let mut c2 = UnixStream::connect(&sock)
+            .await
+            .expect("reconnect after disconnect");
+        let mut d2 = FrameDecoder::new();
+        c2.write_all(&hello_frame()).await.expect("send Hello 2");
+        c2.flush().await.expect("flush 2");
+        assert_eq!(
+            read_daemon_message(&mut c2, &mut d2).await,
+            DaemonMessage::Welcome {
+                version: PROTOCOL_VERSION,
+            }
+        );
+
+        assert!(
+            !server.is_finished(),
+            "serve_uds exited on client disconnect"
+        );
+        server.abort();
+        let _ = tokio::fs::remove_file(&sock).await;
+    }
+
+    #[tokio::test]
+    async fn test_serve_uds_rejects_bind_when_already_running() {
+        let sock = unique_socket_path();
+        let server = tokio::spawn({
+            let sock = sock.clone();
+            async move { serve_uds(&sock, None).await }
+        });
+        wait_for_socket(&sock).await;
+
+        let err = serve_uds(&sock, None)
+            .await
+            .expect_err("second bind must fail");
+        assert!(
+            err.to_string().contains("already listening"),
+            "unexpected error: {err}"
+        );
+
+        server.abort();
+        let _ = tokio::fs::remove_file(&sock).await;
+    }
+
+    #[tokio::test]
+    async fn test_serve_uds_rebinds_over_stale_socket() {
+        let sock = unique_socket_path();
+        // A leftover regular file at the path simulates a stale socket left by a
+        // crashed daemon: connect fails, so serve_uds must remove it and bind.
+        tokio::fs::write(&sock, b"stale")
+            .await
+            .expect("create stale file");
+
+        let server = tokio::spawn({
+            let sock = sock.clone();
+            async move { serve_uds(&sock, None).await }
+        });
+        wait_for_socket(&sock).await;
+
+        let mut client = UnixStream::connect(&sock)
+            .await
+            .expect("connect after rebind");
+        let mut decoder = FrameDecoder::new();
+        client.write_all(&hello_frame()).await.expect("send Hello");
+        client.flush().await.expect("flush Hello");
+        assert_eq!(
+            read_daemon_message(&mut client, &mut decoder).await,
+            DaemonMessage::Welcome {
+                version: PROTOCOL_VERSION,
+            }
+        );
+
+        server.abort();
+        let _ = tokio::fs::remove_file(&sock).await;
+    }
+
+    #[tokio::test]
+    async fn test_relay_round_trips_hello_to_welcome_over_uds() {
+        let sock = unique_socket_path();
+        let server = tokio::spawn({
+            let sock = sock.clone();
+            async move { serve_uds(&sock, None).await }
+        });
+        wait_for_socket(&sock).await;
+
+        // Drive the private `relay` with in-memory "stdio": one half is the
+        // relay's reader/writer, the other is the test's client.
+        let (client, stdio) = tokio::io::duplex(64 * 1024);
+        let (stdio_reader, stdio_writer) = tokio::io::split(stdio);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+
+        let relay_task = tokio::spawn({
+            let sock = sock.clone();
+            async move { relay(stdio_reader, stdio_writer, &sock).await }
+        });
+
+        client_writer
+            .write_all(&hello_frame())
+            .await
+            .expect("send Hello via relay");
+        client_writer.flush().await.expect("flush Hello");
+
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(
+            read_daemon_message(&mut client_reader, &mut decoder).await,
+            DaemonMessage::Welcome {
+                version: PROTOCOL_VERSION,
+            }
+        );
+
+        relay_task.abort();
+        server.abort();
+        let _ = tokio::fs::remove_file(&sock).await;
+    }
+
+    /// A self-cleaning temporary directory for worktree fixtures, mirroring the
+    /// explorer tests' helper so these stay self-contained without a `tempfile`
+    /// dev-dependency.
+    struct TempDir {
+        path: std::path::PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("rift-daemon-{tag}-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("create temp root");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_file(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dirs");
+        }
+        std::fs::write(path, contents).expect("write file");
+    }
+
+    /// Receive broadcast events until the predicate yields, with a generous
+    /// ceiling for a real filesystem event to cross notify, the debounce, the
+    /// rescan, and the dispatch loop.
+    async fn recv_until<T>(
+        events: &mut broadcast::Receiver<DaemonMessage>,
+        mut pick: impl FnMut(DaemonMessage) -> Option<T>,
+    ) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let msg = events.recv().await.expect("event bus open");
+                if let Some(found) = pick(msg) {
+                    return found;
+                }
+            }
+        })
+        .await
+        .expect("expected event within the timeout")
+    }
+
+    /// Read framed messages off a live connection until one complete chunked
+    /// `WorktreeSnapshot` has arrived (tolerating the `Welcome` that precedes
+    /// it), returning its entries. Panics on any other message — the snapshot is
+    /// the per-connection replay, never an update.
+    async fn read_full_snapshot<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        decoder: &mut FrameDecoder,
+    ) -> Vec<rift_protocol::WorktreeEntry> {
+        // Bounded so a regressed delivery path (a dropped chunk that never lets
+        // `final_chunk` arrive) fails the test deterministically instead of
+        // hanging it.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut welcome_seen = false;
+            let mut collected = Vec::new();
+            loop {
+                match read_daemon_message(reader, decoder).await {
+                    DaemonMessage::Welcome { version } => {
+                        assert_eq!(version, PROTOCOL_VERSION);
+                        welcome_seen = true;
+                    }
+                    DaemonMessage::WorktreeSnapshot {
+                        entries: mut chunk,
+                        final_chunk,
+                        ..
+                    } => {
+                        collected.append(&mut chunk);
+                        if final_chunk && welcome_seen {
+                            return collected;
+                        }
+                    }
+                    // The per-connection replay appends the full git status after
+                    // the tree (for a git-repo root); tolerate it so this helper
+                    // works against a repo, not only a plain dir.
+                    DaemonMessage::UpdateGitStatus { .. } | DaemonMessage::RepoState { .. } => {}
+                    other => panic!("unexpected message before snapshot: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("a complete snapshot within the timeout")
+    }
+
+    fn synthetic_entries(count: usize) -> BTreeMap<PathBuf, Entry> {
+        (0..count)
+            .map(|i| {
+                (
+                    PathBuf::from(format!("file-{i:05}.txt")),
+                    Entry {
+                        kind: rift_explorer::EntryKind::File,
+                        ignored: false,
+                        mtime: std::time::SystemTime::UNIX_EPOCH,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_snapshot_messages_empty_tree_yields_single_final_chunk() {
+        let messages = snapshot_messages(Path::new("/root"), &BTreeMap::new());
+        assert_eq!(
+            messages,
+            vec![DaemonMessage::WorktreeSnapshot {
+                root: "/root".to_owned(),
+                entries: Vec::new(),
+                final_chunk: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_snapshot_messages_large_tree_chunks_with_final_flag_on_last_only() {
+        let entries = synthetic_entries(SNAPSHOT_CHUNK + 1);
+        let messages = snapshot_messages(Path::new("/root"), &entries);
+
+        assert_eq!(messages.len(), 2);
+        match &messages[0] {
+            DaemonMessage::WorktreeSnapshot {
+                entries,
+                final_chunk,
+                ..
+            } => {
+                assert_eq!(entries.len(), SNAPSHOT_CHUNK);
+                assert!(!final_chunk);
+            }
+            other => panic!("expected WorktreeSnapshot, got {other:?}"),
+        }
+        match &messages[1] {
+            DaemonMessage::WorktreeSnapshot {
+                entries,
+                final_chunk,
+                ..
+            } => {
+                assert_eq!(entries.len(), 1);
+                assert!(final_chunk);
+            }
+            other => panic!("expected WorktreeSnapshot, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_serve_connection_replays_multichunk_snapshot_off_a_tiny_bus() {
+        // Regression for #227: a tree spanning several SNAPSHOT_CHUNK frames,
+        // served over an event bus far smaller than the chunk count, must still
+        // arrive complete — the snapshot is delivered per connection, off the
+        // bus, backpressured by the socket. Under the old bus broadcast the
+        // surplus chunks were silently dropped and `final_chunk` never arrived.
+        let tmp = TempDir::new("multichunk");
+        let file_count = SNAPSHOT_CHUNK * 2 + 1; // three chunks
+        for i in 0..file_count {
+            write_file(&tmp.path.join(format!("f{i:06}.txt")), "x");
+        }
+
+        // Bus capacity 2 is below the snapshot's chunk count (3): if the snapshot
+        // still flowed over the bus, chunks would be dropped and the read below
+        // would time out.
+        let (mut daemon, handles) = channels(2, 8);
+        daemon.watch_worktree(tmp.path.clone());
+        let inbound = handles.inbound.clone();
+        let events = handles.subscribe();
+        let state = handles.state.clone();
+        let loop_handle = tokio::spawn(daemon.run());
+
+        let (client, server) = tokio::io::duplex(8 * 1024);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+        let (server_reader, server_writer) = tokio::io::split(server);
+        let conn = tokio::spawn(async move {
+            let _ = serve_connection(
+                server_reader,
+                server_writer,
+                inbound,
+                events,
+                state,
+                None,
+                None,
+            )
+            .await;
+        });
+
+        client_writer
+            .write_all(&hello_frame())
+            .await
+            .expect("send Hello");
+        client_writer.flush().await.expect("flush Hello");
+
+        let mut decoder = FrameDecoder::new();
+        let entries = read_full_snapshot(&mut client_reader, &mut decoder).await;
+        assert_eq!(
+            entries.len(),
+            file_count,
+            "every entry across all chunks must arrive despite the tiny bus"
+        );
+
+        drop(client_writer);
+        drop(client_reader);
+        conn.abort();
+        loop_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_serve_connection_bus_traffic_at_connect_welcome_is_first_frame() {
+        // Regression for #425: events broadcast on the shared bus before this
+        // connection's handshake completes must never reach its socket — the
+        // client hard-fails on any non-`Welcome` first frame. Flood the bus
+        // before sending `Hello`, then assert `Welcome` arrives first and that
+        // post-handshake bus events flow again.
+        let (daemon, handles) = channels(64, 8);
+        let inbound = handles.inbound.clone();
+        let events = handles.subscribe();
+        let state = handles.state.clone();
+        let loop_handle = tokio::spawn(daemon.run());
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+        let (server_reader, server_writer) = tokio::io::split(server);
+        let conn = tokio::spawn(async move {
+            let _ = serve_connection(
+                server_reader,
+                server_writer,
+                inbound,
+                events,
+                state,
+                None,
+                None,
+            )
+            .await;
+        });
+
+        // Sustained bus traffic ahead of the handshake: the connection's
+        // subscription (created above, before the flood) queues these in send
+        // order, so every one of them precedes the `Welcome` on the bus.
+        for i in 0..32 {
+            handles
+                .events
+                .send(DaemonMessage::UpdateWorktree {
+                    added: Vec::new(),
+                    changed: Vec::new(),
+                    removed: vec![format!("pre-handshake-{i}")],
+                })
+                .expect("bus subscriber alive");
+        }
+
+        client_writer
+            .write_all(&hello_frame())
+            .await
+            .expect("send Hello");
+        client_writer.flush().await.expect("flush Hello");
+
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(
+            read_daemon_message(&mut client_reader, &mut decoder).await,
+            DaemonMessage::Welcome {
+                version: PROTOCOL_VERSION,
+            },
+            "Welcome must be the first frame despite pre-handshake bus traffic"
+        );
+
+        // Post-handshake bus events reach the socket again. No worktree is
+        // armed, so no snapshot intervenes: the very next frame must be this
+        // event — any leaked pre-handshake frame would arrive ahead of it.
+        let post = DaemonMessage::UpdateWorktree {
+            added: Vec::new(),
+            changed: Vec::new(),
+            removed: vec!["post-handshake".to_owned()],
+        };
+        handles
+            .events
+            .send(post.clone())
+            .expect("bus subscriber alive");
+        assert_eq!(
+            read_daemon_message(&mut client_reader, &mut decoder).await,
+            post,
+            "bus forwarding must resume after the handshake"
+        );
+
+        drop(client_writer);
+        drop(client_reader);
+        conn.abort();
+        loop_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_serve_connection_bus_lag_replays_snapshot_to_converge() {
+        // Regression for #426: when this connection's bus subscription lags,
+        // the dropped incremental updates are unrecoverable — the connection
+        // must replay the full off-bus snapshot so the client model converges
+        // instead of staying permanently stale.
+        let tmp = TempDir::new("lag-resync");
+        write_file(&tmp.path.join("a.txt"), "x");
+        write_file(&tmp.path.join("b.txt"), "y");
+
+        // Bus capacity 2 with a 64-event burst: while the client is not
+        // reading, the connection can drain at most the tiny duplex buffer
+        // plus the retained backlog before it must observe `Lagged` — the
+        // overflow is guaranteed regardless of task scheduling.
+        let (mut daemon, handles) = channels(2, 8);
+        daemon.watch_worktree(tmp.path.clone());
+        let inbound = handles.inbound.clone();
+        let events = handles.subscribe();
+        let state = handles.state.clone();
+        let loop_handle = tokio::spawn(daemon.run());
+
+        let (client, server) = tokio::io::duplex(256);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+        let (server_reader, server_writer) = tokio::io::split(server);
+        let conn = tokio::spawn(async move {
+            let _ = serve_connection(
+                server_reader,
+                server_writer,
+                inbound,
+                events,
+                state,
+                None,
+                None,
+            )
+            .await;
+        });
+
+        client_writer
+            .write_all(&hello_frame())
+            .await
+            .expect("send Hello");
+        client_writer.flush().await.expect("flush Hello");
+
+        let mut decoder = FrameDecoder::new();
+        let initial = read_full_snapshot(&mut client_reader, &mut decoder).await;
+        assert_eq!(initial.len(), 2, "initial replay carries the full tree");
+
+        // Burst past the bus capacity while the client reads nothing: the
+        // connection parks on the full duplex and its subscription overflows.
+        for i in 0..64 {
+            handles
+                .events
+                .send(DaemonMessage::UpdateWorktree {
+                    added: Vec::new(),
+                    changed: Vec::new(),
+                    removed: vec![format!("burst-{i}")],
+                })
+                .expect("bus subscriber alive");
+        }
+
+        // Resume reading: burst frames written before the writer parked (and
+        // the retained bus tail re-delivered after the lag) are tolerated —
+        // convergence requires a complete fresh snapshot to arrive.
+        let fresh = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut collected = Vec::new();
+            loop {
+                match read_daemon_message(&mut client_reader, &mut decoder).await {
+                    DaemonMessage::UpdateWorktree { .. } => {}
+                    DaemonMessage::WorktreeSnapshot {
+                        entries,
+                        final_chunk,
+                        ..
+                    } => {
+                        collected.extend(entries);
+                        if final_chunk {
+                            return collected;
+                        }
+                    }
+                    other => panic!("unexpected message during lag resync: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("lagged connection must receive a fresh snapshot");
+
+        let paths: Vec<&str> = fresh.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["a.txt", "b.txt"],
+            "replayed snapshot must carry the full current tree"
+        );
+
+        drop(client_writer);
+        drop(client_reader);
+        conn.abort();
+        loop_handle.abort();
+    }
+
+    /// Kills an isolated `-L` tmux server on drop, so a terminal test leaves no
+    /// stray tmux behind and never touches the developer's server.
+    struct IsolatedTmux(String);
+
+    impl Drop for IsolatedTmux {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", &self.0, "kill-server"])
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_terminal_joins_a_task_parked_on_full_outbound() {
+        // Deterministic regression for the teardown deadlock (#263 review).
+        // serve_connection's teardown is `shutdown_terminal`. Park a real
+        // terminal task in `process()` on a full (cap-1) outbound channel, then
+        // call shutdown_terminal: it must RETURN. It does so by dropping the
+        // receiver before joining — if it awaited the handle first, the parked
+        // task would never wake and this times out. (The full serve_connection
+        // break-path that exposed this is racy to force; this tests the exact
+        // teardown code it runs.)
+        let server = IsolatedTmux(format!("rift204td-{}", std::process::id()));
+        let (in_tx, in_rx) = mpsc::channel(64);
+        // Capacity 1: the attach's snapshot plus the pane's initial draw overrun
+        // it, so the task parks on a send with nobody reading.
+        let (out_tx, out_rx) = mpsc::channel(1);
+        let handle = tokio::spawn(terminal::terminal_task(
+            in_rx,
+            out_tx,
+            Some(server.0.clone()),
+        ));
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+            })
+            .await
+            .expect("attach");
+        // Let the attach produce >1 message and park on the full channel.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !handle.is_finished(),
+            "task must be parked on the full outbound channel"
+        );
+
+        let done = tokio::time::timeout(
+            Duration::from_secs(10),
+            shutdown_terminal(in_tx, out_rx, handle),
+        )
+        .await;
+        assert!(
+            done.is_ok(),
+            "shutdown_terminal hung joining a task parked on a full outbound channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serve_connection_returns_on_disconnect_during_flood() {
+        // Integration smoke: the whole serve_connection path against real tmux —
+        // attach, flood a pane, stop reading, disconnect — must RETURN.
+        let server = IsolatedTmux(format!("rift204conn-{}", std::process::id()));
+
+        let (daemon, handles) = channels(64, 64);
+        let inbound = handles.inbound.clone();
+        let events = handles.subscribe();
+        let state = handles.state.clone();
+        let loop_handle = tokio::spawn(daemon.run());
+
+        let (client, server_io) = tokio::io::duplex(64 * 1024);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+
+        let tmux_name = server.0.clone();
+        let conn = tokio::spawn(async move {
+            serve_connection(
+                server_reader,
+                server_writer,
+                inbound,
+                events,
+                state,
+                None,
+                Some(tmux_name),
+            )
+            .await
+        });
+
+        // Handshake, then attach and wait for the layout snapshot.
+        client_writer
+            .write_all(&hello_frame())
+            .await
+            .expect("hello");
+        client_writer.flush().await.expect("flush hello");
+        let mut decoder = FrameDecoder::new();
+        loop {
+            if matches!(
+                read_daemon_message(&mut client_reader, &mut decoder).await,
+                DaemonMessage::Welcome { .. }
+            ) {
+                break;
+            }
+        }
+        client_writer
+            .write_all(
+                &encode_frame(&ClientMessage::Attach {
+                    session: "rift".to_owned(),
+                })
+                .expect("encode attach"),
+            )
+            .await
+            .expect("attach");
+        client_writer.flush().await.expect("flush attach");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(
+                    read_daemon_message(&mut client_reader, &mut decoder).await,
+                    DaemonMessage::LayoutSnapshot { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("layout snapshot");
+
+        // Flood the pane, then stop reading and disconnect.
+        client_writer
+            .write_all(
+                &encode_frame(&ClientMessage::Input {
+                    pane_id: 0,
+                    data: "yes RIFTFLOOD\n".to_owned(),
+                })
+                .expect("encode input"),
+            )
+            .await
+            .expect("flood");
+        client_writer.flush().await.expect("flush flood");
+        // Give the flood a moment to fill buffers, then disconnect mid-stream.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(client_reader);
+        drop(client_writer);
+
+        // serve_connection must return (the fix drops terminal_out_rx before
+        // awaiting the possibly-parked terminal task).
+        let result = tokio::time::timeout(Duration::from_secs(15), conn).await;
+        assert!(
+            result.is_ok(),
+            "serve_connection hung on disconnect during a flood"
+        );
+
+        loop_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_worktree_scan_populates_state_and_streams_update_on_change() {
+        let tmp = TempDir::new("scan");
+        write_file(&tmp.path.join("src/main.rs"), "fn main() {}");
+        write_file(&tmp.path.join("README.md"), "# readme");
+
+        let (mut daemon, handles) = channels(64, 8);
+        daemon.watch_worktree(tmp.path.clone());
+        let mut events = handles.subscribe();
+        let mut state = handles.state.clone();
+        let loop_handle = tokio::spawn(daemon.run());
+
+        // The initial scan lands in State (the snapshot is replayed per
+        // connection now, not broadcast on the bus). `borrow_and_update` marks
+        // each value seen so the `changed` await cannot miss the transition.
+        loop {
+            if state.borrow_and_update().worktree.is_some() {
+                break;
+            }
+            state.changed().await.expect("state sender alive");
+        }
+        let held = state.borrow().worktree.clone().expect("worktree in State");
+        assert!(held.get(Path::new("README.md")).is_some());
+        assert!(held.get(Path::new("src")).is_some());
+        assert!(held.get(Path::new("src/main.rs")).is_some());
+
+        // A new file streams as an incremental UpdateWorktree on the bus, and
+        // the State follows it.
+        write_file(&tmp.path.join("src/lib.rs"), "pub fn lib() {}");
+        let added = recv_until(&mut events, |msg| match msg {
+            DaemonMessage::UpdateWorktree { added, .. } => Some(added),
+            _ => None,
+        })
+        .await;
+        assert!(added.iter().any(|e| e.path == "src/lib.rs"));
+        let held = state.borrow().worktree.clone().expect("worktree in State");
+        assert!(held.get(Path::new("src/lib.rs")).is_some());
+
+        drop(handles);
+        drop(events);
+        loop_handle.await.expect("dispatch loop joins cleanly");
+    }
+
+    #[tokio::test]
+    async fn test_serve_uds_replays_snapshot_to_each_attach() {
+        let tmp = TempDir::new("reattach");
+        write_file(&tmp.path.join("tracked.txt"), "x");
+
+        let sock = unique_socket_path();
+        let server = tokio::spawn({
+            let sock = sock.clone();
+            let root = tmp.path.clone();
+            async move { serve_uds(&sock, Some(root)).await }
+        });
+        wait_for_socket(&sock).await;
+
+        // First attach: handshake, receive the full snapshot, then disconnect.
+        {
+            let mut c1 = UnixStream::connect(&sock).await.expect("connect 1");
+            let mut d1 = FrameDecoder::new();
+            c1.write_all(&hello_frame()).await.expect("send Hello 1");
+            c1.flush().await.expect("flush 1");
+            let entries = read_full_snapshot(&mut c1, &mut d1).await;
+            assert!(entries.iter().any(|e| e.path == "tracked.txt"));
+        }
+
+        // Reattach: a fresh connection replays the snapshot again. The replay is
+        // per connection (the #62 reattach contract), with no shared bus
+        // involved — so a large snapshot cannot be lost to a lagging subscriber.
+        let mut c2 = UnixStream::connect(&sock).await.expect("reconnect");
+        let mut d2 = FrameDecoder::new();
+        c2.write_all(&hello_frame()).await.expect("send Hello 2");
+        c2.flush().await.expect("flush 2");
+        let entries = read_full_snapshot(&mut c2, &mut d2).await;
+        assert!(entries.iter().any(|e| e.path == "tracked.txt"));
+
+        server.abort();
+        let _ = tokio::fs::remove_file(&sock).await;
+    }
+
+    #[tokio::test]
+    async fn test_serve_uds_with_worktree_streams_snapshot_then_updates() {
+        let tmp = TempDir::new("uds-worktree");
+        write_file(&tmp.path.join("src/main.rs"), "fn main() {}");
+
+        let sock = unique_socket_path();
+        let server = tokio::spawn({
+            let sock = sock.clone();
+            let root = tmp.path.clone();
+            async move { serve_uds(&sock, Some(root)).await }
+        });
+        wait_for_socket(&sock).await;
+
+        let mut client = UnixStream::connect(&sock).await.expect("connect");
+        let mut decoder = FrameDecoder::new();
+        client.write_all(&hello_frame()).await.expect("send Hello");
+        client.flush().await.expect("flush Hello");
+
+        // The handshake is followed by the per-connection snapshot replay.
+        let entries = read_full_snapshot(&mut client, &mut decoder).await;
+        assert!(entries.iter().any(|e| e.path == "src/main.rs"));
+
+        // A change on disk reaches the attached client as an UpdateWorktree.
+        write_file(&tmp.path.join("src/lib.rs"), "pub fn lib() {}");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match read_daemon_message(&mut client, &mut decoder).await {
+                    DaemonMessage::UpdateWorktree { added, .. }
+                        if added.iter().any(|e| e.path == "src/lib.rs") =>
+                    {
+                        break;
+                    }
+                    // Tolerate unrelated traffic (e.g. a coalesced batch split).
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("UpdateWorktree for the new file within the timeout");
+
+        server.abort();
+        let _ = tokio::fs::remove_file(&sock).await;
+    }
+
+    #[tokio::test]
+    async fn test_ping_false_when_absent_true_when_listening() {
+        let sock = unique_socket_path();
+        assert!(!ping(&sock).await, "ping must be false before any bind");
+
+        let server = tokio::spawn({
+            let sock = sock.clone();
+            async move { serve_uds(&sock, None).await }
+        });
+        wait_for_socket(&sock).await;
+        assert!(
+            ping(&sock).await,
+            "ping must be true while the daemon listens"
+        );
+
+        server.abort();
+        let _ = tokio::fs::remove_file(&sock).await;
+    }
+
+    // --- git status wiring (#134) ---
+
+    use rift_explorer::{GitEntryStatus as ExGitEntryStatus, GitStatusCode as ExCode};
+
+    /// Build an explorer `GitStatus` from `(path, index, worktree)` triples and
+    /// an optional branch, via the public `compute` path is overkill for unit
+    /// tests — instead exercise `git_delta_messages` against a real computed
+    /// status from a git fixture (below). This helper builds the daemon-side
+    /// fixture repos.
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_git_repo(tag: &str) -> TempDir {
+        let tmp = TempDir::new(tag);
+        git(&tmp.path, &["init", "-q", "-b", "main"]);
+        write_file(&tmp.path.join("tracked.txt"), "v1\n");
+        git(&tmp.path, &["add", "tracked.txt"]);
+        git(&tmp.path, &["commit", "-q", "-m", "init"]);
+        tmp
+    }
+
+    /// A flush whose git recompute fails emits worktree changes but no git tick
+    /// (#430). The relay must still deliver those changes on the idle-poll
+    /// timeout — not hold them until the next successful recompute — and a
+    /// later successful recompute must follow as a normal git tick.
+    #[tokio::test]
+    async fn test_relay_events_git_tick_absent_still_relays_worktree_changes() {
+        let (changes_tx, changes_rx) = std::sync::mpsc::channel::<Vec<Change>>();
+        let (git_tx, git_rx) = std::sync::mpsc::channel::<GitStatus>();
+        let (events_tx, mut events_rx) = mpsc::channel(WORKTREE_EVENT_CAPACITY);
+
+        // `relay_events` blocks (`recv_timeout` / `blocking_send`), so it runs
+        // on its own thread — the same shape as the production worker.
+        let relay = std::thread::spawn(move || {
+            relay_events(&changes_rx, &git_rx, &events_tx);
+        });
+
+        // Injected git failure: the flush queued a change batch, but the failed
+        // recompute produced no git tick.
+        changes_tx
+            .send(vec![Change::Removed {
+                path: PathBuf::from("gone.txt"),
+            }])
+            .expect("queue change batch");
+
+        let event = tokio::time::timeout(Duration::from_secs(5), events_rx.recv())
+            .await
+            .expect("worktree change relayed despite the missing git tick")
+            .expect("relay alive");
+        assert!(
+            matches!(
+                &event,
+                WorktreeEvent::Changed(batch)
+                    if matches!(
+                        batch.as_slice(),
+                        [Change::Removed { path }] if path.as_path() == Path::new("gone.txt")
+                    )
+            ),
+            "expected the queued change batch to be relayed"
+        );
+
+        // Git status recovers on a later tick: the recompute is relayed as a
+        // normal GitRecomputed event.
+        let repo = init_git_repo("relay-drain");
+        let status = GitStatus::compute(&repo.path).expect("compute status");
+        git_tx.send(status).expect("queue git tick");
+        let event = tokio::time::timeout(Duration::from_secs(5), events_rx.recv())
+            .await
+            .expect("git tick relayed after recovery")
+            .expect("relay alive");
+        assert!(matches!(event, WorktreeEvent::GitRecomputed(_)));
+
+        // Dropping the watcher-side senders disconnects the relay's channels;
+        // it must return rather than spin.
+        drop(changes_tx);
+        drop(git_tx);
+        relay.join().expect("relay thread joins cleanly");
+    }
+
+    #[test]
+    fn test_git_delta_messages_full_when_old_is_none() {
+        let repo = init_git_repo("delta-full");
+        write_file(&repo.path.join("loose.txt"), "x\n");
+        let status = GitStatus::compute(&repo.path).expect("compute");
+
+        let messages = git_delta_messages(None, &status);
+        // Full set: one UpdateGitStatus (all entries as changed, nothing cleared)
+        // and a RepoState.
+        let update = messages
+            .iter()
+            .find_map(|m| match m {
+                DaemonMessage::UpdateGitStatus { changed, cleared } => Some((changed, cleared)),
+                _ => None,
+            })
+            .expect("an UpdateGitStatus");
+        assert!(update.1.is_empty(), "full set clears nothing");
+        assert!(update.0.iter().any(|e| e.path == "loose.txt"
+            && e.status.worktree == rift_protocol::GitStatusCode::Untracked));
+        assert!(messages
+            .iter()
+            .any(|m| matches!(m, DaemonMessage::RepoState { branch, .. } if branch.as_deref() == Some("main"))));
+    }
+
+    #[test]
+    fn test_git_delta_messages_incremental_changed_and_cleared() {
+        let repo = init_git_repo("delta-incr");
+        // old: one untracked file. new: that file gone, a different one modified.
+        write_file(&repo.path.join("gone.txt"), "g\n");
+        let old = GitStatus::compute(&repo.path).expect("old");
+        std::fs::remove_file(repo.path.join("gone.txt")).expect("rm");
+        write_file(&repo.path.join("tracked.txt"), "v2\n");
+        let new = GitStatus::compute(&repo.path).expect("new");
+
+        let messages = git_delta_messages(Some(&old), &new);
+        let (changed, cleared) = messages
+            .iter()
+            .find_map(|m| match m {
+                DaemonMessage::UpdateGitStatus { changed, cleared } => Some((changed, cleared)),
+                _ => None,
+            })
+            .expect("an UpdateGitStatus");
+        assert!(
+            changed.iter().any(|e| e.path == "tracked.txt"
+                && e.status.worktree == rift_protocol::GitStatusCode::Modified),
+            "the newly-modified file is changed"
+        );
+        assert!(
+            cleared.iter().any(|p| p == "gone.txt"),
+            "the removed-from-status file is cleared"
+        );
+    }
+
+    #[test]
+    fn test_git_delta_messages_repo_only_change_emits_only_repo_state() {
+        let repo = init_git_repo("delta-repo");
+        let old = GitStatus::compute(&repo.path).expect("old");
+        git(&repo.path, &["checkout", "-q", "-b", "feature"]);
+        let new = GitStatus::compute(&repo.path).expect("new");
+
+        let messages = git_delta_messages(Some(&old), &new);
+        // Only the branch changed; no per-file status delta.
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, DaemonMessage::UpdateGitStatus { .. })),
+            "no per-file delta for a branch-only change: {messages:?}"
+        );
+        assert!(messages.iter().any(
+            |m| matches!(m, DaemonMessage::RepoState { branch, .. } if branch.as_deref() == Some("feature"))
+        ));
+    }
+
+    #[test]
+    fn test_git_delta_messages_repo_state_carries_line_totals() {
+        let repo = init_git_repo("delta-totals");
+        write_file(&repo.path.join("tracked.txt"), "v2\nextra\n");
+        let status = GitStatus::compute(&repo.path).expect("compute");
+
+        let messages = git_delta_messages(None, &status);
+        let totals = messages
+            .iter()
+            .find_map(|m| match m {
+                DaemonMessage::RepoState {
+                    lines_added,
+                    lines_removed,
+                    ..
+                } => Some((*lines_added, *lines_removed)),
+                _ => None,
+            })
+            .expect("a RepoState");
+        assert_eq!(totals, (2, 1));
+    }
+
+    #[test]
+    fn test_git_delta_messages_totals_only_change_still_emits_repo_state() {
+        // The per-file porcelain code stays `Modified` on both sides, so no
+        // `UpdateGitStatus` delta fires — but the line totals differ, and
+        // `RepoState`'s `PartialEq` covers them, so it must still re-emit
+        // (the recompute-driven "+N -M updates on the recompute cadence"
+        // acceptance behavior).
+        let repo = init_git_repo("delta-totals-only");
+        write_file(&repo.path.join("tracked.txt"), "v2\n");
+        let old = GitStatus::compute(&repo.path).expect("old");
+        write_file(&repo.path.join("tracked.txt"), "v2\nv3\nv4\n");
+        let new = GitStatus::compute(&repo.path).expect("new");
+
+        let messages = git_delta_messages(Some(&old), &new);
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, DaemonMessage::UpdateGitStatus { .. })),
+            "the porcelain code is unchanged, so no per-file delta: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, DaemonMessage::RepoState { .. })),
+            "the line totals changed, so RepoState must still re-emit: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn test_git_delta_messages_no_change_is_empty() {
+        let repo = init_git_repo("delta-none");
+        let a = GitStatus::compute(&repo.path).expect("a");
+        let b = GitStatus::compute(&repo.path).expect("b");
+        assert!(git_delta_messages(Some(&a), &b).is_empty());
+    }
+
+    #[test]
+    fn test_wire_git_code_maps_every_variant() {
+        use rift_protocol::GitStatusCode as P;
+        for (e, p) in [
+            (ExCode::Unmodified, P::Unmodified),
+            (ExCode::Modified, P::Modified),
+            (ExCode::TypeChange, P::TypeChange),
+            (ExCode::Added, P::Added),
+            (ExCode::Deleted, P::Deleted),
+            (ExCode::Renamed, P::Renamed),
+            (ExCode::Copied, P::Copied),
+            (ExCode::Unmerged, P::Unmerged),
+            (ExCode::Untracked, P::Untracked),
+        ] {
+            assert_eq!(wire_git_code(e), p);
+        }
+    }
+
+    #[test]
+    fn test_wire_git_entry_maps_path_and_both_sides() {
+        let entry = wire_git_entry(
+            Path::new("src/main.rs"),
+            &ExGitEntryStatus {
+                index: ExCode::Added,
+                worktree: ExCode::Modified,
+            },
+        );
+        assert_eq!(entry.path, "src/main.rs");
+        assert_eq!(entry.status.index, rift_protocol::GitStatusCode::Added);
+        assert_eq!(
+            entry.status.worktree,
+            rift_protocol::GitStatusCode::Modified
+        );
+    }
+
+    #[test]
+    fn test_lsp_status_message_carries_server_and_state() {
+        let event = LspStatusEvent {
+            server: "rust-analyzer".to_string(),
+            state: LspServerState::Crashed,
+        };
+        assert_eq!(
+            lsp_status_message(&event),
+            DaemonMessage::LspStatus {
+                server: "rust-analyzer".to_string(),
+                state: LspServerState::Crashed,
+            }
+        );
+    }
+
+    #[test]
+    fn test_lsp_status_snapshot_messages_one_per_server() {
+        let mut lsp_status = BTreeMap::new();
+        lsp_status.insert("rust-analyzer".to_string(), LspServerState::Running);
+        lsp_status.insert("some-linter".to_string(), LspServerState::Crashed);
+
+        let messages = lsp_status_snapshot_messages(&lsp_status);
+        assert_eq!(messages.len(), 2);
+        assert!(messages.contains(&DaemonMessage::LspStatus {
+            server: "rust-analyzer".to_string(),
+            state: LspServerState::Running,
+        }));
+        assert!(messages.contains(&DaemonMessage::LspStatus {
+            server: "some-linter".to_string(),
+            state: LspServerState::Crashed,
+        }));
+    }
+
+    #[test]
+    fn test_lsp_status_snapshot_messages_empty_map_yields_no_messages() {
+        assert!(lsp_status_snapshot_messages(&BTreeMap::new()).is_empty());
+    }
+
+    /// Drain framed messages off a connection until no message arrives within
+    /// `settle`, returning all collected. Tolerates ordering/duplicates (the
+    /// per-connection replay and the bus broadcast can both deliver git state).
+    async fn drain_messages<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        decoder: &mut FrameDecoder,
+        settle: Duration,
+    ) -> Vec<DaemonMessage> {
+        let mut msgs = Vec::new();
+        while let Ok(msg) = tokio::time::timeout(settle, read_daemon_message(reader, decoder)).await
+        {
+            msgs.push(msg);
+        }
+        msgs
+    }
+
+    fn untracked_in(msgs: &[DaemonMessage], path: &str) -> bool {
+        msgs.iter().any(|m| {
+            matches!(m, DaemonMessage::UpdateGitStatus { changed, .. }
+                if changed.iter().any(|e| e.path == path
+                    && e.status.worktree == rift_protocol::GitStatusCode::Untracked))
+        })
+    }
+
+    #[tokio::test]
+    async fn test_serve_uds_git_repo_streams_status_and_updates() {
+        let repo = init_git_repo("uds-git");
+        write_file(&repo.path.join("loose.txt"), "x\n");
+
+        let sock = unique_socket_path();
+        let server = tokio::spawn({
+            let sock = sock.clone();
+            let root = repo.path.clone();
+            async move { serve_uds(&sock, Some(root)).await }
+        });
+        wait_for_socket(&sock).await;
+
+        let mut client = UnixStream::connect(&sock).await.expect("connect");
+        let mut decoder = FrameDecoder::new();
+        client.write_all(&hello_frame()).await.expect("send Hello");
+        client.flush().await.expect("flush Hello");
+
+        // Initial: the replay (and/or bus) delivers the worktree snapshot plus
+        // the full git status — the untracked file and the branch.
+        let initial = drain_messages(&mut client, &mut decoder, Duration::from_secs(2)).await;
+        assert!(
+            untracked_in(&initial, "loose.txt"),
+            "initial git status carries the untracked file: {initial:?}"
+        );
+        assert!(
+            initial.iter().any(|m| matches!(m, DaemonMessage::RepoState { branch, .. } if branch.as_deref() == Some("main"))),
+            "initial repo state carries the branch: {initial:?}"
+        );
+
+        // A `git add` mutates `.git/index`; the daemon recomputes and streams an
+        // incremental moving the change to the index (staged) side.
+        git(&repo.path, &["add", "loose.txt"]);
+        let after = drain_messages(&mut client, &mut decoder, Duration::from_secs(3)).await;
+        assert!(
+            after.iter().any(|m| {
+                matches!(m, DaemonMessage::UpdateGitStatus { changed, .. }
+                    if changed.iter().any(|e| e.path == "loose.txt"
+                        && e.status.index == rift_protocol::GitStatusCode::Added))
+            }),
+            "staging streams an index-side update: {after:?}"
+        );
+
+        server.abort();
+        let _ = tokio::fs::remove_file(&sock).await;
+    }
+
+    #[tokio::test]
+    async fn test_worktree_worker_upgrades_to_git_after_init() {
+        // A root that becomes a git repository after startup must gain git status
+        // without a daemon restart: the worktree-only phase re-probes each tick
+        // and upgrades in place when a repo appears (#483).
+        let tmp = TempDir::new("git-reprobe");
+        write_file(&tmp.path.join("tracked.txt"), "v1\n");
+        let (mut daemon, handles) = channels(64, 8);
+        daemon.watch_worktree(tmp.path.clone());
+        let mut state = handles.state.clone();
+        let loop_handle = tokio::spawn(daemon.run());
+        // The initial scan lands with no git status — the root is not a repo yet.
+        loop {
+            {
+                let snap = state.borrow_and_update();
+                if snap.worktree.is_some() {
+                    assert!(snap.git.is_none(), "a non-repo root carries no git status");
+                    break;
+                }
+            }
+            state.changed().await.expect("state sender alive");
+        }
+        // Make the root a repository. `git add` (no commit) leaves tracked.txt
+        // staged as an add, so the recomputed status carries an entry for it.
+        git(&tmp.path, &["init", "-q", "-b", "main"]);
+        git(&tmp.path, &["add", "tracked.txt"]);
+        // The next re-probe tick upgrades in place: git status for the tracked
+        // file arrives without a restart.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                state.changed().await.expect("state sender alive");
+                let has_status = state
+                    .borrow_and_update()
+                    .git
+                    .as_ref()
+                    .is_some_and(|status| status.get(Path::new("tracked.txt")).is_some());
+                if has_status {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("git status delivered after init without a daemon restart");
+        loop_handle.abort();
+    }
+
+    // ── Navigation routing + per-connection drop-stale (#482) ────────────────
+
+    /// A hover request `ClientMessage` at `id` for a fixed position.
+    fn hover_request_frame(id: u64) -> Vec<u8> {
+        encode_frame(&ClientMessage::HoverRequest {
+            id: NavRequestId(id),
+            path: "a.rs".to_string(),
+            position: rift_protocol::Position {
+                line: 0,
+                character: 0,
+            },
+        })
+        .expect("encode HoverRequest")
+    }
+
+    /// Read framed messages until a `HoverResponse` arrives, returning its id.
+    /// Tolerates the leading `Welcome`; panics on any other message so a frame
+    /// that leaked from another connection fails the test loudly. Bounded so a
+    /// regression that never routes the answer fails fast instead of hanging CI.
+    async fn read_hover_response_id<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        decoder: &mut FrameDecoder,
+    ) -> NavRequestId {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match read_daemon_message(reader, decoder).await {
+                    DaemonMessage::Welcome { .. } => continue,
+                    DaemonMessage::HoverResponse { id, .. } => return id,
+                    other => panic!("unexpected frame before hover response: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("a hover response must arrive within the timeout")
+    }
+
+    /// A document-symbol request `ClientMessage` at `id`. No `Position` field,
+    /// unlike the other navigation requests.
+    fn document_symbol_request_frame(id: u64) -> Vec<u8> {
+        encode_frame(&ClientMessage::DocumentSymbolRequest {
+            id: NavRequestId(id),
+            path: "a.rs".to_string(),
+        })
+        .expect("encode DocumentSymbolRequest")
+    }
+
+    /// Read framed messages until a `DocumentSymbolResponse` arrives, returning
+    /// its id. Same tolerance/bound discipline as [`read_hover_response_id`].
+    async fn read_document_symbol_response_id<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        decoder: &mut FrameDecoder,
+    ) -> NavRequestId {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match read_daemon_message(reader, decoder).await {
+                    DaemonMessage::Welcome { .. } => continue,
+                    DaemonMessage::DocumentSymbolResponse { id, .. } => return id,
+                    other => panic!("unexpected frame before document_symbol response: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("a document_symbol response must arrive within the timeout")
+    }
+
+    /// Assert no further frame arrives within `dur` — the discriminator between
+    /// per-connection routing and the old broadcast: a leaked response would show
+    /// up here. The connection stays open (its writer is held), so a quiet socket
+    /// times out rather than closing.
+    async fn assert_quiet<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        decoder: &mut FrameDecoder,
+        dur: Duration,
+    ) {
+        if let Ok(msg) = tokio::time::timeout(dur, read_daemon_message(reader, decoder)).await {
+            panic!("unexpected extra frame (nav response leaked across connections?): {msg:?}");
+        }
+    }
+
+    #[test]
+    fn test_nav_stale_gate_supersedes_older_request_of_same_kind() {
+        let pos = rift_protocol::Position {
+            line: 0,
+            character: 0,
+        };
+        let mut gate = NavStaleGate::default();
+
+        // Nothing recorded yet: any answer is stale — there is no request to match.
+        assert!(!gate.is_current(&DaemonMessage::HoverResponse {
+            id: NavRequestId(1),
+            content: None,
+        }));
+
+        // The user hovers, then hovers again before the first answer returns.
+        gate.record(&ClientMessage::HoverRequest {
+            id: NavRequestId(1),
+            path: "a.rs".to_string(),
+            position: pos,
+        });
+        gate.record(&ClientMessage::HoverRequest {
+            id: NavRequestId(2),
+            path: "a.rs".to_string(),
+            position: pos,
+        });
+
+        // The superseded id=1 answer is dropped; the latest id=2 answer passes.
+        assert!(!gate.is_current(&DaemonMessage::HoverResponse {
+            id: NavRequestId(1),
+            content: None,
+        }));
+        assert!(gate.is_current(&DaemonMessage::HoverResponse {
+            id: NavRequestId(2),
+            content: None,
+        }));
+    }
+
+    #[test]
+    fn test_nav_stale_gate_keys_each_operation_independently() {
+        let pos = rift_protocol::Position {
+            line: 0,
+            character: 0,
+        };
+        let mut gate = NavStaleGate::default();
+        gate.record(&ClientMessage::HoverRequest {
+            id: NavRequestId(1),
+            path: "a.rs".to_string(),
+            position: pos,
+        });
+        gate.record(&ClientMessage::DefinitionRequest {
+            id: NavRequestId(2),
+            path: "a.rs".to_string(),
+            position: pos,
+        });
+        gate.record(&ClientMessage::ReferencesRequest {
+            id: NavRequestId(3),
+            path: "a.rs".to_string(),
+            position: pos,
+        });
+        gate.record(&ClientMessage::DocumentSymbolRequest {
+            id: NavRequestId(4),
+            path: "a.rs".to_string(),
+        });
+
+        // Each operation matches only its own latest id — no cross-talk.
+        assert!(gate.is_current(&DaemonMessage::HoverResponse {
+            id: NavRequestId(1),
+            content: None,
+        }));
+        assert!(gate.is_current(&DaemonMessage::DefinitionResponse {
+            id: NavRequestId(2),
+            targets: vec![],
+        }));
+        assert!(gate.is_current(&DaemonMessage::ReferencesResponse {
+            id: NavRequestId(3),
+            locations: vec![],
+        }));
+        assert!(gate.is_current(&DaemonMessage::DocumentSymbolResponse {
+            id: NavRequestId(4),
+            symbols: vec![],
+        }));
+        // A hover answer carrying the definition's id does not match hover.
+        assert!(!gate.is_current(&DaemonMessage::HoverResponse {
+            id: NavRequestId(2),
+            content: None,
+        }));
+        // A document-symbol answer carrying the references' id does not match.
+        assert!(!gate.is_current(&DaemonMessage::DocumentSymbolResponse {
+            id: NavRequestId(3),
+            symbols: vec![],
+        }));
+    }
+
+    /// Two connections share one dispatch loop and one off-loop LSP worker (the
+    /// stable + dev dogfooding case): each connection's hover answer must reach
+    /// only its own socket. Before the fix the worker broadcast nav responses, so
+    /// both sockets saw both answers — the leak `assert_quiet` catches.
+    #[tokio::test]
+    async fn test_nav_response_routes_to_requesting_connection_only() {
+        let (daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
+        let _dispatch = tokio::spawn(daemon.run());
+
+        // Fake off-loop LSP worker: echo each hover request's id back on ITS OWN
+        // reply channel — the routing the real worker performs, minus a server.
+        let (nav_tx, mut nav_rx) = mpsc::channel::<NavRequest>(16);
+        let _worker = tokio::spawn(async move {
+            while let Some(req) = nav_rx.recv().await {
+                if let NavRequest::Hover { id, reply, .. } = req {
+                    let _ = reply
+                        .send(DaemonMessage::HoverResponse { id, content: None })
+                        .await;
+                }
+            }
+        });
+
+        let (client_a, server_a) = tokio::io::duplex(64 * 1024);
+        let (mut ca_reader, mut ca_writer) = tokio::io::split(client_a);
+        let (sa_reader, sa_writer) = tokio::io::split(server_a);
+        let _conn_a = {
+            let (inbound, events, state, nav) = (
+                handles.inbound.clone(),
+                handles.subscribe(),
+                handles.state.clone(),
+                nav_tx.clone(),
+            );
+            tokio::spawn(async move {
+                serve_connection(
+                    sa_reader,
+                    sa_writer,
+                    inbound,
+                    events,
+                    state,
+                    Some(nav),
+                    None,
+                )
+                .await
+            })
+        };
+
+        let (client_b, server_b) = tokio::io::duplex(64 * 1024);
+        let (mut cb_reader, mut cb_writer) = tokio::io::split(client_b);
+        let (sb_reader, sb_writer) = tokio::io::split(server_b);
+        let _conn_b = {
+            let (inbound, events, state, nav) = (
+                handles.inbound.clone(),
+                handles.subscribe(),
+                handles.state.clone(),
+                nav_tx.clone(),
+            );
+            tokio::spawn(async move {
+                serve_connection(
+                    sb_reader,
+                    sb_writer,
+                    inbound,
+                    events,
+                    state,
+                    Some(nav),
+                    None,
+                )
+                .await
+            })
+        };
+
+        let mut da = FrameDecoder::new();
+        let mut db = FrameDecoder::new();
+
+        // Handshake both connections.
+        ca_writer.write_all(&hello_frame()).await.expect("A Hello");
+        ca_writer.flush().await.expect("flush A Hello");
+        assert!(matches!(
+            read_daemon_message(&mut ca_reader, &mut da).await,
+            DaemonMessage::Welcome { .. }
+        ));
+        cb_writer.write_all(&hello_frame()).await.expect("B Hello");
+        cb_writer.flush().await.expect("flush B Hello");
+        assert!(matches!(
+            read_daemon_message(&mut cb_reader, &mut db).await,
+            DaemonMessage::Welcome { .. }
+        ));
+
+        // A asks for hover id=100, B for hover id=200.
+        ca_writer
+            .write_all(&hover_request_frame(100))
+            .await
+            .expect("A sends hover");
+        ca_writer.flush().await.expect("flush A hover");
+        cb_writer
+            .write_all(&hover_request_frame(200))
+            .await
+            .expect("B sends hover");
+        cb_writer.flush().await.expect("flush B hover");
+
+        // Each connection receives only its own answer, and nothing else.
+        assert_eq!(
+            read_hover_response_id(&mut ca_reader, &mut da).await,
+            NavRequestId(100),
+            "connection A must receive its own hover answer"
+        );
+        assert_eq!(
+            read_hover_response_id(&mut cb_reader, &mut db).await,
+            NavRequestId(200),
+            "connection B must receive its own hover answer"
+        );
+        assert_quiet(&mut ca_reader, &mut da, Duration::from_millis(300)).await;
+        assert_quiet(&mut cb_reader, &mut db, Duration::from_millis(300)).await;
+    }
+
+    /// A single connection issues two hovers before the first answer returns; the
+    /// gate drops the superseded answer so only the latest reaches the socket —
+    /// per-connection drop-stale over the real transport (#482).
+    #[tokio::test]
+    async fn test_nav_superseded_response_dropped_per_connection() {
+        let (daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
+        let _dispatch = tokio::spawn(daemon.run());
+
+        // Fake worker: wait for BOTH requests before answering, so the connection
+        // has recorded id=2 as its latest hover before the stale id=1 answer is
+        // even sent. Then answer id=1 (stale) first, then id=2.
+        let (nav_tx, mut nav_rx) = mpsc::channel::<NavRequest>(16);
+        let _worker = tokio::spawn(async move {
+            let first = nav_rx.recv().await.expect("first nav request");
+            let second = nav_rx.recv().await.expect("second nav request");
+            let (id1, reply1) = match first {
+                NavRequest::Hover { id, reply, .. } => (id, reply),
+                other => panic!("expected hover, got {other:?}"),
+            };
+            let (id2, reply2) = match second {
+                NavRequest::Hover { id, reply, .. } => (id, reply),
+                other => panic!("expected hover, got {other:?}"),
+            };
+            let _ = reply1
+                .send(DaemonMessage::HoverResponse {
+                    id: id1,
+                    content: None,
+                })
+                .await;
+            let _ = reply2
+                .send(DaemonMessage::HoverResponse {
+                    id: id2,
+                    content: None,
+                })
+                .await;
+        });
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut c_reader, mut c_writer) = tokio::io::split(client);
+        let (s_reader, s_writer) = tokio::io::split(server);
+        let _conn = {
+            let (inbound, events, state) = (
+                handles.inbound.clone(),
+                handles.subscribe(),
+                handles.state.clone(),
+            );
+            tokio::spawn(async move {
+                serve_connection(
+                    s_reader,
+                    s_writer,
+                    inbound,
+                    events,
+                    state,
+                    Some(nav_tx),
+                    None,
+                )
+                .await
+            })
+        };
+
+        let mut decoder = FrameDecoder::new();
+        c_writer
+            .write_all(&hello_frame())
+            .await
+            .expect("send Hello");
+        c_writer.flush().await.expect("flush Hello");
+        assert!(matches!(
+            read_daemon_message(&mut c_reader, &mut decoder).await,
+            DaemonMessage::Welcome { .. }
+        ));
+
+        c_writer
+            .write_all(&hover_request_frame(1))
+            .await
+            .expect("hover 1");
+        c_writer
+            .write_all(&hover_request_frame(2))
+            .await
+            .expect("hover 2");
+        c_writer.flush().await.expect("flush hovers");
+
+        // The stale id=1 answer is dropped; only the latest id=2 reaches the wire.
+        assert_eq!(
+            read_hover_response_id(&mut c_reader, &mut decoder).await,
+            NavRequestId(2),
+            "only the latest hover answer is written; the superseded one is dropped"
+        );
+        assert_quiet(&mut c_reader, &mut decoder, Duration::from_millis(300)).await;
+    }
+
+    /// The document-symbol pair (#526) must not inherit the #482 broadcast bug:
+    /// two connections sharing one dispatch loop and one off-loop LSP worker
+    /// each receive only their own `DocumentSymbolResponse`.
+    #[tokio::test]
+    async fn test_document_symbol_response_routes_to_requesting_connection_only() {
+        let (daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
+        let _dispatch = tokio::spawn(daemon.run());
+
+        // Fake off-loop LSP worker: echo each document-symbol request's id back
+        // on ITS OWN reply channel — the routing the real worker performs,
+        // minus a server.
+        let (nav_tx, mut nav_rx) = mpsc::channel::<NavRequest>(16);
+        let _worker = tokio::spawn(async move {
+            while let Some(req) = nav_rx.recv().await {
+                if let NavRequest::DocumentSymbol { id, reply, .. } = req {
+                    let _ = reply
+                        .send(DaemonMessage::DocumentSymbolResponse {
+                            id,
+                            symbols: vec![],
+                        })
+                        .await;
+                }
+            }
+        });
+
+        let (client_a, server_a) = tokio::io::duplex(64 * 1024);
+        let (mut ca_reader, mut ca_writer) = tokio::io::split(client_a);
+        let (sa_reader, sa_writer) = tokio::io::split(server_a);
+        let _conn_a = {
+            let (inbound, events, state, nav) = (
+                handles.inbound.clone(),
+                handles.subscribe(),
+                handles.state.clone(),
+                nav_tx.clone(),
+            );
+            tokio::spawn(async move {
+                serve_connection(
+                    sa_reader,
+                    sa_writer,
+                    inbound,
+                    events,
+                    state,
+                    Some(nav),
+                    None,
+                )
+                .await
+            })
+        };
+
+        let (client_b, server_b) = tokio::io::duplex(64 * 1024);
+        let (mut cb_reader, mut cb_writer) = tokio::io::split(client_b);
+        let (sb_reader, sb_writer) = tokio::io::split(server_b);
+        let _conn_b = {
+            let (inbound, events, state, nav) = (
+                handles.inbound.clone(),
+                handles.subscribe(),
+                handles.state.clone(),
+                nav_tx.clone(),
+            );
+            tokio::spawn(async move {
+                serve_connection(
+                    sb_reader,
+                    sb_writer,
+                    inbound,
+                    events,
+                    state,
+                    Some(nav),
+                    None,
+                )
+                .await
+            })
+        };
+
+        let mut da = FrameDecoder::new();
+        let mut db = FrameDecoder::new();
+
+        // Handshake both connections.
+        ca_writer.write_all(&hello_frame()).await.expect("A Hello");
+        ca_writer.flush().await.expect("flush A Hello");
+        assert!(matches!(
+            read_daemon_message(&mut ca_reader, &mut da).await,
+            DaemonMessage::Welcome { .. }
+        ));
+        cb_writer.write_all(&hello_frame()).await.expect("B Hello");
+        cb_writer.flush().await.expect("flush B Hello");
+        assert!(matches!(
+            read_daemon_message(&mut cb_reader, &mut db).await,
+            DaemonMessage::Welcome { .. }
+        ));
+
+        // A asks for document symbols id=100, B for id=200.
+        ca_writer
+            .write_all(&document_symbol_request_frame(100))
+            .await
+            .expect("A sends document_symbol");
+        ca_writer.flush().await.expect("flush A document_symbol");
+        cb_writer
+            .write_all(&document_symbol_request_frame(200))
+            .await
+            .expect("B sends document_symbol");
+        cb_writer.flush().await.expect("flush B document_symbol");
+
+        // Each connection receives only its own answer, and nothing else.
+        assert_eq!(
+            read_document_symbol_response_id(&mut ca_reader, &mut da).await,
+            NavRequestId(100),
+            "connection A must receive its own document_symbol answer"
+        );
+        assert_eq!(
+            read_document_symbol_response_id(&mut cb_reader, &mut db).await,
+            NavRequestId(200),
+            "connection B must receive its own document_symbol answer"
+        );
+        assert_quiet(&mut ca_reader, &mut da, Duration::from_millis(300)).await;
+        assert_quiet(&mut cb_reader, &mut db, Duration::from_millis(300)).await;
+    }
+
+    /// Every [`buffer::BufferError`] maps to the matching wire
+    /// [`BufferErrorReason`]: `NotUtf8` / `TooLarge` directly, `PathEscape` to the
+    /// generic `Io`, and an `Io` refined by its [`std::io::ErrorKind`].
+    #[test]
+    fn test_buffer_error_reason_maps_each_variant_to_matching_reason() {
+        use std::io::{Error, ErrorKind};
+
+        let cases: [(buffer::BufferError, BufferErrorReason); 6] = [
+            (
+                buffer::BufferError::NotUtf8("f".into()),
+                BufferErrorReason::NotUtf8,
+            ),
+            (
+                buffer::BufferError::TooLarge("f".into()),
+                BufferErrorReason::TooLarge,
+            ),
+            (
+                buffer::BufferError::PathEscape("f".into()),
+                BufferErrorReason::Io,
+            ),
+            (
+                buffer::BufferError::Io {
+                    path: "f".into(),
+                    source: Error::from(ErrorKind::NotFound),
+                },
+                BufferErrorReason::NotFound,
+            ),
+            (
+                buffer::BufferError::Io {
+                    path: "f".into(),
+                    source: Error::from(ErrorKind::PermissionDenied),
+                },
+                BufferErrorReason::PermissionDenied,
+            ),
+            (
+                buffer::BufferError::Io {
+                    path: "f".into(),
+                    source: Error::from(ErrorKind::Other),
+                },
+                BufferErrorReason::Io,
+            ),
+        ];
+
+        for (err, expected) in cases {
+            assert_eq!(buffer_error_reason(&err), expected, "for {err:?}");
+        }
+    }
+
+    /// A worktree-backed `State` receiver keyed at `root`, for driving
+    /// `request_reply` against a real on-disk worktree in tests. The sender is
+    /// dropped: `request_reply` only `borrow`s the last value, which the receiver
+    /// keeps holding after the sender is gone.
+    fn state_rx_for(root: &Path) -> watch::Receiver<State> {
+        let snapshot = Snapshot::scan(root).expect("scan worktree root");
+        let (_tx, rx) = watch::channel(State {
+            worktree: Some(snapshot),
+            ..Default::default()
+        });
+        rx
+    }
+
+    /// `request_reply` answers a refused `OpenFile` (missing file) with an
+    /// immediate `OpenError` carrying the specific `NotFound` reason, instead of
+    /// dropping the request and leaving the editor to time out.
+    #[tokio::test]
+    async fn test_request_reply_open_missing_file_yields_open_error_not_found() {
+        let tmp = TempDir::new("reply-open-missing");
+        let rx = state_rx_for(&tmp.path);
+
+        let reply = request_reply(
+            &rx,
+            ClientMessage::OpenFile {
+                path: "does-not-exist.rs".to_string(),
+            },
+        )
+        .await;
+        match reply {
+            Some(DaemonMessage::OpenError { path, reason }) => {
+                assert_eq!(path, "does-not-exist.rs");
+                assert_eq!(reason, BufferErrorReason::NotFound);
+            }
+            other => panic!("expected OpenError NotFound, got {other:?}"),
+        }
+    }
+
+    /// `request_reply` answers a refused `OpenFile` (non-UTF-8 content) with an
+    /// `OpenError { reason: NotUtf8 }`.
+    #[tokio::test]
+    async fn test_request_reply_open_binary_file_yields_open_error_not_utf8() {
+        let tmp = TempDir::new("reply-open-binary");
+        std::fs::write(tmp.path.join("blob.bin"), [0x00, 0xff, 0xfe, b'a']).expect("write binary");
+        let rx = state_rx_for(&tmp.path);
+
+        let reply = request_reply(
+            &rx,
+            ClientMessage::OpenFile {
+                path: "blob.bin".to_string(),
+            },
+        )
+        .await;
+        match reply {
+            Some(DaemonMessage::OpenError { path, reason }) => {
+                assert_eq!(path, "blob.bin");
+                assert_eq!(reason, BufferErrorReason::NotUtf8);
+            }
+            other => panic!("expected OpenError NotUtf8, got {other:?}"),
+        }
+    }
+
+    /// `request_reply` answers a refused `SaveFile` (a path escaping the root)
+    /// with an immediate `SaveError` rather than dropping it — a path escape
+    /// collapses to the generic `Io` reason.
+    #[tokio::test]
+    async fn test_request_reply_save_path_escape_yields_save_error_io() {
+        let tmp = TempDir::new("reply-save-escape");
+        let rx = state_rx_for(&tmp.path);
+
+        let reply = request_reply(
+            &rx,
+            ClientMessage::SaveFile {
+                path: "../escape.txt".to_string(),
+                content: "should not land".to_string(),
+                base_mtime: std::time::SystemTime::UNIX_EPOCH,
+            },
+        )
+        .await;
+        match reply {
+            Some(DaemonMessage::SaveError { path, reason }) => {
+                assert_eq!(path, "../escape.txt");
+                assert_eq!(reason, BufferErrorReason::Io);
+            }
+            other => panic!("expected SaveError Io, got {other:?}"),
+        }
+    }
+}

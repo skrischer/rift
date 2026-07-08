@@ -1,0 +1,2519 @@
+//! File-tree render: the navigable explorer panel built from the client
+//! worktree model (`docs/spec-editor.md`, the file-tree render debut; #186).
+//!
+//! The [`WorktreeModel`] is a flat `path -> entry` map (snapshot as source of
+//! truth). This view derives a depth-annotated, collapse-aware *visible row*
+//! list from it and caches it (the zed `EntryDetails` pattern): a model fold
+//! (via [`FileTree::model_mut`]), a collapse toggle, or a selection change
+//! marks the cache dirty, and it is rebuilt once, on the next render — not on
+//! every paint, which used to run the derivation twice per frame (once for
+//! sizing, once inside the virtual list's row closure) and froze interaction.
+//! It renders that cached list virtualized via `gpui-component`'s
+//! [`v_virtual_list`] (so a directory with thousands of entries paints only the
+//! rows on screen), and lets the user expand/collapse directories and select a
+//! file.
+//!
+//! Bounded to **navigate + open + decorate** (the spec's v1 tree scope):
+//! selecting a file emits [`FileTreeEvent::OpenFile`] carrying its root-relative
+//! path — the clean signal the editor surface (#187) subscribes to. Rows carry
+//! git status and diagnostic severity from the model, rolled up onto ancestor
+//! directories (`compute_rollup`, #329) so a collapsed folder still surfaces a
+//! modified/errored descendant; a deleted tracked file, whose own row is gone,
+//! rolls its status up onto surviving ancestors the same way (#480).
+//! No rich operations (create/rename/delete/move)
+//! live here — that stays a later explorer-panel sub-spec. Selecting changes no
+//! tmux pane/window state — this is a pure GUI surface, agent-agnostic by
+//! construction (it only ever reads file paths, kinds, git status, diagnostics,
+//! and the `ignored` flag; it never inspects pane processes or file contents).
+//!
+//! Implements `gpui-component`'s `Panel` trait directly (`docs/spec-ide-shell.md`,
+//! issue #323), so it can be mounted as a dock panel once the shell adopts
+//! `DockArea` (#324).
+
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+
+use gpui::prelude::FluentBuilder as _;
+use gpui::{
+    div, px, App, Context, EventEmitter, FocusHandle, Focusable, FontWeight,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, ScrollStrategy,
+    SharedString, Size, StatefulInteractiveElement as _, Styled as _, Window,
+};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::dock::{Panel, PanelEvent};
+use gpui_component::{
+    h_flex, v_virtual_list, ActiveTheme as _, Sizable as _, VirtualListScrollHandle,
+};
+use rift_protocol::{DiagnosticSeverity, EntryKind, GitEntryStatus, GitStatusCode};
+
+use crate::worktree::WorktreeModel;
+
+/// Stable, distinct dock-panel identity for the file tree (`Panel::panel_name`).
+/// Once shipped this must not change — it is the persisted panel identifier.
+pub const FILE_TREE_PANEL_NAME: &str = "explorer";
+
+/// Fixed row height for every tree entry. The virtual list needs a height per
+/// item; a uniform row keeps the size vector trivial to build and the scroll
+/// math exact.
+const ROW_HEIGHT: Pixels = px(22.0);
+
+/// Height of the `EXPLORER` header band, matching the composite status
+/// line's 28px band (`status_bar.rs`) for a consistent chrome rhythm.
+const HEADER_HEIGHT: Pixels = px(28.0);
+
+/// Horizontal indent applied per nesting level, so depth reads visually.
+const INDENT_PER_LEVEL: f32 = 14.0;
+
+// ── Actions ───────────────────────────────────────────────────────────────────
+
+/// Move the selection to the previous visible row. Bound to `Up` in
+/// `main.rs`, scoped to [`FILE_TREE_KEY_CONTEXT`].
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct SelectUp;
+
+/// Move the selection to the next visible row. Bound to `Down`.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct SelectDown;
+
+/// Collapse the selected directory if expanded, otherwise select its parent.
+/// Bound to `Left`.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct CollapseOrSelectParent;
+
+/// Expand the selected directory if collapsed, otherwise select its first
+/// child. Bound to `Right`.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct ExpandOrSelectChild;
+
+/// Open the selected file, or toggle the selected directory. Bound to
+/// `Enter`.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct OpenSelected;
+
+/// Select the first visible row. Bound to `Home`.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct SelectFirst;
+
+/// Select the last visible row. Bound to `End`.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct SelectLast;
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// The GPUI key context the tree establishes around its root, so the
+/// navigation actions above are scoped to the focused tree and never steal a
+/// keystroke from the terminal panel (agent-first).
+pub const FILE_TREE_KEY_CONTEXT: &str = "FileTree";
+
+/// The open signal the tree emits when the user selects a file — the clean
+/// interface the editor surface (#187) consumes via `cx.subscribe`. Carries the
+/// file's path relative to the worktree root (the same key space as
+/// [`WorktreeModel`] entries); the editor resolves it against the daemon root
+/// when it issues its read request. Only files emit this — selecting a directory
+/// toggles its expansion instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileTreeEvent {
+    /// A file was selected; open it. `path` is root-relative.
+    OpenFile { path: String },
+    /// The header/root-row "reveal active file" action fired
+    /// (`docs/spec-explorer-parity.md`). `workspace.rs`'s existing
+    /// `file_tree` subscription handles this by calling the already-present
+    /// `reveal_open_file_in_tree`, which owns the active-file path — a no-op
+    /// when no file is open. No new protocol, no new cross-crate coupling:
+    /// the panel just re-triggers the reveal path the editor-load flow
+    /// already drives.
+    RevealActiveRequested,
+}
+
+/// Which placeholder the panel shows instead of the tree
+/// (`docs/spec-explorer-parity.md`) — see [`FileTree::empty_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyState {
+    /// No snapshot has arrived yet: startup, connecting, or a non-repo root
+    /// the daemon has not resolved (`model.root()` is `None`).
+    Loading,
+    /// A snapshot arrived and the root has no entries (`model.root()` is
+    /// `Some`, `model.is_empty()` is `true`).
+    EmptyRoot,
+}
+
+/// One rendered row: an entry's path, kind, nesting depth, and decoration
+/// (git status + diagnostic severity, rolled up onto directories; the
+/// `ignored` flag straight from the model). Built by [`FileTree::visible_rows`]
+/// and held in [`FileTree::row_cache`]; the cache is always a wholesale
+/// replacement of a fresh build (never mutated in place), so it can never
+/// drift from the snapshot.
+#[derive(Debug, PartialEq)]
+struct Row {
+    path: String,
+    kind: EntryKind,
+    depth: usize,
+    ignored: bool,
+    /// `None` means clean — no descendant (or, for a file, the file itself)
+    /// carries a git status.
+    git_status: Option<GitRollupStatus>,
+    /// `None` means no descendant (or the file itself) carries a diagnostic.
+    severity: Option<DiagnosticSeverity>,
+}
+
+/// A directory's or file's rolled-up git status, ordered by the roll-up's
+/// rendering precedence (`docs/spec-explorer-panel.md`: `conflicted > changed
+/// > untracked > clean`). A deleted tracked file rolls up under `changed`
+/// (the same affordance as modified/added/renamed, per that spec) — #480 only
+/// adds the ancestor roll-up, not a new lane. Declared low-to-high so
+/// `Option<GitRollupStatus>`'s derived `Ord` (`None` sorts below every variant,
+/// standing in for "clean") lets [`Rollup::merge`] pick the worst of two with a
+/// plain `max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum GitRollupStatus {
+    Untracked,
+    Changed,
+    Conflicted,
+}
+
+impl GitRollupStatus {
+    /// Classify one path's raw index/worktree status into the roll-up's
+    /// three-way precedence. `None` (clean on both sides) is never actually
+    /// sent by the daemon (`WorktreeModel::apply_git_update`'s doc), but is
+    /// handled rather than assumed away. A deletion is a non-`Unmodified`
+    /// status, so it classifies as `Changed` via the catch-all.
+    fn from_status(status: GitEntryStatus) -> Option<Self> {
+        if status.index == GitStatusCode::Unmerged || status.worktree == GitStatusCode::Unmerged {
+            Some(Self::Conflicted)
+        } else if status.index == GitStatusCode::Untracked
+            || status.worktree == GitStatusCode::Untracked
+        {
+            Some(Self::Untracked)
+        } else if status.index != GitStatusCode::Unmodified
+            || status.worktree != GitStatusCode::Unmodified
+        {
+            Some(Self::Changed)
+        } else {
+            None
+        }
+    }
+
+    /// Single-letter badge rendered after a row's name.
+    fn badge(self) -> &'static str {
+        match self {
+            Self::Conflicted => "C",
+            Self::Changed => "M",
+            Self::Untracked => "U",
+        }
+    }
+}
+
+/// Rank a [`DiagnosticSeverity`] for roll-up comparison: the wire enum is
+/// declared in LSP's own severity order, not the roll-up's "worst wins"
+/// precedence (`Error > Warning > Information > Hint`), so it has no useful
+/// `Ord` of its own.
+fn severity_rank(severity: DiagnosticSeverity) -> u8 {
+    match severity {
+        DiagnosticSeverity::Error => 3,
+        DiagnosticSeverity::Warning => 2,
+        DiagnosticSeverity::Information => 1,
+        DiagnosticSeverity::Hint => 0,
+    }
+}
+
+/// The worse (higher-precedence) of two severities.
+fn worse_severity(a: DiagnosticSeverity, b: DiagnosticSeverity) -> DiagnosticSeverity {
+    if severity_rank(b) > severity_rank(a) {
+        b
+    } else {
+        a
+    }
+}
+
+/// The worse of two optional severities; `None` is clean and loses to any
+/// `Some`.
+fn max_severity(
+    a: Option<DiagnosticSeverity>,
+    b: Option<DiagnosticSeverity>,
+) -> Option<DiagnosticSeverity> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(s), None) | (None, Some(s)) => Some(s),
+        (Some(x), Some(y)) => Some(worse_severity(x, y)),
+    }
+}
+
+/// The worst severity among every server's diagnostics for one path, or
+/// `None` when the path currently has none.
+fn own_severity(model: &WorktreeModel, path: &str) -> Option<DiagnosticSeverity> {
+    model
+        .diagnostics(path)?
+        .values()
+        .flatten()
+        .map(|d| d.severity)
+        .reduce(worse_severity)
+}
+
+/// One path's rolled-up decoration: for a file, just its own git status and
+/// diagnostic severity; for a directory, the worst among every descendant
+/// (accumulated by [`compute_rollup`]'s single pass).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Rollup {
+    git_status: Option<GitRollupStatus>,
+    severity: Option<DiagnosticSeverity>,
+}
+
+impl Rollup {
+    /// Fold `other` in, keeping the worse of each dimension.
+    fn merge(&mut self, other: Rollup) {
+        self.git_status = self.git_status.max(other.git_status);
+        self.severity = max_severity(self.severity, other.severity);
+    }
+}
+
+/// Compute every path's rolled-up git status + diagnostic severity in a
+/// single pass over the model's full entry set — deliberately *not* the
+/// collapse-filtered visible set, since a collapsed directory must still
+/// surface a hidden descendant's status. A trailing pass folds in git
+/// statuses whose path has left the tree (deleted tracked files, #480): they
+/// have no row of their own, so their status rolls up onto every surviving
+/// ancestor directory instead.
+///
+/// Tracks currently open ancestor directories by their `dir/` prefix, mirroring
+/// [`FileTree::visible_rows`]'s `skip_prefix` — *not* by depth. Depth alone is
+/// unsound: because entries are keyed by raw path string in a `BTreeMap`, a
+/// same-depth sibling whose name is the directory's name plus a byte less than
+/// `/` (0x2F) — most commonly a `.ext` sibling, e.g. `src.rs` next to `src` —
+/// sorts *between* the directory and its own children (`"src" < "src.rs" <
+/// "src/main.rs"`), so a pop keyed on depth drops the directory off the stack
+/// before its real descendants arrive. Popping is instead deferred until the
+/// current path has moved lexically *past* the ancestor's whole prefix range
+/// (`path > prefix` as well as failing `starts_with`) — a path that merely
+/// sorts before the range (like `src.rs`) does not evict its ancestor, and
+/// each entry only folds into an ancestor whose prefix it actually
+/// `starts_with`, so a non-descendant seen while an ancestor is still open
+/// (again, `src.rs`) is not mistakenly merged into it.
+fn compute_rollup(model: &WorktreeModel) -> HashMap<String, Rollup> {
+    let mut result: HashMap<String, Rollup> = HashMap::new();
+    // Shallowest-first stack of ancestor directories whose subtree may still
+    // contain upcoming entries, paired with their `dir/` prefix.
+    let mut open_dirs: Vec<(String, String)> = Vec::new();
+
+    for (path, entry) in model.entries() {
+        while let Some((prefix, _)) = open_dirs.last() {
+            if path.starts_with(prefix.as_str()) || path.as_str() < prefix.as_str() {
+                break;
+            }
+            open_dirs.pop();
+        }
+
+        let own = Rollup {
+            git_status: model
+                .git_status(path)
+                .and_then(GitRollupStatus::from_status),
+            severity: own_severity(model, path),
+        };
+
+        for (prefix, ancestor) in &open_dirs {
+            if path.starts_with(prefix.as_str()) {
+                result.entry(ancestor.clone()).or_default().merge(own);
+            }
+        }
+        result.entry(path.clone()).or_default().merge(own);
+
+        if entry.kind == EntryKind::Dir {
+            open_dirs.push((format!("{path}/"), path.clone()));
+        }
+    }
+
+    // Deleted tracked files have no tree entry anymore (the worktree update
+    // removed it), so the pass above never sees them — but the model still
+    // holds their git status (a `Deleted` code, classified as `Changed`). Roll
+    // each tree-absent status path up onto its surviving ancestor directories
+    // so the deletion stays visible in the explorer (#480). No severity here:
+    // diagnostics are keyed to live files, and a gone path contributes none.
+    for (path, status) in model.git_statuses() {
+        if model.get(path).is_some() {
+            continue;
+        }
+        let Some(git_status) = GitRollupStatus::from_status(*status) else {
+            continue;
+        };
+        let own = Rollup {
+            git_status: Some(git_status),
+            severity: None,
+        };
+        for ancestor in ancestor_dirs(path) {
+            if model.get(ancestor).is_some() {
+                result.entry(ancestor.to_owned()).or_default().merge(own);
+            }
+        }
+    }
+
+    result
+}
+
+/// Every ancestor directory of `path`, shallowest first — the directories a
+/// "reveal" must expand for `path`'s own row to become visible. `a/b/c.rs`
+/// yields `["a", "a/b"]`; a top-level path (no separator) yields none.
+fn ancestor_dirs(path: &str) -> impl Iterator<Item = &str> {
+    path.match_indices('/').map(|(i, _)| &path[..i])
+}
+
+/// Index of `path` within `rows`, or `None` if it is not currently visible
+/// (e.g. its parent was collapsed after it was selected).
+fn row_index(rows: &[Row], path: &str) -> Option<usize> {
+    rows.iter().position(|r| r.path == path)
+}
+
+/// The nearest ancestor directory of `rows[index]`: the closest preceding row
+/// with a strictly smaller depth. `None` at a top-level row (depth `0`).
+fn parent_path(rows: &[Row], index: usize) -> Option<&str> {
+    let depth = rows[index].depth;
+    if depth == 0 {
+        return None;
+    }
+    rows[..index]
+        .iter()
+        .rev()
+        .find(|r| r.depth < depth)
+        .map(|r| r.path.as_str())
+}
+
+/// The first child row of `rows[index]`, if it is an expanded, non-empty
+/// directory. Since [`FileTree::visible_rows`] lists an expanded directory's
+/// children immediately after it, the first child (if any) is simply the next
+/// row, one level deeper.
+fn first_child_path(rows: &[Row], index: usize) -> Option<&str> {
+    let row = &rows[index];
+    if row.kind != EntryKind::Dir {
+        return None;
+    }
+    let next = rows.get(index + 1)?;
+    (next.depth == row.depth + 1).then_some(next.path.as_str())
+}
+
+/// The row selected after moving down one from `selected` (or the first row
+/// when nothing was selected). Clamped at the last row.
+fn selection_after_down(rows: &[Row], selected: Option<&str>) -> Option<String> {
+    if rows.is_empty() {
+        return None;
+    }
+    let next = match selected.and_then(|p| row_index(rows, p)) {
+        Some(i) => (i + 1).min(rows.len() - 1),
+        None => 0,
+    };
+    Some(rows[next].path.clone())
+}
+
+/// The row selected after moving up one from `selected` (or the first row
+/// when nothing was selected). Clamped at the first row.
+fn selection_after_up(rows: &[Row], selected: Option<&str>) -> Option<String> {
+    if rows.is_empty() {
+        return None;
+    }
+    let next = match selected.and_then(|p| row_index(rows, p)) {
+        Some(i) => i.saturating_sub(1),
+        None => 0,
+    };
+    Some(rows[next].path.clone())
+}
+
+/// The navigable file-tree view.
+///
+/// Owns the [`WorktreeModel`] (the client mirror it renders) plus the small
+/// amount of view-local UI state the model deliberately does not hold: which
+/// directories are collapsed and which entry is selected. The model stays pure
+/// data; this view is its first rendered consumer.
+pub struct FileTree {
+    model: WorktreeModel,
+    /// Directories the user has collapsed (their subtrees are hidden). A
+    /// directory absent from this set is expanded — the tree starts fully
+    /// expanded, matching how a fresh snapshot reads.
+    collapsed: HashSet<String>,
+    /// The currently selected entry's path, or `None` when nothing is selected.
+    selected: Option<String>,
+    scroll_handle: VirtualListScrollHandle,
+    /// Lazily created on first [`Focusable::focus_handle`] call (needs an `App`
+    /// the plain [`FileTree::new`] does not take, so the tree stays constructible
+    /// without a GPUI context for the headless model tests below).
+    focus_handle: RefCell<Option<FocusHandle>>,
+    /// The precomputed decorated-row cache: the depth-annotated visible-row
+    /// list, rebuilt from the model by [`FileTree::refresh_row_cache`] only
+    /// when [`FileTree::cache_dirty`] is set. `render()` and the virtual
+    /// list's row closure both read this field directly — neither calls
+    /// [`FileTree::visible_rows`] itself, which is what running twice per
+    /// paint used to freeze interaction on.
+    row_cache: Vec<Row>,
+    /// Set whenever something that changes the visible-row list happens —
+    /// [`FileTree::model_mut`] (any model fold), [`FileTree::toggle_dir`], or a
+    /// selection change — and cleared by [`FileTree::refresh_row_cache`] once
+    /// it rebuilds [`FileTree::row_cache`] from the fresh state. Marking dirty
+    /// inside `model_mut` itself (rather than at each of its callers) means a
+    /// fold can never forget to invalidate the cache: there is no other way to
+    /// mutate the model.
+    cache_dirty: bool,
+}
+
+impl FileTree {
+    /// Create an empty tree. Feed it daemon worktree messages via
+    /// [`FileTree::model_mut`] (then [`Context::notify`]) as they arrive.
+    pub fn new() -> Self {
+        Self {
+            model: WorktreeModel::default(),
+            collapsed: HashSet::new(),
+            selected: None,
+            scroll_handle: VirtualListScrollHandle::new(),
+            focus_handle: RefCell::new(None),
+            row_cache: Vec::new(),
+            cache_dirty: true,
+        }
+    }
+
+    /// The mirrored worktree model, for read access (e.g. root, entry count).
+    pub fn model(&self) -> &WorktreeModel {
+        &self.model
+    }
+
+    /// Mutable access to the model so the daemon-message consumer can fold
+    /// snapshots and updates into it. The caller must `cx.notify()` afterwards
+    /// to repaint; pruning of collapse/selection state against the new tree
+    /// happens lazily at render time, so no extra bookkeeping is needed here.
+    ///
+    /// Marks the row cache dirty unconditionally: this is the only way to
+    /// mutate the model, so every fold site (snapshot / update / git / repo /
+    /// diagnostics in `workspace.rs`) invalidates through this one seam
+    /// without having to remember to do so itself.
+    pub fn model_mut(&mut self) -> &mut WorktreeModel {
+        self.cache_dirty = true;
+        &mut self.model
+    }
+
+    /// The currently selected entry path, if any — the headless handle for the
+    /// selection state.
+    pub fn selected(&self) -> Option<&str> {
+        self.selected.as_deref()
+    }
+
+    /// Whether `path` (a directory) is currently collapsed.
+    pub fn is_collapsed(&self, path: &str) -> bool {
+        self.collapsed.contains(path)
+    }
+
+    /// Toggle a directory's expanded/collapsed state.
+    fn toggle_dir(&mut self, path: &str) {
+        if !self.collapsed.remove(path) {
+            self.collapsed.insert(path.to_owned());
+        }
+        // Collapsing/expanding changes which paths are in the visible-row set.
+        self.cache_dirty = true;
+    }
+
+    /// Handle a click on a directory row (#481): select it, then toggle its
+    /// expansion. Without the selection, arrow-key navigation right after a
+    /// click resumed from whatever was selected before, not the row just
+    /// clicked.
+    fn click_dir(&mut self, path: &str) {
+        self.selected = Some(path.to_owned());
+        self.toggle_dir(path);
+    }
+
+    /// Which placeholder the panel shows in place of the tree, or `None` when
+    /// there are rows to render (`docs/spec-explorer-parity.md`). Distinguishes
+    /// "no snapshot has arrived yet" from "connected, but the root is
+    /// genuinely empty" — the single prior "No files" branch conflated the
+    /// two, which read as an error during ordinary startup.
+    fn empty_state(&self) -> Option<EmptyState> {
+        if self.model.root().is_none() {
+            Some(EmptyState::Loading)
+        } else if self.model.is_empty() {
+            Some(EmptyState::EmptyRoot)
+        } else {
+            None
+        }
+    }
+
+    /// Whether every directory the model currently knows about is collapsed
+    /// — the header button's and root-row chevron's "fully collapsed" state
+    /// (offers Expand once true; `docs/spec-explorer-parity.md`). Deliberately
+    /// `false`, not the vacuous `true` an empty `all()` would give, when the
+    /// model has no directories at all — an all-file tree never claims to be
+    /// collapsed.
+    fn all_dirs_collapsed(&self) -> bool {
+        let mut any_dir = false;
+        for entry in self.model.entries().values() {
+            if entry.kind == EntryKind::Dir {
+                any_dir = true;
+                if !self.collapsed.contains(&entry.path) {
+                    return false;
+                }
+            }
+        }
+        any_dir
+    }
+
+    /// Collapse every directory the model currently knows about (header
+    /// "Collapse all" / root-row chevron while expanded): inserts each
+    /// `EntryKind::Dir` path into the existing `collapsed` set. Sets
+    /// `cache_dirty` directly, mirroring `toggle_dir`'s discipline, rather
+    /// than looping `toggle_dir` itself — which would re-expand a directory
+    /// that was already collapsed.
+    fn collapse_all(&mut self) {
+        for entry in self.model.entries().values() {
+            if entry.kind == EntryKind::Dir {
+                self.collapsed.insert(entry.path.clone());
+            }
+        }
+        self.cache_dirty = true;
+    }
+
+    /// Expand every directory (header "Expand all" / root-row chevron while
+    /// collapsed): clears the `collapsed` set wholesale.
+    fn expand_all(&mut self) {
+        self.collapsed.clear();
+        self.cache_dirty = true;
+    }
+
+    /// Flip between fully collapsed and fully expanded. The header button
+    /// and the workspace-root chevron are two entry points into the same
+    /// toggle.
+    fn toggle_collapse_all(&mut self) {
+        if self.all_dirs_collapsed() {
+            self.expand_all();
+        } else {
+            self.collapse_all();
+        }
+    }
+
+    /// The leaf (final non-empty path segment) of a root's absolute path —
+    /// the workspace-root row's label before uppercasing. The filesystem
+    /// root `"/"` has no real leaf name; it renders unchanged rather than as
+    /// an empty label.
+    fn root_leaf(root: &str) -> &str {
+        root.rsplit('/')
+            .find(|segment| !segment.is_empty())
+            .unwrap_or(root)
+    }
+
+    /// Reveal `path` in the tree: expand every ancestor directory, select its
+    /// row, and scroll it into view. [`crate::workspace::WorkspaceView`] calls
+    /// this whenever the editor finishes opening or switching to a file
+    /// (`docs/spec-explorer-panel.md`, #331). A `path` absent from the model —
+    /// not (yet) streamed by the daemon, or a stale signal — is a no-op:
+    /// nothing to expand, select, or scroll to.
+    ///
+    /// Mirrors [`FileTree::toggle_dir`]'s dirty-marking discipline: expansion
+    /// or selection changes mark [`FileTree::cache_dirty`], same as a click.
+    /// The cache is then refreshed immediately (not deferred to the next
+    /// render) so the row index used to scroll is current.
+    pub fn reveal(&mut self, path: &str) {
+        if self.model.get(path).is_none() {
+            return;
+        }
+
+        for ancestor in ancestor_dirs(path) {
+            if self.collapsed.remove(ancestor) {
+                self.cache_dirty = true;
+            }
+        }
+        if self.selected.as_deref() != Some(path) {
+            self.selected = Some(path.to_owned());
+            self.cache_dirty = true;
+        }
+
+        self.scroll_selected_into_view();
+    }
+
+    /// Scroll the selected row into view. The tail shared by [`FileTree::reveal`]
+    /// and every keyboard-navigation method below (#431): any selection movement
+    /// must keep the selected row on screen — arrow keys used to walk it
+    /// straight off. Refreshes the row cache first (a collapse/expand step may
+    /// have invalidated it) so the row index used to scroll is current; with no
+    /// selection, or one not in the visible set, there is nothing to scroll to.
+    fn scroll_selected_into_view(&mut self) {
+        self.refresh_row_cache();
+        let Some(selected) = self.selected.as_deref() else {
+            return;
+        };
+        if let Some(ix) = row_index(&self.row_cache, selected) {
+            self.scroll_handle
+                .scroll_to_item(ix, ScrollStrategy::Nearest);
+        }
+    }
+
+    /// Move the selection to the previous visible row ([`SelectUp`]) and
+    /// scroll it into view.
+    fn select_up(&mut self) {
+        self.refresh_row_cache();
+        self.selected = selection_after_up(&self.row_cache, self.selected.as_deref());
+        self.scroll_selected_into_view();
+    }
+
+    /// Move the selection to the next visible row ([`SelectDown`]) and scroll
+    /// it into view.
+    fn select_down(&mut self) {
+        self.refresh_row_cache();
+        self.selected = selection_after_down(&self.row_cache, self.selected.as_deref());
+        self.scroll_selected_into_view();
+    }
+
+    /// Select the first visible row ([`SelectFirst`]) and scroll it into view.
+    fn select_first(&mut self) {
+        self.refresh_row_cache();
+        self.selected = self.row_cache.first().map(|row| row.path.clone());
+        self.scroll_selected_into_view();
+    }
+
+    /// Select the last visible row ([`SelectLast`]) and scroll it into view.
+    fn select_last(&mut self) {
+        self.refresh_row_cache();
+        self.selected = self.row_cache.last().map(|row| row.path.clone());
+        self.scroll_selected_into_view();
+    }
+
+    /// Collapse the selected directory if it is expanded; otherwise select
+    /// its parent ([`CollapseOrSelectParent`]), scrolling the resulting
+    /// selection into view. A no-op at a top-level row with nothing to
+    /// collapse. Selects the first row when nothing was selected yet, matching
+    /// [`FileTree::select_down`]/[`FileTree::select_up`].
+    fn collapse_or_select_parent(&mut self) {
+        self.refresh_row_cache();
+        let Some(selected) = self.selected.clone() else {
+            self.select_first();
+            return;
+        };
+        let Some(index) = row_index(&self.row_cache, &selected) else {
+            return;
+        };
+        let expanded =
+            self.row_cache[index].kind == EntryKind::Dir && !self.collapsed.contains(&selected);
+        if expanded {
+            self.toggle_dir(&selected);
+        } else if let Some(parent) = parent_path(&self.row_cache, index).map(str::to_owned) {
+            self.selected = Some(parent);
+        }
+        self.scroll_selected_into_view();
+    }
+
+    /// Expand the selected directory if it is collapsed; otherwise select its
+    /// first child ([`ExpandOrSelectChild`]), scrolling the resulting
+    /// selection into view. A no-op on a file or an empty, already-expanded
+    /// directory. Selects the first row when nothing was selected yet,
+    /// matching [`FileTree::select_down`]/[`FileTree::select_up`].
+    fn expand_or_select_child(&mut self) {
+        self.refresh_row_cache();
+        let Some(selected) = self.selected.clone() else {
+            self.select_first();
+            return;
+        };
+        let Some(index) = row_index(&self.row_cache, &selected) else {
+            return;
+        };
+        let collapsed =
+            self.row_cache[index].kind == EntryKind::Dir && self.collapsed.contains(&selected);
+        if collapsed {
+            self.toggle_dir(&selected);
+        } else if let Some(child) = first_child_path(&self.row_cache, index).map(str::to_owned) {
+            self.selected = Some(child);
+        }
+        self.scroll_selected_into_view();
+    }
+
+    /// Open the selected file, or toggle the selected directory
+    /// ([`OpenSelected`]) — the keyboard equivalent of [`FileTree::render_row`]'s
+    /// `on_click`.
+    fn open_selected(&mut self, cx: &mut Context<Self>) {
+        self.refresh_row_cache();
+        let Some(selected) = self.selected.clone() else {
+            return;
+        };
+        let Some(index) = row_index(&self.row_cache, &selected) else {
+            return;
+        };
+        if self.row_cache[index].kind == EntryKind::Dir {
+            self.toggle_dir(&selected);
+        } else {
+            cx.emit(FileTreeEvent::OpenFile { path: selected });
+        }
+    }
+
+    /// Rebuild [`FileTree::row_cache`] from the model when [`FileTree::cache_dirty`]
+    /// is set; a no-op otherwise. The single path that calls
+    /// [`FileTree::visible_rows`] — `render()` calls this once per paint instead
+    /// of deriving the visible-row list itself, and the virtual list's row
+    /// closure only ever reads the resulting [`FileTree::row_cache`].
+    fn refresh_row_cache(&mut self) {
+        if self.cache_dirty {
+            self.row_cache = self.visible_rows();
+            self.cache_dirty = false;
+        }
+    }
+
+    /// Build the flattened, depth-annotated, decorated list of currently
+    /// *visible* rows from the model's flat path map.
+    ///
+    /// The model keys entries by their root-relative path in a `BTreeMap`, so
+    /// iteration is already lexicographically ordered — which, for slash-
+    /// separated paths, places every entry directly after its parent and groups
+    /// a directory's whole subtree together. That lets a single pass hide
+    /// subtrees: when a collapsed directory is seen, its descendants (every path
+    /// under `dir/`) are skipped until iteration leaves that prefix.
+    ///
+    /// Decoration is looked up from [`compute_rollup`], which walks the whole
+    /// model (not this collapse-filtered pass) — a collapsed directory's row
+    /// still needs its hidden descendants' rolled-up status.
+    fn visible_rows(&self) -> Vec<Row> {
+        let rollup = compute_rollup(&self.model);
+        let mut rows = Vec::new();
+        // The prefix (`dir/`) of the shallowest collapsed directory currently
+        // being skipped. While set, any path starting with it is a hidden
+        // descendant; the first path that does not is past the subtree.
+        let mut skip_prefix: Option<String> = None;
+
+        for (path, entry) in self.model.entries() {
+            if let Some(prefix) = &skip_prefix {
+                if path.starts_with(prefix.as_str()) {
+                    continue;
+                }
+                skip_prefix = None;
+            }
+
+            // Depth is the number of path separators: a top-level entry has
+            // none, `src/main.rs` has one, and so on.
+            let depth = path.bytes().filter(|&b| b == b'/').count();
+            let decoration = rollup.get(path).copied().unwrap_or_default();
+            rows.push(Row {
+                path: path.clone(),
+                kind: entry.kind.clone(),
+                depth,
+                ignored: entry.ignored,
+                git_status: decoration.git_status,
+                severity: decoration.severity,
+            });
+
+            if entry.kind == EntryKind::Dir && self.collapsed.contains(path) {
+                // Hide this directory's subtree: everything under `path/`.
+                skip_prefix = Some(format!("{path}/"));
+            }
+        }
+
+        rows
+    }
+
+    /// Display name for a row: the final path segment (the model holds full
+    /// root-relative paths; the tree shows the leaf, with depth carrying the
+    /// hierarchy).
+    fn display_name(path: &str) -> &str {
+        path.rsplit('/').next().unwrap_or(path)
+    }
+
+    /// The in-panel header band above the tree (`docs/spec-explorer-parity.md`):
+    /// an uppercase, muted `EXPLORER` label on a subtle elevated surface with
+    /// a bottom hairline, plus a right-aligned action row. Ships exactly the
+    /// two actions that map to a real client capability — collapse-all /
+    /// expand-all (a toggle reflecting `all_dirs_collapsed`) and reveal-active
+    /// — and consciously omits the design's *new file* and *refresh* glyphs
+    /// (no client capability yet: file-ops are deferred, and the tree is
+    /// push-reactive so a manual refresh is redundant; see the spec's prior
+    /// decisions).
+    ///
+    /// Both actions render as `Button::label` text glyphs, not `IconName`
+    /// icons: the shipping `rift` binary does not embed gpui-component's SVG
+    /// icon assets (only the dev-only `gallery` binary enables
+    /// `gpui-component-assets`, see `crates/app/Cargo.toml`), so an
+    /// `IconName` icon would render blank here. A Unicode glyph renders
+    /// reliably either way, mirroring the tree's own disclosure twisty.
+    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let all_collapsed = self.all_dirs_collapsed();
+
+        let collapse_toggle = Button::new("file-tree-collapse-toggle")
+            .ghost()
+            .xsmall()
+            .label(if all_collapsed {
+                "\u{229E}"
+            } else {
+                "\u{229F}"
+            })
+            .tooltip(if all_collapsed {
+                "Expand all"
+            } else {
+                "Collapse all"
+            })
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.toggle_collapse_all();
+                cx.notify();
+            }));
+
+        let reveal_active = Button::new("file-tree-reveal-active")
+            .ghost()
+            .xsmall()
+            .label("\u{2316}")
+            .tooltip("Reveal active file")
+            .on_click(cx.listener(|_this, _event, _window, cx| {
+                cx.emit(FileTreeEvent::RevealActiveRequested);
+            }));
+
+        h_flex()
+            .flex_shrink_0()
+            .items_center()
+            .justify_between()
+            .h(HEADER_HEIGHT)
+            .px(px(8.0))
+            .bg(cx.theme().secondary)
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("EXPLORER"),
+            )
+            .child(
+                h_flex()
+                    .gap(px(2.0))
+                    .child(collapse_toggle)
+                    .child(reveal_active),
+            )
+    }
+
+    /// The workspace-root row (`RIFT` in the design) below the header
+    /// (`docs/spec-explorer-parity.md`): the leaf of `model.root()`'s
+    /// absolute path, uppercased, with a disclosure chevron that mirrors and
+    /// drives the collapse-all/expand-all state. Neutral — no label, no
+    /// chevron, not clickable — while `root()` is `None`: no snapshot has
+    /// arrived yet, so there is nothing to name or toggle.
+    fn render_root_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(root) = self.model.root() else {
+            return h_flex()
+                .flex_shrink_0()
+                .items_center()
+                .h(ROW_HEIGHT)
+                .px(px(8.0))
+                .gap(px(4.0))
+                .child(div().w(px(12.0)).flex_shrink_0())
+                .into_any_element();
+        };
+
+        let chevron = if self.all_dirs_collapsed() {
+            "\u{203a}"
+        } else {
+            "\u{2304}"
+        };
+        let label = Self::root_leaf(root).to_uppercase();
+
+        h_flex()
+            .id("file-tree-root-row")
+            .flex_shrink_0()
+            .items_center()
+            .h(ROW_HEIGHT)
+            .px(px(8.0))
+            .gap(px(4.0))
+            .text_sm()
+            .cursor_pointer()
+            .hover(|s| s.bg(cx.theme().list_hover))
+            .child(div().w(px(12.0)).flex_shrink_0().child(chevron.to_string()))
+            .child(div().text_color(cx.theme().foreground).child(label))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.toggle_collapse_all();
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    /// Whether `row`'s rolled-up decoration (git letter + diagnostic dot)
+    /// should render. Files, and a currently *collapsed* directory, always
+    /// show it; an *expanded* directory shows nothing rolled-up — its visible
+    /// descendants already carry their own, so an ancestor badge would be
+    /// redundant (`docs/spec-explorer-parity.md`). Render-time gate only:
+    /// `compute_rollup` still folds the status onto every directory
+    /// regardless of its collapse state, so toggling collapse (which already
+    /// dirties the row cache) flips this on the very next render.
+    fn row_shows_decoration(&self, row: &Row) -> bool {
+        row.kind != EntryKind::Dir || self.collapsed.contains(&row.path)
+    }
+
+    /// Render one row as an interactive element. Clicking a directory selects
+    /// it and toggles its expansion; clicking a file selects it and emits the
+    /// open signal.
+    fn render_row(&self, row: &Row, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_dir = row.kind == EntryKind::Dir;
+        let is_selected = self.selected.as_deref() == Some(row.path.as_str());
+        let indent = px(row.depth as f32 * INDENT_PER_LEVEL);
+
+        // Directory disclosure glyph (text, not an icon: the product binary does
+        // not embed gpui-component's SVG icon assets, so a glyph renders reliably
+        // either way). A file gets a blank spacer of the same width so names
+        // align across kinds.
+        let twisty = if is_dir {
+            if self.collapsed.contains(&row.path) {
+                "\u{203a}" // single right-pointing angle quotation mark
+            } else {
+                "\u{2304}" // down arrowhead
+            }
+        } else {
+            " "
+        };
+
+        let name = Self::display_name(&row.path).to_owned();
+        let path = row.path.clone();
+
+        // Rolled-up decoration (git letter + diagnostic dot) is suppressed on
+        // an *expanded* directory: its visible descendants already carry
+        // their own, so an ancestor badge would be redundant noise (design:
+        // collapsed `app` shows `M`, expanded `crates`/`terminal`/`src` do
+        // not). Files, and a currently collapsed directory, always show it.
+        let show_decoration = self.row_shows_decoration(row);
+
+        // Diagnostic-severity indicator: a small colored dot, or an empty
+        // same-size spacer when the row is clean or its decoration is
+        // suppressed — keeping every row's layout aligned. Sits in the
+        // trailing cluster, immediately left of the git letter.
+        let severity_dot = row.severity.filter(|_| show_decoration).map(|severity| {
+            let color = match severity {
+                DiagnosticSeverity::Error => cx.theme().danger,
+                DiagnosticSeverity::Warning => cx.theme().warning,
+                DiagnosticSeverity::Information => cx.theme().info,
+                DiagnosticSeverity::Hint => cx.theme().muted_foreground,
+            };
+            div()
+                .size(px(6.0))
+                .flex_shrink_0()
+                .rounded(px(3.0))
+                .bg(color)
+        });
+
+        // Git-status color: tints the name itself, mirroring the roll-up
+        // precedence (`conflicted > changed > untracked`).
+        let git_color = row.git_status.map(|status| match status {
+            GitRollupStatus::Conflicted => cx.theme().danger,
+            GitRollupStatus::Changed => cx.theme().warning,
+            GitRollupStatus::Untracked => cx.theme().success,
+        });
+        let name_el = div()
+            .flex_1()
+            .when(is_selected, |el| el.font_weight(FontWeight::BOLD))
+            .when_some(git_color, |el, color| el.text_color(color))
+            .child(name);
+
+        // Git-status letter: a single glyph in a fixed-width, right-aligned
+        // trailing lane, colored the same as the name tint. `name_el`'s
+        // `flex_1` fills the row's remaining width, so this fixed-width slot
+        // always lands at the same trailing offset — letters column-align
+        // across rows regardless of name length or indent depth.
+        let git_letter = row.git_status.filter(|_| show_decoration).map(|status| {
+            div()
+                .text_xs()
+                .text_color(match status {
+                    GitRollupStatus::Conflicted => cx.theme().danger,
+                    GitRollupStatus::Changed => cx.theme().warning,
+                    GitRollupStatus::Untracked => cx.theme().success,
+                })
+                .child(status.badge())
+        });
+
+        // The row's element id is its path: unique within the tree (the model
+        // keys entries by path), so it makes a stable per-row id without a
+        // running index that would shift as rows scroll in and out.
+        let mut root = div()
+            .id(gpui::SharedString::from(row.path.clone()))
+            .flex()
+            .items_center()
+            .h(ROW_HEIGHT)
+            .pl(indent)
+            .pr(px(8.0))
+            .gap(px(4.0))
+            .text_sm()
+            .cursor_pointer()
+            .hover(|s| s.bg(cx.theme().list_hover))
+            // Ignored entries (not yet shown by default — #309) render dimmed
+            // rather than hidden, once the daemon starts sending them.
+            .when(row.ignored, |el| el.opacity(0.55))
+            .child(div().w(px(12.0)).flex_shrink_0().child(twisty.to_string()))
+            .child(name_el)
+            .child(div().w(px(8.0)).flex_shrink_0().children(severity_dot))
+            .child(div().w(px(12.0)).flex_shrink_0().children(git_letter));
+
+        if is_selected {
+            root = root
+                .bg(cx.theme().list_active)
+                .border_l_2()
+                .border_color(cx.theme().accent)
+                .text_color(cx.theme().foreground);
+        }
+
+        root.on_click(cx.listener(move |this, _event, _window, cx| {
+            if is_dir {
+                this.click_dir(&path);
+            } else {
+                this.selected = Some(path.clone());
+                this.cache_dirty = true;
+                // The open signal the editor surface consumes. Selecting a file
+                // is the only thing that touches anything outside this view — and
+                // it touches nothing but this event; no tmux pane/window state.
+                cx.emit(FileTreeEvent::OpenFile { path: path.clone() });
+            }
+            cx.notify();
+        }))
+    }
+}
+
+impl Default for FileTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EventEmitter<FileTreeEvent> for FileTree {}
+
+impl Focusable for FileTree {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.focus_handle
+            .borrow_mut()
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone()
+    }
+}
+
+impl EventEmitter<PanelEvent> for FileTree {}
+
+impl Panel for FileTree {
+    fn panel_name(&self) -> &'static str {
+        FILE_TREE_PANEL_NAME
+    }
+
+    fn title(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        SharedString::from("Explorer")
+    }
+}
+
+impl Render for FileTree {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Rebuild the row cache once for this paint if the model, a collapse,
+        // or a selection changed since the last render (see `cache_dirty`'s
+        // doc); a no-op otherwise. Both the size vector below and the virtual
+        // list's row closure read `row_cache` from here on — the freeze fix:
+        // this used to run `visible_rows()` once here and again inside the
+        // closure, doubling the tree walk on every single paint.
+        self.refresh_row_cache();
+
+        // Empty state: distinguish "no snapshot yet" from "connected, empty
+        // root" (`docs/spec-explorer-parity.md`) — a single conflated "No
+        // files" branch used to read as an error during ordinary startup.
+        // Keep it quiet — the panel is a passive mirror, not an action surface.
+        let content = if let Some(state) = self.empty_state() {
+            let message = match state {
+                EmptyState::Loading => "Loading\u{2026}",
+                EmptyState::EmptyRoot => "Empty folder",
+            };
+            div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p(px(8.0))
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(message)
+                .into_any_element()
+        } else {
+            // One uniform row height per item — the size vector the virtual
+            // list measures against. Width is ignored for a vertical list.
+            let item_sizes: Rc<Vec<Size<Pixels>>> = Rc::new(
+                self.row_cache
+                    .iter()
+                    .map(|_| Size::new(px(0.0), ROW_HEIGHT))
+                    .collect(),
+            );
+
+            div()
+                .size_full()
+                .child(
+                    v_virtual_list(
+                        cx.entity().clone(),
+                        "file-tree",
+                        item_sizes,
+                        move |this, visible_range, _window, cx| {
+                            // Read the cache built above — the virtual list only
+                            // asks for the rows currently on screen, so a huge tree
+                            // still paints a bounded number of elements, but no
+                            // tree walk happens here: `row_cache` is already fresh.
+                            let this: &Self = this;
+                            visible_range
+                                .filter_map(|ix| {
+                                    this.row_cache.get(ix).map(|row| this.render_row(row, cx))
+                                })
+                                .map(IntoElement::into_any_element)
+                                .collect::<Vec<_>>()
+                        },
+                    )
+                    .track_scroll(&self.scroll_handle),
+                )
+                .into_any_element()
+        };
+
+        // Root: establishes the tree's key context and focus tracking so the
+        // navigation actions below fire only while the tree is focused — the
+        // same scoping pattern as the editor's `EDITOR_KEY_CONTEXT` (never
+        // steals a keystroke the terminal panel would otherwise receive,
+        // since GPUI dispatches actions along the currently *focused*
+        // element's context chain, and the terminal panel is a focus-tracked
+        // sibling, not an ancestor, of this one). `flex_col` stacks the header
+        // band and workspace-root row (both `flex_shrink_0`, fixed height)
+        // above the scrollable content, which claims the remaining space via
+        // `flex_1` (`min_h_0` so the virtual list's own sizing cannot push the
+        // fixed rows off — the same shape `problems_panel.rs`'s summary bar
+        // uses above its list).
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .key_context(FILE_TREE_KEY_CONTEXT)
+            .track_focus(&self.focus_handle(cx))
+            .on_action(cx.listener(|this, _: &SelectUp, _window, cx| {
+                this.select_up();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SelectDown, _window, cx| {
+                this.select_down();
+                cx.notify();
+            }))
+            .on_action(
+                cx.listener(|this, _: &CollapseOrSelectParent, _window, cx| {
+                    this.collapse_or_select_parent();
+                    cx.notify();
+                }),
+            )
+            .on_action(cx.listener(|this, _: &ExpandOrSelectChild, _window, cx| {
+                this.expand_or_select_child();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &OpenSelected, _window, cx| {
+                this.open_selected(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SelectFirst, _window, cx| {
+                this.select_first();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SelectLast, _window, cx| {
+                this.select_last();
+                cx.notify();
+            }))
+            .child(self.render_header(cx))
+            .child(self.render_root_row(cx))
+            .child(div().flex_1().min_h_0().child(content))
+            .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rift_protocol::WorktreeEntry;
+    use std::time::SystemTime;
+
+    fn entry(path: &str, kind: EntryKind) -> WorktreeEntry {
+        WorktreeEntry {
+            path: path.to_owned(),
+            kind,
+            ignored: false,
+            mtime: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    fn file(path: &str) -> WorktreeEntry {
+        entry(path, EntryKind::File)
+    }
+
+    fn dir(path: &str) -> WorktreeEntry {
+        entry(path, EntryKind::Dir)
+    }
+
+    /// Seed a tree's model directly with a single complete snapshot.
+    fn seed(entries: Vec<WorktreeEntry>) -> FileTree {
+        let mut tree = FileTree::new();
+        tree.model_mut()
+            .apply_snapshot_chunk("/proj".into(), entries, true);
+        tree
+    }
+
+    #[test]
+    fn test_visible_rows_annotate_depth_from_path() {
+        let tree = seed(vec![
+            dir("src"),
+            file("src/main.rs"),
+            file("src/lib.rs"),
+            file("README.md"),
+        ]);
+
+        let rows = tree.visible_rows();
+        // BTreeMap order: README.md, src, src/lib.rs, src/main.rs.
+        let by_path: Vec<(&str, usize)> = rows.iter().map(|r| (r.path.as_str(), r.depth)).collect();
+        assert_eq!(
+            by_path,
+            vec![
+                ("README.md", 0),
+                ("src", 0),
+                ("src/lib.rs", 1),
+                ("src/main.rs", 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_collapsing_a_dir_hides_its_whole_subtree() {
+        let mut tree = seed(vec![
+            dir("src"),
+            dir("src/net"),
+            file("src/net/tcp.rs"),
+            file("src/main.rs"),
+            file("top.rs"),
+        ]);
+
+        // Expanded: every entry is visible.
+        assert_eq!(tree.visible_rows().len(), 5);
+
+        // Collapse `src`: src stays, but everything under `src/` disappears.
+        tree.toggle_dir("src");
+        let rows = tree.visible_rows();
+        let visible: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(visible, vec!["src", "top.rs"]);
+        assert!(tree.is_collapsed("src"));
+
+        // Re-expand: the subtree returns in full.
+        tree.toggle_dir("src");
+        assert_eq!(tree.visible_rows().len(), 5);
+        assert!(!tree.is_collapsed("src"));
+    }
+
+    #[test]
+    fn test_collapse_is_prefix_exact_not_substring() {
+        // `src` collapsed must not accidentally hide a sibling like `src2` whose
+        // path shares the `src` text prefix but not the `src/` path prefix.
+        let mut tree = seed(vec![
+            dir("src"),
+            file("src/a.rs"),
+            dir("src2"),
+            file("src2/b.rs"),
+        ]);
+
+        tree.toggle_dir("src");
+        let rows = tree.visible_rows();
+        let visible: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(visible, vec!["src", "src2", "src2/b.rs"]);
+    }
+
+    #[test]
+    fn test_nested_collapse_skips_only_the_outer_subtree_once() {
+        // A collapsed outer directory hides inner directories too, even though
+        // they are also collapsible — the outer skip subsumes them.
+        let mut tree = seed(vec![
+            dir("a"),
+            dir("a/b"),
+            file("a/b/c.rs"),
+            file("a/d.rs"),
+            file("z.rs"),
+        ]);
+
+        tree.toggle_dir("a/b");
+        tree.toggle_dir("a");
+        let rows = tree.visible_rows();
+        let visible: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(visible, vec!["a", "z.rs"]);
+    }
+
+    #[test]
+    fn test_display_name_is_the_leaf_segment() {
+        assert_eq!(FileTree::display_name("src/net/tcp.rs"), "tcp.rs");
+        assert_eq!(FileTree::display_name("README.md"), "README.md");
+        assert_eq!(FileTree::display_name("src"), "src");
+    }
+
+    #[test]
+    fn test_empty_state_with_no_snapshot_yet_is_loading() {
+        // A fresh tree has never received a snapshot, so `model.root()` is
+        // still `None` — startup / connecting, not a genuinely empty root.
+        let tree = FileTree::new();
+        assert_eq!(tree.empty_state(), Some(EmptyState::Loading));
+    }
+
+    #[test]
+    fn test_empty_state_with_an_empty_root_snapshot_is_empty_root() {
+        // A complete snapshot arrived (`root()` is `Some`) but it carried no
+        // entries — a genuinely empty root, distinct from still loading.
+        let tree = seed(vec![]);
+        assert!(tree.model().root().is_some());
+        assert!(tree.model().is_empty());
+        assert_eq!(tree.empty_state(), Some(EmptyState::EmptyRoot));
+    }
+
+    #[test]
+    fn test_empty_state_with_populated_entries_is_none() {
+        let tree = seed(vec![file("README.md")]);
+        assert_eq!(tree.empty_state(), None);
+    }
+
+    #[test]
+    fn test_new_tree_starts_with_a_dirty_cache() {
+        // Nothing has been rendered yet, so the very first `refresh_row_cache`
+        // must not be skipped as "already fresh".
+        let tree = FileTree::new();
+        assert!(tree.cache_dirty);
+        assert!(tree.row_cache.is_empty());
+    }
+
+    #[test]
+    fn test_refresh_row_cache_builds_rows_and_clears_dirty() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs"), file("README.md")]);
+        assert!(
+            tree.cache_dirty,
+            "seeding via model_mut marks the cache dirty"
+        );
+
+        tree.refresh_row_cache();
+
+        assert!(!tree.cache_dirty);
+        assert_eq!(tree.row_cache, tree.visible_rows());
+    }
+
+    #[test]
+    fn test_model_mut_marks_the_cache_dirty_even_with_no_visible_change() {
+        let mut tree = seed(vec![file("a.txt")]);
+        tree.refresh_row_cache();
+        assert!(!tree.cache_dirty);
+
+        // `model_mut` is the only seam that can mutate the model, so it marks
+        // dirty unconditionally — a fold behind it can never forget to.
+        tree.model_mut();
+        assert!(tree.cache_dirty);
+    }
+
+    #[test]
+    fn test_refresh_row_cache_after_incremental_update_matches_a_fresh_build_no_drift() {
+        let mut tree = seed(vec![file("a.txt"), file("stale.txt")]);
+        tree.refresh_row_cache();
+
+        // Fold an incremental update through the same seam `workspace.rs` uses.
+        tree.model_mut()
+            .apply_update(vec![file("fresh.txt")], vec![], vec!["stale.txt".into()]);
+        assert!(
+            tree.cache_dirty,
+            "the update must have marked the cache dirty"
+        );
+
+        tree.refresh_row_cache();
+
+        // The refreshed cache must equal an independently fresh build from the
+        // now-current model — no drift from the update.
+        assert_eq!(tree.row_cache, tree.visible_rows());
+        let paths: Vec<&str> = tree.row_cache.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, vec!["a.txt", "fresh.txt"]);
+    }
+
+    #[test]
+    fn test_refresh_row_cache_is_idempotent_while_clean() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs")]);
+        tree.refresh_row_cache();
+        let built = tree.visible_rows();
+
+        // A second refresh with nothing marked dirty in between must leave the
+        // cache exactly as it was.
+        tree.refresh_row_cache();
+        assert_eq!(tree.row_cache, built);
+    }
+
+    #[test]
+    fn test_toggle_dir_marks_the_cache_dirty_and_refresh_reflects_the_collapse() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs"), file("top.rs")]);
+        tree.refresh_row_cache();
+        assert!(!tree.cache_dirty);
+
+        tree.toggle_dir("src");
+        assert!(tree.cache_dirty);
+
+        tree.refresh_row_cache();
+        let visible: Vec<&str> = tree.row_cache.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(visible, vec!["src", "top.rs"]);
+    }
+
+    #[test]
+    fn test_click_dir_selects_and_toggles_the_directory() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs"), file("top.rs")]);
+
+        tree.click_dir("src");
+        assert_eq!(tree.selected(), Some("src"));
+        assert!(tree.is_collapsed("src"));
+
+        // A second click on the still-selected directory re-expands it and
+        // leaves the selection unchanged.
+        tree.click_dir("src");
+        assert_eq!(tree.selected(), Some("src"));
+        assert!(!tree.is_collapsed("src"));
+    }
+
+    #[test]
+    fn test_click_dir_moves_the_selection_off_a_previously_selected_row() {
+        // Regression for #481: clicking a directory used to toggle it without
+        // touching the selection, so the old selection stuck around and
+        // arrow keys resumed from there instead of the row just clicked.
+        let mut tree = seed(vec![dir("src"), file("src/main.rs"), file("top.rs")]);
+        tree.selected = Some("top.rs".into());
+
+        tree.click_dir("src");
+
+        assert_eq!(tree.selected(), Some("src"));
+    }
+
+    // --- header actions: collapse-all / expand-all, root leaf (#604) ---
+
+    #[test]
+    fn test_all_dirs_collapsed_is_false_on_a_freshly_seeded_expanded_tree() {
+        let tree = seed(vec![dir("src"), file("src/main.rs"), file("top.rs")]);
+        assert!(!tree.all_dirs_collapsed());
+    }
+
+    #[test]
+    fn test_all_dirs_collapsed_is_false_when_a_tree_has_no_directories() {
+        // Vacuous truth would wrongly claim "collapsed" for an all-file tree.
+        let tree = seed(vec![file("a.txt"), file("b.txt")]);
+        assert!(!tree.all_dirs_collapsed());
+    }
+
+    #[test]
+    fn test_collapse_all_collapses_every_directory_and_marks_all_dirs_collapsed() {
+        let mut tree = seed(vec![
+            dir("a"),
+            dir("a/b"),
+            file("a/b/c.rs"),
+            dir("z"),
+            file("top.rs"),
+        ]);
+        tree.refresh_row_cache();
+
+        tree.collapse_all();
+
+        assert!(tree.is_collapsed("a"));
+        assert!(tree.is_collapsed("a/b"));
+        assert!(tree.is_collapsed("z"));
+        assert!(tree.all_dirs_collapsed());
+        assert!(tree.cache_dirty);
+        tree.refresh_row_cache();
+        let visible: Vec<&str> = tree.row_cache.iter().map(|r| r.path.as_str()).collect();
+        // Top-level entries remain; nested subtrees are hidden.
+        assert_eq!(visible, vec!["a", "top.rs", "z"]);
+    }
+
+    #[test]
+    fn test_expand_all_clears_the_collapsed_set() {
+        let mut tree = seed(vec![dir("a"), dir("a/b"), file("a/b/c.rs")]);
+        tree.collapse_all();
+        assert!(tree.all_dirs_collapsed());
+
+        tree.expand_all();
+
+        assert!(!tree.is_collapsed("a"));
+        assert!(!tree.is_collapsed("a/b"));
+        assert!(!tree.all_dirs_collapsed());
+        assert!(tree.cache_dirty);
+    }
+
+    #[test]
+    fn test_toggle_collapse_all_flips_between_fully_collapsed_and_fully_expanded() {
+        let mut tree = seed(vec![dir("a"), file("a/b.rs"), dir("c")]);
+
+        tree.toggle_collapse_all();
+        assert!(tree.all_dirs_collapsed());
+
+        tree.toggle_collapse_all();
+        assert!(!tree.all_dirs_collapsed());
+        assert!(!tree.is_collapsed("a"));
+        assert!(!tree.is_collapsed("c"));
+    }
+
+    #[test]
+    fn test_collapse_all_preserves_an_already_collapsed_directory_not_reported_by_toggle() {
+        // Collapse-all must insert, not toggle: a directory collapsed before
+        // the call must stay collapsed, not flip back to expanded.
+        let mut tree = seed(vec![dir("a"), file("a/x.rs"), dir("b"), file("b/y.rs")]);
+        tree.toggle_dir("a");
+        assert!(tree.is_collapsed("a"));
+
+        tree.collapse_all();
+
+        assert!(tree.is_collapsed("a"));
+        assert!(tree.is_collapsed("b"));
+    }
+
+    #[test]
+    fn test_root_leaf_of_a_nested_absolute_path() {
+        assert_eq!(FileTree::root_leaf("/home/user/proj"), "proj");
+        assert_eq!(FileTree::root_leaf("/proj"), "proj");
+    }
+
+    #[test]
+    fn test_root_leaf_of_the_filesystem_root_is_unchanged() {
+        assert_eq!(FileTree::root_leaf("/"), "/");
+    }
+
+    #[test]
+    fn test_reveal_active_requested_variant_is_distinct_from_open_file_under_eq() {
+        // The event itself carries no payload; this just locks its `PartialEq`
+        // against `OpenFile` so a future refactor cannot silently merge them.
+        assert_ne!(
+            FileTreeEvent::RevealActiveRequested,
+            FileTreeEvent::OpenFile {
+                path: "a.rs".into()
+            }
+        );
+    }
+
+    // --- git + diagnostic decoration / ancestor roll-up (#329) ---
+
+    use rift_protocol::{
+        Diagnostic, DiagnosticSeverity, GitEntryStatus, GitStatusCode, GitStatusEntry, Position,
+        Range,
+    };
+
+    fn git_entry(path: &str, index: GitStatusCode, worktree: GitStatusCode) -> GitStatusEntry {
+        GitStatusEntry {
+            path: path.to_owned(),
+            status: GitEntryStatus { index, worktree },
+        }
+    }
+
+    fn diag(severity: DiagnosticSeverity) -> Diagnostic {
+        Diagnostic {
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 1,
+                },
+            },
+            severity,
+            message: "test".to_owned(),
+            source: None,
+            code: None,
+        }
+    }
+
+    #[test]
+    fn test_git_rollup_status_from_status_precedence() {
+        use GitStatusCode::{Modified, Unmerged, Unmodified, Untracked};
+
+        // Clean on both sides: no decoration.
+        assert_eq!(
+            GitRollupStatus::from_status(GitEntryStatus {
+                index: Unmodified,
+                worktree: Unmodified
+            }),
+            None
+        );
+        assert_eq!(
+            GitRollupStatus::from_status(GitEntryStatus {
+                index: Unmodified,
+                worktree: Untracked
+            }),
+            Some(GitRollupStatus::Untracked)
+        );
+        assert_eq!(
+            GitRollupStatus::from_status(GitEntryStatus {
+                index: Modified,
+                worktree: Unmodified
+            }),
+            Some(GitRollupStatus::Changed)
+        );
+        assert_eq!(
+            GitRollupStatus::from_status(GitEntryStatus {
+                index: Unmerged,
+                worktree: Unmodified
+            }),
+            Some(GitRollupStatus::Conflicted)
+        );
+        // Conflicted outranks a simultaneously "changed"-looking pairing.
+        assert_eq!(
+            GitRollupStatus::from_status(GitEntryStatus {
+                index: Modified,
+                worktree: Unmerged
+            }),
+            Some(GitRollupStatus::Conflicted)
+        );
+    }
+
+    #[test]
+    fn test_git_rollup_status_from_status_deleted_on_either_side_maps_to_changed() {
+        use GitStatusCode::{Deleted, Unmerged, Unmodified};
+
+        // Unstaged deletion (the common case: file removed from the worktree):
+        // rolls up under the shared `changed` lane, per spec-explorer-panel.md.
+        assert_eq!(
+            GitRollupStatus::from_status(GitEntryStatus {
+                index: Unmodified,
+                worktree: Deleted
+            }),
+            Some(GitRollupStatus::Changed)
+        );
+        // Staged deletion.
+        assert_eq!(
+            GitRollupStatus::from_status(GitEntryStatus {
+                index: Deleted,
+                worktree: Unmodified
+            }),
+            Some(GitRollupStatus::Changed)
+        );
+        // A conflict still outranks a deletion on the other side.
+        assert_eq!(
+            GitRollupStatus::from_status(GitEntryStatus {
+                index: Deleted,
+                worktree: Unmerged
+            }),
+            Some(GitRollupStatus::Conflicted)
+        );
+        assert_eq!(GitRollupStatus::Changed.badge(), "M");
+    }
+
+    #[test]
+    fn test_worse_severity_orders_error_above_warning_above_information_above_hint() {
+        use DiagnosticSeverity::{Error, Hint, Information, Warning};
+
+        assert_eq!(worse_severity(Error, Hint), Error);
+        assert_eq!(worse_severity(Hint, Error), Error);
+        assert_eq!(worse_severity(Warning, Information), Warning);
+        assert_eq!(worse_severity(Information, Hint), Information);
+    }
+
+    #[test]
+    fn test_max_severity_none_is_clean_and_loses_to_any_some() {
+        assert_eq!(max_severity(None, None), None);
+        assert_eq!(
+            max_severity(Some(DiagnosticSeverity::Hint), None),
+            Some(DiagnosticSeverity::Hint)
+        );
+        assert_eq!(
+            max_severity(None, Some(DiagnosticSeverity::Error)),
+            Some(DiagnosticSeverity::Error)
+        );
+    }
+
+    #[test]
+    fn test_compute_rollup_propagates_the_worst_status_and_severity_to_ancestors() {
+        // a/
+        //   b/
+        //     c.rs      untracked
+        //     other.rs  changed + an error diagnostic
+        //   d.rs         a warning diagnostic, no git status
+        // e.rs            clean
+        // f.rs             conflicted, top-level (must not leak into `a`)
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk(
+            "/proj".into(),
+            vec![
+                dir("a"),
+                dir("a/b"),
+                file("a/b/c.rs"),
+                file("a/b/other.rs"),
+                file("a/d.rs"),
+                file("e.rs"),
+                file("f.rs"),
+            ],
+            true,
+        );
+        model.apply_git_update(
+            vec![
+                git_entry(
+                    "a/b/c.rs",
+                    GitStatusCode::Unmodified,
+                    GitStatusCode::Untracked,
+                ),
+                git_entry(
+                    "a/b/other.rs",
+                    GitStatusCode::Unmodified,
+                    GitStatusCode::Modified,
+                ),
+                git_entry("f.rs", GitStatusCode::Unmerged, GitStatusCode::Unmerged),
+            ],
+            vec![],
+        );
+        model.apply_diagnostics(
+            "a/b/other.rs".into(),
+            "rust-analyzer".into(),
+            vec![diag(DiagnosticSeverity::Error)],
+        );
+        model.apply_diagnostics(
+            "a/d.rs".into(),
+            "rust-analyzer".into(),
+            vec![diag(DiagnosticSeverity::Warning)],
+        );
+
+        let rollup = compute_rollup(&model);
+        let at = |path: &str| rollup.get(path).copied().unwrap_or_default();
+
+        // `a` rolls up the worst of everything beneath it: `Changed` beats the
+        // `Untracked` sibling file, and the `Error` beats the `Warning`.
+        assert_eq!(
+            at("a"),
+            Rollup {
+                git_status: Some(GitRollupStatus::Changed),
+                severity: Some(DiagnosticSeverity::Error),
+            }
+        );
+        // `a/b` rolls up only its own two children.
+        assert_eq!(
+            at("a/b"),
+            Rollup {
+                git_status: Some(GitRollupStatus::Changed),
+                severity: Some(DiagnosticSeverity::Error),
+            }
+        );
+        // Leaf files carry exactly their own decoration.
+        assert_eq!(
+            at("a/b/c.rs"),
+            Rollup {
+                git_status: Some(GitRollupStatus::Untracked),
+                severity: None,
+            }
+        );
+        assert_eq!(
+            at("a/b/other.rs"),
+            Rollup {
+                git_status: Some(GitRollupStatus::Changed),
+                severity: Some(DiagnosticSeverity::Error),
+            }
+        );
+        assert_eq!(
+            at("a/d.rs"),
+            Rollup {
+                git_status: None,
+                severity: Some(DiagnosticSeverity::Warning),
+            }
+        );
+        // Clean sibling stays clean.
+        assert_eq!(at("e.rs"), Rollup::default());
+        // A conflicted top-level file is its own decoration only — it must not
+        // leak into `a` or `e.rs`.
+        assert_eq!(
+            at("f.rs"),
+            Rollup {
+                git_status: Some(GitRollupStatus::Conflicted),
+                severity: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_compute_rollup_not_confused_by_a_lexically_interleaved_sibling_file() {
+        // BTreeMap order is by raw path string, and `.` (0x2E) sorts below `/`
+        // (0x2F), so `src.rs` sorts *between* `src` and `src/main.rs`:
+        // "src" < "src.rs" < "src/main.rs". A depth-only open-ancestor stack
+        // mistakes `src.rs` (a same-depth sibling, not a descendant) for the
+        // end of `src`'s subtree and pops it prematurely, so `src/main.rs`'s
+        // error never rolls up to `src` (#329's regression).
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk(
+            "/proj".into(),
+            vec![dir("src"), file("src.rs"), file("src/main.rs")],
+            true,
+        );
+        model.apply_git_update(
+            vec![git_entry(
+                "src/main.rs",
+                GitStatusCode::Unmodified,
+                GitStatusCode::Modified,
+            )],
+            vec![],
+        );
+        model.apply_diagnostics(
+            "src/main.rs".into(),
+            "rust-analyzer".into(),
+            vec![diag(DiagnosticSeverity::Error)],
+        );
+
+        let rollup = compute_rollup(&model);
+
+        assert_eq!(
+            rollup.get("src").copied().unwrap_or_default(),
+            Rollup {
+                git_status: Some(GitRollupStatus::Changed),
+                severity: Some(DiagnosticSeverity::Error),
+            },
+            "src/main.rs's status and severity must roll up to its parent `src`, \
+             even with the lexically-interleaved sibling `src.rs` in between"
+        );
+        // The sibling file itself must stay uninvolved in `src`'s subtree.
+        assert_eq!(
+            rollup.get("src.rs").copied().unwrap_or_default(),
+            Rollup::default()
+        );
+    }
+
+    #[test]
+    fn test_compute_rollup_clears_when_the_underlying_status_and_diagnostics_clear() {
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk("/proj".into(), vec![dir("src"), file("src/main.rs")], true);
+        model.apply_git_update(
+            vec![git_entry(
+                "src/main.rs",
+                GitStatusCode::Unmodified,
+                GitStatusCode::Modified,
+            )],
+            vec![],
+        );
+        model.apply_diagnostics(
+            "src/main.rs".into(),
+            "rust-analyzer".into(),
+            vec![diag(DiagnosticSeverity::Error)],
+        );
+
+        let rollup = compute_rollup(&model);
+        assert_eq!(
+            rollup.get("src").copied().unwrap_or_default(),
+            Rollup {
+                git_status: Some(GitRollupStatus::Changed),
+                severity: Some(DiagnosticSeverity::Error),
+            }
+        );
+
+        // The file returns to clean and its diagnostic is fixed.
+        model.apply_git_update(vec![], vec!["src/main.rs".into()]);
+        model.apply_diagnostics("src/main.rs".into(), "rust-analyzer".into(), vec![]);
+
+        let rollup = compute_rollup(&model);
+        assert_eq!(
+            rollup.get("src").copied().unwrap_or_default(),
+            Rollup::default()
+        );
+    }
+
+    // --- deleted tracked files: changed roll-up onto surviving ancestors (#480) ---
+
+    #[test]
+    fn test_compute_rollup_deleted_path_absent_from_tree_marks_surviving_ancestors() {
+        // `a/b/gone.rs` was deleted: its tree entry is gone, but the git
+        // recompute still reports it as worktree-deleted. Both surviving
+        // ancestors must carry the changed roll-up; the clean sibling stays clean.
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk(
+            "/proj".into(),
+            vec![dir("a"), dir("a/b"), file("a/b/keep.rs")],
+            true,
+        );
+        model.apply_git_update(
+            vec![git_entry(
+                "a/b/gone.rs",
+                GitStatusCode::Unmodified,
+                GitStatusCode::Deleted,
+            )],
+            vec![],
+        );
+
+        let rollup = compute_rollup(&model);
+        let at = |path: &str| rollup.get(path).copied().unwrap_or_default();
+
+        let changed = Rollup {
+            git_status: Some(GitRollupStatus::Changed),
+            severity: None,
+        };
+        assert_eq!(at("a"), changed);
+        assert_eq!(at("a/b"), changed);
+        assert_eq!(at("a/b/keep.rs"), Rollup::default());
+        // The gone path itself gets no entry — there is no row to decorate.
+        assert!(!rollup.contains_key("a/b/gone.rs"));
+    }
+
+    #[test]
+    fn test_compute_rollup_deleted_subtree_skips_ancestors_that_also_left_the_tree() {
+        // The whole `a/b` directory was deleted with its file: only the
+        // surviving ancestor `a` is marked; no phantom `a/b` roll-up appears.
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk("/proj".into(), vec![dir("a"), file("a/keep.rs")], true);
+        model.apply_git_update(
+            vec![git_entry(
+                "a/b/gone.rs",
+                GitStatusCode::Unmodified,
+                GitStatusCode::Deleted,
+            )],
+            vec![],
+        );
+
+        let rollup = compute_rollup(&model);
+        assert_eq!(
+            rollup.get("a").copied().unwrap_or_default(),
+            Rollup {
+                git_status: Some(GitRollupStatus::Changed),
+                severity: None,
+            }
+        );
+        assert!(!rollup.contains_key("a/b"));
+    }
+
+    #[test]
+    fn test_compute_rollup_deleted_and_modified_share_the_changed_lane() {
+        // `src` holds both an ordinary edit and a deletion; both classify as
+        // `Changed`, so the shared ancestor carries the changed roll-up.
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk("/proj".into(), vec![dir("src"), file("src/kept.rs")], true);
+        model.apply_git_update(
+            vec![
+                git_entry(
+                    "src/kept.rs",
+                    GitStatusCode::Unmodified,
+                    GitStatusCode::Modified,
+                ),
+                git_entry(
+                    "src/gone.rs",
+                    GitStatusCode::Unmodified,
+                    GitStatusCode::Deleted,
+                ),
+            ],
+            vec![],
+        );
+
+        let rollup = compute_rollup(&model);
+        assert_eq!(
+            rollup.get("src").copied().unwrap_or_default().git_status,
+            Some(GitRollupStatus::Changed)
+        );
+    }
+
+    #[test]
+    fn test_compute_rollup_deleted_top_level_path_without_ancestors_adds_nothing() {
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk("/proj".into(), vec![file("keep.rs")], true);
+        model.apply_git_update(
+            vec![git_entry(
+                "gone.rs",
+                GitStatusCode::Unmodified,
+                GitStatusCode::Deleted,
+            )],
+            vec![],
+        );
+
+        let rollup = compute_rollup(&model);
+        assert_eq!(
+            rollup.get("keep.rs").copied().unwrap_or_default(),
+            Rollup::default()
+        );
+        assert!(!rollup.contains_key("gone.rs"));
+    }
+
+    #[test]
+    fn test_compute_rollup_deleted_rollup_clears_when_the_status_clears() {
+        let mut model = WorktreeModel::default();
+        model.apply_snapshot_chunk("/proj".into(), vec![dir("src"), file("src/keep.rs")], true);
+        model.apply_git_update(
+            vec![git_entry(
+                "src/gone.rs",
+                GitStatusCode::Unmodified,
+                GitStatusCode::Deleted,
+            )],
+            vec![],
+        );
+        assert_eq!(
+            compute_rollup(&model)
+                .get("src")
+                .copied()
+                .unwrap_or_default()
+                .git_status,
+            Some(GitRollupStatus::Changed)
+        );
+
+        // The deletion gets committed (or restored): the recompute clears it.
+        model.apply_git_update(vec![], vec!["src/gone.rs".into()]);
+        assert_eq!(
+            compute_rollup(&model)
+                .get("src")
+                .copied()
+                .unwrap_or_default(),
+            Rollup::default()
+        );
+    }
+
+    #[test]
+    fn test_dir_row_carries_the_changed_rollup_after_a_tracked_file_deletion() {
+        // End-to-end through the view: fold the same message sequence the
+        // daemon sends on a deletion (worktree update removing the entry,
+        // then the git recompute reporting it deleted) and check the parent
+        // directory's rendered row carries the changed decoration.
+        let mut tree = seed(vec![dir("src"), file("src/gone.rs"), file("top.rs")]);
+        tree.model_mut()
+            .apply_update(vec![], vec![], vec!["src/gone.rs".into()]);
+        tree.model_mut().apply_git_update(
+            vec![git_entry(
+                "src/gone.rs",
+                GitStatusCode::Unmodified,
+                GitStatusCode::Deleted,
+            )],
+            vec![],
+        );
+
+        let rows = tree.visible_rows();
+        let visible: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(visible, vec!["src", "top.rs"]);
+
+        let src_row = rows.iter().find(|r| r.path == "src").expect("src row");
+        assert_eq!(src_row.git_status, Some(GitRollupStatus::Changed));
+        assert_eq!(src_row.severity, None);
+    }
+
+    #[test]
+    fn test_collapsed_dir_row_carries_the_rolled_up_git_status_and_severity() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs"), file("top.rs")]);
+        tree.model_mut().apply_git_update(
+            vec![git_entry(
+                "src/main.rs",
+                GitStatusCode::Unmodified,
+                GitStatusCode::Modified,
+            )],
+            vec![],
+        );
+        tree.model_mut().apply_diagnostics(
+            "src/main.rs".into(),
+            "rust-analyzer".into(),
+            vec![diag(DiagnosticSeverity::Error)],
+        );
+
+        tree.toggle_dir("src");
+        let rows = tree.visible_rows();
+        let visible: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(visible, vec!["src", "top.rs"]);
+
+        let src_row = rows.iter().find(|r| r.path == "src").expect("src row");
+        assert_eq!(src_row.git_status, Some(GitRollupStatus::Changed));
+        assert_eq!(src_row.severity, Some(DiagnosticSeverity::Error));
+
+        let top_row = rows
+            .iter()
+            .find(|r| r.path == "top.rs")
+            .expect("top.rs row");
+        assert_eq!(top_row.git_status, None);
+        assert_eq!(top_row.severity, None);
+    }
+
+    #[test]
+    fn test_row_shows_decoration_only_on_a_collapsed_dir_not_an_expanded_one() {
+        // Reuses the same seeded rollup as
+        // `test_collapsed_dir_row_carries_the_rolled_up_git_status_and_severity`:
+        // `src` rolls up a changed + errored descendant either way, but
+        // rendering must suppress that rolled-up badge while `src` is
+        // expanded (its child already shows its own) and surface it once
+        // `src` is collapsed.
+        let mut tree = seed(vec![dir("src"), file("src/main.rs"), file("top.rs")]);
+        tree.model_mut().apply_git_update(
+            vec![git_entry(
+                "src/main.rs",
+                GitStatusCode::Unmodified,
+                GitStatusCode::Modified,
+            )],
+            vec![],
+        );
+        tree.model_mut().apply_diagnostics(
+            "src/main.rs".into(),
+            "rust-analyzer".into(),
+            vec![diag(DiagnosticSeverity::Error)],
+        );
+
+        // Expanded: `src`'s row still carries the rolled-up decoration in the
+        // cache (`compute_rollup` is unchanged), but it must not render.
+        let rows = tree.visible_rows();
+        let src_row = rows.iter().find(|r| r.path == "src").expect("src row");
+        assert_eq!(src_row.git_status, Some(GitRollupStatus::Changed));
+        assert!(!tree.row_shows_decoration(src_row));
+
+        // The file itself always shows its own decoration.
+        let file_row = rows
+            .iter()
+            .find(|r| r.path == "src/main.rs")
+            .expect("file row");
+        assert!(tree.row_shows_decoration(file_row));
+
+        // Collapse `src`: the same rolled-up row now renders its decoration.
+        tree.toggle_dir("src");
+        let rows = tree.visible_rows();
+        let src_row = rows.iter().find(|r| r.path == "src").expect("src row");
+        assert!(tree.row_shows_decoration(src_row));
+    }
+
+    #[test]
+    fn test_visible_rows_carries_the_ignored_flag_from_the_entry() {
+        let mut ignored_entry = file("ignored.rs");
+        ignored_entry.ignored = true;
+        let tree = seed(vec![file("kept.rs"), ignored_entry]);
+
+        let rows = tree.visible_rows();
+        let kept = rows.iter().find(|r| r.path == "kept.rs").expect("kept.rs");
+        let ignored = rows
+            .iter()
+            .find(|r| r.path == "ignored.rs")
+            .expect("ignored.rs");
+        assert!(!kept.ignored);
+        assert!(ignored.ignored);
+    }
+
+    // --- reveal active file (#331) ---
+
+    #[test]
+    fn test_ancestor_dirs_of_a_nested_path() {
+        let ancestors: Vec<&str> = ancestor_dirs("src/net/tcp.rs").collect();
+        assert_eq!(ancestors, vec!["src", "src/net"]);
+    }
+
+    #[test]
+    fn test_ancestor_dirs_of_a_top_level_path_is_empty() {
+        let ancestors: Vec<&str> = ancestor_dirs("top.rs").collect();
+        assert!(ancestors.is_empty());
+    }
+
+    #[test]
+    fn test_reveal_expands_ancestors_selects_and_marks_the_cache_dirty() {
+        let mut tree = seed(vec![dir("a"), dir("a/b"), file("a/b/c.rs"), file("top.rs")]);
+        tree.toggle_dir("a");
+        tree.toggle_dir("a/b");
+        tree.refresh_row_cache();
+        assert!(tree.is_collapsed("a"));
+        assert!(tree.is_collapsed("a/b"));
+        assert!(!tree.cache_dirty);
+
+        tree.reveal("a/b/c.rs");
+
+        assert!(!tree.is_collapsed("a"));
+        assert!(!tree.is_collapsed("a/b"));
+        assert_eq!(tree.selected(), Some("a/b/c.rs"));
+        assert!(!tree.cache_dirty, "reveal refreshes the cache immediately");
+        let visible: Vec<&str> = tree.row_cache.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(visible, vec!["a", "a/b", "a/b/c.rs", "top.rs"]);
+    }
+
+    #[test]
+    fn test_reveal_of_a_path_absent_from_the_model_is_a_no_op() {
+        let mut tree = seed(vec![dir("a"), file("a/b.rs")]);
+        tree.toggle_dir("a");
+        tree.refresh_row_cache();
+
+        tree.reveal("does/not/exist.rs");
+
+        assert!(tree.is_collapsed("a"), "unrelated collapse state untouched");
+        assert_eq!(tree.selected(), None, "no selection for a missing path");
+        assert!(!tree.cache_dirty, "no spurious invalidation for a no-op");
+    }
+
+    #[test]
+    fn test_reveal_is_idempotent_when_already_expanded_and_selected() {
+        let mut tree = seed(vec![dir("a"), file("a/b.rs")]);
+        tree.reveal("a/b.rs");
+        tree.refresh_row_cache();
+        assert!(!tree.cache_dirty);
+
+        tree.reveal("a/b.rs");
+
+        assert_eq!(tree.selected(), Some("a/b.rs"));
+        assert!(
+            !tree.cache_dirty,
+            "revealing an already-expanded, already-selected path changes nothing"
+        );
+    }
+
+    // --- keyboard navigation: selection movement + expand/collapse-at-edge (#332) ---
+
+    /// A bare row for exercising the pure navigation helpers directly, without
+    /// seeding a whole model.
+    fn row_at(path: &str, kind: EntryKind, depth: usize) -> Row {
+        Row {
+            path: path.to_owned(),
+            kind,
+            depth,
+            ignored: false,
+            git_status: None,
+            severity: None,
+        }
+    }
+
+    /// Seeded visible-row set used by the plain-function navigation tests
+    /// below (mirrors `a/b/c.rs`, `a/d.rs`, `e.rs`):
+    /// ```text
+    /// a          depth 0, dir
+    /// a/b        depth 1, dir
+    /// a/b/c.rs   depth 2, file
+    /// a/d.rs     depth 1, file
+    /// e.rs       depth 0, file
+    /// ```
+    fn seeded_rows() -> Vec<Row> {
+        vec![
+            row_at("a", EntryKind::Dir, 0),
+            row_at("a/b", EntryKind::Dir, 1),
+            row_at("a/b/c.rs", EntryKind::File, 2),
+            row_at("a/d.rs", EntryKind::File, 1),
+            row_at("e.rs", EntryKind::File, 0),
+        ]
+    }
+
+    #[test]
+    fn test_selection_after_down_moves_to_the_next_row() {
+        let rows = seeded_rows();
+        assert_eq!(
+            selection_after_down(&rows, Some("a/b")).as_deref(),
+            Some("a/b/c.rs")
+        );
+    }
+
+    #[test]
+    fn test_selection_after_down_clamps_at_the_last_row() {
+        let rows = seeded_rows();
+        assert_eq!(
+            selection_after_down(&rows, Some("e.rs")).as_deref(),
+            Some("e.rs")
+        );
+    }
+
+    #[test]
+    fn test_selection_after_down_selects_the_first_row_when_nothing_was_selected() {
+        let rows = seeded_rows();
+        assert_eq!(selection_after_down(&rows, None).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn test_selection_after_down_falls_back_to_the_first_row_when_the_selection_is_no_longer_visible(
+    ) {
+        // Simulates the selected path having scrolled out of the visible set
+        // (e.g. an ancestor was collapsed after selection).
+        let rows = seeded_rows();
+        assert_eq!(
+            selection_after_down(&rows, Some("gone")).as_deref(),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn test_selection_after_up_moves_to_the_previous_row() {
+        let rows = seeded_rows();
+        assert_eq!(
+            selection_after_up(&rows, Some("a/d.rs")).as_deref(),
+            Some("a/b/c.rs")
+        );
+    }
+
+    #[test]
+    fn test_selection_after_up_clamps_at_the_first_row() {
+        let rows = seeded_rows();
+        assert_eq!(selection_after_up(&rows, Some("a")).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn test_selection_after_up_selects_the_first_row_when_nothing_was_selected() {
+        let rows = seeded_rows();
+        assert_eq!(selection_after_up(&rows, None).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn test_selection_after_down_and_up_on_an_empty_row_set_select_nothing() {
+        let rows: Vec<Row> = Vec::new();
+        assert_eq!(selection_after_down(&rows, None), None);
+        assert_eq!(selection_after_up(&rows, Some("a")), None);
+    }
+
+    #[test]
+    fn test_parent_path_is_none_at_a_top_level_row() {
+        let rows = seeded_rows();
+        assert_eq!(parent_path(&rows, 0), None); // "a"
+        assert_eq!(parent_path(&rows, 4), None); // "e.rs"
+    }
+
+    #[test]
+    fn test_parent_path_finds_the_nearest_ancestor_not_just_the_previous_row() {
+        let rows = seeded_rows();
+        // "a/b/c.rs" (index 2) sits directly under "a/b" (index 1).
+        assert_eq!(parent_path(&rows, 2), Some("a/b"));
+        // "a/d.rs" (index 3) is back up a level, its parent is "a" (index 0),
+        // skipping over the deeper "a/b" sibling that precedes it.
+        assert_eq!(parent_path(&rows, 3), Some("a"));
+    }
+
+    #[test]
+    fn test_first_child_path_finds_the_row_immediately_after_an_expanded_dir() {
+        let rows = seeded_rows();
+        assert_eq!(first_child_path(&rows, 0), Some("a/b")); // "a"'s first child
+        assert_eq!(first_child_path(&rows, 1), Some("a/b/c.rs")); // "a/b"'s first child
+    }
+
+    #[test]
+    fn test_first_child_path_is_none_for_a_file() {
+        let rows = seeded_rows();
+        assert_eq!(first_child_path(&rows, 2), None); // "a/b/c.rs" is a file
+        assert_eq!(first_child_path(&rows, 4), None); // "e.rs" is a file
+    }
+
+    #[test]
+    fn test_first_child_path_is_none_for_an_empty_or_already_collapsed_dir() {
+        // A dir whose next row is a sibling (same or shallower depth), not a
+        // child — the same shape as an empty dir or one hidden by collapse.
+        let rows = vec![
+            row_at("empty", EntryKind::Dir, 0),
+            row_at("sibling.rs", EntryKind::File, 0),
+        ];
+        assert_eq!(first_child_path(&rows, 0), None);
+    }
+
+    #[test]
+    fn test_first_child_path_is_none_for_the_last_row() {
+        let rows = seeded_rows();
+        assert_eq!(first_child_path(&rows, rows.len() - 1), None);
+    }
+
+    #[test]
+    fn test_select_down_and_up_move_the_tree_selection_through_visible_rows() {
+        let mut tree = seed(vec![dir("a"), file("a/b.rs"), file("top.rs")]);
+        // BTreeMap order: a, a/b.rs, top.rs.
+        tree.select_down();
+        assert_eq!(tree.selected(), Some("a"));
+        tree.select_down();
+        assert_eq!(tree.selected(), Some("a/b.rs"));
+        tree.select_down();
+        assert_eq!(tree.selected(), Some("top.rs"));
+        // Clamped at the last row.
+        tree.select_down();
+        assert_eq!(tree.selected(), Some("top.rs"));
+
+        tree.select_up();
+        assert_eq!(tree.selected(), Some("a/b.rs"));
+    }
+
+    #[test]
+    fn test_select_first_and_select_last_jump_to_the_row_set_edges() {
+        let mut tree = seed(vec![dir("a"), file("a/b.rs"), file("top.rs")]);
+        tree.selected = Some("a/b.rs".into());
+
+        tree.select_last();
+        assert_eq!(tree.selected(), Some("top.rs"));
+
+        tree.select_first();
+        assert_eq!(tree.selected(), Some("a"));
+    }
+
+    #[test]
+    fn test_scroll_selected_into_view_refreshes_the_cache_and_tolerates_a_hidden_selection() {
+        let mut tree = seed(vec![dir("a"), file("a/b.rs"), file("top.rs")]);
+        tree.selected = Some("a/b.rs".into());
+        // Hide the selected row: `a/b.rs` drops out of the visible set and the
+        // cache is marked dirty.
+        tree.toggle_dir("a");
+
+        tree.scroll_selected_into_view();
+
+        assert!(!tree.cache_dirty, "the helper refreshes the cache first");
+        // The hidden selection stays put; there is simply no row to scroll to.
+        assert_eq!(tree.selected(), Some("a/b.rs"));
+    }
+
+    #[test]
+    fn test_collapse_or_select_parent_collapses_an_expanded_selected_dir() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs")]);
+        tree.selected = Some("src".into());
+
+        tree.collapse_or_select_parent();
+
+        assert!(tree.is_collapsed("src"));
+        // Collapsing keeps the selection on the directory itself.
+        assert_eq!(tree.selected(), Some("src"));
+    }
+
+    #[test]
+    fn test_collapse_or_select_parent_on_a_file_selects_its_parent() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs")]);
+        tree.selected = Some("src/main.rs".into());
+
+        tree.collapse_or_select_parent();
+
+        assert_eq!(tree.selected(), Some("src"));
+        assert!(
+            !tree.is_collapsed("src"),
+            "selecting the parent must not also collapse it"
+        );
+    }
+
+    #[test]
+    fn test_collapse_or_select_parent_on_an_already_collapsed_dir_selects_its_parent() {
+        let mut tree = seed(vec![dir("a"), dir("a/b"), file("a/b/c.rs")]);
+        tree.toggle_dir("a/b");
+        tree.selected = Some("a/b".into());
+
+        tree.collapse_or_select_parent();
+
+        assert_eq!(tree.selected(), Some("a"));
+    }
+
+    #[test]
+    fn test_collapse_or_select_parent_is_a_noop_at_a_top_level_row() {
+        let mut tree = seed(vec![file("top.rs")]);
+        tree.selected = Some("top.rs".into());
+
+        tree.collapse_or_select_parent();
+
+        // No parent to step to; selection is unchanged.
+        assert_eq!(tree.selected(), Some("top.rs"));
+    }
+
+    #[test]
+    fn test_collapse_or_select_parent_selects_the_first_row_when_nothing_was_selected() {
+        let mut tree = seed(vec![dir("a"), file("top.rs")]);
+
+        tree.collapse_or_select_parent();
+
+        assert_eq!(tree.selected(), Some("a"));
+    }
+
+    #[test]
+    fn test_expand_or_select_child_expands_a_collapsed_selected_dir() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs")]);
+        tree.toggle_dir("src");
+        tree.selected = Some("src".into());
+
+        tree.expand_or_select_child();
+
+        assert!(!tree.is_collapsed("src"));
+        assert_eq!(tree.selected(), Some("src"));
+    }
+
+    #[test]
+    fn test_expand_or_select_child_on_an_expanded_dir_selects_its_first_child() {
+        let mut tree = seed(vec![dir("a"), dir("a/b"), file("a/z.rs")]);
+        tree.selected = Some("a".into());
+
+        tree.expand_or_select_child();
+
+        assert_eq!(tree.selected(), Some("a/b"));
+    }
+
+    #[test]
+    fn test_expand_or_select_child_is_a_noop_on_a_file() {
+        let mut tree = seed(vec![file("top.rs")]);
+        tree.selected = Some("top.rs".into());
+
+        tree.expand_or_select_child();
+
+        assert_eq!(tree.selected(), Some("top.rs"));
+    }
+
+    #[test]
+    fn test_expand_or_select_child_is_a_noop_on_an_empty_expanded_dir() {
+        let mut tree = seed(vec![dir("empty"), file("top.rs")]);
+        tree.selected = Some("empty".into());
+
+        tree.expand_or_select_child();
+
+        assert_eq!(tree.selected(), Some("empty"));
+    }
+
+    #[test]
+    fn test_expand_or_select_child_selects_the_first_row_when_nothing_was_selected() {
+        let mut tree = seed(vec![dir("a"), file("top.rs")]);
+
+        tree.expand_or_select_child();
+
+        assert_eq!(tree.selected(), Some("a"));
+    }
+}

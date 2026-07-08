@@ -1,0 +1,21 @@
+[package]
+name = "rift-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rift-protocol.workspace = true
+async-lsp.workspace = true
+lsp-types.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+tower.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+rift-protocol.workspace = true
+tokio.workspace = true

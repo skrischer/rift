@@ -6,27 +6,80 @@ members = [
     "crates/tmux-core",
     "crates/terminal",
     "crates/explorer",
+    "crates/logging",
+    "crates/lsp",
     "crates/protocol",
     "crates/plugin-api",
     "crates/ssh",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/skrischer/rift"
 
 [workspace.dependencies]
+rift-protocol = { path = "crates/protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 thiserror = "2"
+ignore = "0.4"
+notify = "7"
+# Pure-Rust git for the read-only status path (musl-clean; git2/libgit2 is a C
+# dep ruled out by the static-musl daemon build). `max-performance` (zlib-ng, C)
+# is deliberately NOT enabled — `status` + `dirwalk` over the default pure-Rust
+# zlib keep the daemon statically linkable. `blob-diff` (spec-source-control.md)
+# enables `gix-diff/blob` (`gix-imara-diff`) for the source-control panel's
+# per-file diff, without pulling in a new top-level diff crate.
+gix = { version = "0.84", default-features = false, features = ["status", "dirwalk", "revision", "sha1", "max-performance-safe", "blob-diff"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-gpui = { git = "https://github.com/zed-industries/zed", rev = "83de8a25e0ef71a8d762a148459bc863adaeb7e3", package = "gpui" }
-termy_terminal_ui = { git = "https://github.com/termy-org/termy", rev = "297bf90" }
-flume = "0.12"
+# LSP client stack (daemon-side, gpui-free, musl-clean). `async-lsp` pins
+# `lsp-types = 0.95`; depend on that same line so the diagnostic types match the
+# version `async-lsp` speaks across the JSON-RPC boundary. `lsp-types` upstream
+# is stalled (docs/prior-art.md caveat 6) — watch `tower-lsp-community/ls-types`.
+async-lsp = { version = "0.2", default-features = false, features = ["omni-trait", "tracing", "tokio"] }
+lsp-types = "0.95"
+# Bridges the daemon's tokio child-process stdio into the futures-io `AsyncRead`
+# / `AsyncWrite` that `async-lsp`'s `MainLoop::run_buffered` consumes, so the
+# crate stays on tokio alone (no second smol/async-process runtime).
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"
+tower = "0.5"
+# gpui-component is pinned to a specific commit (the editor surface lands here;
+# an upstream force-push must never shift the widget set under us). The GPUI
+# commit is pinned *alongside* it through Cargo.lock, not with a `rev` here:
+# gpui-component depends on `gpui` / `gpui_platform` from the same zed git URL
+# *without* a rev, so a `rev` on our lines would be a second, non-unifying source
+# and split the graph into two incompatible `gpui` copies (and a same-source
+# `[patch]` is rejected by Cargo). Left rev-less, a git dep does not float on
+# `cargo build` — the committed Cargo.lock pins the exact gpui commit
+# (4bee41211…, matching the gpui-component pin), and it moves only on an explicit
+# `cargo update`. Bump the two in lockstep.
+gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "9ad30e631e15f9bbba049717767bf4cd98e4f179" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "9ad30e631e15f9bbba049717767bf4cd98e4f179" }
+termy_terminal_ui = { git = "https://github.com/skrischer/termy", rev = "2c2bd091e4acedfe6799ad77a7f24bf4e19ece70" }
+flume = "0.11"
 alacritty_terminal = "0.26.0"
 smol = "2.0"
+
+# Stable daily-driver profile: release-grade optimization, but debug-assertions ON so
+# the GPUI Windows DirectX renderer takes its runtime-shader path (cfg(debug_assertions))
+# instead of the release path that include!s build-time fxc-compiled shaders. That build
+# script only runs on a Windows host and needs fxc.exe, so it cannot cross-compile from
+# WSL; the runtime path compiles shaders on the Windows host at startup, like the debug
+# dev loop. See docs/spec-dogfooding-channels.md.
+[profile.stable]
+inherits = "release"
+debug-assertions = true
+
+# Ensure gpui_windows's build script is compiled with debug-assertions too, so its
+# cfg(not(debug_assertions)) shader-compilation gate stays off (otherwise it panics
+# looking for fxc.exe on the Linux host).
+[profile.stable.build-override]
+debug-assertions = true

@@ -1,2 +1,11 @@
 #define RT_MANIFEST 24
-1 RT_MANIFEST "rift.manifest.xml"
+1 RT_MANIFEST "resources/windows/rift.manifest.xml"
+
+// Taskbar/exe icon. WINDOWED (defined by build.rs when the `windowed` feature is
+// on, i.e. the promoted stable build) gets the primary brand mark; dev builds get
+// the monochrome outline so the two channels are visually distinct.
+#ifdef WINDOWED
+1 ICON "resources/windows/rift.ico"
+#else
+1 ICON "resources/windows/rift-dev.ico"
+#endif

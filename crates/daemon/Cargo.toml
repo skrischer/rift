@@ -6,9 +6,11 @@ license.workspace = true
 
 [dependencies]
 rift-protocol = { path = "../protocol" }
-rift-plugin-api = { path = "../plugin-api" }
-rift-tmux-core = { path = "../tmux-core" }
-rift-terminal = { path = "../terminal" }
 rift-explorer = { path = "../explorer" }
+rift-lsp = { path = "../lsp" }
+rift-logging = { path = "../logging" }
+rift-tmux-core = { path = "../tmux-core" }
 tokio.workspace = true
 anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

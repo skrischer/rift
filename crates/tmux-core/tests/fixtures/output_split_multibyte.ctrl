@@ -1,0 +1,23 @@
+%begin 1781354527 265 0
+%end 1781354527 265 0
+%window-add @0
+%sessions-changed
+%session-changed $0 cap
+%output %0 \033[?2004h\033[01;32mdeveloper@skrischer-xps\033[00m:\033[01;34m/tmp\033[00m$ 
+%begin 1781354528 271 1
+%end 1781354528 271 1
+%output %0 clear; printf "\134303"; sleep 0.6; printf "\134244\134n"
+%begin 1781354528 272 1
+%end 1781354528 272 1
+%output %0 \015\012\033[?2004l\015
+%output %0 \033[H\033[J\033[3J
+%output %0 Ã
+%output %0 ¤\015\012
+%window-renamed @0 sleep
+%output %0 \033[?2004h
+%output %0 \033[01;32mdeveloper@skrischer-xps\033[00m:\033[01;34m/tmp\033[00m$ 
+%window-renamed @0 bash
+%begin 1781354530 275 1
+%end 1781354530 275 1
+%sessions-changed
+%exit
