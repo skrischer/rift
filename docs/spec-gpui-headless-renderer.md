@@ -1,6 +1,6 @@
 # Spec: gpui headless renderer (Linux/WSLg)
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-07-08
 > Completed: —
 
@@ -58,10 +58,11 @@ What is true when this work is done:
 - **The Windows (D3D11) headless renderer** — deferred (see Prior decisions;
   gate-confirmed). Linux/WSLg is the headless-loop environment this unblocks.
 - **macOS** — already has `MetalHeadlessRenderer`.
-- **The fork commit to `skrischer/zed` itself** — a human prerequisite (the
-  `[patch]` target must exist before rift's `Cargo.lock` resolves), exactly the
-  role the rev-bump spec gave the termy-fork commit ("a merged commit to the
-  externally-owned-but-rift-controlled fork, out of this spec's scope").
+- **A rift PR for the fork commit** — the wgpu-renderer commit lands in the
+  `skrischer/zed` repo (the milestone's first issue creates the fork + writes +
+  pushes it), not as a rift PR; rift's PRs cover only the `[patch]` +
+  `Cargo.lock` + smoke test that consume it. (The gate chose in-loop autonomous
+  creation over the rev-bump's human-prerequisite model.)
 - Any `gpui` **rev bump** — the base stays `4bee412` (the rev bump is NO-GO,
   `archive/spec-gpui-rev-bump.md`); this is purely additive on it.
 
@@ -103,8 +104,9 @@ What is true when this work is done:
 | Fork lives at `skrischer/zed`; rift consumes it via `[patch]` + a pinned `Cargo.lock` | The renderer reuses `gpui_wgpu`'s private draw internals (shaders, `draw_primitives`, atlas) — an external crate cannot reach them, so the change must be in `gpui` itself ⇒ a fork; `[patch]` redirects every consumer to it | 2026-07-08 |
 | Single-`gpui`-invariant trial mandatory before landing, in a throwaway worktree | The invariant can break silently (rev-bump precedent: same commit, two `SourceId`s); the trial greps one source per zed-sourced crate after the `[patch]` | 2026-07-08 |
 | Reuse `gpui_wgpu`'s existing `CosmicTextSystem` + sprite atlas for the headless context | Accurate glyph shaping needs a real text system (the `HeadlessAppContext` doc-comment); the wgpu renderer already owns both — the headless renderer shares them, as Metal does (`sprite_atlas().clone()`) | 2026-07-08 |
-| **Scope: Linux/WSLg only; Windows (D3D11) deferred** | `OPEN — resolved at the spec-acceptance gate` | 2026-07-08 |
-| **Fork-commit landing: human-prerequisite push to `skrischer/zed` vs. in-loop fork+commit** | `OPEN — resolved at the spec-acceptance gate` | 2026-07-08 |
+| **Scope: Linux/WSLg only; Windows (D3D11) deferred** | Linux renders via `gpui_wgpu` and is the headless-loop environment; Windows uses a different backend (`gpui_windows` D3D11) needing HWND/swapchain decoupling — a separate later phase. Accepted at the gate | 2026-07-08 |
+| **The loop creates the `skrischer/zed` fork autonomously** (not a human hand-off) | The renderer is well-specified (Metal blueprint) and `repo` scope is present; the milestone's first issue forks zed off `4bee412`, writes the wgpu renderer, and pushes a pinned branch. Accepted at the gate | 2026-07-08 |
+| Fork renderer authored at **upstream-PR quality** (a clean `zed-industries/zed` contribution) | Zed shares the non-macOS headless gap; writing to gpui's own conventions from the start (mirroring the `MetalHeadlessRenderer` surface, no rift-specific coupling) means an eventual upstream PR dissolves the fork rather than leaving a permanent rift-only patch. Authored against zed's current default branch shape so the PR rebases cleanly | 2026-07-08 |
 
 ## Prior art
 
@@ -120,12 +122,11 @@ From `docs/prior-art.md`, "Visual UI harness — prior-art index (tooling track)
 
 ## Human prerequisites
 
-- **The `skrischer/zed` fork with the additive headless-renderer branch, pinned
-  to an exact commit** — the `[patch]` target. rift's `Cargo.lock` cannot resolve
-  until it exists. Whether the human pushes it or authorizes the loop to create
-  it (`gh repo fork` + branch off `4bee412` + the additive commit) is the
-  gate-resolved open decision below; either way the fork's existence is the
-  prerequisite the milestone's first issue depends on.
+**None.** The gate authorized the loop to create the `skrischer/zed` fork
+autonomously (`gh repo fork` + branch off `4bee412` + the additive wgpu-renderer
+commit; `repo` scope is present). The fork's existence is an ordering constraint
+*inside* the milestone — the first issue creates it, and the `[patch]` /
+`Cargo.lock` issue depends on that — but nothing is delivered by a human.
 
 ## Tracking
 
@@ -164,6 +165,19 @@ How does the developer know the spec is complete?
 
 ## Decision log
 
+- 2026-07-08: User directive — author the fork renderer at **upstream-PR
+  quality** so it can later be proposed to `zed-industries/zed` (dissolving the
+  fork). Written as a clean, general gpui contribution (gpui conventions,
+  mirroring the `MetalHeadlessRenderer` surface), not a rift-specific hack. The
+  rift base commit is `4bee412` (what `[patch]` pins); the upstream PR itself
+  targets zed's default branch, so the renderer avoids depending on anything that
+  changed after `4bee412`.
+- 2026-07-08: Spec-acceptance gate (user). Two open decisions resolved:
+  (1) **scope is Linux/WSLg only**, Windows (D3D11) deferred to a later phase;
+  (2) **the loop creates the `skrischer/zed` fork autonomously** (not a human
+  hand-off) — the milestone's first issue forks zed + writes the wgpu renderer,
+  and the `[patch]` issue depends on it. Human prerequisites: none. Spec accepted
+  → `READY`, merging.
 - 2026-07-08: All load-bearing gpui API claims re-verified against rift's
   **actual pinned commit `4bee412`** (via `git show` in the cargo bare repo) —
   not the `1d217ee` checkout that also sits in the local cargo cache: the
