@@ -15,7 +15,7 @@ pub use frame::{encode_frame, FrameDecoder, FrameError, MAX_FRAME_LEN};
 /// is wire-compatible in one direction. The message set is pinned by the
 /// fingerprint test beside `PROTOCOL_FINGERPRINT` below, so a message-set
 /// change without a bump cannot pass CI.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Pinned fingerprint of the protocol message set, checked by the
 /// `fingerprint_tests` module: an FNV-1a hash over the serde-visible surface
@@ -25,7 +25,7 @@ pub const PROTOCOL_VERSION: u32 = 8;
 /// [`PROTOCOL_VERSION`] above and re-pin this value (the failing test prints
 /// the new fingerprint).
 #[cfg(test)]
-const PROTOCOL_FINGERPRINT: u64 = 0xe1f2_261a_f2a0_edbe;
+const PROTOCOL_FINGERPRINT: u64 = 0x34f8_2884_a835_39e3;
 
 /// Messages the client sends to the daemon.
 ///
@@ -253,6 +253,49 @@ pub enum ClientMessage {
     /// path-keyed, unlike the other write ops.
     Commit {
         message: String,
+    },
+    /// Create an empty regular file at `path` (relative to the worktree root,
+    /// the same key space as [`WorktreeEntry::path`]): missing parent
+    /// directories are created (as a buffer [`ClientMessage::SaveFile`] write
+    /// does). Refused [`FileOpError::AlreadyExists`] if `path` already
+    /// exists — never overwrites. Runs daemon-side via `std::fs`, confined to
+    /// the worktree root by the same resolver a buffer write uses. Answered
+    /// with exactly one [`DaemonMessage::FileOpResult`] carrying
+    /// [`FileOp::CreateFile`]; the resulting tree change is never echoed in
+    /// the reply — it arrives through the push-only
+    /// [`DaemonMessage::UpdateWorktree`] recompute, the same
+    /// self-inflicted-op contract the write channel established
+    /// (`docs/spec-explorer-file-ops.md`).
+    CreateFile {
+        path: String,
+    },
+    /// Create a directory (and missing intermediates) at `path`. Refused
+    /// [`FileOpError::AlreadyExists`] if a file or directory already occupies
+    /// `path`. Answered with one [`DaemonMessage::FileOpResult`] carrying
+    /// [`FileOp::CreateDir`]; state converges via the push recompute, same as
+    /// [`ClientMessage::CreateFile`].
+    CreateDir {
+        path: String,
+    },
+    /// Rename or move `from` to `to` (one message covers both — inline
+    /// rename is a same-parent `to`, drag-drop move is a new-parent `to`;
+    /// both are the same `fs::rename`). Missing parent directories of `to`
+    /// are created. Refused [`FileOpError::AlreadyExists`] if `to` exists (no
+    /// clobber); [`FileOpError::NotFound`] if `from` is gone. Answered with
+    /// one [`DaemonMessage::FileOpResult`] carrying [`FileOp::Rename`]; state
+    /// converges via the push recompute, same as [`ClientMessage::CreateFile`].
+    RenamePath {
+        from: String,
+        to: String,
+    },
+    /// Delete `path`: a file via `remove_file`, a directory **recursively**
+    /// via `remove_dir_all`. **Destructive.** The client gates this behind an
+    /// explicit confirm dialog (the #420 pattern) and never batches it — one
+    /// request per path. Answered with one [`DaemonMessage::FileOpResult`]
+    /// carrying [`FileOp::Delete`]; state converges via the push recompute,
+    /// same as [`ClientMessage::CreateFile`].
+    DeletePath {
+        path: String,
     },
     Hello {
         version: u32,
@@ -577,6 +620,22 @@ pub enum DaemonMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// The reply to every file-operation request
+    /// ([`ClientMessage::CreateFile`], [`ClientMessage::CreateDir`],
+    /// [`ClientMessage::RenamePath`], [`ClientMessage::DeletePath`]): whether
+    /// `op` succeeded, or a typed `error` when it did not. This is the
+    /// **only** signal the file-op path returns over the wire; the resulting
+    /// tree change is never echoed here — it arrives through the push-only
+    /// [`UpdateWorktree`](DaemonMessage::UpdateWorktree) recompute, the
+    /// protocol's one source of truth for tree structure (mirrors
+    /// [`GitOpResult`](DaemonMessage::GitOpResult)). `error` is omitted on
+    /// success.
+    FileOpResult {
+        op: FileOp,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<FileOpError>,
+    },
     Welcome {
         version: u32,
     },
@@ -812,6 +871,31 @@ pub enum BufferErrorReason {
     Io,
 }
 
+/// Why the daemon refused a file-operation request, carried by
+/// [`DaemonMessage::FileOpResult`].
+///
+/// rift's own type, deliberately independent of `std::io::Error` — the same
+/// precedent as [`BufferErrorReason`]: no third-party or `std` error type
+/// crosses the wire. The daemon maps its internal fs error onto one of these
+/// variants — `AlreadyExists` / `NotFound` / `PermissionDenied` from an
+/// up-front existence check or the underlying [`std::io::ErrorKind`],
+/// `InvalidPath` when the path escaped the worktree root or was empty
+/// (`buffer::resolve`'s guard), and `Io` as the generic fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileOpError {
+    /// The op's target already exists — create and rename never clobber.
+    AlreadyExists,
+    /// The op's source path does not exist on disk.
+    NotFound,
+    /// The daemon lacks permission to perform the operation.
+    PermissionDenied,
+    /// The path escaped the worktree root, or was empty.
+    InvalidPath,
+    /// A generic I/O failure not covered by the more specific reasons above.
+    Io,
+}
+
 /// A half-open span within a file, from `start` (inclusive) to `end`
 /// (exclusive), mirroring LSP ranges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1025,6 +1109,19 @@ pub enum GitWriteOp {
     StageHunk { path: String, hunk_id: u64 },
     DiscardFile { path: String },
     Commit,
+}
+
+/// Which file operation a [`DaemonMessage::FileOpResult`] answers, echoing
+/// enough of the originating [`ClientMessage`] to correlate the reply to it —
+/// `path` for the create/delete ops, `from`/`to` for a rename. Tagged by
+/// `kind` on the wire, mirroring [`GitWriteOp`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileOp {
+    CreateFile { path: String },
+    CreateDir { path: String },
+    Rename { from: String, to: String },
+    Delete { path: String },
 }
 
 /// The FNV-1a fingerprint of a [`DiffHunk`], serving as `hunk_id` on
@@ -3110,6 +3207,215 @@ mod tests {
             err.is_err(),
             "git_op_result without an ok field must not deserialize"
         );
+    }
+
+    // ---- File-operation round-trip tests (docs/spec-explorer-file-ops.md) ----
+
+    #[test]
+    fn test_create_file_roundtrip_preserves_path() {
+        let msg = ClientMessage::CreateFile {
+            path: "src/new.rs".to_owned(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize CreateFile");
+        assert_eq!(json, r#"{"type":"create_file","path":"src/new.rs"}"#);
+        let parsed: ClientMessage = serde_json::from_str(&json).expect("deserialize CreateFile");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_create_file_missing_path_is_rejected() {
+        let err = serde_json::from_str::<ClientMessage>(r#"{"type":"create_file"}"#);
+        assert!(
+            err.is_err(),
+            "create_file without a path must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_create_dir_roundtrip_preserves_path() {
+        let msg = ClientMessage::CreateDir {
+            path: "src/new_dir".to_owned(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize CreateDir");
+        assert_eq!(json, r#"{"type":"create_dir","path":"src/new_dir"}"#);
+        let parsed: ClientMessage = serde_json::from_str(&json).expect("deserialize CreateDir");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_create_dir_missing_path_is_rejected() {
+        let err = serde_json::from_str::<ClientMessage>(r#"{"type":"create_dir"}"#);
+        assert!(
+            err.is_err(),
+            "create_dir without a path must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_rename_path_roundtrip_preserves_from_and_to() {
+        let msg = ClientMessage::RenamePath {
+            from: "src/old.rs".to_owned(),
+            to: "src/new.rs".to_owned(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize RenamePath");
+        assert_eq!(
+            json,
+            r#"{"type":"rename_path","from":"src/old.rs","to":"src/new.rs"}"#
+        );
+        let parsed: ClientMessage = serde_json::from_str(&json).expect("deserialize RenamePath");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_rename_path_missing_to_is_rejected() {
+        let err =
+            serde_json::from_str::<ClientMessage>(r#"{"type":"rename_path","from":"src/old.rs"}"#);
+        assert!(
+            err.is_err(),
+            "rename_path without a to field must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_delete_path_roundtrip_preserves_path() {
+        let msg = ClientMessage::DeletePath {
+            path: "src/old.rs".to_owned(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize DeletePath");
+        assert_eq!(json, r#"{"type":"delete_path","path":"src/old.rs"}"#);
+        let parsed: ClientMessage = serde_json::from_str(&json).expect("deserialize DeletePath");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_delete_path_missing_path_is_rejected() {
+        let err = serde_json::from_str::<ClientMessage>(r#"{"type":"delete_path"}"#);
+        assert!(
+            err.is_err(),
+            "delete_path without a path must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_file_op_result_ok_roundtrip_for_each_op() {
+        // One representative op per FileOp variant, success case: `error`
+        // must be omitted on the wire, never serialized as `null`.
+        for op in [
+            FileOp::CreateFile {
+                path: "a.rs".to_owned(),
+            },
+            FileOp::CreateDir {
+                path: "a_dir".to_owned(),
+            },
+            FileOp::Rename {
+                from: "a.rs".to_owned(),
+                to: "b.rs".to_owned(),
+            },
+            FileOp::Delete {
+                path: "a.rs".to_owned(),
+            },
+        ] {
+            let msg = DaemonMessage::FileOpResult {
+                op: op.clone(),
+                ok: true,
+                error: None,
+            };
+            let json = serde_json::to_string(&msg).expect("serialize FileOpResult");
+            assert!(json.contains(r#""type":"file_op_result""#));
+            assert!(
+                !json.contains("error"),
+                "error must be omitted on success: {json}"
+            );
+            let parsed: DaemonMessage =
+                serde_json::from_str(&json).expect("deserialize FileOpResult");
+            assert_eq!(parsed, msg);
+        }
+    }
+
+    #[test]
+    fn test_file_op_result_error_roundtrip_carries_typed_reason() {
+        let msg = DaemonMessage::FileOpResult {
+            op: FileOp::CreateFile {
+                path: "a.rs".to_owned(),
+            },
+            ok: false,
+            error: Some(FileOpError::AlreadyExists),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize FileOpResult error");
+        assert!(json.contains(r#""kind":"create_file""#));
+        assert!(json.contains(r#""ok":false"#));
+        assert!(json.contains(r#""error":"already_exists""#));
+        let parsed: DaemonMessage =
+            serde_json::from_str(&json).expect("deserialize FileOpResult error");
+        assert_eq!(parsed, msg);
+        match parsed {
+            DaemonMessage::FileOpResult { op, ok, error } => {
+                assert_eq!(
+                    op,
+                    FileOp::CreateFile {
+                        path: "a.rs".to_owned()
+                    }
+                );
+                assert!(!ok);
+                assert_eq!(error, Some(FileOpError::AlreadyExists));
+            }
+            other => panic!("expected FileOpResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_file_op_rename_roundtrip_preserves_from_and_to() {
+        let op = FileOp::Rename {
+            from: "src/old.rs".to_owned(),
+            to: "src/new.rs".to_owned(),
+        };
+        let json = serde_json::to_string(&op).expect("serialize FileOp::Rename");
+        assert_eq!(
+            json,
+            r#"{"kind":"rename","from":"src/old.rs","to":"src/new.rs"}"#
+        );
+        let parsed: FileOp = serde_json::from_str(&json).expect("deserialize FileOp::Rename");
+        assert_eq!(parsed, op);
+    }
+
+    #[test]
+    fn test_file_op_kind_tag_is_rejected_when_unknown() {
+        let err = serde_json::from_str::<FileOp>(r#"{"kind":"frobnicate"}"#);
+        assert!(err.is_err(), "unknown file op kind must not deserialize");
+    }
+
+    #[test]
+    fn test_file_op_result_missing_ok_field_is_rejected() {
+        let err = serde_json::from_str::<DaemonMessage>(
+            r#"{"type":"file_op_result","op":{"kind":"delete","path":"a.rs"}}"#,
+        );
+        assert!(
+            err.is_err(),
+            "file_op_result without an ok field must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_file_op_error_variants_roundtrip_snake_case() {
+        for (reason, tag) in [
+            (FileOpError::AlreadyExists, "already_exists"),
+            (FileOpError::NotFound, "not_found"),
+            (FileOpError::PermissionDenied, "permission_denied"),
+            (FileOpError::InvalidPath, "invalid_path"),
+            (FileOpError::Io, "io"),
+        ] {
+            let json = serde_json::to_string(&reason).expect("serialize FileOpError");
+            assert_eq!(json, format!(r#""{tag}""#));
+            assert_eq!(
+                serde_json::from_str::<FileOpError>(&json).expect("deserialize FileOpError"),
+                reason
+            );
+        }
+    }
+
+    #[test]
+    fn test_file_op_error_unknown_variant_is_rejected() {
+        assert!(serde_json::from_str::<FileOpError>(r#""frobnicated""#).is_err());
     }
 
     #[test]

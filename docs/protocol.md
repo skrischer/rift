@@ -50,7 +50,11 @@ binary, never by tolerating it (`docs/spec-connection-robustness.md`).
   a healthy concurrent connection's stream (relevant for the shared stable+dev
   daemon).
 
-History: version 8 adds the buffer channel's typed error replies `open_error` /
+History: version 9 adds the file-operation channel — `create_file` /
+`create_dir` / `rename_path` / `delete_path`, each answered by one
+`file_op_result` carrying a typed `FileOp` echo and an optional typed
+`FileOpError` (`docs/spec-explorer-file-ops.md`); version 8 adds the buffer
+channel's typed error replies `open_error` /
 `save_error`, each carrying a `BufferErrorReason` (`docs/spec-v1-hardening.md`);
 version 7 adds the source-control write channel — `stage_file` /
 `unstage_file` / `stage_hunk` / `discard_file` / `commit`, each answered by
@@ -566,6 +570,53 @@ its `hunk_id` back to a concrete hunk via `hunk_fingerprint` over the file's
 freshly recomputed worktree-vs-HEAD hunks, so a stale or content-changed id
 matches nothing and is rejected.
 
+## File-operation channel
+
+The file-operation channel is the **seventh request/response family in the
+protocol**, giving the explorer create / rename / delete / move. Specified by
+`docs/spec-explorer-file-ops.md`.
+
+```json
+// client → daemon
+{ "type": "create_file",  "path": "src/new.rs" }
+{ "type": "create_dir",   "path": "src/new_dir" }
+{ "type": "rename_path",  "from": "src/old.rs", "to": "src/new.rs" }
+{ "type": "delete_path",  "path": "src/old.rs" }
+// daemon → client
+{ "type": "file_op_result", "op": { "kind": "create_file", "path": "src/new.rs" }, "ok": true }
+{ "type": "file_op_result", "op": { "kind": "rename", "from": "src/old.rs", "to": "src/new.rs" }, "ok": false, "error": "already_exists" }
+```
+
+- `create_file` / `create_dir` carry only `path` (relative to the worktree
+  root, the same key space as `WorktreeEntry::path`). Missing parent
+  directories are created (as a buffer `save_file` write does). Refused
+  `already_exists` if `path` already exists — neither op ever overwrites.
+- `rename_path` carries `from` and `to`; **one message covers both** inline
+  rename (same parent, new name) and drag-drop move (new parent) — they are
+  the same `fs::rename`. Missing parent directories of `to` are created.
+  Refused `already_exists` if `to` exists (no clobber); `not_found` if `from`
+  is gone.
+- `delete_path` carries only `path`: a file is removed via `remove_file`, a
+  directory **recursively** via `remove_dir_all`. **Destructive.** The client
+  gates this behind an explicit confirm dialog (the #420 pattern) and never
+  batches it — one request per path.
+- `file_op_result` is the **single reply shape for all four requests**: `op`
+  echoes enough of the request to correlate the reply (tagged by `kind`,
+  mirroring `GitWriteOp`) — `path` for `create_file` / `create_dir` /
+  `delete`, `from` + `to` for `rename`; `ok` is whether the operation
+  succeeded; `error` is a typed `FileOpError`
+  (`already_exists` / `not_found` / `permission_denied` / `invalid_path` /
+  `io`), present only on failure (omitted, never `null`, on success). This is
+  the **only** signal the file-op path returns over the wire — the resulting
+  tree change is never echoed here; it arrives through the existing push-only
+  worktree recompute (`update_worktree`), keeping one source of truth for
+  tree structure instead of two (create → `added`, rename → `removed` +
+  `added`, delete → `removed`).
+- Every path is confined to the worktree root by the same resolver a buffer
+  write uses (`buffer::resolve`) — a rename confines **both** endpoints.
+  There is no client-side SFTP path; every op runs daemon-side via `std::fs`
+  on the remote host the daemon already owns.
+
 ## Rules
 
 All message types live in `crates/protocol/`. Adding a new message type is a
@@ -588,11 +639,13 @@ channel** (`open_file` → `file_content`, `save_file` → `save_result` /
 `definition_response`, `references_request` → `references_response`,
 `document_symbol_request` → `document_symbol_response`) for LSP pull
 queries; the **diff channel** (`request_diff` → `file_diff`) for the
-source-control panel's review diff; and the **write channel**
+source-control panel's review diff; the **write channel**
 (`stage_file` / `unstage_file` / `stage_hunk` / `discard_file` / `commit` →
 one `git_op_result` each) for the source-control panel's mutating
-operations. The push-only rule governs structure and decoration, never
-request/response pairs.
+operations; and the **file-operation channel** (`create_file` /
+`create_dir` / `rename_path` / `delete_path` → one `file_op_result` each)
+for the explorer's create / rename / delete / move. The push-only rule
+governs structure and decoration, never request/response pairs.
 
 The protocol may migrate to MessagePack if JSON serialization becomes a bottleneck.
 Keep message types serialization-agnostic (derive `serde::Serialize` +
