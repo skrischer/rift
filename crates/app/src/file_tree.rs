@@ -40,8 +40,11 @@ use gpui::{
     IntoElement, ParentElement as _, Pixels, Render, ScrollStrategy, SharedString, Size,
     StatefulInteractiveElement as _, Styled as _, Window,
 };
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dock::{Panel, PanelEvent};
-use gpui_component::{v_virtual_list, ActiveTheme as _, VirtualListScrollHandle};
+use gpui_component::{
+    h_flex, v_virtual_list, ActiveTheme as _, Sizable as _, VirtualListScrollHandle,
+};
 use rift_protocol::{DiagnosticSeverity, EntryKind, GitEntryStatus, GitStatusCode};
 
 use crate::worktree::WorktreeModel;
@@ -54,6 +57,10 @@ pub const FILE_TREE_PANEL_NAME: &str = "explorer";
 /// item; a uniform row keeps the size vector trivial to build and the scroll
 /// math exact.
 const ROW_HEIGHT: Pixels = px(22.0);
+
+/// Height of the `EXPLORER` header band, matching the composite status
+/// line's 28px band (`status_bar.rs`) for a consistent chrome rhythm.
+const HEADER_HEIGHT: Pixels = px(28.0);
 
 /// Horizontal indent applied per nesting level, so depth reads visually.
 const INDENT_PER_LEVEL: f32 = 14.0;
@@ -116,6 +123,14 @@ pub const FILE_TREE_KEY_CONTEXT: &str = "FileTree";
 pub enum FileTreeEvent {
     /// A file was selected; open it. `path` is root-relative.
     OpenFile { path: String },
+    /// The header/root-row "reveal active file" action fired
+    /// (`docs/spec-explorer-parity.md`). `workspace.rs`'s existing
+    /// `file_tree` subscription handles this by calling the already-present
+    /// `reveal_open_file_in_tree`, which owns the active-file path — a no-op
+    /// when no file is open. No new protocol, no new cross-crate coupling:
+    /// the panel just re-triggers the reveal path the editor-load flow
+    /// already drives.
+    RevealActiveRequested,
 }
 
 /// One rendered row: an entry's path, kind, nesting depth, and decoration
@@ -494,6 +509,68 @@ impl FileTree {
         self.toggle_dir(path);
     }
 
+    /// Whether every directory the model currently knows about is collapsed
+    /// — the header button's and root-row chevron's "fully collapsed" state
+    /// (offers Expand once true; `docs/spec-explorer-parity.md`). Deliberately
+    /// `false`, not the vacuous `true` an empty `all()` would give, when the
+    /// model has no directories at all — an all-file tree never claims to be
+    /// collapsed.
+    fn all_dirs_collapsed(&self) -> bool {
+        let mut any_dir = false;
+        for entry in self.model.entries().values() {
+            if entry.kind == EntryKind::Dir {
+                any_dir = true;
+                if !self.collapsed.contains(&entry.path) {
+                    return false;
+                }
+            }
+        }
+        any_dir
+    }
+
+    /// Collapse every directory the model currently knows about (header
+    /// "Collapse all" / root-row chevron while expanded): inserts each
+    /// `EntryKind::Dir` path into the existing `collapsed` set. Sets
+    /// `cache_dirty` directly, mirroring `toggle_dir`'s discipline, rather
+    /// than looping `toggle_dir` itself — which would re-expand a directory
+    /// that was already collapsed.
+    fn collapse_all(&mut self) {
+        for entry in self.model.entries().values() {
+            if entry.kind == EntryKind::Dir {
+                self.collapsed.insert(entry.path.clone());
+            }
+        }
+        self.cache_dirty = true;
+    }
+
+    /// Expand every directory (header "Expand all" / root-row chevron while
+    /// collapsed): clears the `collapsed` set wholesale.
+    fn expand_all(&mut self) {
+        self.collapsed.clear();
+        self.cache_dirty = true;
+    }
+
+    /// Flip between fully collapsed and fully expanded. The header button
+    /// and the workspace-root chevron are two entry points into the same
+    /// toggle.
+    fn toggle_collapse_all(&mut self) {
+        if self.all_dirs_collapsed() {
+            self.expand_all();
+        } else {
+            self.collapse_all();
+        }
+    }
+
+    /// The leaf (final non-empty path segment) of a root's absolute path —
+    /// the workspace-root row's label before uppercasing. The filesystem
+    /// root `"/"` has no real leaf name; it renders unchanged rather than as
+    /// an empty label.
+    fn root_leaf(root: &str) -> &str {
+        root.rsplit('/')
+            .find(|segment| !segment.is_empty())
+            .unwrap_or(root)
+    }
+
     /// Reveal `path` in the tree: expand every ancestor directory, select its
     /// row, and scroll it into view. [`crate::workspace::WorkspaceView`] calls
     /// this whenever the editor finishes opening or switching to a file
@@ -706,6 +783,119 @@ impl FileTree {
         path.rsplit('/').next().unwrap_or(path)
     }
 
+    /// The in-panel header band above the tree (`docs/spec-explorer-parity.md`):
+    /// an uppercase, muted `EXPLORER` label on a subtle elevated surface with
+    /// a bottom hairline, plus a right-aligned action row. Ships exactly the
+    /// two actions that map to a real client capability — collapse-all /
+    /// expand-all (a toggle reflecting `all_dirs_collapsed`) and reveal-active
+    /// — and consciously omits the design's *new file* and *refresh* glyphs
+    /// (no client capability yet: file-ops are deferred, and the tree is
+    /// push-reactive so a manual refresh is redundant; see the spec's prior
+    /// decisions).
+    ///
+    /// Both actions render as `Button::label` text glyphs, not `IconName`
+    /// icons: the shipping `rift` binary does not embed gpui-component's SVG
+    /// icon assets (only the dev-only `gallery` binary enables
+    /// `gpui-component-assets`, see `crates/app/Cargo.toml`), so an
+    /// `IconName` icon would render blank here. A Unicode glyph renders
+    /// reliably either way, mirroring the tree's own disclosure twisty.
+    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let all_collapsed = self.all_dirs_collapsed();
+
+        let collapse_toggle = Button::new("file-tree-collapse-toggle")
+            .ghost()
+            .xsmall()
+            .label(if all_collapsed {
+                "\u{229E}"
+            } else {
+                "\u{229F}"
+            })
+            .tooltip(if all_collapsed {
+                "Expand all"
+            } else {
+                "Collapse all"
+            })
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.toggle_collapse_all();
+                cx.notify();
+            }));
+
+        let reveal_active = Button::new("file-tree-reveal-active")
+            .ghost()
+            .xsmall()
+            .label("\u{2316}")
+            .tooltip("Reveal active file")
+            .on_click(cx.listener(|_this, _event, _window, cx| {
+                cx.emit(FileTreeEvent::RevealActiveRequested);
+            }));
+
+        h_flex()
+            .flex_shrink_0()
+            .items_center()
+            .justify_between()
+            .h(HEADER_HEIGHT)
+            .px(px(8.0))
+            .bg(cx.theme().secondary)
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("EXPLORER"),
+            )
+            .child(
+                h_flex()
+                    .gap(px(2.0))
+                    .child(collapse_toggle)
+                    .child(reveal_active),
+            )
+    }
+
+    /// The workspace-root row (`RIFT` in the design) below the header
+    /// (`docs/spec-explorer-parity.md`): the leaf of `model.root()`'s
+    /// absolute path, uppercased, with a disclosure chevron that mirrors and
+    /// drives the collapse-all/expand-all state. Neutral — no label, no
+    /// chevron, not clickable — while `root()` is `None`: no snapshot has
+    /// arrived yet, so there is nothing to name or toggle.
+    fn render_root_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(root) = self.model.root() else {
+            return h_flex()
+                .flex_shrink_0()
+                .items_center()
+                .h(ROW_HEIGHT)
+                .px(px(8.0))
+                .gap(px(4.0))
+                .child(div().w(px(12.0)).flex_shrink_0())
+                .into_any_element();
+        };
+
+        let chevron = if self.all_dirs_collapsed() {
+            "\u{203a}"
+        } else {
+            "\u{2304}"
+        };
+        let label = Self::root_leaf(root).to_uppercase();
+
+        h_flex()
+            .id("file-tree-root-row")
+            .flex_shrink_0()
+            .items_center()
+            .h(ROW_HEIGHT)
+            .px(px(8.0))
+            .gap(px(4.0))
+            .text_sm()
+            .cursor_pointer()
+            .hover(|s| s.bg(cx.theme().list_hover))
+            .child(div().w(px(12.0)).flex_shrink_0().child(chevron.to_string()))
+            .child(div().text_color(cx.theme().foreground).child(label))
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.toggle_collapse_all();
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
     /// Render one row as an interactive element. Clicking a directory selects
     /// it and toggles its expansion; clicking a file selects it and emits the
     /// open signal.
@@ -908,9 +1098,16 @@ impl Render for FileTree {
         // steals a keystroke the terminal panel would otherwise receive,
         // since GPUI dispatches actions along the currently *focused*
         // element's context chain, and the terminal panel is a focus-tracked
-        // sibling, not an ancestor, of this one).
+        // sibling, not an ancestor, of this one). `flex_col` stacks the header
+        // band and workspace-root row (both `flex_shrink_0`, fixed height)
+        // above the scrollable content, which claims the remaining space via
+        // `flex_1` (`min_h_0` so the virtual list's own sizing cannot push the
+        // fixed rows off — the same shape `problems_panel.rs`'s summary bar
+        // uses above its list).
         div()
             .size_full()
+            .flex()
+            .flex_col()
             .key_context(FILE_TREE_KEY_CONTEXT)
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(|this, _: &SelectUp, _window, cx| {
@@ -943,7 +1140,9 @@ impl Render for FileTree {
                 this.select_last();
                 cx.notify();
             }))
-            .child(content)
+            .child(self.render_header(cx))
+            .child(self.render_root_row(cx))
+            .child(div().flex_1().min_h_0().child(content))
             .into_any_element()
     }
 }
@@ -1180,6 +1379,109 @@ mod tests {
         tree.click_dir("src");
 
         assert_eq!(tree.selected(), Some("src"));
+    }
+
+    // --- header actions: collapse-all / expand-all, root leaf (#604) ---
+
+    #[test]
+    fn test_all_dirs_collapsed_is_false_on_a_freshly_seeded_expanded_tree() {
+        let tree = seed(vec![dir("src"), file("src/main.rs"), file("top.rs")]);
+        assert!(!tree.all_dirs_collapsed());
+    }
+
+    #[test]
+    fn test_all_dirs_collapsed_is_false_when_a_tree_has_no_directories() {
+        // Vacuous truth would wrongly claim "collapsed" for an all-file tree.
+        let tree = seed(vec![file("a.txt"), file("b.txt")]);
+        assert!(!tree.all_dirs_collapsed());
+    }
+
+    #[test]
+    fn test_collapse_all_collapses_every_directory_and_marks_all_dirs_collapsed() {
+        let mut tree = seed(vec![
+            dir("a"),
+            dir("a/b"),
+            file("a/b/c.rs"),
+            dir("z"),
+            file("top.rs"),
+        ]);
+        tree.refresh_row_cache();
+
+        tree.collapse_all();
+
+        assert!(tree.is_collapsed("a"));
+        assert!(tree.is_collapsed("a/b"));
+        assert!(tree.is_collapsed("z"));
+        assert!(tree.all_dirs_collapsed());
+        assert!(tree.cache_dirty);
+        tree.refresh_row_cache();
+        let visible: Vec<&str> = tree.row_cache.iter().map(|r| r.path.as_str()).collect();
+        // Top-level entries remain; nested subtrees are hidden.
+        assert_eq!(visible, vec!["a", "top.rs", "z"]);
+    }
+
+    #[test]
+    fn test_expand_all_clears_the_collapsed_set() {
+        let mut tree = seed(vec![dir("a"), dir("a/b"), file("a/b/c.rs")]);
+        tree.collapse_all();
+        assert!(tree.all_dirs_collapsed());
+
+        tree.expand_all();
+
+        assert!(!tree.is_collapsed("a"));
+        assert!(!tree.is_collapsed("a/b"));
+        assert!(!tree.all_dirs_collapsed());
+        assert!(tree.cache_dirty);
+    }
+
+    #[test]
+    fn test_toggle_collapse_all_flips_between_fully_collapsed_and_fully_expanded() {
+        let mut tree = seed(vec![dir("a"), file("a/b.rs"), dir("c")]);
+
+        tree.toggle_collapse_all();
+        assert!(tree.all_dirs_collapsed());
+
+        tree.toggle_collapse_all();
+        assert!(!tree.all_dirs_collapsed());
+        assert!(!tree.is_collapsed("a"));
+        assert!(!tree.is_collapsed("c"));
+    }
+
+    #[test]
+    fn test_collapse_all_preserves_an_already_collapsed_directory_not_reported_by_toggle() {
+        // Collapse-all must insert, not toggle: a directory collapsed before
+        // the call must stay collapsed, not flip back to expanded.
+        let mut tree = seed(vec![dir("a"), file("a/x.rs"), dir("b"), file("b/y.rs")]);
+        tree.toggle_dir("a");
+        assert!(tree.is_collapsed("a"));
+
+        tree.collapse_all();
+
+        assert!(tree.is_collapsed("a"));
+        assert!(tree.is_collapsed("b"));
+    }
+
+    #[test]
+    fn test_root_leaf_of_a_nested_absolute_path() {
+        assert_eq!(FileTree::root_leaf("/home/user/proj"), "proj");
+        assert_eq!(FileTree::root_leaf("/proj"), "proj");
+    }
+
+    #[test]
+    fn test_root_leaf_of_the_filesystem_root_is_unchanged() {
+        assert_eq!(FileTree::root_leaf("/"), "/");
+    }
+
+    #[test]
+    fn test_reveal_active_requested_variant_is_distinct_from_open_file_under_eq() {
+        // The event itself carries no payload; this just locks its `PartialEq`
+        // against `OpenFile` so a future refactor cannot silently merge them.
+        assert_ne!(
+            FileTreeEvent::RevealActiveRequested,
+            FileTreeEvent::OpenFile {
+                path: "a.rs".into()
+            }
+        );
     }
 
     // --- git + diagnostic decoration / ancestor roll-up (#329) ---
