@@ -20,9 +20,10 @@ What is true when this work is done:
       `capture_screenshot` returns a **non-blank** `RgbaImage` of the rendered
       scene.
 - [ ] The renderer is an **additive** change on the frozen `gpui` base
-      (`4bee412`): a `WgpuHeadlessRenderer` implementing `render_scene_to_image`
-      / `render_scene` / `sprite_atlas`, plus the `current_headless_renderer()`
-      Linux arm — no other `gpui` API changes.
+      (`4bee412`): a `WgpuHeadlessRenderer` implementing the two
+      `PlatformHeadlessRenderer` trait methods (`render_scene_to_image` +
+      `sprite_atlas` — the trait has exactly these two at `4bee412`), plus the
+      `current_headless_renderer()` Linux arm — no other `gpui` API changes.
 - [ ] rift consumes the fork via a `[patch]` redirect; `Cargo.lock` resolves to
       **exactly one** `gpui` and one source per zed-sourced crate (the
       single-`gpui`-invariant trial is green).
@@ -37,16 +38,18 @@ What is true when this work is done:
 ### In scope
 
 - In the `skrischer/zed` fork (branch off `4bee412`): a `WgpuHeadlessRenderer`
-  in `gpui_wgpu` implementing `gpui::PlatformHeadlessRenderer`
+  in `gpui_wgpu` implementing `gpui::PlatformHeadlessRenderer`'s two methods
   (`render_scene_to_image` = offscreen texture render + `copy_texture_to_buffer`
-  readback + BGRA→RGBA; `render_scene`; `sprite_atlas`), mirrored from
-  `gpui_macos`'s `MetalHeadlessRenderer` / `render_scene_to_image`; and the
+  readback + BGRA→RGBA; `sprite_atlas`), mirrored from `gpui_macos`'s
+  `MetalHeadlessRenderer` / `render_scene_to_image`; and the
   `current_headless_renderer()` Linux arm returning `Some(...)`.
 - In rift: the `[patch."https://github.com/zed-industries/zed"]` redirect to the
   fork, the regenerated `Cargo.lock`, and the single-`gpui`-invariant trial
   (throwaway worktree) that proves the graph still unifies.
-- A minimal rift-side smoke test: build a `HeadlessAppContext`, render a trivial
-  known view, assert `capture_screenshot` yields a non-blank PNG.
+- A minimal rift-side smoke test (hosted in `rift-terminal` — a gpui-consuming
+  crate in the headless workspace, not `rift-app`; the rev-bump built/tested it
+  headlessly): build a `HeadlessAppContext`, render a trivial known view, assert
+  `capture_screenshot` yields a non-blank PNG.
 
 ### Out of scope
 
@@ -67,8 +70,12 @@ What is true when this work is done:
 - **Single-`gpui` invariant (constitution).** `Cargo.lock` must hold exactly one
   `gpui`. Because the fork is additive on the *same* commit every consumer
   already pins (`4bee412`), the `gpui` API is byte-for-byte compatible for
-  `gpui-component` and `termy_terminal_ui`; the `[patch]` redirects the source
-  URL for all of them at once. The trial verifies the invariant actually holds.
+  `gpui-component` and `termy_terminal_ui`. Note `[patch]` is **per crate name**,
+  not per URL: the redirect needs one entry each for `gpui`, `gpui_platform`, and
+  every other zed-sourced crate the graph pulls (`http_client`, `util`, … — the
+  rev-bump enumerated the grown set); miss one and it resolves bare from upstream
+  zed and re-splits the graph. The trial greps one source per zed-sourced crate
+  to verify the invariant holds.
 - **`[patch]` is cross-source, not same-source.** The existing Cargo.toml comment
   notes a *same-source* `[patch]` is rejected by Cargo; redirecting
   `zed-industries/zed` → `skrischer/zed` is the standard fork mechanism and is
@@ -157,6 +164,16 @@ How does the developer know the spec is complete?
 
 ## Decision log
 
+- 2026-07-08: All load-bearing gpui API claims re-verified against rift's
+  **actual pinned commit `4bee412`** (via `git show` in the cargo bare repo) —
+  not the `1d217ee` checkout that also sits in the local cargo cache: the
+  `PlatformHeadlessRenderer` trait has exactly two methods
+  (`render_scene_to_image` + `sprite_atlas`) at `4bee412`,
+  `current_headless_renderer()` returns `None` off-macOS, and
+  `HeadlessAppContext` / `capture_screenshot` / the trait all exist at `4bee412`.
+  Spec-review (PR #651, in-session Agent) verdict APPROVE; its three wording
+  fixes (two-method trait, per-crate `[patch]`, named smoke-test host crate) are
+  applied here.
 - 2026-07-08: Spec created from the "Visual UI harness" track seed (#650). The
   track's Phase 1 is this renderer; Phase 2 (the harness) is a separate spec
   gated on it. Approach set during roadmap sparring: additive `[patch]` fork on
