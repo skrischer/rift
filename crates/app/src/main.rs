@@ -124,6 +124,15 @@ struct EditorChannels {
     /// daemon's `GitOpResult` reply is not routed back, the resulting state
     /// arrives on the worktree stream as `UpdateGitStatus` / `RepoState`.
     git_op_rx: flume::Receiver<rift_protocol::ClientMessage>,
+    /// Fires once whenever `run_ssh_session` selects the daemon terminal but
+    /// `provision_daemon` came back empty (#619): no daemon binary configured,
+    /// or a provisioning step failed. The session still runs — the legacy tmux
+    /// path takes over — but every daemon-backed IDE feature (file explorer,
+    /// diagnostics, git status, LSP) is dead for the session, so this is the
+    /// only render-side signal that anything is missing. Sent once per attempt
+    /// (a reconnect resends it if the daemon is still unavailable); the
+    /// workspace's notification dedups by id so this never stacks duplicates.
+    daemon_unavailable_tx: flume::Sender<()>,
 }
 
 /// The reconnect engine's cross-attempt state (#476): `watch` channels whose
@@ -624,6 +633,7 @@ impl Shell {
         let (diff_tx, diff_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
         let (request_diff_tx, request_diff_rx) = flume::unbounded::<String>();
         let (git_op_tx, git_op_rx) = flume::unbounded::<rift_protocol::ClientMessage>();
+        let (daemon_unavailable_tx, daemon_unavailable_rx) = flume::unbounded::<()>();
         // Fires once when the session pipeline this attempt spawned ends —
         // orderly exit, a canceled reconnect, or a non-retryable failure
         // (`run_session_with_reconnect`'s `end_reason`) — so the Shell can
@@ -684,6 +694,7 @@ impl Shell {
                 diff_tx,
                 request_diff_rx,
                 git_op_rx,
+                daemon_unavailable_tx,
             };
 
             let key_exists = ssh.key.exists();
@@ -734,6 +745,7 @@ impl Shell {
                     nav_tx: nav_request_tx,
                     request_diff_tx,
                     git_op_tx,
+                    daemon_unavailable_rx,
                 },
                 state_path,
                 window,
@@ -1068,10 +1080,18 @@ async fn run_ssh_session(
                 )
                 .await;
             }
-            None => warn!(
-                "daemon terminal selected but no daemon available; \
-                 falling back to the legacy tmux path"
-            ),
+            None => {
+                warn!(
+                    "daemon terminal selected but no daemon available; \
+                     falling back to the legacy tmux path"
+                );
+                // Reactive layer is dead for this session (#619): the legacy
+                // tmux path below still runs the terminal, but the explorer,
+                // diagnostics, git status, and LSP never light up. Tell the
+                // workspace so it can surface that, rather than leaving it
+                // silent.
+                let _ = editor.daemon_unavailable_tx.send(());
+            }
         }
     } else if let Some((client, _endpoint)) = daemon_client {
         // Legacy terminal, but keep the daemon's worktree/git/diagnostics +
@@ -2556,6 +2576,7 @@ mod tests {
         let (diff_tx, _) = flume::unbounded();
         let (request_diff_tx, request_diff_rx) = flume::unbounded();
         let (git_op_tx, git_op_rx) = flume::unbounded();
+        let (daemon_unavailable_tx, _) = flume::unbounded();
         BacklogHarness {
             ch: PtyChannels {
                 pane_output_tx,
@@ -2585,6 +2606,7 @@ mod tests {
                 diff_tx,
                 request_diff_rx,
                 git_op_rx,
+                daemon_unavailable_tx,
             },
             watches: EngineWatches {
                 session: tokio::sync::watch::channel("rift".to_string()).0,
