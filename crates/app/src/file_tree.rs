@@ -879,16 +879,12 @@ impl FileTree {
     /// file* (Phase 30) glyphs (no client capability yet; see the spec's
     /// prior decisions).
     ///
-    /// Both actions render as `Button::label` text glyphs, not `IconName`
-    /// icons: the shipping `rift` binary does not embed gpui-component's SVG
-    /// icon assets (only the dev-only `gallery` binary enables
-    /// `gpui-component-assets`, see `crates/app/Cargo.toml`), so an
-    /// `IconName` icon would render blank here. A Unicode glyph renders
-    /// reliably either way, mirroring the tree's own disclosure twisty. Each
-    /// button is `compact()`, giving it gpui-component's fixed `min_w_5`
-    /// (20px) icon-button footprint — a fixed-width slot Phase 28 can drop a
-    /// real icon into with no re-layout, reusing the widget's own affordance
-    /// rather than a hand-rolled wrapper.
+    /// Both actions render as real `IconName` glyphs via `Button::icon(...)`
+    /// — the shipping `rift` binary embeds gpui-component's SVG icon assets
+    /// through the `RiftAssets` delegating source (`main.rs`, issue #597), so
+    /// the icons resolve in the product build, not only under the dev-only
+    /// `gallery` feature. Each button is `compact()`, giving it
+    /// gpui-component's fixed `min_w_5` (20px) icon-button footprint.
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let all_collapsed = self.all_dirs_collapsed();
 
@@ -896,10 +892,10 @@ impl FileTree {
             .ghost()
             .xsmall()
             .compact()
-            .label(if all_collapsed {
-                "\u{229E}"
+            .icon(if all_collapsed {
+                IconName::Plus
             } else {
-                "\u{229F}"
+                IconName::Minus
             })
             .tooltip(if all_collapsed {
                 "Expand all"
@@ -915,7 +911,7 @@ impl FileTree {
             .ghost()
             .xsmall()
             .compact()
-            .label("\u{2316}")
+            .icon(IconName::Frame)
             .tooltip("Reveal active file")
             .on_click(cx.listener(|_this, _event, _window, cx| {
                 cx.emit(FileTreeEvent::RevealActiveRequested);
@@ -970,9 +966,9 @@ impl FileTree {
         };
 
         let chevron = if self.all_dirs_collapsed() {
-            "\u{203a}"
+            IconName::ChevronRight
         } else {
-            "\u{2304}"
+            IconName::ChevronDown
         };
         let label = Self::root_leaf(root).to_uppercase();
 
@@ -987,7 +983,13 @@ impl FileTree {
             .text_size(px(12.0))
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().list_hover))
-            .child(div().w(px(12.0)).flex_shrink_0().child(chevron.to_string()))
+            .child(
+                div().w(px(12.0)).flex_shrink_0().child(
+                    Icon::new(chevron)
+                        .size(px(12.0))
+                        .text_color(cx.theme().muted_foreground),
+                ),
+            )
             .child(
                 div()
                     .font_weight(FontWeight::BOLD)
