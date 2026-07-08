@@ -48,7 +48,7 @@
 | 29 | Explorer context menu — right-click action framework over the tree; ships the client-capable actions (open, reveal, copy path / relative path, reveal-in-terminal, collapse-all) | — | — |
 | 30 | Explorer file operations — create / rename / delete / move via a daemon write path, surfaced through the context menu + inline rename + drag & drop | — | — |
 | 31 | Explorer search & filter — in-panel fuzzy narrowing, jump-to-file quick-open, multi-select, keyboard-first navigation | — | — |
-| 32 | Session management — glanceable always-visible session list (see every session at once, click to jump), rename / reorder / kill / new operations; extends the phase-19 switcher (switch + new, click-to-open popover) into a full management surface | — | — |
+| 32 | Session management — glanceable always-visible session list (see every session at once, click to jump), rename / reorder / kill / new operations; extends the phase-19 switcher (switch + new, click-to-open popover) into a full management surface | [spec-session-management.md](spec-session-management.md) | [Phase 320](https://github.com/skrischer/rift/milestone/49) |
 | 33 | Post-connect session picker — connect to the host first, then pick or create a session from the live list; de-hardcode the fixed default session name ("rift") baked into the connect card | — | — |
 
 A phase gets a Spec link once `/loopkit:plan` drafts it, and a Milestone link once
@@ -168,14 +168,17 @@ into the connect flow, so 32 precedes 33.
 Foundation impact (authored and ratified in each phase's `/loopkit:plan` spec
 PR, never edited from here):
 
-- Phase 32 — `protocol` gains session-management messages (rename / kill) — a
-  deliberate, reviewed API extension (`docs/protocol.md`) mirroring phase 19's
-  `QuerySessionList` / `SessionListReply`; the daemon serves them via tmux
-  `rename-session` / `kill-session` under the existing correlated-command
-  mechanism (the same shape as phase-19's `new-session -A` create path).
-  **Reorder** is client-side ordering persisted locally (the window-state store
-  pattern, phase 9) — tmux has no native session order — so it needs no protocol
-  change. Killing the attached session surfaces the existing `TerminalExit` path.
+- Phase 32 — **no protocol / daemon change** (corrected at planning from the
+  pre-planning "protocol gains rename/kill messages" estimate): rename / kill ride
+  the existing generic `ClientMessage::TmuxCommand` fire-and-forget seam
+  (`crates/daemon/src/terminal.rs:344`, the same channel the pane-header
+  split / zoom controls use), the codebase's established split of "reply needed →
+  typed correlated message (`QuerySessionList`), fire-and-forget action → generic
+  `TmuxCommand`". The churn-driven `SessionListReply` push refreshes the list;
+  killing the attached session reuses the existing `TerminalExit` path.
+  **Reorder** is client-side ordering persisted locally (the window-state / recents
+  store pattern, phase 9) — tmux has no native session order. `PROTOCOL_VERSION`
+  stays 8; this is a client-only (`[terminal]`/`[app]`) phase.
 - Phase 33 — the connection flow evolves: the Connection screen's Session field
   becomes optional and default-less, and a session-picker step sits between
   connect and cockpit (connect to the host → live list → pick / create). This is
