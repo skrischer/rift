@@ -2000,12 +2000,18 @@ async fn consume_daemon_messages(
             }
             // --- buffer channel replies -> editor (every mode) ---
             // The request/response replies on the buffer channel: the `OpenFile`
-            // read reply (the only message carrying file content) and the
-            // `SaveFile` write replies (`SaveResult` / `SaveConflict`). Forward
-            // each to the editor, which routes it by path against the open buffer.
+            // read reply (the only message carrying file content), the
+            // `SaveFile` write replies (`SaveResult` / `SaveConflict`), and the
+            // typed refusals (`OpenError` / `SaveError`, `docs/spec-v1-hardening.md`)
+            // that answer a refused open/save immediately instead of leaving the
+            // editor to fall back to its own `OPEN_TIMEOUT` / `SAVE_TIMEOUT`.
+            // Forward each to the editor, which routes it by path against the
+            // open buffer.
             msg @ (DaemonMessage::FileContent { .. }
             | DaemonMessage::SaveResult { .. }
-            | DaemonMessage::SaveConflict { .. }) => {
+            | DaemonMessage::SaveConflict { .. }
+            | DaemonMessage::OpenError { .. }
+            | DaemonMessage::SaveError { .. }) => {
                 let _ = editor.buffer_tx.send(msg);
             }
             // --- nav replies -> editor (every mode) ---

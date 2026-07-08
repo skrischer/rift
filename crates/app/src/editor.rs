@@ -177,8 +177,8 @@ use gpui_component::ActiveTheme as _;
 use gpui_component::RopeExt as _;
 use gpui_component::WindowExt as _;
 use rift_protocol::{
-    ClientMessage, Diagnostic, DiagnosticSeverity, DocumentSymbolEntry, HoverContent, NavLocation,
-    NavRequestId, Position, Range,
+    BufferErrorReason, ClientMessage, Diagnostic, DiagnosticSeverity, DocumentSymbolEntry,
+    HoverContent, NavLocation, NavRequestId, Position, Range,
 };
 
 use crate::results_panel::ResultsKind;
@@ -336,8 +336,13 @@ enum TabLoadState {
     Loading,
     /// The tab's content is rendered in the code editor.
     Loaded,
-    /// The last open did not complete.
-    Failed,
+    /// The last open did not complete. `Some(reason)` names the daemon's
+    /// specific refusal (an `OpenError` reply, routed via
+    /// [`EditorView::apply_open_error`]); `None` means the `OPEN_TIMEOUT`
+    /// fired with no reply at all (e.g. no daemon available). A specific
+    /// reply always beats the timeout: it moves the tab out of `Loading`
+    /// before the timeout's own `Loading` guard can fire.
+    Failed(Option<BufferErrorReason>),
 }
 
 /// The transient outcome of a tab's most recent save.
@@ -345,7 +350,11 @@ enum SaveState {
     Idle,
     Saving,
     Conflict,
-    Failed,
+    /// The last save did not land. `Some(reason)` names the daemon's
+    /// specific refusal (a `SaveError` reply, routed via
+    /// [`EditorView::apply_save_error`]); `None` means the `SAVE_TIMEOUT`
+    /// fired with no reply, or the outgoing send itself failed.
+    Failed(Option<BufferErrorReason>),
 }
 
 /// Events the editor emits for the workspace to route to the right-dock results
@@ -772,7 +781,7 @@ impl EditorView {
                     };
                     if tab.generation == generation {
                         if let TabLoadState::Loading = tab.load_state {
-                            tab.load_state = TabLoadState::Failed;
+                            tab.load_state = TabLoadState::Failed(None);
                             cx.notify();
                         }
                     }
@@ -1172,6 +1181,33 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Apply an `OpenError` reply: the daemon refused the read (binary,
+    /// non-UTF-8, unreadable path, or over the read-size cap) instead of
+    /// returning `FileContent`. Routed to the tab awaiting it (matching
+    /// path, `Loading`), mirroring [`load`]'s guard; a reply for a path with
+    /// no `Loading` tab is silently ignored. Surfaces immediately — moving
+    /// the tab out of `Loading` is what makes the specific reason beat the
+    /// generic `OPEN_TIMEOUT` fallback (its guard only fires while still
+    /// `Loading`).
+    ///
+    /// [`load`]: Self::load
+    pub fn apply_open_error(
+        &mut self,
+        path: String,
+        reason: BufferErrorReason,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|t| t.path == path && matches!(t.load_state, TabLoadState::Loading))
+        else {
+            return;
+        };
+        self.tabs[index].load_state = TabLoadState::Failed(Some(reason));
+        cx.notify();
+    }
+
     /// Land the pre-reload cursor on the freshly auto-reloaded content (#432).
     ///
     /// `InputState::set_cursor_position` clamps the position to the new
@@ -1232,7 +1268,7 @@ impl EditorView {
             base_mtime,
         }) {
             tracing::debug!(error = %e, %path, "failed to enqueue save request");
-            self.tabs[index].save_state = SaveState::Failed;
+            self.tabs[index].save_state = SaveState::Failed(None);
             cx.notify();
             return;
         }
@@ -1253,7 +1289,7 @@ impl EditorView {
                     };
                     if tab.save_generation == save_generation {
                         if let SaveState::Saving = tab.save_state {
-                            tab.save_state = SaveState::Failed;
+                            tab.save_state = SaveState::Failed(None);
                             cx.notify();
                         }
                     }
@@ -1305,6 +1341,31 @@ impl EditorView {
         if self.active == Some(index) {
             self.open_conflict_dialog(window, cx);
         }
+    }
+
+    /// Apply a `SaveError` reply: the daemon refused the write outright (a
+    /// write failure, distinct from [`SaveConflict`]'s deliberate stale-base
+    /// rejection). Routed to whichever tab holds `path`; a no-op if no tab
+    /// holds it. Surfaces immediately — bumping `save_generation` fences the
+    /// in-flight `SAVE_TIMEOUT` guard exactly like [`apply_save_result`] /
+    /// [`apply_save_conflict`] do, so the specific reason beats the generic
+    /// timeout fallback.
+    ///
+    /// [`SaveConflict`]: rift_protocol::DaemonMessage::SaveConflict
+    /// [`apply_save_result`]: Self::apply_save_result
+    /// [`apply_save_conflict`]: Self::apply_save_conflict
+    pub fn apply_save_error(
+        &mut self,
+        path: String,
+        reason: BufferErrorReason,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.tab_index_for_path(&path) else {
+            return;
+        };
+        self.tabs[index].save_state = SaveState::Failed(Some(reason));
+        self.tabs[index].save_generation = self.tabs[index].save_generation.wrapping_add(1);
+        cx.notify();
     }
 
     // ── Conflict remedies (#433, dialog #532) ─────────────────────────────
@@ -2239,6 +2300,21 @@ fn editor_surface_colors(cx: &App) -> (Hsla, Hsla) {
     (cx.theme().background, cx.theme().foreground)
 }
 
+/// Human-readable label for a [`BufferErrorReason`], shared by the editor's
+/// open- and save-failure status renders (`docs/spec-v1-hardening.md`). Kept
+/// as a short noun phrase so callers compose it into either an "open" or a
+/// "save" sentence.
+fn buffer_error_reason_label(reason: BufferErrorReason) -> &'static str {
+    match reason {
+        BufferErrorReason::Binary => "binary file",
+        BufferErrorReason::NotUtf8 => "not valid UTF-8",
+        BufferErrorReason::PermissionDenied => "permission denied",
+        BufferErrorReason::NotFound => "file not found",
+        BufferErrorReason::TooLarge => "file too large",
+        BufferErrorReason::Io => "I/O error",
+    }
+}
+
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // No tab open yet: show a centered status message.
@@ -2255,10 +2331,22 @@ impl Render for EditorView {
                 .into_any_element();
         };
 
-        // Loading / failed states: show a centered status message.
-        let status: Option<String> = match tab.load_state {
+        // Loading / failed states: show a centered status message. `TooLarge`
+        // gets its own read-only-placeholder wording (`docs/spec-v1-hardening.md`)
+        // — the daemon never ships content for it, so this message *is* the
+        // whole read-only placeholder, not a lead-in to an editable surface.
+        let status: Option<String> = match &tab.load_state {
             TabLoadState::Loading => Some(format!("Opening {}\u{2026}", tab.path)),
-            TabLoadState::Failed => Some(format!("Could not open {}", tab.path)),
+            TabLoadState::Failed(Some(BufferErrorReason::TooLarge)) => Some(format!(
+                "{} is too large to open \u{2014} read-only",
+                tab.path
+            )),
+            TabLoadState::Failed(Some(reason)) => Some(format!(
+                "Could not open {}: {}",
+                tab.path,
+                buffer_error_reason_label(*reason)
+            )),
+            TabLoadState::Failed(None) => Some(format!("Could not open {}", tab.path)),
             TabLoadState::Loaded => None,
         };
 
@@ -2282,7 +2370,11 @@ impl Render for EditorView {
         let banner: Option<(String, gpui::Hsla)> = match &tab.save_state {
             SaveState::Idle | SaveState::Conflict => None,
             SaveState::Saving => Some(("Saving\u{2026}".to_owned(), cx.theme().muted_foreground)),
-            SaveState::Failed => Some(("Save failed".to_owned(), cx.theme().danger)),
+            SaveState::Failed(Some(reason)) => Some((
+                format!("Save failed: {}", buffer_error_reason_label(*reason)),
+                cx.theme().danger,
+            )),
+            SaveState::Failed(None) => Some(("Save failed".to_owned(), cx.theme().danger)),
         };
 
         // Build the `Input` widget. The context-menu builder is called each
@@ -3460,6 +3552,38 @@ mod tests {
     fn test_language_for_path_lowercases_extension() {
         assert_eq!(language_for_path("MAIN.RS"), "rs");
         assert_eq!(language_for_path("Config.TOML"), "toml");
+    }
+
+    // --- buffer-error reason labels (#617) ---
+
+    /// Every `BufferErrorReason` maps to a distinct, non-empty label — the
+    /// open/save status renders compose it into a full sentence, so an empty
+    /// or colliding label would silently blur two different refusals together.
+    #[test]
+    fn test_buffer_error_reason_label_is_distinct_and_non_empty_for_every_reason() {
+        let reasons = [
+            BufferErrorReason::Binary,
+            BufferErrorReason::NotUtf8,
+            BufferErrorReason::PermissionDenied,
+            BufferErrorReason::NotFound,
+            BufferErrorReason::TooLarge,
+            BufferErrorReason::Io,
+        ];
+        let labels: Vec<&str> = reasons
+            .iter()
+            .map(|r| buffer_error_reason_label(*r))
+            .collect();
+        for label in &labels {
+            assert!(!label.is_empty());
+        }
+        let mut unique = labels.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "every reason must have its own distinct label"
+        );
     }
 
     // --- editor surface theme wiring (#598) ---
@@ -4749,6 +4873,185 @@ mod tests {
 
                     let paths: Vec<&str> = editor.open_paths().collect();
                     assert_eq!(paths, vec!["a.rs", "b.rs", "c.rs"]);
+                });
+            })
+            .unwrap();
+    }
+
+    // --- buffer-channel error replies (#617, docs/spec-v1-hardening.md) ---
+
+    /// Acceptance: an `OpenError` reply for the `Loading` tab awaiting it
+    /// carries the specific reason into `TabLoadState::Failed`, and the
+    /// centered status render names it instead of the generic "Could not
+    /// open" text.
+    #[gpui::test]
+    fn test_apply_open_error_sets_failed_with_the_specific_reason(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    editor.active = Some(a);
+                    assert!(matches!(editor.tabs[a].load_state, TabLoadState::Loading));
+
+                    editor.apply_open_error("a.rs".into(), BufferErrorReason::PermissionDenied, cx);
+
+                    assert!(
+                        matches!(
+                            editor.tabs[a].load_state,
+                            TabLoadState::Failed(Some(BufferErrorReason::PermissionDenied))
+                        ),
+                        "the specific reason must be carried into TabLoadState::Failed"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// Acceptance: `TooLarge` carries into `TabLoadState::Failed` exactly
+    /// like any other reason — [`buffer_error_reason_label`] and the render's
+    /// dedicated `TooLarge` arm are what give it distinct read-only-placeholder
+    /// wording (`docs/spec-v1-hardening.md`); the state transition itself is
+    /// uniform across every [`BufferErrorReason`].
+    #[gpui::test]
+    fn test_apply_open_error_too_large_sets_failed_with_too_large_reason(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("huge.bin".into(), false, window, cx);
+                    editor.active = Some(a);
+
+                    editor.apply_open_error("huge.bin".into(), BufferErrorReason::TooLarge, cx);
+
+                    assert!(matches!(
+                        editor.tabs[a].load_state,
+                        TabLoadState::Failed(Some(BufferErrorReason::TooLarge))
+                    ));
+                });
+            })
+            .unwrap();
+    }
+
+    /// Acceptance: an `OpenError` reply for a path with no `Loading` tab is
+    /// silently ignored — mirrors `load`'s guard for a superseded reload or a
+    /// switch's redundant read.
+    #[gpui::test]
+    fn test_apply_open_error_ignores_a_path_with_no_loading_tab(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    editor.tabs[a].load_state = TabLoadState::Loaded;
+                    editor.active = Some(a);
+
+                    editor.apply_open_error("a.rs".into(), BufferErrorReason::Io, cx);
+
+                    assert!(
+                        matches!(editor.tabs[a].load_state, TabLoadState::Loaded),
+                        "a reply for a tab that already loaded must not be clobbered"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// Acceptance: an `OpenError` reply beats `OPEN_TIMEOUT` — once the
+    /// specific reason has moved the tab out of `Loading`, the timeout's own
+    /// `Loading` guard can no longer fire and overwrite it with the generic
+    /// `Failed(None)`.
+    #[gpui::test]
+    fn test_apply_open_error_beats_the_open_timeout_guard(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    editor.active = Some(a);
+                    let generation = editor.tabs[a].generation;
+
+                    editor.apply_open_error("a.rs".into(), BufferErrorReason::NotFound, cx);
+
+                    // Simulate the timeout firing after the specific reply
+                    // already landed: same generation, but `load_state` has
+                    // already left `Loading`, so its guard must not fire.
+                    if editor.tabs[a].generation == generation {
+                        if let TabLoadState::Loading = editor.tabs[a].load_state {
+                            editor.tabs[a].load_state = TabLoadState::Failed(None);
+                        }
+                    }
+
+                    assert!(
+                        matches!(
+                            editor.tabs[a].load_state,
+                            TabLoadState::Failed(Some(BufferErrorReason::NotFound))
+                        ),
+                        "the specific reason must survive a same-generation timeout fire"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// Acceptance: a `SaveError` reply for the tab holding `path` carries the
+    /// specific reason into `SaveState::Failed`, mirroring `apply_save_result`
+    /// / `apply_save_conflict`'s path-keyed routing.
+    #[gpui::test]
+    fn test_apply_save_error_sets_failed_with_the_specific_reason(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    editor.tabs[a].load_state = TabLoadState::Loaded;
+                    editor.tabs[a].save_state = SaveState::Saving;
+                    editor.active = Some(a);
+                    let save_generation = editor.tabs[a].save_generation;
+
+                    editor.apply_save_error("a.rs".into(), BufferErrorReason::Io, cx);
+
+                    assert!(
+                        matches!(
+                            editor.tabs[a].save_state,
+                            SaveState::Failed(Some(BufferErrorReason::Io))
+                        ),
+                        "the specific reason must be carried into SaveState::Failed"
+                    );
+                    assert_ne!(
+                        editor.tabs[a].save_generation, save_generation,
+                        "the save generation must bump so a same-generation SAVE_TIMEOUT \
+                         guard can no longer clobber it"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// Acceptance: a `SaveError` reply for a path no tab holds is silently
+    /// ignored.
+    #[gpui::test]
+    fn test_apply_save_error_ignores_a_path_with_no_open_tab(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    editor.tabs[a].load_state = TabLoadState::Loaded;
+                    editor.active = Some(a);
+
+                    editor.apply_save_error("missing.rs".into(), BufferErrorReason::Io, cx);
+
+                    assert!(
+                        matches!(editor.tabs[a].save_state, SaveState::Idle),
+                        "a reply for an unopened path must not touch a.rs"
+                    );
                 });
             })
             .unwrap();
