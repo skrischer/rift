@@ -13,6 +13,7 @@ use std::thread;
 use anyhow::{Context as _, Result};
 use gpui::*;
 use gpui_component::{Root, TitleBar};
+use gpui_component_assets::Assets;
 use rift_app::connection_screen::{
     ConnectError, ConnectRequest, ConnectionScreen, ConnectionScreenEvent,
 };
@@ -232,241 +233,247 @@ fn main() {
         "rift starting"
     );
 
-    Application::with_platform(gpui_platform::current_platform(false)).run(|cx: &mut App| {
-        gpui_component::init(cx);
-        // Restore the persisted theme choice (`docs/spec-theme-settings.md`); a
-        // missing platform state directory or a missing/corrupt state file both
-        // degrade to `WindowState::default`'s dark Catppuccin default.
-        let persisted_state = match window_state::state_path() {
-            Ok(path) => window_state::load(&path),
-            Err(e) => {
-                warn!(%e, "no platform state directory, using default preferences");
-                window_state::WindowState::default()
-            }
-        };
-        apply_persisted_theme(&persisted_state, cx);
-        // Alt+1..9 -> switch to window N. Unshifted modifier+digit needs no
-        // keyboard-layout mapping, so it matches identically on Windows and
-        // Linux/X11 (where GPUI's keyboard mapper is a no-op).
-        cx.bind_keys(
-            (1..=9usize).map(|n| KeyBinding::new(&format!("alt-{n}"), SelectWindow(n), None)),
-        );
-        // Command palette (#359, `docs/spec-command-palette.md`): Ctrl+Shift+P /
-        // Cmd+Shift+P opens the palette. Unscoped (`None`), like `SelectWindow`
-        // above, so it reaches the shortcut regardless of which surface is
-        // focused, including the terminal.
-        cx.bind_keys([
-            KeyBinding::new(
-                "ctrl-shift-p",
-                rift_app::command_palette::OpenCommandPalette,
-                None,
-            ),
-            KeyBinding::new(
-                "cmd-shift-p",
-                rift_app::command_palette::OpenCommandPalette,
-                None,
-            ),
-        ]);
-        // Settings surface (#366, `docs/spec-theme-settings.md`): Ctrl+, /
-        // Cmd+, opens it, mirroring the editor-convention shortcut. Unscoped
-        // (`None`), like the command palette above, so it reaches the
-        // shortcut regardless of which surface is focused.
-        cx.bind_keys([
-            KeyBinding::new("ctrl-,", rift_app::settings::OpenSettings, None),
-            KeyBinding::new("cmd-,", rift_app::settings::OpenSettings, None),
-        ]);
-        // gpui-component's `Root` view binds `tab`/`shift-tab` to focus navigation
-        // in the "Root" context. Root is an ancestor of every pane, so that action
-        // consumes the keystroke before it reaches the pane's `on_key_down`, and the
-        // terminal never receives Tab (shell completion, agent prompt suggestions).
-        // Shadow it with `NoAction` in the deeper "Terminal" context: deepest context
-        // wins, NoAction yields no binding, so the keystroke falls through to the
-        // existing `encode_keystroke` path (`\t` / `\x1b[Z`). Scoped to "Terminal", so
-        // Tab still navigates focus in dialogs and forms.
-        cx.bind_keys([
-            KeyBinding::new("tab", NoAction, Some(TERMINAL_KEY_CONTEXT)),
-            KeyBinding::new("shift-tab", NoAction, Some(TERMINAL_KEY_CONTEXT)),
-        ]);
-        // Save the open buffer over the buffer channel (#188). Scoped to the
-        // editor's key context so it fires only when focus is in the editor, never
-        // for an unrelated input. Both chords are bound so the binding matches the
-        // host's muscle memory (Ctrl+S on Windows/Linux, Cmd+S on macOS) without a
-        // per-OS cfg — the inactive chord simply never arrives.
-        cx.bind_keys([
-            KeyBinding::new(
-                "ctrl-s",
-                rift_app::editor::Save,
-                Some(rift_app::editor::EDITOR_KEY_CONTEXT),
-            ),
-            KeyBinding::new(
-                "cmd-s",
-                rift_app::editor::Save,
-                Some(rift_app::editor::EDITOR_KEY_CONTEXT),
-            ),
-            // Go-to-definition (#196): F12 mirrors VS Code / JetBrains muscle memory.
-            // Ctrl+click fires the action programmatically (not via this binding).
-            KeyBinding::new(
-                "f12",
-                rift_app::editor::GoToDefinition,
-                Some(rift_app::editor::EDITOR_KEY_CONTEXT),
-            ),
-            // Back-navigation (#196): Alt+Left mirrors VS Code / JetBrains muscle memory.
-            KeyBinding::new(
-                "alt-left",
-                rift_app::editor::GoBack,
-                Some(rift_app::editor::EDITOR_KEY_CONTEXT),
-            ),
-            // Hover popover (#197, #435): Ctrl+K Ctrl+I mirrors VS Code muscle
-            // memory. A plain Shift+K binding would shadow typing a capital 'K'
-            // into the buffer, so hover uses a non-typing chord instead. Fires
-            // `ShowHover` at the cursor position; the result renders as a
-            // markdown popover anchored to the bottom of the editor area.
-            // Mouse-rest (500 ms debounce) also triggers hover automatically.
-            KeyBinding::new(
-                "ctrl-k ctrl-i",
-                rift_app::editor::ShowHover,
-                Some(rift_app::editor::EDITOR_KEY_CONTEXT),
-            ),
-            // Find references (#198): Shift+F12 mirrors VS Code muscle memory.
-            // Also available via the context-menu "Find References" entry.
-            KeyBinding::new(
-                "shift-f12",
-                rift_app::editor::FindReferences,
-                Some(rift_app::editor::EDITOR_KEY_CONTEXT),
-            ),
-            // Results-panel close (#529): Escape closes the references/
-            // definitions results panel in the right dock. The input's own
-            // `escape` binding (deeper "Input" context) is tried first and
-            // propagates when it has nothing to do (no context menu, inline
-            // completion, or IME composition), so the keystroke falls through
-            // to this binding; `CloseResultsPanel` itself propagates when no
-            // panel is open, keeping Escape's other meanings intact.
-            KeyBinding::new(
-                "escape",
-                rift_app::editor::CloseResultsPanel,
-                Some(rift_app::editor::EDITOR_KEY_CONTEXT),
-            ),
-        ]);
-        // Explorer keyboard navigation (#332): up/down move the selection,
-        // left/right collapse/expand (stepping to parent/first-child at the
-        // edges), Enter opens/toggles, Home/End jump to the first/last visible
-        // row. Scoped to the tree's own key context, so a focused terminal
-        // pane's keystrokes are never intercepted (agent-first).
-        cx.bind_keys([
-            KeyBinding::new(
-                "up",
-                rift_app::file_tree::SelectUp,
-                Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
-            ),
-            KeyBinding::new(
-                "down",
-                rift_app::file_tree::SelectDown,
-                Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
-            ),
-            KeyBinding::new(
-                "left",
-                rift_app::file_tree::CollapseOrSelectParent,
-                Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
-            ),
-            KeyBinding::new(
-                "right",
-                rift_app::file_tree::ExpandOrSelectChild,
-                Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
-            ),
-            KeyBinding::new(
-                "enter",
-                rift_app::file_tree::OpenSelected,
-                Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
-            ),
-            KeyBinding::new(
-                "home",
-                rift_app::file_tree::SelectFirst,
-                Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
-            ),
-            KeyBinding::new(
-                "end",
-                rift_app::file_tree::SelectLast,
-                Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
-            ),
-        ]);
-        // Window-state restore (#225, docs/spec-window-state-persistence.md):
-        // resolve this instance's channel-keyed state file, load it (defaulting
-        // on any read/parse failure per `window_state::load`'s own tolerant
-        // contract), and clamp its bounds against the live display topology —
-        // all before the window is ever created, so the restore lands before
-        // first paint. `state_path` is `None` only when no platform state
-        // directory could be resolved at all (`LOCALAPPDATA`/`XDG_STATE_HOME`/
-        // `HOME` all unset); the window then opens at today's default and every
-        // save site below no-ops instead of crashing.
-        let state_path = match window_state::state_path() {
-            Ok(path) => Some(path),
-            Err(e) => {
-                warn!(%e, "window-state persistence disabled");
-                None
-            }
-        };
-        let restored = state_path
-            .as_deref()
-            .map(window_state::load)
-            .unwrap_or_default();
-        // Recent-connections store (#477, `docs/spec-connection-robustness.md`):
-        // beside the window-state file, same per-channel keying, same
-        // tolerant-degrade-on-error contract.
-        let recents_path = match recents::recents_path() {
-            Ok(path) => Some(path),
-            Err(e) => {
-                warn!(%e, "recent-connections persistence disabled");
-                None
-            }
-        };
-        let window_bounds =
-            workspace::initial_window_bounds(&restored, &workspace::display_rects(cx));
-        // Per-channel window title (matching the per-channel taskbar icons), so the
-        // mirrored stable and dev instances are distinguishable in alt-tab and
-        // taskbar hover. Lowercase `rift` per brand rules.
-        let title = if cfg!(feature = "windowed") {
-            "rift"
-        } else {
-            "rift (dev)"
-        };
-        let font_size_px = restored.font_size_px;
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(window_bounds),
-                // Custom 38px title bar (#511, `docs/spec-cockpit-chrome.md`):
-                // `TitleBar::title_bar_options()` hides the native OS chrome
-                // (`appears_transparent: true`) and leaves `title: None` — the
-                // window's taskbar/alt-tab name is set explicitly below
-                // instead, since the OS title text no longer renders anywhere.
-                titlebar: Some(TitleBar::title_bar_options()),
-                // Client-side decorations (Wayland only; a no-op under X11 and
-                // Windows, where `appears_transparent` above already governs
-                // the chrome) — mirrors gpui-component's own story reference
-                // so a compositor never draws a redundant server-side bar
-                // behind the custom one.
-                #[cfg(target_os = "linux")]
-                window_background: WindowBackgroundAppearance::Transparent,
-                #[cfg(target_os = "linux")]
-                window_decorations: Some(WindowDecorations::Client),
-                ..Default::default()
-            },
-            |window, cx| {
-                // The OS-level window title (taskbar/alt-tab) — no longer
-                // carried by `titlebar.title` now that the native bar is
-                // hidden; the custom bar shows the wordmark instead.
-                window.set_window_title(title);
-                // The Connection screen (#477) is the startup state on every
-                // launch (no auto-connect, per the spec's gate decision): the
-                // Shell renders it first, and only builds the session
-                // pipeline below once the user submits the connect card.
-                let shell =
-                    cx.new(|cx| Shell::new(state_path, recents_path, font_size_px, window, cx));
-                cx.new(|cx| Root::new(shell, window, cx))
-            },
-        )
-        .unwrap();
-        cx.activate(true);
-    });
+    Application::with_platform(gpui_platform::current_platform(false))
+        // Register gpui-component's icon SVGs so the activity rail and window
+        // controls render their glyphs (blank otherwise — #597). Mirrors
+        // `gallery::run`; the embedding lives in the product build via the
+        // gpui-component-assets + rust-embed `debug-embed` dependencies.
+        .with_assets(Assets)
+        .run(|cx: &mut App| {
+            gpui_component::init(cx);
+            // Restore the persisted theme choice (`docs/spec-theme-settings.md`); a
+            // missing platform state directory or a missing/corrupt state file both
+            // degrade to `WindowState::default`'s dark Catppuccin default.
+            let persisted_state = match window_state::state_path() {
+                Ok(path) => window_state::load(&path),
+                Err(e) => {
+                    warn!(%e, "no platform state directory, using default preferences");
+                    window_state::WindowState::default()
+                }
+            };
+            apply_persisted_theme(&persisted_state, cx);
+            // Alt+1..9 -> switch to window N. Unshifted modifier+digit needs no
+            // keyboard-layout mapping, so it matches identically on Windows and
+            // Linux/X11 (where GPUI's keyboard mapper is a no-op).
+            cx.bind_keys(
+                (1..=9usize).map(|n| KeyBinding::new(&format!("alt-{n}"), SelectWindow(n), None)),
+            );
+            // Command palette (#359, `docs/spec-command-palette.md`): Ctrl+Shift+P /
+            // Cmd+Shift+P opens the palette. Unscoped (`None`), like `SelectWindow`
+            // above, so it reaches the shortcut regardless of which surface is
+            // focused, including the terminal.
+            cx.bind_keys([
+                KeyBinding::new(
+                    "ctrl-shift-p",
+                    rift_app::command_palette::OpenCommandPalette,
+                    None,
+                ),
+                KeyBinding::new(
+                    "cmd-shift-p",
+                    rift_app::command_palette::OpenCommandPalette,
+                    None,
+                ),
+            ]);
+            // Settings surface (#366, `docs/spec-theme-settings.md`): Ctrl+, /
+            // Cmd+, opens it, mirroring the editor-convention shortcut. Unscoped
+            // (`None`), like the command palette above, so it reaches the
+            // shortcut regardless of which surface is focused.
+            cx.bind_keys([
+                KeyBinding::new("ctrl-,", rift_app::settings::OpenSettings, None),
+                KeyBinding::new("cmd-,", rift_app::settings::OpenSettings, None),
+            ]);
+            // gpui-component's `Root` view binds `tab`/`shift-tab` to focus navigation
+            // in the "Root" context. Root is an ancestor of every pane, so that action
+            // consumes the keystroke before it reaches the pane's `on_key_down`, and the
+            // terminal never receives Tab (shell completion, agent prompt suggestions).
+            // Shadow it with `NoAction` in the deeper "Terminal" context: deepest context
+            // wins, NoAction yields no binding, so the keystroke falls through to the
+            // existing `encode_keystroke` path (`\t` / `\x1b[Z`). Scoped to "Terminal", so
+            // Tab still navigates focus in dialogs and forms.
+            cx.bind_keys([
+                KeyBinding::new("tab", NoAction, Some(TERMINAL_KEY_CONTEXT)),
+                KeyBinding::new("shift-tab", NoAction, Some(TERMINAL_KEY_CONTEXT)),
+            ]);
+            // Save the open buffer over the buffer channel (#188). Scoped to the
+            // editor's key context so it fires only when focus is in the editor, never
+            // for an unrelated input. Both chords are bound so the binding matches the
+            // host's muscle memory (Ctrl+S on Windows/Linux, Cmd+S on macOS) without a
+            // per-OS cfg — the inactive chord simply never arrives.
+            cx.bind_keys([
+                KeyBinding::new(
+                    "ctrl-s",
+                    rift_app::editor::Save,
+                    Some(rift_app::editor::EDITOR_KEY_CONTEXT),
+                ),
+                KeyBinding::new(
+                    "cmd-s",
+                    rift_app::editor::Save,
+                    Some(rift_app::editor::EDITOR_KEY_CONTEXT),
+                ),
+                // Go-to-definition (#196): F12 mirrors VS Code / JetBrains muscle memory.
+                // Ctrl+click fires the action programmatically (not via this binding).
+                KeyBinding::new(
+                    "f12",
+                    rift_app::editor::GoToDefinition,
+                    Some(rift_app::editor::EDITOR_KEY_CONTEXT),
+                ),
+                // Back-navigation (#196): Alt+Left mirrors VS Code / JetBrains muscle memory.
+                KeyBinding::new(
+                    "alt-left",
+                    rift_app::editor::GoBack,
+                    Some(rift_app::editor::EDITOR_KEY_CONTEXT),
+                ),
+                // Hover popover (#197, #435): Ctrl+K Ctrl+I mirrors VS Code muscle
+                // memory. A plain Shift+K binding would shadow typing a capital 'K'
+                // into the buffer, so hover uses a non-typing chord instead. Fires
+                // `ShowHover` at the cursor position; the result renders as a
+                // markdown popover anchored to the bottom of the editor area.
+                // Mouse-rest (500 ms debounce) also triggers hover automatically.
+                KeyBinding::new(
+                    "ctrl-k ctrl-i",
+                    rift_app::editor::ShowHover,
+                    Some(rift_app::editor::EDITOR_KEY_CONTEXT),
+                ),
+                // Find references (#198): Shift+F12 mirrors VS Code muscle memory.
+                // Also available via the context-menu "Find References" entry.
+                KeyBinding::new(
+                    "shift-f12",
+                    rift_app::editor::FindReferences,
+                    Some(rift_app::editor::EDITOR_KEY_CONTEXT),
+                ),
+                // Results-panel close (#529): Escape closes the references/
+                // definitions results panel in the right dock. The input's own
+                // `escape` binding (deeper "Input" context) is tried first and
+                // propagates when it has nothing to do (no context menu, inline
+                // completion, or IME composition), so the keystroke falls through
+                // to this binding; `CloseResultsPanel` itself propagates when no
+                // panel is open, keeping Escape's other meanings intact.
+                KeyBinding::new(
+                    "escape",
+                    rift_app::editor::CloseResultsPanel,
+                    Some(rift_app::editor::EDITOR_KEY_CONTEXT),
+                ),
+            ]);
+            // Explorer keyboard navigation (#332): up/down move the selection,
+            // left/right collapse/expand (stepping to parent/first-child at the
+            // edges), Enter opens/toggles, Home/End jump to the first/last visible
+            // row. Scoped to the tree's own key context, so a focused terminal
+            // pane's keystrokes are never intercepted (agent-first).
+            cx.bind_keys([
+                KeyBinding::new(
+                    "up",
+                    rift_app::file_tree::SelectUp,
+                    Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
+                ),
+                KeyBinding::new(
+                    "down",
+                    rift_app::file_tree::SelectDown,
+                    Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
+                ),
+                KeyBinding::new(
+                    "left",
+                    rift_app::file_tree::CollapseOrSelectParent,
+                    Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
+                ),
+                KeyBinding::new(
+                    "right",
+                    rift_app::file_tree::ExpandOrSelectChild,
+                    Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
+                ),
+                KeyBinding::new(
+                    "enter",
+                    rift_app::file_tree::OpenSelected,
+                    Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
+                ),
+                KeyBinding::new(
+                    "home",
+                    rift_app::file_tree::SelectFirst,
+                    Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
+                ),
+                KeyBinding::new(
+                    "end",
+                    rift_app::file_tree::SelectLast,
+                    Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
+                ),
+            ]);
+            // Window-state restore (#225, docs/spec-window-state-persistence.md):
+            // resolve this instance's channel-keyed state file, load it (defaulting
+            // on any read/parse failure per `window_state::load`'s own tolerant
+            // contract), and clamp its bounds against the live display topology —
+            // all before the window is ever created, so the restore lands before
+            // first paint. `state_path` is `None` only when no platform state
+            // directory could be resolved at all (`LOCALAPPDATA`/`XDG_STATE_HOME`/
+            // `HOME` all unset); the window then opens at today's default and every
+            // save site below no-ops instead of crashing.
+            let state_path = match window_state::state_path() {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    warn!(%e, "window-state persistence disabled");
+                    None
+                }
+            };
+            let restored = state_path
+                .as_deref()
+                .map(window_state::load)
+                .unwrap_or_default();
+            // Recent-connections store (#477, `docs/spec-connection-robustness.md`):
+            // beside the window-state file, same per-channel keying, same
+            // tolerant-degrade-on-error contract.
+            let recents_path = match recents::recents_path() {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    warn!(%e, "recent-connections persistence disabled");
+                    None
+                }
+            };
+            let window_bounds =
+                workspace::initial_window_bounds(&restored, &workspace::display_rects(cx));
+            // Per-channel window title (matching the per-channel taskbar icons), so the
+            // mirrored stable and dev instances are distinguishable in alt-tab and
+            // taskbar hover. Lowercase `rift` per brand rules.
+            let title = if cfg!(feature = "windowed") {
+                "rift"
+            } else {
+                "rift (dev)"
+            };
+            let font_size_px = restored.font_size_px;
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(window_bounds),
+                    // Custom 38px title bar (#511, `docs/spec-cockpit-chrome.md`):
+                    // `TitleBar::title_bar_options()` hides the native OS chrome
+                    // (`appears_transparent: true`) and leaves `title: None` — the
+                    // window's taskbar/alt-tab name is set explicitly below
+                    // instead, since the OS title text no longer renders anywhere.
+                    titlebar: Some(TitleBar::title_bar_options()),
+                    // Client-side decorations (Wayland only; a no-op under X11 and
+                    // Windows, where `appears_transparent` above already governs
+                    // the chrome) — mirrors gpui-component's own story reference
+                    // so a compositor never draws a redundant server-side bar
+                    // behind the custom one.
+                    #[cfg(target_os = "linux")]
+                    window_background: WindowBackgroundAppearance::Transparent,
+                    #[cfg(target_os = "linux")]
+                    window_decorations: Some(WindowDecorations::Client),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    // The OS-level window title (taskbar/alt-tab) — no longer
+                    // carried by `titlebar.title` now that the native bar is
+                    // hidden; the custom bar shows the wordmark instead.
+                    window.set_window_title(title);
+                    // The Connection screen (#477) is the startup state on every
+                    // launch (no auto-connect, per the spec's gate decision): the
+                    // Shell renders it first, and only builds the session
+                    // pipeline below once the user submits the connect card.
+                    let shell =
+                        cx.new(|cx| Shell::new(state_path, recents_path, font_size_px, window, cx));
+                    cx.new(|cx| Root::new(shell, window, cx))
+                },
+            )
+            .unwrap();
+            cx.activate(true);
+        });
 }
 
 /// The window's root content (#477, `docs/spec-connection-robustness.md`):
@@ -2810,5 +2817,22 @@ mod tests {
 
         assert_eq!(snapshot.pane_is_shell.get("%0"), Some(&true));
         assert_eq!(snapshot.pane_is_shell.get("%7"), Some(&false));
+    }
+
+    #[test]
+    fn test_gpui_component_icon_asset_is_embedded_in_product_build() {
+        use gpui::AssetSource as _;
+        use gpui_component_assets::Assets;
+
+        // The activity-rail and window-control glyphs resolve through
+        // gpui-component-assets. Guard that its icon source is wired into the
+        // product build (not just the `gallery` feature) and that its
+        // `icons/<name>.svg` layout still resolves, so the blank-icon regression
+        // (#597) stays fixed.
+        let icon = Assets
+            .load("icons/folder.svg")
+            .expect("icon asset load must not error")
+            .expect("gpui-component icon must be embedded in the product build");
+        assert!(!icon.is_empty(), "embedded icon SVG must not be empty");
     }
 }
