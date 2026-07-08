@@ -43,6 +43,11 @@
 | 24 | Source-control write path — stage/unstage/commit, hunk staging, split diff + word-level emphasis | [spec-source-control-write.md](spec-source-control-write.md) | [Phase 240](https://github.com/skrischer/rift/milestone/38) |
 | 25 | Explorer design parity — header actions, git letter lane, diagnostic dots + rollup, empty states | — | — |
 | 26 | Settings shell + theme unification — full settings page, theme-driven terminal palette, hardcoded-hex cleanup | — | — |
+| 27 | Explorer redesign — new Paper artboard + overhauled visual language (row anatomy, density, icon / context-menu / filter / file-op affordances); the visual contract phases 28–31 build on | — | — |
+| 28 | Explorer file-type icons — SVG icon-theme asset embedding, file-type → icon mapping, folder / open-folder / chevron glyphs replacing today's text markers | — | — |
+| 29 | Explorer context menu — right-click action framework over the tree; ships the client-capable actions (open, reveal, copy path / relative path, reveal-in-terminal, collapse-all) | — | — |
+| 30 | Explorer file operations — create / rename / delete / move via a daemon write path, surfaced through the context menu + inline rename + drag & drop | — | — |
+| 31 | Explorer search & filter — in-panel fuzzy narrowing, jump-to-file quick-open, multi-select, keyboard-first navigation | — | — |
 
 A phase gets a Spec link once `/loopkit:plan` drafts it, and a Milestone link once
 it is `READY`. The milestone (open/closed + issue progress) is where status lives.
@@ -108,6 +113,39 @@ PR, never edited from here):
 
 Backing prior art: "v1.0 polish + robustness phases — prior-art index
 (Phases 19–26)" in [prior-art.md](prior-art.md).
+
+## Explorer overhaul (phases 27–31)
+
+Seeded 2026-07-08 from idea sparring (research mode: websearch) after v1.0.0
+shipped. The file explorer completed Phase 11 (decoration / reveal / keyboard
+nav) and Phase 25 (design parity) as a **read-only** tree with **text-glyph**
+markers — parity explicitly deferred real file-type icons (the product binary
+does not embed SVG icon assets) and file operations (a daemon write capability),
+and the tree still has no context menu, no search / filter, and no quick-open.
+This block is the full overhaul into a first-class explorer.
+
+Ordering is a DAG, not a strict chain: **27 (redesign) is the visual foundation**
+the other four build on; **28 (icons)** and **31 (search)** are independent client
+work against the new artboard; **29 (context menu)** is the interaction shell that
+**30 (file operations)** surfaces its write actions through, so 29 precedes 30.
+Phase 30 carries the only foundation impact.
+
+Foundation impact (authored and ratified in each phase's `/loopkit:plan` spec
+PR, never edited from here):
+
+- Phase 27 — supersedes the "Cockpit — IDE" artboard's explorer panel as the
+  explorer's visual contract; the new artboard is authored in this phase's spec
+  PR (design-doc → issue → PR). No constitution / architecture change — a design
+  artifact plus the client-side visual shell phases 28–31 render against.
+- Phase 30 — `protocol` gains file-operation messages (create / rename / delete /
+  move) — a deliberate, reviewed API extension (`docs/protocol.md`); the daemon
+  gains its file-op write handlers, executing `std::fs` on the remote host (its
+  second write capability after Phase-24 git-write and buffer save). The daemon
+  owns the filesystem, so ops run **daemon-side**, not client-side SFTP — the
+  same model as Zed's remote server. Ratified in Phase 30's spec PR.
+
+Backing prior art: "Explorer overhaul — prior-art index (Phases 27–31)" in
+[prior-art.md](prior-art.md).
 
 ## Tracks (tooling/DX, not product phases)
 
