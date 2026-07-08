@@ -37,6 +37,9 @@ jobs:
       - name: Test
         run: cargo test --workspace --exclude rift-app
 
+      - name: Color token guard
+        run: ./scripts/check-color-tokens.sh
+
   app-check:
     name: App Check
     runs-on: ubuntu-latest

@@ -8,7 +8,7 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::popover::Popover;
 use gpui_component::tab::{Tab, TabBar};
-use gpui_component::{h_flex, v_flex, white, ActiveTheme, Icon, IconName, Sizable};
+use gpui_component::{h_flex, v_flex, ActiveTheme, Icon, IconName, Sizable};
 use termy_terminal_ui::TmuxSnapshot;
 use tracing::debug;
 
@@ -1866,6 +1866,7 @@ impl Render for SessionView {
         let muted = cx.theme().muted_foreground;
         let success = cx.theme().success;
         let danger = cx.theme().danger;
+        let danger_foreground = cx.theme().danger_foreground;
         let close_idle = cx.theme().muted_foreground;
         let close_hover = cx.theme().danger;
         let new_idle = cx.theme().muted_foreground;
@@ -1973,10 +1974,7 @@ impl Render for SessionView {
                                 div()
                                     .text_size(px(11.0))
                                     .font_weight(FontWeight::BOLD)
-                                    // The same white the gpui-component `Badge`
-                                    // uses for its text — a filled-badge contrast
-                                    // choice, not a themed palette color.
-                                    .text_color(white())
+                                    .text_color(danger_foreground)
                                     .child("!"),
                             )
                             .into_any_element(),
