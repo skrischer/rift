@@ -10,6 +10,7 @@ use alacritty_terminal::vte::ansi::{CursorShape, Processor};
 use gpui::*;
 use gpui_component::dialog::AlertDialog;
 use gpui_component::notification::Notification;
+use gpui_component::ActiveTheme;
 use gpui_component::WindowExt;
 use termy_terminal_ui::{
     add_span_damage_compute_us, encode_mouse_report, find_link_in_line, CellRenderInfo,
@@ -19,7 +20,7 @@ use termy_terminal_ui::{
 };
 use tracing::{debug, error};
 
-use crate::colors;
+use crate::colors::TerminalPalette;
 use crate::error::TerminalError;
 use crate::keyboard;
 use crate::keytable::{self, KeyTable, PrefixOptions};
@@ -647,8 +648,9 @@ impl PaneView {
         }
         let cols = self.history_capture_cols.max(1);
         let pending_scroll = self.history_pending_scroll;
+        let palette = TerminalPalette::from_theme(&cx.theme().colors);
         cx.spawn(async move |this, cx| {
-            let rows = smol::unblock(move || parse_capture_to_rows(&bytes, cols)).await;
+            let rows = smol::unblock(move || parse_capture_to_rows(&bytes, cols, &palette)).await;
             if rows.is_empty() {
                 return;
             }
@@ -993,11 +995,12 @@ fn extract_row_cells(
     row: usize,
     display_offset: usize,
     selection: Option<&GridSelection>,
+    palette: &TerminalPalette,
 ) -> Vec<CellRenderInfo> {
     let grid = term.grid();
     let columns = grid.columns();
     let line = Line(row as i32 - display_offset as i32);
-    let default_bg = Hsla::from(colors::BACKGROUND);
+    let default_bg = palette.background();
     let mut cells = Vec::with_capacity(columns);
 
     for col in 0..columns {
@@ -1009,8 +1012,8 @@ fn extract_row_cells(
         }
 
         let inverse = flags.contains(Flags::INVERSE);
-        let raw_fg = Hsla::from(colors::to_gpui_color(cell.fg));
-        let raw_bg = Hsla::from(colors::to_gpui_color(cell.bg));
+        let raw_fg = palette.resolve(cell.fg);
+        let raw_bg = palette.resolve(cell.bg);
 
         let (mut fg, bg) = if inverse {
             (raw_bg, raw_fg)
@@ -1050,7 +1053,11 @@ fn extract_row_cells(
 /// in the scratch history rather than being lost — the real produced row count
 /// is then read back from the grid, not assumed from the requested range or the
 /// `\n` count (which would silently drop wrapped history).
-fn parse_capture_to_rows(payload: &[u8], cols: usize) -> Vec<Vec<CellRenderInfo>> {
+fn parse_capture_to_rows(
+    payload: &[u8],
+    cols: usize,
+    palette: &TerminalPalette,
+) -> Vec<Vec<CellRenderInfo>> {
     if payload.is_empty() || cols == 0 {
         return Vec::new();
     }
@@ -1078,7 +1085,7 @@ fn parse_capture_to_rows(payload: &[u8], cols: usize) -> Vec<Vec<CellRenderInfo>
     let total = hist + last_line + 1;
 
     (0..total)
-        .map(|row| extract_row_cells(&term, row, hist, None))
+        .map(|row| extract_row_cells(&term, row, hist, None, palette))
         .collect()
 }
 
@@ -1119,6 +1126,10 @@ impl Render for PaneView {
         let font_size = self.font_size;
         let cell_size = measure_cell_size(window, font_size);
         self.cell_size = cell_size;
+
+        // Resolve the terminal palette from the active theme once per render, so
+        // switching the theme restyles the grid live (no restart).
+        let palette = TerminalPalette::from_theme(&cx.theme().colors);
 
         let new_size = if let Some(ts) = self.tmux_size {
             ts
@@ -1218,6 +1229,7 @@ impl Render for PaneView {
                 row_idx - history_rows,
                 display_offset,
                 self.selection.as_ref(),
+                &palette,
             );
             // Live rows render after the history block, so shift their grid-relative
             // index to the viewport row they actually occupy (a no-op when
@@ -1241,8 +1253,8 @@ impl Render for PaneView {
 
         drop(term);
 
-        let bg_hsla = Hsla::from(colors::BACKGROUND);
-        let fg_hsla = Hsla::from(colors::FOREGROUND);
+        let bg_hsla = palette.background();
+        let fg_hsla = palette.foreground();
         let selection_bg = Hsla {
             h: 0.0,
             s: 0.0,
@@ -1625,15 +1637,20 @@ mod tests {
         row.iter().map(|cell| cell.char).collect::<String>()
     }
 
+    fn test_palette() -> TerminalPalette {
+        TerminalPalette::from_theme(&gpui_component::ThemeColor::default())
+    }
+
     #[::core::prelude::v1::test]
     fn test_parse_capture_empty_payload_yields_no_rows() {
-        assert!(parse_capture_to_rows(b"", 80).is_empty());
-        assert!(parse_capture_to_rows(b"abc", 0).is_empty());
+        let palette = test_palette();
+        assert!(parse_capture_to_rows(b"", 80, &palette).is_empty());
+        assert!(parse_capture_to_rows(b"abc", 0, &palette).is_empty());
     }
 
     #[::core::prelude::v1::test]
     fn test_parse_capture_maps_each_line_to_one_row() {
-        let rows = parse_capture_to_rows(b"ab\r\ncd", 4);
+        let rows = parse_capture_to_rows(b"ab\r\ncd", 4, &test_palette());
         assert_eq!(rows.len(), 2);
         assert_eq!(row_text(&rows[0]).trim_end(), "ab");
         assert_eq!(row_text(&rows[1]).trim_end(), "cd");
@@ -1647,7 +1664,7 @@ mod tests {
         // real (wrapped) row count rather than the `\n` count is what keeps the
         // upper history from being silently dropped (the discarded first seam's
         // latent bug).
-        let rows = parse_capture_to_rows(b"abcde\r\nfg", 3);
+        let rows = parse_capture_to_rows(b"abcde\r\nfg", 3, &test_palette());
         assert_eq!(rows.len(), 3);
         assert_eq!(row_text(&rows[0]).trim_end(), "abc");
         assert_eq!(row_text(&rows[1]).trim_end(), "de");
