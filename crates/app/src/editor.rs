@@ -1102,6 +1102,12 @@ impl EditorView {
         self.active_tab().is_some_and(|t| t.dirty)
     }
 
+    /// The number of open tabs with unsaved edits, for the aggregated
+    /// window-close confirm dialog's message (`docs/spec-v1-hardening.md`).
+    pub fn dirty_tab_count(&self) -> usize {
+        self.tabs.iter().filter(|t| t.dirty).count()
+    }
+
     /// Whether the active tab is currently surfacing a save conflict.
     pub fn has_conflict(&self) -> bool {
         self.active_tab()
