@@ -36,12 +36,14 @@ use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, px, App, Context, EventEmitter, FocusHandle, Focusable, FontWeight,
-    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, ScrollStrategy,
-    SharedString, Size, StatefulInteractiveElement as _, Styled as _, Window,
+    div, px, App, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable, FontWeight,
+    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Pixels,
+    Render, ScrollStrategy, SharedString, Size, StatefulInteractiveElement as _, Styled as _,
+    Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dock::{Panel, PanelEvent};
+use gpui_component::menu::{ContextMenuExt as _, PopupMenu};
 use gpui_component::{
     h_flex, v_virtual_list, ActiveTheme as _, Icon, IconName, Sizable as _, VirtualListScrollHandle,
 };
@@ -162,6 +164,34 @@ pub struct SelectFirst;
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = rift, no_json)]
 pub struct SelectLast;
+
+/// Reveal the selected row in the tree — expand its ancestors, select it, and
+/// scroll it into view (reuses [`FileTree::reveal`]). Dispatched by the row
+/// context menu's "Reveal in tree" item; pointer-only, not bound to a key.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct RevealInTree;
+
+/// Copy the selected row's absolute path (the worktree root joined with the
+/// row's root-relative path) to the system clipboard. Dispatched by the row
+/// context menu's "Copy path" item; pointer-only, not bound to a key.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct CopyAbsolutePath;
+
+/// Copy the selected row's root-relative path verbatim to the system
+/// clipboard. Dispatched by the row context menu's "Copy relative path" item;
+/// pointer-only, not bound to a key.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct CopyRelativePath;
+
+/// Collapse every directory (reuses [`FileTree::collapse_all`]). Dispatched
+/// by the row context menu's "Collapse all" item; pointer-only, not bound to
+/// a key.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct CollapseAll;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -418,6 +448,20 @@ fn compute_rollup(model: &WorktreeModel) -> HashMap<String, Rollup> {
 /// yields `["a", "a/b"]`; a top-level path (no separator) yields none.
 fn ancestor_dirs(path: &str) -> impl Iterator<Item = &str> {
     path.match_indices('/').map(|(i, _)| &path[..i])
+}
+
+/// Join a worktree root with a root-relative path into an absolute path —
+/// pure string math, no filesystem access. Trailing-slash-safe: `root` may or
+/// may not already carry a trailing `/` (the daemon-sent root and the
+/// filesystem root `"/"` both need to join without doubling the separator).
+/// A top-level `rel` (no `/` of its own) still joins correctly, since its
+/// parent is the root itself.
+fn absolute_path(root: &str, rel: &str) -> String {
+    if root.ends_with('/') {
+        format!("{root}{rel}")
+    } else {
+        format!("{root}/{rel}")
+    }
 }
 
 /// Index of `path` within `rows`, or `None` if it is not currently visible
@@ -1155,6 +1199,23 @@ impl FileTree {
             .text_sm()
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().list_hover))
+            // Right mouse-down selects the row so the context menu's unit
+            // actions below target it. This listener is attached to the row
+            // itself, so it paints (and registers) before `ContextMenuExt`'s
+            // own right-click listener, which is registered on the wrapping
+            // `ContextMenu` element's *paint*, after this row's paint runs —
+            // the selection lands before the menu's deferred build reads it.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener({
+                    let path = path.clone();
+                    move |this, _event: &MouseDownEvent, _window, cx| {
+                        this.selected = Some(path.clone());
+                        this.cache_dirty = true;
+                        cx.notify();
+                    }
+                }),
+            )
             // Ignored entries (not yet shown by default — #309) render dimmed
             // rather than hidden, once the daemon starts sending them.
             .when(row.ignored, |el| el.opacity(0.55))
@@ -1172,6 +1233,16 @@ impl FileTree {
                 .text_color(cx.theme().foreground);
         }
 
+        // Row context menu (`docs/spec-explorer-context-menu.md`): reuses
+        // `gpui-component`'s `ContextMenuExt`/`PopupMenu` — the same widget
+        // `editor.rs` already ships its right-click menu with. Label-only (no
+        // `IconName`: the product binary does not embed `gpui-component`'s
+        // icon assets, see the module doc). Lists exactly the client-capable
+        // top group, in artboard order, leaving a gap where "Reveal in
+        // terminal" docks in the next issue; the write-actions group is a
+        // later phase (daemon write path does not exist yet). "Open" reuses
+        // the shipped `OpenSelected` action rather than a new one, so it also
+        // keeps that action's existing `Enter` binding hint.
         root.on_click(cx.listener(move |this, _event, _window, cx| {
             if is_dir {
                 this.click_dir(&path);
@@ -1185,6 +1256,13 @@ impl FileTree {
             }
             cx.notify();
         }))
+        .context_menu(|menu: PopupMenu, _window, _cx| {
+            menu.menu("Open", Box::new(OpenSelected))
+                .menu("Reveal in tree", Box::new(RevealInTree))
+                .menu("Copy path", Box::new(CopyAbsolutePath))
+                .menu("Copy relative path", Box::new(CopyRelativePath))
+                .menu("Collapse all", Box::new(CollapseAll))
+        })
     }
 }
 
@@ -1331,6 +1409,37 @@ impl Render for FileTree {
             }))
             .on_action(cx.listener(|this, _: &SelectLast, _window, cx| {
                 this.select_last();
+                cx.notify();
+            }))
+            // Row context-menu actions (`docs/spec-explorer-context-menu.md`):
+            // dispatched by the `PopupMenu` built in `render_row`, handled
+            // here so they stay inside `FILE_TREE_KEY_CONTEXT` like every
+            // other tree action — no key binding is added in `main.rs`. Each
+            // targets `self.selected` (set by the row's right mouse-down
+            // listener); a missing selection or root is a no-op, matching the
+            // tree's "render / act only on what the model carries" discipline.
+            .on_action(cx.listener(|this, _: &RevealInTree, _window, cx| {
+                if let Some(selected) = this.selected.clone() {
+                    this.reveal(&selected);
+                }
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &CopyAbsolutePath, _window, cx| {
+                if let (Some(root), Some(selected)) =
+                    (this.model.root().map(str::to_owned), this.selected.clone())
+                {
+                    cx.write_to_clipboard(ClipboardItem::new_string(absolute_path(
+                        &root, &selected,
+                    )));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CopyRelativePath, _window, cx| {
+                if let Some(selected) = this.selected.clone() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(selected));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CollapseAll, _window, cx| {
+                this.collapse_all();
                 cx.notify();
             }))
             .child(self.render_header(cx))
@@ -2344,6 +2453,29 @@ mod tests {
     fn test_ancestor_dirs_of_a_top_level_path_is_empty() {
         let ancestors: Vec<&str> = ancestor_dirs("top.rs").collect();
         assert!(ancestors.is_empty());
+    }
+
+    // --- absolute_path (context-menu "Copy path", #671) ---
+
+    #[test]
+    fn test_absolute_path_joins_root_and_nested_relative_path() {
+        assert_eq!(absolute_path("/proj", "src/main.rs"), "/proj/src/main.rs");
+    }
+
+    #[test]
+    fn test_absolute_path_of_a_top_level_file_joins_with_a_single_slash() {
+        assert_eq!(absolute_path("/proj", "top.rs"), "/proj/top.rs");
+    }
+
+    #[test]
+    fn test_absolute_path_with_filesystem_root_does_not_double_the_slash() {
+        assert_eq!(absolute_path("/", "top.rs"), "/top.rs");
+        assert_eq!(absolute_path("/", "src/main.rs"), "/src/main.rs");
+    }
+
+    #[test]
+    fn test_absolute_path_with_a_trailing_slash_root_does_not_double_the_slash() {
+        assert_eq!(absolute_path("/proj/", "src/main.rs"), "/proj/src/main.rs");
     }
 
     #[test]
