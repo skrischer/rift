@@ -125,6 +125,18 @@ struct EditorChannels {
     /// daemon's `GitOpResult` reply is not routed back, the resulting state
     /// arrives on the worktree stream as `UpdateGitStatus` / `RepoState`.
     git_op_rx: flume::Receiver<rift_protocol::ClientMessage>,
+    /// File ops the file tree emits (`docs/spec-explorer-file-ops.md`, #675) —
+    /// `CreateFile`, `CreateDir`, `RenamePath`, `DeletePath`; forwarded onto
+    /// the protocol verbatim by the file-op bridge, exactly like `git_op_rx`.
+    /// Unlike the git-write channel, the daemon's `FileOpResult` reply IS
+    /// routed back (on `file_op_result_tx` below) — the tree needs it for UX
+    /// transitions (close the rename editor, surface an error), never for the
+    /// tree mutation itself, which stays push-only via `UpdateWorktree`.
+    file_op_rx: flume::Receiver<rift_protocol::ClientMessage>,
+    /// `FileOpResult` replies routed to the file tree for UX transitions only
+    /// (`docs/spec-explorer-file-ops.md`): `WorktreeModel` is never mutated
+    /// from a file op — the push-only `UpdateWorktree` is the single writer.
+    file_op_result_tx: flume::Sender<rift_protocol::DaemonMessage>,
     /// Fires once whenever `run_ssh_session` selects the daemon terminal but
     /// `provision_daemon` came back empty (#619): no daemon binary configured,
     /// or a provisioning step failed. The session still runs — the legacy tmux
@@ -472,6 +484,11 @@ fn main() {
                     rift_app::file_tree::SelectLast,
                     Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
                 ),
+                KeyBinding::new(
+                    "f2",
+                    rift_app::file_tree::StartRename,
+                    Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
+                ),
             ]);
             // Window-state restore (#225, docs/spec-window-state-persistence.md):
             // resolve this instance's channel-keyed state file, load it (defaulting
@@ -686,6 +703,9 @@ impl Shell {
         let (diff_tx, diff_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
         let (request_diff_tx, request_diff_rx) = flume::unbounded::<String>();
         let (git_op_tx, git_op_rx) = flume::unbounded::<rift_protocol::ClientMessage>();
+        let (file_op_tx, file_op_rx) = flume::unbounded::<rift_protocol::ClientMessage>();
+        let (file_op_result_tx, file_op_result_rx) =
+            flume::unbounded::<rift_protocol::DaemonMessage>();
         let (daemon_unavailable_tx, daemon_unavailable_rx) = flume::unbounded::<()>();
         // Fires once when the session pipeline this attempt spawned ends —
         // orderly exit, a canceled reconnect, or a non-retryable failure
@@ -747,6 +767,8 @@ impl Shell {
                 diff_tx,
                 request_diff_rx,
                 git_op_rx,
+                file_op_rx,
+                file_op_result_tx,
                 daemon_unavailable_tx,
             };
 
@@ -798,6 +820,8 @@ impl Shell {
                     nav_tx: nav_request_tx,
                     request_diff_tx,
                     git_op_tx,
+                    file_op_tx,
+                    file_op_result_rx,
                     daemon_unavailable_rx,
                 },
                 state_path,
@@ -1070,7 +1094,8 @@ fn drain_render_backlog(ch: &PtyChannels, editor: &EditorChannels, watches: &Eng
         + editor.buffer_change_rx.drain().count()
         + editor.nav_request_rx.drain().count()
         + editor.request_diff_rx.drain().count()
-        + editor.git_op_rx.drain().count();
+        + editor.git_op_rx.drain().count()
+        + editor.file_op_rx.drain().count();
     if dropped > 0 {
         debug!(
             dropped,
@@ -1161,7 +1186,8 @@ async fn run_ssh_session(
         spawn_buffer_change_bridge(client_rx.clone(), editor.buffer_change_rx.clone());
         spawn_nav_bridge(client_rx.clone(), editor.nav_request_rx.clone());
         spawn_request_diff_bridge(client_rx.clone(), editor.request_diff_rx.clone());
-        spawn_git_op_bridge(client_rx, editor.git_op_rx.clone());
+        spawn_git_op_bridge(client_rx.clone(), editor.git_op_rx.clone());
+        spawn_file_op_bridge(client_rx, editor.file_op_rx.clone());
         tokio::spawn(async move {
             consume_daemon_messages(&client, None, &editor).await;
         });
@@ -1336,7 +1362,13 @@ async fn run_daemon_terminal(
     // unstage / discard / commit actions forward verbatim. Push-only from here —
     // the resulting git change returns on the worktree stream, not as a routed
     // reply.
-    spawn_git_op_bridge(client_rx, editor.git_op_rx.clone());
+    spawn_git_op_bridge(client_rx.clone(), editor.git_op_rx.clone());
+    // File op reverse path (`docs/spec-explorer-file-ops.md`, #675): the file
+    // tree's create/rename/delete/move actions forward verbatim. The
+    // `FileOpResult` reply returns via `consume_daemon_messages` on
+    // `editor.file_op_result_tx` — routed back for UX only, never the tree
+    // mutation, which stays push-only via `UpdateWorktree`.
+    spawn_file_op_bridge(client_rx, editor.file_op_rx.clone());
 
     // Forward path: fold the daemon stream into the render channels (pane output,
     // layout snapshots, capture replies), the file tree, and the editor. Blocks
@@ -2112,6 +2144,14 @@ async fn consume_daemon_messages(
             msg @ DaemonMessage::FileDiff { .. } => {
                 let _ = editor.diff_tx.send(msg);
             }
+            // --- file-op reply -> file tree (every mode) ---
+            // The reply to a `CreateFile` / `CreateDir` / `RenamePath` /
+            // `DeletePath`: forward to the file tree for UX transitions only
+            // (`docs/spec-explorer-file-ops.md`, #675) — the tree mutation
+            // itself stays push-only via the worktree-family messages above.
+            msg @ DaemonMessage::FileOpResult { .. } => {
+                let _ = editor.file_op_result_tx.send(msg);
+            }
             other => debug!(?other, "daemon message without a consumer yet"),
         }
     }
@@ -2192,6 +2232,28 @@ fn spawn_git_op_bridge(
     tokio::spawn(async move {
         while let Ok(msg) = git_op_rx.recv_async().await {
             debug!(op = ?msg, "sending git write op");
+            let client = client_rx.borrow().clone();
+            let _ = client.send(msg).await;
+        }
+    });
+}
+
+/// Forward the file tree's file ops onto the protocol
+/// (`docs/spec-explorer-file-ops.md`, #675): each `CreateFile` / `CreateDir` /
+/// `RenamePath` / `DeletePath` the tree built (via `FileTreeEvent`, turned
+/// into a `ClientMessage` by `workspace.rs`) is sent verbatim — the same
+/// shape as [`spawn_git_op_bridge`]. Unlike the git-write channel, the
+/// daemon's `FileOpResult` reply IS routed back (`consume_daemon_messages` on
+/// `editor.file_op_result_tx`), since the tree needs it for UX transitions;
+/// the resulting tree change still arrives only through the push-only
+/// `UpdateWorktree` recompute. Ends when the render-side channel closes.
+fn spawn_file_op_bridge(
+    client_rx: DaemonClientWatch,
+    file_op_rx: flume::Receiver<rift_protocol::ClientMessage>,
+) {
+    tokio::spawn(async move {
+        while let Ok(msg) = file_op_rx.recv_async().await {
+            debug!(op = ?msg, "sending file op");
             let client = client_rx.borrow().clone();
             let _ = client.send(msg).await;
         }
@@ -2601,6 +2663,7 @@ mod tests {
         nav_tx: flume::Sender<rift_protocol::ClientMessage>,
         request_diff_tx: flume::Sender<String>,
         git_op_tx: flume::Sender<rift_protocol::ClientMessage>,
+        file_op_tx: flume::Sender<rift_protocol::ClientMessage>,
     }
 
     fn backlog_harness() -> BacklogHarness {
@@ -2629,6 +2692,8 @@ mod tests {
         let (diff_tx, _) = flume::unbounded();
         let (request_diff_tx, request_diff_rx) = flume::unbounded();
         let (git_op_tx, git_op_rx) = flume::unbounded();
+        let (file_op_tx, file_op_rx) = flume::unbounded();
+        let (file_op_result_tx, _) = flume::unbounded();
         let (daemon_unavailable_tx, _) = flume::unbounded();
         BacklogHarness {
             ch: PtyChannels {
@@ -2659,6 +2724,8 @@ mod tests {
                 diff_tx,
                 request_diff_rx,
                 git_op_rx,
+                file_op_rx,
+                file_op_result_tx,
                 daemon_unavailable_tx,
             },
             watches: EngineWatches {
@@ -2678,6 +2745,7 @@ mod tests {
             nav_tx,
             request_diff_tx,
             git_op_tx,
+            file_op_tx,
         }
     }
 
@@ -2744,6 +2812,12 @@ mod tests {
                 path: "src/main.rs".into(),
             })
             .expect("send git op");
+        h.file_op_tx
+            .send(rift_protocol::ClientMessage::RenamePath {
+                from: "src/main.rs".into(),
+                to: "src/lib.rs".into(),
+            })
+            .expect("send file op");
 
         drain_render_backlog(&h.ch, &h.editor, &h.watches);
 
@@ -2759,6 +2833,7 @@ mod tests {
         assert!(h.editor.nav_request_rx.is_empty());
         assert!(h.editor.request_diff_rx.is_empty());
         assert!(h.editor.git_op_rx.is_empty());
+        assert!(h.editor.file_op_rx.is_empty());
     }
 
     #[test]

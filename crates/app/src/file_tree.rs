@@ -13,18 +13,21 @@
 //! rows on screen), and lets the user expand/collapse directories and select a
 //! file.
 //!
-//! Bounded to **navigate + open + decorate** (the spec's v1 tree scope):
-//! selecting a file emits [`FileTreeEvent::OpenFile`] carrying its root-relative
-//! path — the clean signal the editor surface (#187) subscribes to. Rows carry
-//! git status and diagnostic severity from the model, rolled up onto ancestor
-//! directories (`compute_rollup`, #329) so a collapsed folder still surfaces a
+//! Bounded to **navigate + open + decorate**, plus inline rename (artboard
+//! **State C**, `docs/spec-explorer-file-ops.md`, #675): selecting a file
+//! emits [`FileTreeEvent::OpenFile`] carrying its root-relative path — the
+//! clean signal the editor surface (#187) subscribes to. Rows carry git status
+//! and diagnostic severity from the model, rolled up onto ancestor directories
+//! (`compute_rollup`, #329) so a collapsed folder still surfaces a
 //! modified/errored descendant; a deleted tracked file, whose own row is gone,
-//! rolls its status up onto surviving ancestors the same way (#480).
-//! No rich operations (create/rename/delete/move)
-//! live here — that stays a later explorer-panel sub-spec. Selecting changes no
-//! tmux pane/window state — this is a pure GUI surface, agent-agnostic by
-//! construction (it only ever reads file paths, kinds, git status, diagnostics,
-//! and the `ignored` flag; it never inspects pane processes or file contents).
+//! rolls its status up onto surviving ancestors the same way (#480). Create /
+//! delete / move stay a later slice of the same phase — see
+//! `docs/spec-explorer-file-ops.md`. Selecting changes no tmux pane/window
+//! state — this is a pure GUI surface, agent-agnostic by construction (it only
+//! ever reads file paths, kinds, git status, diagnostics, and the `ignored`
+//! flag; it never inspects pane processes or file contents). A rename is user
+//! intent over the filesystem, sent as a [`FileTreeEvent::RenameRequested`]
+//! for `workspace.rs` to forward — no different in kind from any other write.
 //!
 //! Implements `gpui-component`'s `Panel` trait directly (`docs/spec-ide-shell.md`,
 //! issue #323), so it can be mounted as a dock panel once the shell adopts
@@ -36,18 +39,23 @@ use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, px, App, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable, FontWeight,
-    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Pixels,
-    Render, ScrollStrategy, SharedString, Size, StatefulInteractiveElement as _, Styled as _,
-    Window,
+    div, px, AnyElement, App, AppContext as _, ClipboardItem, Context, Div, Entity, EventEmitter,
+    FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement as _, Pixels, Render, ScrollStrategy, SharedString, Size,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dock::{Panel, PanelEvent};
+use gpui_component::input::{
+    Escape, Input, InputEvent, InputState, MoveToStart, SelectToNextWordEnd,
+};
 use gpui_component::menu::{ContextMenuExt as _, PopupMenu};
 use gpui_component::{
     h_flex, v_virtual_list, ActiveTheme as _, Icon, IconName, Sizable as _, VirtualListScrollHandle,
 };
-use rift_protocol::{DiagnosticSeverity, EntryKind, GitEntryStatus, GitStatusCode};
+use rift_protocol::{
+    DiagnosticSeverity, EntryKind, FileOp, FileOpError, GitEntryStatus, GitStatusCode,
+};
 
 use crate::file_icons::{self, Glyph};
 use crate::worktree::WorktreeModel;
@@ -202,6 +210,13 @@ pub struct RevealInTerminal;
 #[action(namespace = rift, no_json)]
 pub struct CollapseAll;
 
+/// Start renaming the selected row inline (artboard **State C**,
+/// `docs/spec-explorer-file-ops.md`). Bound to `F2` in `main.rs`, scoped to
+/// [`FILE_TREE_KEY_CONTEXT`]. A no-op with nothing selected.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct StartRename;
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// The GPUI key context the tree establishes around its root, so the
@@ -235,6 +250,14 @@ pub enum FileTreeEvent {
     /// `new-window -c <dir>` on the existing tmux command channel — no
     /// send-keys into a running pane, no new protocol message.
     RevealInTerminalRequested { dir: String },
+    /// The inline rename editor (State C) committed: rename `from` (the
+    /// row's original root-relative path) to `to` (root-relative, same
+    /// parent — the plain `<parent>/<new-name>` join). `workspace.rs`'s
+    /// existing `file_tree` subscription turns this into a
+    /// `ClientMessage::RenamePath` on the `file_op_tx` bridge — the same
+    /// shape as `OpenFile` above. The tree never sends the request itself:
+    /// it has no protocol channel of its own (`docs/spec-explorer-file-ops.md`).
+    RenameRequested { from: String, to: String },
 }
 
 /// Which placeholder the panel shows instead of the tree
@@ -557,6 +580,51 @@ fn selection_after_up(rows: &[Row], selected: Option<&str>) -> Option<String> {
     Some(rows[next].path.clone())
 }
 
+/// Build the `to` path for an inline rename: `path`'s parent directory (its
+/// portion before the last `/`, empty at a top-level row — the same
+/// string-math `reveal_in_terminal_dir` uses for a file's parent) joined with
+/// `new_name`. Inline rename never changes the parent — that's drag & drop's
+/// job (`docs/spec-explorer-file-ops.md`) — so this always lands `to` beside
+/// `path`.
+fn rename_target(path: &str, new_name: &str) -> String {
+    match path.rsplit_once('/') {
+        Some((parent, _)) => format!("{parent}/{new_name}"),
+        None => new_name.to_owned(),
+    }
+}
+
+/// Short, user-facing text for a [`FileOpError`] the rename editor re-opens
+/// on. Only [`FileOpError::AlreadyExists`] and [`FileOpError::InvalidPath`]
+/// ever reach the editor (`FileTree::apply_file_op_result`'s guard); the other
+/// variants are listed for completeness so this stays exhaustive.
+fn describe_file_op_error(error: FileOpError) -> &'static str {
+    match error {
+        FileOpError::AlreadyExists => "A file or folder with this name already exists",
+        FileOpError::InvalidPath => "Invalid name",
+        FileOpError::NotFound => "The original file was not found",
+        FileOpError::PermissionDenied => "Permission denied",
+        FileOpError::Io => "Rename failed",
+    }
+}
+
+/// Per-tree inline rename editor state (artboard **State C**,
+/// `docs/spec-explorer-file-ops.md`). [`FileTree::render_row`] swaps the
+/// target row's name label for `input` while [`FileTree::rename`] holds one
+/// of these; only one row renames at a time.
+struct RenameEditor {
+    /// The path being renamed (root-relative) — matched against each row in
+    /// `render_row`, and echoed as `RenameRequested::from` on commit.
+    path: String,
+    /// Seeded to the current name at open (or the just-typed name on an
+    /// error re-open) — a `gpui-component` `InputState`, reused verbatim,
+    /// never forked.
+    input: Entity<InputState>,
+    /// Set by an `AlreadyExists` / `InvalidPath` `FileOpResult` reply: shown
+    /// inline beside the (re-seeded) input, which keeps the just-typed name
+    /// rather than reverting to the original.
+    error: Option<String>,
+}
+
 /// The navigable file-tree view.
 ///
 /// Owns the [`WorktreeModel`] (the client mirror it renders) plus the small
@@ -591,6 +659,21 @@ pub struct FileTree {
     /// fold can never forget to invalidate the cache: there is no other way to
     /// mutate the model.
     cache_dirty: bool,
+    /// The active inline rename editor (artboard State C), if any — `None`
+    /// most of the time. `Some` while `render_row` swaps a row's name label
+    /// for a seeded `InputState`.
+    rename: Option<RenameEditor>,
+    /// Keeps the rename input's `PressEnter` subscription alive for as long
+    /// as `rename` is `Some`; dropped (replaced by `None`) alongside it.
+    _rename_input_sub: Option<Subscription>,
+    /// Armed by a successful create/rename `FileOpResult`
+    /// (`FileTree::apply_file_op_result`): the new path to select + reveal
+    /// the moment the matching `UpdateWorktree` `added` entry arrives (the
+    /// spec's pending-reveal). The tree still never mutates `WorktreeModel`
+    /// from a file op — only `model_mut` (fed by `UpdateWorktree`) does; this
+    /// field only drives the follow-up selection once the model already has
+    /// the row.
+    pending_reveal: Option<String>,
 }
 
 impl FileTree {
@@ -605,6 +688,9 @@ impl FileTree {
             focus_handle: RefCell::new(None),
             row_cache: Vec::new(),
             cache_dirty: true,
+            rename: None,
+            _rename_input_sub: None,
+            pending_reveal: None,
         }
     }
 
@@ -760,6 +846,161 @@ impl FileTree {
         }
 
         self.scroll_selected_into_view();
+    }
+
+    /// After an `UpdateWorktree` folds `added_paths` into the model, reveal
+    /// the pending create/rename target if it just arrived (the
+    /// pending-reveal affordance, `docs/spec-explorer-file-ops.md`): a
+    /// successful create/rename arms [`FileTree::pending_reveal`]
+    /// (`FileTree::apply_file_op_result`); this selects + reveals that row
+    /// the moment the push-only recompute actually adds it, then clears the
+    /// marker. A no-op when nothing is pending or `added_paths` doesn't
+    /// contain it — the model itself is never touched here, only read via
+    /// `reveal`. Called from `workspace.rs`'s `apply_worktree_message`,
+    /// after the model fold.
+    pub(crate) fn apply_pending_reveal(&mut self, added_paths: &[String]) {
+        let Some(pending) = &self.pending_reveal else {
+            return;
+        };
+        if added_paths.iter().any(|path| path == pending) {
+            let pending = self.pending_reveal.take().expect("checked Some above");
+            self.reveal(&pending);
+        }
+    }
+
+    /// Start renaming the selected row inline ([`StartRename`] / `F2`): a
+    /// no-op with nothing selected or a selection the model no longer has.
+    fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        if self.model.get(&path).is_none() {
+            return;
+        }
+        let name = Self::display_name(&path).to_owned();
+        self.open_rename_editor(path, name, None, window, cx);
+    }
+
+    /// Open (or re-open) the inline rename editor for `path`, seeded with
+    /// `seed_name` and an optional inline `error` (set on an error re-open,
+    /// `docs/spec-explorer-file-ops.md`). Focuses the fresh `InputState` and
+    /// best-effort selects the name portion before the last `.` (the
+    /// extension left unselected, the standard IDE affordance) via the
+    /// input's own public `MoveToStart` / `SelectToNextWordEnd` actions —
+    /// deferred to [`Window::on_next_frame`] since [`Window::dispatch_action`]
+    /// resolves the focused node against the *last rendered* frame, and this
+    /// row has not painted with the new input yet at call time. Reused
+    /// `InputState`, never forked (`docs/spec-explorer-file-ops.md`).
+    fn open_rename_editor(
+        &mut self,
+        path: String,
+        seed_name: String,
+        error: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(seed_name));
+        let sub = cx.subscribe_in(
+            &input,
+            window,
+            |this, _input, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    this.commit_rename(window, cx);
+                }
+            },
+        );
+
+        let focus_target = input.clone();
+        window.on_next_frame(move |window, cx| {
+            focus_target.update(cx, |state, cx| state.focus(window, cx));
+            window.dispatch_action(Box::new(MoveToStart), cx);
+            window.dispatch_action(Box::new(SelectToNextWordEnd), cx);
+        });
+
+        self.rename = Some(RenameEditor { path, input, error });
+        self._rename_input_sub = Some(sub);
+        self.cache_dirty = true;
+        cx.notify();
+    }
+
+    /// Commit the active rename editor's typed value (`Enter`): closes the
+    /// editor immediately (optimistic — `docs/spec-explorer-file-ops.md`'s
+    /// "the reply drives UX only" contract), then emits
+    /// [`FileTreeEvent::RenameRequested`] for `workspace.rs` to forward as a
+    /// `RenamePath`. A no-op send (editor still closes) for a blank name, a
+    /// name containing `/` (would silently reparent — inline rename only
+    /// ever targets the same parent, drag & drop is the move affordance), or
+    /// a name identical to the current one. `FileTree::apply_file_op_result`
+    /// reconstructs the editor from the `FileOpResult` echo alone on an
+    /// error reply, so no state needs to survive the close here.
+    fn commit_rename(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.rename.take() else {
+            return;
+        };
+        self._rename_input_sub = None;
+        self.cache_dirty = true;
+
+        let typed = editor.input.read(cx).value().trim().to_owned();
+        if !typed.is_empty() && !typed.contains('/') {
+            let to = rename_target(&editor.path, &typed);
+            if to != editor.path {
+                cx.emit(FileTreeEvent::RenameRequested {
+                    from: editor.path,
+                    to,
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// Cancel the active rename editor (`Escape`): closes it with no send.
+    fn cancel_rename(&mut self) {
+        if self.rename.take().is_some() {
+            self._rename_input_sub = None;
+            self.cache_dirty = true;
+        }
+    }
+
+    /// Route a `FileOpResult` reply to UX transitions only — never mutates
+    /// `WorktreeModel` (the single writer is `UpdateWorktree`,
+    /// `docs/spec-explorer-file-ops.md`'s single-writer rule). A successful
+    /// create/rename arms [`FileTree::pending_reveal`] with the new path. An
+    /// `AlreadyExists` / `InvalidPath` reply to a `Rename` re-opens the
+    /// editor for `from` (the file, unmoved — the op failed) seeded with
+    /// `to`'s basename (the name the user just typed) and the error text,
+    /// reconstructed entirely from the reply's own echo — no local state had
+    /// to survive the optimistic close. Any other error, or a reply for an
+    /// op this issue's client surfaces don't yet drive (create/delete —
+    /// `docs/spec-explorer-file-ops.md`'s later slices), is a no-op here.
+    pub(crate) fn apply_file_op_result(
+        &mut self,
+        op: FileOp,
+        ok: bool,
+        error: Option<FileOpError>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match op {
+            FileOp::Rename { from, to } => {
+                if ok {
+                    self.pending_reveal = Some(to);
+                } else if matches!(
+                    error,
+                    Some(FileOpError::AlreadyExists) | Some(FileOpError::InvalidPath)
+                ) {
+                    let seed_name = Self::display_name(&to).to_owned();
+                    let message =
+                        describe_file_op_error(error.expect("matched Some above")).to_owned();
+                    self.open_rename_editor(from, seed_name, Some(message), window, cx);
+                }
+            }
+            FileOp::CreateFile { path } | FileOp::CreateDir { path } => {
+                if ok {
+                    self.pending_reveal = Some(path);
+                }
+            }
+            FileOp::Delete { .. } => {}
+        }
     }
 
     /// Scroll the selected row into view. The tail shared by [`FileTree::reveal`]
@@ -1111,7 +1352,7 @@ impl FileTree {
     /// (mapped file-type / folder glyph, `crate::file_icons`) -> name (the
     /// only flexible slot) -> diagnostic dot -> right-aligned git-status
     /// letter.
-    fn render_row(&self, row: &Row, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_row(&self, row: &Row, cx: &mut Context<Self>) -> AnyElement {
         let is_dir = row.kind == EntryKind::Dir;
         let is_expanded = is_dir && !self.collapsed.contains(&row.path);
         let is_selected = self.selected.as_deref() == Some(row.path.as_str());
@@ -1154,6 +1395,20 @@ impl FileTree {
             .items_center()
             .justify_center()
             .child(icon_glyph.size(ICON_SLOT_WIDTH));
+
+        // Inline rename (artboard State C): while this row is the active
+        // rename target, its name slot is the seeded input instead of the
+        // static label — every other slot (chevron, icon, indent, row
+        // height) stays identical so the row doesn't jump while editing.
+        if let Some(editor) = self
+            .rename
+            .as_ref()
+            .filter(|editor| editor.path == row.path)
+        {
+            return self
+                .render_rename_row(row, indent, twisty, icon_slot, editor, cx)
+                .into_any_element();
+        }
 
         let name = Self::display_name(&row.path).to_owned();
         let path = row.path.clone();
@@ -1297,6 +1552,53 @@ impl FileTree {
                 .menu("Reveal in terminal", Box::new(RevealInTerminal))
                 .menu("Collapse all", Box::new(CollapseAll))
         })
+        .into_any_element()
+    }
+
+    /// The rename-active rendering of one row (artboard State C): chevron +
+    /// icon slot unchanged, the name slot replaced by `editor.input`, and — on
+    /// an error re-open — the inline message in place of the diagnostic-dot /
+    /// git-letter trailing lane. No click / context-menu handlers: the row is
+    /// not selectable or openable while its name is being edited.
+    fn render_rename_row(
+        &self,
+        row: &Row,
+        indent: Pixels,
+        twisty: Div,
+        icon_slot: Div,
+        editor: &RenameEditor,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let trailing = editor.error.as_ref().map(|message| {
+            div()
+                .flex_none()
+                .max_w(px(120.0))
+                .truncate()
+                .text_xs()
+                .text_color(cx.theme().danger)
+                .child(SharedString::from(message.clone()))
+        });
+
+        div()
+            .id(SharedString::from(format!("{}-rename", row.path)))
+            .flex()
+            .items_center()
+            .h(ROW_HEIGHT)
+            .py(ROW_BLOCK_PADDING_Y)
+            .pl(indent)
+            .pr(px(8.0))
+            .gap(ROW_SLOT_GAP)
+            .rounded(ROW_RADIUS)
+            .text_sm()
+            .child(twisty)
+            .child(icon_slot)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&editor.input).small()),
+            )
+            .children(trailing)
     }
 }
 
@@ -1485,6 +1787,24 @@ impl Render for FileTree {
             .on_action(cx.listener(|this, _: &CollapseAll, _window, cx| {
                 this.collapse_all();
                 cx.notify();
+            }))
+            // Inline rename (artboard State C, `docs/spec-explorer-file-ops.md`):
+            // `F2` (bound in `main.rs`) opens the editor for the selected row.
+            .on_action(cx.listener(|this, _: &StartRename, window, cx| {
+                this.start_rename(window, cx);
+            }))
+            // `Escape` while the rename input has focus: `InputState::escape`
+            // propagates the action (it is not in `clean_on_escape` mode), so
+            // it bubbles here to close the editor with no send. A no-op (and
+            // re-propagated) when nothing is being renamed, so an ancestor
+            // gets a chance at a plain Escape too.
+            .on_action(cx.listener(|this, _: &Escape, _window, cx| {
+                if this.rename.is_some() {
+                    this.cancel_rename();
+                    cx.notify();
+                } else {
+                    cx.propagate();
+                }
             }))
             .child(self.render_header(cx))
             .child(self.render_root_row(cx))
@@ -2900,5 +3220,452 @@ mod tests {
         tree.expand_or_select_child();
 
         assert_eq!(tree.selected(), Some("a"));
+    }
+
+    // --- rename_target / describe_file_op_error (pure helpers) -------------
+
+    #[test]
+    fn test_rename_target_joins_new_name_under_the_original_parent() {
+        assert_eq!(rename_target("src/main.rs", "lib.rs"), "src/lib.rs");
+    }
+
+    #[test]
+    fn test_rename_target_top_level_path_has_no_parent_prefix() {
+        assert_eq!(rename_target("README.md", "readme.md"), "readme.md");
+    }
+
+    #[test]
+    fn test_describe_file_op_error_is_distinct_per_variant() {
+        let messages = [
+            describe_file_op_error(FileOpError::AlreadyExists),
+            describe_file_op_error(FileOpError::InvalidPath),
+            describe_file_op_error(FileOpError::NotFound),
+            describe_file_op_error(FileOpError::PermissionDenied),
+            describe_file_op_error(FileOpError::Io),
+        ];
+        let unique: HashSet<&str> = messages.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            messages.len(),
+            "every reason reads distinctly"
+        );
+    }
+
+    // --- inline rename editor (artboard State C, `docs/spec-explorer-file-ops.md`, #675) ---
+
+    /// A windowed `FileTree` (mirrors `source_control.rs`'s `open_panel`):
+    /// the rename editor needs a live `Window`/`Context` to construct its
+    /// `InputState` and focus it, unlike the headless model tests above.
+    fn open_tree(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<FileTree>, gpui::WindowHandle<gpui_component::Root>) {
+        let mut tree = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let ft = cx.new(|_cx| FileTree::new());
+                tree = Some(ft.clone());
+                cx.new(|cx| gpui_component::Root::new(ft, window, cx))
+            })
+            .expect("open window")
+        });
+        (tree.expect("tree constructed in window"), window)
+    }
+
+    /// Subscribe a `Vec<FileTreeEvent>` sink to `tree` (mirrors
+    /// `editor.rs`'s `test_apply_references_response_opens_the_results_panel`
+    /// event-sink pattern).
+    fn subscribe_events(
+        tree: &Entity<FileTree>,
+        cx: &mut gpui::TestAppContext,
+    ) -> Rc<RefCell<Vec<FileTreeEvent>>> {
+        let events: Rc<RefCell<Vec<FileTreeEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = events.clone();
+        cx.update(|cx| {
+            cx.subscribe(tree, move |_tree, event: &FileTreeEvent, _cx| {
+                sink.borrow_mut().push(event.clone());
+            })
+            .detach();
+        });
+        events
+    }
+
+    #[gpui::test]
+    fn test_start_rename_with_selection_opens_editor_seeded_to_display_name(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tree, window) = open_tree(cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut().apply_snapshot_chunk(
+                        "/proj".into(),
+                        vec![file("src/main.rs")],
+                        true,
+                    );
+                    tree.selected = Some("src/main.rs".into());
+                    tree.start_rename(window, cx);
+                });
+            })
+            .expect("start rename");
+
+        cx.update(|cx| {
+            let tree = tree.read(cx);
+            let editor = tree.rename.as_ref().expect("rename editor opened");
+            assert_eq!(editor.path, "src/main.rs");
+            assert_eq!(editor.input.read(cx).value().as_ref(), "main.rs");
+            assert!(editor.error.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn test_start_rename_with_no_selection_is_noop(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.start_rename(window, cx);
+                });
+            })
+            .expect("start rename");
+
+        cx.update(|cx| {
+            assert!(tree.read(cx).rename.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn test_commit_rename_emits_rename_requested_and_closes_editor(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        let events = subscribe_events(&tree, cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut().apply_snapshot_chunk(
+                        "/proj".into(),
+                        vec![file("src/main.rs")],
+                        true,
+                    );
+                    tree.selected = Some("src/main.rs".into());
+                    tree.start_rename(window, cx);
+                    tree.rename
+                        .as_ref()
+                        .expect("editor open")
+                        .input
+                        .update(cx, |input, cx| {
+                            input.set_value("lib.rs", window, cx);
+                        });
+                    tree.commit_rename(window, cx);
+                });
+            })
+            .expect("commit rename");
+
+        cx.update(|cx| {
+            assert!(
+                tree.read(cx).rename.is_none(),
+                "the editor closes immediately on commit"
+            );
+        });
+        assert_eq!(
+            events.borrow().as_slice(),
+            [FileTreeEvent::RenameRequested {
+                from: "src/main.rs".into(),
+                to: "src/lib.rs".into(),
+            }]
+        );
+    }
+
+    #[gpui::test]
+    fn test_commit_rename_with_blank_name_sends_nothing(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        let events = subscribe_events(&tree, cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut().apply_snapshot_chunk(
+                        "/proj".into(),
+                        vec![file("src/main.rs")],
+                        true,
+                    );
+                    tree.selected = Some("src/main.rs".into());
+                    tree.start_rename(window, cx);
+                    tree.rename
+                        .as_ref()
+                        .expect("editor open")
+                        .input
+                        .update(cx, |input, cx| {
+                            input.set_value("   ", window, cx);
+                        });
+                    tree.commit_rename(window, cx);
+                });
+            })
+            .expect("commit rename");
+
+        assert!(
+            events.borrow().is_empty(),
+            "a blank name sends no RenamePath"
+        );
+    }
+
+    #[gpui::test]
+    fn test_commit_rename_with_slash_in_name_sends_nothing(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        let events = subscribe_events(&tree, cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut().apply_snapshot_chunk(
+                        "/proj".into(),
+                        vec![file("src/main.rs")],
+                        true,
+                    );
+                    tree.selected = Some("src/main.rs".into());
+                    tree.start_rename(window, cx);
+                    tree.rename
+                        .as_ref()
+                        .expect("editor open")
+                        .input
+                        .update(cx, |input, cx| {
+                            input.set_value("nested/lib.rs", window, cx);
+                        });
+                    tree.commit_rename(window, cx);
+                });
+            })
+            .expect("commit rename");
+
+        assert!(
+            events.borrow().is_empty(),
+            "a typed `/` would silently reparent the file; inline rename never sends it"
+        );
+    }
+
+    #[gpui::test]
+    fn test_commit_rename_with_unchanged_name_sends_nothing(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        let events = subscribe_events(&tree, cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut().apply_snapshot_chunk(
+                        "/proj".into(),
+                        vec![file("src/main.rs")],
+                        true,
+                    );
+                    tree.selected = Some("src/main.rs".into());
+                    tree.start_rename(window, cx);
+                    // Left as the seeded value ("main.rs") — commit with no edit.
+                    tree.commit_rename(window, cx);
+                });
+            })
+            .expect("commit rename");
+
+        assert!(
+            events.borrow().is_empty(),
+            "committing the unchanged name is a no-op send"
+        );
+    }
+
+    #[gpui::test]
+    fn test_cancel_rename_closes_editor_with_no_event(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        let events = subscribe_events(&tree, cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut().apply_snapshot_chunk(
+                        "/proj".into(),
+                        vec![file("src/main.rs")],
+                        true,
+                    );
+                    tree.selected = Some("src/main.rs".into());
+                    tree.start_rename(window, cx);
+                    tree.cancel_rename();
+                    cx.notify();
+                });
+            })
+            .expect("cancel rename");
+
+        cx.update(|cx| {
+            assert!(tree.read(cx).rename.is_none());
+        });
+        assert!(events.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    fn test_apply_file_op_result_ok_rename_arms_pending_reveal(cx: &mut gpui::TestAppContext) {
+        // The editor already closed optimistically on `commit_rename` — by
+        // the time its `FileOpResult` reply arrives, there is nothing left
+        // to close. This mirrors the real flow: `Enter` sends and closes,
+        // the daemon reply comes back later.
+        let (tree, window) = open_tree(cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut().apply_snapshot_chunk(
+                        "/proj".into(),
+                        vec![file("src/main.rs")],
+                        true,
+                    );
+                    tree.selected = Some("src/main.rs".into());
+                    tree.start_rename(window, cx);
+                    tree.rename
+                        .as_ref()
+                        .expect("editor open")
+                        .input
+                        .update(cx, |input, cx| {
+                            input.set_value("lib.rs", window, cx);
+                        });
+                    tree.commit_rename(window, cx);
+                    assert!(tree.rename.is_none(), "closed optimistically on commit");
+
+                    tree.apply_file_op_result(
+                        FileOp::Rename {
+                            from: "src/main.rs".into(),
+                            to: "src/lib.rs".into(),
+                        },
+                        true,
+                        None,
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .expect("apply file op result");
+
+        cx.update(|cx| {
+            let tree = tree.read(cx);
+            assert!(
+                tree.rename.is_none(),
+                "no editor is open once its own successful reply arrives"
+            );
+            assert_eq!(tree.pending_reveal.as_deref(), Some("src/lib.rs"));
+        });
+    }
+
+    #[gpui::test]
+    fn test_apply_file_op_result_already_exists_reopens_editor_with_error(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tree, window) = open_tree(cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut().apply_snapshot_chunk(
+                        "/proj".into(),
+                        vec![file("src/main.rs")],
+                        true,
+                    );
+                    tree.selected = Some("src/main.rs".into());
+                    tree.start_rename(window, cx);
+                    tree.rename
+                        .as_ref()
+                        .expect("editor open")
+                        .input
+                        .update(cx, |input, cx| {
+                            input.set_value("lib.rs", window, cx);
+                        });
+                    tree.commit_rename(window, cx);
+                    assert!(tree.rename.is_none(), "closed optimistically on commit");
+                    tree.apply_file_op_result(
+                        FileOp::Rename {
+                            from: "src/main.rs".into(),
+                            to: "src/lib.rs".into(),
+                        },
+                        false,
+                        Some(FileOpError::AlreadyExists),
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .expect("apply file op result");
+
+        cx.update(|cx| {
+            let tree = tree.read(cx);
+            let editor = tree
+                .rename
+                .as_ref()
+                .expect("an AlreadyExists reply re-opens the editor");
+            assert_eq!(
+                editor.path, "src/main.rs",
+                "targets the original, unmoved file"
+            );
+            assert_eq!(
+                editor.input.read(cx).value().as_ref(),
+                "lib.rs",
+                "the just-typed name is preserved, not the original"
+            );
+            assert!(editor.error.is_some(), "the error is shown inline");
+        });
+    }
+
+    #[gpui::test]
+    fn test_apply_file_op_result_not_found_does_not_reopen_the_editor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tree, window) = open_tree(cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.apply_file_op_result(
+                        FileOp::Rename {
+                            from: "src/main.rs".into(),
+                            to: "src/lib.rs".into(),
+                        },
+                        false,
+                        Some(FileOpError::NotFound),
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .expect("apply file op result");
+
+        cx.update(|cx| {
+            assert!(
+                tree.read(cx).rename.is_none(),
+                "only AlreadyExists/InvalidPath re-open the editor"
+            );
+        });
+    }
+
+    // --- pending-reveal (`docs/spec-explorer-file-ops.md`, #675) -----------
+
+    #[test]
+    fn test_apply_pending_reveal_selects_and_reveals_the_matching_path() {
+        let mut tree = seed(vec![dir("src"), file("src/lib.rs")]);
+        tree.pending_reveal = Some("src/lib.rs".into());
+
+        tree.apply_pending_reveal(&["src/lib.rs".to_owned()]);
+
+        assert_eq!(tree.selected(), Some("src/lib.rs"));
+        assert!(
+            tree.pending_reveal.is_none(),
+            "the marker clears once the row is revealed"
+        );
+    }
+
+    #[test]
+    fn test_apply_pending_reveal_ignores_unrelated_added_paths() {
+        let mut tree = seed(vec![file("a.rs"), file("b.rs")]);
+        tree.pending_reveal = Some("b.rs".into());
+
+        tree.apply_pending_reveal(&["a.rs".to_owned()]);
+
+        assert_eq!(tree.selected(), None);
+        assert_eq!(
+            tree.pending_reveal.as_deref(),
+            Some("b.rs"),
+            "still armed — the pending path hasn't arrived yet"
+        );
+    }
+
+    #[test]
+    fn test_apply_pending_reveal_with_nothing_pending_is_a_noop() {
+        let mut tree = seed(vec![file("a.rs")]);
+
+        tree.apply_pending_reveal(&["a.rs".to_owned()]);
+
+        assert_eq!(tree.selected(), None);
     }
 }

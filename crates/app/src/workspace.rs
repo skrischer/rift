@@ -245,6 +245,17 @@ pub struct WorkspaceChannels {
     /// echoed into state, the resulting git change arrives on the push
     /// recompute (`docs/spec-source-control-write.md`).
     pub git_op_tx: Sender<ClientMessage>,
+    /// File ops the file tree emits — `CreateFile`, `CreateDir`,
+    /// `RenamePath`, `DeletePath` (`docs/spec-explorer-file-ops.md`, #675).
+    /// The tokio side forwards each onto the protocol verbatim, bridged
+    /// exactly like `git_op_tx`.
+    pub file_op_tx: Sender<ClientMessage>,
+    /// `FileOpResult` replies routed to the file tree for UX transitions only
+    /// (`docs/spec-explorer-file-ops.md`): unlike the git-write channel, this
+    /// reply IS routed back — the tree never mutates `WorktreeModel` from it
+    /// (the push-only `UpdateWorktree` is the single writer), but it does
+    /// close the rename editor on success or re-open it with an error.
+    pub file_op_result_rx: Receiver<DaemonMessage>,
     /// Fires once whenever the tokio side selected the daemon terminal but no
     /// daemon came up (#619, `docs/spec-v1-hardening.md`): the session still
     /// runs over the legacy tmux path, but every daemon-backed IDE feature is
@@ -367,6 +378,8 @@ impl WorkspaceView {
             nav_tx,
             request_diff_tx,
             git_op_tx,
+            file_op_tx,
+            file_op_result_rx,
             daemon_unavailable_rx,
         } = channels;
 
@@ -395,29 +408,43 @@ impl WorkspaceView {
         // (`docs/spec-explorer-context-menu.md`) routes to the existing
         // `SessionView` this view already owns — a new public method enqueues
         // a structural `new-window -c <dir>` on the shipped tmux command
-        // channel; no new protocol message.
-        cx.subscribe_in(
-            &file_tree,
-            window,
-            |this, _tree, event: &FileTreeEvent, window, cx| match event {
-                FileTreeEvent::OpenFile { path } => {
-                    this.editor.update(cx, |editor, cx| {
-                        editor.begin_open(path.clone(), false, window, cx);
-                    });
-                    if let Err(e) = this.open_file_tx.try_send(path.clone()) {
-                        debug!(error = %e, %path, "failed to enqueue open-file request");
+        // channel; no new protocol message. `RenameRequested`
+        // (`docs/spec-explorer-file-ops.md`, #675) is the tree's inline-rename
+        // commit: turned into a `ClientMessage::RenamePath` on `file_op_tx` —
+        // the tree itself holds no protocol channel.
+        {
+            let file_op_tx = file_op_tx.clone();
+            cx.subscribe_in(
+                &file_tree,
+                window,
+                move |this, _tree, event: &FileTreeEvent, window, cx| match event {
+                    FileTreeEvent::OpenFile { path } => {
+                        this.editor.update(cx, |editor, cx| {
+                            editor.begin_open(path.clone(), false, window, cx);
+                        });
+                        if let Err(e) = this.open_file_tx.try_send(path.clone()) {
+                            debug!(error = %e, %path, "failed to enqueue open-file request");
+                        }
                     }
-                }
-                FileTreeEvent::RevealActiveRequested => {
-                    this.reveal_open_file_in_tree(cx);
-                }
-                FileTreeEvent::RevealInTerminalRequested { dir } => {
-                    this.session_view
-                        .update(cx, |session, _cx| session.open_terminal_at(dir));
-                }
-            },
-        )
-        .detach();
+                    FileTreeEvent::RevealActiveRequested => {
+                        this.reveal_open_file_in_tree(cx);
+                    }
+                    FileTreeEvent::RevealInTerminalRequested { dir } => {
+                        this.session_view
+                            .update(cx, |session, _cx| session.open_terminal_at(dir));
+                    }
+                    FileTreeEvent::RenameRequested { from, to } => {
+                        if let Err(e) = file_op_tx.try_send(ClientMessage::RenamePath {
+                            from: from.clone(),
+                            to: to.clone(),
+                        }) {
+                            debug!(error = %e, %from, %to, "failed to enqueue rename");
+                        }
+                    }
+                },
+            )
+            .detach();
+        }
 
         // Worktree structure stream -> file-tree model. Each message folds into
         // the model, then a notify repaints the tree. Routed through this view's
@@ -652,6 +679,34 @@ impl WorkspaceView {
                     };
                     view.diff_view.update(cx, |diff_view, cx| {
                         diff_view.apply_file_diff(path, diff, cx);
+                    });
+                });
+                if result.is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
+
+        // File-op reply stream -> file tree, UX transitions only
+        // (`docs/spec-explorer-file-ops.md`, #675): `FileOpResult` routes to
+        // `FileTree::apply_file_op_result`, which never mutates
+        // `WorktreeModel` — the tree structure change (if any) arrives
+        // separately, through the worktree-structure bridge above, as the
+        // ordinary push-only `UpdateWorktree`. Routed through this view's
+        // weak handle so a closed window ends the loop gracefully, mirroring
+        // the diff reply bridge above.
+        {
+            cx.spawn_in(window, async move |this, cx| loop {
+                let Ok(msg) = file_op_result_rx.recv_async().await else {
+                    break;
+                };
+                let result = this.update_in(cx, |view, window, cx| {
+                    let DaemonMessage::FileOpResult { op, ok, error } = msg else {
+                        return;
+                    };
+                    view.file_tree.update(cx, |tree, cx| {
+                        tree.apply_file_op_result(op, ok, error, window, cx);
                     });
                 });
                 if result.is_err() {
@@ -1348,26 +1403,36 @@ fn duration_to_next_minute() -> Duration {
 
 /// Fold one worktree-family daemon message into the file tree's model. Only the
 /// structure-path messages are routed here; any other variant is ignored (the
-/// tokio side forwards only this family on `worktree_rx`).
+/// tokio side forwards only this family on `worktree_rx`). An `UpdateWorktree`
+/// fold also drives the pending-reveal follow-up
+/// (`docs/spec-explorer-file-ops.md`, #675): a successful create/rename arms
+/// `FileTree::pending_reveal` with the new path, and this is where that path
+/// actually turns into a select + reveal, once the push-only recompute has
+/// added the row to `model` — never before, and never mutating the model a
+/// second time to do it.
 fn apply_worktree_message(tree: &mut FileTree, msg: DaemonMessage) {
     let model = tree.model_mut();
-    match msg {
+    let added_paths = match msg {
         DaemonMessage::WorktreeSnapshot {
             root,
             entries,
             final_chunk,
         } => {
             model.apply_snapshot_chunk(root, entries, final_chunk);
+            None
         }
         DaemonMessage::UpdateWorktree {
             added,
             changed,
             removed,
         } => {
+            let added_paths: Vec<String> = added.iter().map(|entry| entry.path.clone()).collect();
             model.apply_update(added, changed, removed);
+            Some(added_paths)
         }
         DaemonMessage::UpdateGitStatus { changed, cleared } => {
             model.apply_git_update(changed, cleared);
+            None
         }
         DaemonMessage::RepoState {
             branch,
@@ -1376,6 +1441,7 @@ fn apply_worktree_message(tree: &mut FileTree, msg: DaemonMessage) {
             lines_removed,
         } => {
             model.apply_repo_state(branch, ahead_behind, lines_added, lines_removed);
+            None
         }
         DaemonMessage::Diagnostics {
             path,
@@ -1383,8 +1449,12 @@ fn apply_worktree_message(tree: &mut FileTree, msg: DaemonMessage) {
             items,
         } => {
             model.apply_diagnostics(path, server, items);
+            None
         }
-        _ => {}
+        _ => None,
+    };
+    if let Some(added_paths) = added_paths {
+        tree.apply_pending_reveal(&added_paths);
     }
 }
 
@@ -1684,6 +1754,8 @@ mod tests {
         let (nav_tx, _nav_request_rx) = flume::unbounded();
         let (request_diff_tx, _request_diff_rx) = flume::unbounded();
         let (git_op_tx, _git_op_rx) = flume::unbounded();
+        let (file_op_tx, _file_op_rx) = flume::unbounded();
+        let (_file_op_result_tx, file_op_result_rx) = flume::unbounded();
         let (_daemon_unavailable_tx, daemon_unavailable_rx) = flume::unbounded();
         WorkspaceChannels {
             worktree_rx,
@@ -1697,6 +1769,8 @@ mod tests {
             nav_tx,
             request_diff_tx,
             git_op_tx,
+            file_op_tx,
+            file_op_result_rx,
             daemon_unavailable_rx,
         }
     }
