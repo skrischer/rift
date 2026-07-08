@@ -15,9 +15,10 @@ all client-side (no protocol or daemon change).
       without a click-to-open step, and one click jumps the cockpit into any of
       them (the existing switch = re-`Attach` path); the list stays live on
       create / kill / rename (the phase-19 `SessionListReply` churn push).
-- [ ] A session can be renamed in-UI (inline edit → `rename-session`); the list,
-      the session indicator, and the terminal all reflect the new name with no
-      manual refresh (the `%session-renamed` path since #429/#448 already does).
+- [ ] A session can be renamed in-UI (inline edit → `rename-session`); the list
+      updates immediately, and when it is the attached session the indicator and
+      terminal reflect the new name too (the `%session-renamed` path since
+      #429/#448), with no manual refresh.
 - [ ] Sessions can be reordered and the order persists across restarts (a local
       per-channel order store, the recents/window-state pattern); the order
       applies to the glanceable surface, never mutating the server list.
@@ -36,8 +37,9 @@ all client-side (no protocol or daemon change).
 - `terminal`: extend `SessionListItem` (crates/terminal/src/lib.rs:78-85) with the
   tmux session `id` (`$<n>`), which the app currently drops when mapping
   `SessionEntry` → `SessionListItem` (crates/app/src/main.rs:1988-1992). The id is
-  the rename-stable target for rename/kill and the stable in-session key for
-  reorder; `SessionEntry.id` already exists (crates/protocol/src/lib.rs:651-658),
+  the rename-stable target for rename / kill (reorder persistence keys by session
+  name, not id — see Prior decisions; the id is at most the transient row identity
+  during a drag); `SessionEntry.id` already exists (crates/protocol/src/lib.rs:651-658),
   so this is a client-model change only, no protocol change.
 - `terminal`: rename and kill ride the existing generic `ClientMessage::TmuxCommand`
   seam (crates/daemon/src/terminal.rs:344-346 executes it fire-and-forget) — the
@@ -61,7 +63,9 @@ all client-side (no protocol or daemon change).
   restarts, which re-mint ids). Applied as a sort over the server `sessions` list
   at render time, never written into `SessionView.sessions` (replace-semantics
   from the churn push). Unknown / new sessions fall to the tmux default order
-  (name) after the stored ones.
+  (name) after the stored ones. A client-initiated rename updates the order-store
+  key (old → new name) in the SAME action, preserving that session's slot; only an
+  external CLI rename re-slots it (self-healing: unknown names sort last).
 
 ### Out of scope
 
@@ -113,10 +117,9 @@ all client-side (no protocol or daemon change).
 |---|---|---|
 | Rename / kill ride the existing generic `ClientMessage::TmuxCommand`; NO new protocol message, no `PROTOCOL_VERSION` bump | The daemon already executes client-sent raw tmux commands fire-and-forget (terminal.rs:344), which is how pane-header split/zoom/select-pane work; rename/kill need no reply (the `%sessions-changed`/`%session-renamed` churn already re-queries and pushes `SessionListReply`). The codebase's own pattern reserves typed correlated messages (QuerySessionList) for reply-bearing queries only. This supersedes the roadmap's pre-planning "protocol gains rename/kill messages" estimate | 2026-07-08 |
 | Target rename/kill by tmux session id (`$<n>`), not name; add `id` to `SessionListItem` | `SessionEntry.id` is rename-stable (protocol lib.rs:651); a name-targeted command races a concurrent rename. The app drops the id today (main.rs:1988) — restoring it is a client-model change, not a protocol one | 2026-07-08 |
-| Reorder = client-side per-channel order store (a `recents.rs` clone), keyed by session NAME, applied as a render-time sort over the server list | tmux has no session order; the recents/window-state local-store pattern is the established precedent (recents.rs:1-6); name-keying survives a daemon restart that re-mints ids (a rename re-slots, an accepted rare cost). The store must not mutate `SessionView.sessions` — that is replaced wholesale by the churn push (session_view.rs:822) | 2026-07-08 |
+| Reorder = drag-to-order (a total user-set order), over a client-side per-channel order store (a `recents.rs` clone) keyed by session NAME, applied as a render-time sort over the server list | tmux has no session order; "reorder" means an explicit user-set order, so a total-order store (not a pin/favorite subset flag) is the honest model; the recents/window-state local-store pattern is the precedent (recents.rs:1-6). Name-keying survives a daemon restart that re-mints ids; a client-initiated rename renames the key too (slot preserved), only an external CLI rename re-slots. The store never mutates `SessionView.sessions` — replaced wholesale by the churn push (session_view.rs:822) | 2026-07-08 |
 | Kill is guarded by an inline confirm affordance | Phase 19 excluded kill-from-picker as "destructive; not in v1 UI"; adding it needs a mitigation so a stray click cannot nuke a session. Killing the attached session reuses the existing `TerminalExit` path — no new teardown | 2026-07-08 |
-| Glanceable surface placement (replace vs complement the phase-21 title-bar popover) | OPEN — resolved at the spec-acceptance gate | 2026-07-08 |
-| Reorder interaction (drag-to-order vs pin/favorite) | OPEN — resolved at the spec-acceptance gate | 2026-07-08 |
+| Glanceable surface — every session visible without a click-to-open step (Outcome); whether the click-popover is REMOVED or retained alongside, and the surface's home in the cockpit chrome | OPEN — resolved at the spec-acceptance gate | 2026-07-08 |
 
 ## Prior art
 
@@ -143,15 +146,18 @@ secrets, accounts, or external provisioning.
 
 - [ ] `cargo clippy --workspace -- -D warnings` passes
 - [ ] `cargo test --workspace` passes
-- [ ] Unit tests: the tmux-quoting helper (name with spaces / `"` / `;` / unicode
-      round-trips to a single safe `rename-session` argument); the session-order
-      store (tolerant load of missing/corrupt file; atomic save; render-time sort
-      places stored sessions first in order, unknown ones after by name)
+- [ ] Unit tests: the tmux-quoting helper (a name with spaces / `"` / `'` / `;` /
+      leading `-` / `$` / `#` / unicode round-trips to a single safe
+      `rename-session` argument after `--`); the session-order store (tolerant load
+      of missing/corrupt file; atomic save; render-time sort places stored sessions
+      first in order, unknown ones after by name; a client rename renames the key,
+      preserving the slot)
 - [ ] Behavioral (dev channel): every host session is visible without a
       click-to-open step; clicking one jumps the cockpit and the indicator to it
 - [ ] Rename a session in-UI → the list, indicator, and terminal show the new name
       with no manual refresh; a name with a space survives (quoting)
-- [ ] Reorder sessions → the order holds; relaunch the app → the order persists
+- [ ] Reorder sessions (drag) → the order holds; relaunch the app → the order
+      persists; rename a reordered session in-UI → it keeps its slot
 - [ ] Kill a non-attached session (confirm) → it drops from the list live; kill the
       attached session → the existing `TerminalExit` path fires (no freeze)
 - [ ] "+ New session…" creates and attaches a fresh named session
@@ -162,7 +168,8 @@ secrets, accounts, or external provisioning.
 | Risk | Mitigation |
 |---|---|
 | A raw `rename-session` string with an unescaped name breaks the control command or injects a second command | The client assembles the command through a tmux-quoting helper unit-tested with spaces / quotes / `;`; the name is passed after `--` |
-| Reorder store keyed by name goes stale when a session is renamed | Accepted: rename is a rare explicit action; the renamed session re-slots to the default position and can be re-ordered; the store self-heals (unknown names sort last by name) |
+| Reorder store keyed by name goes stale when a session is renamed EXTERNALLY (tmux CLI) | A client-initiated rename renames the store key too (slot preserved); only an external rename re-slots, self-healing (unknown names sort last by name) — accepted for a rare action |
+| Fire-and-forget rename/kill fails silently (duplicate/invalid name, blocked kill) — `TmuxCommand` surfaces no error/ack | Accepted for a personal tool: the inline edit snaps back with no feedback. A typed correlated `RenameSession`/`KillSession` (daemon-assembled, reply-bearing) is the upgrade path IF error feedback ever matters — not warranted now; this is the one real argument for a typed message |
 | Kill fired on the wrong row | Inline confirm affordance (two-step); the id-targeted command cannot hit a renamed-away session |
 | The churn push replaces `sessions` mid-interaction (e.g. during a drag) and drops the local order | Order is a render-time sort over the server list, not stored in `sessions`; a replace re-applies the same sort — the drag operates on the derived view and commits to the order store, not the model |
 | A killed attached session leaves the client frozen | Reuses the existing `TerminalExit` path (protocol lib.rs:365) that pane/window exit already drives; no new teardown |
