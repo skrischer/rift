@@ -45,15 +45,18 @@ gpui_platform.workspace = true
 # and falls back to plain text for an unknown extension.
 gpui-component = { workspace = true, features = ["tree-sitter-languages"] }
 # Icon SVGs backing gpui-component's `IconName` (activity rail, window controls).
-# Part of the product build so the shipping `rift` binary registers them via
-# `with_assets(Assets)` in `main.rs`. Already in the graph via gpui-component, so
-# this direct edge adds no new crate to Cargo.lock.
+# Part of the product build; the shipping `rift` binary registers them via the
+# delegating `RiftAssets` source (`with_assets(RiftAssets)` in `main.rs`, #668).
+# Already in the graph via gpui-component, so this direct edge adds no new
+# crate to Cargo.lock.
 gpui-component-assets = { workspace = true }
-# Not used in code; declared only to enable rust-embed's `debug-embed` feature so
-# gpui-component-assets embeds its icon SVGs in debug builds. Without it rust-embed
-# reads icons from the compile-time path at runtime, which the cross-compiled
-# Windows debug exe cannot find (icons render blank). Already in the graph via
-# gpui-component-assets, so this adds no new crate to Cargo.lock.
+# Embeds `RiftAssets`' own vendored file-type SVGs (`crates/app/assets/file_icons/`,
+# #668) via the `RiftFileIcons` derive in `main.rs`, and enables `debug-embed` so
+# gpui-component-assets also embeds its icon SVGs in debug builds. Without
+# `debug-embed`, rust-embed reads icons from the compile-time path at runtime,
+# which the cross-compiled Windows debug exe cannot find (icons render blank).
+# Already in the graph via gpui-component-assets, so this direct edge adds no
+# new crate to Cargo.lock.
 rust-embed = { version = "8", features = ["debug-embed"] }
 tokio.workspace = true
 flume.workspace = true
