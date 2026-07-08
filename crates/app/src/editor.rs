@@ -1102,16 +1102,6 @@ impl EditorView {
         self.active_tab().is_some_and(|t| t.dirty)
     }
 
-    /// Whether any open tab has unsaved edits — the window-close guard's
-    /// aggregate signal (`docs/spec-v1-hardening.md`), distinct from
-    /// [`is_dirty`], which only reflects the active tab. A workspace with no
-    /// open tabs is clean, so it closes without a prompt.
-    ///
-    /// [`is_dirty`]: Self::is_dirty
-    pub fn any_dirty(&self) -> bool {
-        any_tab_dirty(self.tabs.iter().map(|t| t.dirty))
-    }
-
     /// The number of open tabs with unsaved edits, for the aggregated
     /// window-close confirm dialog's message (`docs/spec-v1-hardening.md`).
     pub fn dirty_tab_count(&self) -> usize {
@@ -3144,16 +3134,6 @@ fn close_needs_confirm(dirty: bool) -> bool {
     dirty
 }
 
-/// Whether any tab in the open set carries unsaved edits — the aggregate the
-/// window-close guard checks before letting the app quit
-/// (`docs/spec-v1-hardening.md`). Pure and GPUI-free, mirroring
-/// [`close_needs_confirm`]'s per-tab decision at workspace scope;
-/// [`EditorView::any_dirty`] applies it over the live tab set. An empty set is
-/// clean, so a workspace with no open tabs closes without a prompt.
-fn any_tab_dirty(dirty_flags: impl IntoIterator<Item = bool>) -> bool {
-    dirty_flags.into_iter().any(|dirty| dirty)
-}
-
 /// Decide the new active index after closing the tab at `closed`, given the
 /// previously active index and the tab count *before* removal. Pure and
 /// GPUI-free — the close-half of the tab-bar contract (`docs/spec-editor-tabs.md`,
@@ -3941,26 +3921,6 @@ mod tests {
     #[test]
     fn test_close_needs_confirm_is_false_for_a_clean_tab() {
         assert!(!close_needs_confirm(false));
-    }
-
-    // --- window-close guard: aggregate dirty across all tabs (spec-v1-hardening) ---
-
-    #[test]
-    fn test_any_tab_dirty_is_true_when_one_of_many_is_dirty() {
-        // The window-close guard blocks a silent quit if any single tab is
-        // dirty, even when every other tab is clean.
-        assert!(any_tab_dirty([false, true, false]));
-    }
-
-    #[test]
-    fn test_any_tab_dirty_is_false_when_all_tabs_are_clean() {
-        assert!(!any_tab_dirty([false, false, false]));
-    }
-
-    #[test]
-    fn test_any_tab_dirty_is_false_for_an_empty_tab_set() {
-        // A workspace with no open tabs is clean and closes without a prompt.
-        assert!(!any_tab_dirty(std::iter::empty()));
     }
 
     // --- minimap marks strip (docs/spec-editor-chrome.md) ---
