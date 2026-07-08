@@ -961,6 +961,11 @@ impl SessionView {
                 // Each pane's own shell flag (not just the window's active pane)
                 // feeds its header type glyph; absent from the map -> non-shell.
                 let pane_shell = pane_is_shell.get(&pane_state.id).copied().unwrap_or(false);
+                // The uncollapsed flag (kept as `Option`) is the authoritative
+                // busy/free signal fed to the pane's activity tracker: `None` on
+                // the legacy path must not read as `false` (busy)
+                // (`docs/spec-pane-activity-v2.md`).
+                let foreground_shell = pane_is_shell.get(&pane_state.id).copied();
                 if self.panes.contains_key(&pane_state.id) {
                     if let Some(entry) = self.panes.get_mut(&pane_state.id) {
                         entry.is_shell = pane_shell;
@@ -974,6 +979,11 @@ impl SessionView {
                             // Alt+1..9, and tmux-side selects clear it uniformly
                             // (`docs/spec-pane-activity-indicators.md`).
                             pv.set_window_active(is_active_window);
+                            // The tmux foreground-process flag (#510) drives the
+                            // pane's busy/free indicator, pushed on every snapshot
+                            // so a process start/exit flips it promptly
+                            // (`docs/spec-pane-activity-v2.md`).
+                            pv.set_foreground_shell(foreground_shell);
                             // CWD is subscription-driven (rift_pane_path); the
                             // snapshot seeds it only at pane creation below.
                             cx.notify();
@@ -1013,6 +1023,7 @@ impl SessionView {
                             pv.set_current_command(pane_state.current_command.clone());
                         }
                         pv.set_window_active(is_active_window);
+                        pv.set_foreground_shell(foreground_shell);
                         pv
                     });
 
