@@ -390,7 +390,12 @@ impl WorkspaceView {
         // Selecting a file touches nothing but this — no tmux pane/window state.
         // The header/root-row `RevealActiveRequested` action (#604) re-triggers
         // the existing reveal path via the already-present
-        // `reveal_open_file_in_tree` — no new protocol, no new coupling.
+        // `reveal_open_file_in_tree` — no new protocol, no new coupling. The
+        // row context menu's `RevealInTerminalRequested`
+        // (`docs/spec-explorer-context-menu.md`) routes to the existing
+        // `SessionView` this view already owns — a new public method enqueues
+        // a structural `new-window -c <dir>` on the shipped tmux command
+        // channel; no new protocol message.
         cx.subscribe_in(
             &file_tree,
             window,
@@ -405,6 +410,10 @@ impl WorkspaceView {
                 }
                 FileTreeEvent::RevealActiveRequested => {
                     this.reveal_open_file_in_tree(cx);
+                }
+                FileTreeEvent::RevealInTerminalRequested { dir } => {
+                    this.session_view
+                        .update(cx, |session, _cx| session.open_terminal_at(dir));
                 }
             },
         )

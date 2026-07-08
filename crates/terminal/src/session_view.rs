@@ -208,6 +208,17 @@ fn select_pane_command(pane: &str) -> String {
     format!("select-pane -t {}", pane)
 }
 
+/// tmux `new-window -c <dir>` command opening a fresh window rooted at `dir`
+/// — the explorer's "Reveal in terminal" context-menu action
+/// (`docs/spec-explorer-context-menu.md`). `dir` is quoted with
+/// [`quote_tmux_name`] so a path containing spaces or metacharacters still
+/// parses as a single argument. Structural only: it never `send-keys` into an
+/// existing pane and never inspects a pane's process, so it stays
+/// agent-agnostic and injection-free.
+fn new_window_at_command(dir: &str) -> String {
+    format!("new-window -c {}", quote_tmux_name(dir))
+}
+
 /// tmux `resize-pane -Z` command toggling the given pane's zoom (full-window)
 /// state — the pane header's zoom control.
 fn zoom_pane_command(pane: &str) -> String {
@@ -1160,6 +1171,19 @@ impl SessionView {
             debug!(error = %e, "failed to send window switch command");
         }
         self.acknowledge_window_attention(window_id, cx);
+    }
+
+    /// Open a fresh tmux window rooted at `dir` through the existing tmux
+    /// command channel (`new-window -c <dir>`) — the explorer row context
+    /// menu's "Reveal in terminal" action (`docs/spec-explorer-context-menu.md`),
+    /// routed here by `workspace.rs`. Structural only, mirroring the shipped
+    /// pane-header split / new-window controls: it never `send-keys` into an
+    /// existing pane and never reads a pane's process, so it neither disturbs
+    /// a running agent nor detects one.
+    pub fn open_terminal_at(&self, dir: &str) {
+        if let Err(e) = self.tmux_command_tx.try_send(new_window_at_command(dir)) {
+            debug!(error = %e, %dir, "failed to send reveal-in-terminal command");
+        }
     }
 
     /// Request a manual key-table refresh (the escape hatch the
@@ -2230,11 +2254,11 @@ impl Render for SessionView {
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_activity, grid_size_for, home_relative, max_vertical_pane_count, quote_tmux_name,
-        reconnect_banner_message, resize_direction, select_pane_command, split_command,
-        tab_state_slot, zoom_pane_command, PaneActivity, SessionListItem, SessionSnapshot,
-        SessionView, TabStateSlot, TermSize, TerminalHandle, DEFAULT_FONT_SIZE, MAX_FONT_SIZE,
-        MIN_FONT_SIZE,
+        aggregate_activity, grid_size_for, home_relative, max_vertical_pane_count,
+        new_window_at_command, quote_tmux_name, reconnect_banner_message, resize_direction,
+        select_pane_command, split_command, tab_state_slot, zoom_pane_command, PaneActivity,
+        SessionListItem, SessionSnapshot, SessionView, TabStateSlot, TermSize, TerminalHandle,
+        DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE,
     };
     use crate::layout::LayoutNode;
     use gpui::{
@@ -2420,6 +2444,22 @@ mod tests {
     #[test]
     fn test_zoom_pane_command_targets_pane() {
         assert_eq!(zoom_pane_command("%7"), "resize-pane -Z -t %7");
+    }
+
+    #[test]
+    fn test_new_window_at_command_targets_plain_dir() {
+        assert_eq!(
+            new_window_at_command("/proj/src"),
+            "new-window -c '/proj/src'"
+        );
+    }
+
+    #[test]
+    fn test_new_window_at_command_quotes_dir_with_spaces() {
+        assert_eq!(
+            new_window_at_command("/proj/my docs"),
+            "new-window -c '/proj/my docs'"
+        );
     }
 
     #[test]

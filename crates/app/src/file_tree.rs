@@ -186,6 +186,15 @@ pub struct CopyAbsolutePath;
 #[action(namespace = rift, no_json)]
 pub struct CopyRelativePath;
 
+/// Open a fresh tmux window rooted at the selected row's directory (a file's
+/// parent, a directory itself), emitting
+/// [`FileTreeEvent::RevealInTerminalRequested`]
+/// (`docs/spec-explorer-context-menu.md`). Dispatched by the row context
+/// menu's "Reveal in terminal" item; pointer-only, not bound to a key.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct RevealInTerminal;
+
 /// Collapse every directory (reuses [`FileTree::collapse_all`]). Dispatched
 /// by the row context menu's "Collapse all" item; pointer-only, not bound to
 /// a key.
@@ -218,6 +227,14 @@ pub enum FileTreeEvent {
     /// the panel just re-triggers the reveal path the editor-load flow
     /// already drives.
     RevealActiveRequested,
+    /// The row context menu's "Reveal in terminal" action fired
+    /// (`docs/spec-explorer-context-menu.md`). `dir` is the target's absolute
+    /// directory (a file's parent, a directory itself). `workspace.rs`'s
+    /// existing `file_tree` subscription routes this to
+    /// `SessionView::open_terminal_at`, which enqueues a structural
+    /// `new-window -c <dir>` on the existing tmux command channel — no
+    /// send-keys into a running pane, no new protocol message.
+    RevealInTerminalRequested { dir: String },
 }
 
 /// Which placeholder the panel shows instead of the tree
@@ -461,6 +478,23 @@ fn absolute_path(root: &str, rel: &str) -> String {
         format!("{root}{rel}")
     } else {
         format!("{root}/{rel}")
+    }
+}
+
+/// The absolute directory the "Reveal in terminal" context-menu action opens
+/// a new tmux window at: a directory's own absolute path, or a file's parent
+/// directory (the root itself for a top-level file). Pure string math on the
+/// row's own root-relative `path` — a file's parent is the substring before
+/// its last `/`, empty at a top-level row — joined with `root` via
+/// [`absolute_path`]; independent of tree expansion state, so it needs no
+/// visible-row lookup.
+fn reveal_in_terminal_dir(root: &str, kind: &EntryKind, path: &str) -> String {
+    match kind {
+        EntryKind::Dir => absolute_path(root, path),
+        EntryKind::File => match path.rsplit_once('/') {
+            Some((parent, _)) => absolute_path(root, parent),
+            None => root.to_string(),
+        },
     }
 }
 
@@ -1238,10 +1272,9 @@ impl FileTree {
         // `editor.rs` already ships its right-click menu with. Label-only (no
         // `IconName`: the product binary does not embed `gpui-component`'s
         // icon assets, see the module doc). Lists exactly the client-capable
-        // top group, in artboard order, leaving a gap where "Reveal in
-        // terminal" docks in the next issue; the write-actions group is a
-        // later phase (daemon write path does not exist yet). "Open" reuses
-        // the shipped `OpenSelected` action rather than a new one, so it also
+        // top group, in artboard order; the write-actions group is a later
+        // phase (daemon write path does not exist yet). "Open" reuses the
+        // shipped `OpenSelected` action rather than a new one, so it also
         // keeps that action's existing `Enter` binding hint.
         root.on_click(cx.listener(move |this, _event, _window, cx| {
             if is_dir {
@@ -1261,6 +1294,7 @@ impl FileTree {
                 .menu("Reveal in tree", Box::new(RevealInTree))
                 .menu("Copy path", Box::new(CopyAbsolutePath))
                 .menu("Copy relative path", Box::new(CopyRelativePath))
+                .menu("Reveal in terminal", Box::new(RevealInTerminal))
                 .menu("Collapse all", Box::new(CollapseAll))
         })
     }
@@ -1436,6 +1470,16 @@ impl Render for FileTree {
             .on_action(cx.listener(|this, _: &CopyRelativePath, _window, cx| {
                 if let Some(selected) = this.selected.clone() {
                     cx.write_to_clipboard(ClipboardItem::new_string(selected));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &RevealInTerminal, _window, cx| {
+                if let (Some(root), Some(selected)) =
+                    (this.model.root().map(str::to_owned), this.selected.clone())
+                {
+                    if let Some(entry) = this.model.get(&selected) {
+                        let dir = reveal_in_terminal_dir(&root, &entry.kind, &selected);
+                        cx.emit(FileTreeEvent::RevealInTerminalRequested { dir });
+                    }
                 }
             }))
             .on_action(cx.listener(|this, _: &CollapseAll, _window, cx| {
@@ -2476,6 +2520,38 @@ mod tests {
     #[test]
     fn test_absolute_path_with_a_trailing_slash_root_does_not_double_the_slash() {
         assert_eq!(absolute_path("/proj/", "src/main.rs"), "/proj/src/main.rs");
+    }
+
+    // --- reveal_in_terminal_dir (context-menu "Reveal in terminal", #672) ---
+
+    #[test]
+    fn test_reveal_in_terminal_dir_of_a_directory_is_itself() {
+        assert_eq!(
+            reveal_in_terminal_dir("/proj", &EntryKind::Dir, "src"),
+            "/proj/src"
+        );
+    }
+
+    #[test]
+    fn test_reveal_in_terminal_dir_of_a_nested_file_is_its_parent() {
+        assert_eq!(
+            reveal_in_terminal_dir("/proj", &EntryKind::File, "src/main.rs"),
+            "/proj/src"
+        );
+    }
+
+    #[test]
+    fn test_reveal_in_terminal_dir_of_a_top_level_file_is_the_root() {
+        assert_eq!(
+            reveal_in_terminal_dir("/proj", &EntryKind::File, "top.rs"),
+            "/proj"
+        );
+    }
+
+    #[test]
+    fn test_reveal_in_terminal_dir_with_filesystem_root_does_not_double_the_slash() {
+        assert_eq!(reveal_in_terminal_dir("/", &EntryKind::File, "top.rs"), "/");
+        assert_eq!(reveal_in_terminal_dir("/", &EntryKind::Dir, "src"), "/src");
     }
 
     #[test]
