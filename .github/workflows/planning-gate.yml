@@ -51,7 +51,25 @@ jobs:
               return;
             }
 
-            const specPattern = /docs\/spec-[A-Za-z0-9._-]+\.md/;
+            // Resolve an issue's referenced spec robustly. First-match-only was wrong:
+            // an issue body may cite an OLD spec path (e.g. as a grep-and-replace note)
+            // BEFORE its real "Spec:" trailer. Once that old spec is archived to
+            // docs/archive/, an existence check on the first match fails and falsely
+            // blocks a PR whose issue *does* point at a valid spec. Fix: prefer an
+            // explicit "Spec:" trailer, then consider every docs/spec-*.md mentioned,
+            // and accept the first that resolves to a real file under docs/ or
+            // docs/archive/ — the gate's intent is "closes an issue referencing an
+            // existing spec", not "the issue's first spec-shaped string exists verbatim".
+            const specPattern = /docs\/spec-[A-Za-z0-9._-]+\.md/g;
+            const specTrailer = /^\s*Spec:\s*(docs\/spec-[A-Za-z0-9._-]+\.md)/mi;
+            // A referenced path resolves to whichever of the live or archived location
+            // actually exists; returns the real path, or null when neither exists.
+            const resolveSpec = (p) => {
+              if (fs.existsSync(p)) return p;
+              const archived = p.replace(/^docs\//, 'docs/archive/');
+              if (archived !== p && fs.existsSync(archived)) return archived;
+              return null;
+            };
             const problems = [];
 
             for (const number of unique) {
@@ -74,15 +92,27 @@ jobs:
                 continue;
               }
 
-              // 2. Issue must reference an existing spec file.
-              const match = (issue.body || '').match(specPattern);
-              if (!match) {
+              // 2. Issue must reference an existing spec file. Prefer an explicit
+              //    "Spec:" trailer, then fall back to every docs/spec-*.md mentioned.
+              const issueBody = issue.body || '';
+              const trailer = issueBody.match(specTrailer);
+              const candidates = [
+                ...(trailer ? [trailer[1]] : []),
+                ...(issueBody.match(specPattern) || []),
+              ];
+              if (candidates.length === 0) {
                 problems.push(`#${number}: issue body does not reference a docs/spec-*.md file.`);
                 continue;
               }
-              const specPath = match[0];
-              if (!fs.existsSync(specPath)) {
-                problems.push(`#${number}: references "${specPath}" but that file does not exist in this branch.`);
+              // Pass if ANY referenced spec resolves to a real file (live or archived).
+              let specPath = null;
+              for (const candidate of candidates) {
+                const resolved = resolveSpec(candidate);
+                if (resolved) { specPath = resolved; break; }
+              }
+              if (!specPath) {
+                const cited = [...new Set(candidates)].map(c => `"${c}"`).join(', ');
+                problems.push(`#${number}: references ${cited} but none of those files exist in this branch.`);
                 continue;
               }
 

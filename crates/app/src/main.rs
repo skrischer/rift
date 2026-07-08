@@ -353,6 +353,21 @@ fn main() {
                     rift_app::editor::CloseResultsPanel,
                     Some(rift_app::editor::EDITOR_KEY_CONTEXT),
                 ),
+                // Redo, Linux muscle memory (#599): `gpui-component`'s own input
+                // keymap (`crates/ui/src/input/state.rs`, non-macOS branch) already
+                // binds Ctrl+Z -> Undo, Ctrl+Y -> Redo, and Ctrl+A/C/X/V ->
+                // SelectAll/Copy/Cut/Paste for Windows/Linux — audited against the
+                // pinned rev and confirmed present, so none of those are re-bound
+                // here. The one real gap: Ctrl+Shift+Z (the GTK/GNOME-convention
+                // redo chord) has no non-macOS binding, only the macOS `cmd-shift-z`
+                // and the Windows-convention `ctrl-y`. Add it as a second redo
+                // chord, mirroring the "bind every chord unconditionally" pattern
+                // above — harmless on macOS alongside `cmd-shift-z`.
+                KeyBinding::new(
+                    "ctrl-shift-z",
+                    gpui_component::input::Redo,
+                    Some(rift_app::editor::EDITOR_KEY_CONTEXT),
+                ),
             ]);
             // Explorer keyboard navigation (#332): up/down move the selection,
             // left/right collapse/expand (stepping to parent/first-child at the

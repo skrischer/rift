@@ -2,15 +2,19 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point as GridPoint};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape, Processor};
 use gpui::*;
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dialog::AlertDialog;
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::notification::Notification;
+use gpui_component::ActiveTheme;
 use gpui_component::WindowExt;
+use gpui_component::{Disableable, Icon, IconName, Sizable};
 use termy_terminal_ui::{
     add_span_damage_compute_us, encode_mouse_report, find_link_in_line, CellRenderInfo,
     CommandLifecycle, CommandPhase, OscEvent, OscInterceptor, TerminalCursorStyle, TerminalGrid,
@@ -19,11 +23,12 @@ use termy_terminal_ui::{
 };
 use tracing::{debug, error};
 
-use crate::colors;
+use crate::colors::TerminalPalette;
 use crate::error::TerminalError;
 use crate::keyboard;
 use crate::keytable::{self, KeyTable, PrefixOptions};
 use crate::prefix::{PrefixAction, PrefixEngine};
+use crate::search::{MatchIndex, SearchState};
 use crate::{CaptureRequest, PaneInput, TermSize};
 
 pub fn statusbar_height() -> Pixels {
@@ -202,6 +207,16 @@ struct HoveredLink {
     target: String,
 }
 
+/// The scrollback search bar's live GPUI wiring: the query [`Input`] and its
+/// change/submit/blur subscription, paired with the pure match state.
+/// Mirrors [`crate::session_view`]'s `NewSessionPrompt`: blur cancels
+/// (closes the bar), Enter/Shift+Enter navigate matches.
+struct SearchPrompt {
+    input: Entity<InputState>,
+    state: SearchState,
+    _subscription: Subscription,
+}
+
 pub struct PaneView {
     pane_id: String,
     terminal: Arc<Mutex<Term<Listener>>>,
@@ -258,6 +273,9 @@ pub struct PaneView {
     /// alternate-screen mode, the OSC-133 phase, the terminal bell) folded into
     /// a [`PaneActivity`] via [`Self::activity`].
     activity: ActivityTracker,
+    /// Scrollback search: query input + match state against the live `Term`
+    /// (`docs/spec-v1-hardening.md`). `None` when the search bar is closed.
+    search: Option<SearchPrompt>,
 }
 
 impl PaneView {
@@ -414,6 +432,7 @@ impl PaneView {
             prefix_options,
             prefix_engine: PrefixEngine::new(),
             activity: ActivityTracker::default(),
+            search: None,
         }
     }
 
@@ -519,6 +538,114 @@ impl PaneView {
                     true
                 })
         });
+    }
+
+    /// Open the scrollback search bar (rift-native `Ctrl+Shift+F`,
+    /// intercepted before tmux key-table mirroring like the whole-client
+    /// zoom/copy/paste chords in `on_key_down`). Already open just refocuses
+    /// the query input — mirrors the browser/editor "find" convention.
+    fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(prompt) = &self.search {
+            prompt.input.update(cx, |state, cx| state.focus(window, cx));
+            return;
+        }
+
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search scrollback"));
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            move |this, input, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    let query = input.read(cx).value();
+                    this.update_search_query(&query, cx);
+                }
+                InputEvent::PressEnter { shift, .. } => {
+                    if *shift {
+                        this.search_select_prev(cx);
+                    } else {
+                        this.search_select_next(cx);
+                    }
+                }
+                InputEvent::Blur => this.close_search(window, cx),
+                _ => {}
+            },
+        );
+        input.update(cx, |state, cx| state.focus(window, cx));
+
+        self.search = Some(SearchPrompt {
+            input,
+            state: SearchState::default(),
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    /// Close the search bar (blur, the close button, or Escape via the
+    /// input's own clear-then-blur) and return focus to the pane so typing
+    /// resumes going to the PTY.
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search.take().is_some() {
+            self.focus_handle.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Recompile the query and re-run it against the live `Term`, then scroll
+    /// to the new first match (if any).
+    fn update_search_query(&mut self, query: &str, cx: &mut Context<Self>) {
+        let term = self.terminal.lock().expect("term lock poisoned");
+        let target = self.search.as_mut().and_then(|prompt| {
+            prompt.state.set_query(query, &term);
+            prompt.state.current_match().map(|m| *m.start())
+        });
+        drop(term);
+        if let Some(point) = target {
+            self.scroll_to_match(point);
+        }
+        cx.notify();
+    }
+
+    /// Advance to the next match and scroll it into view.
+    fn search_select_next(&mut self, cx: &mut Context<Self>) {
+        let target = self.search.as_mut().and_then(|prompt| {
+            prompt.state.select_next();
+            prompt.state.current_match().map(|m| *m.start())
+        });
+        if let Some(point) = target {
+            self.scroll_to_match(point);
+        }
+        cx.notify();
+    }
+
+    /// Step back to the previous match and scroll it into view.
+    fn search_select_prev(&mut self, cx: &mut Context<Self>) {
+        let target = self.search.as_mut().and_then(|prompt| {
+            prompt.state.select_prev();
+            prompt.state.current_match().map(|m| *m.start())
+        });
+        if let Some(point) = target {
+            self.scroll_to_match(point);
+        }
+        cx.notify();
+    }
+
+    /// Scroll the live `Term`'s viewport so `point` (a match's start) is
+    /// visible, roughly centered. Search only ever targets the live `Term`'s
+    /// own scrollback, so this also exits the separate pre-attach history
+    /// block if the pane was scrolled into it — mirrors the snap-back-to-
+    /// live-bottom behavior typing already has in `on_key_down`.
+    fn scroll_to_match(&mut self, point: GridPoint) {
+        let mut term = self.terminal.lock().expect("term lock poisoned");
+        // The live `Term`'s own scrollback depth — distinct from `self.
+        // history_block`, the separately captured pre-attach block below.
+        let term_history_size = term.grid().history_size() as i32;
+        let target = ((self.grid_size.rows as i32) / 2 - point.line.0).clamp(0, term_history_size);
+        let current_offset = term.grid().display_offset() as i32;
+        term.grid_mut()
+            .scroll_display(Scroll::Delta(target - current_offset));
+        drop(term);
+        self.history_scroll = 0;
+        self.paint_cache.clear();
     }
 
     /// Apply a new whole-client font size. The caller is responsible for
@@ -647,8 +774,9 @@ impl PaneView {
         }
         let cols = self.history_capture_cols.max(1);
         let pending_scroll = self.history_pending_scroll;
+        let palette = TerminalPalette::from_theme(&cx.theme().colors);
         cx.spawn(async move |this, cx| {
-            let rows = smol::unblock(move || parse_capture_to_rows(&bytes, cols)).await;
+            let rows = smol::unblock(move || parse_capture_to_rows(&bytes, cols, &palette)).await;
             if rows.is_empty() {
                 return;
             }
@@ -962,6 +1090,88 @@ impl PaneView {
         }
         true
     }
+
+    /// The floating scrollback-search bar: query input, match counter,
+    /// prev/next navigation, and a close button. Rendered as the last child
+    /// on top of the grid (later children paint over earlier ones), so it
+    /// never disturbs the pane's own flex sizing.
+    fn render_search_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(prompt) = self.search.as_ref() else {
+            return div().into_any_element();
+        };
+        let count = prompt.state.count();
+        let query_empty = prompt.input.read(cx).value().is_empty();
+        let counter: SharedString = if query_empty {
+            SharedString::default()
+        } else if count == 0 {
+            "No results".into()
+        } else {
+            format!(
+                "{} / {}",
+                prompt.state.current().map(|i| i + 1).unwrap_or(0),
+                count
+            )
+            .into()
+        };
+
+        div()
+            .id("terminal-search")
+            .occlude()
+            .absolute()
+            .top_2()
+            .right_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded(px(6.0))
+            .bg(cx.theme().popover)
+            .border_1()
+            .border_color(cx.theme().border)
+            .shadow_md()
+            .child(
+                Input::new(&prompt.input)
+                    .small()
+                    .w(px(200.0))
+                    .cleanable(true)
+                    .prefix(Icon::new(IconName::Search)),
+            )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(cx.theme().muted_foreground)
+                    .min_w(px(56.0))
+                    .child(counter),
+            )
+            .child(
+                Button::new("terminal-search-prev")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::ChevronUp)
+                    .disabled(count == 0)
+                    .tooltip("Previous match (Shift+Enter)")
+                    .on_click(cx.listener(|this, _, _window, cx| this.search_select_prev(cx))),
+            )
+            .child(
+                Button::new("terminal-search-next")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::ChevronDown)
+                    .disabled(count == 0)
+                    .tooltip("Next match (Enter)")
+                    .on_click(cx.listener(|this, _, _window, cx| this.search_select_next(cx))),
+            )
+            .child(
+                Button::new("terminal-search-close")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Close)
+                    .tooltip("Close search")
+                    .on_click(cx.listener(|this, _, window, cx| this.close_search(window, cx))),
+            )
+            .into_any_element()
+    }
 }
 
 impl Focusable for PaneView {
@@ -993,11 +1203,13 @@ fn extract_row_cells(
     row: usize,
     display_offset: usize,
     selection: Option<&GridSelection>,
+    palette: &TerminalPalette,
+    search_index: Option<&MatchIndex>,
 ) -> Vec<CellRenderInfo> {
     let grid = term.grid();
     let columns = grid.columns();
     let line = Line(row as i32 - display_offset as i32);
-    let default_bg = Hsla::from(colors::BACKGROUND);
+    let default_bg = palette.background();
     let mut cells = Vec::with_capacity(columns);
 
     for col in 0..columns {
@@ -1009,8 +1221,8 @@ fn extract_row_cells(
         }
 
         let inverse = flags.contains(Flags::INVERSE);
-        let raw_fg = Hsla::from(colors::to_gpui_color(cell.fg));
-        let raw_bg = Hsla::from(colors::to_gpui_color(cell.bg));
+        let raw_fg = palette.resolve(cell.fg);
+        let raw_bg = palette.resolve(cell.bg);
 
         let (mut fg, bg) = if inverse {
             (raw_bg, raw_fg)
@@ -1024,6 +1236,9 @@ fn extract_row_cells(
 
         let ch = if cell.c == '\0' { ' ' } else { cell.c };
         let selected = selection.is_some_and(|sel| sel.contains(row, col));
+        let (search_match, search_current) = search_index
+            .map(|index| crate::search::cell_search_flags(index, line.0, col))
+            .unwrap_or((false, false));
 
         cells.push(CellRenderInfo {
             col,
@@ -1035,8 +1250,8 @@ fn extract_row_cells(
             bold: flags.contains(Flags::BOLD),
             render_text: true,
             selected,
-            search_current: false,
-            search_match: false,
+            search_current,
+            search_match,
         });
     }
 
@@ -1050,7 +1265,11 @@ fn extract_row_cells(
 /// in the scratch history rather than being lost — the real produced row count
 /// is then read back from the grid, not assumed from the requested range or the
 /// `\n` count (which would silently drop wrapped history).
-fn parse_capture_to_rows(payload: &[u8], cols: usize) -> Vec<Vec<CellRenderInfo>> {
+fn parse_capture_to_rows(
+    payload: &[u8],
+    cols: usize,
+    palette: &TerminalPalette,
+) -> Vec<Vec<CellRenderInfo>> {
     if payload.is_empty() || cols == 0 {
         return Vec::new();
     }
@@ -1078,7 +1297,7 @@ fn parse_capture_to_rows(payload: &[u8], cols: usize) -> Vec<Vec<CellRenderInfo>
     let total = hist + last_line + 1;
 
     (0..total)
-        .map(|row| extract_row_cells(&term, row, hist, None))
+        .map(|row| extract_row_cells(&term, row, hist, None, palette, None))
         .collect()
 }
 
@@ -1119,6 +1338,10 @@ impl Render for PaneView {
         let font_size = self.font_size;
         let cell_size = measure_cell_size(window, font_size);
         self.cell_size = cell_size;
+
+        // Resolve the terminal palette from the active theme once per render, so
+        // switching the theme restyles the grid live (no restart).
+        let palette = TerminalPalette::from_theme(&cx.theme().colors);
 
         let new_size = if let Some(ts) = self.tmux_size {
             ts
@@ -1164,6 +1387,15 @@ impl Render for PaneView {
             self.prev_selection = self.selection.clone();
         }
 
+        // Search highlighting can change (query edits, next/prev navigation)
+        // with no underlying PTY damage at all (an idle prompt), so `map_damage`
+        // alone would miss it. Force a full repaint on every frame the search
+        // bar is open — bounded by the pane's own visible cell count, not the
+        // scrollback, and only paid while the user has search open.
+        if self.search.is_some() {
+            paint_damage = TerminalGridPaintDamage::Full;
+        }
+
         let mode = *term.mode();
 
         let is_focused = self.focus_handle.is_focused(window);
@@ -1201,6 +1433,14 @@ impl Render for PaneView {
             .map_or(0, |block| self.history_scroll.min(block.len()))
             .min(new_size.rows);
 
+        // Search only ever targets the live `Term`'s own scrollback (never the
+        // separately captured pre-attach block above), so the index is built
+        // once here and only fed to the live-row extraction below.
+        let search_index = self
+            .search
+            .as_ref()
+            .map(|prompt| prompt.state.index_by_line(new_size.cols));
+
         let mut grid_rows: Vec<Arc<Vec<CellRenderInfo>>> = Vec::with_capacity(new_size.rows);
         if let (true, Some(block)) = (history_rows > 0, self.history_block.as_ref()) {
             let first = block.len() - self.history_scroll.min(block.len());
@@ -1218,6 +1458,8 @@ impl Render for PaneView {
                 row_idx - history_rows,
                 display_offset,
                 self.selection.as_ref(),
+                &palette,
+                search_index.as_ref(),
             );
             // Live rows render after the history block, so shift their grid-relative
             // index to the viewport row they actually occupy (a no-op when
@@ -1241,14 +1483,20 @@ impl Render for PaneView {
 
         drop(term);
 
-        let bg_hsla = Hsla::from(colors::BACKGROUND);
-        let fg_hsla = Hsla::from(colors::FOREGROUND);
+        let bg_hsla = palette.background();
+        let fg_hsla = palette.foreground();
         let selection_bg = Hsla {
             h: 0.0,
             s: 0.0,
             l: 0.35,
             a: 1.0,
         };
+        // Distinct theme-derived highlight colors, not the `selection_bg`
+        // alias the search render fields used to carry
+        // (`docs/spec-v1-hardening.md`): every match dims yellow, the current
+        // match reads brighter.
+        let search_match_bg = cx.theme().yellow.opacity(0.35);
+        let search_current_bg = cx.theme().yellow_light.opacity(0.55);
 
         let grid = TerminalGrid {
             cells: Arc::new(grid_rows),
@@ -1262,8 +1510,8 @@ impl Render for PaneView {
             cursor_color: fg_hsla,
             selection_bg,
             selection_fg: fg_hsla,
-            search_match_bg: selection_bg,
-            search_current_bg: selection_bg,
+            search_match_bg,
+            search_current_bg,
             hovered_link_range: self
                 .hovered_link
                 .as_ref()
@@ -1298,9 +1546,24 @@ impl Render for PaneView {
             terminal_area = terminal_area.cursor(gpui::CursorStyle::PointingHand);
         }
 
-        terminal_area
+        let terminal_area = terminal_area
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                 let ks = &event.keystroke;
+
+                // Defense in depth: while the search bar's own query input
+                // holds focus, every key belongs to it exclusively (typing,
+                // navigation) — never fall through to PTY input/tmux dispatch
+                // below, regardless of GPUI's own bubbling of this handler.
+                if let Some(prompt) = &this.search {
+                    if prompt.input.read(cx).focus_handle(cx).is_focused(window) {
+                        return;
+                    }
+                }
+
+                if ks.modifiers.control && ks.modifiers.shift && ks.key.as_str() == "f" {
+                    this.open_search(window, cx);
+                    return;
+                }
 
                 if ks.modifiers.control && ks.modifiers.shift && ks.key.as_str() == "c" {
                     if let Some(text) = this.selected_text() {
@@ -1613,7 +1876,13 @@ impl Render for PaneView {
                 }
             }))
             .child(bounds_observer)
-            .child(grid)
+            .child(grid);
+
+        if self.search.is_some() {
+            terminal_area.child(self.render_search_bar(cx))
+        } else {
+            terminal_area
+        }
     }
 }
 
@@ -1625,15 +1894,20 @@ mod tests {
         row.iter().map(|cell| cell.char).collect::<String>()
     }
 
+    fn test_palette() -> TerminalPalette {
+        TerminalPalette::from_theme(&gpui_component::ThemeColor::default())
+    }
+
     #[::core::prelude::v1::test]
     fn test_parse_capture_empty_payload_yields_no_rows() {
-        assert!(parse_capture_to_rows(b"", 80).is_empty());
-        assert!(parse_capture_to_rows(b"abc", 0).is_empty());
+        let palette = test_palette();
+        assert!(parse_capture_to_rows(b"", 80, &palette).is_empty());
+        assert!(parse_capture_to_rows(b"abc", 0, &palette).is_empty());
     }
 
     #[::core::prelude::v1::test]
     fn test_parse_capture_maps_each_line_to_one_row() {
-        let rows = parse_capture_to_rows(b"ab\r\ncd", 4);
+        let rows = parse_capture_to_rows(b"ab\r\ncd", 4, &test_palette());
         assert_eq!(rows.len(), 2);
         assert_eq!(row_text(&rows[0]).trim_end(), "ab");
         assert_eq!(row_text(&rows[1]).trim_end(), "cd");
@@ -1647,11 +1921,46 @@ mod tests {
         // real (wrapped) row count rather than the `\n` count is what keeps the
         // upper history from being silently dropped (the discarded first seam's
         // latent bug).
-        let rows = parse_capture_to_rows(b"abcde\r\nfg", 3);
+        let rows = parse_capture_to_rows(b"abcde\r\nfg", 3, &test_palette());
         assert_eq!(rows.len(), 3);
         assert_eq!(row_text(&rows[0]).trim_end(), "abc");
         assert_eq!(row_text(&rows[1]).trim_end(), "de");
         assert_eq!(row_text(&rows[2]).trim_end(), "fg");
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_extract_row_cells_search_index_marks_match_and_current_flags() {
+        let palette = test_palette();
+        let (event_tx, _event_rx) = flume::unbounded();
+        let listener = Listener { event_tx };
+        let size = TermSize { cols: 10, rows: 1 };
+        let mut term = Term::new(Config::default(), &size, listener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, b"foobar");
+
+        let matches = vec![GridPoint::new(Line(0), Column(0))..=GridPoint::new(Line(0), Column(2))];
+        let index = crate::search::index_matches_by_line(&matches, Some(0), size.cols);
+
+        let cells = extract_row_cells(&term, 0, 0, None, &palette, Some(&index));
+        assert!(cells[0].search_match && cells[0].search_current);
+        assert!(cells[2].search_match && cells[2].search_current);
+        assert!(!cells[3].search_match);
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_extract_row_cells_no_search_index_never_sets_search_flags() {
+        let palette = test_palette();
+        let (event_tx, _event_rx) = flume::unbounded();
+        let listener = Listener { event_tx };
+        let size = TermSize { cols: 10, rows: 1 };
+        let mut term = Term::new(Config::default(), &size, listener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, b"foobar");
+
+        let cells = extract_row_cells(&term, 0, 0, None, &palette, None);
+        assert!(cells
+            .iter()
+            .all(|cell| !cell.search_match && !cell.search_current));
     }
 
     #[::core::prelude::v1::test]
