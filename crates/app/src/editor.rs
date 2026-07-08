@@ -305,9 +305,11 @@ const HOVER_DEFINITION_HINT: &str = "F12";
 /// `FindReferences` binding advertised by the command registry.
 const HOVER_REFERENCES_HINT: &str = "Shift+F12";
 
-/// Width of the minimap marks strip on the editor's right edge
-/// (`docs/spec-editor-chrome.md`: "~14px").
-const MINIMAP_WIDTH: Pixels = px(14.0);
+/// Width of the minimap marks strip on the editor's right edge. Widened from
+/// the original "~14px" (`docs/spec-editor-chrome.md`) — that width left
+/// barely any room for line-length marks to vary, making the strip unreadable
+/// (#600). Still a marks strip, not a pixel-perfect code render.
+const MINIMAP_WIDTH: Pixels = px(32.0);
 
 /// Maximum number of line-length sample rows painted in the minimap. Caps the
 /// per-render work so a very large buffer stays cheap — the strip is only a few
@@ -316,14 +318,15 @@ const MINIMAP_WIDTH: Pixels = px(14.0);
 const MINIMAP_SAMPLES: usize = 1024;
 
 /// Height in pixels of a diagnostic mark painted over the minimap strip.
-const MINIMAP_DIAG_MARK_HEIGHT: f32 = 2.0;
+/// Thickened alongside the strip width (#600) so tints stay legible.
+const MINIMAP_DIAG_MARK_HEIGHT: f32 = 3.0;
 
 /// Minimum height in pixels of the minimap viewport slab, so it stays visible
 /// even when the buffer is far taller than the viewport.
 const MINIMAP_SLAB_MIN_HEIGHT: f32 = 6.0;
 
 /// Horizontal inset in pixels of the line-length marks from the strip's edges.
-const MINIMAP_MARK_INSET: f32 = 2.0;
+const MINIMAP_MARK_INSET: f32 = 3.0;
 
 // ── Internal state types ──────────────────────────────────────────────────────
 
@@ -2215,6 +2218,27 @@ impl Panel for EditorView {
 
 // ── Render ────────────────────────────────────────────────────────────────────
 
+/// The code editor surface's background/foreground colors, read live from the
+/// active theme (`docs/spec-editor.md`, #598) — never hardcoded, so the
+/// surface tracks a runtime theme switch (`ActiveTheme::theme`) exactly like
+/// every other panel. `gpui_component::input::Input`'s own code-editor
+/// background falls back to `cx.theme().highlight_theme` — a Zed-style syntax
+/// theme populated from a `ThemeConfig`'s `highlight` block
+/// (`assets/themes/catppuccin-mocha.json`, added for #598) — so without that
+/// block the fallback stayed pinned to gpui-component's built-in *light*
+/// default regardless of rift's active dark mode, and every Tree-sitter token
+/// with no explicit `syntax` entry rendered with `highlight_theme`'s light
+/// default text color too (`element.rs`'s `SyntaxColors::style` falls back to
+/// `HighlightStyle::default()`, `color: None`, which resolves to whatever
+/// base run color the widget was given). Sourcing the surface's
+/// background/foreground from `ThemeColor` here — already correctly dark
+/// under Catppuccin Mocha — fixes the surface and doubles as that base run
+/// color for every unstyled token, independent of the `highlight` block ever
+/// being complete or present at all.
+fn editor_surface_colors(cx: &App) -> (Hsla, Hsla) {
+    (cx.theme().background, cx.theme().foreground)
+}
+
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // No tab open yet: show a centered status message.
@@ -2268,9 +2292,21 @@ impl Render for EditorView {
         // div below. `.disabled` blocks all key events and edit operations in
         // the `InputState`, enforcing the out-of-root read-only contract
         // (#196/#301).
+        //
+        // `.bg` / `.text_color` explicitly wire the surface to
+        // [`editor_surface_colors`] — `StyledExt::refine_style` (applied last
+        // in `Input::render`) lets them win over gpui-component's own
+        // code-editor background/foreground defaults, and `.text_color` is
+        // also the base run color every Tree-sitter token without its own
+        // `syntax` entry in the `highlight` block resolves to. Gutter,
+        // line-number, and selection colors already read `cx.theme()` inside
+        // the widget itself and need no override.
+        let (surface_bg, surface_fg) = editor_surface_colors(cx);
         let input_widget = Input::new(&tab.input)
             .font_family(cx.theme().mono_font_family.clone())
             .text_size(cx.theme().mono_font_size)
+            .bg(surface_bg)
+            .text_color(surface_fg)
             .size_full()
             .disabled(tab.read_only)
             .context_menu(|menu: PopupMenu, _window, _cx| {
@@ -2548,10 +2584,14 @@ impl Render for EditorView {
         // borrow is released before painting. Explicitly NOT a pixel-perfect
         // code render: marks are capped at `MINIMAP_SAMPLES`, positioned by
         // ratio, redrawn only on damage.
-        let mut minimap_mark_color = cx.theme().muted_foreground;
-        minimap_mark_color.a = 0.55;
+        // Bolder/higher-contrast than the original muted-foreground-at-.55 (#600):
+        // `foreground` reads clearly against the strip's `secondary` background at
+        // the widened size, while the slab keeps `accent` but a touch more opaque
+        // so it stays visually distinct from the length/diagnostic marks under it.
+        let mut minimap_mark_color = cx.theme().foreground;
+        minimap_mark_color.a = 0.65;
         let mut minimap_slab_color = cx.theme().accent;
-        minimap_slab_color.a = 0.20;
+        minimap_slab_color.a = 0.28;
         let minimap_data = {
             let input_state = tab.input.read(cx);
             let total = input_state.text().lines_len();
@@ -3420,6 +3460,92 @@ mod tests {
     fn test_language_for_path_lowercases_extension() {
         assert_eq!(language_for_path("MAIN.RS"), "rs");
         assert_eq!(language_for_path("Config.TOML"), "toml");
+    }
+
+    // --- editor surface theme wiring (#598) ---
+
+    /// Under rift's active Catppuccin Mocha theme, the code editor surface's
+    /// colors must be the live theme's dark tokens (never a light default or
+    /// a hardcoded value) and must move with a runtime theme switch.
+    #[gpui::test]
+    fn test_editor_surface_colors_are_dark_under_catppuccin_and_follow_a_theme_switch(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::apply_theme(cx);
+            assert!(cx.theme().is_dark());
+
+            let (dark_bg, dark_fg) = editor_surface_colors(cx);
+            assert_eq!(dark_bg, cx.theme().background);
+            assert_eq!(dark_fg, cx.theme().foreground);
+
+            gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
+            assert!(!cx.theme().is_dark());
+
+            let (light_bg, light_fg) = editor_surface_colors(cx);
+            assert_eq!(light_bg, cx.theme().background);
+            assert_eq!(light_fg, cx.theme().foreground);
+            assert_ne!(
+                light_bg, dark_bg,
+                "editor surface background must track a runtime theme switch"
+            );
+        });
+    }
+
+    /// WCAG 2.1 relative luminance of an sRGB color (used only by
+    /// [`contrast_ratio`] below).
+    fn relative_luminance(color: Hsla) -> f32 {
+        let rgba = color.to_rgb();
+        let channel = |c: f32| {
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(rgba.r) + 0.7152 * channel(rgba.g) + 0.0722 * channel(rgba.b)
+    }
+
+    /// WCAG 2.1 contrast ratio between two colors — 1.0 (no contrast) to 21.0
+    /// (black on white). `4.5` is the AA threshold for normal text.
+    fn contrast_ratio(a: Hsla, b: Hsla) -> f32 {
+        let (l1, l2) = (relative_luminance(a), relative_luminance(b));
+        let (lighter, darker) = if l1 > l2 { (l1, l2) } else { (l2, l1) };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    /// Regression test for #598: without a `highlight` block in
+    /// `catppuccin-mocha.json`, `cx.theme().highlight_theme` stayed pinned to
+    /// gpui-component's built-in light default, so every Tree-sitter syntax
+    /// token rendered at near-zero contrast on the editor's dark background.
+    /// Asserts the most common source-level tokens meet WCAG AA (4.5:1)
+    /// against the editor's own dark `editor.background`.
+    #[gpui::test]
+    fn test_editor_syntax_colors_meet_wcag_aa_contrast_under_catppuccin(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::apply_theme(cx);
+            assert!(cx.theme().is_dark());
+
+            let style = &cx.theme().highlight_theme.style;
+            let bg = style
+                .editor_background
+                .expect("Catppuccin Mocha's highlight block must set editor.background");
+
+            for token in ["function", "string", "keyword", "type", "property", "constant"] {
+                let color = style
+                    .syntax
+                    .style(token)
+                    .and_then(|s| s.color)
+                    .unwrap_or(cx.theme().foreground);
+                let ratio = contrast_ratio(color, bg);
+                assert!(
+                    ratio >= 4.5,
+                    "token `{token}` contrast {ratio:.2}:1 against the editor background is below WCAG AA 4.5:1"
+                );
+            }
+        });
     }
 
     // --- concurrent-write decision (#188) ---
