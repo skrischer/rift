@@ -513,6 +513,29 @@ token (protocol-hash vs bumped integer) and whether daemon restart stays
 client-driven only; phase 24 — how index-vs-worktree staging semantics surface
 in the UI.
 
+## Explorer overhaul — prior-art index (Phases 27–31)
+
+Per-phase prior-art for the explorer overhaul ([roadmap.md](roadmap.md)), same
+shape as the indexes above. Research mode: websearch (2026-07-08) — the two
+genuinely new concerns (icon-asset embedding, remote file operations) were topped
+up with focused lookups; the rest resolves against Category 5 (File Explorers) and
+Category 1 already catalogued. All licenses GPL-3.0-compatible.
+
+| Phase | Concern | Reference (repo + path) | License | Verdict |
+|---|---|---|---|---|
+| 27 | Explorer visual-language redesign | Paper `rift` design file (Cockpit — IDE explorer + Styleguide); `zed` `crates/project_panel` row anatomy (Category 5 #1); `noh-rs/nohrs` + `sxyazi/yazi` GPUI/async tree density (Category 5 #4/#2) | GPL-3.0 / MIT | reference — anatomy + density only; the durable new artboard is authored in Phase 27's `/loopkit:plan` (reviewed at spec-acceptance), not seeded here |
+| 28 | File-type icon theme + SVG asset embedding | Zed **icon themes** (JSON schema `default_file`/`default_folder`/`default_folder_open`/`file_types` → bundled `./icons/*.svg`, [docs](https://zed.dev/docs/extensions/icon-themes)); `longbridge/gpui-component` `Icon` element (SVGs **not** bundled by default — the exact gap `file_tree.rs` documented); icon sets: Seti (MIT), Material Icon Theme (MIT), `dmhendricks/file-icon-vectors` (MIT / CC-BY), Lucide (ISC) for chrome glyphs | Apache-2.0 / MIT / ISC | **reuse** (gpui-component `Icon` + a bundled MIT icon set embedded via `rust-embed` / gpui assets) / reference (Zed's icon-theme JSON mapping shape; per-extension icon `default_file` fallback + `file_types` extension map) |
+| 29 | Tree context menu | `longbridge/gpui-component` ContextMenu / PopupMenu (Category 1 #1, already vendored); `zed` `crates/project_panel` right-click action taxonomy (Category 5 #1) | Apache-2.0 / GPL-3.0 | **reuse** (gpui-component popup menu) / reference (project_panel's action set — split client-capable actions from write actions, which land with Phase 30, so the menu ships no dead controls) |
+| 30 | Remote file operations (create / rename / delete / move) | `zed` remote model — the daemon owns the fs, ops run **daemon-side** not client SFTP (Category 8 #1); rift's own daemon write precedent (Phase 24 git-write + buffer save); `remotefs-ssh` russh backend + `russh-sftp` (reference fallback only — rift's daemon uses `std::fs` on the remote host it already runs on) | GPL-3.0 / MIT-Apache | reference — file ops become new `protocol` messages executed by the daemon with `std::fs`, mirroring Zed's server-side fs; **not** client-side SFTP. Git-aware moves via the existing `gix` dependency |
+| 31 | In-panel fuzzy filter + quick-open | `Canop/broot` incremental narrowing UX (Category 5 #5); `helix-editor/nucleo` fuzzy matcher (Potential dependencies); `Augani/nexus-explorer` GPUI + nucleo wiring (Category 1 #5); `zed` `crates/file_finder` | MIT / MPL-2.0 / GPL-3.0 | **reuse** (`nucleo` for matching — already a candidate dep, MPL-2.0-compatible) / reference (broot narrowing, Zed file finder; decide at plan time whether quick-open needs a daemon-side project file index or stays over the streamed tree) |
+
+Open design decisions deferred to each phase's `/loopkit:plan` spec (never a
+roadmap guess): phase 28 — which icon set ships and whether icon themes are
+user-swappable (Zed-style) or a single bundled set for v1; phase 30 — the exact
+file-op message shape, conflict / overwrite semantics, and how a rename racing a
+daemon filesystem event is reconciled; phase 31 — whether quick-open indexes the
+whole project daemon-side (jwalk) or narrows only the already-streamed tree.
+
 ## Priority reference projects (top 10)
 
 1. **penso/arbor** — Closest existing implementation of rift's exact concept (Rust + GPUI + daemon + SSH outposts + agent state). Read end-to-end before writing any architecture docs.
