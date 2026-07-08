@@ -12,8 +12,8 @@ use lsp::{document_changes, BufferEvent, LspDiagnostics, LspStatusEvent, LspWork
 use rift_explorer::{Change, Entry, GitStatus, Snapshot, Watcher};
 use rift_lsp::{DocumentChange, DocumentSelector};
 use rift_protocol::{
-    encode_frame, ClientMessage, DaemonMessage, Diagnostic, EntryKind, FrameDecoder,
-    LspServerState, NavRequestId, WorktreeEntry, PROTOCOL_VERSION,
+    encode_frame, BufferErrorReason, ClientMessage, DaemonMessage, Diagnostic, EntryKind,
+    FrameDecoder, LspServerState, NavRequestId, WorktreeEntry, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -708,12 +708,13 @@ fn snapshot_messages(root: &Path, entries: &BTreeMap<PathBuf, Entry>) -> Vec<Dae
 /// carve-out (a navigation target outside the root, opened read-only) and is
 /// served by [`buffer::read_file`] — writes of an absolute path stay refused.
 /// `RequestDiff` has no such carve-out: it is confined exactly like a write
-/// ([`diff::compute`]). A failure (a path escape, non-UTF-8 content, a missing
-/// file, a write error, or a diff compute error) is logged to stderr (the
-/// daemon's log sink) and the request is dropped — v1 has no buffer-error
-/// message in the protocol, so a refused request simply produces no reply,
-/// and the editor falls back to its own timeout. The success/conflict
-/// outcomes map directly onto the protocol replies.
+/// ([`diff::compute`]). A refused `OpenFile` / `SaveFile` is logged and answered
+/// with a typed [`DaemonMessage::OpenError`] / [`DaemonMessage::SaveError`]
+/// carrying a [`BufferErrorReason`] (mapped from the internal
+/// [`buffer::BufferError`] by [`buffer_error_reason`]), so the editor renders the
+/// specific failure at once instead of waiting out its own open/save timeout. A
+/// `RequestDiff` failure has no error reply in the protocol — it is logged and
+/// dropped. The success/conflict outcomes map directly onto the protocol replies.
 async fn request_reply(
     state: &watch::Receiver<State>,
     msg: ClientMessage,
@@ -742,7 +743,8 @@ async fn request_reply(
             }),
             Err(err) => {
                 warn!(?path, %err, "open_file refused");
-                None
+                let reason = buffer_error_reason(&err);
+                Some(DaemonMessage::OpenError { path, reason })
             }
         },
         ClientMessage::SaveFile {
@@ -758,7 +760,8 @@ async fn request_reply(
             }
             Err(err) => {
                 warn!(?path, %err, "save_file refused");
-                None
+                let reason = buffer_error_reason(&err);
+                Some(DaemonMessage::SaveError { path, reason })
             }
         },
         ClientMessage::RequestDiff { path } => match diff::compute(&root, &path).await {
@@ -776,6 +779,28 @@ async fn request_reply(
         // rather than a panic so a stray message can never take the
         // connection down.
         _ => None,
+    }
+}
+
+/// Map an internal [`buffer::BufferError`] onto the wire [`BufferErrorReason`] the
+/// editor renders.
+///
+/// `NotUtf8` and `TooLarge` map directly. A `PathEscape` is a client-side
+/// impossibility (the editor only ever sends worktree-relative or out-of-root
+/// navigation paths), so it collapses to the generic `Io` rather than earning a
+/// distinct wire variant — the spec's decision. An `Io` failure is refined by its
+/// [`std::io::ErrorKind`] into `NotFound` / `PermissionDenied`, falling back to
+/// the generic `Io` for any other kind.
+fn buffer_error_reason(err: &buffer::BufferError) -> BufferErrorReason {
+    match err {
+        buffer::BufferError::NotUtf8(_) => BufferErrorReason::NotUtf8,
+        buffer::BufferError::TooLarge(_) => BufferErrorReason::TooLarge,
+        buffer::BufferError::PathEscape(_) => BufferErrorReason::Io,
+        buffer::BufferError::Io { source, .. } => match source.kind() {
+            std::io::ErrorKind::NotFound => BufferErrorReason::NotFound,
+            std::io::ErrorKind::PermissionDenied => BufferErrorReason::PermissionDenied,
+            _ => BufferErrorReason::Io,
+        },
     }
 }
 
@@ -3818,5 +3843,140 @@ mod tests {
         );
         assert_quiet(&mut ca_reader, &mut da, Duration::from_millis(300)).await;
         assert_quiet(&mut cb_reader, &mut db, Duration::from_millis(300)).await;
+    }
+
+    /// Every [`buffer::BufferError`] maps to the matching wire
+    /// [`BufferErrorReason`]: `NotUtf8` / `TooLarge` directly, `PathEscape` to the
+    /// generic `Io`, and an `Io` refined by its [`std::io::ErrorKind`].
+    #[test]
+    fn test_buffer_error_reason_maps_each_variant_to_matching_reason() {
+        use std::io::{Error, ErrorKind};
+
+        let cases: [(buffer::BufferError, BufferErrorReason); 6] = [
+            (
+                buffer::BufferError::NotUtf8("f".into()),
+                BufferErrorReason::NotUtf8,
+            ),
+            (
+                buffer::BufferError::TooLarge("f".into()),
+                BufferErrorReason::TooLarge,
+            ),
+            (
+                buffer::BufferError::PathEscape("f".into()),
+                BufferErrorReason::Io,
+            ),
+            (
+                buffer::BufferError::Io {
+                    path: "f".into(),
+                    source: Error::from(ErrorKind::NotFound),
+                },
+                BufferErrorReason::NotFound,
+            ),
+            (
+                buffer::BufferError::Io {
+                    path: "f".into(),
+                    source: Error::from(ErrorKind::PermissionDenied),
+                },
+                BufferErrorReason::PermissionDenied,
+            ),
+            (
+                buffer::BufferError::Io {
+                    path: "f".into(),
+                    source: Error::from(ErrorKind::Other),
+                },
+                BufferErrorReason::Io,
+            ),
+        ];
+
+        for (err, expected) in cases {
+            assert_eq!(buffer_error_reason(&err), expected, "for {err:?}");
+        }
+    }
+
+    /// A worktree-backed `State` receiver keyed at `root`, for driving
+    /// `request_reply` against a real on-disk worktree in tests. The sender is
+    /// dropped: `request_reply` only `borrow`s the last value, which the receiver
+    /// keeps holding after the sender is gone.
+    fn state_rx_for(root: &Path) -> watch::Receiver<State> {
+        let snapshot = Snapshot::scan(root).expect("scan worktree root");
+        let (_tx, rx) = watch::channel(State {
+            worktree: Some(snapshot),
+            ..Default::default()
+        });
+        rx
+    }
+
+    /// `request_reply` answers a refused `OpenFile` (missing file) with an
+    /// immediate `OpenError` carrying the specific `NotFound` reason, instead of
+    /// dropping the request and leaving the editor to time out.
+    #[tokio::test]
+    async fn test_request_reply_open_missing_file_yields_open_error_not_found() {
+        let tmp = TempDir::new("reply-open-missing");
+        let rx = state_rx_for(&tmp.path);
+
+        let reply = request_reply(
+            &rx,
+            ClientMessage::OpenFile {
+                path: "does-not-exist.rs".to_string(),
+            },
+        )
+        .await;
+        match reply {
+            Some(DaemonMessage::OpenError { path, reason }) => {
+                assert_eq!(path, "does-not-exist.rs");
+                assert_eq!(reason, BufferErrorReason::NotFound);
+            }
+            other => panic!("expected OpenError NotFound, got {other:?}"),
+        }
+    }
+
+    /// `request_reply` answers a refused `OpenFile` (non-UTF-8 content) with an
+    /// `OpenError { reason: NotUtf8 }`.
+    #[tokio::test]
+    async fn test_request_reply_open_binary_file_yields_open_error_not_utf8() {
+        let tmp = TempDir::new("reply-open-binary");
+        std::fs::write(tmp.path.join("blob.bin"), [0x00, 0xff, 0xfe, b'a']).expect("write binary");
+        let rx = state_rx_for(&tmp.path);
+
+        let reply = request_reply(
+            &rx,
+            ClientMessage::OpenFile {
+                path: "blob.bin".to_string(),
+            },
+        )
+        .await;
+        match reply {
+            Some(DaemonMessage::OpenError { path, reason }) => {
+                assert_eq!(path, "blob.bin");
+                assert_eq!(reason, BufferErrorReason::NotUtf8);
+            }
+            other => panic!("expected OpenError NotUtf8, got {other:?}"),
+        }
+    }
+
+    /// `request_reply` answers a refused `SaveFile` (a path escaping the root)
+    /// with an immediate `SaveError` rather than dropping it — a path escape
+    /// collapses to the generic `Io` reason.
+    #[tokio::test]
+    async fn test_request_reply_save_path_escape_yields_save_error_io() {
+        let tmp = TempDir::new("reply-save-escape");
+        let rx = state_rx_for(&tmp.path);
+
+        let reply = request_reply(
+            &rx,
+            ClientMessage::SaveFile {
+                path: "../escape.txt".to_string(),
+                content: "should not land".to_string(),
+                base_mtime: std::time::SystemTime::UNIX_EPOCH,
+            },
+        )
+        .await;
+        match reply {
+            Some(DaemonMessage::SaveError { path, reason }) => {
+                assert_eq!(path, "../escape.txt");
+                assert_eq!(reason, BufferErrorReason::Io);
+            }
+            other => panic!("expected SaveError Io, got {other:?}"),
+        }
     }
 }

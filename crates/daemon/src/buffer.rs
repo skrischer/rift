@@ -66,6 +66,9 @@ pub enum BufferError {
         path: String,
         source: std::io::Error,
     },
+    /// The file exceeds the daemon's read-size cap ([`MAX_READ_BYTES`]) and was
+    /// not read whole into a single message. Carries the worktree-relative path.
+    TooLarge(String),
 }
 
 impl fmt::Display for BufferError {
@@ -81,6 +84,10 @@ impl fmt::Display for BufferError {
                 )
             }
             BufferError::Io { path, source } => write!(f, "io error on {path:?}: {source}"),
+            BufferError::TooLarge(path) => write!(
+                f,
+                "file {path:?} exceeds the {MAX_READ_BYTES}-byte read-size cap"
+            ),
         }
     }
 }
@@ -107,6 +114,14 @@ pub enum SaveOutcome {
     Conflict(SystemTime),
 }
 
+/// Byte ceiling for a whole-file buffer read. A file larger than this is refused
+/// with [`BufferError::TooLarge`] rather than shipped in one unbounded message,
+/// mirroring the diff channel's per-side size ceiling
+/// (`rift_explorer::diff` caps each side at ~2 MB). The cap is a **size** ceiling,
+/// not a line count: the file is read whole and shipped in one message, so the
+/// byte length is the bound that matters.
+const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
+
 /// Read the whole file at `path` as UTF-8 text, paired with its current on-disk
 /// `mtime`.
 ///
@@ -126,17 +141,29 @@ pub enum SaveOutcome {
 ///
 /// Non-UTF-8 content is refused with [`BufferError::NotUtf8`] rather than
 /// mangled, on both the in-root and out-of-root read paths.
+///
+/// A file larger than [`MAX_READ_BYTES`] is refused with
+/// [`BufferError::TooLarge`] **before** it is pulled whole into memory: the size
+/// is checked from a single up-front stat, whose `mtime` the editor then adopts
+/// as its save base. Capturing the `mtime` before the read (rather than after)
+/// is the safe direction for the save conflict check — a write racing the read
+/// leaves the base older than the served content, so a later save conflicts and
+/// rebases instead of clobbering.
 pub async fn read_file(root: &Path, path: &str) -> Result<(String, SystemTime), BufferError> {
     let resolved = resolve_read(root, path)?;
 
-    let bytes = tokio::fs::read(&resolved)
-        .await
-        .map_err(|source| BufferError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
+    let io_err = |source| BufferError::Io {
+        path: path.to_owned(),
+        source,
+    };
+    let metadata = tokio::fs::metadata(&resolved).await.map_err(&io_err)?;
+    if metadata.len() > MAX_READ_BYTES {
+        return Err(BufferError::TooLarge(path.to_owned()));
+    }
+    let mtime = metadata.modified().map_err(&io_err)?;
+
+    let bytes = tokio::fs::read(&resolved).await.map_err(&io_err)?;
     let content = String::from_utf8(bytes).map_err(|_| BufferError::NotUtf8(path.to_owned()))?;
-    let mtime = mtime_of(&resolved, path).await?;
 
     Ok((content, mtime))
 }
@@ -799,5 +826,33 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&target);
+    }
+
+    /// The read-size cap refuses a file one byte over the ceiling with
+    /// [`BufferError::TooLarge`] rather than shipping it whole.
+    #[tokio::test]
+    async fn test_read_file_one_byte_over_cap_is_refused_too_large() {
+        let tmp = TempDir::new("read-too-large");
+        let oversized = vec![b'a'; MAX_READ_BYTES as usize + 1];
+        write_disk(&tmp.path.join("big.txt"), &oversized);
+
+        let err = read_file(&tmp.path, "big.txt")
+            .await
+            .expect_err("a file over the read cap is refused");
+        assert!(matches!(err, BufferError::TooLarge(_)), "got {err:?}");
+    }
+
+    /// A file exactly at the ceiling is still served — the cap is a strict `>`
+    /// bound, so the boundary is inclusive.
+    #[tokio::test]
+    async fn test_read_file_exactly_at_cap_is_served() {
+        let tmp = TempDir::new("read-at-cap");
+        let at_cap = vec![b'a'; MAX_READ_BYTES as usize];
+        write_disk(&tmp.path.join("edge.txt"), &at_cap);
+
+        let (content, _mtime) = read_file(&tmp.path, "edge.txt")
+            .await
+            .expect("a file exactly at the cap is served");
+        assert_eq!(content.len(), MAX_READ_BYTES as usize);
     }
 }
