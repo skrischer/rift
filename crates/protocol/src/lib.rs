@@ -15,7 +15,7 @@ pub use frame::{encode_frame, FrameDecoder, FrameError, MAX_FRAME_LEN};
 /// is wire-compatible in one direction. The message set is pinned by the
 /// fingerprint test beside `PROTOCOL_FINGERPRINT` below, so a message-set
 /// change without a bump cannot pass CI.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Pinned fingerprint of the protocol message set, checked by the
 /// `fingerprint_tests` module: an FNV-1a hash over the serde-visible surface
@@ -25,7 +25,7 @@ pub const PROTOCOL_VERSION: u32 = 7;
 /// [`PROTOCOL_VERSION`] above and re-pin this value (the failing test prints
 /// the new fingerprint).
 #[cfg(test)]
-const PROTOCOL_FINGERPRINT: u64 = 0x6313_30a3_4d24_c08d;
+const PROTOCOL_FINGERPRINT: u64 = 0xe1f2_261a_f2a0_edbe;
 
 /// Messages the client sends to the daemon.
 ///
@@ -486,6 +486,33 @@ pub enum DaemonMessage {
         path: String,
         disk_mtime: SystemTime,
     },
+    /// The error reply to a [`ClientMessage::OpenFile`]: the daemon could not
+    /// read the file at `path` (relative to the worktree root) and refused the
+    /// request instead of returning [`FileContent`]. `reason` is the typed
+    /// [`BufferErrorReason`] naming why — binary or non-UTF-8 content, a missing
+    /// or unreadable path, a file over the daemon's read-size cap, or a generic
+    /// I/O failure. This lets the editor surface the specific failure
+    /// **immediately**, rather than waiting out its own open timeout. No content
+    /// is delivered; the buffer for `path` stays unloaded.
+    ///
+    /// [`FileContent`]: DaemonMessage::FileContent
+    OpenError {
+        path: String,
+        reason: BufferErrorReason,
+    },
+    /// The error reply to a [`ClientMessage::SaveFile`]: the daemon could not
+    /// write the file at `path` (relative to the worktree root) and the save did
+    /// not land — distinct from [`SaveConflict`], which is a deliberate
+    /// stale-base rejection. `reason` is the typed [`BufferErrorReason`] naming
+    /// why the write failed (e.g. an unwritable path or a generic I/O failure).
+    /// The editor surfaces the reason at once instead of waiting out its own save
+    /// timeout. No write happened.
+    ///
+    /// [`SaveConflict`]: DaemonMessage::SaveConflict
+    SaveError {
+        path: String,
+        reason: BufferErrorReason,
+    },
     /// Reply to [`ClientMessage::HoverRequest`]. `id` echoes the request's
     /// [`NavRequestId`] so the client can match and drop superseded responses.
     /// `content` is the server's markdown-rendered hover text; `None` when the
@@ -751,6 +778,38 @@ pub enum LspServerState {
     /// The server's main loop ended (exit, crash, or a transport failure)
     /// and it has not been restarted yet.
     Crashed,
+}
+
+/// Why the daemon refused a buffer-channel read or write, carried by
+/// [`DaemonMessage::OpenError`] / [`DaemonMessage::SaveError`].
+///
+/// rift's own type, deliberately independent of `std::io::Error` — the same
+/// precedent as [`DiagnosticSeverity`] / [`SymbolKind`] mirroring LSP types: no
+/// third-party or `std` error type crosses the wire, so the shared protocol
+/// stays dependency-light and serialization-agnostic. The daemon maps its
+/// internal buffer error onto one of these variants — `NotUtf8` from a decode
+/// failure, `TooLarge` from the read-size cap, and `NotFound` /
+/// `PermissionDenied` / `Io` by inspecting the underlying
+/// [`std::io::ErrorKind`]. A path that escapes the worktree root is a
+/// client-side impossibility (the editor only sends worktree-relative or
+/// out-of-root navigation paths), so it maps to the generic `Io` rather than a
+/// distinct variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BufferErrorReason {
+    /// The file's content is binary — it holds bytes the daemon will not treat
+    /// as editable text.
+    Binary,
+    /// The file's content is not valid UTF-8 and cannot be decoded to text.
+    NotUtf8,
+    /// The daemon lacks permission to read or write the path.
+    PermissionDenied,
+    /// The path does not exist on disk.
+    NotFound,
+    /// The file exceeds the daemon's read-size cap and was not shipped.
+    TooLarge,
+    /// A generic I/O failure not covered by the more specific reasons above.
+    Io,
 }
 
 /// A half-open span within a file, from `start` (inclusive) to `end`
@@ -1969,6 +2028,75 @@ mod tests {
             serde_json::from_str::<DaemonMessage>(&json).expect("deserialize SaveConflict"),
             msg
         );
+    }
+
+    #[test]
+    fn test_open_error_roundtrip_preserves_path_and_reason() {
+        // The refused-read reply carries the path and the typed reason so the
+        // editor renders the specific failure at once, without waiting out its
+        // open timeout.
+        let msg = DaemonMessage::OpenError {
+            path: "assets/logo.png".to_owned(),
+            reason: BufferErrorReason::Binary,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize OpenError");
+        assert!(json.contains(r#""type":"open_error""#));
+        assert!(json.contains(r#""reason":"binary""#));
+
+        let parsed: DaemonMessage = serde_json::from_str(&json).expect("deserialize OpenError");
+        assert_eq!(parsed, msg);
+        match parsed {
+            DaemonMessage::OpenError { path, reason } => {
+                assert_eq!(path, "assets/logo.png");
+                assert_eq!(reason, BufferErrorReason::Binary);
+            }
+            other => panic!("expected OpenError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_save_error_roundtrip_preserves_path_and_reason() {
+        // The failed-write reply is distinct from SaveConflict: the write did
+        // not land for an I/O reason, not a stale-base rejection.
+        let msg = DaemonMessage::SaveError {
+            path: "src/lib.rs".to_owned(),
+            reason: BufferErrorReason::PermissionDenied,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize SaveError");
+        assert!(json.contains(r#""type":"save_error""#));
+        assert!(json.contains(r#""reason":"permission_denied""#));
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize SaveError"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_buffer_error_reason_roundtrips_every_variant() {
+        // Every reason variant must survive the wire so the daemon can name any
+        // refusal cause and the editor render it.
+        for (reason, wire) in [
+            (BufferErrorReason::Binary, "binary"),
+            (BufferErrorReason::NotUtf8, "not_utf8"),
+            (BufferErrorReason::PermissionDenied, "permission_denied"),
+            (BufferErrorReason::NotFound, "not_found"),
+            (BufferErrorReason::TooLarge, "too_large"),
+            (BufferErrorReason::Io, "io"),
+        ] {
+            let json = serde_json::to_string(&reason).expect("serialize BufferErrorReason");
+            assert_eq!(json, format!(r#""{wire}""#));
+            assert_eq!(
+                serde_json::from_str::<BufferErrorReason>(&json)
+                    .expect("deserialize BufferErrorReason"),
+                reason
+            );
+        }
+    }
+
+    #[test]
+    fn test_buffer_error_reason_unknown_variant_is_rejected() {
+        // An unknown reason fails loudly rather than being silently misread.
+        assert!(serde_json::from_str::<BufferErrorReason>(r#""frobnicated""#).is_err());
     }
 
     #[test]
