@@ -365,16 +365,23 @@ impl WorkspaceView {
         // Open requests originate from the tree's `OpenFile` event: arm the
         // editor's open (and its timeout) and send the path to the tokio side.
         // Selecting a file touches nothing but this — no tmux pane/window state.
+        // The header/root-row `RevealActiveRequested` action (#604) re-triggers
+        // the existing reveal path via the already-present
+        // `reveal_open_file_in_tree` — no new protocol, no new coupling.
         cx.subscribe_in(
             &file_tree,
             window,
-            |this, _tree, event: &FileTreeEvent, window, cx| {
-                let FileTreeEvent::OpenFile { path } = event;
-                this.editor.update(cx, |editor, cx| {
-                    editor.begin_open(path.clone(), false, window, cx);
-                });
-                if let Err(e) = this.open_file_tx.try_send(path.clone()) {
-                    debug!(error = %e, %path, "failed to enqueue open-file request");
+            |this, _tree, event: &FileTreeEvent, window, cx| match event {
+                FileTreeEvent::OpenFile { path } => {
+                    this.editor.update(cx, |editor, cx| {
+                        editor.begin_open(path.clone(), false, window, cx);
+                    });
+                    if let Err(e) = this.open_file_tx.try_send(path.clone()) {
+                        debug!(error = %e, %path, "failed to enqueue open-file request");
+                    }
+                }
+                FileTreeEvent::RevealActiveRequested => {
+                    this.reveal_open_file_in_tree(cx);
                 }
             },
         )
