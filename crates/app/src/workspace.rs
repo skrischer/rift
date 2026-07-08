@@ -69,7 +69,7 @@ use gpui::{
     SharedString, Styled as _, Window, WindowBounds,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::dock::{DockArea, DockItem, DockPlacement, PanelView};
+use gpui_component::dock::{Dock, DockArea, DockItem, DockPlacement, PanelView};
 use gpui_component::{ActiveTheme as _, IconName, Root, Sizable as _};
 use rift_protocol::{ClientMessage, DaemonMessage, LspServerState};
 use rift_terminal::{SessionView, SessionViewEvent};
@@ -779,6 +779,35 @@ impl WorkspaceView {
             dock.set_right_dock(right_item, Some(px(RIGHT_DOCK_WIDTH)), false, window, cx);
             dock.set_bottom_dock(bottom_item, Some(px(BOTTOM_DOCK_HEIGHT)), false, window, cx);
         });
+
+        // Terminal reflow on dock layout change (#596): toggling or dragging a
+        // dock resizes the center terminal panel, but gpui-component notifies
+        // only the dock being changed. The terminal is a center sibling — never
+        // an ancestor of that dock — so GPUI never marks it dirty, and its
+        // cached panel prepaint (the pane-area grid observer that pushes the
+        // client resize onto `refresh-client -C`) is reused, leaving tmux at the
+        // old size and the content clipped behind the panels. Observing each
+        // dock and notifying the session forces it to re-render against its new
+        // bounds and re-emit the resize; the observer's own grid dedup keeps a
+        // no-op layout change from spamming the seam.
+        let docks: Vec<Entity<Dock>> = {
+            let dock_area = dock_area.read(cx);
+            [
+                dock_area.left_dock(),
+                dock_area.right_dock(),
+                dock_area.bottom_dock(),
+            ]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect()
+        };
+        for dock in docks {
+            cx.observe(&dock, |this, _dock, cx| {
+                this.session_view.update(cx, |_session, cx| cx.notify());
+            })
+            .detach();
+        }
 
         let command_palette = CommandPalette::new(window, cx);
         let settings_view = SettingsView::new(session_view.clone());

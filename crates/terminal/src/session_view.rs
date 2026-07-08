@@ -770,6 +770,36 @@ impl SessionView {
         cx.notify();
     }
 
+    /// Recompute the tmux client grid from the terminal pane-area `area` and
+    /// `cell` metrics and, only when the whole-cell grid actually changes, cache
+    /// it, push it onto the resize seam (`size_changed_tx` -> the daemon's
+    /// `refresh-client -C`), and arm the transient grid-size overlay. Returns
+    /// whether a resize was emitted, so the caller can `cx.notify()` exactly
+    /// once.
+    ///
+    /// The stacked pane headers are reserved before flooring rows so a vertical
+    /// split never clips its bottom rows (#424): the worst-case column loses one
+    /// header per pane stacked in it. Deduped against `client_grid_size`, so a
+    /// stable area (or a sub-cell wobble that floors to the same grid) sends
+    /// nothing — a dock-layout change that leaves the grid unchanged never spams
+    /// the seam (#596).
+    fn resize_client_to_area(&mut self, area: Size<Pixels>, cell: Size<Pixels>) -> bool {
+        let header_rows = self
+            .layout
+            .as_ref()
+            .map(max_vertical_pane_count)
+            .unwrap_or(1);
+        let reserved = px(PANE_HEADER_HEIGHT * header_rows as f32);
+        let grid = grid_size_for(area, cell, reserved);
+        if grid == self.client_grid_size {
+            return false;
+        }
+        self.client_grid_size = grid;
+        let _ = self.size_changed_tx.try_send(grid);
+        self.resize_overlay_deadline = Some(Instant::now() + RESIZE_OVERLAY_DURATION);
+        true
+    }
+
     /// Apply a refreshed `list-keys`/`show-options` reply: re-parse into the
     /// mirrored `KeyTable`/`PrefixOptions` and push the result down to every
     /// live pane (`apply_snapshot` only seeds new panes at creation — an
@@ -2052,37 +2082,25 @@ impl Render for SessionView {
         };
 
         // The tmux client is sized from the pane area's measured bounds — the
-        // flex slot below the tab bar and above the statusbar, minus the stacked
-        // pane headers — never from the window viewport: with the editor split
-        // open, the terminal panel only gets a slice of the window, and a
-        // viewport-derived grid would overshoot and clip/mis-wrap every pane
-        // (#424). The canvas
+        // flex slot below the tab bar, minus the stacked pane headers — never
+        // from the window viewport: with the editor split open, the terminal
+        // panel only gets a slice of the window, and a viewport-derived grid
+        // would overshoot and clip/mis-wrap every pane (#424). The canvas
         // overlays the pane area (absolute, zero layout impact) and its prepaint
-        // sees the post-layout bounds each frame, so a dock-splitter drag
-        // re-sends the client resize as the panel geometry changes.
+        // sees the post-layout bounds whenever this view renders, so a resize is
+        // re-sent as the panel geometry changes. Because gpui-component caches
+        // the dock panel, this view only re-renders when it is marked dirty; the
+        // app re-asserts that on every dock layout change so a dock toggle or
+        // splitter drag reaches here even while the terminal is idle (#596).
         let entity = cx.entity().clone();
         let grid_observer = canvas(
             move |bounds: Bounds<Pixels>, _window: &mut Window, cx: &mut App| {
                 entity.update(cx, |view: &mut Self, cx| {
-                    // Reserve the stacked pane headers from the reported grid so
-                    // a vertical split never clips its bottom rows (#424): the
-                    // worst-case column loses one header per pane stacked in it.
-                    let header_rows = view
-                        .layout
-                        .as_ref()
-                        .map(max_vertical_pane_count)
-                        .unwrap_or(1);
-                    let reserved = px(PANE_HEADER_HEIGHT * header_rows as f32);
-                    let grid = grid_size_for(bounds.size, cell_size, reserved);
-                    if grid != view.client_grid_size {
-                        view.client_grid_size = grid;
-                        let _ = view.size_changed_tx.try_send(grid);
-                        // Surface the transient grid readout near the terminal;
-                        // notify so at least one more frame paints it even for a
-                        // single discrete resize. The idle tick clears it once
-                        // the deadline passes (no dedicated timer).
-                        view.resize_overlay_deadline =
-                            Some(Instant::now() + RESIZE_OVERLAY_DURATION);
+                    // On a size change: notify so at least one more frame paints
+                    // the transient grid readout even for a single discrete
+                    // resize. The idle tick clears the overlay once the deadline
+                    // passes (no dedicated timer).
+                    if view.resize_client_to_area(bounds.size, cell_size) {
                         cx.notify();
                     }
                 });
@@ -2271,6 +2289,43 @@ mod tests {
             ),
             TermSize { cols: 80, rows: 1 }
         );
+    }
+
+    /// The pane-area resize decision (#596) emits a client resize only when the
+    /// whole-cell grid actually changes: a repeated area sends nothing (no
+    /// dock-layout resize spam), and a real change sends exactly one new grid.
+    /// The default (no-layout) path reserves one 32px pane header before
+    /// flooring rows.
+    #[gpui::test]
+    fn test_resize_client_to_area_sends_once_per_grid_change(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, handle) = session_and_handle(cx);
+            let cell = size(px(10.0), px(20.0));
+
+            session.update(cx, |view, _cx| {
+                // Initial client grid is 80x24; an area that floors to 80x24
+                // after the reserved 32px header is unchanged -> nothing emitted.
+                // cols: 800/10 = 80; rows: (512 - 32)/20 = 24.
+                assert!(!view.resize_client_to_area(size(px(800.0), px(512.0)), cell));
+
+                // A taller area floors to 80x34 -> a real change, one emit.
+                // rows: (712 - 32)/20 = 34.
+                assert!(view.resize_client_to_area(size(px(800.0), px(712.0)), cell));
+
+                // The same area again is now the cached grid -> no second emit.
+                assert!(!view.resize_client_to_area(size(px(800.0), px(712.0)), cell));
+            });
+
+            let emitted = handle
+                .size_changed_rx
+                .try_recv()
+                .expect("one resize emitted on the grid change");
+            assert_eq!(emitted, TermSize { cols: 80, rows: 34 });
+            assert!(
+                handle.size_changed_rx.try_recv().is_err(),
+                "a stable area emits no further resize"
+            );
+        });
     }
 
     #[test]
