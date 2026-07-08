@@ -119,6 +119,10 @@ activities.
   block** — not needed; the six `base` tokens + their `_light` variants + fg/
   bg/border/muted cover the 16 slots (mapping in Prior decisions). Forking the
   vendored theme structs is forbidden (constitution).
+- **The terminal PTY grid font stays the pinned JetBrainsMono Nerd Font
+  Mono** — its icon glyphs and cell-metric measurement depend on it; the
+  Appearance mono-font control governs the editor and GUI panes only, not the
+  terminal grid.
 
 ## Human prerequisites
 
@@ -273,3 +277,10 @@ Decisions made during implementation. Added as work progresses.
   is populated. No genuinely-open decisions surfaced (the config-layer
   exclusion and the theme-schema-fork exclusion are settled precedent, not
   re-opened; feature toggles without backing state are flatly out).
+- 2026-07-08: Narrowed the Appearance mono-font control to the editor and GUI
+  panes; it does not drive the terminal PTY grid. `rift_terminal`'s
+  `session_view`/`pane_view` pin "JetBrainsMono Nerd Font Mono" because the
+  terminal's icon glyphs and cell-metric measurement depend on that specific
+  font — swapping it live is a structural, resize-math-sensitive change this
+  spec never scoped. Ratified by the planner, sanctioning PR #634 (issue
+  #608).

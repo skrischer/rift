@@ -305,9 +305,11 @@ const HOVER_DEFINITION_HINT: &str = "F12";
 /// `FindReferences` binding advertised by the command registry.
 const HOVER_REFERENCES_HINT: &str = "Shift+F12";
 
-/// Width of the minimap marks strip on the editor's right edge
-/// (`docs/spec-editor-chrome.md`: "~14px").
-const MINIMAP_WIDTH: Pixels = px(14.0);
+/// Width of the minimap marks strip on the editor's right edge. Widened from
+/// the original "~14px" (`docs/spec-editor-chrome.md`) — that width left
+/// barely any room for line-length marks to vary, making the strip unreadable
+/// (#600). Still a marks strip, not a pixel-perfect code render.
+const MINIMAP_WIDTH: Pixels = px(32.0);
 
 /// Maximum number of line-length sample rows painted in the minimap. Caps the
 /// per-render work so a very large buffer stays cheap — the strip is only a few
@@ -316,14 +318,15 @@ const MINIMAP_WIDTH: Pixels = px(14.0);
 const MINIMAP_SAMPLES: usize = 1024;
 
 /// Height in pixels of a diagnostic mark painted over the minimap strip.
-const MINIMAP_DIAG_MARK_HEIGHT: f32 = 2.0;
+/// Thickened alongside the strip width (#600) so tints stay legible.
+const MINIMAP_DIAG_MARK_HEIGHT: f32 = 3.0;
 
 /// Minimum height in pixels of the minimap viewport slab, so it stays visible
 /// even when the buffer is far taller than the viewport.
 const MINIMAP_SLAB_MIN_HEIGHT: f32 = 6.0;
 
 /// Horizontal inset in pixels of the line-length marks from the strip's edges.
-const MINIMAP_MARK_INSET: f32 = 2.0;
+const MINIMAP_MARK_INSET: f32 = 3.0;
 
 // ── Internal state types ──────────────────────────────────────────────────────
 
@@ -2581,10 +2584,14 @@ impl Render for EditorView {
         // borrow is released before painting. Explicitly NOT a pixel-perfect
         // code render: marks are capped at `MINIMAP_SAMPLES`, positioned by
         // ratio, redrawn only on damage.
-        let mut minimap_mark_color = cx.theme().muted_foreground;
-        minimap_mark_color.a = 0.55;
+        // Bolder/higher-contrast than the original muted-foreground-at-.55 (#600):
+        // `foreground` reads clearly against the strip's `secondary` background at
+        // the widened size, while the slab keeps `accent` but a touch more opaque
+        // so it stays visually distinct from the length/diagnostic marks under it.
+        let mut minimap_mark_color = cx.theme().foreground;
+        minimap_mark_color.a = 0.65;
         let mut minimap_slab_color = cx.theme().accent;
-        minimap_slab_color.a = 0.20;
+        minimap_slab_color.a = 0.28;
         let minimap_data = {
             let input_state = tab.input.read(cx);
             let total = input_state.text().lines_len();

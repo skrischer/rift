@@ -108,6 +108,18 @@ pub struct WindowState {
     /// of the theme/geometry fields above (`docs/spec-source-control-write.md`,
     /// issue #547).
     pub diff_view_mode: DiffViewMode,
+    /// A user-selected UI font family override (the Appearance page's "UI
+    /// font" dropdown, `docs/spec-settings-theme.md`, issue #608), applied on
+    /// top of whatever the active theme's own `font.family` set. Empty means
+    /// "no override" — the active theme's font stands, exactly like a fresh
+    /// store predating this field.
+    pub ui_font_family: String,
+    /// A user-selected editor/status-bar/source-control mono font family
+    /// override (the "Editor & panes font" dropdown), same "empty means no
+    /// override" contract as [`WindowState::ui_font_family`]. Never applied to
+    /// the raw terminal PTY grid, which stays pinned to a Nerd Font variant
+    /// for its icon glyphs (`rift_terminal`'s `session_view`/`pane_view`).
+    pub mono_font_family: String,
 }
 
 impl Default for WindowState {
@@ -123,6 +135,8 @@ impl Default for WindowState {
             // rest of the store's tolerant load already promises.
             theme_mode: ThemeMode::Dark,
             diff_view_mode: DiffViewMode::default(),
+            ui_font_family: String::new(),
+            mono_font_family: String::new(),
         }
     }
 }
@@ -158,6 +172,26 @@ pub fn save_theme_mode(path: &Path, mode: ThemeMode) -> Result<(), StoreError> {
 pub fn save_diff_view_mode(path: &Path, mode: DiffViewMode) -> Result<(), StoreError> {
     let mut state = load(path);
     state.diff_view_mode = mode;
+    save(path, &state)
+}
+
+/// Persist a UI-font-family override into the store at `path`: a
+/// read-modify-write that updates only `ui_font_family`, leaving bounds/
+/// theme/mono-font/diff-view-mode already on disk untouched — mirrors
+/// [`save_diff_view_mode`]'s shape (issue #608). An empty `font_family`
+/// clears the override, reverting to the active theme's own font.
+pub fn save_ui_font_family(path: &Path, font_family: &str) -> Result<(), StoreError> {
+    let mut state = load(path);
+    state.ui_font_family = font_family.to_string();
+    save(path, &state)
+}
+
+/// Persist an editor/status-bar/source-control mono-font-family override,
+/// mirroring [`save_ui_font_family`]'s shape and empty-clears-the-override
+/// contract.
+pub fn save_mono_font_family(path: &Path, font_family: &str) -> Result<(), StoreError> {
+    let mut state = load(path);
+    state.mono_font_family = font_family.to_string();
     save(path, &state)
 }
 
@@ -419,6 +453,8 @@ mod tests {
             theme_name: "Default Light".to_string(),
             theme_mode: ThemeMode::Light,
             diff_view_mode: DiffViewMode::Split,
+            ui_font_family: "Inter".to_string(),
+            mono_font_family: "JetBrains Mono".to_string(),
         }
     }
 
@@ -449,6 +485,8 @@ mod tests {
         assert_eq!(parsed.theme_name, crate::DEFAULT_THEME_NAME);
         assert_eq!(parsed.theme_mode, ThemeMode::Dark);
         assert_eq!(parsed.diff_view_mode, DiffViewMode::Unified);
+        assert_eq!(parsed.ui_font_family, "");
+        assert_eq!(parsed.mono_font_family, "");
     }
 
     #[test]
@@ -500,6 +538,11 @@ mod tests {
         assert_eq!(parsed.theme_name, crate::DEFAULT_THEME_NAME);
         assert_eq!(parsed.theme_mode, ThemeMode::Dark);
         assert_eq!(parsed.diff_view_mode, DiffViewMode::Unified);
+        assert_eq!(
+            parsed.ui_font_family, "",
+            "a field this JSON predates falls back too"
+        );
+        assert_eq!(parsed.mono_font_family, "");
     }
 
     #[test]
@@ -706,6 +749,68 @@ mod tests {
 
         let loaded = load(&path);
         assert_eq!(loaded.diff_view_mode, DiffViewMode::Split);
+        assert_eq!(loaded.theme_name, crate::DEFAULT_THEME_NAME);
+        assert_eq!(loaded.bounds, Rect::default());
+    }
+
+    // --- font-family persistence (#608) -------------------------------------
+
+    #[test]
+    fn test_save_ui_font_family_updates_only_that_field_and_preserves_the_rest() {
+        let scratch = Scratch::new("save_ui_font_family");
+        let path = scratch.path("state.json");
+        let initial = sample_state();
+        save(&path, &initial).expect("initial save");
+
+        save_ui_font_family(&path, "Segoe UI").expect("save_ui_font_family");
+
+        let loaded = load(&path);
+        assert_eq!(loaded.ui_font_family, "Segoe UI");
+        assert_eq!(loaded.mono_font_family, initial.mono_font_family);
+        assert_eq!(loaded.theme_name, initial.theme_name);
+        assert_eq!(loaded.bounds, initial.bounds);
+        assert_eq!(loaded.font_size_px, initial.font_size_px);
+    }
+
+    #[test]
+    fn test_save_ui_font_family_on_missing_file_starts_from_defaults() {
+        let scratch = Scratch::new("save_ui_font_family_missing");
+        let path = scratch.path("does-not-exist.json");
+
+        save_ui_font_family(&path, "Inter").expect("save_ui_font_family");
+
+        let loaded = load(&path);
+        assert_eq!(loaded.ui_font_family, "Inter");
+        assert_eq!(loaded.theme_name, crate::DEFAULT_THEME_NAME);
+        assert_eq!(loaded.bounds, Rect::default());
+    }
+
+    #[test]
+    fn test_save_mono_font_family_updates_only_that_field_and_preserves_the_rest() {
+        let scratch = Scratch::new("save_mono_font_family");
+        let path = scratch.path("state.json");
+        let initial = sample_state();
+        save(&path, &initial).expect("initial save");
+
+        save_mono_font_family(&path, "Consolas").expect("save_mono_font_family");
+
+        let loaded = load(&path);
+        assert_eq!(loaded.mono_font_family, "Consolas");
+        assert_eq!(loaded.ui_font_family, initial.ui_font_family);
+        assert_eq!(loaded.theme_name, initial.theme_name);
+        assert_eq!(loaded.bounds, initial.bounds);
+        assert_eq!(loaded.font_size_px, initial.font_size_px);
+    }
+
+    #[test]
+    fn test_save_mono_font_family_on_missing_file_starts_from_defaults() {
+        let scratch = Scratch::new("save_mono_font_family_missing");
+        let path = scratch.path("does-not-exist.json");
+
+        save_mono_font_family(&path, "JetBrains Mono").expect("save_mono_font_family");
+
+        let loaded = load(&path);
+        assert_eq!(loaded.mono_font_family, "JetBrains Mono");
         assert_eq!(loaded.theme_name, crate::DEFAULT_THEME_NAME);
         assert_eq!(loaded.bounds, Rect::default());
     }
