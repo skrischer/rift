@@ -3492,9 +3492,11 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_apply_file_op_result_ok_rename_arms_pending_reveal_and_closes_editor(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn test_apply_file_op_result_ok_rename_arms_pending_reveal(cx: &mut gpui::TestAppContext) {
+        // The editor already closed optimistically on `commit_rename` — by
+        // the time its `FileOpResult` reply arrives, there is nothing left
+        // to close. This mirrors the real flow: `Enter` sends and closes,
+        // the daemon reply comes back later.
         let (tree, window) = open_tree(cx);
         window
             .update(cx, |_, window, cx| {
@@ -3506,6 +3508,16 @@ mod tests {
                     );
                     tree.selected = Some("src/main.rs".into());
                     tree.start_rename(window, cx);
+                    tree.rename
+                        .as_ref()
+                        .expect("editor open")
+                        .input
+                        .update(cx, |input, cx| {
+                            input.set_value("lib.rs", window, cx);
+                        });
+                    tree.commit_rename(window, cx);
+                    assert!(tree.rename.is_none(), "closed optimistically on commit");
+
                     tree.apply_file_op_result(
                         FileOp::Rename {
                             from: "src/main.rs".into(),
@@ -3524,7 +3536,7 @@ mod tests {
             let tree = tree.read(cx);
             assert!(
                 tree.rename.is_none(),
-                "a successful reply closes the editor"
+                "no editor is open once its own successful reply arrives"
             );
             assert_eq!(tree.pending_reveal.as_deref(), Some("src/lib.rs"));
         });
