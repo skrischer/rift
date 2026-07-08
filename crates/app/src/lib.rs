@@ -268,7 +268,7 @@ pub fn toggle_theme_mode_persisted(window: Option<&mut Window>, cx: &mut App) {
 
 // ── Font-family setters (issue #608) ─────────────────────────────────────────
 //
-// The Appearance page's "UI font" / "Editor & terminal font" dropdowns
+// The Appearance page's "UI font" / "Editor & panes font" dropdowns
 // (`crate::settings`) mutate `Theme::global`'s `font_family` /
 // `mono_font_family` directly rather than through `Theme::change` — no
 // `ThemeConfig`/color reapplication is needed, just the one field. `Root`'s

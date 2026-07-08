@@ -236,7 +236,7 @@ fn appearance_page(
                 // measurement; wiring that grid to this setting is out of this
                 // issue's scope.
                 SettingItem::new(
-                    "Editor & terminal font",
+                    "Editor & panes font",
                     SettingField::scrollable_dropdown(
                         mono_font_options,
                         |cx: &App| cx.theme().mono_font_family.clone(),
@@ -245,7 +245,7 @@ fn appearance_page(
                         },
                     ),
                 )
-                .description("Monospace for code and panes."),
+                .description("Monospace for the editor, status bar, and other dock panels (not the terminal PTY grid)."),
                 SettingItem::new(
                     "Font size",
                     SettingField::number_input(

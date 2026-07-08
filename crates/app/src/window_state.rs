@@ -115,7 +115,7 @@ pub struct WindowState {
     /// store predating this field.
     pub ui_font_family: String,
     /// A user-selected editor/status-bar/source-control mono font family
-    /// override (the "Editor & terminal font" dropdown), same "empty means no
+    /// override (the "Editor & panes font" dropdown), same "empty means no
     /// override" contract as [`WindowState::ui_font_family`]. Never applied to
     /// the raw terminal PTY grid, which stays pinned to a Nerd Font variant
     /// for its icon glyphs (`rift_terminal`'s `session_view`/`pane_view`).
