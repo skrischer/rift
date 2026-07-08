@@ -48,6 +48,8 @@
 | 29 | Explorer context menu — right-click action framework over the tree; ships the client-capable actions (open, reveal, copy path / relative path, reveal-in-terminal, collapse-all) | — | — |
 | 30 | Explorer file operations — create / rename / delete / move via a daemon write path, surfaced through the context menu + inline rename + drag & drop | — | — |
 | 31 | Explorer search & filter — in-panel fuzzy narrowing, jump-to-file quick-open, multi-select, keyboard-first navigation | — | — |
+| 32 | Session management — glanceable always-visible session list (see every session at once, click to jump), rename / reorder / kill / new operations; extends the phase-19 switcher (switch + new, click-to-open popover) into a full management surface | — | — |
+| 33 | Post-connect session picker — connect to the host first, then pick or create a session from the live list; de-hardcode the fixed default session name ("rift") baked into the connect card | — | — |
 
 A phase gets a Spec link once `/loopkit:plan` drafts it, and a Milestone link once
 it is `READY`. The milestone (open/closed + issue progress) is where status lives.
@@ -146,6 +148,44 @@ PR, never edited from here):
 
 Backing prior art: "Explorer overhaul — prior-art index (Phases 27–31)" in
 [prior-art.md](prior-art.md).
+
+## Session management (phases 32–33)
+
+Seeded 2026-07-08 from idea sparring (research mode: websearch). The shipped tmux
+session support — the phase-19 switcher, relocated into the phase-21 title-bar
+connection group — is **switch + new only**, behind a click-to-open popover;
+phase 19 explicitly deferred killing sessions from the picker (destructive) and
+never covered rename-in-UI or reorder. The connection screen (phase 20) still
+requires a session name up front — `DEFAULT_SESSION = "rift"` on the connect card
+(`crates/app/src/connection_screen.rs`), chosen before the SSH connect — with no
+"connect first, then pick from a live list" flow. This block turns tmux sessions
+into a first-class, manageable surface.
+
+Ordering is a chain: **32 (management surface + operations)** is the foundation
+**33 (post-connect picker)** reuses — 33 wires the same live list + create path
+into the connect flow, so 32 precedes 33.
+
+Foundation impact (authored and ratified in each phase's `/loopkit:plan` spec
+PR, never edited from here):
+
+- Phase 32 — `protocol` gains session-management messages (rename / kill) — a
+  deliberate, reviewed API extension (`docs/protocol.md`) mirroring phase 19's
+  `QuerySessionList` / `SessionListReply`; the daemon serves them via tmux
+  `rename-session` / `kill-session` under the existing correlated-command
+  mechanism (the same shape as phase-19's `new-session -A` create path).
+  **Reorder** is client-side ordering persisted locally (the window-state store
+  pattern, phase 9) — tmux has no native session order — so it needs no protocol
+  change. Killing the attached session surfaces the existing `TerminalExit` path.
+- Phase 33 — the connection flow evolves: the Connection screen's Session field
+  becomes optional and default-less, and a session-picker step sits between
+  connect and cockpit (connect to the host → live list → pick / create). This is
+  a deliberate change to the phase-20 "Connection screen is the startup state"
+  contract; whether it also touches `architecture.md`'s connection-flow section
+  is settled in phase 33's spec PR. De-hardcoding the fixed `"rift"` default is
+  part of this phase.
+
+Backing prior art: "Session management & post-connect picker — prior-art index
+(Phases 32–33)" in [prior-art.md](prior-art.md).
 
 ## Tracks (tooling/DX, not product phases)
 
