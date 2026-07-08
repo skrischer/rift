@@ -50,12 +50,18 @@ all client-side (no protocol or daemon change).
   the result surfaces via the churn-driven `SessionListReply` push
   (terminal.rs:461-473, :552-554) and, for a killed attached session, the existing
   `TerminalExit` path.
-- `terminal`/`app`: the glanceable management surface — every session shown at a
-  glance (placement resolved at the gate, see Prior decisions), each row carrying:
-  name, window count, attached dot (today's anatomy, session_view.rs:1462-1509),
-  plus a trailing action lane for inline rename and a confirm-guarded kill, and a
-  reorder affordance. The current-session row keeps its 2px primary bar. "+ New
-  session…" stays. Row click = `switch_to_session` (session_view.rs:867-878).
+- `terminal`/`app`: the glanceable management surface = an always-visible session
+  strip in the custom title bar's connection group (crates/app/src/title_bar.rs
+  `render_connection_group` :148-164 / workspace.rs :1399-1414), REPLACING the
+  phase-19 click-to-open popover (`render_session_switcher`,
+  session_view.rs:1416-1557). Sessions render as chips: name + attached/current
+  marker (the current chip keeps the 2px primary emphasis); click =
+  `switch_to_session` (session_view.rs:867-878); a per-chip hover / right-click
+  menu holds inline rename and a confirm-guarded kill; drag reorders the chips.
+  "+ New session…" stays as a trailing affordance. Reuses the phase-19/21 row
+  tokens (mono name 13px, muted window count, success attached dot, danger
+  kill-confirm). With the host's few sessions the strip fits the connection group
+  beside the window controls; it adds no dock panel.
 - `app`: a client-side session-order store — a new `session_order.rs` beside
   `recents.rs` (crates/app/src/recents.rs) reusing `window_state::state_dir`, a
   per-channel `"{channel}-session-order.json"` file, the same tolerant-load /
@@ -119,7 +125,7 @@ all client-side (no protocol or daemon change).
 | Target rename/kill by tmux session id (`$<n>`), not name; add `id` to `SessionListItem` | `SessionEntry.id` is rename-stable (protocol lib.rs:651); a name-targeted command races a concurrent rename. The app drops the id today (main.rs:1988) — restoring it is a client-model change, not a protocol one | 2026-07-08 |
 | Reorder = drag-to-order (a total user-set order), over a client-side per-channel order store (a `recents.rs` clone) keyed by session NAME, applied as a render-time sort over the server list | tmux has no session order; "reorder" means an explicit user-set order, so a total-order store (not a pin/favorite subset flag) is the honest model; the recents/window-state local-store pattern is the precedent (recents.rs:1-6). Name-keying survives a daemon restart that re-mints ids; a client-initiated rename renames the key too (slot preserved), only an external CLI rename re-slots. The store never mutates `SessionView.sessions` — replaced wholesale by the churn push (session_view.rs:822) | 2026-07-08 |
 | Kill is guarded by an inline confirm affordance | Phase 19 excluded kill-from-picker as "destructive; not in v1 UI"; adding it needs a mitigation so a stray click cannot nuke a session. Killing the attached session reuses the existing `TerminalExit` path — no new teardown | 2026-07-08 |
-| Glanceable surface — every session visible without a click-to-open step (Outcome); whether the click-popover is REMOVED or retained alongside, and the surface's home in the cockpit chrome | OPEN — resolved at the spec-acceptance gate | 2026-07-08 |
+| Glanceable surface = an always-visible session strip in the custom title bar (phase-21 connection group): chips, click = switch (current marked), rename / kill via a per-chip hover / right-click menu, drag = reorder; the phase-19 click-to-open popover is REMOVED | Spec-acceptance gate (2026-07-08): the few-session workflow (rift / rift-dev) wants glanceable-first with zero extra panel; the connection/session group already lives in the title bar, so the strip replaces the popover there rather than adding a dock panel that competes with the explorer for width. Rename/kill are compact by design (per-chip menu) | 2026-07-08 |
 
 ## Prior art
 
@@ -183,3 +189,15 @@ secrets, accounts, or external provisioning.
   roadmap's pre-planning "protocol gains rename/kill messages" foundation note is
   corrected in this phase's step-8 roadmap-update PR (no protocol change; reorder
   client-side).
+- 2026-07-08: Fresh-context review (PR #667): APPROVE, no blocking findings.
+  Adopted the non-blocking refinements — reorder fixed to drag-to-order (total
+  order, the store already implies it); an in-UI rename renames the order-store
+  key so the slot is preserved (only external CLI renames re-slot); silent
+  fire-and-forget rename/kill failure acknowledged in Risks (typed correlated
+  message is the upgrade path, not warranted now); expanded quoting-helper tests
+  (leading `-`, `'`, `$`, `#`); tightened the rename-indicator wording to the
+  attached session.
+- 2026-07-08: Spec-acceptance gate — the one open decision (glanceable-surface
+  placement) resolved to an always-visible title-bar session strip replacing the
+  phase-19 popover; rename/kill via a per-chip hover / right-click menu, drag to
+  reorder. Human prerequisites: none. Spec accepted.
