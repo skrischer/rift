@@ -384,6 +384,10 @@ impl Attach {
             // are answered per connection by `git_write::reply` (#544) and hunk
             // staging is parked on the shared loop (#545) — neither reaches the
             // terminal task, so both are a defensive no-op here.
+            // The file-operation requests (create/create-dir/rename/delete,
+            // #673) are likewise not terminal messages; their `std::fs`-backed
+            // handlers land in a follow-on issue — silently dropped here in
+            // the meantime, same convention.
             ClientMessage::Input { .. }
             | ClientMessage::Attach { .. }
             | ClientMessage::OpenFile { .. }
@@ -400,6 +404,10 @@ impl Attach {
             | ClientMessage::StageHunk { .. }
             | ClientMessage::DiscardFile { .. }
             | ClientMessage::Commit { .. }
+            | ClientMessage::CreateFile { .. }
+            | ClientMessage::CreateDir { .. }
+            | ClientMessage::RenamePath { .. }
+            | ClientMessage::DeletePath { .. }
             | ClientMessage::Hello { .. } => {}
         }
         Ok(())

@@ -1093,8 +1093,21 @@ where
                         // single loop (one document model + servers for the
                         // daemon), not per connection. Push-only — no reply here;
                         // diagnostics return on the shared broadcast bus.
+                        //
+                        // The file-operation requests (`docs/spec-explorer-file-ops.md`,
+                        // #673) are parked here too, pending their `std::fs`-backed
+                        // handlers (`crates/daemon/src/file_ops.rs`, a follow-on
+                        // issue) — the same "forward to the shared loop, no-op for
+                        // now" convention the source-control write channel used
+                        // between #543 and #544/#545. `Core::dispatch`'s
+                        // defensive no-op arm absorbs them until then; no
+                        // `FileOpResult` is sent yet.
                         ClientMessage::BufferChanged { .. }
-                        | ClientMessage::BufferClosed { .. } => {
+                        | ClientMessage::BufferClosed { .. }
+                        | ClientMessage::CreateFile { .. }
+                        | ClientMessage::CreateDir { .. }
+                        | ClientMessage::RenamePath { .. }
+                        | ClientMessage::DeletePath { .. } => {
                             if inbound.send(msg).await.is_err() {
                                 // Dispatch loop gone; nothing left to serve.
                                 break 'serve;
@@ -1653,6 +1666,13 @@ impl Core {
             // answered per connection by `git_write::reply` (request/response
             // back to that socket), so they never reach this loop; their arms
             // below are a defensive no-op.
+            //
+            // The file-operation requests (#673) DO reach this loop —
+            // `serve_connection` forwards them here alongside the live-buffer
+            // feed — but their `std::fs`-backed handlers land in a follow-on
+            // issue (`crates/daemon/src/file_ops.rs`), so they are absorbed as
+            // a silent no-op for now, same as the write ops were between #543
+            // and #544/#545.
             ClientMessage::Hello { .. }
             | ClientMessage::Attach { .. }
             | ClientMessage::Input { .. }
@@ -1672,7 +1692,11 @@ impl Core {
             | ClientMessage::UnstageFile { .. }
             | ClientMessage::StageHunk { .. }
             | ClientMessage::DiscardFile { .. }
-            | ClientMessage::Commit { .. } => {}
+            | ClientMessage::Commit { .. }
+            | ClientMessage::CreateFile { .. }
+            | ClientMessage::CreateDir { .. }
+            | ClientMessage::RenamePath { .. }
+            | ClientMessage::DeletePath { .. } => {}
         }
     }
 
