@@ -291,6 +291,27 @@ export RIFT_SSH_KEY := env("RIFT_SSH_KEY", home_directory() / ".ssh" / "id_rsa")
 # scans the project checkout instead of the SSH login dir ($HOME). Mirrors the
 # RIFT_SSH_KEY knob; `promote` bakes the RIFT_DEFAULT_PROJECT_ROOT fallback.
 export RIFT_PROJECT_ROOT := env("RIFT_PROJECT_ROOT", "/home/developer/CascadeProjects/rift")
+# Optional remote exec wrapper (docs/spec-remote-exec-wrapper.md) so the daemon
+# and tmux run one hop deeper than the SSH login — inside a container, a WSL
+# distro, or under a jump user — e.g. `RIFT_REMOTE_EXEC_WRAPPER="docker exec -i
+# devenv"`. Unset (the default) is byte-for-byte today's direct host connection.
+# `RIFT_REMOTE_EXEC_WRAPPER` (runtime) wins over a `RIFT_DEFAULT_REMOTE_EXEC_WRAPPER`
+# compile-time bake, mirroring the RIFT_SSH_KEY / RIFT_DEFAULT_SSH_KEY split.
+# Hard requirements when set:
+#   - the wrapper MUST carry `-i`, NEVER `-t` — the daemon transport is
+#     PTY-less binary framing; a TTY corrupts the frames.
+#   - `RIFT_PROJECT_ROOT` must be an absolute in-container path (e.g.
+#     `/workspace`), never `$HOME`-relative (`--root` is single-quoted
+#     literally, no `$HOME` expansion happens inside the container).
+#   - set `RIFT_DAEMON_REMOTE_DIR` to an absolute in-container dir when the
+#     image does not guarantee `$HOME` (`docker exec` runs no login shell, so
+#     an unset `$HOME` resolves the default `$HOME/.rift/bin` to `/.rift/bin`).
+#   - only coherent on the daemon terminal path (the default); do not combine
+#     with `RIFT_TERMINAL_LEGACY` — the legacy `tmux -CC` path is unwrapped and
+#     would attach to the host's tmux while the daemon watches the container.
+#   - scope it per-launch like RIFT_SSH_HOST/RIFT_PROJECT_ROOT, never `export`
+#     it in a shell profile, or a second plain-host/WSL instance inherits it
+#     and tries `docker exec` against a container that isn't there.
 # Local musl daemon binary to auto-deploy and attach to. Defaults to the musl
 # release build under target/; `dev`/`dev-windows` build it first (via the
 # release-daemon dependency) so the path is always valid. It is absolute so the
@@ -432,6 +453,10 @@ promote:
     # then reads/uploads the daemon and streams the terminal over it. The bake is
     # the Windows form of the WSL musl path (wslpath -w) so the native exe can read
     # it; runtime RIFT_DAEMON_BINARY still overrides. Mirrors the SSH-key bake.
+    # RIFT_DEFAULT_REMOTE_EXEC_WRAPPER (docs/spec-remote-exec-wrapper.md) could be
+    # baked here the same way as RIFT_DEFAULT_SSH_KEY, so the pinned stable exe
+    # targets a container with no runtime env — but it is intentionally NOT baked
+    # by default: the daily-driver stable channel targets the host directly.
     RIFT_DEFAULT_SSH_KEY="{{windows_ssh_key}}" \
     RIFT_DEFAULT_WORKDIR="$(wslpath -w /)" \
     RIFT_DEFAULT_PROJECT_ROOT="{{RIFT_PROJECT_ROOT}}" \

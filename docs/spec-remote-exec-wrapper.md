@@ -204,3 +204,9 @@ Each issue references this spec path in its body.
   `exec_capture`, and `upload_executable` all route through it via a new
   `remote_exec_wrapper` field set by `with_remote_exec_wrapper`.
   `open_pty`/`open_pty_exec` are untouched per scope.
+- 2026-07-09 (issue #764): app resolves `RIFT_REMOTE_EXEC_WRAPPER` runtime-over-
+  `RIFT_DEFAULT_REMOTE_EXEC_WRAPPER`-bake in `resolve_remote_exec_wrapper`
+  (`crates/app/src/main.rs`), mirroring the daemon-binary/project-root splits,
+  and threads it onto the connected `SshConnection` via `with_remote_exec_wrapper`
+  at the single `run_ssh_session` connect site; the `promote` bake is documented
+  but intentionally left unset by default.
