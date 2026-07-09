@@ -52,6 +52,7 @@
 | 33 | Post-connect session picker — connect to the host first, then pick or create a session from the live list; de-hardcode the fixed default session name ("rift") baked into the connect card | [spec-post-connect-picker.md](spec-post-connect-picker.md) | [Phase 330](https://github.com/skrischer/rift/milestone/50) |
 | 34 | Session start-directory — new panes / windows / sessions spawn in the session's project root (`-c` on new-session / new-window / split-window + `attach-session -c` to re-root a pre-existing session), replacing the `$HOME` landing; single-root (no per-session dynamize yet) | [spec-session-start-directory.md](spec-session-start-directory.md) | [Phase 340](https://github.com/skrischer/rift/milestone/52) |
 | 35 | Per-session project root — the daemon watched root follows the active session; the root is coupled to the tmux session via a session-scoped `@root` user option, resolved daemon-side on attach, superseding the single baked `RIFT_PROJECT_ROOT`; a session switch re-roots the reactive layer (file tree / git / LSP). session = project | [spec-per-session-project-root.md](spec-per-session-project-root.md) | [Phase 350](https://github.com/skrischer/rift/milestone/53) |
+| 36 | New-session remote root picker — creating a session picks its project root by browsing the remote filesystem (a daemon-side directory listing), binding session = project at creation: the name defaults to the folder basename and the root is written to `@root` (phase 35). Supersedes the zero-sessions picker screen — with no sessions, connecting opens the root picker directly | — | — |
 
 A phase gets a Spec link once `/loopkit:plan` drafts it, and a Milestone link once
 it is `READY`. The milestone (open/closed + issue progress) is where status lives.
@@ -196,7 +197,7 @@ PR, never edited from here):
 Backing prior art: "Session management & post-connect picker — prior-art index
 (Phases 32–33)" in [prior-art.md](prior-art.md).
 
-## Session ↔ project root coupling (phases 34–35)
+## Session ↔ project root coupling (phases 34–36)
 
 Seeded 2026-07-09 from idea sparring (research mode: websearch). Codifies the
 long-standing "tmux session = project" decision and picks up the three items the
@@ -215,7 +216,11 @@ the reactive layer on the old root.
 Ordering is a chain: **34 (start-directory)** is the single-root quick win that
 stops panes landing in `$HOME`; **35 (per-session root)** dynamizes the root and
 couples it to the session, and depends on both 34 and the session-management block
-(32–33) whose switch / list / pick flow it extends.
+(32–33) whose switch / list / pick flow it extends. **36 (remote root picker)**
+builds on 35: it adds the surface that *chooses* the root at session-creation
+time — a remote folder picker — so a new session is bound to a project the moment
+it is made; it depends on 35's `@root` substrate and reuses the phase-33
+post-connect picker flow and the phase-30 daemon-side filesystem access.
 
 Foundation impact (authored and ratified in each phase's `/loopkit:plan` spec PR,
 never edited from here):
@@ -233,6 +238,17 @@ never edited from here):
   session's `@root`. Ties to vision Scenario 2 (per-worktree diagnostics), but the
   simultaneous multi-pane explorer UI stays deferred; Phase 35 delivers only "root
   follows the active session" plus the daemon-side per-session substrate.
+- Phase 36 — `protocol` gains a remote directory-listing request/reply (browse a
+  path on the host → its dir entries + a git-repo flag). A deliberate, reviewed API
+  extension: the daemon's first filesystem *browse* read, executed daemon-side with
+  `std::fs::read_dir` (the Phase-30 file-op model, not client SFTP). No
+  `architecture.md` change beyond noting the browse capability — the per-session
+  context substrate is already Phase 35's foundation change. The UX decision ratified
+  in sparring (recorded in the spec's decision log at plan time): the picker
+  supersedes the zero-sessions empty-state screen (with no sessions, Connect opens
+  the picker directly; the session list shows only when sessions exist), the session
+  name defaults to the folder basename, and `RIFT_SESSION` stays the picker-skipping
+  fast-path.
 
 Open design decisions deferred to each phase's `/loopkit:plan` spec (never a
 roadmap guess): phase 34 — whether the root is set once via the session default
@@ -245,12 +261,15 @@ there is no dead data) and the daemon context depth (only the active context,
 re-scanned on switch — simpler — vs concurrent per-session contexts, which alone is
 correct when two app instances attach different sessions to the one shared daemon;
 recommendation: concurrent, since the single-root chokepoint is being touched
-regardless). No speculative root-switch hook is pre-baked into the in-flight
+regardless); phase 36 — where the browse starts (`$HOME` vs a phase-9 recents
+list), whether git repos are flagged and non-repo roots allowed, and the async
+per-level round-trip that must never block the UI. No speculative root-switch hook
+is pre-baked into the in-flight
 phase-32/33 work — the `SessionSwitchRequest → Attach` seam
 (`crates/app/src/main.rs`) is already the extension point Phase 35 plugs into.
 
 Backing prior art: "Session ↔ project root coupling — prior-art index
-(Phases 34–35)" in [prior-art.md](prior-art.md).
+(Phases 34–36)" in [prior-art.md](prior-art.md).
 
 ## Tracks (tooling/DX, not product phases)
 

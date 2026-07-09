@@ -586,13 +586,16 @@ distinct step between connect and cockpit or an optional-session connect card
 that lands on the picker when the field is left blank, and how a killed / renamed
 session racing the picker is reconciled.
 
-## Session ↔ project root coupling — prior-art index (Phases 34–35)
+## Session ↔ project root coupling — prior-art index (Phases 34–36)
 
 Per-phase prior-art for the session↔project-root block ([roadmap.md](roadmap.md)),
 same shape as the indexes above. Research mode: websearch (2026-07-09) — the
 session-scoped root-storage mechanism and the "one server, many per-context stores"
 daemon shape were topped up with focused lookups; the tmux control-mode plumbing
 resolves against Category 3 already catalogued. All licenses GPL-3.0-compatible.
+Phase 36 (remote root picker) was added 2026-07-09 with no fresh research — its
+browse capability resolves against the Zed remote-FS model (Category 8 #1) and
+rift's own Phase-30 daemon file-op precedent already catalogued.
 
 | Phase | Concern | Reference (repo + path) | License | Verdict |
 |---|---|---|---|---|
@@ -601,6 +604,8 @@ resolves against Category 3 already catalogued. All licenses GPL-3.0-compatible.
 | 35 | Session-scoped root storage (the coupling) | tmux **session user option** `@root`: `set -t <session> @root <path>`, query `display -p -t <session> '#{@root}'` — session-scoped, does not pollute the shell env ([tmux Advanced-Use wiki](https://github.com/tmux/tmux/wiki/Advanced-Use)); the session default working dir as a fallback signal; session **environment** (`set-environment -t`) as the rejected alternative | ISC | **reuse** — the `@root` user option is the clean, native, session-scoped coupling; no external project registry needed (tmux holds it). AVOID session-environment (leaks into child shells) and relying on a durable session-start-dir format var (tmux exposes per-pane `#{pane_current_path}`, not a stable session path) |
 | 35 | One server holding N project-root contexts + per-context LSP / git (the per-session daemon shape) | `zed` `HeadlessProject` → `WorktreeStore` holds **multiple** `Worktree` entities at once; `LspStore` / `GitStore` share that store and operate per-worktree ([Project & Worktrees, DeepWiki](https://deepwiki.com/zed-industries/zed/5.1-project-and-worktrees); Category 8 #1); rift's own single-root chokepoint (`crates/daemon/src/lib.rs` — workers spawned once at serve start) + the Phase-3.5 bind-at-spawn / shared-socket decision ([archive/spec-daemon-project-root.md](archive/spec-daemon-project-root.md)) | GPL-3.0 | **reference** — the target shape: the one shared daemon holds a session-keyed map of watched contexts (not a single global root re-scanned on switch), so two app instances attaching different sessions to the one daemon each get their own tree / git / LSP. Rejected: per-project daemon / socket (breaks the reattachable-single-daemon contract, #62 / dogfooding-channels) |
 | 35 | Which session → which root, across restarts + the connect flow | `zed` workspace persistence — root paths serialized per workspace in SQLite, `recent_project_workspaces` for the recents list ([Workspace Persistence, DeepWiki](https://deepwiki.com/zed-industries/zed/3.4-workspace-persistence)); rift's own recents / window-state store (phase 9) | GPL-3.0 | **reference / reuse own pattern** — the durable per-session root lives in tmux `@root`; the app keeps only a lightweight recents mapping (session → last-used root) for the connect / pick flow, reusing the phase-9 store — no bespoke external project-file format (Zed-style workspace files) |
+| 36 | Remote directory browsing — pick a project root on the host | `zed` remote model — the daemon owns the fs and enumerates directories server-side, clients are thin proxies (`HeadlessProject` / `WorktreeStore`, Category 8 #1); rift's own Phase-30 daemon file-op precedent (`std::fs` on the remote host via new `protocol` messages, not client SFTP); `sxyazi/yazi` russh-SFTP remote-fs provider (Category 5 #2, reference-only — rift's daemon already runs on the host, so `std::fs::read_dir`, not SFTP) | GPL-3.0 / MIT | **reference / reuse own pattern** — a new `protocol` dir-listing request/reply, executed daemon-side like the Phase-30 file ops; the picker is the UI over it. AVOID client-side SFTP (the daemon is already on the host) |
+| 36 | Folder picker → session (name = basename, git-aware, recents) | `joshmedeski/sesh` + `*/tmux-sessionizer` (folder / git repo → session in its dir, basename as the name — already cited for 34/35); `zed` "Open Folder" + `recent_project_workspaces` recents ([Workspace Persistence, DeepWiki](https://deepwiki.com/zed-industries/zed/3.4-workspace-persistence), Category 8 #1) | MIT / GPL-3.0 | **reference (pattern)** — folder-basename default + a phase-9 recents list of recent roots; the picker replaces the zero-sessions empty-state (connect with no sessions opens it directly) and reuses the phase-33 post-connect picker as its entry surface |
 
 Open design decisions deferred to each phase's `/loopkit:plan` spec (never a
 roadmap guess): phase 34 — session default dir (set once, inherited) vs per-call
@@ -608,7 +613,10 @@ roadmap guess): phase 34 — session default dir (set once, inherited) vs per-ca
 phase 35 — the durable store (`@root` vs session dir vs app recents; recommendation
 `@root`, written + read in one phase) and the daemon context depth (active-only
 re-scan vs concurrent per-session contexts; recommendation concurrent, the only
-shape correct under two instances sharing one daemon). No root-switch hook is
+shape correct under two instances sharing one daemon); phase 36 — where the browse
+starts (`$HOME` vs a phase-9 recents list), whether non-git roots are allowed and
+git repos flagged, and whether the first-run picker pre-selects a sensible default
+vs always starting empty. No root-switch hook is
 pre-baked into the in-flight phase-32/33 work — the `SessionSwitchRequest → Attach`
 seam is already the extension point.
 
