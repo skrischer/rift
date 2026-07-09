@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::Arc;
 use std::time::Duration;
 
 mod browse;
@@ -20,7 +20,7 @@ use rift_protocol::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use tracing::{error, info, warn};
 
 /// Single source of truth for the daemon's observable worktree/git state.
@@ -197,6 +197,11 @@ const SERVE_READ_BUFFER: usize = 8 * 1024;
 /// never grow this without bound (its backpressure pauses the pane tmux-side).
 const TERMINAL_INBOUND_CAPACITY: usize = 256;
 const TERMINAL_OUTBOUND_CAPACITY: usize = 256;
+
+/// Per-connection resolved-root channel bound (#737, the Attach seam): at
+/// most one value in flight per attach, so this only needs to absorb a rapid
+/// re-attach without blocking the tmux read loop — see `terminal::RootResolved`.
+const ROOT_RESOLVED_CAPACITY: usize = 4;
 
 /// Per-connection navigation-reply channel bound (#482): the private inbox the
 /// LSP worker's spawned nav tasks send this connection's hover/definition/
@@ -944,18 +949,36 @@ impl NavStaleGate {
 /// watched project root, passed into this connection's `terminal_task` so a
 /// freshly created tmux session defaults to it instead of `$HOME`
 /// (`docs/spec-session-start-directory.md`); `None` in the rootless test call
-/// sites. Returns once the reader reaches EOF, the dispatch loop is gone, or the
+/// sites.
+///
+/// `context_map` is the shared, per-root [`ContextMap`] (#737, the Attach
+/// seam): `None` opts a caller out of re-rooting entirely (every test above
+/// that only exercises unrelated behavior); `Some` lets this connection
+/// follow the tmux session it attaches to. On each `Attach` whose session
+/// root resolves (`terminal::terminal_task`'s `RootResolved` signal, read off
+/// a dedicated internal channel this function owns), `inbound`/`events`/
+/// `state`/`nav_requests` above are REBOUND to the resolved root's acquired
+/// context, in the defined resolve -> acquire -> release-old -> snapshot
+/// order (`reroot_connection`), so the first `WorktreeSnapshot` after an
+/// `Attach` always carries the new root. `root` above (the connect-time
+/// default) and its context are never touched by this — they are this
+/// function's caller's own reference, acquired and released outside it,
+/// exactly as before #737; only a root a resolved `Attach` actually names is
+/// tracked and released by this connection itself.
+///
+/// Returns once the reader reaches EOF, the dispatch loop is gone, or the
 /// event bus closes.
 #[allow(clippy::too_many_arguments)]
 async fn serve_connection<R, W>(
     reader: R,
     mut writer: W,
-    inbound: mpsc::Sender<ClientMessage>,
+    mut inbound: mpsc::Sender<ClientMessage>,
     mut events: broadcast::Receiver<DaemonMessage>,
     mut state: watch::Receiver<State>,
-    nav_requests: Option<mpsc::Sender<NavRequest>>,
+    mut nav_requests: Option<mpsc::Sender<NavRequest>>,
     tmux_server: Option<String>,
     root: Option<PathBuf>,
+    context_map: Option<Arc<ContextMap>>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -990,13 +1013,23 @@ where
     // each rift client an independent attach (per-client size, flow control).
     let (terminal_in_tx, terminal_in_rx) = mpsc::channel(TERMINAL_INBOUND_CAPACITY);
     let (terminal_out_tx, mut terminal_out_rx) = mpsc::channel(TERMINAL_OUTBOUND_CAPACITY);
+    // The Attach seam (#737): `terminal_task` reports the resolved session
+    // root here once per attach; the branch below drives the re-root.
+    // `terminal_done` (below) guards both this and `terminal_out_rx` since
+    // their senders are dropped together when the terminal task ends.
+    let (root_resolved_tx, mut root_resolved_rx) = mpsc::channel(ROOT_RESOLVED_CAPACITY);
     let terminal = tokio::spawn(terminal::terminal_task(
         terminal_in_rx,
         terminal_out_tx,
         tmux_server,
         root,
+        root_resolved_tx,
     ));
     let mut terminal_done = false;
+    // The root this connection has itself acquired via a resolved `Attach`
+    // (as opposed to `root`/its context above, which the CALLER acquired and
+    // releases). `None` until the first `Attach` resolves a root.
+    let mut self_root: Option<PathBuf> = None;
 
     'serve: loop {
         tokio::select! {
@@ -1235,6 +1268,38 @@ where
                     None => terminal_done = true,
                 }
             }
+            // The Attach seam (#737): the terminal task resolved the attached
+            // session's root. Re-root this connection's reactive bindings to
+            // it, then replay a fresh snapshot so the FIRST one after Attach
+            // always carries the new root (guarded the same way and for the
+            // same reason as `terminal_out_rx` above — both channels' senders
+            // close together when the terminal task ends).
+            resolved = root_resolved_rx.recv(), if !terminal_done => {
+                match resolved {
+                    Some(Some(resolved_root)) => {
+                        if let Some(map) = context_map.as_ref() {
+                            reroot_connection(
+                                map,
+                                resolved_root,
+                                &mut self_root,
+                                &mut inbound,
+                                &mut events,
+                                &mut state,
+                                &mut nav_requests,
+                            )
+                            .await;
+                            if handshaken {
+                                snapshot_sent = write_snapshot(&mut writer, &state).await?;
+                            }
+                        }
+                    }
+                    // Resolution yielded no root (an empty `session_path` too
+                    // — should not happen for a live session); nothing to
+                    // re-root to, so the current context stays as is.
+                    Some(None) => {}
+                    None => terminal_done = true,
+                }
+            }
             // This connection's private navigation answers (#482), off the shared
             // bus: the LSP worker's nav task sends hover/definition/references/
             // document-symbol results here. Drop a superseded answer (the user
@@ -1257,6 +1322,21 @@ where
     // End this connection's tmux attach. The task then detaches the control
     // child (the tmux session persists) and exits.
     shutdown_terminal(terminal_in_tx, terminal_out_rx, terminal).await;
+
+    // Release the root THIS connection acquired for itself via a resolved
+    // `Attach` (#737), if any — `root`/its context above is the caller's own
+    // reference, untouched here. Drop every clone of it first (the same
+    // "drop before the final release" discipline `reroot_connection` and
+    // `ContextMap::release` document), so a self-root that happens to be the
+    // last reference tears down cleanly instead of hanging on its own
+    // still-held `inbound`.
+    if let (Some(map), Some(root)) = (context_map, self_root) {
+        drop(inbound);
+        drop(events);
+        drop(state);
+        drop(nav_requests);
+        map.release(&root).await;
+    }
 
     Ok(())
 }
@@ -1384,10 +1464,29 @@ struct ContextEntry {
 ///
 /// Keyed by the raw `PathBuf` an acquirer passes in — no canonicalization at
 /// this layer, matching [`Daemon::watch_worktree`]'s existing raw-root
-/// contract. Guarded by a plain [`std::sync::Mutex`]: this is a registry
-/// (create/look-up/refcount bookkeeping), not the shared mutable `State` the
-/// project's async guidance targets; no `.await` point is ever reached while
-/// the lock is held.
+/// contract; a caller that wants two spellings of one directory (a
+/// resolved-but-uncanonical `@root`/`session_path`, a trailing slash, a
+/// relative path) to share a context normalizes it BEFORE calling `acquire`
+/// (`reroot_connection` does this for the Attach seam, #737).
+///
+/// Guarded by a [`tokio::sync::Mutex`] — deliberately, not a
+/// [`std::sync::Mutex`] — because of a concurrency gap #736's review
+/// surfaced and #737 closes: the old `std::sync::Mutex` version dropped the
+/// lock BEFORE awaiting the last release's dispatch-loop join, so a
+/// concurrent `acquire` for the SAME root landing in that window built a
+/// SECOND live context (a second rust-analyzer) while the first was still
+/// tearing down — exactly the RAM duplication this registry exists to
+/// prevent. `release`'s last-reference path now tears its context down
+/// (drops it, then awaits the join) WHILE STILL HOLDING this lock, so any
+/// concurrent `acquire`/`release` — for this root or any other, since the
+/// lock is registry-wide, not per-root — blocks until that teardown fully
+/// completes; by the time it can look at the map, the old entry is gone AND
+/// its dispatch loop has already exited, so a re-acquire always builds a
+/// fresh context, never a duplicate. This trades finer-grained per-root
+/// locking for a much simpler, provably-correct scheme; at the connection
+/// counts this daemon serves (a handful, per `docs/spec-dogfooding-channels.md`)
+/// briefly serializing an unrelated root's acquire behind another root's
+/// teardown is not a real cost.
 #[derive(Default)]
 pub struct ContextMap {
     entries: Mutex<HashMap<PathBuf, ContextEntry>>,
@@ -1404,12 +1503,11 @@ impl ContextMap {
     /// context on a later acquire for the same root. Never fails: a bad or
     /// missing root degrades to a worktree-only or empty context and logs, via
     /// the same [`worktree_worker`] degradation path a directly-armed root
-    /// already goes through.
-    pub fn acquire(&self, root: PathBuf) -> Context {
-        let mut entries = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+    /// already goes through. `async` (unlike #736's original sync version) so
+    /// this can wait out a concurrent last-release's in-flight teardown
+    /// rather than race it — see the struct doc comment.
+    pub async fn acquire(&self, root: PathBuf) -> Context {
+        let mut entries = self.entries.lock().await;
         if let Some(entry) = entries.get_mut(&root) {
             entry.refcount += 1;
             return entry.context.clone();
@@ -1437,33 +1535,99 @@ impl ContextMap {
 
     /// Release one reference to `root`'s context. A root with no live entry
     /// (already fully released, or never acquired) is a no-op. On the last
-    /// release the entry is removed from the map, dropping the registry's own
-    /// `Context` clone; this then awaits that loop's task to completion, so a
-    /// caller that just dropped its own last handle can rely on the context
-    /// being fully torn down once this returns. A dispatch task that panicked
-    /// is logged, not propagated — an internal teardown detail degrades
-    /// rather than failing the releasing caller.
+    /// release the entry is removed from the map and torn down — its
+    /// registry-owned `Context` clone dropped, then its dispatch loop's task
+    /// joined — WITHOUT releasing the registry lock in between (the
+    /// atomicity fix; see the struct doc comment), so a caller that just
+    /// dropped its own last handle can rely on the context being fully torn
+    /// down, with no concurrent duplicate possible, once this returns. A
+    /// dispatch task that panicked is logged, not propagated — an internal
+    /// teardown detail degrades rather than failing the releasing caller.
+    ///
+    /// The caller MUST have already dropped every clone of this root's
+    /// `Context`/handles it was holding before calling this on what it knows
+    /// to be the last reference: the dispatch loop only ends once ALL
+    /// `inbound` sender clones — not just the registry's own — have dropped,
+    /// so a lingering one held past this call hangs the join forever
+    /// (`reroot_connection` follows this discipline for the Attach seam,
+    /// #737).
     pub async fn release(&self, root: &Path) {
-        let task = {
-            let mut entries = match self.entries.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            let entry = match entries.get_mut(root) {
-                Some(entry) => entry,
-                None => return,
-            };
-            entry.refcount = entry.refcount.saturating_sub(1);
-            if entry.refcount > 0 {
-                return;
-            }
-            entries.remove(root).map(|entry| entry.task)
+        let mut entries = self.entries.lock().await;
+        let Some(entry) = entries.get_mut(root) else {
+            return;
         };
-        if let Some(task) = task {
-            if let Err(err) = task.await {
-                warn!(root = %root.display(), %err, "context dispatch loop ended with an error");
-            }
+        entry.refcount = entry.refcount.saturating_sub(1);
+        if entry.refcount > 0 {
+            return;
         }
+        let Some(entry) = entries.remove(root) else {
+            return;
+        };
+        // Still holding `entries`: the atomicity fix. Drop the registry's own
+        // `Context` clone (closing its `inbound` sender), then await the
+        // dispatch loop's join, all before releasing the lock.
+        drop(entry.context);
+        if let Err(err) = entry.task.await {
+            warn!(root = %root.display(), %err, "context dispatch loop ended with an error");
+        }
+    }
+}
+
+/// Re-root one connection's reactive bindings to `resolved_root`'s per-root
+/// [`Context`] — the Attach seam (#737, `docs/spec-per-session-project-root.md`).
+/// Called from `serve_connection`'s dispatch loop once `terminal::terminal_task`
+/// resolves an attached session's root: resolve (already done by the caller) ->
+/// acquire -> release-old, in that defined order, so `self_root`/`inbound`/
+/// `events`/`state`/`nav_requests` always land on a fully live context before
+/// this returns; the caller streams the fresh snapshot immediately after.
+///
+/// `resolved_root` is canonicalized first so two spellings of one directory (a
+/// raw `@root`/`session_path`, a trailing slash, a relative path, a symlink)
+/// key the SAME context rather than a second one — [`ContextMap`] itself stays
+/// keyed by the raw path an acquirer passes in (its own contract, #736), so
+/// normalizing before `acquire` is this caller's responsibility. Canonicalize
+/// failure (a since-removed directory, a permissions error) degrades to the
+/// raw path and logs, never aborts — `ContextMap::acquire` already degrades a
+/// bad root to an empty/worktree-only context on its own.
+///
+/// The new context is acquired BEFORE the previous one (if any) is released,
+/// so re-attaching the SAME root (a plain reconnect) never drops its refcount
+/// to zero and pays a teardown + rebuild for a root nothing else stopped
+/// referencing. `inbound`/`events`/`state`/`nav_requests` are fully replaced
+/// (and the new `Context` handle dropped) BEFORE the old root is released,
+/// satisfying [`ContextMap::release`]'s "caller must have already dropped its
+/// own clones" contract — the exact ordering #736's review flagged as
+/// otherwise hanging the last release's dispatch-join.
+async fn reroot_connection(
+    context_map: &ContextMap,
+    resolved_root: PathBuf,
+    self_root: &mut Option<PathBuf>,
+    inbound: &mut mpsc::Sender<ClientMessage>,
+    events: &mut broadcast::Receiver<DaemonMessage>,
+    state: &mut watch::Receiver<State>,
+    nav_requests: &mut Option<mpsc::Sender<NavRequest>>,
+) {
+    let canonical = match tokio::fs::canonicalize(&resolved_root).await {
+        Ok(canonical) => canonical,
+        Err(err) => {
+            warn!(
+                root = %resolved_root.display(),
+                %err,
+                "failed to canonicalize the resolved session root; keying the context map by the raw path"
+            );
+            resolved_root
+        }
+    };
+
+    let context = context_map.acquire(canonical.clone()).await;
+    *events = context.handles.subscribe();
+    *inbound = context.handles.inbound.clone();
+    *state = context.handles.state.clone();
+    *nav_requests = context.nav_requests.clone();
+    drop(context);
+
+    if let Some(previous) = self_root.replace(canonical) {
+        context_map.release(&previous).await;
     }
 }
 
@@ -1484,14 +1648,18 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    // A local, single-use registry: `serve` drives exactly one connection.
+    // Shared with `serve_connection` (#737) even though it drives only that
+    // one connection, because that connection's OWN `Attach` can still
+    // resolve a DIFFERENT session root mid-connection (a reconnect that picks
+    // another session) and re-root against this same registry.
+    let context_map = Arc::new(ContextMap::new());
     match worktree_root {
         Some(root) => {
-            // A local, single-use registry: `serve` drives exactly one
-            // connection, so this acquires the one root's context up front,
-            // exactly like the pre-context-map code did, and releases it
-            // below once that connection ends.
-            let context_map = ContextMap::new();
-            let context = context_map.acquire(root.clone());
+            // Acquires the one root's context up front, exactly like the
+            // pre-context-map code did, and releases it below once that
+            // connection ends.
+            let context = context_map.acquire(root.clone()).await;
             let events = context.handles.subscribe();
             let inbound = context.handles.inbound.clone();
             let state = context.handles.state.clone();
@@ -1513,6 +1681,7 @@ where
                 nav_requests,
                 None,
                 Some(root.clone()),
+                Some(context_map.clone()),
             )
             .await;
             // `serve_connection` dropped its `inbound` clone on return, making
@@ -1542,6 +1711,7 @@ where
                 nav_requests,
                 None,
                 None,
+                Some(context_map.clone()),
             )
             .await;
             // `serve_connection` dropped its `inbound` clone on return, so the
@@ -1644,12 +1814,14 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
     // Acquired once, up front, and held (never released) for the accept
     // loop's entire lifetime, so the dispatch loop and its `State` stay alive
     // even while no client is attached — exactly like the pre-context-map
-    // `handles`/`_dispatch` did. The single-root path stays a special case:
-    // per-connection acquire/release on `Attach` re-rooting is #737, not this.
-    let context_map = ContextMap::new();
+    // `handles`/`_dispatch` did. `context_map` itself is now shared with every
+    // accepted connection too (#737): each one's own `Attach` can resolve a
+    // DIFFERENT session root and re-root against the SAME registry, without
+    // disturbing this keep-warm reference.
+    let context_map = Arc::new(ContextMap::new());
     let connection_root = worktree_root.clone();
     let context = match worktree_root {
-        Some(root) => context_map.acquire(root),
+        Some(root) => context_map.acquire(root).await,
         None => standalone_context(),
     };
     let nav_requests = context.nav_requests.clone();
@@ -1673,6 +1845,7 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
         let state = context.handles.state.clone();
         let nav_requests = nav_requests.clone();
         let root = connection_root.clone();
+        let context_map = Arc::clone(&context_map);
         tokio::spawn(async move {
             if let Err(e) = serve_connection(
                 reader,
@@ -1683,6 +1856,7 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
                 nav_requests,
                 None,
                 root,
+                Some(context_map),
             )
             .await
             {
@@ -2153,6 +2327,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -2215,6 +2390,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
             }
@@ -2249,6 +2425,7 @@ mod tests {
                     inbound,
                     events,
                     state,
+                    None,
                     None,
                     None,
                     None,
@@ -2695,6 +2872,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await;
         });
@@ -2742,6 +2920,7 @@ mod tests {
                 inbound,
                 events,
                 state,
+                None,
                 None,
                 None,
                 None,
@@ -2833,6 +3012,7 @@ mod tests {
                 inbound,
                 events,
                 state,
+                None,
                 None,
                 None,
                 None,
@@ -2929,11 +3109,13 @@ mod tests {
         // Capacity 1: the attach's snapshot plus the pane's initial draw overrun
         // it, so the task parks on a send with nobody reading.
         let (out_tx, out_rx) = mpsc::channel(1);
+        let (root_resolved_tx, _root_resolved_rx) = mpsc::channel(4);
         let handle = tokio::spawn(terminal::terminal_task(
             in_rx,
             out_tx,
             Some(server.0.clone()),
             None,
+            root_resolved_tx,
         ));
 
         in_tx
@@ -2987,6 +3169,7 @@ mod tests {
                 state,
                 None,
                 Some(tmux_name),
+                None,
                 None,
             )
             .await
@@ -3056,6 +3239,166 @@ mod tests {
             "serve_connection hung on disconnect during a flood"
         );
 
+        loop_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_serve_connection_attach_reroots_worktree_snapshot_to_the_resolved_session_root() {
+        // #737 end-to-end (the Attach seam): two real tmux sessions, each
+        // stamped with a DIFFERENT `@root`. Attaching to each in turn must
+        // re-root this connection's reactive layer — resolve -> acquire ->
+        // release-old -> snapshot — so the FIRST WorktreeSnapshot after each
+        // Attach carries THAT session's own root and tree, never the other's
+        // and never stale data left over from before the switch. `root: None`
+        // below: this connection has no connect-time default to fall back
+        // on, so the snapshots below can only have come from `Attach`.
+        let server = IsolatedTmux(format!("rift737e2e-{}", std::process::id()));
+        let tmp_a = TempDir::new("reroot-e2e-a");
+        let tmp_b = TempDir::new("reroot-e2e-b");
+        write_file(&tmp_a.path.join("a-only.txt"), "a");
+        write_file(&tmp_b.path.join("b-only.txt"), "b");
+
+        for (session, root) in [("sess-a", &tmp_a.path), ("sess-b", &tmp_b.path)] {
+            let status = std::process::Command::new("tmux")
+                .args(["-L", &server.0, "new-session", "-d", "-s", session])
+                .status()
+                .expect("tmux new-session");
+            assert!(status.success(), "tmux new-session {session} failed");
+            let status = std::process::Command::new("tmux")
+                .args([
+                    "-L",
+                    &server.0,
+                    "set-option",
+                    "-t",
+                    session,
+                    "@root",
+                    &root.to_string_lossy(),
+                ])
+                .status()
+                .expect("tmux set-option @root");
+            assert!(
+                status.success(),
+                "tmux set-option @root for {session} failed"
+            );
+        }
+
+        let context_map = Arc::new(ContextMap::new());
+        let (daemon, handles) = channels(64, 64);
+        let inbound = handles.inbound.clone();
+        let events = handles.subscribe();
+        let state = handles.state.clone();
+        let loop_handle = tokio::spawn(daemon.run());
+
+        let (client, server_io) = tokio::io::duplex(64 * 1024);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+
+        let tmux_name = server.0.clone();
+        let conn = tokio::spawn(async move {
+            serve_connection(
+                server_reader,
+                server_writer,
+                inbound,
+                events,
+                state,
+                None,
+                Some(tmux_name),
+                None,
+                Some(context_map),
+            )
+            .await
+        });
+
+        client_writer
+            .write_all(&hello_frame())
+            .await
+            .expect("hello");
+        client_writer.flush().await.expect("flush hello");
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(
+            read_daemon_message(&mut client_reader, &mut decoder).await,
+            DaemonMessage::Welcome {
+                version: PROTOCOL_VERSION,
+            }
+        );
+
+        async fn attach_and_read_snapshot(
+            client_writer: &mut (impl AsyncWrite + Unpin),
+            client_reader: &mut (impl AsyncRead + Unpin),
+            decoder: &mut FrameDecoder,
+            session: &str,
+        ) -> (String, Vec<String>) {
+            client_writer
+                .write_all(
+                    &encode_frame(&ClientMessage::Attach {
+                        session: session.to_owned(),
+                        root: None,
+                    })
+                    .expect("encode attach"),
+                )
+                .await
+                .expect("send attach");
+            client_writer.flush().await.expect("flush attach");
+
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut paths = Vec::new();
+                loop {
+                    // Terminal/layout traffic interleaves with the worktree
+                    // snapshot; only the snapshot matters here.
+                    if let DaemonMessage::WorktreeSnapshot {
+                        root,
+                        entries,
+                        final_chunk,
+                    } = read_daemon_message(client_reader, decoder).await
+                    {
+                        paths.extend(entries.into_iter().map(|e| e.path));
+                        if final_chunk {
+                            return (root, paths);
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("worktree snapshot after attach")
+        }
+
+        let (root_a, paths_a) = attach_and_read_snapshot(
+            &mut client_writer,
+            &mut client_reader,
+            &mut decoder,
+            "sess-a",
+        )
+        .await;
+        assert_eq!(
+            root_a,
+            std::fs::canonicalize(&tmp_a.path)
+                .expect("canonicalize root a")
+                .to_string_lossy()
+        );
+        assert_eq!(paths_a, ["a-only.txt"]);
+
+        let (root_b, paths_b) = attach_and_read_snapshot(
+            &mut client_writer,
+            &mut client_reader,
+            &mut decoder,
+            "sess-b",
+        )
+        .await;
+        assert_eq!(
+            root_b,
+            std::fs::canonicalize(&tmp_b.path)
+                .expect("canonicalize root b")
+                .to_string_lossy()
+        );
+        assert_eq!(
+            paths_b,
+            ["b-only.txt"],
+            "the snapshot after switching to sess-b must carry root B's tree, not A's"
+        );
+
+        drop(client_reader);
+        drop(client_writer);
+        let _ = tokio::time::timeout(Duration::from_secs(10), conn).await;
         loop_handle.abort();
     }
 
@@ -3830,6 +4173,7 @@ mod tests {
                     Some(nav),
                     None,
                     None,
+                    None,
                 )
                 .await
             })
@@ -3853,6 +4197,7 @@ mod tests {
                     events,
                     state,
                     Some(nav),
+                    None,
                     None,
                     None,
                 )
@@ -3960,6 +4305,7 @@ mod tests {
                     Some(nav_tx),
                     None,
                     None,
+                    None,
                 )
                 .await
             })
@@ -4040,6 +4386,7 @@ mod tests {
                     Some(nav),
                     None,
                     None,
+                    None,
                 )
                 .await
             })
@@ -4063,6 +4410,7 @@ mod tests {
                     events,
                     state,
                     Some(nav),
+                    None,
                     None,
                     None,
                 )
@@ -4259,8 +4607,8 @@ mod tests {
         let tmp_b = TempDir::new("ctxmap-distinct-b");
         let map = ContextMap::new();
 
-        let ctx_a = map.acquire(tmp_a.path.clone());
-        let ctx_b = map.acquire(tmp_b.path.clone());
+        let ctx_a = map.acquire(tmp_a.path.clone()).await;
+        let ctx_b = map.acquire(tmp_b.path.clone()).await;
         assert!(
             !ctx_a.handles.inbound.same_channel(&ctx_b.handles.inbound),
             "distinct roots must not share a dispatch loop"
@@ -4282,8 +4630,8 @@ mod tests {
         write_file(&tmp.path.join("tracked.txt"), "x");
         let map = ContextMap::new();
 
-        let ctx_1 = map.acquire(tmp.path.clone());
-        let ctx_2 = map.acquire(tmp.path.clone());
+        let ctx_1 = map.acquire(tmp.path.clone()).await;
+        let ctx_2 = map.acquire(tmp.path.clone()).await;
         assert!(
             ctx_1.handles.inbound.same_channel(&ctx_2.handles.inbound),
             "a second acquire for the same root must share the first's dispatch loop"
@@ -4319,7 +4667,7 @@ mod tests {
         let tmp = TempDir::new("ctxmap-teardown");
         let map = ContextMap::new();
 
-        let ctx = map.acquire(tmp.path.clone());
+        let ctx = map.acquire(tmp.path.clone()).await;
         let mut state = ctx.handles.state.clone();
         drop(ctx);
 
@@ -4339,5 +4687,240 @@ mod tests {
         let tmp = TempDir::new("ctxmap-unknown");
         let map = ContextMap::new();
         map.release(&tmp.path).await;
+    }
+
+    // ── ContextMap: the #736-review atomicity fix (#737) ────────────────────
+
+    /// Reacquiring a root whose sole reference was already fully released
+    /// (torn down) must build a brand new dispatch loop from scratch, never
+    /// resurrect the dead one — the "teardown-then-reacquire" case the #736
+    /// review named directly.
+    #[tokio::test]
+    async fn test_context_map_reacquire_after_full_teardown_builds_a_fresh_working_context() {
+        let tmp = TempDir::new("ctxmap-fresh");
+        write_file(&tmp.path.join("tracked.txt"), "x");
+        let map = ContextMap::new();
+
+        let ctx_1 = map.acquire(tmp.path.clone()).await;
+        let mut state_1 = ctx_1.handles.state.clone();
+        drop(ctx_1);
+        map.release(&tmp.path).await;
+        assert!(
+            state_1.changed().await.is_err(),
+            "the first context must be fully torn down before the reacquire below"
+        );
+
+        let ctx_2 = map.acquire(tmp.path.clone()).await;
+        let mut state_2 = ctx_2.handles.state.clone();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state_2.borrow_and_update().worktree.is_some() {
+                    break;
+                }
+                state_2
+                    .changed()
+                    .await
+                    .expect("the fresh context's state sender is alive");
+            }
+        })
+        .await
+        .expect("the fresh context completes its own scan within the timeout");
+
+        drop(ctx_2);
+        map.release(&tmp.path).await;
+    }
+
+    /// The atomicity fix itself: the last release tears its context down
+    /// WHILE HOLDING the registry lock, so a concurrent `acquire` — for this
+    /// root or any other, since the lock is registry-wide — cannot observe
+    /// the in-between state where the old entry is gone but its dispatch loop
+    /// has not yet exited (the exact RAM-duplication race the #736 review
+    /// surfaced). Proven directly by holding the lock ourselves — standing in
+    /// for an in-flight last-release teardown — and asserting a concurrent
+    /// `acquire` blocks until it is released.
+    #[tokio::test]
+    async fn test_context_map_acquire_blocks_while_the_registry_lock_is_held() {
+        let map = Arc::new(ContextMap::new());
+        let guard = map.entries.lock().await;
+
+        let tmp = TempDir::new("ctxmap-lockwait");
+        let root = tmp.path.clone();
+        let map_task = Arc::clone(&map);
+        let acquire_task = tokio::spawn(async move { map_task.acquire(root).await });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !acquire_task.is_finished(),
+            "acquire must block while a release's in-flight teardown holds the registry lock"
+        );
+
+        drop(guard);
+        let ctx = tokio::time::timeout(Duration::from_secs(5), acquire_task)
+            .await
+            .expect("acquire completes once the lock is released")
+            .expect("acquire task joins");
+
+        drop(ctx);
+        map.release(&tmp.path).await;
+    }
+
+    // ── reroot_connection: the Attach seam (#737) ────────────────────────────
+
+    /// A placeholder reactive binding to seed `reroot_connection`'s `&mut`
+    /// out-params with before any root has ever been resolved — mirrors
+    /// `serve_connection`'s own pre-`Attach` state, no `ContextMap` entry.
+    fn placeholder_bindings() -> (
+        mpsc::Sender<ClientMessage>,
+        broadcast::Receiver<DaemonMessage>,
+        watch::Receiver<State>,
+        Option<mpsc::Sender<NavRequest>>,
+    ) {
+        let placeholder = standalone_context();
+        let inbound = placeholder.handles.inbound.clone();
+        let events = placeholder.handles.subscribe();
+        let state = placeholder.handles.state.clone();
+        let nav_requests = placeholder.nav_requests.clone();
+        drop(placeholder);
+        (inbound, events, state, nav_requests)
+    }
+
+    /// The first `Attach` resolution in a connection's lifetime has no
+    /// previous self-acquired root to release: it only acquires, and the
+    /// rebound `state` observes the newly acquired context's own scan.
+    #[tokio::test]
+    async fn test_reroot_connection_first_attach_only_acquires() {
+        let tmp = TempDir::new("reroot-first");
+        let map = ContextMap::new();
+        let (mut inbound, mut events, mut state, mut nav_requests) = placeholder_bindings();
+        let mut self_root: Option<PathBuf> = None;
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            reroot_connection(
+                &map,
+                tmp.path.clone(),
+                &mut self_root,
+                &mut inbound,
+                &mut events,
+                &mut state,
+                &mut nav_requests,
+            ),
+        )
+        .await
+        .expect("reroot_connection completes within the timeout");
+
+        let expected = std::fs::canonicalize(&tmp.path).expect("canonicalize temp root");
+        assert_eq!(self_root, Some(expected.clone()));
+        assert!(
+            state.changed().await.is_ok(),
+            "state must now be bound to the freshly acquired context, not the placeholder"
+        );
+
+        drop(inbound);
+        drop(events);
+        drop(state);
+        drop(nav_requests);
+        map.release(&expected).await;
+    }
+
+    /// A switch to a different root acquires the new one BEFORE releasing
+    /// the previous self-acquired one (#736's "drop the old context before
+    /// the final release" contract) — this connection's only reference to
+    /// root A is torn down cleanly, without hanging on its own still-held
+    /// handles, and `self_root` lands on root B.
+    #[tokio::test]
+    async fn test_reroot_connection_switch_tears_down_the_previous_sole_reference() {
+        let tmp_a = TempDir::new("reroot-switch-a");
+        let tmp_b = TempDir::new("reroot-switch-b");
+        let map = ContextMap::new();
+        let (mut inbound, mut events, mut state, mut nav_requests) = placeholder_bindings();
+        let mut self_root: Option<PathBuf> = None;
+
+        reroot_connection(
+            &map,
+            tmp_a.path.clone(),
+            &mut self_root,
+            &mut inbound,
+            &mut events,
+            &mut state,
+            &mut nav_requests,
+        )
+        .await;
+        let mut state_a = state.clone();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            reroot_connection(
+                &map,
+                tmp_b.path.clone(),
+                &mut self_root,
+                &mut inbound,
+                &mut events,
+                &mut state,
+                &mut nav_requests,
+            ),
+        )
+        .await
+        .expect("switching roots must not hang releasing the previous sole reference");
+
+        let expected_b = std::fs::canonicalize(&tmp_b.path).expect("canonicalize root b");
+        assert_eq!(self_root, Some(expected_b.clone()));
+
+        let torn_down = tokio::time::timeout(Duration::from_secs(5), state_a.changed())
+            .await
+            .expect("root A's context must be torn down within the timeout");
+        assert!(
+            torn_down.is_err(),
+            "switching away from the sole reference to root A must tear its context down"
+        );
+
+        drop(inbound);
+        drop(events);
+        drop(state);
+        drop(nav_requests);
+        map.release(&expected_b).await;
+    }
+
+    /// A non-canonical spelling of an already-live root (here, a trailing
+    /// `/.`) must key the SAME context as the canonical spelling, never build
+    /// a second one — the map-key canonicalization requirement the #736
+    /// review raised.
+    #[tokio::test]
+    async fn test_reroot_connection_canonicalizes_the_key_so_two_spellings_share_one_context() {
+        let tmp = TempDir::new("reroot-canon");
+        let odd_spelling = tmp.path.join(".");
+        let expected = std::fs::canonicalize(&tmp.path).expect("canonicalize temp root");
+
+        let map = ContextMap::new();
+        let witness = map.acquire(expected.clone()).await;
+        let witness_inbound = witness.handles.inbound.clone();
+        drop(witness);
+
+        let (mut inbound, mut events, mut state, mut nav_requests) = placeholder_bindings();
+        let mut self_root: Option<PathBuf> = None;
+        reroot_connection(
+            &map,
+            odd_spelling,
+            &mut self_root,
+            &mut inbound,
+            &mut events,
+            &mut state,
+            &mut nav_requests,
+        )
+        .await;
+
+        assert_eq!(self_root, Some(expected.clone()));
+        assert!(
+            inbound.same_channel(&witness_inbound),
+            "a non-canonical spelling of an already-live root must share its context, never build a second one"
+        );
+
+        drop(inbound);
+        drop(events);
+        drop(state);
+        drop(nav_requests);
+        drop(witness_inbound);
+        map.release(&expected).await; // the witness's reference
+        map.release(&expected).await; // this connection's own reference
     }
 }
