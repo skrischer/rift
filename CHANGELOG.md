@@ -3,6 +3,21 @@
 All notable changes to rift are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## v1.2.1 — 2026-07-09 — Session strip fixes
+
+Fixes three regressions in the v1.2.0 title-bar session strip, found while
+dogfooding:
+
+- The strip lists the host's sessions immediately on connect — an initial
+  session-list query is now issued on cockpit entry, instead of the strip
+  staying empty until the first session change.
+- Clicking a session chip reliably switches sessions again. The per-chip
+  drag-to-reorder was fighting the title bar's own window-move drag: it hijacked
+  the click (so switching stopped working) and left the drag preview stuck to the
+  cursor after release. Reorder moves to explicit "Move left" / "Move right"
+  context-menu actions (persisted via the same client-side session-order store);
+  the chip body is click-to-switch only.
+
 ## v1.2.0 — 2026-07-09 — Session management & post-connect picker
 
 Makes tmux sessions a first-class, manageable surface and moves session choice to
