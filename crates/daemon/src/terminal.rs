@@ -71,9 +71,13 @@ const LAYOUT_QUERY: &str = "list-panes -s -F '#{window_id}\t#{window_index}\t#{w
 /// [`parse_session_line`]); the `#{...}` formats are single-quoted because the
 /// control parser treats an unquoted `#` as a comment (tmux-reference pitfall 9).
 /// `#{session_id}` (`$<n>`) is the rename-stable key; `#{session_attached}` is
-/// the attached-client count, folded to a bool at the parse.
-const SESSION_LIST_QUERY: &str =
-    "list-sessions -F '#{session_id}\t#{session_windows}\t#{session_attached}\t#{session_name}'";
+/// the attached-client count, folded to a bool at the parse. `#{@root}` — the
+/// durable per-session root stamp [`stamp_root_command`] writes at attach
+/// (`docs/spec-session-root-picker.md`) — sits right before `session_name`,
+/// same convention as [`ROOT_QUERY`]'s `session_path`: the field most likely
+/// to contain arbitrary characters (the user-renamable session name) stays
+/// last, so a picked filesystem path never displaces it.
+const SESSION_LIST_QUERY: &str = "list-sessions -F '#{session_id}\t#{session_windows}\t#{session_attached}\t#{@root}\t#{session_name}'";
 
 /// The `-F` format alone (no `list-sessions -F '...'` wrapper), for the
 /// pre-attach one-off query ([`query_session_list_detached`], #757), which runs
@@ -81,7 +85,7 @@ const SESSION_LIST_QUERY: &str =
 /// no surrounding shell quotes. MUST stay identical to the format embedded in
 /// [`SESSION_LIST_QUERY`] so both paths parse with [`parse_session_line`].
 const SESSION_LIST_FORMAT: &str =
-    "#{session_id}\t#{session_windows}\t#{session_attached}\t#{session_name}";
+    "#{session_id}\t#{session_windows}\t#{session_attached}\t#{@root}\t#{session_name}";
 
 /// One query that resolves the attached session's project root
 /// (`docs/spec-per-session-project-root.md`): `@root` — the durable stamp
@@ -1109,24 +1113,30 @@ fn parse_session_list(lines: &[String]) -> Vec<SessionEntry> {
         .collect()
 }
 
-/// Parse one tab-separated `$<id> <windows> <attached> <name>` line (see
-/// [`SESSION_LIST_QUERY`] for why tabs); `splitn(4, '\t')` keeps a session
-/// name containing tabs intact in the final field. `attached` is tmux's
-/// attached-client COUNT, folded to a bool.
+/// Parse one tab-separated `$<id> <windows> <attached> <root> <name>` line
+/// (see [`SESSION_LIST_QUERY`] for why tabs); `splitn(5, '\t')` keeps a
+/// session name containing tabs intact in the final field. `attached` is
+/// tmux's attached-client COUNT, folded to a bool. `root` is `#{@root}`
+/// (`docs/spec-session-root-picker.md`) — empty for a session never stamped
+/// by [`stamp_root_command`] — folded to `None`.
 fn parse_session_line(line: &str) -> Option<SessionEntry> {
-    let mut fields = line.splitn(4, '\t');
+    let mut fields = line.splitn(5, '\t');
     let id = fields.next()?.strip_prefix('$')?.parse().ok()?;
     let windows = fields.next()?.parse().ok()?;
     let attached = fields.next()?.parse::<u32>().ok()? > 0;
+    let root = fields.next()?;
+    let root = if root.is_empty() {
+        None
+    } else {
+        Some(root.to_owned())
+    };
     let name = fields.next()?.to_owned();
     Some(SessionEntry {
         id,
         name,
         windows,
         attached,
-        // `SESSION_LIST_QUERY` does not read `#{@root}` yet — a follow-on
-        // issue extends it and this constructor fills `root` from it.
-        root: None,
+        root,
     })
 }
 
@@ -1465,7 +1475,7 @@ mod tests {
 
     #[test]
     fn test_parse_session_line_full_fields() {
-        let parsed = parse_session_line("$3\t2\t1\trift").expect("parse");
+        let parsed = parse_session_line("$3\t2\t1\t\trift").expect("parse");
         assert_eq!(
             parsed,
             SessionEntry {
@@ -1482,7 +1492,7 @@ mod tests {
     fn test_parse_session_line_name_with_spaces_and_tabs_preserved() {
         // The name is the LAST field precisely so spaces and even tabs inside
         // it survive the split (the spec's malformed-name risk).
-        let parsed = parse_session_line("$0\t1\t0\tmy project\twith tab").expect("parse");
+        let parsed = parse_session_line("$0\t1\t0\t\tmy project\twith tab").expect("parse");
         assert_eq!(parsed.name, "my project\twith tab");
         assert!(!parsed.attached);
     }
@@ -1492,23 +1502,35 @@ mod tests {
         // `#{session_attached}` is a client COUNT: several attached clients
         // still mean "attached", zero means not.
         assert!(
-            parse_session_line("$0\t1\t2\trift")
+            parse_session_line("$0\t1\t2\t\trift")
                 .expect("parse")
                 .attached
         );
         assert!(
-            !parse_session_line("$0\t1\t0\trift")
+            !parse_session_line("$0\t1\t0\t\trift")
                 .expect("parse")
                 .attached
         );
     }
 
     #[test]
+    fn test_parse_session_line_root_set_yields_some() {
+        let parsed = parse_session_line("$0\t1\t1\t/home/dev/proj\trift").expect("parse");
+        assert_eq!(parsed.root, Some("/home/dev/proj".to_owned()));
+    }
+
+    #[test]
+    fn test_parse_session_line_root_empty_yields_none() {
+        let parsed = parse_session_line("$0\t1\t1\t\trift").expect("parse");
+        assert_eq!(parsed.root, None);
+    }
+
+    #[test]
     fn test_parse_session_line_malformed_returns_none() {
-        assert_eq!(parse_session_line("0\t1\t1\trift").map(|_| ()), None); // id no $
+        assert_eq!(parse_session_line("0\t1\t1\t\trift").map(|_| ()), None); // id no $
         assert_eq!(parse_session_line("$0\t1\t1").map(|_| ()), None); // too few fields
-        assert_eq!(parse_session_line("$0\tmany\t1\trift").map(|_| ()), None); // windows not numeric
-        assert_eq!(parse_session_line("$0\t1\tyes\trift").map(|_| ()), None); // attached not numeric
+        assert_eq!(parse_session_line("$0\tmany\t1\t\trift").map(|_| ()), None); // windows not numeric
+        assert_eq!(parse_session_line("$0\t1\tyes\t\trift").map(|_| ()), None); // attached not numeric
         assert_eq!(parse_session_line("$0 1 1 rift").map(|_| ()), None); // space-separated
         assert_eq!(parse_session_line("").map(|_| ()), None);
     }
@@ -1517,14 +1539,15 @@ mod tests {
     fn test_parse_session_list_skips_malformed_lines() {
         let lines = vec![
             "garbage".to_owned(),
-            "$0\t1\t1\trift".to_owned(),
-            "$5\t3\t0\tscratch".to_owned(),
+            "$0\t1\t1\t\trift".to_owned(),
+            "$5\t3\t0\t/home/dev/scratch\tscratch".to_owned(),
         ];
         let sessions = parse_session_list(&lines);
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].id, 0);
         assert_eq!(sessions[1].name, "scratch");
         assert!(!sessions[1].attached);
+        assert_eq!(sessions[1].root, Some("/home/dev/scratch".to_owned()));
     }
 
     #[test]

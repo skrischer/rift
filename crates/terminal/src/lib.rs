@@ -88,6 +88,12 @@ pub struct SessionListItem {
     pub windows: u32,
     /// Whether at least one client is attached to this session.
     pub attached: bool,
+    /// The session's project root (`rift_protocol::SessionEntry::root`,
+    /// `docs/spec-session-root-picker.md`), read from tmux's `@root` user
+    /// option. `None` for a session never stamped by the daemon's
+    /// `stamp_root_command` (created outside rift, or attached before the
+    /// per-session-root feature).
+    pub root: Option<String>,
 }
 
 /// A cockpit switch emitted by the session switcher: re-attach this client to

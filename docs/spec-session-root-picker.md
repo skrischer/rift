@@ -486,3 +486,18 @@ that traces back here (planning gate).
   builds and tests the surface + its browse state, tested headlessly via
   `#[gpui::test]` over a real `TestAppContext`/window (needed for the `InputState`
   name field), mirroring `file_tree.rs`'s `open_tree` harness.
+- 2026-07-10: Issue #770 implemented (per-session root display, no protocol
+  change — `SessionEntry.root` already existed from #766). `SESSION_LIST_QUERY`/
+  `SESSION_LIST_FORMAT` gained `#{@root}` positioned right before `session_name`
+  (not after it): `session_name` is the one truly free-form, user-renamable
+  field, so it keeps the "most-arbitrary-field-last" slot per
+  [`ROOT_QUERY`]'s existing convention (`#{@root}` before `#{session_path}`) —
+  `parse_session_line`'s `splitn` grew from 4 to 5 fields accordingly.
+  App-side, `SessionListItem`/`SessionRow` both gained `root: Option<String>`,
+  threaded from the daemon's `SessionEntry.root` with no re-derivation. Render
+  placement: the Phase-32 title-bar strip chip (fixed 24px single-line height)
+  shows the root as a small muted truncated label appended after the name on
+  the SAME line (mirroring the existing attached-dot/windows-caption
+  horizontal-secondary pattern) rather than growing chip height; the Phase-33
+  post-connect picker's vertical row (more space) shows it as a muted line
+  below the name. Both omit the label entirely for `root: None`.
