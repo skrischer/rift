@@ -210,8 +210,8 @@ struct HoveredLink {
 
 /// The scrollback search bar's live GPUI wiring: the query [`Input`] and its
 /// change/submit/blur subscription, paired with the pure match state.
-/// Mirrors [`crate::session_view`]'s `NewSessionPrompt`: blur cancels
-/// (closes the bar), Enter/Shift+Enter navigate matches.
+/// Mirrors [`crate::session_view`]'s `WindowRename`: blur cancels (closes
+/// the bar), Enter/Shift+Enter navigate matches.
 struct SearchPrompt {
     input: Entity<InputState>,
     state: SearchState,

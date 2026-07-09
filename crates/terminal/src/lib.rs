@@ -105,10 +105,18 @@ pub struct SessionListItem {
 /// a size *change*. Inert on the legacy tmux path (`RIFT_TERMINAL_LEGACY`):
 /// the receiver drops there, so a switch request goes nowhere (the legacy
 /// path is slated for removal, #285).
+/// `root` carries the create-with-root transport
+/// (`docs/spec-session-root-picker.md`, issue #769): `Some(picked)` when this
+/// switch is really a root-picker create (`SessionView::create_session_at_root`),
+/// re-sent as `Attach { session, root: Some(picked) }` so the daemon threads
+/// it into `new-session -c <picked>` and the `@root` stamp instead of its own
+/// configured root; `None` for every plain switch (an existing chip, or the
+/// command-palette switcher), preserving today's behavior unchanged.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionSwitchRequest {
     pub session: String,
     pub size: TermSize,
+    pub root: Option<String>,
 }
 
 /// A session-order mutation emitted by the title-bar strip (#686,
