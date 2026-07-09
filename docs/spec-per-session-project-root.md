@@ -254,3 +254,18 @@ Each issue references this spec path in its body.
   root resolution** (`display-message -p`, no `Attach` change), and **defer
   per-session-root display** (Phase 35 stays protocol-free). Human prerequisites:
   none. Status `DRAFT` → `READY`; milestone `Phase 350` created at acceptance.
+- 2026-07-09: Issue #735 implementation. Two narrow decisions not spelled out by
+  the spec's command sketch: (1) **`stamp_root_command` sends unconditionally on
+  every attach** (like `reroot_command`), not only when `new-session -A` actually
+  creates the session — tmux control mode gives no "did this create the session"
+  signal, and Phase 34's `reroot_command` already established the unconditional +
+  idempotent pattern for exactly this reason ("Phase 34 has exactly one root, so
+  sending this unconditionally on every attach is idempotent"); the same
+  reasoning carries to `@root` while the daemon still has one root. (2) **the
+  stamp targets the session explicitly (`set -t <session> @root <root>`)**,
+  unlike `reroot_command`'s no-target trick, per the spec's own literal command
+  sketch — both `session` and `root` are quoted with `quote_tmux_arg` and checked
+  for `\n`/`\r`. The resolve side (`ROOT_QUERY`, `resolve_session_root`) is wired
+  into `Attach::spawn`'s round trip and resolves-and-logs on every attach; nothing
+  downstream consumes the resolved value yet — that lands with #736/#737 (the
+  per-root context map and the re-root seam).
