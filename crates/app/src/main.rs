@@ -13,14 +13,17 @@ use std::thread;
 
 use anyhow::{Context as _, Result};
 use gpui::*;
-use gpui_component::{Root, TitleBar};
+use gpui_component::{ActiveTheme as _, Root, TitleBar};
 use gpui_component_assets::Assets;
 use rift_app::connection_screen::{
     ConnectError, ConnectRequest, ConnectionScreen, ConnectionScreenEvent, SessionIntent,
 };
 use rift_app::recents::RecentConnection;
+use rift_app::root_picker::{RootPicker, RootPickerEvent};
 use rift_app::session_picker::{SessionPicker, SessionPickerEvent};
-use rift_app::{apply_persisted_theme, recents, session_order, window_state, workspace};
+use rift_app::{
+    apply_persisted_theme, recents, root_picker, session_order, title_bar, window_state, workspace,
+};
 use rift_logging::{
     LogTarget, RotatingMakeWriter, SizedWriter, DEFAULT_MAX_BYTES, FORCE_CONSOLE_ENV,
 };
@@ -147,6 +150,18 @@ struct EditorChannels {
     /// (a reconnect resends it if the daemon is still unavailable); the
     /// workspace's notification dedups by id so this never stacks duplicates.
     daemon_unavailable_tx: flume::Sender<()>,
+    /// Root-picker browse requests (issue #769, `docs/spec-session-root-picker.md`):
+    /// every `ClientMessage::QueryDirEntries` either root picker (pre-cockpit
+    /// or in-cockpit) issues, forwarded onto the protocol verbatim by
+    /// `spawn_dir_browse_bridge`. Unlike the other reverse-path channels
+    /// above, this bridge is spawned early in `run_daemon_terminal` — before
+    /// any session is attached — since the pre-cockpit picker needs it.
+    dir_browse_rx: flume::Receiver<rift_protocol::ClientMessage>,
+    /// `DirEntriesReply` replies, routed by `consume_daemon_messages` to
+    /// whichever picker's owner (`Shell` for both the pre-cockpit and, via
+    /// `WorkspaceView::apply_dir_entries_reply`, the in-cockpit picker) is
+    /// currently showing.
+    dir_browse_reply_tx: flume::Sender<rift_protocol::DaemonMessage>,
 }
 
 /// The reconnect engine's cross-attempt state (#476): values that must
@@ -198,10 +213,25 @@ struct PickerChannels {
     /// the host) or the live list needs a human pick — the Shell swaps to
     /// `ScreenState::Picker` only for the latter.
     outcome_tx: flume::Sender<PickerOutcome>,
-    /// The user's pick (an existing session name or a fresh one to create),
-    /// sent by the Shell once [`rift_app::session_picker::SessionPickerEvent::Pick`]
-    /// fires. `run_daemon_terminal` blocks on this before the first `Attach`.
-    choice_rx: flume::Receiver<String>,
+    /// The user's pick, sent by the Shell once
+    /// [`rift_app::session_picker::SessionPickerEvent::Pick`] (an existing
+    /// row, `root: None`) or [`rift_app::root_picker::RootPickerEvent::Picked`]
+    /// (a create-with-root, issue #769) fires. `run_daemon_terminal` blocks
+    /// on this before the first `Attach`.
+    choice_rx: flume::Receiver<PickedSession>,
+}
+
+/// A resolved post-connect pick (issue #769,
+/// `docs/spec-session-root-picker.md`): the session name to attach and,
+/// for a root-picker create, the picked root — carried across
+/// [`PickerChannels::choice_rx`] into `run_daemon_terminal`'s first `Attach`.
+/// `root` is `None` for an existing-row pick (a plain attach); `Some(picked)`
+/// only for a fresh create-with-root, threaded verbatim into
+/// `ClientMessage::Attach.root`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PickedSession {
+    session: String,
+    root: Option<String>,
 }
 
 /// What [`await_session_pick`]'s live-list query resolved to (issue #707):
@@ -680,7 +710,26 @@ enum ScreenState {
     /// attach, only when the entry point's [`SessionIntent`] is `Pick`, or a
     /// `Preferred` name that is no longer present on the live host.
     Picker(Entity<SessionPicker>),
+    /// The post-connect root picker (issue #769,
+    /// `docs/spec-session-root-picker.md`): the entry point for every
+    /// create — the zero-sessions edge (superseding the session picker's
+    /// empty-list state) and the session picker's "+ New session..." footer
+    /// both land here.
+    RootPicker(RootPickerScreen),
     Workspace(Entity<workspace::WorkspaceView>),
+}
+
+/// [`ScreenState::RootPicker`]'s payload: the live picker entity plus the
+/// owner-side correlation guard (issue #769's review-flagged CRITICAL
+/// correctness fix — `RootPicker` itself tracks no in-flight path, so a
+/// stale/duplicate/out-of-order `DirEntriesReply` must never clobber the
+/// current level). `pending_browse` is the exact path last sent on
+/// `QueryDirEntries`, checked via [`root_picker::browse_reply_matches`]
+/// before a reply is fed back into `picker`.
+struct RootPickerScreen {
+    ssh_label: SharedString,
+    picker: Entity<RootPicker>,
+    pending_browse: Option<String>,
 }
 
 /// [`Shell::show_session_picker`]'s arguments, bundled to stay under clippy's
@@ -688,13 +737,34 @@ enum ScreenState {
 /// `sessions`, the pre-loaded client-side `order`) plus what a pick does next
 /// (`choice_tx` back to the daemon thread, the eagerly built `workspace` to
 /// swap to, and `recents` — the target to record a pick into, issue #707).
+/// `dir_browse_tx` and `state_path` ride along so a "+ New session..." pick
+/// can hand off straight into [`RootPickerLaunch`] (issue #769).
 struct PickerLaunch {
     ssh_label: SharedString,
     sessions: Vec<SessionListItem>,
     order: Vec<String>,
-    choice_tx: flume::Sender<String>,
+    choice_tx: flume::Sender<PickedSession>,
     workspace: Entity<workspace::WorkspaceView>,
     recents: Option<(PathBuf, RecentTarget)>,
+    dir_browse_tx: flume::Sender<rift_protocol::ClientMessage>,
+    state_path: Option<PathBuf>,
+}
+
+/// [`Shell::show_root_picker`]'s arguments (issue #769,
+/// `docs/spec-session-root-picker.md`), mirroring [`PickerLaunch`]: `sessions`
+/// is the live list known when the picker opened, used to disambiguate the
+/// picked basename before Create; `dir_browse_tx` sends `QueryDirEntries` for
+/// every `RootPickerEvent::Browse`; `state_path` seeds the picker's start
+/// level from the phase-9 recents-of-roots store and records a successful
+/// pick back into it.
+struct RootPickerLaunch {
+    ssh_label: SharedString,
+    sessions: Vec<SessionListItem>,
+    choice_tx: flume::Sender<PickedSession>,
+    workspace: Entity<workspace::WorkspaceView>,
+    recents: Option<(PathBuf, RecentTarget)>,
+    dir_browse_tx: flume::Sender<rift_protocol::ClientMessage>,
+    state_path: Option<PathBuf>,
 }
 
 /// The host/user/port/key identity for a recents entry (issue #707), captured
@@ -875,6 +945,21 @@ impl Shell {
         let (file_op_result_tx, file_op_result_rx) =
             flume::unbounded::<rift_protocol::DaemonMessage>();
         let (daemon_unavailable_tx, daemon_unavailable_rx) = flume::unbounded::<()>();
+        // Directory-browse channel (issue #769, `docs/spec-session-root-picker.md`):
+        // `dir_browse_tx` carries every `ClientMessage::QueryDirEntries` a root
+        // picker issues — the pre-cockpit `Shell`-owned one (a clone, captured
+        // below before the original moves into `WorkspaceChannels`) and the
+        // in-cockpit `WorkspaceView`-owned one alike, the single transport for
+        // both entry points. The bridge forwarding it onto the protocol is
+        // spawned early in `run_daemon_terminal` (before the post-connect
+        // picker phase, unlike the other reverse-path bridges below), so
+        // browsing works before any session is attached. `dir_browse_reply_rx`
+        // is drained by a Shell-owned loop (below) that routes each
+        // `DirEntriesReply` to whichever picker is currently showing —
+        // `WorkspaceChannels` gets no reply receiver of its own.
+        let (dir_browse_tx, dir_browse_rx) = flume::unbounded::<rift_protocol::ClientMessage>();
+        let (dir_browse_reply_tx, dir_browse_reply_rx) =
+            flume::unbounded::<rift_protocol::DaemonMessage>();
         // Post-connect picker coordination (#706/#707): the daemon thread
         // sends what its live-list query resolved to once on
         // `picker_outcome_tx` (a direct attach, or the list to show), and
@@ -882,7 +967,7 @@ impl Shell {
         // `SessionIntent::Preferred`/`Pick` (`run_daemon_terminal`'s own
         // check against the session watch).
         let (picker_outcome_tx, picker_outcome_rx) = flume::unbounded::<PickerOutcome>();
-        let (picker_choice_tx, picker_choice_rx) = flume::unbounded::<String>();
+        let (picker_choice_tx, picker_choice_rx) = flume::unbounded::<PickedSession>();
         // Fires once when the session pipeline this attempt spawned ends —
         // orderly exit, a canceled reconnect, or a non-retryable failure
         // (`run_session_with_reconnect`'s `end_reason`) — so the Shell can
@@ -967,6 +1052,8 @@ impl Shell {
                 file_op_rx,
                 file_op_result_tx,
                 daemon_unavailable_tx,
+                dir_browse_rx,
+                dir_browse_reply_tx,
             };
 
             let key_exists = ssh.key.exists();
@@ -1024,6 +1111,7 @@ impl Shell {
                     file_op_tx,
                     file_op_result_rx,
                     daemon_unavailable_rx,
+                    dir_browse_tx: dir_browse_tx.clone(),
                 },
                 state_path,
                 window,
@@ -1047,6 +1135,37 @@ impl Shell {
         })
         .detach();
 
+        // Directory-browse reply routing (issue #769,
+        // `docs/spec-session-root-picker.md`): every `DirEntriesReply` is
+        // dispatched to whichever picker currently owns the outstanding
+        // request — the pre-cockpit root picker (`ScreenState::RootPicker`)
+        // or the in-cockpit one hosted inside `WorkspaceView` — via
+        // `Shell::apply_dir_entries_reply`, rather than each picker draining
+        // its own receiver (only one `flume::Receiver` exists; it cannot be
+        // split across two independent consumers). Engine-attempt-scoped
+        // like the watcher above, for the same reason.
+        cx.spawn_in(window, async move |this, cx| loop {
+            let Ok(msg) = dir_browse_reply_rx.recv_async().await else {
+                break;
+            };
+            let rift_protocol::DaemonMessage::DirEntriesReply {
+                path,
+                parent,
+                entries,
+                error,
+            } = msg
+            else {
+                continue;
+            };
+            let result = this.update_in(cx, |shell, window, cx| {
+                shell.apply_dir_entries_reply(path, parent, entries, error, window, cx);
+            });
+            if result.is_err() {
+                break;
+            }
+        })
+        .detach();
+
         if is_fixed_intent {
             self.enter_workspace(workspace, window, cx);
         } else {
@@ -1064,6 +1183,7 @@ impl Shell {
                 .map(session_order::load)
                 .unwrap_or_default();
             let recents_path = self.recents_path.clone();
+            let state_path_for_picker = self.state_path.clone();
             cx.spawn_in(window, async move |this, cx| {
                 let Ok(outcome) = picker_outcome_rx.recv_async().await else {
                     return;
@@ -1082,6 +1202,29 @@ impl Shell {
                             shell.enter_workspace(workspace, window, cx);
                         });
                     }
+                    // Zero-sessions (issue #769, `docs/spec-session-root-picker.md`):
+                    // supersedes the session picker's empty-state list — with
+                    // no sessions on the host, connecting opens the root
+                    // picker directly rather than a picker with nothing to
+                    // pick and only the create affordance.
+                    PickerOutcome::ShowPicker(sessions) if sessions.is_empty() => {
+                        let recents = recents_path.map(|path| (path, recent_target));
+                        let _ = this.update_in(cx, |shell, window, cx| {
+                            shell.show_root_picker(
+                                RootPickerLaunch {
+                                    ssh_label,
+                                    sessions,
+                                    choice_tx: picker_choice_tx,
+                                    workspace,
+                                    recents,
+                                    dir_browse_tx,
+                                    state_path: state_path_for_picker,
+                                },
+                                window,
+                                cx,
+                            );
+                        });
+                    }
                     PickerOutcome::ShowPicker(sessions) => {
                         let recents = recents_path.map(|path| (path, recent_target));
                         let _ = this.update_in(cx, |shell, window, cx| {
@@ -1093,6 +1236,8 @@ impl Shell {
                                     choice_tx: picker_choice_tx,
                                     workspace,
                                     recents,
+                                    dir_browse_tx,
+                                    state_path: state_path_for_picker,
                                 },
                                 window,
                                 cx,
@@ -1127,18 +1272,44 @@ impl Shell {
             choice_tx,
             workspace,
             recents,
+            dir_browse_tx,
+            state_path,
         } = launch;
+        // Cloned before `SessionPicker::new` consumes the originals below —
+        // the "+ New session..." branch hands its own copy into
+        // `RootPickerLaunch` (issue #769).
+        let root_picker_ssh_label = ssh_label.clone();
+        let root_picker_sessions = sessions.clone();
         let picker = cx.new(|cx| SessionPicker::new(ssh_label, sessions, &order, window, cx));
         cx.subscribe_in(
             &picker,
             window,
-            move |this, _picker, event: &SessionPickerEvent, window, cx| {
-                let SessionPickerEvent::Pick(name) = event;
-                if let Some((path, target)) = &recents {
-                    target.record(path, name);
+            move |this, _picker, event: &SessionPickerEvent, window, cx| match event {
+                SessionPickerEvent::Pick(name) => {
+                    if let Some((path, target)) = &recents {
+                        target.record(path, name);
+                    }
+                    let _ = choice_tx.send(PickedSession {
+                        session: name.clone(),
+                        root: None,
+                    });
+                    this.enter_workspace(workspace.clone(), window, cx);
                 }
-                let _ = choice_tx.send(name.clone());
-                this.enter_workspace(workspace.clone(), window, cx);
+                SessionPickerEvent::NewSession => {
+                    this.show_root_picker(
+                        RootPickerLaunch {
+                            ssh_label: root_picker_ssh_label.clone(),
+                            sessions: root_picker_sessions.clone(),
+                            choice_tx: choice_tx.clone(),
+                            workspace: workspace.clone(),
+                            recents: recents.clone(),
+                            dir_browse_tx: dir_browse_tx.clone(),
+                            state_path: state_path.clone(),
+                        },
+                        window,
+                        cx,
+                    );
+                }
             },
         )
         .detach();
@@ -1148,6 +1319,128 @@ impl Shell {
         });
         self.screen = ScreenState::Picker(picker);
         cx.notify();
+    }
+
+    /// Open the root picker (issue #769, `docs/spec-session-root-picker.md`):
+    /// the entry point for every create — reached directly from the
+    /// zero-sessions edge or from the session picker's "+ New session..."
+    /// footer. Seeds the first browse from the phase-9 recents-of-roots store
+    /// (`launch.state_path`), falling back to `""` ($HOME). A
+    /// [`RootPickerEvent::Browse`] sends `QueryDirEntries` and records the
+    /// requested path as the outstanding one
+    /// ([`root_picker::browse_reply_matches`] guards the reply); a
+    /// [`RootPickerEvent::Picked`] disambiguates the name against the
+    /// picker-open-time live list, records the picked root in recents, sends
+    /// the choice to the daemon thread, and swaps to the cockpit.
+    fn show_root_picker(
+        &mut self,
+        launch: RootPickerLaunch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let RootPickerLaunch {
+            ssh_label,
+            sessions,
+            choice_tx,
+            workspace,
+            recents,
+            dir_browse_tx,
+            state_path,
+        } = launch;
+        let recent_roots = state_path
+            .as_deref()
+            .map(|path| window_state::load(path).recent_roots)
+            .unwrap_or_default();
+        let start = root_picker::start_path(&recent_roots);
+        let picker = cx.new(|cx| RootPicker::new(window, cx));
+        self.screen = ScreenState::RootPicker(RootPickerScreen {
+            ssh_label,
+            picker: picker.clone(),
+            pending_browse: Some(start.clone()),
+        });
+
+        cx.subscribe_in(
+            &picker,
+            window,
+            move |this, _picker, event: &RootPickerEvent, window, cx| match event {
+                RootPickerEvent::Browse(path) => {
+                    let _ = dir_browse_tx.try_send(rift_protocol::ClientMessage::QueryDirEntries {
+                        path: path.clone(),
+                    });
+                    if let ScreenState::RootPicker(screen) = &mut this.screen {
+                        screen.pending_browse = Some(path.clone());
+                    }
+                }
+                RootPickerEvent::Picked { root, name } => {
+                    let existing: Vec<String> = sessions
+                        .iter()
+                        .map(|session| session.name.clone())
+                        .collect();
+                    let session = root_picker::disambiguate_session_name(name, &existing);
+                    if let Some(path) = &state_path {
+                        if let Err(e) = window_state::record_recent_root(path, root) {
+                            warn!(%e, "failed to record recent root");
+                        }
+                    }
+                    if let Some((path, target)) = &recents {
+                        target.record(path, &session);
+                    }
+                    let _ = choice_tx.send(PickedSession {
+                        session,
+                        root: Some(root.clone()),
+                    });
+                    this.enter_workspace(workspace.clone(), window, cx);
+                }
+            },
+        )
+        .detach();
+
+        // Kick off the first browse — after subscribing, so the owner's
+        // `Browse` handler above (which sends `QueryDirEntries`) actually
+        // observes it; an emit before the subscription exists would be lost.
+        picker.update(cx, |picker, cx| picker.browse(start, cx));
+
+        let focus_handle = picker.focus_handle(cx);
+        window.defer(cx, move |window, cx| {
+            focus_handle.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Route a `DirEntriesReply` (issue #769) to whichever picker is
+    /// currently showing: the pre-cockpit root picker, applying the
+    /// [`root_picker::browse_reply_matches`] correlation guard directly, or
+    /// the in-cockpit `WorkspaceView`, which applies its own equivalent
+    /// guard. Any other screen (no root picker open) drops the reply — it
+    /// cannot belong to anything currently displayed.
+    fn apply_dir_entries_reply(
+        &mut self,
+        path: String,
+        parent: Option<String>,
+        entries: Vec<rift_protocol::DirEntry>,
+        error: Option<rift_protocol::DirBrowseError>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match &mut self.screen {
+            ScreenState::RootPicker(screen) => {
+                if !root_picker::browse_reply_matches(screen.pending_browse.as_deref(), &path) {
+                    return;
+                }
+                screen.pending_browse = None;
+                let picker = screen.picker.clone();
+                picker.update(cx, |picker, cx| {
+                    picker.apply_dir_entries_reply(path, parent, entries, error, window, cx);
+                });
+            }
+            ScreenState::Workspace(workspace) => {
+                let workspace = workspace.clone();
+                workspace.update(cx, |workspace, cx| {
+                    workspace.apply_dir_entries_reply(path, parent, entries, error, window, cx);
+                });
+            }
+            ScreenState::Connection(_) | ScreenState::Picker(_) => {}
+        }
     }
 
     /// Focus and show the cockpit — the SET fast-path's direct route out of
@@ -1185,11 +1478,39 @@ impl Shell {
     }
 }
 
+/// The post-connect root picker's full-screen chrome (issue #769): the same
+/// title bar + centered-card sandwich as [`rift_app::session_picker::SessionPicker`]
+/// (it is the sibling entry point, reached either directly from zero-sessions
+/// or from that picker's own footer) around [`RootPicker`]'s own card, which
+/// renders only its content, not a full screen of its own
+/// (`root_picker.rs`'s "presented as a modal/panel by the caller" contract).
+fn render_root_picker_screen(screen: &RootPickerScreen, cx: &mut App) -> AnyElement {
+    let connection =
+        title_bar::ConnectionGroup::connected(cx.theme().success, screen.ssh_label.clone());
+    let title_bar = title_bar::render(connection, None, None, cx);
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .bg(cx.theme().background)
+        .child(title_bar)
+        .child(
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(screen.picker.clone()),
+        )
+        .into_any_element()
+}
+
 impl Render for Shell {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         match &self.screen {
             ScreenState::Connection(screen) => screen.clone().into_any_element(),
             ScreenState::Picker(picker) => picker.clone().into_any_element(),
+            ScreenState::RootPicker(screen) => render_root_picker_screen(screen, cx),
             ScreenState::Workspace(workspace) => workspace.clone().into_any_element(),
         }
     }
@@ -1634,6 +1955,15 @@ async fn run_daemon_terminal(
     // fires (then the attach default is all there is to keep).
     let viewport_rx = watches.viewport.subscribe();
 
+    // Directory-browse request bridge (issue #769,
+    // `docs/spec-session-root-picker.md`): spawned here, before the
+    // session-resolution block below, rather than alongside the other
+    // reverse-path bridges further down (all spawned strictly after the
+    // first `Attach`) — the pre-cockpit root picker (reached from
+    // `await_session_pick`, below) needs to browse before any session is
+    // attached.
+    spawn_dir_browse_bridge(client_rx.clone(), editor.dir_browse_rx.clone());
+
     // Open this client's own tmux attach against the engine-tracked current
     // session (seeded end-to-end from the Connection screen's connect
     // request). The daemon answers with a
@@ -1641,7 +1971,7 @@ async fn run_daemon_terminal(
     // daemon channel died right behind the handshake — a transport death for
     // the reconnect engine, not an orderly end.
     let session = watches.session.borrow().clone();
-    let session = if session_is_unset(&session) {
+    let picked = if session_is_unset(&session) {
         // Post-connect session picker (#706/#707, `docs/spec-post-connect-picker.md`):
         // the entry point's intent was `Preferred`/`Pick`, so nothing survived
         // to this attach yet. Query the live host list and either attach a
@@ -1651,7 +1981,10 @@ async fn run_daemon_terminal(
         // Re-entered on every reconnect attempt while the watch stays unset
         // (SSH dropping before resolution re-shows the picker instead of a
         // blind attach); the watch is seeded below so a later reconnect
-        // (after resolution) skips straight past this branch.
+        // (after resolution) skips straight past this branch. `picked.root`
+        // (the create-with-root transport, `docs/spec-session-root-picker.md`,
+        // issue #769) is `Some` only for a fresh root-picker create; `Attached`
+        // and every later reconnect never carry one.
         let picked = await_session_pick(
             &client,
             &editor,
@@ -1659,19 +1992,14 @@ async fn run_daemon_terminal(
             watches.preferred_session.as_deref(),
         )
         .await?;
-        watches.session.send_replace(picked.clone());
-        picked
+        watches.session.send_replace(picked.session.clone());
+        Some(picked)
     } else {
-        session
+        None
     };
+    let (session, root) = resolve_attach_session(session, picked);
     client
-        .send(ClientMessage::Attach {
-            session,
-            // The create-with-root transport (`docs/spec-session-root-picker.md`)
-            // is wired by the root-picker follow-on issue; this path never
-            // creates at a picked root.
-            root: None,
-        })
+        .send(ClientMessage::Attach { session, root })
         .await
         .context("failed to open daemon terminal attach")?;
     // Re-assert the last known grid behind the attach, exactly like the
@@ -1819,6 +2147,26 @@ fn resolve_preferred_session(
         .then(|| name.to_string())
 }
 
+/// The `(session, root)` pair for `run_daemon_terminal`'s first `Attach`
+/// (issue #769, `docs/spec-session-root-picker.md`): `picked` is `Some` only
+/// when `watches.session` was unset and `await_session_pick` resolved it
+/// (either a `Preferred` attach, `root: None`, or a root-picker create,
+/// `root: Some(picked)`); `None` when the watch was already set (a `Fixed`
+/// entry point, or a later reconnect), which always attaches with `root:
+/// None` — today's unchanged configured-root behavior. A pure function so
+/// this is unit-tested without a live daemon connection: the app-side half
+/// of `Attach.root`'s round-trip (the wire encoding itself is `protocol`'s
+/// own test).
+fn resolve_attach_session(
+    session: String,
+    picked: Option<PickedSession>,
+) -> (String, Option<String>) {
+    match picked {
+        Some(picked) => (picked.session, picked.root),
+        None => (session, None),
+    }
+}
+
 /// Pre-cockpit session pick (#706/#707): entered only when `watches.session`
 /// is unset. Issues `QuerySessionList` on the handshaken client and reuses
 /// [`consume_daemon_messages`]'s own routing table for everything else that
@@ -1846,7 +2194,7 @@ async fn await_session_pick(
     editor: &EditorChannels,
     picker: &PickerChannels,
     preferred: Option<&str>,
-) -> Result<String> {
+) -> Result<PickedSession> {
     use rift_protocol::ClientMessage;
 
     client
@@ -1867,13 +2215,16 @@ async fn await_session_pick(
         let _ = picker
             .outcome_tx
             .send(PickerOutcome::Attached(name.clone()));
-        return Ok(name);
+        return Ok(PickedSession {
+            session: name,
+            root: None,
+        });
     }
 
     let _ = picker.outcome_tx.send(PickerOutcome::ShowPicker(sessions));
 
     match consume_daemon_messages(client, None, editor, false, Some(&picker.choice_rx)).await {
-        StreamEnd::Picked(name) => Ok(name),
+        StreamEnd::Picked(picked) => Ok(picked),
         _ => Err(anyhow::Error::new(rift_ssh::SshError::Channel(
             "daemon stream closed while awaiting the session pick".to_string(),
         ))),
@@ -2511,7 +2862,7 @@ async fn consume_daemon_messages(
     terminal: Option<&TerminalSinks>,
     editor: &EditorChannels,
     capture_session_list: bool,
-    pick_rx: Option<&flume::Receiver<String>>,
+    pick_rx: Option<&flume::Receiver<PickedSession>>,
 ) -> StreamEnd {
     use rift_protocol::DaemonMessage;
 
@@ -2522,7 +2873,7 @@ async fn consume_daemon_messages(
                     msg = client.recv() => msg,
                     picked = rx.recv_async() => {
                         return match picked {
-                            Ok(name) => StreamEnd::Picked(name),
+                            Ok(picked) => StreamEnd::Picked(picked),
                             Err(_) => StreamEnd::Closed,
                         };
                     }
@@ -2672,6 +3023,16 @@ async fn consume_daemon_messages(
             msg @ DaemonMessage::FileOpResult { .. } => {
                 let _ = editor.file_op_result_tx.send(msg);
             }
+            // --- directory-browse reply -> whichever root picker is
+            // currently showing (issue #769, `docs/spec-session-root-picker.md`) ---
+            // Forwarded unconditionally in every mode (like `FileDiff`
+            // above), including during the pre-cockpit picker phase's own
+            // `consume_daemon_messages` calls (`await_session_pick`) — the
+            // pre-cockpit root picker needs its browse replies before any
+            // session is attached.
+            msg @ DaemonMessage::DirEntriesReply { .. } => {
+                let _ = editor.dir_browse_reply_tx.send(msg);
+            }
             other => debug!(?other, "daemon message without a consumer yet"),
         }
     }
@@ -2698,9 +3059,11 @@ enum StreamEnd {
     /// stream dying before the reply arrived.
     SessionListSent(Vec<SessionListItem>),
     /// The user picked (or created) a session while `pick_rx` was armed
-    /// (#706) — carries the chosen name so [`await_session_pick`]'s caller
-    /// can seed the engine's session watch before the first `Attach`.
-    Picked(String),
+    /// (#706) — carries the chosen name (and, for a root-picker create,
+    /// issue #769, the picked root) so [`await_session_pick`]'s caller can
+    /// seed the engine's session watch and thread the root into the first
+    /// `Attach`.
+    Picked(PickedSession),
 }
 
 /// The bridges' handle to the current daemon client: a `watch` receiver the
@@ -2764,6 +3127,29 @@ fn spawn_git_op_bridge(
     tokio::spawn(async move {
         while let Ok(msg) = git_op_rx.recv_async().await {
             debug!(op = ?msg, "sending git write op");
+            let client = client_rx.borrow().clone();
+            let _ = client.send(msg).await;
+        }
+    });
+}
+
+/// Forward every root picker's browse requests onto the protocol as
+/// [`rift_protocol::ClientMessage::QueryDirEntries`] (issue #769,
+/// `docs/spec-session-root-picker.md`): both the pre-cockpit and the
+/// in-cockpit root picker share this one bridge (their owners hold clones of
+/// the same sender), so the single transport is also a single reverse-path
+/// bridge. Spawned early in `run_daemon_terminal` — before any session is
+/// attached, unlike every other reverse-path bridge — since the pre-cockpit
+/// picker needs it. The reply (`DaemonMessage::DirEntriesReply`) returns
+/// through `consume_daemon_messages` on `editor.dir_browse_reply_tx`. Ends
+/// when the render-side channel closes.
+fn spawn_dir_browse_bridge(
+    client_rx: DaemonClientWatch,
+    dir_browse_rx: flume::Receiver<rift_protocol::ClientMessage>,
+) {
+    tokio::spawn(async move {
+        while let Ok(msg) = dir_browse_rx.recv_async().await {
+            debug!(request = ?msg, "sending directory-browse request");
             let client = client_rx.borrow().clone();
             let _ = client.send(msg).await;
         }
@@ -3041,7 +3427,10 @@ fn spawn_session_list_bridge(
 /// recovery re-attaches to the session the client is actually on (#475); a
 /// switch dropped mid-outage stays untracked — dropped, never buffered — and
 /// the resync restores the last session the daemon was actually asked for.
-/// Ends when the render-side channel closes.
+/// `req.root` (issue #769, `docs/spec-session-root-picker.md`) carries the
+/// in-cockpit root picker's create-with-root transport straight through —
+/// `Some` only for `SessionView::create_session_at_root`, `None` for every
+/// plain chip switch. Ends when the render-side channel closes.
 fn spawn_session_switch_bridge(
     client_rx: DaemonClientWatch,
     session_switch_rx: flume::Receiver<SessionSwitchRequest>,
@@ -3055,9 +3444,7 @@ fn spawn_session_switch_bridge(
             if client
                 .send(ClientMessage::Attach {
                     session: req.session.clone(),
-                    // A switch always targets an existing session; never
-                    // creates at a picked root.
-                    root: None,
+                    root: req.root.clone(),
                 })
                 .await
                 .is_err()
@@ -3283,8 +3670,9 @@ fn layout_to_snapshot(
 mod tests {
     use super::{
         drain_render_backlog, is_retryable_session_error, layout_to_snapshot,
-        resolve_preferred_session, session_is_unset, CaptureRequest, EditorChannels, EngineWatches,
-        PaneInput, PickerChannels, PtyChannels, SessionListItem, SessionSwitchRequest, TermSize,
+        resolve_attach_session, resolve_preferred_session, session_is_unset, CaptureRequest,
+        EditorChannels, EngineWatches, PaneInput, PickedSession, PickerChannels, PtyChannels,
+        SessionListItem, SessionSwitchRequest, TermSize,
     };
 
     #[test]
@@ -3296,6 +3684,38 @@ mod tests {
     fn test_session_is_unset_non_empty_name_is_set() {
         assert!(!session_is_unset("rift"));
         assert!(!session_is_unset("rift-dev"));
+    }
+
+    #[test]
+    fn test_resolve_attach_session_no_pick_reattaches_with_no_root() {
+        assert_eq!(
+            resolve_attach_session("rift".to_string(), None),
+            ("rift".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn test_resolve_attach_session_preferred_attach_carries_no_root() {
+        let picked = PickedSession {
+            session: "rift".to_string(),
+            root: None,
+        };
+        assert_eq!(
+            resolve_attach_session(String::new(), Some(picked)),
+            ("rift".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn test_resolve_attach_session_root_picker_create_carries_the_picked_root() {
+        let picked = PickedSession {
+            session: "agent".to_string(),
+            root: Some("/home/dev/agent".to_string()),
+        };
+        assert_eq!(
+            resolve_attach_session(String::new(), Some(picked)),
+            ("agent".to_string(), Some("/home/dev/agent".to_string()))
+        );
     }
 
     fn session_item(name: &str) -> SessionListItem {
@@ -3389,6 +3809,8 @@ mod tests {
         let (file_op_tx, file_op_rx) = flume::unbounded();
         let (file_op_result_tx, _) = flume::unbounded();
         let (daemon_unavailable_tx, _) = flume::unbounded();
+        let (_, dir_browse_rx) = flume::unbounded();
+        let (dir_browse_reply_tx, _) = flume::unbounded();
         BacklogHarness {
             ch: PtyChannels {
                 pane_output_tx,
@@ -3421,6 +3843,8 @@ mod tests {
                 file_op_rx,
                 file_op_result_tx,
                 daemon_unavailable_tx,
+                dir_browse_rx,
+                dir_browse_reply_tx,
             },
             watches: EngineWatches {
                 session: tokio::sync::watch::channel("rift".to_string()).0,
@@ -3476,6 +3900,7 @@ mod tests {
             .send(SessionSwitchRequest {
                 session: "elsewhere".into(),
                 size: TermSize { cols: 80, rows: 24 },
+                root: None,
             })
             .expect("send switch");
         h.open_file_tx
@@ -3583,6 +4008,7 @@ mod tests {
             .send(SessionSwitchRequest {
                 session: "elsewhere".into(),
                 size: TermSize { cols: 80, rows: 24 },
+                root: None,
             })
             .expect("send switch");
 

@@ -75,14 +75,16 @@ use flume::{Receiver, Sender};
 use gpui::{
     div, point, px, size, App, AppContext as _, Axis, Bounds, Context, Entity, FocusHandle,
     Focusable, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
-    SharedString, Styled as _, Window, WindowBounds,
+    SharedString, Styled as _, Subscription, Window, WindowBounds,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dialog::{AlertDialog, DialogButtonProps};
 use gpui_component::dock::{Dock, DockArea, DockItem, DockPlacement, PanelView};
 use gpui_component::notification::Notification;
 use gpui_component::{ActiveTheme as _, IconName, Root, Sizable as _, WindowExt as _};
-use rift_protocol::{ClientMessage, DaemonMessage, EntryKind, LspServerState};
+use rift_protocol::{
+    ClientMessage, DaemonMessage, DirBrowseError, DirEntry, EntryKind, LspServerState,
+};
 use rift_terminal::{SessionView, SessionViewEvent};
 use tracing::{debug, warn};
 
@@ -95,6 +97,7 @@ use crate::outline_panel::{OutlinePanel, OutlinePanelEvent};
 use crate::problems_panel::{ProblemsPanel, ProblemsPanelEvent};
 use crate::quick_open::{OpenQuickOpen, QuickOpen};
 use crate::results_panel::{ResultsPanel, ResultsPanelEvent};
+use crate::root_picker::{self, RootPicker, RootPickerEvent};
 use crate::settings::{OpenSettings, SettingsView};
 use crate::source_control::{SourceControlEvent, SourceControlPanel};
 use crate::status_bar;
@@ -203,6 +206,12 @@ const BOTTOM_DOCK_HEIGHT: f32 = 200.0;
 /// remaining right-dock height to the diff view below it.
 const SOURCE_CONTROL_SPLIT_HEIGHT: f32 = 180.0;
 
+/// Width of the in-cockpit root-picker dialog (issue #769,
+/// `docs/spec-session-root-picker.md`) — `RootPicker`'s own card is 470px
+/// (`root_picker::CARD_WIDTH`, private to that module); this leaves it a
+/// small margin inside the dialog chrome rather than matching exactly.
+const ROOT_PICKER_DIALOG_WIDTH: f32 = 520.0;
+
 /// Notification id marker for the daemon-unavailable banner (#619) — pushing
 /// with this type keeps a repeat signal (e.g. a reconnect that still finds no
 /// daemon) from stacking a second notification instead of replacing the first.
@@ -265,6 +274,16 @@ pub struct WorkspaceChannels {
     /// dead. Folded into a persistent, dismissible notification rather than
     /// only a log line, so the degraded session is visible on screen.
     pub daemon_unavailable_rx: Receiver<()>,
+    /// Root-picker browse requests (`docs/spec-session-root-picker.md`, issue
+    /// #769): every `ClientMessage::QueryDirEntries` the in-cockpit root
+    /// picker issues. The tokio side forwards it onto the protocol verbatim,
+    /// sharing the bridge the pre-cockpit root picker's own clone of this
+    /// sender also feeds (`main.rs`'s single directory-browse transport). The
+    /// `DirEntriesReply` reply does NOT come back on a matching receiver
+    /// here — `main.rs`'s `Shell` owns that single reply loop and calls
+    /// [`WorkspaceView::apply_dir_entries_reply`] directly, since only one of
+    /// the pre-/in-cockpit pickers is ever showing at a time.
+    pub dir_browse_tx: Sender<ClientMessage>,
 }
 
 /// The composed app root.
@@ -359,6 +378,28 @@ pub struct WorkspaceView {
     /// theme mode, named theme, and font scale, hosted as a `Root` dialog
     /// like `command_palette` above.
     settings_view: SettingsView,
+    /// Root-picker browse requests (`docs/spec-session-root-picker.md`, issue
+    /// #769): the tokio side forwards each onto the protocol verbatim,
+    /// sharing `main.rs`'s single directory-browse bridge with the
+    /// pre-cockpit picker.
+    dir_browse_tx: Sender<ClientMessage>,
+    /// The in-cockpit root picker's live state (issue #769), `None` when no
+    /// "+ New session..." dialog is open. A fresh [`RootPicker`] entity is
+    /// built on every open (mirroring `main.rs`'s `Shell` — never reused
+    /// across opens), so `pending_browse` — the owner-side correlation guard
+    /// [`root_picker::browse_reply_matches`] checks against every incoming
+    /// `DirEntriesReply` — always starts clean.
+    root_picker_session: Option<RootPickerSession>,
+}
+
+/// [`WorkspaceView::root_picker_session`]'s payload, mirroring `main.rs`'s
+/// `RootPickerScreen`: the live picker entity, the outstanding-request guard,
+/// and the subscription that keeps `picker`'s event stream alive for as long
+/// as the dialog is open.
+struct RootPickerSession {
+    picker: Entity<RootPicker>,
+    pending_browse: Option<String>,
+    _subscription: Subscription,
 }
 
 impl WorkspaceView {
@@ -388,6 +429,7 @@ impl WorkspaceView {
             file_op_tx,
             file_op_result_rx,
             daemon_unavailable_rx,
+            dir_browse_tx,
         } = channels;
 
         let file_tree = cx.new(|_| FileTree::new());
@@ -1009,8 +1051,17 @@ impl WorkspaceView {
         cx.subscribe_in(
             &session_view,
             window,
-            |this, _session_view, _event: &SessionViewEvent, window, cx| {
-                this.arm_window_state_save(window, cx);
+            |this, _session_view, event: &SessionViewEvent, window, cx| match event {
+                SessionViewEvent::FontSizeChanged { .. } => {
+                    this.arm_window_state_save(window, cx);
+                }
+                // The strip's "+ New session..." chip / the command
+                // palette's "New Session..." entry (issue #769,
+                // `docs/spec-session-root-picker.md`): open the root picker
+                // as a modal over the workspace.
+                SessionViewEvent::NewSessionRequested => {
+                    this.open_root_picker(window, cx);
+                }
             },
         )
         .detach();
@@ -1110,6 +1161,8 @@ impl WorkspaceView {
             window_state_path,
             window_state_save_generation: 0,
             settings_view,
+            dir_browse_tx,
+            root_picker_session: None,
         }
     }
 
@@ -1351,6 +1404,109 @@ impl WorkspaceView {
     /// Open the settings surface (issue #366) as a `Root` dialog.
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_view.open(window, cx);
+    }
+
+    /// Open the in-cockpit root picker (issue #769,
+    /// `docs/spec-session-root-picker.md`) as a modal `Root` dialog over the
+    /// workspace — the session strip's "+ New session..." chip and the
+    /// command palette's "New Session..." entry both route here via
+    /// [`SessionViewEvent::NewSessionRequested`]. A fresh [`RootPicker`]
+    /// entity is built on every open (never reused, mirroring `main.rs`'s
+    /// `Shell`), so its correlation guard always starts clean; its start
+    /// level seeds from the phase-9 recents-of-roots store. On `Picked`, the
+    /// name is disambiguated against `session_view`'s live list before
+    /// [`SessionView::create_session_at_root`] sends the create — the
+    /// single create-with-root transport this and the pre-cockpit picker
+    /// both use.
+    fn open_root_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let recent_roots = self
+            .window_state_path
+            .as_deref()
+            .map(|path| window_state::load(path).recent_roots)
+            .unwrap_or_default();
+        let start = root_picker::start_path(&recent_roots);
+        let picker = cx.new(|cx| RootPicker::new(window, cx));
+
+        let dir_browse_tx = self.dir_browse_tx.clone();
+        let window_state_path = self.window_state_path.clone();
+        let session_view = self.session_view.clone();
+        let subscription = cx.subscribe_in(
+            &picker,
+            window,
+            move |this, _picker, event: &RootPickerEvent, window, cx| match event {
+                RootPickerEvent::Browse(path) => {
+                    let _ = dir_browse_tx
+                        .try_send(ClientMessage::QueryDirEntries { path: path.clone() });
+                    if let Some(session) = this.root_picker_session.as_mut() {
+                        session.pending_browse = Some(path.clone());
+                    }
+                }
+                RootPickerEvent::Picked { root, name } => {
+                    let existing: Vec<String> = session_view
+                        .read(cx)
+                        .sessions()
+                        .iter()
+                        .map(|session| session.name.clone())
+                        .collect();
+                    let session_name = root_picker::disambiguate_session_name(name, &existing);
+                    if let Some(path) = &window_state_path {
+                        if let Err(e) = window_state::record_recent_root(path, root) {
+                            warn!(%e, "failed to record recent root");
+                        }
+                    }
+                    session_view.update(cx, |session, cx| {
+                        session.create_session_at_root(session_name, root.clone(), cx);
+                    });
+                    this.root_picker_session = None;
+                    window.close_dialog(cx);
+                }
+            },
+        );
+
+        // Set the session BEFORE kicking off the first browse below: the
+        // `Browse` handler above updates `this.root_picker_session`, so it
+        // must already exist by the time that emit is observed.
+        self.root_picker_session = Some(RootPickerSession {
+            picker: picker.clone(),
+            pending_browse: Some(start.clone()),
+            _subscription: subscription,
+        });
+        picker.update(cx, |picker, cx| picker.browse(start, cx));
+
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            dialog
+                .title("New session")
+                .w(px(ROOT_PICKER_DIALOG_WIDTH))
+                .child(picker.clone())
+        });
+    }
+
+    /// Route a `DirEntriesReply` to the in-cockpit root picker, if one is
+    /// open (issue #769) — called directly by `main.rs`'s `Shell`, which owns
+    /// the single reply-receiving loop shared with the pre-cockpit picker
+    /// (only one of the two is ever showing at a time). Applies the same
+    /// [`root_picker::browse_reply_matches`] correlation guard
+    /// `Shell::apply_dir_entries_reply` applies to its own picker.
+    pub fn apply_dir_entries_reply(
+        &mut self,
+        path: String,
+        parent: Option<String>,
+        entries: Vec<DirEntry>,
+        error: Option<DirBrowseError>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.root_picker_session.as_mut() else {
+            return;
+        };
+        if !root_picker::browse_reply_matches(session.pending_browse.as_deref(), &path) {
+            return;
+        }
+        session.pending_browse = None;
+        let picker = session.picker.clone();
+        picker.update(cx, |picker, cx| {
+            picker.apply_dir_entries_reply(path, parent, entries, error, window, cx);
+        });
     }
 
     /// Toggle light/dark mode (issue #367), keeping whichever named theme is
@@ -1684,9 +1840,9 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &SwitchSession, _window, cx| {
                 this.session_view.read(cx).open_session_switcher();
             }))
-            .on_action(cx.listener(|this, _: &NewSession, window, cx| {
+            .on_action(cx.listener(|this, _: &NewSession, _window, cx| {
                 this.session_view.update(cx, |session, cx| {
-                    session.open_new_session_prompt(window, cx);
+                    session.open_new_session_prompt(cx);
                 });
             }))
             .on_action(cx.listener(|this, _: &RefreshKeyTables, _window, cx| {
@@ -1865,6 +2021,7 @@ mod tests {
         let (file_op_tx, _file_op_rx) = flume::unbounded();
         let (_file_op_result_tx, file_op_result_rx) = flume::unbounded();
         let (_daemon_unavailable_tx, daemon_unavailable_rx) = flume::unbounded();
+        let (dir_browse_tx, _dir_browse_rx) = flume::unbounded();
         WorkspaceChannels {
             worktree_rx,
             buffer_rx,
@@ -1880,6 +2037,7 @@ mod tests {
             file_op_tx,
             file_op_result_rx,
             daemon_unavailable_rx,
+            dir_browse_tx,
         }
     }
 
@@ -2702,6 +2860,243 @@ mod tests {
                 workspace.read(cx).focus_handle(cx),
                 session_view.read(cx).focus_handle(cx),
                 "dismissing quick-open leaves the terminal focus delegation untouched"
+            );
+        })
+        .unwrap();
+    }
+
+    /// The in-cockpit root picker (issue #769,
+    /// `docs/spec-session-root-picker.md`): opening sets an active `Root`
+    /// dialog and an in-flight browse of the seeded start path, mirroring
+    /// the command palette / settings / quick-open dialogs above; closing it
+    /// leaves the workspace's focus delegation untouched.
+    #[gpui::test]
+    fn test_open_root_picker_opens_a_dialog_with_a_pending_seed_browse(cx: &mut TestAppContext) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let mut session_view: Option<Entity<SessionView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let view = cx.new(|cx| SessionView::new(cx).0);
+                session_view = Some(view.clone());
+                workspace =
+                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+        let session_view =
+            session_view.expect("session view constructed inside the window callback");
+
+        cx.update_window(window.into(), |_, window, cx| {
+            assert!(!window.has_active_dialog(cx));
+
+            workspace.update(cx, |view, cx| {
+                view.open_root_picker(window, cx);
+            });
+
+            assert!(
+                window.has_active_dialog(cx),
+                "opening the root picker opens a Root dialog"
+            );
+            assert_eq!(
+                workspace
+                    .read(cx)
+                    .root_picker_session
+                    .as_ref()
+                    .unwrap()
+                    .pending_browse,
+                Some(String::new()),
+                "no recent roots yet: the seed browse targets \"\" ($HOME)"
+            );
+            assert_eq!(
+                workspace.read(cx).focus_handle(cx),
+                session_view.read(cx).focus_handle(cx),
+                "opening the root picker does not move the terminal focus delegation"
+            );
+
+            window.close_dialog(cx);
+            assert!(!window.has_active_dialog(cx));
+        })
+        .unwrap();
+    }
+
+    /// The session strip's "+ New session..." chip and the command
+    /// palette's "New Session..." entry both call
+    /// `SessionView::open_new_session_prompt`, which only emits
+    /// `SessionViewEvent::NewSessionRequested` — `WorkspaceView`'s
+    /// subscription (wired in `new`) reacts by opening the root picker
+    /// (issue #769, `docs/spec-session-root-picker.md`).
+    #[gpui::test]
+    fn test_new_session_requested_event_opens_the_root_picker(cx: &mut TestAppContext) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let mut session_view: Option<Entity<SessionView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let view = cx.new(|cx| SessionView::new(cx).0);
+                session_view = Some(view.clone());
+                workspace =
+                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+        let session_view =
+            session_view.expect("session view constructed inside the window callback");
+
+        cx.update_window(window.into(), |_, _window, cx| {
+            assert!(workspace.read(cx).root_picker_session.is_none());
+            session_view.update(cx, |session, cx| {
+                session.open_new_session_prompt(cx);
+            });
+        })
+        .unwrap();
+
+        cx.update_window(window.into(), |_, _window, cx| {
+            assert!(
+                workspace.read(cx).root_picker_session.is_some(),
+                "NewSessionRequested opens the root picker"
+            );
+        })
+        .unwrap();
+    }
+
+    /// [`WorkspaceView::apply_dir_entries_reply`]'s correlation guard (issue
+    /// #769, `docs/spec-session-root-picker.md`): a reply whose path does
+    /// not match the outstanding browse is dropped without clearing
+    /// `pending_browse`; a matching reply clears it. The seed browse
+    /// (`""`) matches any resolved path (`root_picker::browse_reply_matches`),
+    /// so this drives the picker one level past it first — into a browse
+    /// whose requested path IS the reply's resolved path — to exercise a
+    /// genuine mismatch.
+    #[gpui::test]
+    fn test_apply_dir_entries_reply_drops_a_non_matching_path(cx: &mut TestAppContext) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let view = cx.new(|cx| SessionView::new(cx).0);
+                workspace =
+                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+
+        // Every step below runs as its own `update_window` call — subscriber
+        // callbacks (the `RootPickerEvent::Browse` handler that updates
+        // `pending_browse`) are only guaranteed observed once effects flush
+        // at the end of a top-level update, so triggering an emit and
+        // asserting its effect inside the SAME call (as the earlier dialog
+        // tests above do for state that needs no cross-entity round trip)
+        // would race the flush.
+        cx.update_window(window.into(), |_, window, cx| {
+            workspace.update(cx, |view, cx| {
+                view.open_root_picker(window, cx);
+            });
+        })
+        .unwrap();
+
+        // Resolve the seed level first, then descend into a child —
+        // `select_entry` is private to `root_picker`, so this reaches
+        // through the picker's own public `browse` instead, mirroring what a
+        // row click would do.
+        cx.update_window(window.into(), |_, window, cx| {
+            workspace.update(cx, |view, cx| {
+                view.apply_dir_entries_reply(
+                    "/home/dev".to_string(),
+                    None,
+                    Vec::new(),
+                    None,
+                    window,
+                    cx,
+                );
+            });
+        })
+        .unwrap();
+        cx.update_window(window.into(), |_, _window, cx| {
+            let picker = workspace
+                .read(cx)
+                .root_picker_session
+                .as_ref()
+                .unwrap()
+                .picker
+                .clone();
+            picker.update(cx, |picker, cx| {
+                picker.browse("/home/dev/project".to_string(), cx);
+            });
+        })
+        .unwrap();
+        cx.update_window(window.into(), |_, _window, cx| {
+            assert_eq!(
+                workspace
+                    .read(cx)
+                    .root_picker_session
+                    .as_ref()
+                    .unwrap()
+                    .pending_browse,
+                Some("/home/dev/project".to_string()),
+                "the child browse is now the outstanding request"
+            );
+        })
+        .unwrap();
+
+        // A stale/mismatched reply must not clobber it.
+        cx.update_window(window.into(), |_, window, cx| {
+            workspace.update(cx, |view, cx| {
+                view.apply_dir_entries_reply(
+                    "/some/other/path".to_string(),
+                    None,
+                    Vec::new(),
+                    None,
+                    window,
+                    cx,
+                );
+            });
+        })
+        .unwrap();
+        cx.update_window(window.into(), |_, _window, cx| {
+            assert_eq!(
+                workspace
+                    .read(cx)
+                    .root_picker_session
+                    .as_ref()
+                    .unwrap()
+                    .pending_browse,
+                Some("/home/dev/project".to_string()),
+                "a non-matching reply is dropped, the outstanding request survives"
+            );
+        })
+        .unwrap();
+
+        // The matching reply clears it.
+        cx.update_window(window.into(), |_, window, cx| {
+            workspace.update(cx, |view, cx| {
+                view.apply_dir_entries_reply(
+                    "/home/dev/project".to_string(),
+                    None,
+                    Vec::new(),
+                    None,
+                    window,
+                    cx,
+                );
+            });
+        })
+        .unwrap();
+        cx.update_window(window.into(), |_, _window, cx| {
+            assert_eq!(
+                workspace
+                    .read(cx)
+                    .root_picker_session
+                    .as_ref()
+                    .unwrap()
+                    .pending_browse,
+                None,
+                "the matching reply clears the outstanding request"
             );
         })
         .unwrap();

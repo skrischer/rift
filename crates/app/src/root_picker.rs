@@ -37,6 +37,54 @@ use rift_protocol::{DirBrowseError, DirEntry};
 /// precedent for small duplicated visual primitives.
 const CARD_WIDTH: f32 = 470.0;
 
+/// Whether an incoming `DirEntriesReply`'s resolved `path` answers the
+/// currently outstanding `QueryDirEntries` request (issue #769: the owner's
+/// correlation guard — `RootPicker` itself tracks no in-flight path, so a
+/// stale/duplicate/out-of-order reply, e.g. from a request abandoned when the
+/// owner closed and reopened a fresh picker, must never clobber the CURRENT
+/// level). `pending` is the exact path string the owner last sent on
+/// `QueryDirEntries` (`None` when nothing is outstanding, e.g. no browse has
+/// been issued yet, or the last reply was already consumed).
+///
+/// A plain equality check is exact for every non-seed request: every path
+/// after the first is built from a previously RESOLVED value
+/// (`current_path`/`parent`/a breadcrumb segment), so the daemon echoes it
+/// back unchanged. The one request whose resolution the client cannot
+/// predict up front is the seed (`""` or a `~`-prefixed recent root,
+/// resolving to `$HOME`) — matched unconditionally, since at most one such
+/// request is ever outstanding for a freshly opened picker.
+pub fn browse_reply_matches(pending: Option<&str>, reply_path: &str) -> bool {
+    match pending {
+        None => false,
+        Some(pending) => pending.is_empty() || pending.starts_with('~') || pending == reply_path,
+    }
+}
+
+/// Disambiguate a picked session `name` against `existing` live session names
+/// (`docs/spec-session-root-picker.md`'s create-with-root guarantee): tmux's
+/// `new-session -A -s <name>` attaches an existing session of that name
+/// instead of creating one — ignoring `-c` — so a picked root's basename
+/// colliding with a live session would silently land the create in, and
+/// re-stamp the `@root` of, an unrelated project. Returns `name` unchanged
+/// when it does not collide; otherwise appends the lowest `-<n>` (`n >= 2`)
+/// that is not itself already taken (`rift` -> `rift-2` -> `rift-3` ...). The
+/// owner calls this right before sending `Attach` on every
+/// [`RootPickerEvent::Picked`] — the client-side guarantee that a create
+/// never lands in an unrelated existing session.
+pub fn disambiguate_session_name(name: &str, existing: &[String]) -> String {
+    if !existing.iter().any(|session| session == name) {
+        return name.to_string();
+    }
+    let mut suffix = 2;
+    loop {
+        let candidate = format!("{name}-{suffix}");
+        if !existing.iter().any(|session| session == &candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
 /// Pick the picker's start level: the most-recently-picked root (the
 /// phase-9 `window_state` store's `recent_roots`, front = newest) if any,
 /// else an empty string — the daemon's own `QueryDirEntries` resolution of
@@ -525,6 +573,48 @@ mod tests {
     use gpui::TestAppContext;
 
     // --- pure helpers --------------------------------------------------------
+
+    #[test]
+    fn test_browse_reply_matches_none_pending_drops_every_reply() {
+        assert!(!browse_reply_matches(None, "/home/dev"));
+        assert!(!browse_reply_matches(None, ""));
+    }
+
+    #[test]
+    fn test_browse_reply_matches_exact_path_accepts_only_that_path() {
+        assert!(browse_reply_matches(Some("/home/dev"), "/home/dev"));
+        assert!(!browse_reply_matches(Some("/home/dev"), "/home/other"));
+    }
+
+    #[test]
+    fn test_browse_reply_matches_seed_request_accepts_any_resolved_path() {
+        assert!(browse_reply_matches(Some(""), "/home/dev"));
+        assert!(browse_reply_matches(Some("~"), "/home/dev"));
+        assert!(browse_reply_matches(
+            Some("~/projects"),
+            "/home/dev/projects"
+        ));
+    }
+
+    #[test]
+    fn test_disambiguate_session_name_no_collision_returns_name_unchanged() {
+        let existing = vec!["agent".to_string(), "tests".to_string()];
+        assert_eq!(disambiguate_session_name("rift", &existing), "rift");
+    }
+
+    #[test]
+    fn test_disambiguate_session_name_collision_appends_lowest_free_suffix() {
+        let existing = vec!["rift".to_string()];
+        assert_eq!(disambiguate_session_name("rift", &existing), "rift-2");
+
+        let existing = vec!["rift".to_string(), "rift-2".to_string()];
+        assert_eq!(disambiguate_session_name("rift", &existing), "rift-3");
+    }
+
+    #[test]
+    fn test_disambiguate_session_name_empty_existing_list_returns_name_unchanged() {
+        assert_eq!(disambiguate_session_name("rift", &[]), "rift");
+    }
 
     #[test]
     fn test_start_path_prefers_the_first_recent_root_else_falls_back_to_empty() {
