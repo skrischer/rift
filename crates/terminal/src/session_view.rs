@@ -1874,7 +1874,10 @@ impl SessionView {
                     .when(is_current, |el| el.bg(current_bg))
                     .hover(move |s| s.bg(current_bg))
                     .text_color(if is_current { fg } else { muted })
-                    .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                    // `on_click` (not `on_mouse_down`): GPUI suppresses the click
+                    // after a drag, so dragging a chip to reorder does not also
+                    // fire a session switch (which would reload the whole cockpit).
+                    .on_click(move |_event, _window, cx| {
                         row_entity.update(cx, |view, cx| {
                             view.switch_to_session(&name, cx);
                         });
