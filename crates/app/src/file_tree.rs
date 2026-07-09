@@ -105,8 +105,8 @@ const ROW_BLOCK_PADDING_Y: Pixels = px(4.0);
 /// row density.
 const ROW_RADIUS: Pixels = px(5.0);
 
-/// Gap between every row slot (chevron, icon, name, diagnostic dot, git
-/// letter), from the artboard's row density.
+/// Gap between every row slot (icon, name, diagnostic dot, git letter),
+/// from the artboard's row density.
 const ROW_SLOT_GAP: Pixels = px(6.0);
 
 /// Height of the `EXPLORER` header band, from the "Explorer — Redesign"
@@ -142,10 +142,11 @@ const INDENT_BASE: Pixels = px(8.0);
 /// shipped flat 14px-per-level indent.
 const INDENT_PER_LEVEL: f32 = 16.0;
 
-/// Fixed width of the reserved icon slot, between the chevron and the name —
+/// Fixed width of the reserved icon slot, the row's leading slot since the
+/// chevron twisty was removed (`docs/spec-explorer-polish.md`, #710) —
 /// sized to the artboard's icon glyph (`docs/spec-explorer-redesign.md`).
-/// Renders the mapped file-type / folder glyph ([`file_icons`]); unchanged
-/// from Phase 27 so no row re-layout follows (`docs/spec-explorer-icons.md`).
+/// Renders the mapped file-type glyph, or the open/closed folder glyph that
+/// is now the sole per-folder disclosure affordance ([`file_icons`]).
 const ICON_SLOT_WIDTH: Pixels = px(14.0);
 
 /// Diameter of the diagnostic-severity dot and the width of its slot in the
@@ -1026,6 +1027,17 @@ pub struct FileTree {
     /// as long as `filter_input` is `Some`; dropped (replaced by `None`)
     /// alongside it, mirroring `_rename_input_sub`.
     _filter_input_sub: Option<Subscription>,
+    /// Whole-tree collapse driven by clicking the fully-left workspace-root
+    /// row (`docs/spec-explorer-polish.md`, #710): a view-local flag,
+    /// distinct from the real per-folder `collapsed` set and from the
+    /// header's collapse-all/expand-all (`toggle_collapse_all`, which still
+    /// folds every directory while leaving root-level entries visible).
+    /// While `true`, [`FileTree::visible_rows`] short-circuits to an empty
+    /// list — hiding every root-level file and folder — without ever
+    /// reading or mutating `collapsed`; clearing it restores the exact
+    /// prior tree, mirroring the filter bar's non-mutating discipline
+    /// (`filter_query` above).
+    root_collapsed: bool,
 }
 
 impl FileTree {
@@ -1050,6 +1062,7 @@ impl FileTree {
             filter_query: String::new(),
             filter_input: None,
             _filter_input_sub: None,
+            root_collapsed: false,
         }
     }
 
@@ -1250,8 +1263,8 @@ impl FileTree {
     }
 
     /// Whether every directory the model currently knows about is collapsed
-    /// — the header button's and root-row chevron's "fully collapsed" state
-    /// (offers Expand once true; `docs/spec-explorer-parity.md`). Deliberately
+    /// — the header collapse-toggle button's "fully collapsed" state (offers
+    /// Expand once true; `docs/spec-explorer-parity.md`). Deliberately
     /// `false`, not the vacuous `true` an empty `all()` would give, when the
     /// model has no directories at all — an all-file tree never claims to be
     /// collapsed.
@@ -1269,11 +1282,14 @@ impl FileTree {
     }
 
     /// Collapse every directory the model currently knows about (header
-    /// "Collapse all" / root-row chevron while expanded): inserts each
-    /// `EntryKind::Dir` path into the existing `collapsed` set. Sets
-    /// `cache_dirty` directly, mirroring `toggle_dir`'s discipline, rather
-    /// than looping `toggle_dir` itself — which would re-expand a directory
-    /// that was already collapsed.
+    /// "Collapse all", also reachable via the row context menu's `CollapseAll`
+    /// action): inserts each `EntryKind::Dir` path into the existing
+    /// `collapsed` set. Sets `cache_dirty` directly, mirroring `toggle_dir`'s
+    /// discipline, rather than looping `toggle_dir` itself — which would
+    /// re-expand a directory that was already collapsed. Distinct from the
+    /// workspace-root row's whole-tree collapse
+    /// ([`FileTree::toggle_root_collapsed`]): this folds every directory
+    /// while leaving root-level entries visible.
     fn collapse_all(&mut self) {
         for entry in self.model.entries().values() {
             if entry.kind == EntryKind::Dir {
@@ -1283,22 +1299,32 @@ impl FileTree {
         self.cache_dirty = true;
     }
 
-    /// Expand every directory (header "Expand all" / root-row chevron while
-    /// collapsed): clears the `collapsed` set wholesale.
+    /// Expand every directory (header "Expand all"): clears the `collapsed`
+    /// set wholesale.
     fn expand_all(&mut self) {
         self.collapsed.clear();
         self.cache_dirty = true;
     }
 
-    /// Flip between fully collapsed and fully expanded. The header button
-    /// and the workspace-root chevron are two entry points into the same
-    /// toggle.
+    /// Flip between fully collapsed and fully expanded — the header
+    /// collapse-toggle button's click handler.
     fn toggle_collapse_all(&mut self) {
         if self.all_dirs_collapsed() {
             self.expand_all();
         } else {
             self.collapse_all();
         }
+    }
+
+    /// Toggle the whole-tree collapse driven by clicking the fully-left
+    /// workspace-root row (`docs/spec-explorer-polish.md`, #710) — distinct
+    /// from [`FileTree::toggle_collapse_all`], which still folds every
+    /// directory while leaving root-level entries visible. Flips
+    /// `root_collapsed` and marks the cache dirty, mirroring `toggle_dir`'s
+    /// discipline; never reads or writes the real `collapsed` set.
+    fn toggle_root_collapsed(&mut self) {
+        self.root_collapsed = !self.root_collapsed;
+        self.cache_dirty = true;
     }
 
     /// Toggle the in-panel filter bar (artboard **State B**,
@@ -1937,12 +1963,18 @@ impl FileTree {
     }
 
     /// Build the flattened, depth-annotated, decorated list of currently
-    /// *visible* rows from the model's flat path map: the plain
-    /// collapse-aware pass with no active filter query, or the filtered
-    /// narrowing pass (`docs/spec-explorer-search.md`, Phase 31) once one is
-    /// set — see [`FileTree::visible_rows_unfiltered`] /
+    /// *visible* rows from the model's flat path map: an empty list while
+    /// the workspace-root row's whole-tree collapse
+    /// (`docs/spec-explorer-polish.md`, #710) is active — checked first, and
+    /// short-circuiting before the model is ever walked — otherwise the
+    /// plain collapse-aware pass with no active filter query, or the
+    /// filtered narrowing pass (`docs/spec-explorer-search.md`, Phase 31)
+    /// once one is set — see [`FileTree::visible_rows_unfiltered`] /
     /// [`FileTree::visible_rows_filtered`].
     fn visible_rows(&self) -> Vec<Row> {
+        if self.root_collapsed {
+            return Vec::new();
+        }
         if self.filter_query.is_empty() {
             self.visible_rows_unfiltered()
         } else {
@@ -2205,16 +2237,19 @@ impl FileTree {
     }
 
     /// The workspace-root row (`RIFT` in the design) below the header
-    /// (`docs/spec-explorer-redesign.md`): the leaf of `model.root()`'s
-    /// absolute path, uppercased and bold at the artboard's 12px label
-    /// style, with a disclosure chevron that mirrors and drives the
-    /// collapse-all/expand-all state, re-densified to the artboard's row
-    /// height, padding, and slot gap (shared with [`FileTree::render_row`]'s
-    /// [`ROW_HEIGHT`] / [`ROW_SLOT_GAP`]) and its own measured background
-    /// tint, which gives the row a subtle band against the panel surface.
-    /// Neutral — no label, no chevron, not clickable — while `root()` is
-    /// `None`: no snapshot has arrived yet, so there is nothing to name or
-    /// toggle.
+    /// (`docs/spec-explorer-polish.md`, #710 — REVISES the chevron-driven
+    /// root row `docs/spec-explorer-redesign.md` shipped): the leaf of
+    /// `model.root()`'s absolute path, uppercased and bold at the artboard's
+    /// 12px label style, rendered fully left-aligned — no chevron, no
+    /// reserved icon/chevron slot, as the project root — at the row's
+    /// existing height and background tint (shared with
+    /// [`FileTree::render_row`]'s [`ROW_HEIGHT`]), which gives the row a
+    /// subtle band against the panel surface. Clicking it drives the
+    /// whole-tree collapse ([`FileTree::toggle_root_collapsed`]), distinct
+    /// from the header's collapse-all/expand-all
+    /// ([`FileTree::toggle_collapse_all`]). Neutral — no label, not
+    /// clickable — while `root()` is `None`: no snapshot has arrived yet, so
+    /// there is nothing to name or toggle.
     fn render_root_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(root) = self.model.root() else {
             return h_flex()
@@ -2222,17 +2257,10 @@ impl FileTree {
                 .items_center()
                 .h(ROW_HEIGHT)
                 .px(ROOT_ROW_PADDING_X)
-                .gap(ROW_SLOT_GAP)
                 .bg(cx.theme().background)
-                .child(div().w(px(12.0)).flex_shrink_0())
                 .into_any_element();
         };
 
-        let chevron = if self.all_dirs_collapsed() {
-            IconName::ChevronRight
-        } else {
-            IconName::ChevronDown
-        };
         let label = Self::root_leaf(root).to_uppercase();
 
         h_flex()
@@ -2241,18 +2269,10 @@ impl FileTree {
             .items_center()
             .h(ROW_HEIGHT)
             .px(ROOT_ROW_PADDING_X)
-            .gap(ROW_SLOT_GAP)
             .bg(cx.theme().background)
             .text_size(px(12.0))
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().list_hover))
-            .child(
-                div().w(px(12.0)).flex_shrink_0().child(
-                    Icon::new(chevron)
-                        .size(px(12.0))
-                        .text_color(cx.theme().muted_foreground),
-                ),
-            )
             .child(
                 div()
                     .font_weight(FontWeight::BOLD)
@@ -2260,7 +2280,7 @@ impl FileTree {
                     .child(label),
             )
             .on_click(cx.listener(|this, _event, _window, cx| {
-                this.toggle_collapse_all();
+                this.toggle_root_collapsed();
                 cx.notify();
             }))
             .into_any_element()
@@ -2292,31 +2312,19 @@ impl FileTree {
     ///
     /// Slot order, left to right, every slot `flex_shrink_0` so names and the
     /// trailing cluster column-align across rows and depths
-    /// (`docs/spec-explorer-redesign.md`): chevron -> reserved icon slot
-    /// (mapped file-type / folder glyph, `crate::file_icons`) -> name (the
-    /// only flexible slot) -> diagnostic dot -> right-aligned git-status
-    /// letter.
+    /// (`docs/spec-explorer-polish.md`, #710 — REVISES the chevron slot
+    /// `docs/spec-explorer-redesign.md` shipped): reserved icon slot (the
+    /// mapped file-type glyph, or the open/closed folder glyph
+    /// [`file_icons::folder_icon_for`] — the sole disclosure affordance for a
+    /// directory row, `crate::file_icons`) -> name (the only flexible slot)
+    /// -> diagnostic dot -> right-aligned git-status letter. The chevron
+    /// twisty and its reserved slot, and the blank chevron spacer files used
+    /// to reserve, are gone — every row shifts left by that reclaimed width.
     fn render_row(&self, row: &Row, cx: &mut Context<Self>) -> AnyElement {
         let is_dir = row.kind == EntryKind::Dir;
         let is_expanded = is_dir && !self.collapsed.contains(&row.path);
         let is_selected = self.selected.as_deref() == Some(row.path.as_str());
         let indent = Self::row_indent(row.depth);
-
-        // Directory disclosure chevron (right collapsed / down expanded); a
-        // file gets a same-width blank spacer so names align across kinds
-        // (`docs/spec-explorer-icons.md`).
-        let twisty = div().w(px(12.0)).flex_shrink_0().when(is_dir, |el| {
-            let chevron = if is_expanded {
-                IconName::ChevronDown
-            } else {
-                IconName::ChevronRight
-            };
-            el.child(
-                Icon::new(chevron)
-                    .size(px(12.0))
-                    .text_color(cx.theme().muted_foreground),
-            )
-        });
 
         // Reserved icon slot: the mapped file-type glyph for a file, or the
         // open/closed folder glyph for a directory (`crate::file_icons`),
@@ -2342,15 +2350,15 @@ impl FileTree {
 
         // Inline rename (artboard State C): while this row is the active
         // rename target, its name slot is the seeded input instead of the
-        // static label — every other slot (chevron, icon, indent, row
-        // height) stays identical so the row doesn't jump while editing.
+        // static label — every other slot (icon, indent, row height) stays
+        // identical so the row doesn't jump while editing.
         if let Some(editor) = self
             .rename
             .as_ref()
             .filter(|editor| editor.path == row.path)
         {
             return self
-                .render_rename_row(row, indent, twisty, icon_slot, editor, cx)
+                .render_rename_row(row, indent, icon_slot, editor, cx)
                 .into_any_element();
         }
 
@@ -2362,7 +2370,7 @@ impl FileTree {
         if row.is_pending_create {
             if let Some(editor) = self.create.as_ref() {
                 return self
-                    .render_create_row(indent, twisty, icon_slot, editor, cx)
+                    .render_create_row(indent, icon_slot, editor, cx)
                     .into_any_element();
             }
         }
@@ -2487,7 +2495,6 @@ impl FileTree {
             // Ignored entries (not yet shown by default — #309) render dimmed
             // rather than hidden, once the daemon starts sending them.
             .when(row.ignored, |el| el.opacity(0.55))
-            .child(twisty)
             .child(icon_slot)
             .child(name_el)
             .child(severity_dot)
@@ -2592,16 +2599,16 @@ impl FileTree {
         .into_any_element()
     }
 
-    /// The rename-active rendering of one row (artboard State C): chevron +
-    /// icon slot unchanged, the name slot replaced by `editor.input`, and — on
-    /// an error re-open — the inline message in place of the diagnostic-dot /
-    /// git-letter trailing lane. No click / context-menu handlers: the row is
-    /// not selectable or openable while its name is being edited.
+    /// The rename-active rendering of one row (artboard State C): icon slot
+    /// unchanged (no chevron, `docs/spec-explorer-polish.md`, #710), the name
+    /// slot replaced by `editor.input`, and — on an error re-open — the
+    /// inline message in place of the diagnostic-dot / git-letter trailing
+    /// lane. No click / context-menu handlers: the row is not selectable or
+    /// openable while its name is being edited.
     fn render_rename_row(
         &self,
         row: &Row,
         indent: Pixels,
-        twisty: Div,
         icon_slot: Div,
         editor: &RenameEditor,
         cx: &Context<Self>,
@@ -2627,7 +2634,6 @@ impl FileTree {
             .gap(ROW_SLOT_GAP)
             .rounded(ROW_RADIUS)
             .text_sm()
-            .child(twisty)
             .child(icon_slot)
             .child(
                 div()
@@ -2639,16 +2645,16 @@ impl FileTree {
     }
 
     /// The rendering of the transient create row [`insert_create_row`] adds
-    /// to the cache (artboard **State D**, #676): chevron + icon slot
-    /// unchanged (the icon reflects `editor.kind` via the synthetic row's own
-    /// `kind`), the name slot is `editor.input`, and — on an error re-open —
-    /// the inline message in the trailing lane. Mirrors
-    /// [`FileTree::render_rename_row`]; no click / context-menu handlers,
-    /// matching that row's "not yet a real entry" affordance.
+    /// to the cache (artboard **State D**, #676): icon slot unchanged (no
+    /// chevron, `docs/spec-explorer-polish.md`, #710 — the icon reflects
+    /// `editor.kind` via the synthetic row's own `kind`), the name slot is
+    /// `editor.input`, and — on an error re-open — the inline message in the
+    /// trailing lane. Mirrors [`FileTree::render_rename_row`]; no click /
+    /// context-menu handlers, matching that row's "not yet a real entry"
+    /// affordance.
     fn render_create_row(
         &self,
         indent: Pixels,
-        twisty: Div,
         icon_slot: Div,
         editor: &CreateEditor,
         cx: &Context<Self>,
@@ -2674,7 +2680,6 @@ impl FileTree {
             .gap(ROW_SLOT_GAP)
             .rounded(ROW_RADIUS)
             .text_sm()
-            .child(twisty)
             .child(icon_slot)
             .child(
                 div()
@@ -3093,8 +3098,10 @@ mod tests {
         assert_eq!(HEADER_PADDING_RIGHT, px(12.0));
         assert_eq!(HEADER_ACTION_GAP, px(12.0));
         assert_eq!(ROOT_ROW_PADDING_X, px(12.0));
-        // The root row shares the row-anatomy step's slot gap rather than
-        // introducing its own — the artboard measures the same 6px.
+        // Still the row-anatomy step's slot gap, shared with `render_row`'s
+        // tree rows — the root row itself has a single child since the
+        // chevron-less redesign (`docs/spec-explorer-polish.md`, #710), so
+        // it no longer applies the gap.
         assert_eq!(ROW_SLOT_GAP, px(6.0));
     }
 
@@ -3311,6 +3318,74 @@ mod tests {
 
         assert!(tree.is_collapsed("a"));
         assert!(tree.is_collapsed("b"));
+    }
+
+    // --- workspace-root row whole-tree collapse (`docs/spec-explorer-polish.md`, #710) ---
+
+    #[test]
+    fn test_toggle_root_collapsed_hides_all_entries_then_restores_the_exact_prior_tree() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs"), file("top.rs")]);
+        let before = tree.visible_rows();
+        assert!(!before.is_empty());
+
+        tree.toggle_root_collapsed();
+        assert!(
+            tree.visible_rows().is_empty(),
+            "collapsing the root hides every root-level entry"
+        );
+
+        tree.toggle_root_collapsed();
+        assert_eq!(
+            tree.visible_rows(),
+            before,
+            "expanding the root restores a build identical to the original"
+        );
+    }
+
+    #[test]
+    fn test_toggle_root_collapsed_never_reads_or_mutates_the_real_collapsed_set() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs")]);
+        tree.toggle_dir("src");
+        assert!(tree.is_collapsed("src"));
+
+        tree.toggle_root_collapsed();
+        assert!(
+            tree.is_collapsed("src"),
+            "the whole-tree toggle must not touch the per-folder collapsed set"
+        );
+
+        tree.toggle_root_collapsed();
+        assert!(
+            tree.is_collapsed("src"),
+            "src is still collapsed once the whole-tree toggle clears"
+        );
+    }
+
+    #[test]
+    fn test_root_collapsed_is_distinct_from_header_collapse_all() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs"), file("top.rs")]);
+
+        // Header collapse-all folds every directory but leaves root-level
+        // entries visible.
+        tree.collapse_all();
+        assert!(tree.all_dirs_collapsed());
+        assert!(!tree.visible_rows().is_empty());
+
+        // The whole-tree toggle hides root-level entries too, without
+        // disturbing collapse-all's fully-collapsed state.
+        tree.toggle_root_collapsed();
+        assert!(tree.visible_rows().is_empty());
+        assert!(tree.all_dirs_collapsed());
+    }
+
+    #[test]
+    fn test_toggle_root_collapsed_marks_the_cache_dirty() {
+        let mut tree = seed(vec![file("a.txt")]);
+        tree.refresh_row_cache();
+        assert!(!tree.cache_dirty);
+
+        tree.toggle_root_collapsed();
+        assert!(tree.cache_dirty);
     }
 
     #[test]
