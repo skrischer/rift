@@ -383,3 +383,50 @@ Each issue references this spec path in its body.
   duplication`) exercises the atomicity fix through real concurrent
   acquirers and a real `Daemon::run()` join, not only the lock-held
   stand-in.
+- 2026-07-09: #738 implemented — "Detach open buffers on re-root", the last
+  issue of Phase 35. Daemon side (`crates/daemon/src/lib.rs`): each
+  connection now tracks its own live-buffer path set (`open_buffers:
+  HashSet<String>`, populated/cleared by the `BufferChanged`/`BufferClosed`
+  arms already forwarding onto `inbound`). A new `detach_open_buffers`
+  helper drains that set and sends a synthetic `ClientMessage::BufferClosed`
+  per path — reusing the EXISTING `BufferClosed` -> `BufferEvent::Closed`
+  path (`Core::dispatch`/`forward_buffer_event`) rather than inventing a new
+  event, per the issue's explicit instruction. `reroot_connection` calls it
+  on an ACTUAL root change only (after its existing same-root no-op early
+  return, so a reconnect/redundant `Attach` never drops buffers) and,
+  crucially, BEFORE rebinding `inbound` to the new root's context — so the
+  synthetic closes land on the OLD root's dispatch loop/document model, not
+  the new one's. `try_send` (non-blocking, drop-and-log on a full queue),
+  matching `forward_buffer_event`'s existing discipline — this is
+  safety-net cleanup on a context the connection is leaving, never worth
+  stalling the re-root over. Regression coverage: a unit test on
+  `detach_open_buffers` alone (raw channel, no `ContextMap`), an end-to-end
+  `reroot_connection` test asserting the OLD root's inbound receives one
+  `BufferClosed` per previously-open path and `open_buffers` ends up empty,
+  and a same-root no-op test asserting a still-open buffer is NOT detached
+  when nothing actually re-rooted. App side (`crates/app/src/workspace.rs`,
+  `crates/app/src/editor.rs`): the daemon-message loop that already folds
+  `WorktreeSnapshot` into the file-tree model now diffs the model's root
+  immediately before vs. after each fold (`worktree_root_switched`, a pure
+  predicate, unit-tested standalone) — `true` only when a previous root
+  existed and the fold committed a DIFFERENT one, which is multi-chunk-safe
+  for free (`apply_snapshot_chunk` only commits `root` on the snapshot's
+  final chunk, so a mid-accumulation chunk never trips it) and correctly
+  skips the very first snapshot after connecting (nothing is open yet). On
+  a genuine switch it calls a new `EditorView::close_all_tabs_for_project_
+  switch`, which force-closes every open tab — INCLUDING dirty ones,
+  bypassing the per-tab confirm dialog `close_tab` uses for a user-driven
+  close. Decision: an automatic background re-root is not a user click:
+  stacking one confirm dialog per dirty tab on every session switch would
+  be disruptive, and the issue's hard scope explicitly defers full
+  cross-switch tab persistence — discarding unsaved edits on a switch is
+  the accepted trade-off already implied there, not a new one introduced by
+  this change. Each forced close still goes through the existing
+  `close_tab_now` -> `close_live_buffer` path, so it enqueues its own
+  `BufferClosed` exactly like a manual close (belt-and-suspenders alongside
+  the daemon's own re-root detach, which alone is already sufficient since
+  the daemon drops the OLD root's live-buffer feed regardless of whether
+  the client sends anything further). No protocol change on either side —
+  both reuse messages the wire protocol already carries
+  (`ClientMessage::BufferClosed`, `DaemonMessage::WorktreeSnapshot { root
+  }`), per the spec's protocol-free constraint for this phase.

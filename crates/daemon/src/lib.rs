@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1041,6 +1041,14 @@ where
     // (as opposed to `root`/its context above, which the CALLER acquired and
     // releases). `None` until the first `Attach` resolves a root.
     let mut self_root: Option<PathBuf> = None;
+    // This connection's own view of which paths currently have a live buffer
+    // open against `self_root`'s context (#738, "Detach open buffers on
+    // re-root"): every `BufferChanged` inserts, every `BufferClosed` removes.
+    // `reroot_connection` drains this and synthesizes a `BufferClosed` for
+    // each remaining path on the OLD root before rebinding, so a buffer left
+    // open across a project switch can never resolve a later save against
+    // the wrong root.
+    let mut open_buffers: HashSet<String> = HashSet::new();
 
     'serve: loop {
         tokio::select! {
@@ -1186,7 +1194,22 @@ where
                         // single loop (one document model + servers for the
                         // daemon), not per connection. Push-only — no reply here;
                         // diagnostics return on the shared broadcast bus.
-                        ClientMessage::BufferChanged { .. } | ClientMessage::BufferClosed { .. } => {
+                        //
+                        // Also track which paths THIS connection currently has
+                        // open (#738): `reroot_connection` drains this set and
+                        // synthesizes a `BufferClosed` for each remaining path
+                        // on the OLD root before rebinding to a new one, so a
+                        // buffer left open across a project switch is detached
+                        // rather than silently carried into the new context.
+                        ClientMessage::BufferChanged { ref path, .. } => {
+                            open_buffers.insert(path.clone());
+                            if inbound.send(msg).await.is_err() {
+                                // Dispatch loop gone; nothing left to serve.
+                                break 'serve;
+                            }
+                        }
+                        ClientMessage::BufferClosed { ref path } => {
+                            open_buffers.remove(path);
                             if inbound.send(msg).await.is_err() {
                                 // Dispatch loop gone; nothing left to serve.
                                 break 'serve;
@@ -1297,6 +1320,7 @@ where
                                 &mut events,
                                 &mut state,
                                 &mut nav_requests,
+                                &mut open_buffers,
                             )
                             .await;
                             // Same root as already active (a same-session
@@ -1636,6 +1660,40 @@ async fn canonicalize_root(root: PathBuf) -> PathBuf {
     }
 }
 
+/// Detach a connection's live-buffer feed (#738,
+/// `docs/spec-per-session-project-root.md`, "Detach open buffers on
+/// re-root"): send a synthetic [`ClientMessage::BufferClosed`] over
+/// `inbound` for every path in `open_buffers`, then clear the set.
+///
+/// Reuses the EXISTING `BufferClosed` -> [`BufferEvent::Closed`] machinery
+/// (`Core::dispatch`/`forward_buffer_event`) rather than inventing a new
+/// event: from the dispatch loop's point of view this is indistinguishable
+/// from the editor itself closing the tab, so the per-root document model
+/// reverts the path to its disk-backed baseline. [`reroot_connection`] calls
+/// this against the OLD root's `inbound` BEFORE rebinding to the new root's
+/// context, so a buffer left open across a project switch is closed on the
+/// root being left behind — never silently carried into the new one, and
+/// never able to resolve a later save against the wrong root (the existing
+/// `mtime`-conflict check on [`buffer::write_file`] is the backstop against
+/// a save that DOES land, e.g. a client that has not yet processed the
+/// switch).
+///
+/// Best-effort and non-blocking (`try_send`), matching
+/// `forward_buffer_event`'s discipline: a full or already-gone inbound just
+/// drops the synthetic close and logs — this is safety-net cleanup on a
+/// context this connection is leaving, never a request worth stalling the
+/// re-root over.
+async fn detach_open_buffers(
+    inbound: &mpsc::Sender<ClientMessage>,
+    open_buffers: &mut HashSet<String>,
+) {
+    for path in open_buffers.drain() {
+        if let Err(err) = inbound.try_send(ClientMessage::BufferClosed { path }) {
+            warn!(%err, "dropped synthetic buffer-close on re-root");
+        }
+    }
+}
+
 /// Re-root one connection's reactive bindings to `resolved_root`'s per-root
 /// [`Context`] — the Attach seam (#737, `docs/spec-per-session-project-root.md`).
 /// Called from `serve_connection`'s dispatch loop once `terminal::terminal_task`
@@ -1662,6 +1720,12 @@ async fn canonicalize_root(root: PathBuf) -> PathBuf {
 /// [`ContextMap::release`]'s "caller must have already dropped its own
 /// clones" contract — the exact ordering #736's review flagged as otherwise
 /// hanging the last release's dispatch-join — and this returns `true`.
+///
+/// On an ACTUAL re-root (never on the same-root no-op above), also detaches
+/// this connection's live-buffer feed via [`detach_open_buffers`] — #738's
+/// cross-project write-safety rule — against the OLD `inbound`, before it is
+/// rebound to the new root's context.
+#[allow(clippy::too_many_arguments)]
 async fn reroot_connection(
     context_map: &ContextMap,
     resolved_root: PathBuf,
@@ -1670,13 +1734,17 @@ async fn reroot_connection(
     events: &mut broadcast::Receiver<DaemonMessage>,
     state: &mut watch::Receiver<State>,
     nav_requests: &mut Option<mpsc::Sender<NavRequest>>,
+    open_buffers: &mut HashSet<String>,
 ) -> bool {
     let canonical = canonicalize_root(resolved_root).await;
     if self_root.as_ref() == Some(&canonical) {
         // Already on this root (a same-session reconnect, or a redundant
-        // Attach): nothing to acquire, release, or re-snapshot.
+        // Attach): nothing to acquire, release, or re-snapshot — and no
+        // buffers to detach either, since the root has not actually changed.
         return false;
     }
+
+    detach_open_buffers(inbound, open_buffers).await;
 
     let context = context_map.acquire(canonical.clone()).await;
     *events = context.handles.subscribe();
@@ -4925,6 +4993,7 @@ mod tests {
         let map = ContextMap::new();
         let (mut inbound, mut events, mut state, mut nav_requests) = placeholder_bindings();
         let mut self_root: Option<PathBuf> = None;
+        let mut open_buffers: HashSet<String> = HashSet::new();
 
         let rerooted = tokio::time::timeout(
             Duration::from_secs(5),
@@ -4936,6 +5005,7 @@ mod tests {
                 &mut events,
                 &mut state,
                 &mut nav_requests,
+                &mut open_buffers,
             ),
         )
         .await
@@ -4971,6 +5041,7 @@ mod tests {
         let map = ContextMap::new();
         let (mut inbound, mut events, mut state, mut nav_requests) = placeholder_bindings();
         let mut self_root: Option<PathBuf> = None;
+        let mut open_buffers: HashSet<String> = HashSet::new();
 
         let first = reroot_connection(
             &map,
@@ -4980,6 +5051,7 @@ mod tests {
             &mut events,
             &mut state,
             &mut nav_requests,
+            &mut open_buffers,
         )
         .await;
         assert!(first, "the first attach resolution must perform a re-root");
@@ -4995,6 +5067,7 @@ mod tests {
                 &mut events,
                 &mut state,
                 &mut nav_requests,
+                &mut open_buffers,
             ),
         )
         .await
@@ -5027,13 +5100,15 @@ mod tests {
     /// no-op — no acquire(+1)/release(-1) churn on the map, and `inbound`/
     /// `events`/`state`/`nav_requests` are left untouched (still the SAME
     /// bindings, not merely equal ones) so the caller can skip the
-    /// re-snapshot too.
+    /// re-snapshot too. #738: a same-root no-op is not a real re-root, so a
+    /// buffer still tracked open must NOT be detached either.
     #[tokio::test]
     async fn test_reroot_connection_same_root_again_is_a_noop() {
         let tmp = TempDir::new("reroot-noop");
         let map = ContextMap::new();
         let (mut inbound, mut events, mut state, mut nav_requests) = placeholder_bindings();
         let mut self_root: Option<PathBuf> = None;
+        let mut open_buffers: HashSet<String> = HashSet::new();
 
         let first = reroot_connection(
             &map,
@@ -5043,10 +5118,12 @@ mod tests {
             &mut events,
             &mut state,
             &mut nav_requests,
+            &mut open_buffers,
         )
         .await;
         assert!(first);
         let bound_inbound = inbound.clone();
+        open_buffers.insert("src/main.rs".to_string());
 
         // Re-resolve the identical root, spelled slightly differently (a
         // trailing slash) so a real bug could not hide behind pointer/string
@@ -5061,6 +5138,7 @@ mod tests {
             &mut events,
             &mut state,
             &mut nav_requests,
+            &mut open_buffers,
         )
         .await;
 
@@ -5068,6 +5146,10 @@ mod tests {
         assert!(
             inbound.same_channel(&bound_inbound),
             "a no-op re-root must leave the bound handles untouched"
+        );
+        assert!(
+            open_buffers.contains("src/main.rs"),
+            "a same-root no-op must not detach buffers still open on the unchanged root"
         );
 
         drop(inbound);
@@ -5095,6 +5177,7 @@ mod tests {
 
         let (mut inbound, mut events, mut state, mut nav_requests) = placeholder_bindings();
         let mut self_root: Option<PathBuf> = None;
+        let mut open_buffers: HashSet<String> = HashSet::new();
         reroot_connection(
             &map,
             odd_spelling,
@@ -5103,6 +5186,7 @@ mod tests {
             &mut events,
             &mut state,
             &mut nav_requests,
+            &mut open_buffers,
         )
         .await;
 
@@ -5152,6 +5236,7 @@ mod tests {
         // A later Attach resolves the SAME directory, spelled plainly.
         let (mut inbound, mut events, mut state, mut nav_requests) = placeholder_bindings();
         let mut self_root: Option<PathBuf> = None;
+        let mut open_buffers: HashSet<String> = HashSet::new();
         let rerooted = reroot_connection(
             &map,
             tmp.path.clone(),
@@ -5160,6 +5245,7 @@ mod tests {
             &mut events,
             &mut state,
             &mut nav_requests,
+            &mut open_buffers,
         )
         .await;
         assert!(
@@ -5181,5 +5267,134 @@ mod tests {
         drop(keep_warm_inbound);
         map.release(&keep_warm_key).await; // this connection's own reference
         map.release(&keep_warm_key).await; // the keep-warm reference
+    }
+
+    // ── detach_open_buffers / reroot_connection buffer detach (#738) ─────────
+
+    /// `detach_open_buffers` sends one `BufferClosed` per tracked path over
+    /// the given `inbound` and drains the set — the unit-level behavior
+    /// `reroot_connection` relies on for cross-project write safety.
+    #[tokio::test]
+    async fn test_detach_open_buffers_sends_buffer_closed_for_each_path_and_clears_the_set() {
+        let (inbound, mut rx) = mpsc::channel::<ClientMessage>(4);
+        let mut open_buffers: HashSet<String> =
+            ["src/main.rs".to_string(), "Cargo.toml".to_string()]
+                .into_iter()
+                .collect();
+
+        detach_open_buffers(&inbound, &mut open_buffers).await;
+
+        assert!(
+            open_buffers.is_empty(),
+            "every tracked path must be drained from the set"
+        );
+
+        let mut closed: HashSet<String> = HashSet::new();
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                ClientMessage::BufferClosed { path } => {
+                    closed.insert(path);
+                }
+                other => panic!("expected only BufferClosed, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            closed,
+            ["src/main.rs".to_string(), "Cargo.toml".to_string()]
+                .into_iter()
+                .collect::<HashSet<_>>()
+        );
+    }
+
+    /// An empty tracking set sends nothing — the common case of a re-root
+    /// with no editor buffers open.
+    #[tokio::test]
+    async fn test_detach_open_buffers_empty_set_sends_nothing() {
+        let (inbound, mut rx) = mpsc::channel::<ClientMessage>(4);
+        let mut open_buffers: HashSet<String> = HashSet::new();
+
+        detach_open_buffers(&inbound, &mut open_buffers).await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "no buffers were open, so nothing should be sent"
+        );
+    }
+
+    /// End-to-end through `reroot_connection`: a connection with paths
+    /// tracked open against root A must have a `BufferClosed` synthesized on
+    /// root A's `inbound` for each of them, BEFORE `inbound` is rebound to
+    /// root B — and `open_buffers` must come out empty, so a subsequent
+    /// `BufferChanged`/`SaveFile` starts clean against the new root.
+    ///
+    /// Root A's `inbound` here is a bare, unconsumed `mpsc` channel (not a
+    /// real `ContextMap`-acquired context) specifically so the synthetic
+    /// closes are directly observable instead of being silently absorbed by
+    /// a running dispatch loop.
+    #[tokio::test]
+    async fn test_reroot_connection_switch_detaches_previously_open_buffers_on_the_old_root() {
+        let tmp_b = TempDir::new("reroot-detach-buffers-b");
+        let map = ContextMap::new();
+
+        let (mut inbound, mut old_inbound_rx) = mpsc::channel::<ClientMessage>(8);
+        let (_events_tx, events_rx) = broadcast::channel::<DaemonMessage>(4);
+        let mut events = events_rx;
+        let (_state_tx, mut state) = watch::channel(State::default());
+        let mut nav_requests: Option<mpsc::Sender<NavRequest>> = None;
+        let mut self_root =
+            Some(std::env::temp_dir().join("reroot-detach-buffers-root-a-stand-in"));
+        let mut open_buffers: HashSet<String> =
+            ["src/main.rs".to_string(), "Cargo.toml".to_string()]
+                .into_iter()
+                .collect();
+
+        let switched = reroot_connection(
+            &map,
+            tmp_b.path.clone(),
+            &mut self_root,
+            &mut inbound,
+            &mut events,
+            &mut state,
+            &mut nav_requests,
+            &mut open_buffers,
+        )
+        .await;
+
+        assert!(
+            switched,
+            "switching to a different root must perform a re-root"
+        );
+        assert!(
+            open_buffers.is_empty(),
+            "the previously-open buffers must be cleared on an actual re-root"
+        );
+
+        let mut closed: HashSet<String> = HashSet::new();
+        while let Ok(msg) = old_inbound_rx.try_recv() {
+            match msg {
+                ClientMessage::BufferClosed { path } => {
+                    closed.insert(path);
+                }
+                other => {
+                    panic!("expected only BufferClosed on the OLD root's inbound, got {other:?}")
+                }
+            }
+        }
+        assert_eq!(
+            closed,
+            ["src/main.rs".to_string(), "Cargo.toml".to_string()]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            "the OLD root's inbound must receive a BufferClosed for every previously-open path"
+        );
+
+        let expected_b = std::fs::canonicalize(&tmp_b.path).expect("canonicalize root b");
+        assert_eq!(self_root, Some(expected_b.clone()));
+
+        drop(inbound);
+        drop(events);
+        drop(state);
+        drop(nav_requests);
+        map.release(&expected_b).await;
     }
 }

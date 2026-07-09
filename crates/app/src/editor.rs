@@ -2348,6 +2348,33 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Force-close every open tab on a project switch (#738, cross-project
+    /// write safety; `docs/spec-per-session-project-root.md`, "Detach open
+    /// buffers on re-root"). Called by [`crate::workspace::WorkspaceView`]'s
+    /// daemon-message loop when a completed `WorktreeSnapshot` carries a
+    /// DIFFERENT root than the one previously mirrored — a session switch,
+    /// not a reconnect/resend of the same root.
+    ///
+    /// Bypasses the dirty-close confirm dialog ([`close_tab`]): this fires
+    /// from an automatic background event, not a user click, so prompting
+    /// once per dirty tab would stack blocking dialogs on every switch.
+    /// Discarding unsaved edits is the accepted trade-off — full cross-switch
+    /// tab persistence is explicitly out of scope for this phase. Each close
+    /// still reverts its live buffer to disk-backed first
+    /// ([`close_live_buffer`], via [`close_tab_now`]), so the OLD root's
+    /// document model is not left holding a stale buffer override either —
+    /// belt-and-suspenders alongside the daemon's own re-root detach. A
+    /// no-op with no open tabs.
+    pub fn close_all_tabs_for_project_switch(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        while !self.tabs.is_empty() {
+            self.close_tab_now(0, window, cx);
+        }
+    }
+
     /// Open `path` at `range`, scrolling/selecting it once loaded — the thin
     /// public wrapper `docs/spec-problems-panel.md` calls for so the problems
     /// panel (#343) can reach the existing LSP-nav jump machinery
@@ -4569,6 +4596,75 @@ mod tests {
                 1,
                 "the dirty tab stays open until the user confirms"
             );
+        })
+        .unwrap();
+    }
+
+    /// #738 (`docs/spec-per-session-project-root.md`, "Detach open buffers
+    /// on re-root"): a project switch must close every open tab — including
+    /// a DIRTY one — without prompting the per-tab confirm dialog
+    /// [`close_tab`] uses; each close still enqueues its own `BufferClosed`
+    /// on the live-buffer channel, exactly like a normal close.
+    #[gpui::test]
+    fn test_close_all_tabs_for_project_switch_closes_every_tab_without_a_confirm_dialog(
+        cx: &mut TestAppContext,
+    ) {
+        let (editor, window, _open_file_rx, _save_file_rx, buffer_change_rx) =
+            build_test_editor_full(cx);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let a = editor.push_tab("a.rs".into(), false, window, cx);
+                let b = editor.push_tab("b.rs".into(), false, window, cx);
+                editor.tabs[a].load_state = TabLoadState::Loaded;
+                editor.tabs[b].load_state = TabLoadState::Loaded;
+                editor.tabs[b].dirty = true;
+                editor.active = Some(b);
+
+                editor.close_all_tabs_for_project_switch(window, cx);
+            });
+
+            assert!(
+                !window.has_active_dialog(cx),
+                "a project switch must not prompt a confirm dialog for a dirty tab"
+            );
+            assert!(
+                editor.read(cx).tabs.is_empty(),
+                "every open tab must be closed"
+            );
+            assert_eq!(editor.read(cx).active, None);
+        })
+        .unwrap();
+
+        let mut closed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while let Ok(msg) = buffer_change_rx.try_recv() {
+            match msg {
+                ClientMessage::BufferClosed { path } => {
+                    closed.insert(path);
+                }
+                other => panic!("expected only BufferClosed, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            closed,
+            ["a.rs".to_string(), "b.rs".to_string()]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    /// A no-op with nothing open — must not panic.
+    #[gpui::test]
+    fn test_close_all_tabs_for_project_switch_is_a_no_op_with_no_open_tabs(
+        cx: &mut TestAppContext,
+    ) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.close_all_tabs_for_project_switch(window, cx);
+            });
+            assert!(editor.read(cx).tabs.is_empty());
         })
         .unwrap();
     }

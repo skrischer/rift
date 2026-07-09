@@ -514,10 +514,35 @@ impl WorkspaceView {
                         ),
                         _ => None,
                     };
+                    // Cross-project write safety (#738,
+                    // `docs/spec-per-session-project-root.md`, "Detach open
+                    // buffers on re-root"): capture the model's root BEFORE
+                    // folding this message, so a completed `WorktreeSnapshot`
+                    // that lands on a DIFFERENT root than before (a session
+                    // switch, not the initial connect or a same-root
+                    // reconnect) is detected below. `apply_snapshot_chunk`
+                    // only commits `root` on the FINAL chunk of a snapshot,
+                    // so comparing before/after this fold — rather than
+                    // matching on the message type — naturally fires exactly
+                    // once per completed snapshot, multi-chunk-safe.
+                    let previous_root = view.file_tree.read(cx).model().root().map(str::to_owned);
                     view.file_tree.update(cx, |tree, cx| {
                         apply_worktree_message(tree, msg);
                         cx.notify();
                     });
+                    let new_root = view.file_tree.read(cx).model().root().map(str::to_owned);
+                    if worktree_root_switched(previous_root.as_deref(), new_root.as_deref()) {
+                        // The reactive layer just re-rooted to a different
+                        // project: force-close every open tab so a buffer
+                        // left open against the OLD root can never resolve a
+                        // later save against the new one (the daemon detaches
+                        // its own live-buffer feed symmetrically on the same
+                        // re-root, `reroot_connection`/`detach_open_buffers`
+                        // in `crates/daemon/src/lib.rs`).
+                        view.editor.update(cx, |editor, cx| {
+                            editor.close_all_tabs_for_project_switch(window, cx);
+                        });
+                    }
                     // Status bar (#347, #348): a `RepoState` fold changes the
                     // branch/ahead-behind segment and a `Diagnostics` fold changes
                     // the error/warning counts segment, both read inline in
@@ -1435,6 +1460,20 @@ fn duration_to_next_minute() -> Duration {
     Duration::from_secs(60u64.saturating_sub(secs).max(1))
 }
 
+/// Whether folding a worktree message just completed a project switch
+/// (#738, `docs/spec-per-session-project-root.md`, "Detach open buffers on
+/// re-root"): `previous` is the file tree model's root immediately BEFORE
+/// the fold, `new` is its root immediately AFTER. `true` only when there
+/// WAS a previous root and the fold committed a DIFFERENT one — never on
+/// the very first snapshot after connecting (`previous` is `None`, nothing
+/// is open yet to close) and never mid-accumulation of a multi-chunk
+/// snapshot or a same-root resend/reconnect (`WorktreeModel::
+/// apply_snapshot_chunk` only commits `root` on the snapshot's FINAL chunk,
+/// so `new` stays equal to `previous` until then).
+fn worktree_root_switched(previous: Option<&str>, new: Option<&str>) -> bool {
+    previous.is_some() && previous != new
+}
+
 /// Fold one worktree-family daemon message into the file tree's model. Only the
 /// structure-path messages are routed here; any other variant is ignored (the
 /// tokio side forwards only this family on `worktree_rx`). An `UpdateWorktree`
@@ -1724,6 +1763,28 @@ mod tests {
             "plural copy names the count: {message}"
         );
         assert!(message.contains("Discard them"), "plural copy: {message}");
+    }
+
+    // --- project-switch buffer detach (#738) ----------------------------------
+    // Headless: `worktree_root_switched` is plain data logic, no GPUI test
+    // harness needed.
+
+    #[test]
+    fn test_worktree_root_switched_true_when_the_committed_root_differs() {
+        assert!(worktree_root_switched(Some("/proj/a"), Some("/proj/b")));
+    }
+
+    #[test]
+    fn test_worktree_root_switched_false_when_the_root_is_unchanged() {
+        assert!(!worktree_root_switched(Some("/proj/a"), Some("/proj/a")));
+    }
+
+    #[test]
+    fn test_worktree_root_switched_false_on_the_first_ever_snapshot() {
+        // `previous` is `None` before the daemon's first `WorktreeSnapshot`
+        // ever completes — nothing was open yet, so this must not be treated
+        // as a switch.
+        assert!(!worktree_root_switched(None, Some("/proj/a")));
     }
 
     #[test]
