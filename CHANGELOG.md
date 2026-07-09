@@ -3,6 +3,41 @@
 All notable changes to rift are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## v1.2.0 — 2026-07-09 — Session management & post-connect picker
+
+Makes tmux sessions a first-class, manageable surface and moves session choice to
+after the connection: an always-visible title-bar session strip with rename,
+kill, reorder and create, plus a post-connect session picker that retires the
+hardcoded default session — all agent-agnostic, driven only by the tmux
+control-mode stream, and rendered from the new "rift — Session management" Paper
+contract.
+
+### Session management
+- The click-to-open session popover is replaced by an always-visible session
+  strip in the title-bar connection group: every host tmux session shown as a
+  chip (name + window count + attached/current marker), one click to switch, a
+  trailing "+ New session…".
+- Inline rename and a confirm-guarded kill per chip (a two-step "Kill?" guard),
+  both over the existing tmux control-mode command seam — no protocol change; the
+  live list refreshes from the daemon's session-change notifications, and killing
+  the attached session reuses the existing terminal-exit path.
+- Drag-to-reorder the chips, persisted in a per-channel client-side order store
+  (the recents/window-state pattern); an in-UI rename preserves a reordered
+  session's slot. Session names are tmux-quoted so spaces / quotes / separators
+  cannot break or inject a command.
+
+### Post-connect session picker
+- The tmux session is chosen AFTER connecting, not before: a pre-cockpit picker
+  appears after the SSH connect + daemon handshake, listing the host's live
+  sessions (with a zero-session create-only state). The connect card's Session
+  field and the hardcoded `"rift"` default are removed.
+- Entry-point-driven flow: `RIFT_SESSION` attaches directly (the dogfooding
+  fast-path, unchanged); connecting via a recent reattaches its remembered
+  session when it still exists on the host, otherwise shows the picker; the plain
+  "Connect →" always shows the picker. No protocol/daemon change — the picker
+  drives the existing session-list query + attach, and an SSH drop while the
+  picker is open retries and re-enters it instead of dead-ending.
+
 ## v1.1.0 — 2026-07-09 — Explorer overhaul
 
 Turns the file explorer from a read-only tree into a first-class file manager: a
