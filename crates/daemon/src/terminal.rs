@@ -27,7 +27,7 @@ use rift_tmux_core::{Client, CommandId, Event};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 /// Seconds of buffered pane output tmux tolerates before pausing that pane
 /// (`refresh-client -f pause-after=N`). Small, so a flood is bounded tightly.
@@ -82,6 +82,22 @@ const SESSION_LIST_QUERY: &str =
 /// [`SESSION_LIST_QUERY`] so both paths parse with [`parse_session_line`].
 const SESSION_LIST_FORMAT: &str =
     "#{session_id}\t#{session_windows}\t#{session_attached}\t#{session_name}";
+
+/// One query that resolves the attached session's project root
+/// (`docs/spec-per-session-project-root.md`): `@root` — the durable stamp
+/// [`stamp_root_command`] writes at attach — and `#{session_path}` — the
+/// session's working directory (Phase 34's `-c` default) — returned together
+/// so [`resolve_session_root`] can prefer the former and fall back to the
+/// latter for a session `@root` has never stamped (created outside rift).
+/// `session_path` is LAST (same convention as [`LAYOUT_QUERY`]/
+/// [`SESSION_LIST_QUERY`]): the field most likely to contain arbitrary
+/// characters stays intact in the final position. Sent with no `-t`, like
+/// [`reroot_command`]: over the just-attached control connection,
+/// `display-message -p` without a target reports on the issuing client's own
+/// current session, so the session name never has to be embedded here. The
+/// `#{...}` format is single-quoted because the control parser treats an
+/// unquoted `#` as a comment (tmux-reference pitfall 9).
+const ROOT_QUERY: &str = "display-message -p '#{@root}\t#{session_path}'";
 
 /// Signals that the connection's outbound channel closed — the client is gone.
 struct Closed;
@@ -359,6 +375,43 @@ fn reroot_command(root: &Path) -> Option<String> {
     Some(format!("attach-session -c {}", quote_tmux_arg(&root)))
 }
 
+/// Build the control-mode command that stamps `root` as `session`'s durable,
+/// session-scoped `@root` user option (`docs/spec-per-session-project-root.md`;
+/// `@root` does not exist in the codebase before this — this is the
+/// introduction). Sent right after `new-session -A` on the same
+/// `new-session -A -s <session>` chokepoint [`spawn_args`] uses, alongside
+/// [`reroot_command`], so a rift-attached session durably carries its
+/// project root as tmux metadata — read back on a later attach via
+/// [`ROOT_QUERY`] / [`resolve_session_root`]. Sent unconditionally on every
+/// attach, mirroring [`reroot_command`]'s idempotence rationale: in the
+/// current single-root daemon, resending the same value is a no-op for a
+/// session already stamped, and durably couples one that is not yet.
+///
+/// Unlike [`reroot_command`] (which omits `-t` to avoid embedding the
+/// session name), this command targets the session explicitly — `-t
+/// <session>` — so both `session` and `root` are quoted with
+/// [`quote_tmux_arg`] against tmux's control-mode command lexer, and both are
+/// checked for an embedded `\n`/`\r`: a character that would split
+/// [`Attach::send_command`]'s single control-mode line into two, the second
+/// unquoted and attacker-controlled (the same line-framing hazard
+/// [`reroot_command`] documents). Returns `None` rather than building an
+/// unsafe command; the caller skips the stamp and logs.
+fn stamp_root_command(session: &str, root: &Path) -> Option<String> {
+    let root = root.to_string_lossy();
+    if session.contains('\n')
+        || session.contains('\r')
+        || root.contains('\n')
+        || root.contains('\r')
+    {
+        return None;
+    }
+    Some(format!(
+        "set -t {} @root {}",
+        quote_tmux_arg(session),
+        quote_tmux_arg(&root)
+    ))
+}
+
 /// Wrap `value` as a single literal tmux control-mode command-line argument:
 /// wrapping in `'...'` and escaping an embedded `'` as `'\''` makes tmux's
 /// *lexer* treat `value` as exactly one token regardless of in-line
@@ -398,6 +451,12 @@ struct Attach {
     /// The in-flight session-list query (at most one), correlated by
     /// [`CommandId`] — the same coalescing discipline as `layout_query`.
     session_list_query: Option<CommandId>,
+    /// The in-flight [`ROOT_QUERY`] (at most one), correlated by
+    /// [`CommandId`] — resolves this session's project root
+    /// (`docs/spec-per-session-project-root.md`) once, right after attach;
+    /// unlike `layout_query`/`session_list_query` it is not re-queried on
+    /// churn (a session's root does not change without a re-attach).
+    root_query: Option<CommandId>,
     /// Session churn arrived while a session-list query was in flight;
     /// re-query once it returns so a burst (`%sessions-changed` storms)
     /// collapses to bounded queries.
@@ -462,6 +521,7 @@ impl Attach {
             layout_dirty: false,
             session_list_query: None,
             session_list_dirty: false,
+            root_query: None,
             paused: HashSet::new(),
             captures: HashMap::new(),
             key_table_query: None,
@@ -488,6 +548,20 @@ impl Attach {
                     "skipping session re-root: root path contains a control character that cannot be safely sent over tmux control mode"
                 ),
             }
+            // Couple this session to its project root
+            // (`docs/spec-per-session-project-root.md`): stamp durable,
+            // session-scoped `@root` metadata alongside the re-root above —
+            // see `stamp_root_command`.
+            match stamp_root_command(&attach.session, root) {
+                Some(cmd) => {
+                    attach.send_command(&cmd).await?;
+                }
+                None => warn!(
+                    session = %attach.session,
+                    root = %root.display(),
+                    "skipping @root stamp: session or root contains a control character that cannot be safely sent over tmux control mode"
+                ),
+            }
         }
         // The task loop already reads stdout (we are subscribed), so any change
         // after this query lands as a live LayoutUpdate — no gap; the snapshot is
@@ -497,6 +571,13 @@ impl Attach {
         // Key-table mirror: queried unprompted on attach/reconnect (the spec's
         // "on attach/reconnect" refresh trigger), same as the layout query above.
         attach.request_key_table().await?;
+        // Resolve this session's project root (`docs/spec-per-session-project-root.md`):
+        // query `@root` + `session_path` together on this freshly-attached
+        // child, same correlated round-trip discipline as the layout query
+        // above. Later steps (#736/#737) consume the resolved value; this
+        // step's `process` arm only resolves and logs it.
+        let root_id = attach.send_command(ROOT_QUERY).await?;
+        attach.root_query = Some(root_id);
         Ok(attach)
     }
 
@@ -703,6 +784,21 @@ impl Attach {
                         if self.session_list_dirty {
                             self.session_list_dirty = false;
                             self.request_session_list().await;
+                        }
+                    } else if id.is_some() && id == self.root_query {
+                        self.root_query = None;
+                        if !error {
+                            if let Some(line) = output.first() {
+                                let mut fields = line.splitn(2, '\t');
+                                let root_option = fields.next().unwrap_or("");
+                                let session_path = fields.next().unwrap_or("");
+                                let resolved = resolve_session_root(root_option, session_path);
+                                debug!(
+                                    session = %self.session,
+                                    root = ?resolved,
+                                    "resolved session root on attach"
+                                );
+                            }
                         }
                     } else if let Some(pane) = id.and_then(|id| self.captures.remove(&id)) {
                         // A `capture-pane` reply: forward the captured bytes (empty
@@ -1009,6 +1105,28 @@ fn parse_session_line(line: &str) -> Option<SessionEntry> {
     })
 }
 
+/// Resolve a session's project root from a [`ROOT_QUERY`] reply's two raw
+/// fields (`docs/spec-per-session-project-root.md`): `root_option` is
+/// `#{@root}` — the durable stamp [`stamp_root_command`] writes at attach —
+/// and `session_path` is `#{session_path}` — the session's working
+/// directory (Phase 34's `-c` default). Prefers `root_option` when
+/// non-empty (the session has been stamped); falls back to `session_path`
+/// for a session `@root` has never stamped (created outside rift, or
+/// attached before this phase). `None` only when tmux itself reports an
+/// empty `session_path` too (should not happen for a live session, but the
+/// daemon degrades rather than assumes). Pure so it is unit-tested without
+/// tmux; the caller ([`Attach::process`]'s `root_query` reply arm) passes
+/// the two raw reply fields through untouched.
+fn resolve_session_root(root_option: &str, session_path: &str) -> Option<PathBuf> {
+    if !root_option.is_empty() {
+        Some(PathBuf::from(root_option))
+    } else if !session_path.is_empty() {
+        Some(PathBuf::from(session_path))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1109,6 +1227,65 @@ mod tests {
         // malformed command.
         assert_eq!(reroot_command(Path::new("/tmp/a\nkill-server")), None);
         assert_eq!(reroot_command(Path::new("/tmp/a\rkill-server")), None);
+    }
+
+    #[test]
+    fn test_stamp_root_command_sets_at_root_with_quoted_session_and_root() {
+        let command = stamp_root_command("rift", Path::new("/home/dev/proj"))
+            .expect("plain session and root are safe");
+        assert_eq!(command, "set -t 'rift' @root '/home/dev/proj'");
+    }
+
+    #[test]
+    fn test_stamp_root_command_quotes_a_root_containing_a_space() {
+        // Unquoted, tmux's command lexer would split this into two
+        // arguments (same lexer hazard `reroot_command` documents).
+        let command = stamp_root_command("rift", Path::new("/tmp/rift stamp project"))
+            .expect("a space is a lexer-level, not line-framing, character");
+        assert_eq!(command, "set -t 'rift' @root '/tmp/rift stamp project'");
+    }
+
+    #[test]
+    fn test_stamp_root_command_quotes_a_session_containing_a_space() {
+        let command = stamp_root_command("my session", Path::new("/tmp/proj"))
+            .expect("a space in the session name is a lexer-level character");
+        assert_eq!(command, "set -t 'my session' @root '/tmp/proj'");
+    }
+
+    #[test]
+    fn test_stamp_root_command_escapes_an_embedded_single_quote() {
+        let command = stamp_root_command("rift", Path::new("/tmp/rift's project"))
+            .expect("an embedded quote is a lexer-level, not line-framing, character");
+        assert_eq!(command, "set -t 'rift' @root '/tmp/rift'\\''s project'");
+    }
+
+    #[test]
+    fn test_stamp_root_command_with_newline_in_root_returns_none() {
+        // Same line-framing hazard `reroot_command` guards: a literal `\n`
+        // in `root` would split this into two control-mode commands, the
+        // second unquoted and attacker-controlled.
+        assert_eq!(
+            stamp_root_command("rift", Path::new("/tmp/a\nkill-server")),
+            None
+        );
+        assert_eq!(
+            stamp_root_command("rift", Path::new("/tmp/a\rkill-server")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_stamp_root_command_with_newline_in_session_returns_none() {
+        // Unlike `reroot_command`, this command embeds the session name, so
+        // it must be checked for the same line-framing hazard.
+        assert_eq!(
+            stamp_root_command("rift\nkill-server", Path::new("/tmp/proj")),
+            None
+        );
+        assert_eq!(
+            stamp_root_command("rift\rkill-server", Path::new("/tmp/proj")),
+            None
+        );
     }
 
     #[test]
@@ -1325,6 +1502,23 @@ mod tests {
         assert!(!sessions[1].attached);
     }
 
+    #[test]
+    fn test_resolve_session_root_prefers_non_empty_root_option() {
+        let resolved = resolve_session_root("/home/dev/proj", "/home/dev/other");
+        assert_eq!(resolved, Some(PathBuf::from("/home/dev/proj")));
+    }
+
+    #[test]
+    fn test_resolve_session_root_falls_back_to_session_path_when_root_option_empty() {
+        let resolved = resolve_session_root("", "/home/dev/other");
+        assert_eq!(resolved, Some(PathBuf::from("/home/dev/other")));
+    }
+
+    #[test]
+    fn test_resolve_session_root_returns_none_when_both_empty() {
+        assert_eq!(resolve_session_root("", ""), None);
+    }
+
     // --- real-tmux integration (#204) ---
     //
     // Each test drives `terminal_task` against an isolated tmux server (a unique
@@ -1371,10 +1565,25 @@ mod tests {
         mpsc::Receiver<DaemonMessage>,
         tokio::task::JoinHandle<()>,
     ) {
+        spawn_task_with_root(server, outbound_cap, None)
+    }
+
+    /// Like [`spawn_task`] but with the daemon's configured project root
+    /// (`docs/spec-per-session-project-root.md`), for fixtures that exercise
+    /// the `@root` stamp / re-root (`Attach::spawn`'s `root` parameter).
+    fn spawn_task_with_root(
+        server: &TmuxServer,
+        outbound_cap: usize,
+        root: Option<PathBuf>,
+    ) -> (
+        mpsc::Sender<ClientMessage>,
+        mpsc::Receiver<DaemonMessage>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (in_tx, in_rx) = mpsc::channel(64);
         let (out_tx, out_rx) = mpsc::channel(outbound_cap);
         let socket = server.name.clone();
-        let handle = tokio::spawn(terminal_task(in_rx, out_tx, Some(socket), None));
+        let handle = tokio::spawn(terminal_task(in_rx, out_tx, Some(socket), root));
         (in_tx, out_rx, handle)
     }
 
@@ -1480,6 +1689,52 @@ mod tests {
             !pane.current_command.is_empty(),
             "pane current command must name the running shell"
         );
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_attach_with_root_stamps_at_root_readable_via_display_message() {
+        // Validates `stamp_root_command` against a real tmux server
+        // (`docs/spec-per-session-project-root.md` acceptance): after attach,
+        // `@root` is independently queryable — via a plain `tmux
+        // display-message`, outside the daemon's own control-mode child —
+        // and carries the daemon's configured root.
+        let server = TmuxServer::new("rootstamp");
+        let root = std::env::temp_dir().join("rift-root-coupling-test");
+        let (in_tx, mut out_rx, task) = spawn_task_with_root(&server, 256, Some(root.clone()));
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+                root: None,
+            })
+            .await
+            .expect("send attach");
+
+        recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::LayoutSnapshot { .. } => Some(()),
+            _ => None,
+        })
+        .await
+        .expect("layout snapshot after attach");
+
+        let output = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &server.name,
+                "display-message",
+                "-p",
+                "-t",
+                "rift",
+                "#{@root}",
+            ])
+            .output()
+            .expect("query @root via tmux display-message");
+        assert!(output.status.success(), "tmux display-message failed");
+        let stamped = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        assert_eq!(stamped, root.to_string_lossy());
 
         drop(in_tx);
         let _ = task.await;
