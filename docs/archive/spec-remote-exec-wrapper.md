@@ -1,8 +1,8 @@
 # Spec: Remote exec wrapper (container / WSL / jump target)
 
-> Status: READY
+> Status: COMPLETED
 > Created: 2026-07-09
-> Completed: —
+> Completed: 2026-07-09
 
 A single opaque command-wrapper (`RIFT_REMOTE_EXEC_WRAPPER`, e.g.
 `docker exec -i devenv`) applied at the SSH exec chokepoint so rift runs its
