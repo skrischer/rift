@@ -75,6 +75,14 @@ const LAYOUT_QUERY: &str = "list-panes -s -F '#{window_id}\t#{window_index}\t#{w
 const SESSION_LIST_QUERY: &str =
     "list-sessions -F '#{session_id}\t#{session_windows}\t#{session_attached}\t#{session_name}'";
 
+/// The `-F` format alone (no `list-sessions -F '...'` wrapper), for the
+/// pre-attach one-off query ([`query_session_list_detached`], #757), which runs
+/// `tmux` directly with each argument passed separately — so the format takes
+/// no surrounding shell quotes. MUST stay identical to the format embedded in
+/// [`SESSION_LIST_QUERY`] so both paths parse with [`parse_session_line`].
+const SESSION_LIST_FORMAT: &str =
+    "#{session_id}\t#{session_windows}\t#{session_attached}\t#{session_name}";
+
 /// Signals that the connection's outbound channel closed — the client is gone.
 struct Closed;
 
@@ -136,6 +144,19 @@ pub(crate) async fn terminal_task(
                         &outbound,
                     )
                     .await;
+                }
+                Some(ClientMessage::QuerySessionList) if attach.is_none() => {
+                    // The picker queries the session list BEFORE attaching
+                    // (#757, `docs/spec-post-connect-picker.md`): there is no
+                    // control-mode child yet, so answer with a one-off
+                    // `tmux list-sessions` instead of dropping it in the arm
+                    // below. A host with no server running replies with an
+                    // empty list, so the picker reaches its zero-session
+                    // create-only state rather than the client hanging on a
+                    // reply that never arrives. Once attached, a
+                    // `QuerySessionList` falls through to the control-mode path
+                    // (`handle_client_message` -> `request_session_list`).
+                    query_session_list_detached(server_socket.as_deref(), &outbound).await;
                 }
                 Some(other) => {
                     if let Some(a) = attach.as_mut() {
@@ -222,6 +243,43 @@ async fn open_attach(
             None
         }
     }
+}
+
+/// Answer a pre-attach [`ClientMessage::QuerySessionList`] (#757) with a one-off
+/// `tmux list-sessions`, independent of the control-mode attach path
+/// ([`Attach::send_command`]), which does not exist until a session is attached.
+/// The picker issues this query before any `Attach`
+/// (`docs/spec-post-connect-picker.md`), so a host with no server running yet
+/// (fresh boot, or every session killed) must not hang the client: tmux exits
+/// non-zero with "no server running on ..." and this maps that — like any
+/// failure — to an EMPTY [`DaemonMessage::SessionListReply`], which drives the
+/// picker's zero-session create-only state. `server_socket` selects the tmux
+/// server (`-L`), matching [`spawn_args`].
+async fn query_session_list_detached(
+    server_socket: Option<&str>,
+    outbound: &mpsc::Sender<DaemonMessage>,
+) {
+    let mut command = tokio::process::Command::new("tmux");
+    if let Some(socket) = server_socket {
+        command.args(["-L", socket]);
+    }
+    command.args(["list-sessions", "-F", SESSION_LIST_FORMAT]);
+    let sessions = match command.output().await {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            parse_session_list(&text.lines().map(str::to_owned).collect::<Vec<_>>())
+        }
+        // A non-zero exit is the "no server running" case (or a genuine tmux
+        // error); the picker's zero-session edge treats both as an empty list.
+        Ok(_) => Vec::new(),
+        Err(err) => {
+            warn!(%err, "one-off tmux list-sessions failed; replying with an empty session list");
+            Vec::new()
+        }
+    };
+    let _ = outbound
+        .send(DaemonMessage::SessionListReply { sessions })
+        .await;
 }
 
 /// Build the argv (excluding the `tmux` program name itself) for the attach's
@@ -2087,6 +2145,66 @@ mod tests {
             .expect("the attached session must be listed");
         assert!(rift.attached, "this attach counts as an attached client");
         assert!(rift.windows >= 1, "a live session has at least one window");
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_query_session_list_pre_attach_no_server_replies_empty() {
+        // #757: the picker queries the list BEFORE any Attach. With no tmux
+        // server running (fresh boot, or every session killed), the daemon must
+        // answer with an EMPTY SessionListReply so the picker reaches its
+        // create-only state, not drop the query and hang the client.
+        let server = TmuxServer::new("presess-empty");
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+
+        in_tx
+            .send(ClientMessage::QuerySessionList)
+            .await
+            .expect("query session list");
+        let sessions = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::SessionListReply { sessions } => Some(sessions.clone()),
+            _ => None,
+        })
+        .await
+        .expect("session-list reply");
+        assert!(
+            sessions.is_empty(),
+            "no tmux server running must reply with an empty list, got {sessions:?}"
+        );
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_query_session_list_pre_attach_lists_existing_sessions() {
+        // #757: with a server that already has sessions, the pre-attach picker
+        // query lists them WITHOUT the client ever attaching through the task.
+        let server = TmuxServer::new("presess-list");
+        let status = std::process::Command::new("tmux")
+            .args(["-L", &server.name, "new-session", "-d", "-s", "rift757pre"])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run tmux new-session");
+        assert!(status.success(), "seed a session out-of-band");
+
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+        in_tx
+            .send(ClientMessage::QuerySessionList)
+            .await
+            .expect("query session list");
+        let sessions = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::SessionListReply { sessions } => Some(sessions.clone()),
+            _ => None,
+        })
+        .await
+        .expect("session-list reply");
+        assert!(
+            sessions.iter().any(|s| s.name == "rift757pre"),
+            "the pre-existing session must be listed pre-attach, got {sessions:?}"
+        );
 
         drop(in_tx);
         let _ = task.await;
