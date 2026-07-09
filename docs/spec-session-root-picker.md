@@ -466,3 +466,23 @@ that traces back here (planning gate).
   list / picker show each session's path — riding the milestone-#53 dependency).
   Human prerequisites: none. Status `DRAFT` → `READY`; milestone `Phase 360` created
   at acceptance with `Depends on milestone: #53`.
+- 2026-07-10: Issue #768 (client root-picker surface) implemented. `crates/app/src/root_picker.rs`
+  adds `RootPicker`, a GPUI-view-only card mirroring `session_picker::SessionPicker`'s
+  split: it never touches `ClientMessage`/`DaemonMessage` itself, instead emitting
+  `RootPickerEvent::Browse(path)` for the owner to turn into a `QueryDirEntries`
+  request, and exposing `apply_dir_entries_reply(path, parent, entries, error,
+  window, cx)` (the reply's fields, not a `DirEntriesReply` type — that shape is a
+  `DaemonMessage` variant, not a standalone struct) for the owner to feed the
+  answer back. An `error` reply keeps the last good level displayed and renders the
+  failure inline, never tearing the picker down. Every browse (row click, breadcrumb
+  segment, the parent affordance) reseeds the session-name field with the new
+  level's basename on success; Create emits `RootPickerEvent::Picked { root, name }`.
+  The phase-9 `window_state` store gained `recent_roots: Vec<String>` (schema-additive,
+  `#[serde(default)]`) plus `record_recent_root` (a move-to-front/cap mutator
+  mirroring `save_diff_view_mode`'s shape) — `root_picker::start_path` is a pure
+  function over that list the caller uses to seed the first browse, falling back to
+  `""` ($HOME). Wiring this picker into the Phase-33 picker container, the in-cockpit
+  strip "+", and the create-with-root `Attach` send stays #769's job — this PR only
+  builds and tests the surface + its browse state, tested headlessly via
+  `#[gpui::test]` over a real `TestAppContext`/window (needed for the `InputState`
+  name field), mirroring `file_tree.rs`'s `open_tree` harness.
