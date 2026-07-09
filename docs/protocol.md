@@ -50,7 +50,12 @@ binary, never by tolerating it (`docs/spec-connection-robustness.md`).
   a healthy concurrent connection's stream (relevant for the shared stable+dev
   daemon).
 
-History: version 9 adds the file-operation channel — `create_file` /
+History: version 10 adds the directory-browse channel — `query_dir_entries`
+answered by one `dir_entries_reply` carrying `DirEntry` children and an
+optional typed `DirBrowseError` — plus a `root: Option<String>` field on
+`attach` (the create-with-root transport) and a `root: Option<String>` field
+on `SessionEntry` (each session's project path, read from tmux `#{@root}`)
+(`docs/spec-session-root-picker.md`); version 9 adds the file-operation channel — `create_file` /
 `create_dir` / `rename_path` / `delete_path`, each answered by one
 `file_op_result` carrying a typed `FileOp` echo and an optional typed
 `FileOpError` (`docs/spec-explorer-file-ops.md`); version 8 adds the buffer
@@ -80,6 +85,7 @@ streams pane bytes and layout state back.
 
 ```json
 { "type": "attach",       "session": "rift" }
+{ "type": "attach",       "session": "my-project", "root": "/home/dev/my-project" }
 { "type": "input",        "pane_id": 3, "data": "ls\n" }
 { "type": "resize_pane",  "pane_id": 3, "cols": 120, "rows": 40 }
 { "type": "tmux_command", "cmd": "split-window -h" }
@@ -91,7 +97,12 @@ streams pane bytes and layout state back.
 - `attach` carries the **session name end-to-end**, so the `RIFT_SESSION` knob
   (e.g. `RIFT_SESSION=rift-dev` for the dogfooding isolation channel) survives the
   protocol seam. The daemon runs attach-or-create (`new-session -A -s <session>`)
-  per attach, one tmux control-mode attach per connected client.
+  per attach, one tmux control-mode attach per connected client. `root` is the
+  **create-with-root transport** (`docs/spec-session-root-picker.md`): `None`
+  (omitted on the wire) on every existing caller — reconnect, switch,
+  pick-existing — leaves today's behavior unchanged; `Some(<picked>)` when
+  creating a session at a picked root threads the path into `new-session -c
+  <picked>` and stamps `@root <picked>` on the new session.
 - `input` carries raw keystroke bytes; `data` is **opaque** — the protocol
   forwards it to tmux and never interprets pane input or output (agent-agnostic).
 - `resize_pane` maps to this client's tmux resize/`refresh-client -C`.
@@ -129,7 +140,7 @@ streams pane bytes and layout state back.
 { "type": "layout_update",   "session": "rift", "windows": [ <window>, ... ] }
 { "type": "terminal_exit",   "session": "rift", "reason": "server exited" }
 { "type": "key_table_reply", "list_keys": "bind-key -T prefix c new-window\n...", "options": "prefix C-b\nrepeat-time 500\n..." }
-{ "type": "session_list_reply", "sessions": [{ "id": 0, "name": "rift", "windows": 3, "attached": true }] }
+{ "type": "session_list_reply", "sessions": [{ "id": 0, "name": "rift", "windows": 3, "attached": true, "root": "/home/dev/rift" }] }
 ```
 
 ```jsonc
@@ -182,10 +193,12 @@ streams pane bytes and layout state back.
   spaces or tabs survive). Per session: `id` is tmux's `$<n>` session id (the
   rename-stable key), `name` the current name, `windows` the window count,
   and `attached` whether at least one client is attached (tmux's
-  attached-client count folded to a bool). The client replaces its whole
-  session list on every arrival (replace semantics, like `layout_update`).
-  Which session THIS client is attached to is not carried here — the
-  `session` string on `layout_snapshot`/`layout_update` already owns that.
+  attached-client count folded to a bool). `root` is the session's project
+  path, read from tmux `#{@root}` (the Phase-35 stamp) — omitted (`None`) for
+  a session with no stamped root. The client replaces its whole session list
+  on every arrival (replace semantics, like `layout_update`). Which session
+  THIS client is attached to is not carried here — the `session` string on
+  `layout_snapshot`/`layout_update` already owns that.
 
 ### Snapshot ↔ live-stream consistency contract
 
@@ -617,6 +630,48 @@ protocol**, giving the explorer create / rename / delete / move. Specified by
   There is no client-side SFTP path; every op runs daemon-side via `std::fs`
   on the remote host the daemon already owns.
 
+## Directory-browse channel
+
+The directory-browse channel is the **eighth request/response family in the
+protocol**, backing the remote root picker that resolves a project root
+before a session is created. Specified by
+`docs/spec-session-root-picker.md`.
+
+```json
+// client → daemon
+{ "type": "query_dir_entries", "path": "/home/dev" }
+{ "type": "query_dir_entries", "path": "" }
+// daemon → client
+{ "type": "dir_entries_reply", "path": "/home/dev", "parent": "/home", "entries": [{ "name": "rift", "is_git_repo": true, "git_branch": "develop" }, { "name": "notes", "is_git_repo": false }] }
+{ "type": "dir_entries_reply", "path": "/root", "parent": null, "entries": [], "error": "permission_denied" }
+```
+
+- `query_dir_entries` requests the child **directories** of `path`, an
+  **absolute** host path. An empty string (or a leading `~`/`~/…`) resolves
+  to the daemon user's `$HOME` (the picker's start level; degrades to `/`
+  when `HOME` is unset). Unlike the worktree-relative paths elsewhere in the
+  protocol, `path` here is **not confined** to any worktree root — the
+  browse is a discovery read over whatever the daemon's SSH user can already
+  see (the `open_file` out-of-root read carve-out and the shell in every
+  pane already expose arbitrary-path reads; enumeration is the only
+  genuinely new capability), run daemon-side via `std::fs::read_dir`, never
+  client SFTP.
+- `dir_entries_reply` is the **single reply shape**: `path` is the resolved
+  absolute directory that was listed (so the client can correlate and render
+  the breadcrumb even when it sent `""`); `parent` is its parent directory,
+  or `null` at the filesystem root; `entries` are its child directories,
+  name-sorted (symlinked directories followed and included; dotfile
+  directories included; files omitted). On failure `entries` is empty and
+  `error` is a typed `DirBrowseError` (`not_found` / `permission_denied` /
+  `not_a_directory` / `io`), present only on failure (omitted, never `null`,
+  on success) — a **query-reply** shape (success = `error` absent),
+  deliberately not the `ok: bool` op-result shape of `file_op_result`: a
+  query returns data or an error, not an ack.
+- Each `DirEntry` carries `name`, `is_git_repo` (a cheap `<name>/.git`
+  existence check), and an optional `git_branch` parsed from
+  `<name>/.git/HEAD` (`ref: refs/heads/<branch>` → `<branch>`; a detached
+  HEAD or non-repo → omitted) — a plain file read, not a `gix` call.
+
 ## Rules
 
 All message types live in `crates/protocol/`. Adding a new message type is a
@@ -642,10 +697,12 @@ queries; the **diff channel** (`request_diff` → `file_diff`) for the
 source-control panel's review diff; the **write channel**
 (`stage_file` / `unstage_file` / `stage_hunk` / `discard_file` / `commit` →
 one `git_op_result` each) for the source-control panel's mutating
-operations; and the **file-operation channel** (`create_file` /
+operations; the **file-operation channel** (`create_file` /
 `create_dir` / `rename_path` / `delete_path` → one `file_op_result` each)
-for the explorer's create / rename / delete / move. The push-only rule
-governs structure and decoration, never request/response pairs.
+for the explorer's create / rename / delete / move; and the
+**directory-browse channel** (`query_dir_entries` → `dir_entries_reply`)
+for the remote root picker. The push-only rule governs structure and
+decoration, never request/response pairs.
 
 The protocol may migrate to MessagePack if JSON serialization becomes a bottleneck.
 Keep message types serialization-agnostic (derive `serde::Serialize` +

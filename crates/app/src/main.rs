@@ -1665,7 +1665,13 @@ async fn run_daemon_terminal(
         session
     };
     client
-        .send(ClientMessage::Attach { session })
+        .send(ClientMessage::Attach {
+            session,
+            // The create-with-root transport (`docs/spec-session-root-picker.md`)
+            // is wired by the root-picker follow-on issue; this path never
+            // creates at a picked root.
+            root: None,
+        })
         .await
         .context("failed to open daemon terminal attach")?;
     // Re-assert the last known grid behind the attach, exactly like the
@@ -1992,6 +1998,9 @@ async fn try_daemon_reconnect(
     client
         .send(rift_protocol::ClientMessage::Attach {
             session: session.to_string(),
+            // Reconnect always re-attaches an existing session; never creates
+            // at a picked root.
+            root: None,
         })
         .await
         .map_err(ReconnectFailure::Transient)?;
@@ -3045,6 +3054,9 @@ fn spawn_session_switch_bridge(
             if client
                 .send(ClientMessage::Attach {
                     session: req.session.clone(),
+                    // A switch always targets an existing session; never
+                    // creates at a picked root.
+                    root: None,
                 })
                 .await
                 .is_err()

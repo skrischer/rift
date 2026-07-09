@@ -134,8 +134,12 @@ pub(crate) async fn terminal_task(
                 }
             },
             msg = inbound.recv() => match msg {
-                Some(ClientMessage::Attach { session }) => {
+                Some(ClientMessage::Attach { session, .. }) => {
                     // Re-attach: tear the current child down before opening anew.
+                    // `root` (the create-with-root transport,
+                    // `docs/spec-session-root-picker.md`) is ignored here — the
+                    // create-with-root wiring into `open_attach`/`spawn_args`
+                    // lands in a follow-on issue.
                     detach(&mut attach).await;
                     attach = open_attach(
                         session,
@@ -568,6 +572,9 @@ impl Attach {
             // #673) are likewise not terminal messages; their `std::fs`-backed
             // handlers land in a follow-on issue — silently dropped here in
             // the meantime, same convention.
+            // `QueryDirEntries` (the directory-browse channel, #766) is
+            // likewise not a terminal message: it is answered per connection
+            // by `browse::reply`, so it never reaches the terminal task.
             ClientMessage::Input { .. }
             | ClientMessage::Attach { .. }
             | ClientMessage::OpenFile { .. }
@@ -588,6 +595,7 @@ impl Attach {
             | ClientMessage::CreateDir { .. }
             | ClientMessage::RenamePath { .. }
             | ClientMessage::DeletePath { .. }
+            | ClientMessage::QueryDirEntries { .. }
             | ClientMessage::Hello { .. } => {}
         }
         Ok(())
@@ -995,6 +1003,9 @@ fn parse_session_line(line: &str) -> Option<SessionEntry> {
         name,
         windows,
         attached,
+        // `SESSION_LIST_QUERY` does not read `#{@root}` yet — a follow-on
+        // issue extends it and this constructor fills `root` from it.
+        root: None,
     })
 }
 
@@ -1260,6 +1271,7 @@ mod tests {
                 name: "rift".to_owned(),
                 windows: 2,
                 attached: true,
+                root: None,
             }
         );
     }
@@ -1428,6 +1440,7 @@ mod tests {
         in_tx
             .send(ClientMessage::Attach {
                 session: "rift".to_owned(),
+                root: None,
             })
             .await
             .expect("send attach");
@@ -1481,6 +1494,7 @@ mod tests {
             in_tx
                 .send(ClientMessage::Attach {
                     session: "rift".to_owned(),
+                    root: None,
                 })
                 .await
                 .expect("attach");
@@ -1536,6 +1550,7 @@ mod tests {
         in_tx
             .send(ClientMessage::Attach {
                 session: "rift".to_owned(),
+                root: None,
             })
             .await
             .expect("attach");
@@ -1607,6 +1622,7 @@ mod tests {
         in_tx
             .send(ClientMessage::Attach {
                 session: "rift".to_owned(),
+                root: None,
             })
             .await
             .expect("attach");
@@ -1635,6 +1651,7 @@ mod tests {
         in_tx
             .send(ClientMessage::Attach {
                 session: "rift".to_owned(),
+                root: None,
             })
             .await
             .expect("attach");
@@ -1674,6 +1691,7 @@ mod tests {
         in_tx
             .send(ClientMessage::Attach {
                 session: "rift".to_owned(),
+                root: None,
             })
             .await
             .expect("attach");
@@ -1700,6 +1718,7 @@ mod tests {
         in_tx
             .send(ClientMessage::Attach {
                 session: "rift".to_owned(),
+                root: None,
             })
             .await
             .expect("attach");
@@ -1738,6 +1757,7 @@ mod tests {
         in_tx
             .send(ClientMessage::Attach {
                 session: "rift".to_owned(),
+                root: None,
             })
             .await
             .expect("attach");
@@ -1820,6 +1840,7 @@ mod tests {
         in_tx
             .send(ClientMessage::Attach {
                 session: "rift".to_owned(),
+                root: None,
             })
             .await
             .expect("attach");
@@ -1894,6 +1915,7 @@ mod tests {
         in_tx
             .send(ClientMessage::Attach {
                 session: "rift".to_owned(),
+                root: None,
             })
             .await
             .expect("attach");
@@ -1970,6 +1992,7 @@ mod tests {
         in_tx
             .send(ClientMessage::Attach {
                 session: "rift".to_owned(),
+                root: None,
             })
             .await
             .expect("attach");
@@ -2014,6 +2037,7 @@ mod tests {
         in_tx
             .send(ClientMessage::Attach {
                 session: "rift".to_owned(),
+                root: None,
             })
             .await
             .expect("attach");
@@ -2057,6 +2081,7 @@ mod tests {
         in_tx
             .send(ClientMessage::Attach {
                 session: "rift".to_owned(),
+                root: None,
             })
             .await
             .expect("attach");
@@ -2120,6 +2145,7 @@ mod tests {
         in_tx
             .send(ClientMessage::Attach {
                 session: "rift".to_owned(),
+                root: None,
             })
             .await
             .expect("attach");
@@ -2220,6 +2246,7 @@ mod tests {
         in_tx
             .send(ClientMessage::Attach {
                 session: "rift".to_owned(),
+                root: None,
             })
             .await
             .expect("attach");
@@ -2281,6 +2308,7 @@ mod tests {
         in_tx
             .send(ClientMessage::Attach {
                 session: "rift".to_owned(),
+                root: None,
             })
             .await
             .expect("attach");
@@ -2342,6 +2370,7 @@ mod tests {
         in_tx
             .send(ClientMessage::Attach {
                 session: "rift".to_owned(),
+                root: None,
             })
             .await
             .expect("attach");
@@ -2393,6 +2422,7 @@ mod tests {
             in_tx
                 .send(ClientMessage::Attach {
                     session: "rift".to_owned(),
+                    root: None,
                 })
                 .await
                 .expect("attach 1");
@@ -2428,6 +2458,7 @@ mod tests {
         in_tx
             .send(ClientMessage::Attach {
                 session: "rift".to_owned(),
+                root: None,
             })
             .await
             .expect("attach 2");
@@ -2455,6 +2486,7 @@ mod tests {
         in_tx
             .send(ClientMessage::Attach {
                 session: "rift".to_owned(),
+                root: None,
             })
             .await
             .expect("attach");
@@ -2499,6 +2531,7 @@ mod tests {
         in_tx
             .send(ClientMessage::Attach {
                 session: "rift".to_owned(),
+                root: None,
             })
             .await
             .expect("attach");
