@@ -1417,11 +1417,19 @@ fn drain_render_backlog(ch: &PtyChannels, editor: &EditorChannels, watches: &Eng
     // A switch queued mid-outage is dropped without recording it on the
     // session watch: the daemon never saw it, and the resync restores the
     // last session actually asked of the daemon (#475 drop semantics).
+    //
+    // `session_list_request_rx` is intentionally NOT drained here: unlike
+    // the channels below (stale keystrokes / tmux commands / captures — user
+    // actions that must not replay into a live pane), it carries only an
+    // idempotent "refresh the session list" nudge. `SessionView::new` fires
+    // one at construction, before the first attach; draining it here would
+    // discard that initial request and leave the session strip showing only
+    // the current session (issue #750). Replaying it costs at most one extra
+    // harmless `QuerySessionList`.
     let dropped = ch.input_rx.drain().count()
         + ch.tmux_command_rx.drain().count()
         + ch.capture_request_rx.drain().count()
         + ch.key_table_request_rx.drain().count()
-        + ch.session_list_request_rx.drain().count()
         + ch.session_switch_rx.drain().count()
         + editor.open_file_rx.drain().count()
         + editor.save_file_rx.drain().count()
@@ -3485,7 +3493,9 @@ mod tests {
         assert!(h.ch.tmux_command_rx.is_empty());
         assert!(h.ch.capture_request_rx.is_empty());
         assert!(h.ch.key_table_request_rx.is_empty());
-        assert!(h.ch.session_list_request_rx.is_empty());
+        // Not drained (issue #750): an idempotent "refresh the list" nudge is
+        // cheap to replay and must survive to trigger the post-attach query.
+        assert!(!h.ch.session_list_request_rx.is_empty());
         assert!(h.ch.session_switch_rx.is_empty());
         assert!(h.editor.open_file_rx.is_empty());
         assert!(h.editor.save_file_rx.is_empty());

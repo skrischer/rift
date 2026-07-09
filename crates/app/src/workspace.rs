@@ -1509,7 +1509,7 @@ impl Render for WorkspaceView {
         // interim statusbar anchor) once a live session names it. The
         // settings gear dispatches through the same `open_settings` path as
         // the `OpenSettings` action below.
-        let connection = {
+        let (connection, session_strip) = {
             let (dot_color, ssh_label, has_session) = {
                 let session = self.session_view.read(cx);
                 let (_, dot_color) = session.connection_status().status_dot(cx);
@@ -1524,7 +1524,10 @@ impl Render for WorkspaceView {
                     session.render_session_strip(cx).into_any_element()
                 })
             });
-            title_bar::ConnectionGroup::connected(dot_color, ssh_label, session_strip)
+            (
+                title_bar::ConnectionGroup::connected(dot_color, ssh_label),
+                session_strip,
+            )
         };
         let settings_button = Button::new("title-bar-settings")
             .ghost()
@@ -1534,7 +1537,7 @@ impl Render for WorkspaceView {
                 this.open_settings(window, cx);
             }))
             .into_any_element();
-        let title_bar = title_bar::render(connection, Some(settings_button), cx);
+        let title_bar = title_bar::render(connection, session_strip, Some(settings_button), cx);
 
         // The activity rail (#513, `docs/spec-cockpit-chrome.md`): active
         // state tracks live dock visibility and the badges read the same
