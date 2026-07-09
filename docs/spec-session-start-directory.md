@@ -30,18 +30,41 @@ login directory (`$HOME`) — without navigating there by hand. Roadmap Phase 34
 
 ### In scope
 
-- `crates/daemon/src/terminal.rs`: thread the daemon's watched root from
-  `serve_uds` → `terminal_task` → `open_attach` → `Attach::spawn`, and append
-  `-c <root>` to the `new-session -A -s <session>` invocation so a freshly
-  created session's default working directory is the project root. The root is a
-  separate argv entry (not a shell string), so it is injection-safe by
-  construction — no quoting helper needed (unlike `crates/ssh/src/launch.rs`).
-- A unit test on the spawn-command construction: with a root, the argv contains
-  `-c <root>` after `new-session -A -s <session>`; with no root, `-c` is absent.
-- (Conditional on the gate decision) re-rooting a pre-existing session on attach
-  via `attach-session -c <root>` (or equivalent), plus its own command-construction
-  test.
-- Updating any existing daemon tests that assert the exact `new-session` argv.
+- Thread the daemon's watched root to the tmux control-mode attach and append
+  `-c <root>` to `new-session -A -s <session>` in `Attach::spawn`, so a freshly
+  created session's default working directory is the project root. The seam is
+  **`serve_connection`** (`crates/daemon/src/lib.rs`), which spawns `terminal_task`
+  and is shared by both entry points — the real path is
+  `serve_uds` / `serve` → `serve_connection` → `terminal_task` → `open_attach` →
+  `Attach::spawn`. Concretely:
+  - `crates/daemon/src/lib.rs`: `serve_connection` gains a `root: Option<PathBuf>`
+    parameter and passes it into the `terminal::terminal_task(...)` spawn.
+    `serve_uds` and the stdio `serve` currently *consume* `worktree_root` into
+    `watch_worktree` / `watch_lsp`; they retain a clone to hand each connection's
+    `serve_connection` call. Every `serve_connection` call site — the two
+    production ones and the many test ones — takes the new argument (mechanical).
+  - `crates/daemon/src/terminal.rs`: `terminal_task` → `open_attach` →
+    `Attach::spawn` gain the `root: Option<PathBuf>`; `Attach::spawn` appends
+    `-c <root>` when present. The root is a separate argv entry (not a shell
+    string), so it is injection-safe by construction — no quoting helper needed
+    (unlike `crates/ssh/src/launch.rs`).
+- Extract the argv construction from `Attach::spawn` into a pure, testable helper
+  (e.g. `fn spawn_args(session, server_socket, root: Option<&Path>) -> Vec<String>`),
+  mirroring the `parse_serve_uds_args` / `watched_root` extraction from
+  `archive/spec-daemon-project-root.md`, and unit-test it: with a root the argv
+  contains `-c <root>` after `new-session -A -s <session>`; with no root, `-c` is
+  absent. (Extraction for testability — a function, not a trait; no
+  premature-abstraction concern.)
+- Update the `terminal_task` spawn sites for the new parameter — the production
+  seam (`serve_connection`) and the test helpers (`terminal.rs`'s `spawn_task` and
+  the `terminal_task` spawns in `lib.rs`'s tests). No existing test asserts the
+  `new-session` argv (the `terminal.rs` tests are real-tmux integration tests), so
+  this is a compile-level update, not a behavioral-test rewrite.
+- (Conditional on the gate decision) re-rooting a pre-existing session on attach.
+  The concrete command (`attach-session -c <root>` issued from the already-attached
+  control client, or an equivalent) must be **validated against real tmux** — not
+  assumed — before it is committed to; its effect on an existing session's cwd is
+  the thing under test. Plus its own command-construction test.
 
 ### Out of scope
 
@@ -71,8 +94,12 @@ login directory (`$HOME`) — without navigating there by hand. Roadmap Phase 34
   attaches an already-existing session, `-c` is a no-op. Re-rooting a pre-existing
   session needs a separate `attach-session -c <root>` (the gate decision).
 - In `--serve-uds` mode the daemon refuses to start without `--root` (issue #502),
-  so a root is present in production; `terminal_task` / `Attach::spawn` still take
-  the root as `Option` and omit `-c` when absent (the stdio / test paths).
+  so a root is present in production. The stdio `serve` path also carries a
+  `worktree_root: Option<PathBuf>`; threading through the shared `serve_connection`
+  seam means stdio sessions get `-c <root>` too when a root is present — the
+  consistent behavior, not something to suppress. `root` stays `Option` (and `-c`
+  is omitted when `None`) for the **test** call sites, which build connections
+  with no root.
 - The daemon builds tmux argv as a `Vec`, not a shell string — `-c <root>` is a
   plain arg, inherently injection-safe. No `shell_single_quote` needed here.
 - Best-effort side channel: a bad root must degrade (tmux may reject `-c`), never
@@ -83,7 +110,7 @@ login directory (`$HOME`) — without navigating there by hand. Roadmap Phase 34
 | Decision | Rationale | Date |
 |---|---|---|
 | **Set-once via the session default directory**, not per-call `-c` on split/new-window | tmux (≥1.9) inherits the session's default working directory for `new-window`/`split-window` when `-c` is omitted; setting it once at `new-session -c <root>` makes every window/pane land in the project root. Keeps the change daemon-local — `session_view.rs` and the app's tmux-command strings stay untouched, respecting the crate boundary. Roadmap-flagged open decision, resolved here by the tmux constraint. | 2026-07-09 |
-| Realize the change **daemon-side** at `Attach::spawn`, threading the root `serve_uds → terminal_task → open_attach → Attach::spawn` | All session creation (UI new-session prompt, switch, `+`, prefix `c`) funnels through `ClientMessage::Attach` → the daemon's `new-session -A`; the daemon already holds the watched root. One chokepoint covers every path. | 2026-07-09 |
+| Realize the change **daemon-side** at `Attach::spawn`, threading the root through the shared `serve_connection` seam: `serve_uds` / `serve` → `serve_connection` → `terminal_task` → `open_attach` → `Attach::spawn` | All session creation (UI new-session prompt, switch, `+`, prefix `c`) funnels through `ClientMessage::Attach` → the daemon's `new-session -A`; the daemon already holds the watched root, and `serve_connection` is the single seam both entry points spawn `terminal_task` through. One chokepoint covers every path. | 2026-07-09 |
 | Root source = the daemon's existing single `--root` (single-root scope) | No per-session root in this phase; dynamizing the root is Phase 35. Reuses the shipped `archive/spec-daemon-project-root.md` resolution unchanged. | 2026-07-09 |
 | `-c <root>` passed as a separate argv entry (no quoting helper) | The daemon spawns tmux via `Command::args`, not a shell; a path arg cannot inject. Contrast `launch.rs`, which builds a shell string and must single-quote. | 2026-07-09 |
 | **OPEN — resolved at the spec-acceptance gate:** whether to re-root a pre-existing session (default dir ≠ project root, e.g. created outside rift in `$HOME`) on attach via `attach-session -c <root>`, or leave an externally-created session's directory untouched | Tradeoff: completing "new panes never land in `$HOME`" for a session persisted/created before this change vs overriding a directory the user may have chosen deliberately. Neither vision nor constitution settles the UX call. | 2026-07-09 |
@@ -122,11 +149,12 @@ Each issue references this spec path in its body.
 
 - [ ] `just ci` passes (fmt-check + clippy `-D warnings` + tests, workspace
       excluding `rift-app`).
-- [ ] Unit (`crates/daemon`): `Attach::spawn` with a root builds
-      `new-session -A -s <session> -c <root>` (argv contains `-c` then the root);
-      with no root, `-c` is absent. (Plus the re-root command test if the gate
-      approves re-rooting.)
-- [ ] Existing daemon tests that assert the `new-session` argv are updated.
+- [ ] Unit (`crates/daemon`): the extracted `spawn_args` helper, with a root,
+      builds `new-session -A -s <session> -c <root>` (argv contains `-c` then the
+      root); with no root, `-c` is absent. (Plus the re-root command test if the
+      gate approves re-rooting.)
+- [ ] The `terminal_task` / `serve_connection` call sites compile with the new
+      `root` parameter (production seam + test helpers).
 - [ ] Behavioral (dev-channel QA gate): create a fresh rift session; open a new
       window (`+` and prefix `c`) and a split; `pwd` in each is the project root,
       not `$HOME`. (If re-rooting is approved: attaching a session whose default
@@ -138,7 +166,7 @@ Each issue references this spec path in its body.
 |---|---|
 | `-c` interacts unexpectedly with `-A` when the session already exists (silently ignored) | Documented in Constraints/Prior decisions: `-c` applies on create only; the re-root path (if approved) covers pre-existing sessions. Command-construction unit test pins the argv. |
 | A stale session persisted from before this change keeps its `$HOME` default dir | Same class as the 3.5 stale-daemon migration: a one-time re-create (or the re-root decision) fixes it; documented at the QA gate. |
-| tmux rejects a bad/nonexistent `-c` path | Daemon degrades and logs (best-effort side channel); the tmux flow is unaffected. |
+| tmux rejects a bad/nonexistent `-c` path | Not realistic in production (the root is the already-validated watched root). If it occurred, `new-session` fails and surfaces as this attach ending (`TerminalExit`); the daemon process survives — only this one attach ends, not the daemon. |
 
 ## Decision log
 
@@ -147,3 +175,15 @@ Each issue references this spec path in its body.
   resolved to **set-once** by the tmux ≥1.9 constraint (windows/splits inherit the
   session default dir), which also keeps the change daemon-local. One genuinely
   open decision carried to the acceptance gate: re-rooting a pre-existing session.
+- 2026-07-09: Spec review (VERDICT REQUEST_CHANGES → addressed): corrected the
+  plumbing path — `terminal_task` is spawned by the shared `serve_connection` seam
+  (`lib.rs:979`), not directly by `serve_uds`, so the root threads
+  `serve` / `serve_uds` → `serve_connection` → `terminal_task` → `open_attach` →
+  `Attach::spawn` and the change spans `lib.rs` (the seam + its call sites) and
+  `terminal.rs`. Clarified that the stdio `serve` path also gets `-c` (only test
+  call sites are rootless); specified the `spawn_args` helper extraction for the
+  unit test; reworded the "update tests" scope (no argv-asserting test exists — it
+  is a compile-level call-site update) and the bad-`-c` risk wording; flagged that
+  the re-root command must be validated against real tmux if the gate approves it.
+  The design itself (set-once daemon-side, tmux inheritance, session_view.rs
+  untouched, scope vs Phase 35) was confirmed sound.
