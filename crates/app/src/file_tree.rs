@@ -61,10 +61,11 @@ use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, px, AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Div, Entity,
-    EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement as _, Pixels, Render, ScrollStrategy, SharedString,
-    Size, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
+    div, px, transparent_black, AnyElement, App, AppContext as _, ClickEvent, ClipboardItem,
+    Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
+    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Pixels,
+    Render, ScrollStrategy, SharedString, Size, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Window,
 };
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_component::dialog::{AlertDialog, DialogButtonProps};
@@ -2472,8 +2473,8 @@ impl FileTree {
         // shifts the row's trailing slots rightward relative to its
         // unselected siblings — a visible layout jump. Selected and
         // unselected rows now share identical text metrics; legibility comes
-        // from the brighter `secondary_active` fill + inset accent bar below
-        // instead of weight.
+        // from the `list_active` fill + `primary` left border below instead
+        // of weight.
         let name_el = h_flex()
             .flex_1()
             .when_some(git_color, |el, color| el.text_color(color))
@@ -2530,6 +2531,12 @@ impl FileTree {
             .rounded(ROW_RADIUS)
             .text_sm()
             .cursor_pointer()
+            // Every row carries the 2px left-border slot (the selected row
+            // colors it `primary`), so selecting a row never shifts its
+            // content against its siblings — mirrors the session pill's
+            // treatment (`session_view.rs`'s `render_session_strip`, #731).
+            .border_l_2()
+            .border_color(transparent_black())
             .hover(|s| s.bg(cx.theme().list_hover))
             .children(Self::render_indent_guides(row.depth, cx))
             // Right mouse-down selects the row so the context menu's unit
@@ -2557,23 +2564,19 @@ impl FileTree {
             .child(severity_dot)
             .child(git_letter);
 
-        // Selection fill: the cursor row keeps Phase 27's inset accent bar +
-        // active-surface tint; a multi-selected row that is *not* the cursor
-        // gets the artboard's discrete flat-surface fill instead (a neutral
-        // `secondary` theme role, distinct from `list_active`/`accent` — no
-        // accent bar, `docs/spec-explorer-search.md`, Phase 31, #680). The
-        // cursor's own treatment always wins when a row is both.
-        //
-        // The cursor fill is `secondary_active` rather than `list_active`
-        // (#729): a step brighter than both `list_active` (hover/drag-over)
-        // and the multi-select `secondary` fill above, compensating for the
-        // now-removed bold so the selected row still reads as legibly
-        // distinct.
+        // Selection fill: the cursor row matches the session pill's active
+        // treatment (`session_view.rs`'s `render_session_strip`, #731) — the
+        // `primary` (blue) left border reserved above plus a `list_active`
+        // fill and foreground text. A multi-selected row that is *not* the
+        // cursor keeps the artboard's discrete flat-surface fill instead (a
+        // neutral `secondary` theme role, no accent bar,
+        // `docs/spec-explorer-search.md`, Phase 31, #680), staying visually
+        // distinct from the cursor row. The cursor's own treatment always
+        // wins when a row is both.
         if is_selected {
             root = root
-                .bg(cx.theme().secondary_active)
-                .border_l_2()
-                .border_color(cx.theme().accent)
+                .bg(cx.theme().list_active)
+                .border_color(cx.theme().primary)
                 .text_color(cx.theme().foreground);
         } else if self.selection.contains(&row.path) {
             root = root.bg(cx.theme().secondary);
