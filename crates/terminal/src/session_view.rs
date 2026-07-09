@@ -183,6 +183,21 @@ struct SessionRename {
     _subscription: Subscription,
 }
 
+/// An in-progress inline kill confirmation for a session chip (#685,
+/// `docs/spec-session-management.md`), armed by a chip's right-click menu's
+/// "Kill" item (see [`SessionView::render_session_strip`]). Two-step by
+/// design: the menu item only arms this state (see
+/// [`SessionView::start_session_kill_confirm`]) — nothing reaches tmux until
+/// the confirm control commits (see [`SessionView::confirm_session_kill`]);
+/// Escape or the cancel control aborts with no command sent
+/// ([`SessionView::cancel_session_kill`]). `session_id` is tmux's
+/// rename-stable session id (`SessionListItem::id`, targeted as `$<id>`);
+/// `session_name` is display-only (the confirm affordance's label/tooltip).
+struct SessionKillConfirm {
+    session_id: u32,
+    session_name: String,
+}
+
 /// An in-progress border drag. `start` is the mouse position along the drag
 /// axis at mouse-down; `emitted_cells` is the whole-cell offset already sent to
 /// tmux, so each move only emits the incremental `resize-pane`.
@@ -210,6 +225,16 @@ fn quote_tmux_name(name: &str) -> String {
 /// second command.
 fn rename_session_command(id: u32, new_name: &str) -> String {
     format!("rename-session -t ${id} -- {}", quote_tmux_arg(new_name))
+}
+
+/// tmux `kill-session -t $<id>` command for a session chip's kill-confirm
+/// (#685, `docs/spec-session-management.md`). `id` targets tmux's
+/// rename-stable session id (`SessionListItem::id`), never the (possibly
+/// stale) name; a numeric `$<id>` target needs no quoting helper — quoting
+/// only matters for untrusted text arguments like a session name (see
+/// [`rename_session_command`]).
+fn kill_session_command(id: u32) -> String {
+    format!("kill-session -t ${id}")
 }
 
 /// tmux `resize-pane` direction flag for a cell delta. Positive grows the
@@ -461,6 +486,11 @@ pub struct SessionView {
     /// a chip's right-click menu; when active, that chip renders the edit
     /// input in place of its name.
     renaming_session: Option<SessionRename>,
+    /// The strip's in-progress inline kill confirmation (#685), armed from a
+    /// chip's right-click menu's "Kill" item; when active, that chip renders
+    /// a compact confirm affordance ("Kill?" + confirm/cancel) in place of
+    /// its normal row. Two-step by design — see [`SessionKillConfirm`].
+    confirming_kill: Option<SessionKillConfirm>,
     /// Requests an on-demand session-list refresh (forwarded to
     /// `TerminalHandle`'s `session_list_request_rx`); between requests the
     /// daemon's churn-driven pushes keep the strip live.
@@ -692,6 +722,7 @@ impl SessionView {
             sessions: Vec::new(),
             new_session_prompt: None,
             renaming_session: None,
+            confirming_kill: None,
             session_list_request_tx,
             session_switch_tx,
             reconnect_cancel_tx,
@@ -1406,6 +1437,54 @@ impl SessionView {
         }
     }
 
+    /// Arm the kill confirmation for chip `id` (name `name`), dispatched by
+    /// the chip's right-click menu's "Kill" item (#685,
+    /// `docs/spec-session-management.md`): two-step by design, so a stray
+    /// click can never kill a session outright. No command is sent here —
+    /// only [`Self::confirm_session_kill`] sends one.
+    fn start_session_kill_confirm(&mut self, id: u32, name: String, cx: &mut Context<Self>) {
+        self.confirming_kill = Some(SessionKillConfirm {
+            session_id: id,
+            session_name: name,
+        });
+        cx.notify();
+    }
+
+    /// Commit an armed kill confirmation: send `kill-session -t $<id>` over
+    /// the existing raw tmux-command seam (`tmux_command_tx`, the same
+    /// channel rename and the pane-header split/zoom/select-pane controls
+    /// use). The strip drops the session live via the daemon's
+    /// `%sessions-changed` churn push (`SessionListReply`); killing the
+    /// ATTACHED session surfaces the existing `TerminalExit` path — no new
+    /// teardown here. A second confirm after the kill already committed (or
+    /// was cancelled) must not re-send.
+    fn confirm_session_kill(&mut self, cx: &mut Context<Self>) {
+        let Some(confirm) = self.confirming_kill.take() else {
+            return;
+        };
+        if let Err(e) = self
+            .tmux_command_tx
+            .try_send(kill_session_command(confirm.session_id))
+        {
+            debug!(error = %e, "failed to send session kill command");
+        }
+        // The inline confirm unmounts now; return keyboard focus to the pane
+        // (mirrors session/window rename) so the terminal is not left
+        // keyboard-dead.
+        self.needs_focus = true;
+        cx.notify();
+    }
+
+    /// Cancel an armed kill confirmation without emitting a command
+    /// (Escape or the cancel control).
+    fn cancel_session_kill(&mut self, cx: &mut Context<Self>) {
+        if self.confirming_kill.is_some() {
+            self.confirming_kill = None;
+            self.needs_focus = true;
+            cx.notify();
+        }
+    }
+
     fn render_layout(
         &self,
         node: &LayoutNode,
@@ -1555,6 +1634,7 @@ impl SessionView {
         let current_bg = cx.theme().list_active;
         let primary = cx.theme().primary;
         let attached_dot = cx.theme().success;
+        let danger = cx.theme().danger;
 
         let mut strip = h_flex()
             .items_center()
@@ -1579,6 +1659,12 @@ impl SessionView {
                 .filter(|rename| rename.session_id == row.id)
                 .map(|rename| rename.input.clone());
 
+            let kill_confirm_name = self
+                .confirming_kill
+                .as_ref()
+                .filter(|confirm| confirm.session_id == row.id)
+                .map(|confirm| confirm.session_name.clone());
+
             let chip = if let Some(input) = renaming_input {
                 let cancel_entity = entity.clone();
                 h_flex()
@@ -1594,6 +1680,50 @@ impl SessionView {
                         }
                     })
                     .child(Input::new(&input).xsmall())
+                    .into_any_element()
+            } else if let Some(kill_name) = kill_confirm_name {
+                let confirm_entity = entity.clone();
+                let cancel_entity = entity.clone();
+                let key_cancel_entity = entity.clone();
+                let confirm_id = row.id;
+                h_flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .h(px(SESSION_CHIP_HEIGHT))
+                    .px(px(6.0))
+                    .on_key_down(move |event: &KeyDownEvent, _window, cx| {
+                        if event.keystroke.key.as_str() == "escape" {
+                            key_cancel_entity.update(cx, |view, cx| {
+                                view.cancel_session_kill(cx);
+                            });
+                            cx.stop_propagation();
+                        }
+                    })
+                    .child(div().text_color(danger).child("Kill?"))
+                    .child(
+                        Button::new(("session-kill-confirm", confirm_id as usize))
+                            .xsmall()
+                            .danger()
+                            .icon(IconName::Check)
+                            .tooltip(SharedString::from(format!("Kill \"{kill_name}\"")))
+                            .on_click(move |_event, _window, cx| {
+                                confirm_entity.update(cx, |view, cx| {
+                                    view.confirm_session_kill(cx);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new(("session-kill-cancel", confirm_id as usize))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tooltip("Cancel")
+                            .on_click(move |_event, _window, cx| {
+                                cancel_entity.update(cx, |view, cx| {
+                                    view.cancel_session_kill(cx);
+                                });
+                            }),
+                    )
                     .into_any_element()
             } else {
                 let base = h_flex()
@@ -1636,20 +1766,40 @@ impl SessionView {
                     let session_id = row.id;
                     let session_name = row.name.clone();
                     base.context_menu(move |menu, _window, _cx| {
-                        let menu_entity = menu_entity.clone();
-                        let session_name = session_name.clone();
+                        let rename_entity = menu_entity.clone();
+                        let rename_name = session_name.clone();
+                        let kill_entity = menu_entity.clone();
+                        let kill_name = session_name.clone();
                         menu.item(PopupMenuItem::new("Rename").on_click(
                             move |_event, window, cx| {
-                                menu_entity.update(cx, |view, cx| {
+                                rename_entity.update(cx, |view, cx| {
                                     view.start_session_rename(
                                         session_id,
-                                        session_name.clone(),
+                                        rename_name.clone(),
                                         window,
                                         cx,
                                     );
                                 });
                             },
                         ))
+                        .item(
+                            // "Kill" only ARMS the chip's inline confirm
+                            // (#685, `docs/spec-session-management.md`); the
+                            // danger token marks it destructive at the menu
+                            // level too, matching the confirm affordance.
+                            PopupMenuItem::element(|_window, cx| {
+                                div().text_color(cx.theme().danger).child("Kill")
+                            })
+                            .on_click(move |_event, _window, cx| {
+                                kill_entity.update(cx, |view, cx| {
+                                    view.start_session_kill_confirm(
+                                        session_id,
+                                        kill_name.clone(),
+                                        cx,
+                                    );
+                                });
+                            }),
+                        )
                     })
                     .into_any_element()
                 } else {
@@ -2379,11 +2529,12 @@ impl Render for SessionView {
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_activity, grid_size_for, home_relative, max_vertical_pane_count,
-        new_window_at_command, quote_tmux_name, reconnect_banner_message, rename_session_command,
-        resize_direction, select_pane_command, split_command, tab_state_slot, zoom_pane_command,
-        PaneActivity, SessionListItem, SessionSnapshot, SessionView, TabStateSlot, TermSize,
-        TerminalHandle, DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE,
+        aggregate_activity, grid_size_for, home_relative, kill_session_command,
+        max_vertical_pane_count, new_window_at_command, quote_tmux_name, reconnect_banner_message,
+        rename_session_command, resize_direction, select_pane_command, split_command,
+        tab_state_slot, zoom_pane_command, PaneActivity, SessionListItem, SessionSnapshot,
+        SessionView, TabStateSlot, TermSize, TerminalHandle, DEFAULT_FONT_SIZE, MAX_FONT_SIZE,
+        MIN_FONT_SIZE,
     };
     use crate::layout::LayoutNode;
     use gpui::{
@@ -2601,6 +2752,11 @@ mod tests {
             rename_session_command(5, "it's"),
             "rename-session -t $5 -- 'it'\\''s'"
         );
+    }
+
+    #[test]
+    fn test_kill_session_command_targets_dollar_id() {
+        assert_eq!(kill_session_command(3), "kill-session -t $3");
     }
 
     #[test]
@@ -3318,6 +3474,93 @@ mod tests {
             );
         })
         .unwrap();
+    }
+
+    /// The chip's right-click "Kill" (#685) only ARMS the two-step confirm —
+    /// nothing is sent to tmux yet, and needs_focus is left untouched by
+    /// arming (only clearing the confirm, on either path, restores it).
+    #[gpui::test]
+    fn test_start_session_kill_confirm_arms_without_sending(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, handle) = session_and_handle(cx);
+
+            session.update(cx, |view, cx| {
+                view.start_session_kill_confirm(3, "rift".to_string(), cx);
+            });
+
+            assert!(
+                session.read(cx).confirming_kill.is_some(),
+                "Kill arms the inline confirm"
+            );
+            assert!(
+                handle.tmux_command_rx.try_recv().is_err(),
+                "arming the confirm sends no command"
+            );
+        });
+    }
+
+    /// Confirming an armed kill sends exactly one `kill-session -t $<id>` —
+    /// targeted by the numeric tmux session id, so no quoting is needed —
+    /// clears the confirm state, and restores pane focus (mirrors
+    /// `submit_session_rename`). A second confirm after the commit must not
+    /// re-send.
+    #[gpui::test]
+    fn test_confirm_session_kill_sends_one_kill_command_and_restores_focus(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let (session, handle) = session_and_handle(cx);
+
+            session.update(cx, |view, cx| {
+                view.start_session_kill_confirm(3, "rift".to_string(), cx);
+                view.needs_focus = false;
+            });
+
+            session.update(cx, |view, cx| view.confirm_session_kill(cx));
+
+            assert_eq!(
+                handle.tmux_command_rx.try_recv().expect("command sent"),
+                "kill-session -t $3"
+            );
+            assert!(
+                session.read(cx).confirming_kill.is_none(),
+                "confirm cleared after commit"
+            );
+            assert!(session.read(cx).needs_focus, "focus restored after confirm");
+
+            session.update(cx, |view, cx| view.confirm_session_kill(cx));
+            assert!(
+                handle.tmux_command_rx.try_recv().is_err(),
+                "a second confirm after the commit sends nothing"
+            );
+        });
+    }
+
+    /// Cancel (mirrors Escape, which dispatches the same handler) sends no
+    /// command, clears the armed confirm, and restores pane focus.
+    #[gpui::test]
+    fn test_cancel_session_kill_sends_nothing_and_restores_focus(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, handle) = session_and_handle(cx);
+
+            session.update(cx, |view, cx| {
+                view.start_session_kill_confirm(1, "rift".to_string(), cx);
+                view.needs_focus = false;
+            });
+            assert!(session.read(cx).confirming_kill.is_some());
+
+            session.update(cx, |view, cx| view.cancel_session_kill(cx));
+
+            assert!(
+                session.read(cx).confirming_kill.is_none(),
+                "cancel clears the in-progress kill confirm"
+            );
+            assert!(
+                handle.tmux_command_rx.try_recv().is_err(),
+                "cancel sends no command"
+            );
+            assert!(session.read(cx).needs_focus, "focus restored after cancel");
+        });
     }
 
     /// `font_size()` starts at the same default `apply_font_zoom`'s delta path
