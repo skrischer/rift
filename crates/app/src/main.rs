@@ -337,6 +337,17 @@ fn main() {
                     None,
                 ),
             ]);
+            // Jump-to-file quick-open (`docs/spec-explorer-search.md`, Phase 31,
+            // #681): Ctrl+Shift+O / Cmd+Shift+O opens it, mirroring Xcode's
+            // "Open Quickly" muscle memory and the command palette's
+            // Ctrl+Shift+P pattern above — a terminal-safe `Ctrl/Cmd+Shift`
+            // chord, never the bare `Ctrl+P` the terminal's readline claims.
+            // Unscoped (`None`), so the shortcut reaches quick-open regardless
+            // of which surface is focused, including the terminal.
+            cx.bind_keys([
+                KeyBinding::new("ctrl-shift-o", rift_app::quick_open::OpenQuickOpen, None),
+                KeyBinding::new("cmd-shift-o", rift_app::quick_open::OpenQuickOpen, None),
+            ]);
             // Settings surface (#366, `docs/spec-theme-settings.md`): Ctrl+, /
             // Cmd+, opens it, mirroring the editor-convention shortcut. Unscoped
             // (`None`), like the command palette above, so it reaches the
