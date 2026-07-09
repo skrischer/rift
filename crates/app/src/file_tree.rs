@@ -2468,9 +2468,14 @@ impl FileTree {
         // `matched_indices` (no filter, or an ancestor-of-a-match directory
         // row) yields a single unmatched span, identical to the plain `name`
         // child this replaces.
+        // No bold on selection (#729): a bolded name widens the glyph run and
+        // shifts the row's trailing slots rightward relative to its
+        // unselected siblings — a visible layout jump. Selected and
+        // unselected rows now share identical text metrics; legibility comes
+        // from the brighter `secondary_active` fill + inset accent bar below
+        // instead of weight.
         let name_el = h_flex()
             .flex_1()
-            .when(is_selected, |el| el.font_weight(FontWeight::BOLD))
             .when_some(git_color, |el, color| el.text_color(color))
             .children(
                 emphasis_segments(&name, &row.matched_indices)
@@ -2558,9 +2563,15 @@ impl FileTree {
         // `secondary` theme role, distinct from `list_active`/`accent` — no
         // accent bar, `docs/spec-explorer-search.md`, Phase 31, #680). The
         // cursor's own treatment always wins when a row is both.
+        //
+        // The cursor fill is `secondary_active` rather than `list_active`
+        // (#729): a step brighter than both `list_active` (hover/drag-over)
+        // and the multi-select `secondary` fill above, compensating for the
+        // now-removed bold so the selected row still reads as legibly
+        // distinct.
         if is_selected {
             root = root
-                .bg(cx.theme().list_active)
+                .bg(cx.theme().secondary_active)
                 .border_l_2()
                 .border_color(cx.theme().accent)
                 .text_color(cx.theme().foreground);
