@@ -1951,11 +1951,12 @@ mod tests {
     }
 
     /// Dock interaction (`docs/spec-ide-shell.md`, issue #325): every surface
-    /// stays zoomable to fill the shell and restore. None of `FileTree`,
-    /// `EditorView`, `TerminalPanel`, or `ProblemsPanel` override
-    /// `Panel::zoomable`, so the default reaches the dock's native
-    /// zoom-in/zoom-out control for all four — this locks that invariant
-    /// against an accidental future override.
+    /// stays zoomable to fill the shell and restore. `FileTree`, `EditorView`,
+    /// `TerminalPanel`, and `ProblemsPanel` all override `Panel::zoomable` to
+    /// `Some(PanelControl::Toolbar)` (`docs/spec-dogfooding-fixes.md`, #716)
+    /// so the zoom control renders as a direct header button instead of the
+    /// "..." overflow menu — this locks the "stays zoomable" invariant
+    /// against an accidental future override that drops it to `None`.
     #[gpui::test]
     fn test_all_dock_surfaces_stay_zoomable(cx: &mut TestAppContext) {
         let mut workspace: Option<Entity<WorkspaceView>> = None;
@@ -1984,23 +1985,34 @@ mod tests {
                 )
             };
 
-            assert!(
-                file_tree.read(cx).zoomable(cx).is_some(),
-                "the explorer stays zoomable"
-            );
-            assert!(
-                editor.read(cx).zoomable(cx).is_some(),
-                "the editor stays zoomable"
-            );
-            assert!(
-                problems_panel.read(cx).zoomable(cx).is_some(),
-                "the problems panel stays zoomable"
-            );
+            for (name, control) in [
+                ("the explorer", file_tree.read(cx).zoomable(cx)),
+                ("the editor", editor.read(cx).zoomable(cx)),
+                ("the problems panel", problems_panel.read(cx).zoomable(cx)),
+            ] {
+                let control = control.unwrap_or_else(|| panic!("{name} stays zoomable"));
+                assert!(
+                    control.toolbar_visible(),
+                    "{name}'s zoom renders as a direct header button, not the \"...\" menu"
+                );
+                assert!(
+                    !control.menu_visible(),
+                    "{name}'s zoom is pulled out of the \"...\" overflow menu"
+                );
+            }
 
             let terminal_panel = cx.new(|_| TerminalPanel::new(session_view));
+            let terminal_control = terminal_panel
+                .read(cx)
+                .zoomable(cx)
+                .expect("the terminal stays zoomable");
             assert!(
-                terminal_panel.read(cx).zoomable(cx).is_some(),
-                "the terminal stays zoomable"
+                terminal_control.toolbar_visible(),
+                "the terminal's zoom renders as a direct header button, not the \"...\" menu"
+            );
+            assert!(
+                !terminal_control.menu_visible(),
+                "the terminal's zoom is pulled out of the \"...\" overflow menu"
             );
         });
     }

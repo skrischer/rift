@@ -12,7 +12,7 @@ use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render, SharedString,
     Window,
 };
-use gpui_component::dock::{Panel, PanelEvent};
+use gpui_component::dock::{Panel, PanelControl, PanelEvent};
 use rift_terminal::SessionView;
 
 /// Stable, distinct dock-panel identity for the terminal (`Panel::panel_name`).
@@ -47,6 +47,15 @@ impl Panel for TerminalPanel {
 
     fn title(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         SharedString::from("Terminal")
+    }
+
+    // Direct header button rather than the "..." overflow menu default
+    // (`docs/spec-dogfooding-fixes.md`, #716): `Panel::zoomable` defaults to
+    // `PanelControl::Menu`, which buries zoom in/out inside the Ellipsis
+    // menu. `Toolbar` renders it as a `Maximize`/`Minimize` button in the
+    // panel header instead, reusing gpui-component's own extension point.
+    fn zoomable(&self, _cx: &App) -> Option<PanelControl> {
+        Some(PanelControl::Toolbar)
     }
 }
 

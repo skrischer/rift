@@ -68,7 +68,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_component::dialog::{AlertDialog, DialogButtonProps};
-use gpui_component::dock::{Panel, PanelEvent};
+use gpui_component::dock::{Panel, PanelControl, PanelEvent};
 use gpui_component::input::{
     Escape, Input, InputEvent, InputState, MoveToStart, SelectToNextWordEnd,
 };
@@ -2777,6 +2777,15 @@ impl Panel for FileTree {
 
     fn title(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         SharedString::from("Explorer")
+    }
+
+    // Direct header button rather than the "..." overflow menu default
+    // (`docs/spec-dogfooding-fixes.md`, #716): `Panel::zoomable` defaults to
+    // `PanelControl::Menu`, which buries zoom in/out inside the Ellipsis
+    // menu. `Toolbar` renders it as a `Maximize`/`Minimize` button in the
+    // panel header instead, reusing gpui-component's own extension point.
+    fn zoomable(&self, _cx: &App) -> Option<PanelControl> {
+        Some(PanelControl::Toolbar)
     }
 }
 
