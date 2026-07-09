@@ -239,3 +239,10 @@ Each issue references this spec path in its body.
     back through tmux's stable manpage history with the same "sets the
     session working directory (used for new windows)" wording, consistent
     with the spec's Constraints section.
+  - Review follow-up: `quote_tmux_arg`'s in-line escaping cannot neutralize a
+    `\n`/`\r` in `root`, since `Attach::send_command` frames each command as
+    one control-mode line before tmux's lexer runs — `reroot_command` now
+    guards this and returns `None` (skip the re-root, warn) rather than ever
+    sending a split, partially-unquoted command, preserving the spec's
+    per-attach containment guarantee (a bad `-c` ends only this attach, never
+    the daemon or the tmux server).

@@ -278,20 +278,37 @@ fn spawn_args(session: &str, server_socket: Option<&str>, root: Option<&Path>) -
 /// quoted with [`quote_tmux_arg`]: an unquoted space would otherwise split it
 /// into two tokens (confirmed against real tmux: unquoted, a rooted path
 /// containing a space fails with tmux's `%error … too many arguments`).
-fn reroot_command(root: &Path) -> String {
-    format!(
-        "attach-session -c {}",
-        quote_tmux_arg(&root.to_string_lossy())
-    )
+///
+/// Quoting alone cannot neutralize a `\n`/`\r` in `root`: [`Attach::send_command`]
+/// frames each command as one control-mode *line*, terminated before tmux's
+/// own lexer (and hence `quote_tmux_arg`'s `'...'` escaping) ever runs — a
+/// literal newline in the path would split this into two control-mode
+/// commands, the second one unquoted and attacker-controlled (POSIX paths may
+/// legally contain `\n`; only `/` and NUL are forbidden). Returns `None` for
+/// such a `root` instead of building an unsafe command; the caller skips the
+/// re-root and logs rather than sending it (best-effort degrade, matching the
+/// spec's "never abort the daemon" risk mitigation, narrowed here to "never
+/// send a malformed command").
+fn reroot_command(root: &Path) -> Option<String> {
+    let root = root.to_string_lossy();
+    if root.contains('\n') || root.contains('\r') {
+        return None;
+    }
+    Some(format!("attach-session -c {}", quote_tmux_arg(&root)))
 }
 
 /// Wrap `value` as a single literal tmux control-mode command-line argument:
 /// wrapping in `'...'` and escaping an embedded `'` as `'\''` makes tmux's
-/// lexer treat `value` as exactly one token regardless of whitespace or
-/// metacharacters. Mirrors `crates/terminal/src/tmux_quote.rs::quote_tmux_arg`;
-/// duplicated rather than shared because the daemon and `terminal` crates
-/// stay independent (`docs/constitution.md` crate-boundary rule) and this is
-/// the daemon's only tmux command line that embeds a dynamic, unbounded value.
+/// *lexer* treat `value` as exactly one token regardless of in-line
+/// whitespace or metacharacters (`"`, `;`, a leading `-`, `$`, `#`). This is a
+/// within-line, lexer-level defense only — it says nothing about a `\n`/`\r`
+/// in `value`, which breaks the control-mode *line framing* the lexer never
+/// even sees (guarded separately by [`reroot_command`]'s `None` case; do not
+/// rely on this function for that). Mirrors
+/// `crates/terminal/src/tmux_quote.rs::quote_tmux_arg`; duplicated rather
+/// than shared because the daemon and `terminal` crates stay independent
+/// (`docs/constitution.md` crate-boundary rule) and this is the daemon's only
+/// tmux command line that embeds a dynamic, unbounded value.
 fn quote_tmux_arg(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -395,9 +412,20 @@ impl Attach {
         // attach (`docs/spec-session-start-directory.md`); a no-op when the
         // session was just created with `-c root` above. Best-effort: a reply
         // arrives as an unmatched CommandReply and is silently dropped, same
-        // as any other ack (see `process`'s CommandReply arm).
+        // as any other ack (see `process`'s CommandReply arm). A root that
+        // cannot be safely framed as one control-mode line (`\n`/`\r`) skips
+        // the re-root rather than sending a malformed command — see
+        // `reroot_command`.
         if let Some(root) = root {
-            attach.send_command(&reroot_command(root)).await?;
+            match reroot_command(root) {
+                Some(cmd) => {
+                    attach.send_command(&cmd).await?;
+                }
+                None => warn!(
+                    root = %root.display(),
+                    "skipping session re-root: root path contains a control character that cannot be safely sent over tmux control mode"
+                ),
+            }
         }
         // The task loop already reads stdout (we are subscribed), so any change
         // after this query lands as a live LayoutUpdate — no gap; the snapshot is
@@ -976,7 +1004,7 @@ mod tests {
 
     #[test]
     fn test_reroot_command_wraps_root_in_attach_session_c_with_no_target() {
-        let command = reroot_command(Path::new("/home/dev/proj"));
+        let command = reroot_command(Path::new("/home/dev/proj")).expect("plain root is safe");
         assert_eq!(command, "attach-session -c '/home/dev/proj'");
         // No `-t <session>`: the command targets the issuing client's own
         // current session (validated against real tmux), so a session name
@@ -989,14 +1017,29 @@ mod tests {
         // Unquoted, real tmux rejects this with `%error … too many
         // arguments` (validated) because its command lexer splits on
         // whitespace; the quoting keeps the whole path one argument.
-        let command = reroot_command(Path::new("/tmp/rift reroot project"));
+        let command = reroot_command(Path::new("/tmp/rift reroot project"))
+            .expect("a space is a lexer-level, not line-framing, character");
         assert_eq!(command, "attach-session -c '/tmp/rift reroot project'");
     }
 
     #[test]
     fn test_reroot_command_escapes_an_embedded_single_quote() {
-        let command = reroot_command(Path::new("/tmp/rift's project"));
+        let command = reroot_command(Path::new("/tmp/rift's project"))
+            .expect("an embedded quote is a lexer-level, not line-framing, character");
         assert_eq!(command, "attach-session -c '/tmp/rift'\\''s project'");
+    }
+
+    #[test]
+    fn test_reroot_command_with_newline_in_root_returns_none() {
+        // `Attach::send_command` frames each command as one control-mode
+        // line, terminated before tmux's lexer (and quote_tmux_arg's
+        // escaping) ever runs; a literal `\n` would split this into two
+        // control-mode commands, the second unquoted and attacker-controlled.
+        // A POSIX path may legally contain `\n` (only `/` and NUL are
+        // forbidden), so this must degrade to "no re-root", never send the
+        // malformed command.
+        assert_eq!(reroot_command(Path::new("/tmp/a\nkill-server")), None);
+        assert_eq!(reroot_command(Path::new("/tmp/a\rkill-server")), None);
     }
 
     #[test]
