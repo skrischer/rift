@@ -6302,7 +6302,7 @@ dependencies = [
 
 [[package]]
 name = "rift-app"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6330,7 +6330,7 @@ dependencies = [
 
 [[package]]
 name = "rift-daemon"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "rift-explorer",
@@ -6345,7 +6345,7 @@ dependencies = [
 
 [[package]]
 name = "rift-explorer"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "gix",
  "ignore",
@@ -6356,7 +6356,7 @@ dependencies = [
 
 [[package]]
 name = "rift-logging"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -6364,7 +6364,7 @@ dependencies = [
 
 [[package]]
 name = "rift-lsp"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-lsp",
  "futures",
@@ -6380,14 +6380,14 @@ dependencies = [
 
 [[package]]
 name = "rift-plugin-api"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rift-protocol",
 ]
 
 [[package]]
 name = "rift-protocol"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -6396,7 +6396,7 @@ dependencies = [
 
 [[package]]
 name = "rift-ssh"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "flume",
@@ -6412,7 +6412,7 @@ dependencies = [
 
 [[package]]
 name = "rift-terminal"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "alacritty_terminal",
  "flume",
@@ -6426,7 +6426,7 @@ dependencies = [
 
 [[package]]
 name = "rift-tmux-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "thiserror 2.0.18",
 ]
