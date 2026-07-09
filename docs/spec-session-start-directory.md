@@ -198,3 +198,51 @@ Each issue references this spec path in its body.
   `crates/terminal/src/pane_view.rs` and `crates/app/src/editor.rs`, rather than
   bundling the connection's wiring into a struct — an unrelated refactor out of
   scope for this step.
+- 2026-07-09: Issue #727 implementation — re-root command validated against a
+  real tmux 3.4 server (`tmux -L rift-reroot-test`, killed after each run).
+  Findings, driving a real `-C` control-mode child via its stdin/stdout (a bare
+  CLI `new-window` was *not* representative: run from a client with no
+  attached session, tmux falls back to that command client's own invocation
+  cwd rather than the session default dir — server_client_get_cwd's
+  command-client branch — so only a genuinely attached control client
+  exercises the session-inherits-default-dir path the spec's Constraints
+  section relies on):
+  - `attach-session -c <root>`, sent with **no `-t`**, over the control-mode
+    connection already attached to the target session, sets that session's
+    `#{session_path}` to `root`; a subsequent `new-window` from the same
+    client then lands in `root`. Omitting `-t` targets the client's own
+    current session, so the session name is never embedded in the command
+    line — no quoting/injection surface for it at all. (`-t <session>` also
+    works, targeting explicitly, but is unnecessary here.)
+  - Re-issuing it for a session already at `root` (the freshly-created-session
+    case) is a harmless no-op behaviorally: tmux applies the same path, and
+    the `%session-changed` it emits carries this attach's own unchanged
+    session id, which the existing `Event::SessionChanged` handler already
+    treats as `switched = false` (no spurious layout re-query from that event
+    specifically; the `%window-add`/`%session-window-changed` also observed
+    on the wire are already-handled structural-change events, coalesced by
+    the existing `layout_dirty` logic — no new handling needed).
+  - The command string is parsed by tmux's own control-mode lexer (unlike
+    `spawn_args`, which is real process argv), so `root` must be quoted:
+    confirmed empirically that an **unquoted** root containing a space
+    (`/tmp/rift reroot project`) makes tmux reply
+    `parse error: command attach-session: too many arguments (need at most 0)`
+    and leaves the session unrerooted, while the same path **single-quoted**
+    (tmux-lexer style, embedded `'` escaped as `'\''`) re-roots correctly —
+    verified for both a plain space and an embedded single quote. Implemented
+    as a small `quote_tmux_arg` duplicated from
+    `crates/terminal/src/tmux_quote.rs` rather than shared, since the daemon
+    and `terminal` crates stay independent and this is the daemon's one
+    command line with a dynamic, unbounded value.
+  - No version caveat found within this validation (tmux 3.4, the version
+    available in this environment); `-c` on `attach-session` is documented
+    back through tmux's stable manpage history with the same "sets the
+    session working directory (used for new windows)" wording, consistent
+    with the spec's Constraints section.
+  - Review follow-up: `quote_tmux_arg`'s in-line escaping cannot neutralize a
+    `\n`/`\r` in `root`, since `Attach::send_command` frames each command as
+    one control-mode line before tmux's lexer runs — `reroot_command` now
+    guards this and returns `None` (skip the re-root, warn) rather than ever
+    sending a split, partially-unquoted command, preserving the spec's
+    per-attach containment guarantee (a bad `-c` ends only this attach, never
+    the daemon or the tmux server).
