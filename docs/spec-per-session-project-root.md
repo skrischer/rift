@@ -269,3 +269,24 @@ Each issue references this spec path in its body.
   into `Attach::spawn`'s round trip and resolves-and-logs on every attach; nothing
   downstream consumes the resolved value yet — that lands with #736/#737 (the
   per-root context map and the re-root seam).
+- 2026-07-09: Issue #736 implementation (`ContextMap`, `crates/daemon/src/lib.rs`).
+  Built the per-root, reference-counted context map on top of the existing
+  single-root primitives (`channels`, `Daemon::watch_worktree`,
+  `Daemon::watch_lsp`) rather than replacing them, so the ~170 existing daemon
+  tests needed no changes. Three narrow decisions: (1) **keyed by the raw
+  `PathBuf` an acquirer passes in, no canonicalization at the map layer** —
+  matches `Daemon::watch_worktree`'s existing raw-root contract; a future
+  caller resolving `@root`/`session_path` (#737) is responsible for passing a
+  consistent value if it wants same-directory sessions to share a context. (2)
+  **teardown reuses the existing drop cascade** — a context's dispatch loop
+  already ends cleanly once every `inbound` sender clone drops, cascading into
+  `LspWorker::run`'s own clean shutdown; `release` just drops the registry's
+  own `Context` clone on the last release. (3) **`release` is `async` and
+  awaits the dispatch task's `JoinHandle` on the last release** (logging, not
+  propagating, a panicked task) — needed so `serve`'s single-connection path
+  can await full teardown before returning, reproducing its pre-context-map
+  `dispatch.await?`; `acquire` stays sync. `serve`/`serve_uds` now acquire
+  their one `--root` context up front through `ContextMap`; `serve_uds` never
+  releases (its context lives for the daemon's whole process lifetime). No
+  connection/`Attach` wiring, no re-root routing, no protocol change — out of
+  scope, deferred to #737.
