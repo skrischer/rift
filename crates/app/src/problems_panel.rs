@@ -45,7 +45,7 @@ use gpui::{
     InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Pixels,
     Render, SharedString, Size, Styled as _, Subscription, Window,
 };
-use gpui_component::dock::{Panel, PanelEvent};
+use gpui_component::dock::{Panel, PanelControl, PanelEvent};
 use gpui_component::{v_virtual_list, ActiveTheme as _, VirtualListScrollHandle};
 use rift_protocol::{Diagnostic, DiagnosticSeverity, Range};
 
@@ -426,6 +426,15 @@ impl Panel for ProblemsPanel {
 
     fn title(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         SharedString::from("Problems")
+    }
+
+    // Direct header button rather than the "..." overflow menu default
+    // (`docs/spec-dogfooding-fixes.md`, #716): `Panel::zoomable` defaults to
+    // `PanelControl::Menu`, which buries zoom in/out inside the Ellipsis
+    // menu. `Toolbar` renders it as a `Maximize`/`Minimize` button in the
+    // panel header instead, reusing gpui-component's own extension point.
+    fn zoomable(&self, _cx: &App) -> Option<PanelControl> {
+        Some(PanelControl::Toolbar)
     }
 }
 

@@ -33,7 +33,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_component::dialog::{AlertDialog, DialogButtonProps};
-use gpui_component::dock::{Panel, PanelEvent};
+use gpui_component::dock::{Panel, PanelControl, PanelEvent};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{
@@ -593,6 +593,15 @@ impl Panel for SourceControlPanel {
     fn title(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         SharedString::from("Source Control")
     }
+
+    // Direct header button rather than the "..." overflow menu default
+    // (`docs/spec-dogfooding-fixes.md`, #716): `Panel::zoomable` defaults to
+    // `PanelControl::Menu`, which buries zoom in/out inside the Ellipsis
+    // menu. `Toolbar` renders it as a `Maximize`/`Minimize` button in the
+    // panel header instead, reusing gpui-component's own extension point.
+    fn zoomable(&self, _cx: &App) -> Option<PanelControl> {
+        Some(PanelControl::Toolbar)
+    }
 }
 
 impl gpui::Render for SourceControlPanel {
@@ -1089,6 +1098,28 @@ mod tests {
                 panel.read(cx).selected(),
                 Some("dirty.rs"),
                 "a tick that doesn't touch the selected path leaves it selected"
+            );
+        });
+    }
+
+    // Dock header control (`docs/spec-dogfooding-fixes.md`, #716): zoom must
+    // render as a direct toolbar button, not inside the "..." overflow menu.
+    #[gpui::test]
+    fn test_zoomable_returns_toolbar_control_not_menu(cx: &mut TestAppContext) {
+        let (_file_tree, panel, _rx, _window) = open_panel(cx);
+
+        cx.update(|cx| {
+            let control = panel
+                .read(cx)
+                .zoomable(cx)
+                .expect("source control panel stays zoomable");
+            assert!(
+                control.toolbar_visible(),
+                "zoom renders as a direct header button"
+            );
+            assert!(
+                !control.menu_visible(),
+                "zoom is pulled out of the \"...\" overflow menu"
             );
         });
     }

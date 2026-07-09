@@ -193,7 +193,7 @@ use gpui::{
     Styled as _, Subscription, Window,
 };
 use gpui_component::dialog::{AlertDialog, Dialog, DialogButtonProps};
-use gpui_component::dock::{Panel, PanelEvent};
+use gpui_component::dock::{Panel, PanelControl, PanelEvent};
 use gpui_component::highlighter::{
     Diagnostic as EditorDiagnostic, DiagnosticSeverity as EditorSeverity,
 };
@@ -2419,6 +2419,15 @@ impl Panel for EditorView {
             .map(|path| path.rsplit('/').next().unwrap_or(path).to_owned())
             .unwrap_or_else(|| "Editor".to_owned());
         SharedString::from(title)
+    }
+
+    // Direct header button rather than the "..." overflow menu default
+    // (`docs/spec-dogfooding-fixes.md`, #716): `Panel::zoomable` defaults to
+    // `PanelControl::Menu`, which buries zoom in/out inside the Ellipsis
+    // menu. `Toolbar` renders it as a `Maximize`/`Minimize` button in the
+    // panel header instead, reusing gpui-component's own extension point.
+    fn zoomable(&self, _cx: &App) -> Option<PanelControl> {
+        Some(PanelControl::Toolbar)
     }
 }
 
