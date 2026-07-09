@@ -88,7 +88,12 @@ Add to `ClientMessage`:
   switch, pick-existing) → unchanged behavior (Phase-35 resolves `@root` /
   `session_path`); `Some(<picked>)` when creating at a picked root, where the
   daemon threads it into the `new-session -c` and the Phase-35 `@root` stamp (the
-  create sequence is in the client section below). The field rides this bump.
+  create sequence is in the client section below). The field carries
+  `#[serde(default, skip_serializing_if = "Option::is_none")]`, so a `root`-less
+  payload still deserializes and a `None` attach serializes without a `root` key —
+  matching the pinned `test_attach_roundtrip_carries_session_name` exact-JSON
+  assertion and the `Option`-field precedent (`GitOpResult::error`,
+  `Diagnostic::source`). The field rides this bump.
 
 Add to `DaemonMessage`:
 
@@ -178,11 +183,13 @@ session's `@root`; `None` preserves today's behavior (reconnect / switch /
 pick-existing, Phase-35 resolving `@root`/`session_path`). Because `new-session -A`
 **attaches** an existing session of the same name (ignoring `-c`), the picker
 **guarantees a fresh name**: it checks the live `QuerySessionList` and
-disambiguates a colliding basename (e.g. `rift` → `rift-2`) before Create, so
-creating a new project never silently lands in — and re-stamps the `@root` of — an
-unrelated existing session. As a daemon-side backstop, the `@root` stamp is applied
-only when `root` is `Some` (an explicit create-with-root intent). The name defaults
-to the folder basename and is editable before Create.
+disambiguates a colliding basename (e.g. `rift` → `rift-2`) before Create — the
+**client-side fresh-name check is the guarantee** that a create does not land in an
+unrelated existing session. The daemon's `Some`-only `@root` stamp only spares the
+`None` path (reconnect / switch / pick-existing never re-stamp); it does not itself
+cover a `Some` + same-name race, which the disambiguation prevents (the residual
+list-check-to-Attach TOCTOU on the shared daemon is negligible and recoverable).
+The name defaults to the folder basename and is editable before Create.
 
 ### Out of scope — each its own phase or deliberately deferred
 
@@ -255,7 +262,7 @@ to the folder basename and is editable before Create.
 | **The browse is a new daemon-side `protocol` dir-listing channel (`QueryDirEntries` → `DirEntriesReply`), executed with `std::fs::read_dir`, never client SFTP** | The daemon owns the remote filesystem (it watches, reads, saves, mutates the git index). Directory browsing is the same read capability; a client SFTP layer would be a second transport for a job the daemon is positioned to do — mirroring Zed's remote server (`docs/prior-art.md`, "Session ↔ project root coupling — prior-art index", Phase 36 rows) and the Phase-30 file-op precedent. | 2026-07-09 |
 | **The browse handler is NOT root-confined** — it accepts an absolute path, does no `buffer::resolve`, holds no context/`State`, and reads anywhere the daemon user can | Its purpose is to choose a *new* project root, so confining it to an existing worktree root would defeat it. The one genuinely-new capability is directory **enumeration** (discovery): reading arbitrary absolute paths is already exposed (the `OpenFile` out-of-root read carve-out, `crates/daemon/src/lib.rs`) and the SSH user runs a shell in every pane (it can `ls` anything). So this is not a privilege escalation — a discovery convenience over reads the user already has. The Phase-30 write confinement is a write-path concept and does not apply. | 2026-07-09 |
 | **The picked root reaches the daemon via a new `root: Option<String>` on `Attach`; the daemon threads it into the Phase-34 `-c` and the Phase-35 `@root` stamp** | `Attach` today carries only a session name and the daemon spawns `new-session` with its *own configured* root, so a create-at-picked-root needs a wire channel — the minimal one is an optional `root` on the existing attach-or-create path (not a separate `CreateSession` message, which would duplicate the attach flow). `None` = unchanged; `Some` = create at the picked root. Phase 36 stays additive over 34/35: it reuses their `-c` and `@root` mechanics, only supplying a per-attach value. | 2026-07-09 |
-| **The picker guarantees a fresh session name (disambiguates against the live list) before a create; the daemon stamps `@root` only when `Attach.root` is `Some`** | `new-session -A -s <name>` **attaches** an existing session of that name and ignores `-c`, so a colliding basename would silently land in — and, without the guard, re-stamp the `@root` of — an unrelated project. The picker already holds the live `QuerySessionList`, so it disambiguates client-side (`rift` → `rift-2`); the `Some`-only stamp is the daemon-side backstop. | 2026-07-09 |
+| **The picker guarantees a fresh session name (disambiguates against the live list) before a create; the daemon stamps `@root` only when `Attach.root` is `Some`** | `new-session -A -s <name>` **attaches** an existing session of that name and ignores `-c`, so a colliding basename would silently land in — and, without the guard, re-stamp the `@root` of — an unrelated project. The **client-side disambiguation is the guarantee** (the picker holds the live `QuerySessionList` and renames `rift` → `rift-2`); the `Some`-only stamp only spares the `None` path (reconnect / switch / pick-existing never re-stamp), not a `Some` + colliding-name race — which the disambiguation, not the stamp, prevents. The residual `Some` + same-name shared-daemon TOCTOU window is negligible and recoverable for a personal tool. | 2026-07-09 |
 | **The picker supersedes the zero-sessions empty-state screen** — with no sessions on the host, connecting opens the root picker directly; the session list shows only when sessions exist; `RIFT_SESSION` stays the picker-skipping fast-path | "No sessions → you must create one → creating means picking a root", so a distinct empty-list screen is redundant (idea sparring, this session; the "Session flows" artboard Path A and Frame B's superseded note encode it). The Phase-33 zero-sessions edge is re-pointed at the root picker. | 2026-07-09 |
 | **The session name defaults to the folder basename, editable before Create** | "session = project" — the name falls out of the chosen folder, removing the "name it first" friction; still editable for when the basename is not the wanted session name. Matches the `sesh` / `tmux-sessionizer` folder-basename convention (`docs/prior-art.md`, Phase 36 rows). | 2026-07-09 |
 | **The root picker is a modal/panel over the Phase-33 picker container and the in-cockpit workspace — not a new `Shell` state** | Phase 33 already introduced the pre-cockpit picker `Shell` state; the root picker is a mode within it (post-connect) and a modal over the workspace (in-cockpit strip "+"). Reusing those containers avoids a fourth top-level state and a second session-creation UI. | 2026-07-09 |
@@ -382,7 +389,7 @@ that traces back here (planning gate).
 | Browse latency makes the picker feel unresponsive | Every level is async with a loading state; the picker never blocks. Selecting a still-cached ancestor via the breadcrumb re-queries but renders immediately from the last reply if unchanged (client-side, not a protocol concern). |
 | A denied / vanished directory mid-browse | The daemon returns a typed `DirBrowseError`; the picker renders it inline and keeps the last good level, never tearing down. |
 | Phase 35's `@root` stamp is not yet merged when the create-with-root issue runs | The milestone carries `Depends on milestone: #53` and the create issue depends on the Phase-35 stamp issue; the loop parks it until Phase 35 lands. The protocol + daemon browse + picker-UI issues do not need Phase 35 and can proceed. |
-| `new-session -A` with a colliding basename attaches an existing session and re-stamps its `@root` (cross-project surprise) | The picker guarantees a fresh name from the live `QuerySessionList` (disambiguates `name` → `name-2`) before Create; the daemon stamps `@root` only when `Attach.root` is `Some`. So a create never lands in an unrelated existing session. |
+| `new-session -A` with a colliding basename attaches an existing session and re-stamps its `@root` (cross-project surprise) | The client-side fresh-name check against the live `QuerySessionList` (disambiguates `name` → `name-2`) before Create is the guarantee a create does not land in an unrelated session; the daemon's `Some`-only stamp only spares the `None` path. A `Some` + same-name race is a negligible, recoverable shared-daemon TOCTOU. |
 | The message-set change merges without the version bump | The fingerprint test fails on any message-set change until `PROTOCOL_VERSION` bumps and re-pins — CI-enforced, the same gate every prior protocol change passed. |
 | Scope creep into a project registry / multi-context UI | Explicitly out of scope: durable root stays in `@root`, recents (if in scope) is a lightweight phase-9 mapping, Scenario 2 stays deferred. |
 
