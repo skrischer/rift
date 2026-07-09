@@ -1,6 +1,6 @@
 # Spec: Session start-directory (spawn panes in the project root)
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-07-09
 > Completed: —
 
@@ -21,10 +21,9 @@ login directory (`$HOME`) — without navigating there by hand. Roadmap Phase 34
 - [ ] The root used is the daemon's existing single watched root (the `--root`
       value the daemon already holds); how the reactive layer (file tree / git /
       LSP) is rooted is unchanged. No per-session or dynamic root here.
-- [ ] (Re-root decision — resolved at the acceptance gate) A pre-existing session
-      whose default directory is not the project root behaves per the accepted
-      decision: either re-rooted on attach so its new windows/panes land in the
-      project root, or left untouched.
+- [ ] Attaching a pre-existing session whose default directory is not the project
+      root re-roots it (via `attach-session -c <root>`), so its new windows/panes
+      also land in the project root — not `$HOME`.
 
 ## Scope
 
@@ -60,9 +59,9 @@ login directory (`$HOME`) — without navigating there by hand. Roadmap Phase 34
   the `terminal_task` spawns in `lib.rs`'s tests). No existing test asserts the
   `new-session` argv (the `terminal.rs` tests are real-tmux integration tests), so
   this is a compile-level update, not a behavioral-test rewrite.
-- (Conditional on the gate decision) re-rooting a pre-existing session on attach.
-  The concrete command (`attach-session -c <root>` issued from the already-attached
-  control client, or an equivalent) must be **validated against real tmux** — not
+- Re-rooting a pre-existing session on attach (accepted at the gate). The concrete
+  command (`attach-session -c <root>` issued from the already-attached control
+  client, or a validated equivalent) must be **validated against real tmux** — not
   assumed — before it is committed to; its effect on an existing session's cwd is
   the thing under test. Plus its own command-construction test.
 
@@ -113,7 +112,7 @@ login directory (`$HOME`) — without navigating there by hand. Roadmap Phase 34
 | Realize the change **daemon-side** at `Attach::spawn`, threading the root through the shared `serve_connection` seam: `serve_uds` / `serve` → `serve_connection` → `terminal_task` → `open_attach` → `Attach::spawn` | All session creation (UI new-session prompt, switch, `+`, prefix `c`) funnels through `ClientMessage::Attach` → the daemon's `new-session -A`; the daemon already holds the watched root, and `serve_connection` is the single seam both entry points spawn `terminal_task` through. One chokepoint covers every path. | 2026-07-09 |
 | Root source = the daemon's existing single `--root` (single-root scope) | No per-session root in this phase; dynamizing the root is Phase 35. Reuses the shipped `archive/spec-daemon-project-root.md` resolution unchanged. | 2026-07-09 |
 | `-c <root>` passed as a separate argv entry (no quoting helper) | The daemon spawns tmux via `Command::args`, not a shell; a path arg cannot inject. Contrast `launch.rs`, which builds a shell string and must single-quote. | 2026-07-09 |
-| **OPEN — resolved at the spec-acceptance gate:** whether to re-root a pre-existing session (default dir ≠ project root, e.g. created outside rift in `$HOME`) on attach via `attach-session -c <root>`, or leave an externally-created session's directory untouched | Tradeoff: completing "new panes never land in `$HOME`" for a session persisted/created before this change vs overriding a directory the user may have chosen deliberately. Neither vision nor constitution settles the UX call. | 2026-07-09 |
+| **Re-root a pre-existing session on attach** (via `attach-session -c <root>` or a validated equivalent), so a session whose default dir is not the project root (created outside rift in `$HOME`, or persisted from before this change) also lands its new windows/panes in the project root | Resolved at the spec-acceptance gate: completes the "never land in `$HOME`" outcome for the whole session set and avoids a one-time session-recreate migration for the live dogfooding `rift` session; consistent with the single-root "session = project" model. Caveat: overrides a deliberately-chosen session dir (acceptable under single-root; Phase 35 makes it per-session). | 2026-07-09 |
 
 ## Prior art
 
@@ -151,14 +150,14 @@ Each issue references this spec path in its body.
       excluding `rift-app`).
 - [ ] Unit (`crates/daemon`): the extracted `spawn_args` helper, with a root,
       builds `new-session -A -s <session> -c <root>` (argv contains `-c` then the
-      root); with no root, `-c` is absent. (Plus the re-root command test if the
-      gate approves re-rooting.)
+      root); with no root, `-c` is absent. Plus the re-root command-construction
+      test.
 - [ ] The `terminal_task` / `serve_connection` call sites compile with the new
       `root` parameter (production seam + test helpers).
 - [ ] Behavioral (dev-channel QA gate): create a fresh rift session; open a new
       window (`+` and prefix `c`) and a split; `pwd` in each is the project root,
-      not `$HOME`. (If re-rooting is approved: attaching a session whose default
-      dir was `$HOME` re-roots its new windows to the project root.)
+      not `$HOME`. Attaching a session whose default dir was `$HOME` re-roots its
+      new windows to the project root.
 
 ## Risks and mitigations
 
@@ -187,3 +186,8 @@ Each issue references this spec path in its body.
   the re-root command must be validated against real tmux if the gate approves it.
   The design itself (set-once daemon-side, tmux inheritance, session_view.rs
   untouched, scope vs Phase 35) was confirmed sound.
+- 2026-07-09: Spec-acceptance gate. Resolved the open decision — **re-root a
+  pre-existing session on attach** (`attach-session -c <root>`), to complete the
+  never-`$HOME` outcome and avoid a session-recreate migration for the live
+  dogfooding session. Human prerequisites: none. Status flipped `DRAFT` → `READY`
+  in the same PR; milestone `Phase 340` created at acceptance.
