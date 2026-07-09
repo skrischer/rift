@@ -3053,4 +3053,26 @@ mod tests {
             "embedded file-type icon SVG must not be empty"
         );
     }
+
+    #[test]
+    fn test_rift_newly_vendored_file_icon_asset_is_embedded_in_product_build() {
+        use gpui::AssetSource as _;
+
+        use super::RiftAssets;
+
+        // A file-type glyph vendored by the industry-standard mapping
+        // broadening (`docs/spec-explorer-polish.md`, issue #712) must
+        // resolve through the same delegating RiftAssets source as the
+        // pre-existing set, so the broadened mapping renders real glyphs in
+        // the shipping binary too, not only under the dev-only `gallery`
+        // feature.
+        let icon = RiftAssets
+            .load("file_icons/typescript.svg")
+            .expect("file-type icon asset load must not error")
+            .expect("newly vendored file-type icon must be embedded in the product build");
+        assert!(
+            !icon.is_empty(),
+            "embedded file-type icon SVG must not be empty"
+        );
+    }
 }
