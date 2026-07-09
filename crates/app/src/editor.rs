@@ -204,6 +204,7 @@ use gpui_component::text::markdown;
 use gpui_component::ActiveTheme as _;
 use gpui_component::RopeExt as _;
 use gpui_component::WindowExt as _;
+use gpui_component::{Icon, IconName};
 use rift_protocol::{
     BufferErrorReason, ClientMessage, Diagnostic, DiagnosticSeverity, DocumentSymbolEntry,
     HoverContent, NavLocation, NavRequestId, Position, Range,
@@ -2450,8 +2451,21 @@ impl Panel for EditorView {
 /// under Catppuccin Mocha — fixes the surface and doubles as that base run
 /// color for every unstyled token, independent of the `highlight` block ever
 /// being complete or present at all.
+///
+/// The background is `secondary`, not `background` (#730): one theme step
+/// lighter, and already the token this same render function uses for the
+/// editor's own immediate chrome (`crumb_bg`, the minimap strip below) — so
+/// the surface now reads as one cohesive, elevated panel (breadcrumb, text,
+/// and minimap together) distinct from the surrounding dock/sidebar chrome,
+/// which stays on `background`. `muted`/`accent` were considered and
+/// rejected: under Catppuccin Mocha both resolve to the *same* value, and
+/// the current-line highlight below already washes `accent` over the
+/// surface at low alpha — an identical surface color would flatten that
+/// highlight into invisibility (caught by
+/// `test_editor_surface_background_is_a_subtle_step_lighter_than_base`).
+/// `secondary` differs from `accent`, so the highlight stays visible.
 fn editor_surface_colors(cx: &App) -> (Hsla, Hsla) {
-    (cx.theme().background, cx.theme().foreground)
+    (cx.theme().secondary, cx.theme().foreground)
 }
 
 /// Human-readable label for a [`BufferErrorReason`], shared by the editor's
@@ -2890,10 +2904,12 @@ impl Render for EditorView {
         let read_only = tab.read_only;
 
         // Tab bar (#352, #354): one Tab per open file, showing its name, a
-        // dirty dot, and a close "x" — the same TabBar/Tab pattern
-        // `SessionView` uses for tmux windows. Clicking a tab activates it
-        // (moves focus to its buffer); the close affordance closes it —
-        // immediately when clean, after a confirm dialog when dirty.
+        // dirty dot, and a close icon — the same TabBar/Tab pattern
+        // `SessionView` uses for tmux windows (`crates/terminal/src/session_view.rs`).
+        // Clicking a tab activates it (moves focus to its buffer); the close
+        // affordance closes it — immediately when clean, after a confirm
+        // dialog when dirty. Middle-clicking anywhere on the tab closes it
+        // through the same path (#730), mirroring the window-tab convention.
         let selected_index = self.active.unwrap_or(0);
         let close_idle = cx.theme().muted_foreground;
         let close_hover = cx.theme().danger;
@@ -2910,7 +2926,7 @@ impl Render for EditorView {
                     .px(px(4.0))
                     .text_color(close_idle)
                     .hover(move |this| this.text_color(close_hover))
-                    .child("x")
+                    .child(Icon::new(IconName::Close).size_3())
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
@@ -2931,6 +2947,13 @@ impl Render for EditorView {
                     .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                         this.activate_tab(ix, window, cx);
                     }))
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
+                            this.close_tab(ix, window, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
             })
             .collect();
 
@@ -3771,18 +3794,47 @@ mod tests {
             assert!(cx.theme().is_dark());
 
             let (dark_bg, dark_fg) = editor_surface_colors(cx);
-            assert_eq!(dark_bg, cx.theme().background);
+            assert_eq!(dark_bg, cx.theme().secondary);
             assert_eq!(dark_fg, cx.theme().foreground);
 
             gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
             assert!(!cx.theme().is_dark());
 
             let (light_bg, light_fg) = editor_surface_colors(cx);
-            assert_eq!(light_bg, cx.theme().background);
+            assert_eq!(light_bg, cx.theme().secondary);
             assert_eq!(light_fg, cx.theme().foreground);
             assert_ne!(
                 light_bg, dark_bg,
                 "editor surface background must track a runtime theme switch"
+            );
+        });
+    }
+
+    /// #730: the editor surface must read as a nuance lighter than the base
+    /// `background` (a subtle step, not a full re-theme), and must not
+    /// collide with the current-line highlight color (`accent`), which is
+    /// washed over the surface at low alpha — an identical hue would flatten
+    /// that highlight into invisibility.
+    #[gpui::test]
+    fn test_editor_surface_background_is_a_subtle_step_lighter_than_base(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::apply_theme(cx);
+
+            let (surface_bg, _) = editor_surface_colors(cx);
+            let base_bg = cx.theme().background;
+            assert_ne!(
+                surface_bg, base_bg,
+                "editor surface must differ from the base background"
+            );
+            assert!(
+                relative_luminance(surface_bg) > relative_luminance(base_bg),
+                "editor surface must be lighter than the base background"
+            );
+            assert_ne!(
+                surface_bg,
+                cx.theme().accent,
+                "editor surface must not match the current-line highlight color"
             );
         });
     }
