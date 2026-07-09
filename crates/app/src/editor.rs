@@ -2452,17 +2452,20 @@ impl Panel for EditorView {
 /// color for every unstyled token, independent of the `highlight` block ever
 /// being complete or present at all.
 ///
-/// The background is `muted`, not `background` (#730): under Catppuccin
-/// Mocha `muted` is one Catppuccin surface step above the base `background`
-/// (`surface0` vs `base`) — the same "elevated one step" token the app
-/// already uses for header/banner strips (`problems_panel.rs`,
-/// `diff_view.rs`'s hunk headers). That keeps the editor reading as a
-/// distinct surface from the surrounding dock/sidebar chrome (which stays on
-/// `background`) as a nuance, not a full re-theme, and — unlike `accent`,
-/// which the current-line highlight already washes over the surface at low
-/// alpha — does not flatten that highlight into invisibility.
+/// The background is `secondary`, not `background` (#730): one theme step
+/// lighter, and already the token this same render function uses for the
+/// editor's own immediate chrome (`crumb_bg`, the minimap strip below) — so
+/// the surface now reads as one cohesive, elevated panel (breadcrumb, text,
+/// and minimap together) distinct from the surrounding dock/sidebar chrome,
+/// which stays on `background`. `muted`/`accent` were considered and
+/// rejected: under Catppuccin Mocha both resolve to the *same* value, and
+/// the current-line highlight below already washes `accent` over the
+/// surface at low alpha — an identical surface color would flatten that
+/// highlight into invisibility (caught by
+/// `test_editor_surface_background_is_a_subtle_step_lighter_than_base`).
+/// `secondary` differs from `accent`, so the highlight stays visible.
 fn editor_surface_colors(cx: &App) -> (Hsla, Hsla) {
-    (cx.theme().muted, cx.theme().foreground)
+    (cx.theme().secondary, cx.theme().foreground)
 }
 
 /// Human-readable label for a [`BufferErrorReason`], shared by the editor's
@@ -3791,14 +3794,14 @@ mod tests {
             assert!(cx.theme().is_dark());
 
             let (dark_bg, dark_fg) = editor_surface_colors(cx);
-            assert_eq!(dark_bg, cx.theme().muted);
+            assert_eq!(dark_bg, cx.theme().secondary);
             assert_eq!(dark_fg, cx.theme().foreground);
 
             gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
             assert!(!cx.theme().is_dark());
 
             let (light_bg, light_fg) = editor_surface_colors(cx);
-            assert_eq!(light_bg, cx.theme().muted);
+            assert_eq!(light_bg, cx.theme().secondary);
             assert_eq!(light_fg, cx.theme().foreground);
             assert_ne!(
                 light_bg, dark_bg,

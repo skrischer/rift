@@ -195,11 +195,14 @@ includes:
   is wired on the `Tab` itself via `on_mouse_down(MouseButton::Middle, ...)` routed
   through the existing `close_tab` dirty-confirm path, mirroring
   `crates/terminal/src/session_view.rs`'s window-tab convention exactly (left-click still
-  activates, the close icon still closes on left-click). Background token: `muted`, not
-  `secondary`. Under Catppuccin Mocha, `muted`/`accent` equal Catppuccin's `surface0`
-  (one step above `background`'s `base`), while `secondary` equals `surface1` (two
-  steps) — `muted` is the truer "nuance," and it is already the token the app uses
-  elsewhere for elevated one-step surfaces (`problems_panel.rs`, `diff_view.rs`'s hunk
-  headers). `accent` was rejected despite an identical hex value in this theme: the
-  current-line highlight already washes `accent` over the surface at low alpha, so an
-  opaque `accent` surface would blend that highlight to invisibility.
+  activates, the close icon still closes on left-click). Background token: `secondary`,
+  already the token this same render function uses for the editor's own immediate chrome
+  (the breadcrumb bar, the minimap strip) — the surface now reads as one cohesive,
+  elevated panel distinct from the surrounding dock/sidebar chrome, which stays on
+  `background`. `muted`/`accent` were tried first (one Catppuccin surface step above
+  `background`, vs. `secondary`'s two) but rejected: under Catppuccin Mocha `muted` and
+  `accent` resolve to the *identical* hex, and the current-line highlight already washes
+  `accent` over the surface at low alpha — an identical surface color flattened that
+  highlight to invisibility, caught by a CI test failure
+  (`test_editor_surface_background_is_a_subtle_step_lighter_than_base`) before merge.
+  `secondary` differs from `accent`, so the highlight stays visible.
