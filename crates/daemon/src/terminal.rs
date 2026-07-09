@@ -173,17 +173,22 @@ pub(crate) async fn terminal_task(
                 }
             },
             msg = inbound.recv() => match msg {
-                Some(ClientMessage::Attach { session, .. }) => {
+                Some(ClientMessage::Attach { session, root: picked_root }) => {
                     // Re-attach: tear the current child down before opening anew.
-                    // `root` (the create-with-root transport,
-                    // `docs/spec-session-root-picker.md`) is ignored here — the
-                    // create-with-root wiring into `open_attach`/`spawn_args`
-                    // lands in a follow-on issue.
+                    // The create-with-root transport
+                    // (`docs/spec-session-root-picker.md`): `Some(picked)`
+                    // overrides the daemon's own configured `root` for this one
+                    // attach — `new-session -c <picked>` and the `@root` stamp
+                    // both target the picked root; `None` (every existing
+                    // caller — reconnect / switch / pick-existing) preserves
+                    // today's configured-root behavior unchanged. See
+                    // `effective_attach_root`.
                     detach(&mut attach).await;
+                    let picked_root = effective_attach_root(picked_root.as_deref(), root.as_deref());
                     attach = open_attach(
                         session,
                         server_socket.as_deref(),
-                        root.as_deref(),
+                        picked_root.as_deref(),
                         &outbound,
                     )
                     .await;
@@ -323,6 +328,21 @@ async fn query_session_list_detached(
     let _ = outbound
         .send(DaemonMessage::SessionListReply { sessions })
         .await;
+}
+
+/// Resolve the root to attach with for one [`ClientMessage::Attach`]
+/// (`docs/spec-session-root-picker.md`, the create-with-root transport):
+/// `picked` (the message's own `root` field, `Some` only when the client is
+/// creating a session at a root chosen through the root picker) wins over
+/// `configured` (the daemon's own startup-configured project root, threaded
+/// into every attach today via [`terminal_task`]'s `root` parameter). `None`
+/// when neither is set. A pure function so the precedence is unit-tested
+/// without spawning tmux.
+fn effective_attach_root(picked: Option<&str>, configured: Option<&Path>) -> Option<PathBuf> {
+    match picked {
+        Some(picked) => Some(PathBuf::from(picked)),
+        None => configured.map(Path::to_path_buf),
+    }
 }
 
 /// Build the argv (excluding the `tmux` program name itself) for the attach's
@@ -1179,6 +1199,23 @@ mod tests {
         assert_eq!(parse_pane_arg("%12 extra"), Some(12));
         assert_eq!(parse_pane_arg("@3"), None);
         assert_eq!(parse_pane_arg(""), None);
+    }
+
+    #[test]
+    fn test_effective_attach_root_picked_wins_over_configured() {
+        let root = effective_attach_root(Some("/picked/root"), Some(Path::new("/configured")));
+        assert_eq!(root, Some(PathBuf::from("/picked/root")));
+    }
+
+    #[test]
+    fn test_effective_attach_root_none_picked_falls_back_to_configured() {
+        let root = effective_attach_root(None, Some(Path::new("/configured")));
+        assert_eq!(root, Some(PathBuf::from("/configured")));
+    }
+
+    #[test]
+    fn test_effective_attach_root_neither_set_is_none() {
+        assert_eq!(effective_attach_root(None, None), None);
     }
 
     #[test]

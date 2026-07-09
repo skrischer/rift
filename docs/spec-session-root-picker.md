@@ -501,3 +501,43 @@ that traces back here (planning gate).
   horizontal-secondary pattern) rather than growing chip height; the Phase-33
   post-connect picker's vertical row (more space) shows it as a muted line
   below the name. Both omit the label entirely for `root: None`.
+- 2026-07-10: Issue #769 implemented (new-session entry points +
+  create-with-root, the milestone-closing wiring issue). Both entry points now
+  open `RootPicker` instead of a bare-name prompt: the Phase-33 post-connect
+  picker's zero-sessions edge opens it directly (`Shell::show_root_picker`),
+  its "+ New session..." footer now emits `SessionPickerEvent::NewSession`
+  instead of an inline prompt, and the in-cockpit strip "+"/command palette's
+  "New Session..." now emit `SessionViewEvent::NewSessionRequested` (a
+  `rift-terminal`-side event, since `SessionView` cannot depend on `rift-app`'s
+  `RootPicker`) that `WorkspaceView::open_root_picker` answers with a modal
+  `Root` dialog hosting a fresh `RootPicker` entity. The app owns the picker's
+  protocol I/O end to end: `RootPickerEvent::Browse` becomes
+  `ClientMessage::QueryDirEntries` on a new `dir_browse_tx`/`dir_browse_rx`
+  channel pair shared by both entry points (one bridge, spawned early in
+  `run_daemon_terminal` — before any session is attached — since the
+  pre-cockpit picker needs it before the first `Attach`); the CRITICAL
+  correctness fix flagged at review — `RootPicker` itself tracks no in-flight
+  request — is an owner-side `pending_browse: Option<String>` guard
+  (`root_picker::browse_reply_matches`, a pure, unit-tested function shared by
+  both owners) that drops any `DirEntriesReply` whose resolved path does not
+  match the outstanding request, so a stale/duplicate/out-of-order reply can
+  never clobber the current level. On `Picked`, the name is disambiguated
+  against the live session list (`root_picker::disambiguate_session_name`,
+  `rift` -> `rift-2` on collision) before sending `Attach { session, root:
+  Some(picked) }` on a new internal `PickedSession` carried across
+  `PickerChannels::choice_rx` (replacing the plain `String` the pre-#769
+  picker choice used) and, for the in-cockpit path, on `SessionSwitchRequest`'s
+  new `root: Option<String>` field (an app-internal struct, not `protocol` —
+  no wire change) via a new `SessionView::create_session_at_root`. The
+  in-cockpit strip's old inline "+ New session..." text-prompt subsystem
+  (`NewSessionPrompt`) is removed outright, superseded by the picker — the
+  single create-with-root transport for both entry points, per the spec's own
+  "no separate in-cockpit `TmuxCommand` create path" constraint.
+  Daemon-side: `crates/daemon/src/terminal.rs` threads `Attach.root` through a
+  new pure `effective_attach_root(picked, configured)` helper — `Some(picked)`
+  overrides the daemon's own configured root for that one attach (`-c` +
+  the `@root` stamp both target it); `None` preserves today's
+  configured-root behavior unchanged. `RIFT_SESSION` (`SessionIntent::Fixed`)
+  is untouched — it never reaches the picker branch. No `protocol` change:
+  `Attach.root`/`QueryDirEntries` already existed from #766/#769's
+  prerequisites; `PROTOCOL_VERSION` stays unchanged.

@@ -18,7 +18,6 @@
 //! swap on a pick.
 
 use gpui::*;
-use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{h_flex, v_flex, ActiveTheme, Icon, IconName};
 
 use rift_terminal::SessionListItem;
@@ -78,24 +77,17 @@ pub fn build_rows(sessions: Vec<SessionListItem>, order: &[String]) -> Vec<Sessi
         .collect()
 }
 
-/// Emitted by [`SessionPicker`]; `main.rs`'s Shell subscribes and forwards the
-/// chosen name to the daemon thread over `picker_choice_tx`, then swaps to
-/// the cockpit `Workspace`. Carries either an existing row's name (a plain
-/// attach) or a freshly typed one (the daemon's attach-or-create `new-session
-/// -A` creates it) — the two are indistinguishable on the wire, and the
-/// picker does not need to know which happened.
+/// Emitted by [`SessionPicker`]; `main.rs`'s Shell subscribes.
 pub enum SessionPickerEvent {
+    /// A row click: attach an existing session. `main.rs`'s Shell forwards
+    /// the name to the daemon thread over `picker_choice_tx`, then swaps to
+    /// the cockpit `Workspace`.
     Pick(String),
-}
-
-/// An in-progress "+ New session..." inline prompt, mirroring
-/// `rift_terminal::SessionView`'s own `NewSessionPrompt` (the phase-32 strip's
-/// new-session affordance this picker's footer is styled after): `input`
-/// holds the edit state, `_subscription` keeps the submit/blur handler alive
-/// while the prompt is active.
-struct NewSessionPrompt {
-    input: Entity<InputState>,
-    _subscription: Subscription,
+    /// The "+ New session..." footer: ask the owner to open the root picker
+    /// (`docs/spec-session-root-picker.md`, issue #769) instead of a bare
+    /// name prompt — every create now travels through
+    /// `Attach { session, root: Some(picked) }`, never a plain typed name.
+    NewSession,
 }
 
 /// The session picker view (issue #706): a centered card listing every
@@ -105,7 +97,6 @@ struct NewSessionPrompt {
 pub struct SessionPicker {
     ssh_label: SharedString,
     rows: Vec<SessionRow>,
-    new_session_prompt: Option<NewSessionPrompt>,
     focus_handle: FocusHandle,
 }
 
@@ -123,61 +114,18 @@ impl SessionPicker {
         Self {
             ssh_label,
             rows: build_rows(sessions, order),
-            new_session_prompt: None,
             focus_handle: cx.focus_handle(),
         }
     }
 
-    /// A row click: attach (or, for a name typed into the new-session prompt,
-    /// create) the picked session.
+    /// A row click: attach the picked session.
     fn pick(&mut self, name: String, cx: &mut Context<Self>) {
         cx.emit(SessionPickerEvent::Pick(name));
     }
 
-    /// Activate the footer's inline input: seed an empty field, focus it, and
-    /// subscribe for submit/blur — mirrors
-    /// `rift_terminal::SessionView::start_new_session_prompt` verbatim.
-    fn start_new_session_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("session name"));
-        let subscription = cx.subscribe_in(
-            &input,
-            window,
-            move |this, _input, event: &InputEvent, _window, cx| match event {
-                InputEvent::PressEnter { .. } => this.submit_new_session_prompt(cx),
-                InputEvent::Blur => this.cancel_new_session_prompt(cx),
-                _ => {}
-            },
-        );
-        input.update(cx, |state, cx| state.focus(window, cx));
-        self.new_session_prompt = Some(NewSessionPrompt {
-            input,
-            _subscription: subscription,
-        });
-        cx.notify();
-    }
-
-    /// Commit the new-session prompt (Enter): a non-empty trimmed name picks
-    /// it (the daemon's attach-or-create handles a fresh vs. duplicate name
-    /// identically). An empty name sends nothing and dismisses the prompt
-    /// back to the trailing "+ New session..." row.
-    fn submit_new_session_prompt(&mut self, cx: &mut Context<Self>) {
-        let Some(prompt) = self.new_session_prompt.take() else {
-            return;
-        };
-        let value = prompt.input.read(cx).value();
-        let trimmed = value.trim().to_string();
-        if !trimmed.is_empty() {
-            cx.emit(SessionPickerEvent::Pick(trimmed));
-        }
-        cx.notify();
-    }
-
-    /// Cancel an in-progress new-session prompt without emitting anything.
-    fn cancel_new_session_prompt(&mut self, cx: &mut Context<Self>) {
-        if self.new_session_prompt.is_some() {
-            self.new_session_prompt = None;
-            cx.notify();
-        }
+    /// The "+ New session..." footer: ask the owner to open the root picker.
+    fn request_new_session(&mut self, cx: &mut Context<Self>) {
+        cx.emit(SessionPickerEvent::NewSession);
     }
 }
 
@@ -337,42 +285,13 @@ fn render_empty_state(cx: &mut Context<SessionPicker>) -> AnyElement {
         .into_any_element()
 }
 
-/// The "+ New session..." footer: a plain clickable row until clicked, then
-/// an inline mono input (Enter picks/creates, Escape or blur cancels) —
-/// mirrors `rift_terminal::SessionView::render_session_strip`'s trailing
-/// new-session chip, adapted to this screen's row shape. `active_input` is
-/// `self.new_session_prompt`'s input, read by the caller before this runs —
-/// never fetched here via `cx.entity().read(cx)`, which would re-borrow the
-/// view's own data while its `render` call already holds `&mut self`.
-fn render_new_session_footer(
-    cx: &mut Context<SessionPicker>,
-    active_input: Option<Entity<InputState>>,
-) -> AnyElement {
+/// The "+ New session..." footer: a plain clickable row that asks the owner
+/// to open the root picker (`docs/spec-session-root-picker.md`) — no inline
+/// name prompt anymore, mirroring `rift_terminal::SessionView::render_session_strip`'s
+/// trailing chip.
+fn render_new_session_footer(cx: &mut Context<SessionPicker>) -> AnyElement {
     let muted = cx.theme().muted_foreground;
     let hover_bg = cx.theme().list_hover;
-
-    if let Some(input) = active_input {
-        let cancel_entity = cx.entity();
-        return h_flex()
-            .id("session-picker-new-session-active")
-            .w_full()
-            .items_center()
-            .gap(px(8.0))
-            .px(px(10.0))
-            .py(px(8.0))
-            .rounded(px(8.0))
-            .on_key_down(move |event: &KeyDownEvent, _window, cx| {
-                if event.keystroke.key.as_str() == "escape" {
-                    cancel_entity.update(cx, |view, cx| {
-                        view.cancel_new_session_prompt(cx);
-                    });
-                    cx.stop_propagation();
-                }
-            })
-            .child(Icon::new(IconName::Plus).text_color(muted))
-            .child(Input::new(&input).flex_1())
-            .into_any_element();
-    }
 
     h_flex()
         .id("session-picker-new-session")
@@ -385,8 +304,8 @@ fn render_new_session_footer(
         .cursor_pointer()
         .text_color(muted)
         .hover(move |el| el.bg(hover_bg))
-        .on_click(cx.listener(|this, _event, window, cx| {
-            this.start_new_session_prompt(window, cx);
+        .on_click(cx.listener(|this, _event, _window, cx| {
+            this.request_new_session(cx);
         }))
         .child(Icon::new(IconName::Plus).text_color(muted))
         .child(div().child("New session..."))
@@ -411,8 +330,7 @@ impl Render for SessionPicker {
             v_flex().gap(px(4.0)).children(rows).into_any_element()
         };
 
-        let active_input = self.new_session_prompt.as_ref().map(|p| p.input.clone());
-        let footer = render_new_session_footer(cx, active_input);
+        let footer = render_new_session_footer(cx);
 
         let card = v_flex()
             .w(px(CARD_WIDTH))

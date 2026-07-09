@@ -164,18 +164,6 @@ struct WindowRename {
     _subscription: Subscription,
 }
 
-/// An in-progress new-session prompt in the switcher's footer row. Mirrors
-/// [`WindowRename`]: `input` holds the edit state and `_subscription` keeps the
-/// submit handler alive while the prompt is active. Enter sends a
-/// [`SessionSwitchRequest`] for the typed name (the daemon child command is
-/// attach-or-create, so a fresh name creates the session); the new list and
-/// indicator arrive via the daemon's push and the fresh snapshot, never an
-/// optimistic local mutation.
-struct NewSessionPrompt {
-    input: Entity<InputState>,
-    _subscription: Subscription,
-}
-
 /// An in-progress inline session rename in the title-bar strip (#684,
 /// `docs/spec-session-management.md`), dispatched from a chip's right-click
 /// menu (see [`SessionView::render_session_strip`]). Mirrors [`WindowRename`]:
@@ -439,12 +427,17 @@ fn type_glyph(is_shell: bool) -> IconName {
     }
 }
 
-/// Emitted for whole-client state that window-state persistence needs to
-/// observe but that lives inside `SessionView` (#225,
-/// `docs/spec-window-state-persistence.md`): today, only a font-size zoom.
+/// Emitted for whole-client state the owner (`rift-app`'s `WorkspaceView`)
+/// needs to observe but that lives inside `SessionView` (#225,
+/// `docs/spec-window-state-persistence.md`): a font-size zoom, or the strip's
+/// "+ New session..." affordance asking the owner to open the root picker
+/// (`docs/spec-session-root-picker.md`, issue #769) — `SessionView` stays
+/// agent-agnostic and has no protocol/root-picker knowledge of its own, so it
+/// only asks; the owner drives the actual create.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SessionViewEvent {
     FontSizeChanged { font_size_px: f32 },
+    NewSessionRequested,
 }
 
 impl EventEmitter<SessionViewEvent> for SessionView {}
@@ -504,9 +497,6 @@ pub struct SessionView {
     /// stream) owns that. Rendered as the always-visible title-bar chip strip
     /// (#683), which replaced the phase-19 click-to-open popover.
     sessions: Vec<SessionListItem>,
-    /// The strip's in-progress inline new-session prompt (trailing "+ New
-    /// session..." chip), when active.
-    new_session_prompt: Option<NewSessionPrompt>,
     /// The strip's in-progress inline session rename (#684), dispatched from
     /// a chip's right-click menu; when active, that chip renders the edit
     /// input in place of its name.
@@ -751,7 +741,6 @@ impl SessionView {
             prefix_options: PrefixOptions::default(),
             key_table_request_tx,
             sessions: Vec::new(),
-            new_session_prompt: None,
             renaming_session: None,
             confirming_kill: None,
             session_list_request_tx,
@@ -951,10 +940,42 @@ impl SessionView {
         let _ = self.session_list_request_tx.try_send(());
     }
 
-    /// Activate the strip's inline new-session prompt — the command palette's
-    /// "New Session..." entry, routed through the workspace.
-    pub fn open_new_session_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.start_new_session_prompt(window, cx);
+    /// Ask the owner to open the root picker (`docs/spec-session-root-picker.md`,
+    /// issue #769) — the strip's trailing "+ New session..." chip and the
+    /// command palette's "New Session..." entry both route here. `SessionView`
+    /// stays agent-agnostic and has no protocol/root-picker knowledge of its
+    /// own; [`SessionViewEvent::NewSessionRequested`] only asks, the owner
+    /// (`rift-app`'s `WorkspaceView`) drives the actual create via
+    /// [`Self::create_session_at_root`] once a root and name are picked.
+    pub fn open_new_session_prompt(&mut self, cx: &mut Context<Self>) {
+        cx.emit(SessionViewEvent::NewSessionRequested);
+    }
+
+    /// The live host session list (`docs/spec-session-management.md`), as of
+    /// the last `SessionListReply` — read by the owner to disambiguate a
+    /// picked root's basename against every live session name before
+    /// creating (`docs/spec-session-root-picker.md`).
+    pub fn sessions(&self) -> &[SessionListItem] {
+        &self.sessions
+    }
+
+    /// Create a session at `root`, named `name` (already disambiguated by the
+    /// owner against [`Self::sessions`]) — the root-picker's single transport
+    /// for both entry points (`docs/spec-session-root-picker.md`): a
+    /// [`SessionSwitchRequest`] carrying `root: Some(root)`, so the app seam's
+    /// re-sent `Attach { session, root }` creates the session at the picked
+    /// root instead of the daemon's configured one. Mirrors
+    /// [`Self::switch_to_session`], minus its already-attached no-op check —
+    /// the picker already guarantees a fresh name, so this is always a create.
+    pub fn create_session_at_root(&mut self, name: String, root: String, cx: &mut Context<Self>) {
+        if let Err(e) = self.session_switch_tx.try_send(SessionSwitchRequest {
+            session: name,
+            size: self.client_grid_size,
+            root: Some(root),
+        }) {
+            debug!(error = %e, "failed to send create-with-root switch request");
+        }
+        cx.notify();
     }
 
     /// Switch the cockpit to `session`: emit the switch request (the app seam
@@ -968,6 +989,7 @@ impl SessionView {
             if let Err(e) = self.session_switch_tx.try_send(SessionSwitchRequest {
                 session: session.to_string(),
                 size: self.client_grid_size,
+                root: None,
             }) {
                 debug!(error = %e, %session, "failed to send session switch request");
             }
@@ -1008,57 +1030,6 @@ impl SessionView {
             debug!(error = %e, "failed to send session reorder update");
         }
         cx.notify();
-    }
-
-    /// Activate the strip's trailing new-session prompt: seed an empty input,
-    /// focus it, and subscribe for submit/blur (mirroring the window-rename
-    /// prompt). Enter with a non-empty name switches to it (attach-or-create);
-    /// blur cancels.
-    fn start_new_session_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("session name"));
-        let subscription = cx.subscribe_in(
-            &input,
-            window,
-            move |this, _input, event: &InputEvent, _window, cx| match event {
-                InputEvent::PressEnter { .. } => this.submit_new_session_prompt(cx),
-                InputEvent::Blur => this.cancel_new_session_prompt(cx),
-                _ => {}
-            },
-        );
-        input.update(cx, |state, cx| state.focus(window, cx));
-        self.new_session_prompt = Some(NewSessionPrompt {
-            input,
-            _subscription: subscription,
-        });
-        cx.notify();
-    }
-
-    /// Commit the new-session prompt (Enter): a non-empty trimmed name switches
-    /// to it — the daemon child command is attach-or-create (`new-session -A`),
-    /// so a fresh name creates the session and a duplicate of an existing one
-    /// simply attaches (issue #467). An empty name sends nothing and dismisses
-    /// the prompt back to the trailing "+ New session..." chip. A second
-    /// submit after the prompt already committed (or was cancelled) must not
-    /// re-submit.
-    fn submit_new_session_prompt(&mut self, cx: &mut Context<Self>) {
-        let Some(prompt) = self.new_session_prompt.take() else {
-            return;
-        };
-        let value = prompt.input.read(cx).value();
-        let trimmed = value.trim().to_string();
-        if !trimmed.is_empty() {
-            self.switch_to_session(&trimmed, cx);
-        }
-        cx.notify();
-    }
-
-    /// Cancel an in-progress new-session prompt without emitting anything,
-    /// restoring the trailing "+ New session..." chip.
-    fn cancel_new_session_prompt(&mut self, cx: &mut Context<Self>) {
-        if self.new_session_prompt.is_some() {
-            self.new_session_prompt = None;
-            cx.notify();
-        }
     }
 
     fn apply_snapshot(&mut self, session_snapshot: SessionSnapshot, cx: &mut Context<Self>) {
@@ -1700,9 +1671,10 @@ impl SessionView {
     /// name, a fixed attached-dot lane) with no open/close step; the current
     /// session's chip keeps the 2px primary left bar on a surface
     /// background — the same tokens the popover's current row used. A
-    /// trailing "+ New session..." chip reuses the popover's own inline-prompt
-    /// flow ([`Self::start_new_session_prompt`]/[`Self::submit_new_session_prompt`]).
-    /// All colors are theme tokens. A per-chip right-click menu
+    /// trailing "+ New session..." chip asks the owner to open the root
+    /// picker ([`Self::open_new_session_prompt`], `docs/spec-session-root-picker.md`)
+    /// rather than an inline prompt of its own. All colors are theme tokens.
+    /// A per-chip right-click menu
     /// ([`gpui_component::menu::ContextMenuExt`], the same widget the
     /// explorer row/editor context menus already ship with) holds "Rename",
     /// which opens the inline edit below (#684), "Kill" (#685), which arms
@@ -1741,8 +1713,6 @@ impl SessionView {
                 root: None,
             });
         }
-        let prompt_input = self.new_session_prompt.as_ref().map(|p| p.input.clone());
-
         let fg = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
         let current_bg = cx.theme().list_active;
@@ -1991,43 +1961,22 @@ impl SessionView {
             strip = strip.child(chip);
         }
 
-        let new_session = match &prompt_input {
-            Some(input) => {
-                let cancel_entity = entity.clone();
-                h_flex()
-                    .items_center()
-                    .h(px(SESSION_CHIP_HEIGHT))
-                    .px(px(6.0))
-                    .on_key_down(move |event: &KeyDownEvent, _window, cx| {
-                        if event.keystroke.key.as_str() == "escape" {
-                            cancel_entity.update(cx, |view, cx| {
-                                view.cancel_new_session_prompt(cx);
-                            });
-                            cx.stop_propagation();
-                        }
-                    })
-                    .child(Input::new(input).xsmall())
-                    .into_any_element()
-            }
-            None => {
-                let prompt_entity = entity.clone();
-                h_flex()
-                    .items_center()
-                    .h(px(SESSION_CHIP_HEIGHT))
-                    .px(px(8.0))
-                    .rounded(px(4.0))
-                    .cursor_pointer()
-                    .text_color(muted)
-                    .hover(move |s| s.text_color(fg))
-                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                        prompt_entity.update(cx, |view, cx| {
-                            view.start_new_session_prompt(window, cx);
-                        });
-                    })
-                    .child("+ New session...")
-                    .into_any_element()
-            }
-        };
+        let prompt_entity = entity.clone();
+        let new_session = h_flex()
+            .id("session-strip-new-session")
+            .items_center()
+            .h(px(SESSION_CHIP_HEIGHT))
+            .px(px(8.0))
+            .rounded(px(4.0))
+            .cursor_pointer()
+            .text_color(muted)
+            .hover(move |s| s.text_color(fg))
+            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                prompt_entity.update(cx, |view, cx| {
+                    view.open_new_session_prompt(cx);
+                });
+            })
+            .child("+ New session...");
 
         strip.child(new_session)
     }
@@ -2275,15 +2224,14 @@ impl Focusable for SessionView {
 
 impl Render for SessionView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Skip pane auto-focus while an inline rename, the switcher's
-        // new-session prompt, or an armed kill confirm (#686 drive-by fix)
-        // owns focus, so a snapshot arriving mid-edit does not steal the
-        // keystroke stream from it — the kill confirm has no input of its own
-        // to notice the theft, so without this guard a stray steal-back would
-        // silently break its Escape handler again.
+        // Skip pane auto-focus while an inline rename or an armed kill
+        // confirm (#686 drive-by fix) owns focus, so a snapshot arriving
+        // mid-edit does not steal the keystroke stream from it — the kill
+        // confirm has no input of its own to notice the theft, so without
+        // this guard a stray steal-back would silently break its Escape
+        // handler again.
         if self.needs_focus
             && self.renaming_window.is_none()
-            && self.new_session_prompt.is_none()
             && self.renaming_session.is_none()
             && self.confirming_kill.is_none()
         {
@@ -2718,14 +2666,13 @@ mod tests {
         max_vertical_pane_count, new_window_at_command, quote_tmux_name, reconnect_banner_message,
         rename_session_command, resize_direction, select_pane_command, split_command,
         tab_state_slot, zoom_pane_command, MoveDirection, PaneActivity, SessionListItem,
-        SessionOrderUpdate, SessionSnapshot, SessionView, TabStateSlot, TermSize, TerminalHandle,
-        DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE,
+        SessionOrderUpdate, SessionSnapshot, SessionView, SessionViewEvent, TabStateSlot, TermSize,
+        TerminalHandle, DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE,
     };
     use crate::layout::LayoutNode;
     use gpui::{
         px, size, AnyWindowHandle, App, AppContext as _, Entity, SharedString, TestAppContext,
     };
-    use gpui_component::input::InputState;
     use std::collections::HashMap;
     use std::time::Instant;
     use termy_terminal_ui::{TmuxPaneState, TmuxSnapshot, TmuxWindowState};
@@ -3360,6 +3307,28 @@ mod tests {
         });
     }
 
+    /// [`SessionView::sessions`] exposes the same live list `apply_session_list`
+    /// installs — the owner reads it to disambiguate a picked root's basename
+    /// before creating (`docs/spec-session-root-picker.md`).
+    #[gpui::test]
+    fn test_sessions_accessor_reflects_the_live_list(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, _handle) = session_and_handle(cx);
+            assert!(session.read(cx).sessions().is_empty());
+
+            let list = vec![SessionListItem {
+                id: 0,
+                name: "rift".into(),
+                windows: 1,
+                attached: true,
+                root: None,
+            }];
+            session.update(cx, |view, cx| view.apply_session_list(list.clone(), cx));
+
+            assert_eq!(session.read(cx).sessions(), list.as_slice());
+        });
+    }
+
     /// The three-session fixture ("rift", "agent", "tests" at indices 0, 1,
     /// 2) shared by the [`SessionView::move_session`] tests below (#744,
     /// replacing #686's drag-based `reorder_sessions`).
@@ -3524,192 +3493,54 @@ mod tests {
         (window.into(), session, handle)
     }
 
-    /// The active prompt's input entity, for driving its value in tests.
-    fn prompt_input(session: &Entity<SessionView>, cx: &App) -> Entity<InputState> {
-        session
-            .read(cx)
-            .new_session_prompt
-            .as_ref()
-            .expect("new-session prompt active")
-            .input
-            .clone()
+    /// The strip's trailing "+ New session..." chip (and the command
+    /// palette's "New Session..." entry, routed through the same method)
+    /// only asks the owner to open the root picker
+    /// (`docs/spec-session-root-picker.md`, issue #769) — `SessionView` has
+    /// no inline prompt of its own anymore.
+    #[gpui::test]
+    fn test_open_new_session_prompt_emits_new_session_requested(cx: &mut TestAppContext) {
+        let mut session_entity = None;
+        let events: std::rc::Rc<std::cell::RefCell<Vec<SessionViewEvent>>> = Default::default();
+        cx.update(|cx| {
+            let (session, _handle) = session_and_handle(cx);
+            let sink = events.clone();
+            cx.subscribe(&session, move |_session, event: &SessionViewEvent, _cx| {
+                sink.borrow_mut().push(*event);
+            })
+            .detach();
+            session_entity = Some(session);
+        });
+        let session = session_entity.expect("session constructed above");
+
+        cx.update(|cx| session.update(cx, |view, cx| view.open_new_session_prompt(cx)));
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            [SessionViewEvent::NewSessionRequested]
+        );
     }
 
-    /// The palette's "New Session..." entry activates the strip's trailing
-    /// prompt directly (#683 dropped the popover open/close step).
+    /// [`SessionView::create_session_at_root`] sends one switch request
+    /// carrying the given name and `root: Some(root)` — the create-with-root
+    /// transport the owner uses after the root picker resolves a Picked
+    /// event (`docs/spec-session-root-picker.md`).
     #[gpui::test]
-    fn test_open_new_session_prompt_activates_the_prompt(cx: &mut TestAppContext) {
-        let (window, session, _handle) = windowed_session_and_handle(cx);
+    fn test_create_session_at_root_sends_switch_request_with_root(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, handle) = session_and_handle(cx);
 
-        cx.update_window(window, |_, window, cx| {
-            session.update(cx, |view, cx| view.open_new_session_prompt(window, cx));
-
-            assert!(
-                session.read(cx).new_session_prompt.is_some(),
-                "new-session prompt active"
-            );
-
-            session.update(cx, |view, cx| view.cancel_new_session_prompt(cx));
-            assert!(
-                session.read(cx).new_session_prompt.is_none(),
-                "cancel restores the trailing chip"
-            );
-        })
-        .unwrap();
-    }
-
-    /// Submitting a fresh name sends one switch request carrying the trimmed
-    /// name (the daemon's attach-or-create child creates the session) and
-    /// clears the prompt; a second submit after the commit must not re-attach
-    /// (issue #467).
-    #[gpui::test]
-    fn test_submit_new_session_prompt_fresh_name_sends_trimmed_switch_and_clears(
-        cx: &mut TestAppContext,
-    ) {
-        let (window, session, handle) = windowed_session_and_handle(cx);
-
-        cx.update_window(window, |_, window, cx| {
             session.update(cx, |view, cx| {
-                view.session_name = SharedString::from("rift");
-                view.open_new_session_prompt(window, cx);
+                view.create_session_at_root("agent".to_string(), "/home/dev/agent".to_string(), cx);
             });
-            let input = prompt_input(&session, cx);
-            input.update(cx, |state, cx| state.set_value("  agent  ", window, cx));
-
-            session.update(cx, |view, cx| view.submit_new_session_prompt(cx));
 
             let request = handle
                 .session_switch_rx
                 .try_recv()
                 .expect("switch request sent");
-            assert_eq!(request.session, "agent", "name is trimmed");
-            assert!(
-                session.read(cx).new_session_prompt.is_none(),
-                "prompt cleared"
-            );
-
-            session.update(cx, |view, cx| view.submit_new_session_prompt(cx));
-            assert!(
-                handle.session_switch_rx.try_recv().is_err(),
-                "a second submit after the commit sends nothing"
-            );
-        })
-        .unwrap();
-    }
-
-    /// An empty (or whitespace-only) name sends nothing across the seam: the
-    /// prompt dismisses back to the "+ New session..." chip — no dead state
-    /// (issue #467).
-    #[gpui::test]
-    fn test_submit_new_session_prompt_empty_name_sends_nothing_and_dismisses(
-        cx: &mut TestAppContext,
-    ) {
-        let (window, session, handle) = windowed_session_and_handle(cx);
-
-        cx.update_window(window, |_, window, cx| {
-            session.update(cx, |view, cx| view.open_new_session_prompt(window, cx));
-            let input = prompt_input(&session, cx);
-            input.update(cx, |state, cx| state.set_value("   ", window, cx));
-
-            session.update(cx, |view, cx| view.submit_new_session_prompt(cx));
-
-            assert!(
-                handle.session_switch_rx.try_recv().is_err(),
-                "no switch request for an empty name"
-            );
-            assert!(
-                session.read(cx).new_session_prompt.is_none(),
-                "prompt dismissed back to the trailing chip"
-            );
-        })
-        .unwrap();
-    }
-
-    /// A name duplicating the already-attached session sends no pointless
-    /// re-attach; any other existing name takes the same path as a fresh one
-    /// (attach-or-create attaches instead of creating), so duplicates can
-    /// never error (issue #467).
-    #[gpui::test]
-    fn test_submit_new_session_prompt_attached_session_name_sends_nothing(cx: &mut TestAppContext) {
-        let (window, session, handle) = windowed_session_and_handle(cx);
-
-        cx.update_window(window, |_, window, cx| {
-            session.update(cx, |view, cx| {
-                view.session_name = SharedString::from("rift");
-                view.apply_session_list(
-                    vec![SessionListItem {
-                        id: 0,
-                        name: "rift".into(),
-                        windows: 2,
-                        attached: true,
-                        root: None,
-                    }],
-                    cx,
-                );
-                view.open_new_session_prompt(window, cx);
-            });
-            let input = prompt_input(&session, cx);
-            input.update(cx, |state, cx| state.set_value("rift", window, cx));
-
-            session.update(cx, |view, cx| view.submit_new_session_prompt(cx));
-
-            assert!(
-                handle.session_switch_rx.try_recv().is_err(),
-                "no re-attach for the already-attached session"
-            );
-            assert!(
-                session.read(cx).new_session_prompt.is_none(),
-                "prompt cleared"
-            );
-        })
-        .unwrap();
-    }
-
-    /// A name duplicating another (non-attached) existing session switches to
-    /// it exactly like a fresh name — attach-or-create resolves the duplicate
-    /// by attaching (issue #467).
-    #[gpui::test]
-    fn test_submit_new_session_prompt_existing_other_session_name_switches_to_it(
-        cx: &mut TestAppContext,
-    ) {
-        let (window, session, handle) = windowed_session_and_handle(cx);
-
-        cx.update_window(window, |_, window, cx| {
-            session.update(cx, |view, cx| {
-                view.session_name = SharedString::from("rift");
-                view.apply_session_list(
-                    vec![
-                        SessionListItem {
-                            id: 0,
-                            name: "rift".into(),
-                            windows: 2,
-                            attached: true,
-                            root: None,
-                        },
-                        SessionListItem {
-                            id: 1,
-                            name: "agent".into(),
-                            windows: 1,
-                            attached: false,
-                            root: None,
-                        },
-                    ],
-                    cx,
-                );
-                view.open_new_session_prompt(window, cx);
-            });
-            let input = prompt_input(&session, cx);
-            input.update(cx, |state, cx| state.set_value("agent", window, cx));
-
-            session.update(cx, |view, cx| view.submit_new_session_prompt(cx));
-
-            let request = handle
-                .session_switch_rx
-                .try_recv()
-                .expect("duplicate of a non-attached session is a plain switch");
             assert_eq!(request.session, "agent");
-        })
-        .unwrap();
+            assert_eq!(request.root.as_deref(), Some("/home/dev/agent"));
+        });
     }
 
     /// The chip's right-click "Rename" (#684) commits a changed, non-empty
