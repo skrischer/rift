@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 mod browse;
@@ -122,6 +123,12 @@ struct Core {
 }
 
 /// Sender handles for driving a [`Daemon`].
+///
+/// `Clone`: every field is itself a channel handle (`mpsc`/`broadcast`/
+/// `watch`), so cloning `Handles` never creates a second dispatch loop — it
+/// hands out another set of handles onto the SAME one. [`ContextMap`] relies
+/// on this to share one [`Context`] across every acquirer of a root.
+#[derive(Clone)]
 pub struct Handles {
     /// Send `ClientMessage`s into the dispatch loop.
     pub inbound: mpsc::Sender<ClientMessage>,
@@ -1324,6 +1331,142 @@ async fn write_messages<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// One root's live reactive context: its `State`, worktree/git worker, LSP
+/// worker, and update bus — wired exactly like [`serve`]/[`serve_uds`]'s
+/// single-root setup always has been: [`channels`] plus
+/// [`Daemon::watch_worktree`] and [`Daemon::watch_lsp`], run on its own
+/// dispatch-loop task. Acquired and released through [`ContextMap`] rather
+/// than constructed directly.
+#[derive(Clone)]
+pub struct Context {
+    /// Handles into this context's dispatch loop.
+    pub handles: Handles,
+    /// This context's LSP nav-request sender (#482), cloned per acquirer.
+    /// `None` when no root is armed (see [`standalone_context`]).
+    pub nav_requests: Option<mpsc::Sender<NavRequest>>,
+}
+
+/// A bare dispatch loop over [`channels`] with no worktree/git watcher and no
+/// LSP worker — `State` stays at its `Default` forever. Mirrors what
+/// [`serve`]/[`serve_uds`] have always done when no `--root` is given; kept
+/// outside [`ContextMap`] because there is no root to key it by.
+fn standalone_context() -> Context {
+    let (daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
+    let nav_requests = daemon.nav_request_sender();
+    tokio::spawn(daemon.run());
+    Context {
+        handles,
+        nav_requests,
+    }
+}
+
+/// A root's registry bookkeeping: its [`Context`], how many acquirers
+/// currently hold it, and the dispatch loop's task handle — joined by
+/// [`ContextMap::release`] on the last release.
+struct ContextEntry {
+    context: Context,
+    refcount: usize,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Per-root, reference-counted registry of reactive [`Context`]s
+/// (`docs/spec-per-session-project-root.md`, "Per-root, reference-counted
+/// context map"). Replaces the daemon's old single process-global `State` +
+/// worker set: [`ContextMap::acquire`] creates a root's context on first
+/// acquire — a fresh dispatch loop, worktree/git worker, and LSP worker,
+/// exactly [`serve`]/[`serve_uds`]'s single-root wiring — and shares the SAME
+/// context with every later acquirer of that root, so two connections on one
+/// root never run a second language server (the decisive RAM constraint; see
+/// the spec's "Prior decisions"). [`ContextMap::release`] drops the ref; the
+/// last release removes the entry, dropping the registry's own `Context`
+/// clone — closing the dispatch loop's inbound channel and cascading into
+/// [`lsp::LspWorker::run`]'s own clean server shutdown.
+///
+/// Keyed by the raw `PathBuf` an acquirer passes in — no canonicalization at
+/// this layer, matching [`Daemon::watch_worktree`]'s existing raw-root
+/// contract. Guarded by a plain [`std::sync::Mutex`]: this is a registry
+/// (create/look-up/refcount bookkeeping), not the shared mutable `State` the
+/// project's async guidance targets; no `.await` point is ever reached while
+/// the lock is held.
+#[derive(Default)]
+pub struct ContextMap {
+    entries: Mutex<HashMap<PathBuf, ContextEntry>>,
+}
+
+impl ContextMap {
+    /// An empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Acquire `root`'s context: create it (scan + watchers + LSP) on first
+    /// acquire, or bump the refcount and hand back a clone of the already-live
+    /// context on a later acquire for the same root. Never fails: a bad or
+    /// missing root degrades to a worktree-only or empty context and logs, via
+    /// the same [`worktree_worker`] degradation path a directly-armed root
+    /// already goes through.
+    pub fn acquire(&self, root: PathBuf) -> Context {
+        let mut entries = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(entry) = entries.get_mut(&root) {
+            entry.refcount += 1;
+            return entry.context.clone();
+        }
+
+        let (mut daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
+        daemon.watch_worktree(root.clone());
+        daemon.watch_lsp(root.clone(), DocumentSelector::builtin());
+        let nav_requests = daemon.nav_request_sender();
+        let task = tokio::spawn(daemon.run());
+        let context = Context {
+            handles,
+            nav_requests,
+        };
+        entries.insert(
+            root,
+            ContextEntry {
+                context: context.clone(),
+                refcount: 1,
+                task,
+            },
+        );
+        context
+    }
+
+    /// Release one reference to `root`'s context. A root with no live entry
+    /// (already fully released, or never acquired) is a no-op. On the last
+    /// release the entry is removed from the map, dropping the registry's own
+    /// `Context` clone; this then awaits that loop's task to completion, so a
+    /// caller that just dropped its own last handle can rely on the context
+    /// being fully torn down once this returns. A dispatch task that panicked
+    /// is logged, not propagated — an internal teardown detail degrades
+    /// rather than failing the releasing caller.
+    pub async fn release(&self, root: &Path) {
+        let task = {
+            let mut entries = match self.entries.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let entry = match entries.get_mut(root) {
+                Some(entry) => entry,
+                None => return,
+            };
+            entry.refcount = entry.refcount.saturating_sub(1);
+            if entry.refcount > 0 {
+                return;
+            }
+            entries.remove(root).map(|entry| entry.task)
+        };
+        if let Some(task) = task {
+            if let Err(err) = task.await {
+                warn!(root = %root.display(), %err, "context dispatch loop ended with an error");
+            }
+        }
+    }
+}
+
 /// Run a daemon over a single byte-stream transport until either side closes.
 ///
 /// Spins up a dispatch loop, serves exactly one connection over `reader`/
@@ -1341,43 +1484,72 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let (mut daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
-    // Retain a clone for the connection's terminal attach below; `watch_worktree`
-    // / `watch_lsp` consume the original.
-    let connection_root = worktree_root.clone();
-    if let Some(root) = worktree_root {
-        daemon.watch_worktree(root.clone());
-        daemon.watch_lsp(root, DocumentSelector::builtin());
-    }
-    let events = handles.subscribe();
-    let inbound = handles.inbound.clone();
-    let state = handles.state.clone();
-    // This connection's clone of the LSP worker's nav-request sender (#482), so
-    // its hover/definition/references/document-symbol answers return to this
-    // socket alone. `None` when LSP is not armed. Cloned before `daemon.run()`
-    // consumes the daemon.
-    let nav_requests = daemon.nav_request_sender();
-    // Drop the spare handles so the dispatch loop ends once the connection's
-    // `inbound` clone is dropped at EOF.
-    drop(handles);
+    match worktree_root {
+        Some(root) => {
+            // A local, single-use registry: `serve` drives exactly one
+            // connection, so this acquires the one root's context up front,
+            // exactly like the pre-context-map code did, and releases it
+            // below once that connection ends.
+            let context_map = ContextMap::new();
+            let context = context_map.acquire(root.clone());
+            let events = context.handles.subscribe();
+            let inbound = context.handles.inbound.clone();
+            let state = context.handles.state.clone();
+            let nav_requests = context.nav_requests.clone();
+            // Drop this function's own handle: the clone passed into
+            // `serve_connection` below is then the only inbound sender left
+            // outstanding besides the registry's own — `release` below drops
+            // that one too, so the dispatch loop ends exactly when this
+            // connection does, unchanged from the pre-context-map behavior.
+            drop(context);
 
-    let dispatch = tokio::spawn(daemon.run());
-    // The `None`: production uses the default tmux server for attaches.
-    let result = serve_connection(
-        reader,
-        writer,
-        inbound,
-        events,
-        state,
-        nav_requests,
-        None,
-        connection_root,
-    )
-    .await;
-    // `serve_connection` dropped its `inbound` clone on return, so the dispatch
-    // loop has observed channel closure and will join.
-    dispatch.await?;
-    result
+            // The `None`: production uses the default tmux server for attaches.
+            let result = serve_connection(
+                reader,
+                writer,
+                inbound,
+                events,
+                state,
+                nav_requests,
+                None,
+                Some(root.clone()),
+            )
+            .await;
+            // `serve_connection` dropped its `inbound` clone on return, making
+            // this the context's last reference; `release` awaits the
+            // dispatch loop's own join before this function returns —
+            // matching the pre-context-map `dispatch.await?`.
+            context_map.release(&root).await;
+            result
+        }
+        None => {
+            let (daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
+            let events = handles.subscribe();
+            let inbound = handles.inbound.clone();
+            let state = handles.state.clone();
+            let nav_requests = daemon.nav_request_sender();
+            // Drop the spare handles so the dispatch loop ends once the
+            // connection's `inbound` clone is dropped at EOF.
+            drop(handles);
+
+            let dispatch = tokio::spawn(daemon.run());
+            let result = serve_connection(
+                reader,
+                writer,
+                inbound,
+                events,
+                state,
+                nav_requests,
+                None,
+                None,
+            )
+            .await;
+            // `serve_connection` dropped its `inbound` clone on return, so the
+            // dispatch loop has observed channel closure and will join.
+            dispatch.await?;
+            result
+        }
+    }
 }
 
 /// Derive the pidfile path for a daemon socket: the socket path with a `.pid`
@@ -1421,12 +1593,14 @@ impl Drop for PidfileGuard {
 /// only that connection; a reconnect attaches to the same running daemon rather
 /// than spawning a second one.
 ///
-/// With a `worktree_root`, the root is scanned and watched for the daemon's
+/// With a `worktree_root`, the root's [`Context`] is acquired once up front
+/// (see [`ContextMap::acquire`]) and scanned/watched for the daemon's
 /// lifetime; every attaching client receives the current snapshot on its
-/// handshake (see [`Daemon::watch_worktree`]), and each accepted connection's
-/// terminal attach gets a clone of the root too
-/// (`docs/spec-session-start-directory.md`), so a freshly created tmux session's
-/// default directory is the project root, not `$HOME`.
+/// handshake, and each accepted connection's terminal attach gets a clone of
+/// the root too (`docs/spec-session-start-directory.md`), so a freshly
+/// created tmux session's default directory is the project root, not `$HOME`.
+/// A single root stays a special case — one context for the daemon's whole
+/// lifetime; per-connection re-rooting on `Attach` is a later step (#737).
 ///
 /// If a live daemon already owns `socket_path` this returns an error — the
 /// caller must attach via [`connect_relay`], not spawn. A stale socket left by a
@@ -1467,24 +1641,18 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
         }
     };
 
-    let (mut daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
-    // Retained across the accept loop's lifetime so each accepted connection can
-    // clone it for its own terminal attach; `watch_worktree` / `watch_lsp`
-    // consume the original.
+    // Acquired once, up front, and held (never released) for the accept
+    // loop's entire lifetime, so the dispatch loop and its `State` stay alive
+    // even while no client is attached — exactly like the pre-context-map
+    // `handles`/`_dispatch` did. The single-root path stays a special case:
+    // per-connection acquire/release on `Attach` re-rooting is #737, not this.
+    let context_map = ContextMap::new();
     let connection_root = worktree_root.clone();
-    if let Some(root) = worktree_root {
-        daemon.watch_worktree(root.clone());
-        daemon.watch_lsp(root, DocumentSelector::builtin());
-    }
-    // The LSP worker's nav-request sender (#482): each accepted connection gets a
-    // clone so its navigation answers route to its own socket. Grabbed before
-    // `daemon.run()` consumes the daemon, and this original is held for the accept
-    // loop's lifetime — the dispatch loop keeps its own too, so the worker's nav
-    // channel never closes as clients come and go. `None` when LSP is not armed.
-    let nav_requests = daemon.nav_request_sender();
-    // Held for the lifetime of the accept loop, so the dispatch loop and its
-    // `State` stay alive even while no client is attached.
-    let _dispatch = tokio::spawn(daemon.run());
+    let context = match worktree_root {
+        Some(root) => context_map.acquire(root),
+        None => standalone_context(),
+    };
+    let nav_requests = context.nav_requests.clone();
 
     loop {
         let (stream, _addr) = match listener.accept().await {
@@ -1500,9 +1668,9 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
             }
         };
         let (reader, writer) = stream.into_split();
-        let inbound = handles.inbound.clone();
-        let events = handles.subscribe();
-        let state = handles.state.clone();
+        let inbound = context.handles.inbound.clone();
+        let events = context.handles.subscribe();
+        let state = context.handles.state.clone();
         let nav_requests = nav_requests.clone();
         let root = connection_root.clone();
         tokio::spawn(async move {
@@ -4079,5 +4247,97 @@ mod tests {
             }
             other => panic!("expected SaveError Io, got {other:?}"),
         }
+    }
+
+    // ── ContextMap: per-root, reference-counted context registry (#736) ─────
+
+    /// Two distinct roots acquire two independent contexts — neither their
+    /// `inbound` channels nor their `State`s are the same underlying loop.
+    #[tokio::test]
+    async fn test_context_map_acquire_distinct_roots_yields_independent_contexts() {
+        let tmp_a = TempDir::new("ctxmap-distinct-a");
+        let tmp_b = TempDir::new("ctxmap-distinct-b");
+        let map = ContextMap::new();
+
+        let ctx_a = map.acquire(tmp_a.path.clone());
+        let ctx_b = map.acquire(tmp_b.path.clone());
+        assert!(
+            !ctx_a.handles.inbound.same_channel(&ctx_b.handles.inbound),
+            "distinct roots must not share a dispatch loop"
+        );
+
+        drop(ctx_a);
+        drop(ctx_b);
+        map.release(&tmp_a.path).await;
+        map.release(&tmp_b.path).await;
+    }
+
+    /// A second acquire for an already-live root shares the SAME context (same
+    /// `inbound` channel, and a state change driven through one acquirer's
+    /// handle is observable through the other's), stays alive while a
+    /// reference remains after one release, and only tears down at the last.
+    #[tokio::test]
+    async fn test_context_map_acquire_same_root_twice_shares_one_context() {
+        let tmp = TempDir::new("ctxmap-shared");
+        write_file(&tmp.path.join("tracked.txt"), "x");
+        let map = ContextMap::new();
+
+        let ctx_1 = map.acquire(tmp.path.clone());
+        let ctx_2 = map.acquire(tmp.path.clone());
+        assert!(
+            ctx_1.handles.inbound.same_channel(&ctx_2.handles.inbound),
+            "a second acquire for the same root must share the first's dispatch loop"
+        );
+
+        // Functional proof, not just channel identity: the initial scan driven
+        // by `ctx_1`'s acquire lands in `ctx_2`'s own `State` view too.
+        let mut state_2 = ctx_2.handles.state.clone();
+        loop {
+            if state_2.borrow_and_update().worktree.is_some() {
+                break;
+            }
+            state_2.changed().await.expect("state sender alive");
+        }
+
+        drop(ctx_1);
+        map.release(&tmp.path).await; // refcount 2 -> 1: `ctx_2` still holds it.
+        assert!(
+            state_2.has_changed().is_ok(),
+            "the context must stay alive while a reference (ctx_2) remains"
+        );
+
+        drop(ctx_2);
+        map.release(&tmp.path).await; // refcount 1 -> 0: torn down.
+    }
+
+    /// The last release tears the context down: its `State` sender (owned by
+    /// the dispatch loop's `Core`) is dropped once every acquirer's handle and
+    /// the registry's own are gone, which is exactly what the last `release`
+    /// awaits before returning.
+    #[tokio::test]
+    async fn test_context_map_release_to_zero_tears_down_context() {
+        let tmp = TempDir::new("ctxmap-teardown");
+        let map = ContextMap::new();
+
+        let ctx = map.acquire(tmp.path.clone());
+        let mut state = ctx.handles.state.clone();
+        drop(ctx);
+
+        map.release(&tmp.path).await;
+
+        let result = state.changed().await;
+        assert!(
+            result.is_err(),
+            "the context's State sender must be dropped once torn down"
+        );
+    }
+
+    /// Releasing a root with no live entry (never acquired, or already fully
+    /// released) is a no-op rather than a panic.
+    #[tokio::test]
+    async fn test_context_map_release_unknown_root_is_noop() {
+        let tmp = TempDir::new("ctxmap-unknown");
+        let map = ContextMap::new();
+        map.release(&tmp.path).await;
     }
 }
