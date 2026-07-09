@@ -385,9 +385,12 @@ pub(crate) mod exec {
         fn test_wrap_command_with_wrapper_relocates_command_into_sh_c() {
             let command = "cat > 'x' && mv 'x' 'y'";
             let wrapped = wrap_command(Some("docker exec -i c"), command);
+            // Hardcoded doubly-escaped literal (not re-derived via
+            // shell_single_quote) so a regression inside shell_single_quote
+            // itself would be caught here.
             assert_eq!(
                 wrapped,
-                format!("docker exec -i c sh -c {}", shell_single_quote(command))
+                "docker exec -i c sh -c 'cat > '\\''x'\\'' && mv '\\''x'\\'' '\\''y'\\'''"
             );
             // Wrapper tokens are spliced raw (word-split by the host shell);
             // only the command is quoted.
@@ -398,14 +401,18 @@ pub(crate) mod exec {
         fn test_wrap_command_neutralizes_injection_inside_quoted_command() {
             let command = "echo $(touch pwned) `whoami`";
             let wrapped = wrap_command(Some("docker exec -i c"), command);
+            // Hardcoded literal: the command has no embedded single quotes, so
+            // shell_single_quote wraps it verbatim in one pair of quotes.
             assert_eq!(
                 wrapped,
-                format!("docker exec -i c sh -c {}", shell_single_quote(command))
+                "docker exec -i c sh -c 'echo $(touch pwned) `whoami`'"
             );
-            // `$(...)` and backticks stay inert inside the single-quoted
-            // argument — they must not execute in the host shell's argv.
-            assert!(wrapped.contains("$(touch pwned)"));
-            assert!(wrapped.contains("`whoami`"));
+            // Prove the metacharacters sit INSIDE the single-quoted argument
+            // (bounded by a literal `'` immediately before and after), not
+            // merely present somewhere in the output — `.contains("$(touch
+            // pwned)")` alone would also pass for an injectable unquoted
+            // command, so it does not prove inertness by itself.
+            assert!(wrapped.contains("'echo $(touch pwned) `whoami`'"));
         }
 
         #[test]
