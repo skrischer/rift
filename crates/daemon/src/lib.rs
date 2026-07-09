@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod browse;
 mod buffer;
 mod diff;
 mod file_ops;
@@ -1115,6 +1116,20 @@ where
                             writer.write_all(&frame).await?;
                             writer.flush().await?;
                         }
+                        // The directory-browse request
+                        // (`docs/spec-session-root-picker.md`, #766) is
+                        // per-connection request/response too, but — unlike the
+                        // file-op/git-write ops above — it is deliberately
+                        // ROOTLESS: it accepts an absolute host path and reads
+                        // wherever the daemon's SSH user can, with no
+                        // `buffer::resolve` confinement and no `State` borrow
+                        // (the browse's purpose is to pick a *new* root).
+                        ClientMessage::QueryDirEntries { .. } => {
+                            let reply = browse::reply(msg).await;
+                            let frame = encode_frame(&reply)?;
+                            writer.write_all(&frame).await?;
+                            writer.flush().await?;
+                        }
                         // The live-buffer feed goes to the shared loop: the LSP
                         // worker that consumes the buffer events lives off that
                         // single loop (one document model + servers for the
@@ -1715,6 +1730,10 @@ impl Core {
             // The file-operation requests (#674) are answered per connection
             // by `file_ops::reply` the same way, so they never reach this loop
             // either; their arms below are a defensive no-op too.
+            //
+            // The directory-browse request (#766) is answered per connection
+            // by `browse::reply`, same pattern; its arm below is a defensive
+            // no-op too.
             ClientMessage::Hello { .. }
             | ClientMessage::Attach { .. }
             | ClientMessage::Input { .. }
@@ -1738,7 +1757,8 @@ impl Core {
             | ClientMessage::CreateFile { .. }
             | ClientMessage::CreateDir { .. }
             | ClientMessage::RenamePath { .. }
-            | ClientMessage::DeletePath { .. } => {}
+            | ClientMessage::DeletePath { .. }
+            | ClientMessage::QueryDirEntries { .. } => {}
         }
     }
 
@@ -2751,6 +2771,7 @@ mod tests {
         in_tx
             .send(ClientMessage::Attach {
                 session: "rift".to_owned(),
+                root: None,
             })
             .await
             .expect("attach");
@@ -2822,6 +2843,7 @@ mod tests {
             .write_all(
                 &encode_frame(&ClientMessage::Attach {
                     session: "rift".to_owned(),
+                    root: None,
                 })
                 .expect("encode attach"),
             )

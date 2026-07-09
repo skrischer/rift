@@ -15,7 +15,7 @@ pub use frame::{encode_frame, FrameDecoder, FrameError, MAX_FRAME_LEN};
 /// is wire-compatible in one direction. The message set is pinned by the
 /// fingerprint test beside `PROTOCOL_FINGERPRINT` below, so a message-set
 /// change without a bump cannot pass CI.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Pinned fingerprint of the protocol message set, checked by the
 /// `fingerprint_tests` module: an FNV-1a hash over the serde-visible surface
@@ -25,7 +25,7 @@ pub const PROTOCOL_VERSION: u32 = 9;
 /// [`PROTOCOL_VERSION`] above and re-pin this value (the failing test prints
 /// the new fingerprint).
 #[cfg(test)]
-const PROTOCOL_FINGERPRINT: u64 = 0x34f8_2884_a835_39e3;
+const PROTOCOL_FINGERPRINT: u64 = 0x4dd8_1f8a_47ef_a5b8;
 
 /// Messages the client sends to the daemon.
 ///
@@ -42,8 +42,19 @@ pub enum ClientMessage {
     /// <session>`) per attach, so the dogfooding isolation session
     /// (`RIFT_SESSION=rift-dev`) survives the protocol seam. The daemon answers
     /// with a [`DaemonMessage::LayoutSnapshot`] baseline, then the live stream.
+    ///
+    /// `root` is the create-with-root transport (`docs/spec-session-root-picker.md`):
+    /// `None` on every existing caller (reconnect, switch, pick-existing) —
+    /// unchanged behavior, the daemon resolves `@root`/`session_path` itself.
+    /// `Some(<picked>)` when creating a session at a picked root — the daemon
+    /// threads it into `new-session -c <picked>` and stamps `@root <picked>`.
+    /// Carries `#[serde(default, skip_serializing_if = "Option::is_none")]`, so
+    /// a `root`-less payload still deserializes and a `None` attach serializes
+    /// without a `root` key.
     Attach {
         session: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        root: Option<String>,
     },
     Input {
         pane_id: u32,
@@ -94,6 +105,19 @@ pub enum ClientMessage {
     /// this explicitly only for an on-demand refresh (e.g. opening the
     /// session switcher).
     QuerySessionList,
+    /// Request the child directories of `path`, an **absolute** host path — the
+    /// directory-browse channel backing the remote root picker
+    /// (`docs/spec-session-root-picker.md`). An empty string resolves to the
+    /// daemon user's `$HOME` (the picker's start level); a leading `~/` expands
+    /// to `$HOME` too. The daemon answers with exactly one
+    /// [`DaemonMessage::DirEntriesReply`]. Unlike [`ClientMessage::OpenFile`]
+    /// and the other worktree-relative paths, `path` here is **not**
+    /// root-confined — the browse is a discovery read over whatever the
+    /// daemon's SSH user can already see, run daemon-side via `std::fs`, never
+    /// client SFTP.
+    QueryDirEntries {
+        path: String,
+    },
     /// Read request on the buffer channel: pull the current content of the file
     /// at `path` (relative to the worktree root, the same key space as
     /// [`WorktreeEntry::path`]). The daemon answers with exactly one
@@ -382,6 +406,23 @@ pub enum DaemonMessage {
     /// [`LayoutSnapshot`]: DaemonMessage::LayoutSnapshot
     SessionListReply {
         sessions: Vec<SessionEntry>,
+    },
+    /// The reply to every [`ClientMessage::QueryDirEntries`]: `path` is the
+    /// resolved absolute directory that was listed (so the client can
+    /// correlate and render the breadcrumb even when it sent `""`); `parent`
+    /// is its parent directory, or `None` at the filesystem root; `entries`
+    /// are its child directories, name-sorted. On failure `entries` is empty
+    /// and `error` is set (omitted on success via
+    /// `skip_serializing_if = "Option::is_none"`). Deliberately a
+    /// **query-reply** shape (success = `error.is_none()`), not the `ok: bool`
+    /// op-result shape of [`FileOpResult`](DaemonMessage::FileOpResult) — a
+    /// query returns data or an error, not an ack.
+    DirEntriesReply {
+        path: String,
+        parent: Option<String>,
+        entries: Vec<DirEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<DirBrowseError>,
     },
     /// The complete window/pane layout for `session`, sent once per attach as the
     /// baseline of the consistency contract (see the type-level docs). The client
@@ -707,6 +748,10 @@ pub struct PaneLayout {
 /// (`#{session_windows}`); `attached` is whether at least one client is
 /// attached (`#{session_attached}` reports a count; the daemon folds it to a
 /// bool — the picker only marks attached sessions, never counts clients).
+/// `root` is the session's project path (tmux `#{@root}`, the Phase-35
+/// stamp) — `None` for a session created before the stamp existed or with no
+/// picked root. Carries `#[serde(default, skip_serializing_if =
+/// "Option::is_none")]`, so a `root`-less payload still deserializes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEntry {
     pub id: u32,
@@ -714,6 +759,45 @@ pub struct SessionEntry {
     pub windows: u32,
     /// Whether at least one client is attached to this session.
     pub attached: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+}
+
+/// One child **directory** of a [`DaemonMessage::DirEntriesReply`] listing
+/// (`docs/spec-session-root-picker.md`). Files are omitted — a project root
+/// is a directory; dotfile directories are included. `is_git_repo` is a
+/// cheap `<name>/.git` existence check; `git_branch` is the repo's current
+/// branch parsed from `<name>/.git/HEAD` (`ref: refs/heads/<branch>` ->
+/// `<branch>`; a detached HEAD or non-repo -> `None`) — a plain file read,
+/// not a `gix` call. Carries `#[serde(default, skip_serializing_if =
+/// "Option::is_none")]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirEntry {
+    pub name: String,
+    pub is_git_repo: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+}
+
+/// Why the daemon refused a [`ClientMessage::QueryDirEntries`] request,
+/// carried by [`DaemonMessage::DirEntriesReply::error`].
+///
+/// rift's own type, deliberately independent of `std::io::Error` — the same
+/// precedent as [`FileOpError`] / [`BufferErrorReason`]: no third-party or
+/// `std` error type crosses the wire. The daemon maps its internal fs error
+/// onto one of these variants from an up-front `fs::metadata` check or the
+/// underlying [`std::io::ErrorKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirBrowseError {
+    /// The target path does not exist on disk.
+    NotFound,
+    /// The daemon lacks permission to read the path.
+    PermissionDenied,
+    /// The target path exists but is not a directory.
+    NotADirectory,
+    /// A generic I/O failure not covered by the more specific reasons above.
+    Io,
 }
 
 /// A single worktree entry, keyed by its path relative to the worktree root.
@@ -1180,9 +1264,12 @@ mod tests {
     #[test]
     fn test_attach_roundtrip_carries_session_name() {
         // The attach request is the seam that carries `RIFT_SESSION` end-to-end,
-        // so the session name must survive serialization untouched.
+        // so the session name must survive serialization untouched. A `None`
+        // root must serialize without a `root` key at all (the pinned exact-JSON
+        // assertion below).
         let msg = ClientMessage::Attach {
             session: "rift-dev".to_owned(),
+            root: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize Attach");
         assert_eq!(json, r#"{"type":"attach","session":"rift-dev"}"#);
@@ -1190,9 +1277,51 @@ mod tests {
         let parsed: ClientMessage = serde_json::from_str(&json).expect("deserialize Attach");
         assert_eq!(parsed, msg);
         match parsed {
-            ClientMessage::Attach { session } => assert_eq!(session, "rift-dev"),
+            ClientMessage::Attach { session, root } => {
+                assert_eq!(session, "rift-dev");
+                assert_eq!(root, None);
+            }
             other => panic!("expected Attach, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_attach_roundtrip_carries_some_root() {
+        // The create-with-root transport: a picked root travels alongside the
+        // session name and round-trips exactly.
+        let msg = ClientMessage::Attach {
+            session: "my-project".to_owned(),
+            root: Some("/home/dev/my-project".to_owned()),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize Attach with root");
+        assert!(json.contains(r#""root":"/home/dev/my-project""#));
+
+        let parsed: ClientMessage =
+            serde_json::from_str(&json).expect("deserialize Attach with root");
+        assert_eq!(parsed, msg);
+        match parsed {
+            ClientMessage::Attach { session, root } => {
+                assert_eq!(session, "my-project");
+                assert_eq!(root, Some("/home/dev/my-project".to_owned()));
+            }
+            other => panic!("expected Attach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_attach_rootless_payload_still_deserializes() {
+        // A payload emitted before this field existed (no `root` key at all)
+        // must still deserialize, defaulting to `None`.
+        let parsed: ClientMessage =
+            serde_json::from_str(r#"{"type":"attach","session":"rift-dev"}"#)
+                .expect("deserialize root-less Attach");
+        assert_eq!(
+            parsed,
+            ClientMessage::Attach {
+                session: "rift-dev".to_owned(),
+                root: None,
+            }
+        );
     }
 
     #[test]
@@ -1274,6 +1403,45 @@ mod tests {
         assert!(
             err.is_err(),
             "attach without a session must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_query_dir_entries_roundtrip_preserves_path() {
+        let msg = ClientMessage::QueryDirEntries {
+            path: "/home/dev/projects".to_owned(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize QueryDirEntries");
+        assert_eq!(
+            json,
+            r#"{"type":"query_dir_entries","path":"/home/dev/projects"}"#
+        );
+        let parsed: ClientMessage =
+            serde_json::from_str(&json).expect("deserialize QueryDirEntries");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_query_dir_entries_empty_path_roundtrips() {
+        // An empty path is the picker's start-level request (resolves to
+        // `$HOME` daemon-side); it must round-trip as an empty string, not be
+        // rejected or coerced.
+        let msg = ClientMessage::QueryDirEntries {
+            path: String::new(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize QueryDirEntries");
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&json).expect("deserialize QueryDirEntries"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_query_dir_entries_missing_path_field_is_rejected() {
+        let err = serde_json::from_str::<ClientMessage>(r#"{"type":"query_dir_entries"}"#);
+        assert!(
+            err.is_err(),
+            "query_dir_entries without a path must not deserialize"
         );
     }
 
@@ -3509,12 +3677,14 @@ mod tests {
                     name: "rift".to_owned(),
                     windows: 3,
                     attached: true,
+                    root: Some("/home/dev/rift".to_owned()),
                 },
                 SessionEntry {
                     id: 4,
                     name: "my project".to_owned(),
                     windows: 1,
                     attached: false,
+                    root: None,
                 },
             ],
         };
@@ -3522,6 +3692,7 @@ mod tests {
         assert!(json.contains(r#""type":"session_list_reply""#));
         assert!(json.contains(r#""name":"rift""#));
         assert!(json.contains(r#""attached":true"#));
+        assert!(json.contains(r#""root":"/home/dev/rift""#));
 
         let parsed: DaemonMessage =
             serde_json::from_str(&json).expect("deserialize SessionListReply");
@@ -3531,9 +3702,39 @@ mod tests {
                 assert_eq!(sessions.len(), 2);
                 assert_eq!(sessions[1].name, "my project");
                 assert!(!sessions[1].attached);
+                assert_eq!(sessions[0].root, Some("/home/dev/rift".to_owned()));
+                assert_eq!(sessions[1].root, None);
             }
             other => panic!("expected SessionListReply, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_session_entry_root_omitted_when_none() {
+        // `root` must not serialize as a `null` key when absent — mirroring the
+        // `GitOpResult::error` / `Diagnostic::source` precedent.
+        let entry = SessionEntry {
+            id: 1,
+            name: "rift".to_owned(),
+            windows: 1,
+            attached: true,
+            root: None,
+        };
+        let json = serde_json::to_string(&entry).expect("serialize SessionEntry");
+        assert!(
+            !json.contains("root"),
+            "root must be omitted on None: {json}"
+        );
+    }
+
+    #[test]
+    fn test_session_entry_rootless_payload_still_deserializes() {
+        // A payload emitted before this field existed (no `root` key at all)
+        // must still deserialize, defaulting to `None`.
+        let parsed: SessionEntry =
+            serde_json::from_str(r#"{"id":1,"name":"rift","windows":1,"attached":true}"#)
+                .expect("deserialize root-less SessionEntry");
+        assert_eq!(parsed.root, None);
     }
 
     #[test]
@@ -3572,6 +3773,158 @@ mod tests {
                 "malformed session entry must not deserialize: {json}"
             );
         }
+    }
+
+    // ---- Directory-browse round-trip tests (docs/spec-session-root-picker.md) --
+
+    #[test]
+    fn test_dir_entry_roundtrip_with_git_branch() {
+        let entry = DirEntry {
+            name: "rift".to_owned(),
+            is_git_repo: true,
+            git_branch: Some("develop".to_owned()),
+        };
+        let json = serde_json::to_string(&entry).expect("serialize DirEntry");
+        assert_eq!(
+            json,
+            r#"{"name":"rift","is_git_repo":true,"git_branch":"develop"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<DirEntry>(&json).expect("deserialize DirEntry"),
+            entry
+        );
+    }
+
+    #[test]
+    fn test_dir_entry_roundtrip_without_git_branch() {
+        // A non-repo directory (or a detached HEAD) carries no branch; the key
+        // must be omitted on the wire, not serialized as `null`.
+        let entry = DirEntry {
+            name: "notes".to_owned(),
+            is_git_repo: false,
+            git_branch: None,
+        };
+        let json = serde_json::to_string(&entry).expect("serialize DirEntry");
+        assert!(
+            !json.contains("git_branch"),
+            "git_branch must be omitted on None: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<DirEntry>(&json).expect("deserialize DirEntry"),
+            entry
+        );
+    }
+
+    #[test]
+    fn test_dir_entry_rootless_payload_still_deserializes() {
+        let parsed: DirEntry = serde_json::from_str(r#"{"name":"notes","is_git_repo":false}"#)
+            .expect("deserialize DirEntry without git_branch key");
+        assert_eq!(parsed.git_branch, None);
+    }
+
+    #[test]
+    fn test_dir_browse_error_variants_roundtrip_snake_case() {
+        for (reason, tag) in [
+            (DirBrowseError::NotFound, "not_found"),
+            (DirBrowseError::PermissionDenied, "permission_denied"),
+            (DirBrowseError::NotADirectory, "not_a_directory"),
+            (DirBrowseError::Io, "io"),
+        ] {
+            let json = serde_json::to_string(&reason).expect("serialize DirBrowseError");
+            assert_eq!(json, format!(r#""{tag}""#));
+            assert_eq!(
+                serde_json::from_str::<DirBrowseError>(&json).expect("deserialize DirBrowseError"),
+                reason
+            );
+        }
+    }
+
+    #[test]
+    fn test_dir_browse_error_unknown_variant_is_rejected() {
+        assert!(serde_json::from_str::<DirBrowseError>(r#""frobnicated""#).is_err());
+    }
+
+    #[test]
+    fn test_dir_entries_reply_success_omits_error() {
+        // Success = `error.is_none()` — `error` must be omitted on the wire,
+        // never serialized as `null` (mirrors `FileOpResult`/`GitOpResult`).
+        let msg = DaemonMessage::DirEntriesReply {
+            path: "/home/dev".to_owned(),
+            parent: Some("/home".to_owned()),
+            entries: vec![
+                DirEntry {
+                    name: "project-a".to_owned(),
+                    is_git_repo: true,
+                    git_branch: Some("main".to_owned()),
+                },
+                DirEntry {
+                    name: "project-b".to_owned(),
+                    is_git_repo: false,
+                    git_branch: None,
+                },
+            ],
+            error: None,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize DirEntriesReply");
+        assert!(json.contains(r#""type":"dir_entries_reply""#));
+        assert!(
+            !json.contains("error"),
+            "error must be omitted on success: {json}"
+        );
+        let parsed: DaemonMessage =
+            serde_json::from_str(&json).expect("deserialize DirEntriesReply");
+        assert_eq!(parsed, msg);
+        match parsed {
+            DaemonMessage::DirEntriesReply {
+                path,
+                parent,
+                entries,
+                error,
+            } => {
+                assert_eq!(path, "/home/dev");
+                assert_eq!(parent, Some("/home".to_owned()));
+                assert_eq!(entries.len(), 2);
+                assert_eq!(error, None);
+            }
+            other => panic!("expected DirEntriesReply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dir_entries_reply_failure_carries_typed_error_and_empty_entries() {
+        let msg = DaemonMessage::DirEntriesReply {
+            path: "/root".to_owned(),
+            parent: None,
+            entries: vec![],
+            error: Some(DirBrowseError::PermissionDenied),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize DirEntriesReply error");
+        assert!(json.contains(r#""error":"permission_denied""#));
+        assert!(json.contains(r#""parent":null"#));
+        assert!(json.contains(r#""entries":[]"#));
+        let parsed: DaemonMessage =
+            serde_json::from_str(&json).expect("deserialize DirEntriesReply error");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_dir_entries_reply_missing_entries_field_is_rejected() {
+        let err = serde_json::from_str::<DaemonMessage>(
+            r#"{"type":"dir_entries_reply","path":"/home","parent":null}"#,
+        );
+        assert!(
+            err.is_err(),
+            "dir_entries_reply without an entries field must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_dir_entries_reply_unknown_type_is_rejected() {
+        let err = serde_json::from_str::<DaemonMessage>(r#"{"type":"dir_entries_replyy"}"#);
+        assert!(
+            err.is_err(),
+            "unknown daemon message type must not deserialize"
+        );
     }
 }
 
@@ -3716,7 +4069,9 @@ pub enum Sample {
         // trips the fingerprint) and the container serde attributes.
         let client = enum_surface(PROTOCOL_SOURCE, "ClientMessage").expect("extract ClientMessage");
         assert!(client.starts_with(r##"#[serde(tag="type",rename_all="snake_case")]"##));
-        assert!(client.contains("Attach{session:String,}"));
+        assert!(client.contains(
+            r#"Attach{session:String,#[serde(default,skip_serializing_if="Option::is_none")]root:Option<String>,}"#
+        ));
         assert!(client.contains("Hello{version:u32,}"));
 
         let daemon = enum_surface(PROTOCOL_SOURCE, "DaemonMessage").expect("extract DaemonMessage");
