@@ -341,12 +341,45 @@ Each issue references this spec path in its body.
   over. `serve_connection` owns the per-connection `self_root` bookkeeping
   and the `ContextMap` acquire/release calls (passed in as `Option<Arc<
   ContextMap>>`, `None` in call sites that do not exercise re-root); the
-  connect-time default root and its context (`serve`/`serve_uds`'s own
-  up-front acquire) stay entirely the caller's own reference, untouched by
-  a connection's own `Attach`-driven re-root. End-to-end coverage (`test_
+  connect-time default root's CONTEXT REFERENCE (`serve`/`serve_uds`'s own
+  up-front acquire — held for the connection's/daemon's whole lifetime) stays
+  entirely the caller's own, untouched by a connection's own `Attach`-driven
+  re-root — but, after the review-round fix below, it is keyed by the SAME
+  canonicalized value a re-root to that directory would use, so the two
+  correctly converge on ONE registry entry rather than owning two separate
+  references to two separate contexts. End-to-end coverage (`test_
   serve_connection_attach_reroots_worktree_snapshot_to_the_resolved_
   session_root`) drives two real tmux sessions stamped with different
   `@root`s through the whole `Attach` -> `terminal_task` -> `ContextMap`
   path and asserts the first `WorktreeSnapshot` after each switch carries
   that session's own root and tree. No protocol change; buffer detach on
   re-root stays out of scope, deferred to #738 per the issue's hard limit.
+- 2026-07-09: PR #778 review round (VERDICT REQUEST_CHANGES → addressed).
+  One BLOCKING defect, closed: the keep-warm/default acquire in `serve`
+  (its `Some(root)` branch) and `serve_uds` keyed `ContextMap` with the RAW
+  `--root`, while `reroot_connection` keyed it with `canonicalize(resolved_
+  root)` — an uncanonical `--root` (a trailing slash, a symlinked path, `..`)
+  then keyed a SECOND, distinct entry once an `Attach` resolved to the same
+  directory, so the daemon ran two independent `LspWorker`s — two
+  rust-analyzers — for one project: precisely the RAM-duplication failure
+  option (b) was rejected for in the spec's "Prior decisions" table. Fixed
+  by extracting the canonicalization into one shared `canonicalize_root`
+  helper and calling it at EVERY context-map key site — `reroot_connection`,
+  `serve`'s keep-warm acquire AND its matching `release`, and `serve_uds`'s
+  keep-warm acquire — so no acquire/release can key differently again; the
+  `@root` tmux stamp and the root handed to a connection's terminal attach
+  (session start-directory) stay RAW, since only the map KEY needs to
+  converge. Regression: `test_keep_warm_acquire_and_reroot_share_one_
+  context_for_a_trailing_slash_root`. Three cheap follow-ups, also applied:
+  re-resolving the SAME (canonical) root a connection already holds is now a
+  no-op in `reroot_connection` — no acquire/release churn and no redundant
+  re-snapshot on a same-session reconnect (`test_reroot_connection_same_
+  root_again_is_a_noop`); the last-release teardown join is now bounded by a
+  `CONTEXT_RELEASE_JOIN_TIMEOUT` (30s) so a FUTURE violation of the
+  "drop-before-release" contract degrades to a logged leak instead of
+  wedging the whole registry (the join runs while holding the map-wide
+  lock); and a second concurrency test
+  (`test_context_map_concurrent_acquirers_racing_to_zero_converge_without_
+  duplication`) exercises the atomicity fix through real concurrent
+  acquirers and a real `Daemon::run()` join, not only the lock-held
+  stand-in.

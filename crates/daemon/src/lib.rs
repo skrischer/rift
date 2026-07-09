@@ -203,6 +203,17 @@ const TERMINAL_OUTBOUND_CAPACITY: usize = 256;
 /// re-attach without blocking the tmux read loop — see `terminal::RootResolved`.
 const ROOT_RESOLVED_CAPACITY: usize = 4;
 
+/// How long [`ContextMap::release`]'s last-reference path waits for the torn-
+/// down context's dispatch loop to join, while holding the registry-wide
+/// lock (the atomicity fix, #737). Generous — LSP shutdown can take a
+/// moment — but bounded: a FUTURE violation of the "caller drops its own
+/// clones before the final release" contract (documented on `release`) would
+/// otherwise wedge EVERY root's acquire/release behind a join that never
+/// completes; past this, the join is abandoned (the task keeps running
+/// detached — a logged leak, not a forced abort) rather than the whole
+/// registry hanging forever.
+const CONTEXT_RELEASE_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Per-connection navigation-reply channel bound (#482): the private inbox the
 /// LSP worker's spawned nav tasks send this connection's hover/definition/
 /// references answers to. Nav responses are user-paced (one per hover or click),
@@ -1278,7 +1289,7 @@ where
                 match resolved {
                     Some(Some(resolved_root)) => {
                         if let Some(map) = context_map.as_ref() {
-                            reroot_connection(
+                            let rerooted = reroot_connection(
                                 map,
                                 resolved_root,
                                 &mut self_root,
@@ -1288,7 +1299,10 @@ where
                                 &mut nav_requests,
                             )
                             .await;
-                            if handshaken {
+                            // Same root as already active (a same-session
+                            // reconnect, or a redundant Attach): nothing
+                            // changed, so no re-snapshot either.
+                            if rerooted && handshaken {
                                 snapshot_sent = write_snapshot(&mut writer, &state).await?;
                             }
                         }
@@ -1565,10 +1579,59 @@ impl ContextMap {
         };
         // Still holding `entries`: the atomicity fix. Drop the registry's own
         // `Context` clone (closing its `inbound` sender), then await the
-        // dispatch loop's join, all before releasing the lock.
+        // dispatch loop's join, all before releasing the lock. Bounded (N1,
+        // #737 review): see `CONTEXT_RELEASE_JOIN_TIMEOUT`.
         drop(entry.context);
-        if let Err(err) = entry.task.await {
-            warn!(root = %root.display(), %err, "context dispatch loop ended with an error");
+        match tokio::time::timeout(CONTEXT_RELEASE_JOIN_TIMEOUT, entry.task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                warn!(root = %root.display(), %err, "context dispatch loop ended with an error");
+            }
+            Err(_) => {
+                warn!(
+                    root = %root.display(),
+                    "context dispatch loop did not exit within the teardown timeout; \
+                     leaking it rather than wedging the registry"
+                );
+            }
+        }
+    }
+}
+
+/// Canonicalize a filesystem path before it keys the [`ContextMap`] registry
+/// (#737, closing a gap the #736 review AND the #737 review both surfaced):
+/// EVERY acquire/release call that keys the map from a resolved or configured
+/// root — `reroot_connection`, `serve`'s and `serve_uds`'s keep-warm
+/// acquire (and `serve`'s matching release) — MUST go through this one
+/// helper, so two spellings of one directory (a raw `--root`/`@root`, a
+/// trailing slash, a relative path, a symlink) can never key two DIFFERENT
+/// entries. Two entries for one project means two independent `LspWorker`s —
+/// two rust-analyzers for one project — the exact RAM-duplication failure
+/// [`ContextMap`] exists to prevent (`docs/spec-per-session-project-root.md`,
+/// "Prior decisions", option (b) rejected for precisely this reason).
+///
+/// [`ContextMap`] itself stays keyed by the raw path an acquirer passes in
+/// (its own contract, #736) — normalizing before every `acquire`/`release`
+/// call is entirely this helper's (and its callers') responsibility.
+/// Canonicalize failure (a since-removed directory, a permissions error)
+/// degrades to the raw path and logs, never aborts — `ContextMap::acquire`
+/// already degrades a bad root to an empty/worktree-only context on its own.
+///
+/// A `@root` tmux STAMP (`terminal::stamp_root_command`) and the root handed
+/// to `terminal_task` for a freshly created session's default directory stay
+/// RAW — only the map KEY goes through this helper; a later `Attach`
+/// resolving that same stamped value canonicalizes it again on read
+/// (`reroot_connection`), so the two always converge on one key regardless.
+async fn canonicalize_root(root: PathBuf) -> PathBuf {
+    match tokio::fs::canonicalize(&root).await {
+        Ok(canonical) => canonical,
+        Err(err) => {
+            warn!(
+                root = %root.display(),
+                %err,
+                "failed to canonicalize root; keying the context map by the raw path"
+            );
+            root
         }
     }
 }
@@ -1581,23 +1644,24 @@ impl ContextMap {
 /// `events`/`state`/`nav_requests` always land on a fully live context before
 /// this returns; the caller streams the fresh snapshot immediately after.
 ///
-/// `resolved_root` is canonicalized first so two spellings of one directory (a
-/// raw `@root`/`session_path`, a trailing slash, a relative path, a symlink)
-/// key the SAME context rather than a second one — [`ContextMap`] itself stays
-/// keyed by the raw path an acquirer passes in (its own contract, #736), so
-/// normalizing before `acquire` is this caller's responsibility. Canonicalize
-/// failure (a since-removed directory, a permissions error) degrades to the
-/// raw path and logs, never aborts — `ContextMap::acquire` already degrades a
-/// bad root to an empty/worktree-only context on its own.
+/// `resolved_root` is canonicalized first, via [`canonicalize_root`], so two
+/// spellings of one directory (a raw `@root`/`session_path`, a trailing
+/// slash, a relative path, a symlink) key the SAME context rather than a
+/// second one — see that function's doc comment.
 ///
 /// The new context is acquired BEFORE the previous one (if any) is released,
 /// so re-attaching the SAME root (a plain reconnect) never drops its refcount
 /// to zero and pays a teardown + rebuild for a root nothing else stopped
-/// referencing. `inbound`/`events`/`state`/`nav_requests` are fully replaced
-/// (and the new `Context` handle dropped) BEFORE the old root is released,
-/// satisfying [`ContextMap::release`]'s "caller must have already dropped its
-/// own clones" contract — the exact ordering #736's review flagged as
-/// otherwise hanging the last release's dispatch-join.
+/// referencing. If the canonical root is UNCHANGED from `self_root`, this
+/// returns `false` immediately without touching the map at all — a
+/// same-session reconnect or a redundant `Attach` is then a no-op, not a
+/// spurious acquire(+1)/release(-1) churn; the caller uses the return value
+/// to skip the redundant re-snapshot too. Otherwise `inbound`/`events`/
+/// `state`/`nav_requests` are fully replaced (and the new `Context` handle
+/// dropped) BEFORE the old root is released, satisfying
+/// [`ContextMap::release`]'s "caller must have already dropped its own
+/// clones" contract — the exact ordering #736's review flagged as otherwise
+/// hanging the last release's dispatch-join — and this returns `true`.
 async fn reroot_connection(
     context_map: &ContextMap,
     resolved_root: PathBuf,
@@ -1606,18 +1670,13 @@ async fn reroot_connection(
     events: &mut broadcast::Receiver<DaemonMessage>,
     state: &mut watch::Receiver<State>,
     nav_requests: &mut Option<mpsc::Sender<NavRequest>>,
-) {
-    let canonical = match tokio::fs::canonicalize(&resolved_root).await {
-        Ok(canonical) => canonical,
-        Err(err) => {
-            warn!(
-                root = %resolved_root.display(),
-                %err,
-                "failed to canonicalize the resolved session root; keying the context map by the raw path"
-            );
-            resolved_root
-        }
-    };
+) -> bool {
+    let canonical = canonicalize_root(resolved_root).await;
+    if self_root.as_ref() == Some(&canonical) {
+        // Already on this root (a same-session reconnect, or a redundant
+        // Attach): nothing to acquire, release, or re-snapshot.
+        return false;
+    }
 
     let context = context_map.acquire(canonical.clone()).await;
     *events = context.handles.subscribe();
@@ -1629,6 +1688,7 @@ async fn reroot_connection(
     if let Some(previous) = self_root.replace(canonical) {
         context_map.release(&previous).await;
     }
+    true
 }
 
 /// Run a daemon over a single byte-stream transport until either side closes.
@@ -1658,8 +1718,18 @@ where
         Some(root) => {
             // Acquires the one root's context up front, exactly like the
             // pre-context-map code did, and releases it below once that
-            // connection ends.
-            let context = context_map.acquire(root.clone()).await;
+            // connection ends. Keyed by the CANONICAL root (#737 review,
+            // B1): a later `Attach` re-rooting to this SAME directory keys
+            // through `canonicalize_root` too (`reroot_connection`), so an
+            // uncanonical `--root` (a trailing slash, a symlinked path) must
+            // key identically here or the two acquire TWO live contexts —
+            // two `LspWorker`s, two rust-analyzers — for one project. `root`
+            // itself stays RAW below: it is handed to `serve_connection`'s
+            // terminal attach unchanged (the `@root` stamp / session
+            // start-directory, which a later resolve-on-attach canonicalizes
+            // again on read, converging on the same key regardless).
+            let canonical_root = canonicalize_root(root.clone()).await;
+            let context = context_map.acquire(canonical_root.clone()).await;
             let events = context.handles.subscribe();
             let inbound = context.handles.inbound.clone();
             let state = context.handles.state.clone();
@@ -1680,15 +1750,17 @@ where
                 state,
                 nav_requests,
                 None,
-                Some(root.clone()),
+                Some(root),
                 Some(context_map.clone()),
             )
             .await;
             // `serve_connection` dropped its `inbound` clone on return, making
             // this the context's last reference; `release` awaits the
             // dispatch loop's own join before this function returns —
-            // matching the pre-context-map `dispatch.await?`.
-            context_map.release(&root).await;
+            // matching the pre-context-map `dispatch.await?`. Same canonical
+            // key as the acquire above, or this would release a DIFFERENT
+            // (nonexistent) entry and leak the real one.
+            context_map.release(&canonical_root).await;
             result
         }
         None => {
@@ -1821,7 +1893,14 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
     let context_map = Arc::new(ContextMap::new());
     let connection_root = worktree_root.clone();
     let context = match worktree_root {
-        Some(root) => context_map.acquire(root).await,
+        // Canonicalized for the SAME reason as `serve`'s keep-warm acquire
+        // above (#737 review, B1): a later `Attach` re-rooting to this same
+        // directory keys through `canonicalize_root` too
+        // (`reroot_connection`), so an uncanonical `--root` must key
+        // identically here or the two build TWO live contexts — two
+        // `LspWorker`s — for one project. `connection_root` below (handed to
+        // each connection's terminal attach) stays RAW.
+        Some(root) => context_map.acquire(canonicalize_root(root).await).await,
         None => standalone_context(),
     };
     let nav_requests = context.nav_requests.clone();
@@ -4764,6 +4843,59 @@ mod tests {
         map.release(&tmp.path).await;
     }
 
+    /// The atomicity fix through REAL concurrent acquirers and a REAL
+    /// `Daemon::run()` join (N3, #737 review) — not the lock-held stand-in
+    /// above: many tasks race acquire/drop/release cycles on ONE root
+    /// concurrently, repeatedly driving it to zero and back up. Every
+    /// interleaving must converge without a hang or a panic, and must leave
+    /// the registry USABLE afterward — a fresh acquire still completes its
+    /// own scan — which a corrupted refcount or a resurrected/duplicated
+    /// context (the RAM-duplication race the #736 review surfaced) would
+    /// have broken.
+    #[tokio::test]
+    async fn test_context_map_concurrent_acquirers_racing_to_zero_converge_without_duplication() {
+        let tmp = TempDir::new("ctxmap-race-real");
+        write_file(&tmp.path.join("tracked.txt"), "x");
+        let map = Arc::new(ContextMap::new());
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let map = Arc::clone(&map);
+            let root = tmp.path.clone();
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..20 {
+                    let ctx = map.acquire(root.clone()).await;
+                    drop(ctx);
+                    map.release(&root).await;
+                }
+            }));
+        }
+        for task in tasks {
+            tokio::time::timeout(Duration::from_secs(30), task)
+                .await
+                .expect("concurrent acquire/release cycles must not hang")
+                .expect("acquirer task joins without panicking");
+        }
+
+        // The registry must be left USABLE: a fresh acquire completes its own
+        // scan, proving no corrupted refcount or wedged entry survived the race.
+        let ctx = map.acquire(tmp.path.clone()).await;
+        let mut state = ctx.handles.state.clone();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state.borrow_and_update().worktree.is_some() {
+                    break;
+                }
+                state.changed().await.expect("state sender alive");
+            }
+        })
+        .await
+        .expect("final acquire completes its own scan");
+
+        drop(ctx);
+        map.release(&tmp.path).await;
+    }
+
     // ── reroot_connection: the Attach seam (#737) ────────────────────────────
 
     /// A placeholder reactive binding to seed `reroot_connection`'s `&mut`
@@ -4794,7 +4926,7 @@ mod tests {
         let (mut inbound, mut events, mut state, mut nav_requests) = placeholder_bindings();
         let mut self_root: Option<PathBuf> = None;
 
-        tokio::time::timeout(
+        let rerooted = tokio::time::timeout(
             Duration::from_secs(5),
             reroot_connection(
                 &map,
@@ -4808,6 +4940,10 @@ mod tests {
         )
         .await
         .expect("reroot_connection completes within the timeout");
+        assert!(
+            rerooted,
+            "the first attach resolution must perform a re-root"
+        );
 
         let expected = std::fs::canonicalize(&tmp.path).expect("canonicalize temp root");
         assert_eq!(self_root, Some(expected.clone()));
@@ -4836,7 +4972,7 @@ mod tests {
         let (mut inbound, mut events, mut state, mut nav_requests) = placeholder_bindings();
         let mut self_root: Option<PathBuf> = None;
 
-        reroot_connection(
+        let first = reroot_connection(
             &map,
             tmp_a.path.clone(),
             &mut self_root,
@@ -4846,9 +4982,10 @@ mod tests {
             &mut nav_requests,
         )
         .await;
+        assert!(first, "the first attach resolution must perform a re-root");
         let mut state_a = state.clone();
 
-        tokio::time::timeout(
+        let switched = tokio::time::timeout(
             Duration::from_secs(5),
             reroot_connection(
                 &map,
@@ -4862,6 +4999,10 @@ mod tests {
         )
         .await
         .expect("switching roots must not hang releasing the previous sole reference");
+        assert!(
+            switched,
+            "switching to a DIFFERENT root must perform a re-root"
+        );
 
         let expected_b = std::fs::canonicalize(&tmp_b.path).expect("canonicalize root b");
         assert_eq!(self_root, Some(expected_b.clone()));
@@ -4879,6 +5020,62 @@ mod tests {
         drop(state);
         drop(nav_requests);
         map.release(&expected_b).await;
+    }
+
+    /// N2 (#737 review): re-resolving the SAME root already active for this
+    /// connection (a same-session reconnect, or a redundant `Attach`) is a
+    /// no-op — no acquire(+1)/release(-1) churn on the map, and `inbound`/
+    /// `events`/`state`/`nav_requests` are left untouched (still the SAME
+    /// bindings, not merely equal ones) so the caller can skip the
+    /// re-snapshot too.
+    #[tokio::test]
+    async fn test_reroot_connection_same_root_again_is_a_noop() {
+        let tmp = TempDir::new("reroot-noop");
+        let map = ContextMap::new();
+        let (mut inbound, mut events, mut state, mut nav_requests) = placeholder_bindings();
+        let mut self_root: Option<PathBuf> = None;
+
+        let first = reroot_connection(
+            &map,
+            tmp.path.clone(),
+            &mut self_root,
+            &mut inbound,
+            &mut events,
+            &mut state,
+            &mut nav_requests,
+        )
+        .await;
+        assert!(first);
+        let bound_inbound = inbound.clone();
+
+        // Re-resolve the identical root, spelled slightly differently (a
+        // trailing slash) so a real bug could not hide behind pointer/string
+        // equality on the raw path.
+        let mut trailing_slash = tmp.path.clone().into_os_string();
+        trailing_slash.push("/");
+        let again = reroot_connection(
+            &map,
+            PathBuf::from(trailing_slash),
+            &mut self_root,
+            &mut inbound,
+            &mut events,
+            &mut state,
+            &mut nav_requests,
+        )
+        .await;
+
+        assert!(!again, "re-resolving the same root must be a no-op");
+        assert!(
+            inbound.same_channel(&bound_inbound),
+            "a no-op re-root must leave the bound handles untouched"
+        );
+
+        drop(inbound);
+        drop(events);
+        drop(state);
+        drop(nav_requests);
+        drop(bound_inbound);
+        map.release(&self_root.expect("self_root set")).await;
     }
 
     /// A non-canonical spelling of an already-live root (here, a trailing
@@ -4922,5 +5119,67 @@ mod tests {
         drop(witness_inbound);
         map.release(&expected).await; // the witness's reference
         map.release(&expected).await; // this connection's own reference
+    }
+
+    /// B1 (#737 review, BLOCKING): the keep-warm/default context —
+    /// `serve`/`serve_uds`'s own up-front acquire, simulated here via the
+    /// SAME `canonicalize_root` helper they now call before `acquire` — and
+    /// a later `Attach`-driven re-root to the SAME directory must share ONE
+    /// context even when the two are spelled differently (here: a
+    /// trailing-slash `--root` vs. the plain path `Attach` resolves).
+    /// Before this fix, the keep-warm acquire keyed the map with the RAW
+    /// `--root` while `reroot_connection` keyed it with the canonicalized
+    /// resolved root, so an uncanonical `--root` built TWO live contexts —
+    /// two independent `LspWorker`s, two rust-analyzers — for one project;
+    /// this is the OOM `docs/spec-per-session-project-root.md`'s per-root
+    /// context map exists to prevent.
+    #[tokio::test]
+    async fn test_keep_warm_acquire_and_reroot_share_one_context_for_a_trailing_slash_root() {
+        let tmp = TempDir::new("ctxmap-keepwarm-trailing-slash");
+        let mut trailing_slash = tmp.path.clone().into_os_string();
+        trailing_slash.push("/");
+        let raw_root_with_trailing_slash = PathBuf::from(trailing_slash);
+
+        let map = ContextMap::new();
+
+        // The keep-warm acquire, exactly as `serve`/`serve_uds` now perform
+        // it: canonicalize THEN acquire.
+        let keep_warm_key = canonicalize_root(raw_root_with_trailing_slash).await;
+        let keep_warm = map.acquire(keep_warm_key.clone()).await;
+        let keep_warm_inbound = keep_warm.handles.inbound.clone();
+        drop(keep_warm);
+
+        // A later Attach resolves the SAME directory, spelled plainly.
+        let (mut inbound, mut events, mut state, mut nav_requests) = placeholder_bindings();
+        let mut self_root: Option<PathBuf> = None;
+        let rerooted = reroot_connection(
+            &map,
+            tmp.path.clone(),
+            &mut self_root,
+            &mut inbound,
+            &mut events,
+            &mut state,
+            &mut nav_requests,
+        )
+        .await;
+        assert!(
+            rerooted,
+            "the first Attach resolution must perform a re-root"
+        );
+
+        assert_eq!(self_root, Some(keep_warm_key.clone()));
+        assert!(
+            inbound.same_channel(&keep_warm_inbound),
+            "the keep-warm context and a re-root to the same (differently spelled) \
+             directory must share ONE context, never build a second one"
+        );
+
+        drop(inbound);
+        drop(events);
+        drop(state);
+        drop(nav_requests);
+        drop(keep_warm_inbound);
+        map.release(&keep_warm_key).await; // this connection's own reference
+        map.release(&keep_warm_key).await; // the keep-warm reference
     }
 }
