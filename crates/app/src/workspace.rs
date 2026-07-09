@@ -876,7 +876,13 @@ impl WorkspaceView {
         // Results panel (#529): the editor emits `ShowResults` when a
         // find-references / multi-target definition response lands — feed the
         // panel and open it in the right dock — and `CloseResults` when Escape
-        // closes it from the editor. Mirrors the panel-toggle wiring above.
+        // closes it from the editor. `ActiveTabChanged` (#404) fires when
+        // `open_or_switch` lands on an already-open tab (cross-file
+        // go-to-definition or `go_back`) — the only switch path with no
+        // `FileContent` reply to key the FileContent-load reveal off (below),
+        // so it re-triggers the same `reveal_open_file_in_tree` the header's
+        // `RevealActiveRequested` action uses. Mirrors the panel-toggle wiring
+        // above.
         cx.subscribe_in(
             &editor,
             window,
@@ -893,6 +899,9 @@ impl WorkspaceView {
                 }
                 EditorEvent::CloseResults => {
                     this.hide_results_panel(window, cx);
+                }
+                EditorEvent::ActiveTabChanged => {
+                    this.reveal_open_file_in_tree(cx);
                 }
             },
         )
@@ -2759,5 +2768,93 @@ mod tests {
             );
         })
         .unwrap();
+    }
+
+    /// Explorer reveal on tab switch (#404): switching to an already-open
+    /// tab (`EditorView::open_or_switch`'s already-open branch) has no
+    /// `FileContent` reply to key the existing reveal off, so the editor's
+    /// `ActiveTabChanged` event must drive `reveal_open_file_in_tree` itself
+    /// — mirroring the header's `RevealActiveRequested` wiring above.
+    #[gpui::test]
+    fn test_switching_to_an_already_open_tab_reveals_it_in_the_tree(cx: &mut TestAppContext) {
+        use rift_protocol::WorktreeEntry;
+        use std::time::SystemTime;
+
+        fn file(path: &str) -> WorktreeEntry {
+            WorktreeEntry {
+                path: path.to_owned(),
+                kind: EntryKind::File,
+                ignored: false,
+                mtime: SystemTime::UNIX_EPOCH,
+            }
+        }
+
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let session_view = cx.new(|cx| SessionView::new(cx).0);
+                workspace =
+                    Some(cx.new(|cx| {
+                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
+                    }));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+        let (editor, file_tree) = cx.update(|cx| {
+            let view = workspace.read(cx);
+            (view.editor.clone(), view.file_tree.clone())
+        });
+
+        // Seed the tree with both paths so `reveal` can find them, and open
+        // two fresh tabs (no daemon reply simulated, so no reveal happens
+        // yet): a.rs then b.rs, landing active on b.rs. Subscriber-driven
+        // effects (the `ActiveTabChanged` reveal included) only flush once
+        // this outermost `window.update` returns, so assertions on them sit
+        // after it, not inside its closure (`docs/patterns.md`).
+        window
+            .update(cx, |_, window, cx| {
+                file_tree.update(cx, |tree, cx| {
+                    apply_worktree_message(
+                        tree,
+                        DaemonMessage::WorktreeSnapshot {
+                            root: "/proj".into(),
+                            entries: vec![file("a.rs"), file("b.rs")],
+                            final_chunk: true,
+                        },
+                    );
+                    cx.notify();
+                });
+                editor.update(cx, |editor, cx| {
+                    editor.begin_open("a.rs".into(), false, window, cx);
+                    editor.begin_open("b.rs".into(), false, window, cx);
+                });
+            })
+            .unwrap();
+        cx.update(|cx| {
+            assert_eq!(
+                file_tree.read(cx).selected(),
+                None,
+                "a fresh open alone does not reveal (that path rides the FileContent load)"
+            );
+        });
+
+        // Switching back to the already-open a.rs must reveal it.
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.begin_open("a.rs".into(), false, window, cx);
+                });
+            })
+            .unwrap();
+        cx.update(|cx| {
+            assert_eq!(
+                file_tree.read(cx).selected(),
+                Some("a.rs"),
+                "switching to the already-open a.rs tab reveals it in the tree"
+            );
+        });
     }
 }
