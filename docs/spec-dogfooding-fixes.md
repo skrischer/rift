@@ -187,3 +187,19 @@ includes:
   clear message when the flag is absent, since every sanctioned launch path
   (`crates/ssh/src/launch.rs` via `RIFT_PROJECT_ROOT`, the justfile's default) already
   resolves and passes an explicit root.
+- 2026-07-09: **Editor tabs middle-click close + close icon; lighter editor background**
+  resolved (#730). Category 1 for the close icon (completing the existing tab-chrome
+  affordance — `SessionView`'s window tabs already use `IconName::Close` and
+  middle-click, the editor tabs had not caught up); category 2 for the background (the
+  surface was pinned to the darkest base token instead of an elevated one). Middle-click
+  is wired on the `Tab` itself via `on_mouse_down(MouseButton::Middle, ...)` routed
+  through the existing `close_tab` dirty-confirm path, mirroring
+  `crates/terminal/src/session_view.rs`'s window-tab convention exactly (left-click still
+  activates, the close icon still closes on left-click). Background token: `muted`, not
+  `secondary`. Under Catppuccin Mocha, `muted`/`accent` equal Catppuccin's `surface0`
+  (one step above `background`'s `base`), while `secondary` equals `surface1` (two
+  steps) — `muted` is the truer "nuance," and it is already the token the app uses
+  elsewhere for elevated one-step surfaces (`problems_panel.rs`, `diff_view.rs`'s hunk
+  headers). `accent` was rejected despite an identical hex value in this theme: the
+  current-line highlight already washes `accent` over the surface at low alpha, so an
+  opaque `accent` surface would blend that highlight to invisibility.
