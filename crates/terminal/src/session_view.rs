@@ -88,14 +88,14 @@ pub struct TerminalHandle {
     /// re-assert (see [`SessionSwitchRequest`]). Same legacy-path caveat as
     /// `session_list_request_rx`.
     pub session_switch_rx: flume::Receiver<SessionSwitchRequest>,
-    /// A session-order mutation from the strip — a drag-to-reorder commit or
-    /// a rename's slot-preserving key rename (#686,
-    /// `docs/spec-session-management.md`). Routed to `rift-app`'s
-    /// `session_order` store, which persists it and re-sorts + re-pushes the
-    /// current list on `session_list_tx`'s target channel. Unused on the
-    /// legacy tmux path (the strip's drag/rename affordances still emit, but
-    /// nothing is listening — harmless, the same caveat as
-    /// `session_list_request_rx`).
+    /// A session-order mutation from the strip — a "Move left"/"Move right"
+    /// context-menu commit (#744, replacing #686's drag-to-reorder) or a
+    /// rename's slot-preserving key rename (`docs/spec-session-management.md`).
+    /// Routed to `rift-app`'s `session_order` store, which persists it and
+    /// re-sorts + re-pushes the current list on `session_list_tx`'s target
+    /// channel. Unused on the legacy tmux path (the strip's move/rename
+    /// affordances still emit, but nothing is listening — harmless, the same
+    /// caveat as `session_list_request_rx`).
     pub session_order_rx: flume::Receiver<SessionOrderUpdate>,
     /// The reconnect banner's Cancel (#476,
     /// `docs/spec-connection-robustness.md`): consumed by the SSH-level
@@ -213,39 +213,14 @@ struct SessionKillConfirm {
     focus_handle: FocusHandle,
 }
 
-/// The payload a dragged session chip carries (#686,
-/// `docs/spec-session-management.md`): the session's NAME — the order
-/// store's key, not the tmux id — read by the drop target's `on_drop` handler
-/// ([`SessionView::reorder_sessions`]) via gpui's `on_drag`/`on_drop`, mirroring
-/// the explorer tree's own drag payload (`file_tree.rs`'s `DraggedRow`).
-#[derive(Clone)]
-struct DraggedSession {
-    name: String,
-}
-
-/// The floating preview that follows the cursor while a [`DraggedSession`] is
-/// in flight, mirroring the explorer tree's `DragPreview`
-/// (`file_tree.rs`) and gpui-component's own drag preview
-/// (`dock/tab_panel.rs`'s `DragPanel`). Theme tokens only, never a hardcoded
-/// hex.
-struct SessionDragPreview {
-    name: SharedString,
-}
-
-impl Render for SessionDragPreview {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id("session-chip-drag-preview")
-            .px_2()
-            .py_1()
-            .rounded(px(4.0))
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().background)
-            .text_size(px(13.0))
-            .text_color(cx.theme().foreground)
-            .child(self.name.clone())
-    }
+/// Which way a chip's context-menu reorder action ([`SessionView::move_session`])
+/// swaps it in the visible session order (#744, "Move left"/"Move right"
+/// replacing #686's drag-to-reorder — see [`SessionView::move_session`] for
+/// why drag was removed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveDirection {
+    Left,
+    Right,
 }
 
 /// An in-progress border drag. `start` is the mouse position along the drag
@@ -550,8 +525,9 @@ pub struct SessionView {
     /// commits.
     session_switch_tx: flume::Sender<SessionSwitchRequest>,
     /// Emits a session-order mutation (forwarded to `TerminalHandle`'s
-    /// `session_order_rx`) on a drag-to-reorder drop or a rename commit
-    /// (#686, `docs/spec-session-management.md`).
+    /// `session_order_rx`) on a "Move left"/"Move right" context-menu commit
+    /// (#744, replacing #686's drag-to-reorder) or a rename commit
+    /// (`docs/spec-session-management.md`).
     session_order_tx: flume::Sender<SessionOrderUpdate>,
     /// Emits the reconnect banner's Cancel to the SSH-level reconnect engine
     /// (forwarded to `TerminalHandle`'s `reconnect_cancel_rx`).
@@ -784,6 +760,14 @@ impl SessionView {
             reconnect_cancel_tx,
         };
 
+        // The strip is now always-visible (#683) with no click-to-open step
+        // to trigger `open_session_switcher`'s on-demand refresh, so an
+        // initial request must be fired here or the strip stays empty until
+        // the daemon's next churn-driven `%sessions-changed` push (#744).
+        // Inert on the legacy tmux path, same caveat as
+        // `session_list_request_rx` above.
+        let _ = view.session_list_request_tx.try_send(());
+
         let handle = TerminalHandle {
             pane_output_tx,
             input_rx,
@@ -991,30 +975,32 @@ impl SessionView {
         cx.notify();
     }
 
-    /// Commit a drag-to-reorder drop (#686, `docs/spec-session-management.md`,
-    /// Prior decisions: "drag-to-order, a total user-set order"): take
-    /// `dragged`'s current slot out of the live session list and reinsert it
-    /// immediately before `target`, then emit the WHOLE resulting name
-    /// sequence as one [`SessionOrderUpdate::Reorder`] — never a partial
-    /// two-row patch. `rift-app`'s session-order store persists it and
-    /// re-pushes the re-sorted list on the next `SessionListReply`-driven
-    /// push, so the strip is never mutated optimistically here. A drop onto
-    /// itself, or a name no longer in the live list (the daemon's churn push
-    /// raced the drag), is a no-op.
-    fn reorder_sessions(&mut self, dragged: &str, target: &str, cx: &mut Context<Self>) {
-        if dragged == target {
-            return;
-        }
+    /// Commit a "Move left"/"Move right" context-menu reorder (#744,
+    /// replacing #686's drag-to-reorder — the chip's `on_drag`/`on_drop` lived
+    /// in the title bar's window-drag region, hijacking clicks; see
+    /// [`Self::render_session_strip`]'s doc comment). Swaps `name`'s slot
+    /// with its predecessor (`Left`) or successor (`Right`) and emits the
+    /// WHOLE resulting name sequence as one [`SessionOrderUpdate::Reorder`]
+    /// — never a partial patch, mirroring the removed drag path's
+    /// full-sequence commit (#686 Prior decisions: "drag-to-order, a total
+    /// user-set order"); `rift-app`'s order store persists and re-pushes the
+    /// re-sorted list, so the strip is never mutated optimistically here. A
+    /// boundary move or an unknown `name` (the daemon's churn push raced the
+    /// click) is a no-op — the menu omits the item at a boundary.
+    fn move_session(&mut self, name: &str, direction: MoveDirection, cx: &mut Context<Self>) {
         let mut names: Vec<String> = self.sessions.iter().map(|s| s.name.clone()).collect();
-        let Some(from) = names.iter().position(|n| n == dragged) else {
+        let Some(index) = names.iter().position(|n| n == name) else {
             return;
         };
-        let dragged_name = names.remove(from);
-        let to = names
-            .iter()
-            .position(|n| n == target)
-            .unwrap_or(names.len());
-        names.insert(to, dragged_name);
+        let swap_with = match direction {
+            MoveDirection::Left => index.checked_sub(1),
+            MoveDirection::Right if index + 1 < names.len() => Some(index + 1),
+            MoveDirection::Right => None,
+        };
+        let Some(swap_with) = swap_with else {
+            return;
+        };
+        names.swap(index, swap_with);
         if let Err(e) = self
             .session_order_tx
             .try_send(SessionOrderUpdate::Reorder(names))
@@ -1719,14 +1705,17 @@ impl SessionView {
     /// All colors are theme tokens. A per-chip right-click menu
     /// ([`gpui_component::menu::ContextMenuExt`], the same widget the
     /// explorer row/editor context menus already ship with) holds "Rename",
-    /// which opens the inline edit below (#684), and "Kill" (#685), which
-    /// arms the inline confirm. Each real chip is also a drag source and drop
-    /// target (#686): dropping one onto another resequences the whole visible
-    /// list and commits it via [`Self::reorder_sessions`], mirroring the
-    /// explorer tree's own drag-to-move (`file_tree.rs`). No `Window` param
-    /// needed here (unlike the spec's draft architecture): every GPUI
-    /// interactive-element closure attached below (`on_click`, `on_drag`,
-    /// `on_drop`, the popup menu's `on_click`) already receives its own
+    /// which opens the inline edit below (#684), "Kill" (#685), which arms
+    /// the inline confirm, and "Move left"/"Move right" (#744), which commit
+    /// via [`Self::move_session`]. Chips carry NO drag/drop (#744, replacing
+    /// #686): the chip lives inside the title bar's window-drag region, so a
+    /// plain click there started a window drag instead of firing `on_click`
+    /// (switching was broken) and the drag preview stuck to the cursor after
+    /// release (the title bar's window-move consumed the mouse-up) — the
+    /// context-menu reorder above is the title-bar-safe replacement. No
+    /// `Window` param needed here (unlike the spec's draft architecture):
+    /// every GPUI interactive-element closure attached below (`on_click`,
+    /// the popup menu's `on_click`) already receives its own
     /// `&mut Window` at dispatch time — see [`Self::start_session_kill_confirm`]'s
     /// call site, which reuses the "Kill" menu item's own closure-scoped
     /// `window` instead of a value threaded from here.
@@ -1769,8 +1758,9 @@ impl SessionView {
         // so the menu is only attached once the host list has actually
         // loaded.
         let has_real_sessions = !self.sessions.is_empty();
+        let row_count = rows.len();
 
-        for row in &rows {
+        for (row_index, row) in rows.iter().enumerate() {
             let is_current = row.name.as_str() == current.as_ref();
             let name = row.name.clone();
             let row_entity = entity.clone();
@@ -1874,9 +1864,9 @@ impl SessionView {
                     .when(is_current, |el| el.bg(current_bg))
                     .hover(move |s| s.bg(current_bg))
                     .text_color(if is_current { fg } else { muted })
-                    // `on_click` (not `on_mouse_down`): GPUI suppresses the click
-                    // after a drag, so dragging a chip to reorder does not also
-                    // fire a session switch (which would reload the whole cockpit).
+                    // `on_click` (#744: the chip carries no drag/drop
+                    // anymore — see `Self::render_session_strip`'s doc
+                    // comment — so this fires unobstructed on a plain click).
                     .on_click(move |_event, _window, cx| {
                         row_entity.update(cx, |view, cx| {
                             view.switch_to_session(&name, cx);
@@ -1897,50 +1887,18 @@ impl SessionView {
                     let menu_entity = entity.clone();
                     let session_id = row.id;
                     let session_name = row.name.clone();
-
-                    // Drag-to-reorder (#686, `docs/spec-session-management.md`,
-                    // Prior decisions: "drag-to-order, a total user-set
-                    // order"): every real chip is both a drag source (a
-                    // themed floating preview, `SessionDragPreview`) and a
-                    // drop target, mirroring the explorer tree's own
-                    // drag/drop (`file_tree.rs`'s `DraggedRow`/`DragPreview`).
-                    // Dropping one chip onto another resequences the WHOLE
-                    // visible list (never just the two dragged/target rows)
-                    // and commits it via `Self::reorder_sessions`, which
-                    // sends a `SessionOrderUpdate::Reorder` — `rift-app`
-                    // persists it and re-pushes the re-sorted list, so the
-                    // strip never mutates `self.sessions` optimistically.
-                    // `can_drop` refuses a chip dropped onto itself.
-                    let drag_payload = DraggedSession {
-                        name: session_name.clone(),
-                    };
-                    let preview_name = SharedString::from(session_name.clone());
-                    let can_drop_name = session_name.clone();
-                    let drop_target_name = session_name.clone();
-                    let base = base
-                        .on_drag(drag_payload, move |_drag, _point, _window, cx| {
-                            cx.new(|_| SessionDragPreview {
-                                name: preview_name.clone(),
-                            })
-                        })
-                        .drag_over::<DraggedSession>(|style, _drag, _window, cx| {
-                            style.bg(cx.theme().list_active)
-                        })
-                        .can_drop(move |drag: &dyn std::any::Any, _window, _cx| {
-                            drag.downcast_ref::<DraggedSession>()
-                                .is_some_and(|dragged| dragged.name != can_drop_name)
-                        })
-                        .on_drop(
-                            cx.listener(move |this, drag: &DraggedSession, _window, cx| {
-                                this.reorder_sessions(&drag.name, &drop_target_name, cx);
-                            }),
-                        );
+                    let can_move_left = row_index > 0;
+                    let can_move_right = row_index + 1 < row_count;
 
                     base.context_menu(move |menu, _window, _cx| {
                         let rename_entity = menu_entity.clone();
                         let rename_name = session_name.clone();
                         let kill_entity = menu_entity.clone();
                         let kill_name = session_name.clone();
+                        let move_left_entity = menu_entity.clone();
+                        let move_left_name = session_name.clone();
+                        let move_right_entity = menu_entity.clone();
+                        let move_right_name = session_name.clone();
                         menu.item(PopupMenuItem::new("Rename").on_click(
                             move |_event, window, cx| {
                                 rename_entity.update(cx, |view, cx| {
@@ -1953,6 +1911,32 @@ impl SessionView {
                                 });
                             },
                         ))
+                        // Reorder (#744, replacing #686's drag-to-reorder,
+                        // see `Self::render_session_strip`) via
+                        // `Self::move_session`; omitted at whichever
+                        // boundary would be a no-op.
+                        .when(can_move_left, |menu| {
+                            menu.item(PopupMenuItem::new("Move left").on_click(
+                                move |_event, _window, cx| {
+                                    move_left_entity.update(cx, |view, cx| {
+                                        view.move_session(&move_left_name, MoveDirection::Left, cx);
+                                    });
+                                },
+                            ))
+                        })
+                        .when(can_move_right, |menu| {
+                            menu.item(PopupMenuItem::new("Move right").on_click(
+                                move |_event, _window, cx| {
+                                    move_right_entity.update(cx, |view, cx| {
+                                        view.move_session(
+                                            &move_right_name,
+                                            MoveDirection::Right,
+                                            cx,
+                                        );
+                                    });
+                                },
+                            ))
+                        })
                         .item(
                             // "Kill" only ARMS the chip's inline confirm
                             // (#685, `docs/spec-session-management.md`); the
@@ -2708,9 +2692,9 @@ mod tests {
         aggregate_activity, grid_size_for, home_relative, kill_session_command,
         max_vertical_pane_count, new_window_at_command, quote_tmux_name, reconnect_banner_message,
         rename_session_command, resize_direction, select_pane_command, split_command,
-        tab_state_slot, zoom_pane_command, PaneActivity, SessionListItem, SessionOrderUpdate,
-        SessionSnapshot, SessionView, TabStateSlot, TermSize, TerminalHandle, DEFAULT_FONT_SIZE,
-        MAX_FONT_SIZE, MIN_FONT_SIZE,
+        tab_state_slot, zoom_pane_command, MoveDirection, PaneActivity, SessionListItem,
+        SessionOrderUpdate, SessionSnapshot, SessionView, TabStateSlot, TermSize, TerminalHandle,
+        DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE,
     };
     use crate::layout::LayoutNode;
     use gpui::{
@@ -3112,6 +3096,26 @@ mod tests {
         (session, handle.expect("handle built by SessionView::new"))
     }
 
+    /// #744: the always-visible strip has no click-to-open step to trigger
+    /// `open_session_switcher`'s refresh, so `SessionView::new` must fire
+    /// exactly one initial request itself, or the strip stays empty until
+    /// the daemon's next churn-driven push.
+    #[gpui::test]
+    fn test_session_view_new_enqueues_exactly_one_initial_list_request(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (_session, handle) = session_and_handle(cx);
+
+            assert!(
+                handle.session_list_request_rx.try_recv().is_ok(),
+                "SessionView::new requests an initial session list"
+            );
+            assert!(
+                handle.session_list_request_rx.try_recv().is_err(),
+                "exactly one initial request, no duplicate"
+            );
+        });
+    }
+
     /// A minimal one-window, one-pane snapshot with the given `pane_is_shell`
     /// map, for exercising `apply_snapshot`'s foreground-shell wiring.
     fn snapshot_with_pane_is_shell(pane_is_shell: HashMap<String, bool>) -> SessionSnapshot {
@@ -3328,43 +3332,48 @@ mod tests {
         });
     }
 
-    /// A chip dropped onto another emits the WHOLE resulting name sequence
-    /// (#686), not just the two rows involved — `reorder_sessions` reinserts
-    /// the dragged name immediately before the target and resequences every
-    /// other known session around it.
+    /// The three-session fixture ("rift", "agent", "tests" at indices 0, 1,
+    /// 2) shared by the [`SessionView::move_session`] tests below (#744,
+    /// replacing #686's drag-based `reorder_sessions`).
+    fn seed_three_sessions(session: &Entity<SessionView>, cx: &mut App) {
+        session.update(cx, |view, cx| {
+            view.apply_session_list(
+                vec![
+                    SessionListItem {
+                        id: 0,
+                        name: "rift".into(),
+                        windows: 1,
+                        attached: true,
+                    },
+                    SessionListItem {
+                        id: 1,
+                        name: "agent".into(),
+                        windows: 1,
+                        attached: false,
+                    },
+                    SessionListItem {
+                        id: 2,
+                        name: "tests".into(),
+                        windows: 1,
+                        attached: false,
+                    },
+                ],
+                cx,
+            );
+        });
+    }
+
+    /// "Move left" swaps the target with its predecessor and emits the WHOLE
+    /// resulting name sequence, not just the two swapped rows.
     #[gpui::test]
-    fn test_reorder_sessions_emits_full_sequence_with_dragged_before_target(
-        cx: &mut TestAppContext,
-    ) {
+    fn test_move_session_left_swaps_with_predecessor(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let (session, handle) = session_and_handle(cx);
-            session.update(cx, |view, cx| {
-                view.apply_session_list(
-                    vec![
-                        SessionListItem {
-                            id: 0,
-                            name: "rift".into(),
-                            windows: 1,
-                            attached: true,
-                        },
-                        SessionListItem {
-                            id: 1,
-                            name: "agent".into(),
-                            windows: 1,
-                            attached: false,
-                        },
-                        SessionListItem {
-                            id: 2,
-                            name: "tests".into(),
-                            windows: 1,
-                            attached: false,
-                        },
-                    ],
-                    cx,
-                );
-            });
+            seed_three_sessions(&session, cx);
 
-            session.update(cx, |view, cx| view.reorder_sessions("tests", "rift", cx));
+            session.update(cx, |view, cx| {
+                view.move_session("agent", MoveDirection::Left, cx)
+            });
 
             assert_eq!(
                 handle
@@ -3372,65 +3381,94 @@ mod tests {
                     .try_recv()
                     .expect("reorder update sent"),
                 SessionOrderUpdate::Reorder(vec![
-                    "tests".to_string(),
+                    "agent".to_string(),
                     "rift".to_string(),
+                    "tests".to_string(),
+                ])
+            );
+        });
+    }
+
+    /// "Move right" swaps the target with its successor and emits the WHOLE
+    /// resulting name sequence, not just the two swapped rows.
+    #[gpui::test]
+    fn test_move_session_right_swaps_with_successor(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, handle) = session_and_handle(cx);
+            seed_three_sessions(&session, cx);
+
+            session.update(cx, |view, cx| {
+                view.move_session("agent", MoveDirection::Right, cx)
+            });
+
+            assert_eq!(
+                handle
+                    .session_order_rx
+                    .try_recv()
+                    .expect("reorder update sent"),
+                SessionOrderUpdate::Reorder(vec![
+                    "rift".to_string(),
+                    "tests".to_string(),
                     "agent".to_string(),
                 ])
             );
         });
     }
 
-    /// A chip dropped onto itself is a no-op — no update crosses the seam.
+    /// "Move left" on the first chip is a boundary no-op — no update crosses
+    /// the seam (the context menu omits the item there; this guards a stale
+    /// click).
     #[gpui::test]
-    fn test_reorder_sessions_dropped_onto_itself_sends_nothing(cx: &mut TestAppContext) {
+    fn test_move_session_left_at_first_position_sends_nothing(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let (session, handle) = session_and_handle(cx);
-            session.update(cx, |view, cx| {
-                view.apply_session_list(
-                    vec![SessionListItem {
-                        id: 0,
-                        name: "rift".into(),
-                        windows: 1,
-                        attached: true,
-                    }],
-                    cx,
-                );
-            });
+            seed_three_sessions(&session, cx);
 
-            session.update(cx, |view, cx| view.reorder_sessions("rift", "rift", cx));
+            session.update(cx, |view, cx| {
+                view.move_session("rift", MoveDirection::Left, cx)
+            });
 
             assert!(
                 handle.session_order_rx.try_recv().is_err(),
-                "a drop onto itself sends no reorder update"
+                "a move-left on the first chip sends no reorder update"
             );
         });
     }
 
-    /// A dragged name no longer in the live list (the daemon's churn push
-    /// raced the drag) is a no-op rather than inserting a stale entry.
+    /// "Move right" on the last chip is a boundary no-op — no update crosses
+    /// the seam.
     #[gpui::test]
-    fn test_reorder_sessions_unknown_dragged_name_sends_nothing(cx: &mut TestAppContext) {
+    fn test_move_session_right_at_last_position_sends_nothing(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let (session, handle) = session_and_handle(cx);
-            session.update(cx, |view, cx| {
-                view.apply_session_list(
-                    vec![SessionListItem {
-                        id: 0,
-                        name: "rift".into(),
-                        windows: 1,
-                        attached: true,
-                    }],
-                    cx,
-                );
-            });
+            seed_three_sessions(&session, cx);
 
             session.update(cx, |view, cx| {
-                view.reorder_sessions("gone", "rift", cx);
+                view.move_session("tests", MoveDirection::Right, cx)
             });
 
             assert!(
                 handle.session_order_rx.try_recv().is_err(),
-                "an unknown dragged name sends nothing"
+                "a move-right on the last chip sends no reorder update"
+            );
+        });
+    }
+
+    /// A name no longer in the live list (the daemon's churn push raced the
+    /// click) is a no-op rather than inserting a stale entry.
+    #[gpui::test]
+    fn test_move_session_unknown_name_sends_nothing(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, handle) = session_and_handle(cx);
+            seed_three_sessions(&session, cx);
+
+            session.update(cx, |view, cx| {
+                view.move_session("gone", MoveDirection::Left, cx);
+            });
+
+            assert!(
+                handle.session_order_rx.try_recv().is_err(),
+                "an unknown name sends nothing"
             );
         });
     }
