@@ -290,3 +290,96 @@ Each issue references this spec path in its body.
   releases (its context lives for the daemon's whole process lifetime). No
   connection/`Attach` wiring, no re-root routing, no protocol change — out of
   scope, deferred to #737.
+- 2026-07-09: Issue #737 implementation (the Attach seam,
+  `crates/daemon/src/{lib,terminal}.rs`). Wired `ClientMessage::Attach` to
+  re-root a connection's reactive bindings (`inbound`/`events`/`state`/
+  `nav_requests`) to its attached session's resolved root, in the spec's
+  defined resolve -> acquire -> release-old -> snapshot order, and closed the
+  two concurrency gaps the #736 review surfaced (both explicitly in this
+  issue's scope):
+  1. **Atomic last-release + re-acquire.** `ContextMap::entries` moved from a
+     `std::sync::Mutex` to a `tokio::sync::Mutex`, and `release`'s
+     last-reference path now drops the torn-down `Context` and awaits its
+     dispatch task's join WHILE STILL HOLDING the lock, instead of releasing
+     it first. `acquire` is now `async` too, so a concurrent `acquire`/
+     `release` — for the same root or any other, since the lock is
+     registry-wide rather than per-root — simply blocks until an in-flight
+     last-release's teardown fully completes; by the time it can look at the
+     map, the old entry is provably gone and its loop has already exited, so
+     a re-acquire always builds a fresh context, never a duplicate. Trades
+     finer-grained per-root locking (a tombstone/generation guard, the
+     spec's other named option) for a much simpler, provably-correct scheme —
+     judged the right tradeoff at this daemon's connection counts (a
+     handful; `docs/spec-dogfooding-channels.md`), where briefly serializing
+     an unrelated root's acquire behind another root's teardown is not a
+     real cost. Proven directly in `test_context_map_acquire_blocks_while_
+     the_registry_lock_is_held` (holds the lock itself, standing in for an
+     in-flight teardown, and asserts a concurrent `acquire` blocks until it
+     is released) and `test_context_map_reacquire_after_full_teardown_
+     builds_a_fresh_working_context`.
+  2. **Canonical root key**, resolved by a new `reroot_connection` helper
+     (`lib.rs`) rather than inside `ContextMap` itself or inside
+     `terminal.rs`'s `resolve_session_root`: `ContextMap` keeps its #736
+     raw-key contract unchanged (still no canonicalization at the map
+     layer), and `resolve_session_root` stays pure/sync (parses the two
+     `ROOT_QUERY` reply fields with no filesystem access, so it stays
+     unit-tested without tmux). `reroot_connection` — the one caller that
+     turns a resolved root into an `acquire` — canonicalizes with
+     `tokio::fs::canonicalize` right before calling it; a canonicalize
+     failure (a since-removed directory, a permissions error) degrades to
+     the raw path and logs, never aborts, since `ContextMap::acquire`
+     already degrades a bad root to an empty/worktree-only context on its
+     own. Covered by `test_reroot_connection_canonicalizes_the_key_so_two_
+     spellings_share_one_context`.
+  A third mechanical decision: the resolved root crosses from `terminal.rs`
+  (which owns the tmux control-mode attach and the `ROOT_QUERY` round trip)
+  to `lib.rs` (which owns `ContextMap` and the connection's socket writer)
+  over a new internal, non-protocol channel (`terminal::RootResolved =
+  mpsc::Sender<Option<PathBuf>>`), sent with `try_send` from `Attach::
+  process`'s `root_query` reply arm — best-effort, since this is an
+  at-most-one-per-attach signal never worth blocking the tmux read loop
+  over. `serve_connection` owns the per-connection `self_root` bookkeeping
+  and the `ContextMap` acquire/release calls (passed in as `Option<Arc<
+  ContextMap>>`, `None` in call sites that do not exercise re-root); the
+  connect-time default root's CONTEXT REFERENCE (`serve`/`serve_uds`'s own
+  up-front acquire — held for the connection's/daemon's whole lifetime) stays
+  entirely the caller's own, untouched by a connection's own `Attach`-driven
+  re-root — but, after the review-round fix below, it is keyed by the SAME
+  canonicalized value a re-root to that directory would use, so the two
+  correctly converge on ONE registry entry rather than owning two separate
+  references to two separate contexts. End-to-end coverage (`test_
+  serve_connection_attach_reroots_worktree_snapshot_to_the_resolved_
+  session_root`) drives two real tmux sessions stamped with different
+  `@root`s through the whole `Attach` -> `terminal_task` -> `ContextMap`
+  path and asserts the first `WorktreeSnapshot` after each switch carries
+  that session's own root and tree. No protocol change; buffer detach on
+  re-root stays out of scope, deferred to #738 per the issue's hard limit.
+- 2026-07-09: PR #778 review round (VERDICT REQUEST_CHANGES → addressed).
+  One BLOCKING defect, closed: the keep-warm/default acquire in `serve`
+  (its `Some(root)` branch) and `serve_uds` keyed `ContextMap` with the RAW
+  `--root`, while `reroot_connection` keyed it with `canonicalize(resolved_
+  root)` — an uncanonical `--root` (a trailing slash, a symlinked path, `..`)
+  then keyed a SECOND, distinct entry once an `Attach` resolved to the same
+  directory, so the daemon ran two independent `LspWorker`s — two
+  rust-analyzers — for one project: precisely the RAM-duplication failure
+  option (b) was rejected for in the spec's "Prior decisions" table. Fixed
+  by extracting the canonicalization into one shared `canonicalize_root`
+  helper and calling it at EVERY context-map key site — `reroot_connection`,
+  `serve`'s keep-warm acquire AND its matching `release`, and `serve_uds`'s
+  keep-warm acquire — so no acquire/release can key differently again; the
+  `@root` tmux stamp and the root handed to a connection's terminal attach
+  (session start-directory) stay RAW, since only the map KEY needs to
+  converge. Regression: `test_keep_warm_acquire_and_reroot_share_one_
+  context_for_a_trailing_slash_root`. Three cheap follow-ups, also applied:
+  re-resolving the SAME (canonical) root a connection already holds is now a
+  no-op in `reroot_connection` — no acquire/release churn and no redundant
+  re-snapshot on a same-session reconnect (`test_reroot_connection_same_
+  root_again_is_a_noop`); the last-release teardown join is now bounded by a
+  `CONTEXT_RELEASE_JOIN_TIMEOUT` (30s) so a FUTURE violation of the
+  "drop-before-release" contract degrades to a logged leak instead of
+  wedging the whole registry (the join runs while holding the map-wide
+  lock); and a second concurrency test
+  (`test_context_map_concurrent_acquirers_racing_to_zero_converge_without_
+  duplication`) exercises the atomicity fix through real concurrent
+  acquirers and a real `Daemon::run()` join, not only the lock-held
+  stand-in.

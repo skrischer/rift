@@ -99,6 +99,22 @@ const SESSION_LIST_FORMAT: &str =
 /// unquoted `#` as a comment (tmux-reference pitfall 9).
 const ROOT_QUERY: &str = "display-message -p '#{@root}\t#{session_path}'";
 
+/// One resolved-root signal per `Attach`, sent once the [`ROOT_QUERY`] reply
+/// lands (`docs/spec-per-session-project-root.md`, the Attach seam, #737).
+/// Internal to the daemon, NOT a protocol message: `lib.rs`'s
+/// `serve_connection` consumes it to drive the per-root `ContextMap`'s
+/// acquire/release/re-subscribe sequence, in the defined resolve -> acquire
+/// -> snapshot order. `None` when [`resolve_session_root`] itself resolves to
+/// `None` (tmux reports an empty `session_path` too — should not happen for a
+/// live session, but handled defensively rather than assumed). Sent with
+/// `try_send`, not an awaited send: this is a best-effort, at-most-one-per-
+/// attach signal, never worth blocking the tmux read loop over, and a
+/// superseded value (a rapid re-attach) is fine to drop since the newer
+/// attach's own resolution follows right behind. A full channel or a gone
+/// receiver (e.g. a test that constructs `terminal_task` directly and never
+/// drains it) is silently tolerated for the same reason.
+pub(crate) type RootResolved = mpsc::Sender<Option<PathBuf>>;
+
 /// Signals that the connection's outbound channel closed — the client is gone.
 struct Closed;
 
@@ -117,12 +133,15 @@ enum Flow {
 /// `root` is the daemon's watched project root (`docs/spec-session-start-directory.md`):
 /// when present, a freshly created session's default working directory is set to
 /// it (`Attach::spawn`), so every later window and split inherits the project
-/// root instead of `$HOME`. `None` in the rootless test call sites.
+/// root instead of `$HOME`. `None` in the rootless test call sites. `root_resolved`
+/// carries the per-attach resolved session root back to `serve_connection` — see
+/// [`RootResolved`].
 pub(crate) async fn terminal_task(
     mut inbound: mpsc::Receiver<ClientMessage>,
     outbound: mpsc::Sender<DaemonMessage>,
     server_socket: Option<String>,
     root: Option<PathBuf>,
+    root_resolved: RootResolved,
 ) {
     let mut attach: Option<Attach> = None;
     let mut buf = vec![0u8; TERM_READ_BUFFER];
@@ -136,7 +155,7 @@ pub(crate) async fn terminal_task(
                 Ok(0) | Err(_) => terminal_down(&mut attach, &outbound, None).await,
                 Ok(n) => {
                     let outcome = match attach.as_mut() {
-                        Some(a) => a.process(&buf[..n], &outbound).await,
+                        Some(a) => a.process(&buf[..n], &outbound, &root_resolved).await,
                         None => continue,
                     };
                     match outcome {
@@ -687,6 +706,7 @@ impl Attach {
         &mut self,
         bytes: &[u8],
         outbound: &mpsc::Sender<DaemonMessage>,
+        root_resolved: &RootResolved,
     ) -> Result<Flow, Closed> {
         for event in self.client.feed(bytes) {
             match event {
@@ -798,6 +818,11 @@ impl Attach {
                                     root = ?resolved,
                                     "resolved session root on attach"
                                 );
+                                // Best-effort (see `RootResolved`'s doc comment):
+                                // `serve_connection` drives the per-root
+                                // `ContextMap` re-root from this; never worth
+                                // blocking the tmux read loop over.
+                                let _ = root_resolved.try_send(resolved);
                             }
                         }
                     } else if let Some(pane) = id.and_then(|id| self.captures.remove(&id)) {
@@ -1582,8 +1607,18 @@ mod tests {
     ) {
         let (in_tx, in_rx) = mpsc::channel(64);
         let (out_tx, out_rx) = mpsc::channel(outbound_cap);
+        // The resolved-root receiver is not observed by these fixtures; #737's
+        // `test_attach_sends_resolved_root_on_the_internal_channel` constructs
+        // `terminal_task` directly to observe it instead.
+        let (root_resolved_tx, _root_resolved_rx) = mpsc::channel(4);
         let socket = server.name.clone();
-        let handle = tokio::spawn(terminal_task(in_rx, out_tx, Some(socket), root));
+        let handle = tokio::spawn(terminal_task(
+            in_rx,
+            out_tx,
+            Some(socket),
+            root,
+            root_resolved_tx,
+        ));
         (in_tx, out_rx, handle)
     }
 
@@ -1735,6 +1770,52 @@ mod tests {
         assert!(output.status.success(), "tmux display-message failed");
         let stamped = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         assert_eq!(stamped, root.to_string_lossy());
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_attach_sends_resolved_root_on_the_internal_channel() {
+        // #737 (the Attach seam): once the `ROOT_QUERY` reply lands,
+        // `Attach::process` reports the resolved root on the internal
+        // `RootResolved` channel — the signal `serve_connection` (`lib.rs`)
+        // consumes to drive the per-root `ContextMap` re-root. Bypasses
+        // `spawn_task_with_root` (which discards this channel) to observe it
+        // directly.
+        let server = TmuxServer::new("resolvedroot");
+        let root = std::env::temp_dir().join("rift-resolved-root-test");
+        let (in_tx, in_rx) = mpsc::channel(64);
+        let (out_tx, mut out_rx) = mpsc::channel(256);
+        let (root_resolved_tx, mut root_resolved_rx) = mpsc::channel(4);
+        let task = tokio::spawn(terminal_task(
+            in_rx,
+            out_tx,
+            Some(server.name.clone()),
+            Some(root.clone()),
+            root_resolved_tx,
+        ));
+
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+                root: None,
+            })
+            .await
+            .expect("send attach");
+
+        recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::LayoutSnapshot { .. } => Some(()),
+            _ => None,
+        })
+        .await
+        .expect("layout snapshot after attach");
+
+        let resolved = tokio::time::timeout(Duration::from_secs(10), root_resolved_rx.recv())
+            .await
+            .expect("resolved-root channel fires within the timeout")
+            .expect("channel stays open while the terminal task is alive");
+        assert_eq!(resolved, Some(root));
 
         drop(in_tx);
         let _ = task.await;
