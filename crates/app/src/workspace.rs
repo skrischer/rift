@@ -162,17 +162,19 @@ pub struct FocusTerminal;
 #[action(namespace = rift, no_json)]
 pub struct ZoomActivePanel;
 
-/// Open the session switcher (`docs/spec-session-switch.md`): the popover
-/// anchored to the statusbar session label, listing every host tmux session.
-/// Handled at the workspace root (not inside the terminal) so the palette's
-/// dispatch reaches it regardless of which surface holds focus.
+/// Request an on-demand session-list refresh (`docs/spec-session-management.md`).
+/// The always-visible title-bar session strip (#683) replaced the phase-19
+/// click-to-open popover this used to open, so this is now a manual nudge
+/// rather than a toggle. Handled at the workspace root (not inside the
+/// terminal) so the palette's dispatch reaches it regardless of which surface
+/// holds focus.
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = rift, no_json)]
 pub struct SwitchSession;
 
-/// Open the session switcher with its new-session prompt active
-/// (`docs/spec-session-switch.md`): naming a fresh session attach-creates it
-/// (the daemon child command is `new-session -A -s <name>`).
+/// Activate the session strip's trailing new-session prompt
+/// (`docs/spec-session-management.md`): naming a fresh session attach-creates
+/// it (the daemon child command is `new-session -A -s <name>`).
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = rift, no_json)]
 pub struct NewSession;
@@ -1503,10 +1505,10 @@ impl Render for WorkspaceView {
         // The custom title bar (#511/#512, `docs/spec-cockpit-chrome.md`): the
         // connection group reads the live `SessionView` fields the terminal
         // crate's own statusbar shows, so the two never disagree, and hosts
-        // the session-switcher popover itself (relocated from the interim
-        // statusbar anchor) once a live session names it. The settings gear
-        // dispatches through the same `open_settings` path as the
-        // `OpenSettings` action below.
+        // the always-visible session strip itself (#683, relocated from the
+        // interim statusbar anchor) once a live session names it. The
+        // settings gear dispatches through the same `open_settings` path as
+        // the `OpenSettings` action below.
         let connection = {
             let (dot_color, ssh_label, has_session) = {
                 let session = self.session_view.read(cx);
@@ -1517,12 +1519,12 @@ impl Render for WorkspaceView {
                     !session.session_name().is_empty(),
                 )
             };
-            let switcher = has_session.then(|| {
+            let session_strip = has_session.then(|| {
                 self.session_view.update(cx, |session, cx| {
-                    session.render_session_switcher(cx).into_any_element()
+                    session.render_session_strip(cx).into_any_element()
                 })
             });
-            title_bar::ConnectionGroup::connected(dot_color, ssh_label, switcher)
+            title_bar::ConnectionGroup::connected(dot_color, ssh_label, session_strip)
         };
         let settings_button = Button::new("title-bar-settings")
             .ghost()
@@ -1629,9 +1631,7 @@ impl Render for WorkspaceView {
                 this.zoom_active_panel(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SwitchSession, _window, cx| {
-                this.session_view.update(cx, |session, cx| {
-                    session.open_session_switcher(cx);
-                });
+                this.session_view.read(cx).open_session_switcher();
             }))
             .on_action(cx.listener(|this, _: &NewSession, window, cx| {
                 this.session_view.update(cx, |session, cx| {
