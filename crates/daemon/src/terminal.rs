@@ -17,6 +17,7 @@
 //! resumed as soon as that channel has room, so the loop never deadlocks.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -89,10 +90,15 @@ enum Flow {
 /// resize, raw command); `outbound` is the connection's bounded event channel,
 /// drained by the socket writer. `server_socket` selects the tmux server: `None`
 /// uses the default server (production); tests pass a unique `-L` name to isolate.
+/// `root` is the daemon's watched project root (`docs/spec-session-start-directory.md`):
+/// when present, a freshly created session's default working directory is set to
+/// it (`Attach::spawn`), so every later window and split inherits the project
+/// root instead of `$HOME`. `None` in the rootless test call sites.
 pub(crate) async fn terminal_task(
     mut inbound: mpsc::Receiver<ClientMessage>,
     outbound: mpsc::Sender<DaemonMessage>,
     server_socket: Option<String>,
+    root: Option<PathBuf>,
 ) {
     let mut attach: Option<Attach> = None;
     let mut buf = vec![0u8; TERM_READ_BUFFER];
@@ -123,7 +129,13 @@ pub(crate) async fn terminal_task(
                 Some(ClientMessage::Attach { session }) => {
                     // Re-attach: tear the current child down before opening anew.
                     detach(&mut attach).await;
-                    attach = open_attach(session, server_socket.as_deref(), &outbound).await;
+                    attach = open_attach(
+                        session,
+                        server_socket.as_deref(),
+                        root.as_deref(),
+                        &outbound,
+                    )
+                    .await;
                 }
                 Some(other) => {
                     if let Some(a) = attach.as_mut() {
@@ -194,9 +206,10 @@ async fn terminal_down(
 async fn open_attach(
     session: String,
     server_socket: Option<&str>,
+    root: Option<&Path>,
     outbound: &mpsc::Sender<DaemonMessage>,
 ) -> Option<Attach> {
-    match Attach::spawn(session.clone(), server_socket).await {
+    match Attach::spawn(session.clone(), server_socket, root).await {
         Ok(attach) => Some(attach),
         Err(err) => {
             error!(%session, %err, "tmux attach failed");
@@ -209,6 +222,35 @@ async fn open_attach(
             None
         }
     }
+}
+
+/// Build the argv (excluding the `tmux` program name itself) for the attach's
+/// control-mode child: an optional `-L <server_socket>`, then the fixed
+/// `-C new-session -A -s <session>`, then an optional `-c <root>`
+/// (`docs/spec-session-start-directory.md`) so a freshly created session's
+/// default working directory is the project root — inherited by every later
+/// `new-window`/`split-window` that omits its own `-c` (tmux >=1.9). `-c` only
+/// takes effect when `new-session -A` actually creates the session; attaching
+/// an existing one leaves its default directory untouched (the re-root path is
+/// separate). Extracted as a pure function so the argv shape is unit-tested
+/// without spawning tmux; each entry is its own argv element, never a shell
+/// string, so a root path cannot inject extra arguments.
+fn spawn_args(session: &str, server_socket: Option<&str>, root: Option<&Path>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(socket) = server_socket {
+        args.push("-L".to_owned());
+        args.push(socket.to_owned());
+    }
+    args.push("-C".to_owned());
+    args.push("new-session".to_owned());
+    args.push("-A".to_owned());
+    args.push("-s".to_owned());
+    args.push(session.to_owned());
+    if let Some(root) = root {
+        args.push("-c".to_owned());
+        args.push(root.to_string_lossy().into_owned());
+    }
+    args
 }
 
 /// One client's live tmux control-mode attach.
@@ -266,13 +308,14 @@ struct KeyTableQuery {
 }
 
 impl Attach {
-    async fn spawn(session: String, server_socket: Option<&str>) -> anyhow::Result<Self> {
+    async fn spawn(
+        session: String,
+        server_socket: Option<&str>,
+        root: Option<&Path>,
+    ) -> anyhow::Result<Self> {
         let mut command = tokio::process::Command::new("tmux");
-        if let Some(socket) = server_socket {
-            command.args(["-L", socket]);
-        }
         command
-            .args(["-C", "new-session", "-A", "-s", &session])
+            .args(spawn_args(&session, server_socket, root))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -838,6 +881,49 @@ mod tests {
     }
 
     #[test]
+    fn test_spawn_args_with_root_appends_c_flag_after_new_session() {
+        let args = spawn_args("rift", None, Some(Path::new("/home/dev/proj")));
+        assert_eq!(
+            args,
+            vec![
+                "-C",
+                "new-session",
+                "-A",
+                "-s",
+                "rift",
+                "-c",
+                "/home/dev/proj"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_spawn_args_without_root_omits_c_flag() {
+        let args = spawn_args("rift", None, None);
+        assert_eq!(args, vec!["-C", "new-session", "-A", "-s", "rift"]);
+        assert!(!args.iter().any(|a| a == "-c"));
+    }
+
+    #[test]
+    fn test_spawn_args_with_server_socket_prepends_l_flag() {
+        let args = spawn_args("rift", Some("mysock"), Some(Path::new("/proj")));
+        assert_eq!(
+            args,
+            vec![
+                "-L",
+                "mysock",
+                "-C",
+                "new-session",
+                "-A",
+                "-s",
+                "rift",
+                "-c",
+                "/proj"
+            ]
+        );
+    }
+
+    #[test]
     fn test_parse_layout_line_full_fields() {
         let parsed =
             parse_layout_line("@0\t3\t1\t%1\t1\t51\t0\t49\t30\tnvim\t/home/dev/proj\t0\tbash")
@@ -1089,7 +1175,7 @@ mod tests {
         let (in_tx, in_rx) = mpsc::channel(64);
         let (out_tx, out_rx) = mpsc::channel(outbound_cap);
         let socket = server.name.clone();
-        let handle = tokio::spawn(terminal_task(in_rx, out_tx, Some(socket)));
+        let handle = tokio::spawn(terminal_task(in_rx, out_tx, Some(socket), None));
         (in_tx, out_rx, handle)
     }
 

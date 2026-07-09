@@ -191,3 +191,10 @@ Each issue references this spec path in its body.
   never-`$HOME` outcome and avoid a session-recreate migration for the live
   dogfooding session. Human prerequisites: none. Status flipped `DRAFT` → `READY`
   in the same PR; milestone `Phase 340` created at acceptance.
+- 2026-07-09: Issue #726 implementation. Threading `root: Option<PathBuf>` through
+  `serve_connection` (already at 7 parameters) pushed it to 8, past clippy's
+  `too_many_arguments` default threshold; annotated it
+  `#[allow(clippy::too_many_arguments)]`, the same pattern already used at
+  `crates/terminal/src/pane_view.rs` and `crates/app/src/editor.rs`, rather than
+  bundling the connection's wiring into a struct — an unrelated refactor out of
+  scope for this step.

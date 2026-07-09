@@ -932,8 +932,13 @@ impl NavStaleGate {
 /// connection ends); `events` is a fresh subscription to the outbound bus;
 /// `state` observes the latest worktree snapshot; `nav_requests` is this
 /// connection's clone of the LSP worker's request sender (`None` when LSP is not
-/// armed — nav requests are then silently dropped). Returns once the reader
-/// reaches EOF, the dispatch loop is gone, or the event bus closes.
+/// armed — nav requests are then silently dropped). `root` is the daemon's
+/// watched project root, passed into this connection's `terminal_task` so a
+/// freshly created tmux session defaults to it instead of `$HOME`
+/// (`docs/spec-session-start-directory.md`); `None` in the rootless test call
+/// sites. Returns once the reader reaches EOF, the dispatch loop is gone, or the
+/// event bus closes.
+#[allow(clippy::too_many_arguments)]
 async fn serve_connection<R, W>(
     reader: R,
     mut writer: W,
@@ -942,6 +947,7 @@ async fn serve_connection<R, W>(
     mut state: watch::Receiver<State>,
     nav_requests: Option<mpsc::Sender<NavRequest>>,
     tmux_server: Option<String>,
+    root: Option<PathBuf>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -980,6 +986,7 @@ where
         terminal_in_rx,
         terminal_out_tx,
         tmux_server,
+        root,
     ));
     let mut terminal_done = false;
 
@@ -1307,9 +1314,11 @@ async fn write_messages<W: AsyncWrite + Unpin>(
 /// Spins up a dispatch loop, serves exactly one connection over `reader`/
 /// `writer`, then tears the loop down. With a `worktree_root`, the root is
 /// scanned and watched for the daemon's lifetime (see
-/// [`Daemon::watch_worktree`]). Used by the daemon binary's stdio mode and the
-/// duplex round-trip test. For a long-lived, reattachable daemon that survives
-/// client disconnects, see [`serve_uds`].
+/// [`Daemon::watch_worktree`]) and handed to the connection's terminal attach
+/// too (`docs/spec-session-start-directory.md`), so a freshly created tmux
+/// session's default directory is the project root, not `$HOME`. Used by the
+/// daemon binary's stdio mode and the duplex round-trip test. For a long-lived,
+/// reattachable daemon that survives client disconnects, see [`serve_uds`].
 ///
 /// Returns once the reader reaches EOF or the writer/event bus closes.
 pub async fn serve<R, W>(reader: R, writer: W, worktree_root: Option<PathBuf>) -> anyhow::Result<()>
@@ -1318,6 +1327,9 @@ where
     W: AsyncWrite + Unpin,
 {
     let (mut daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
+    // Retain a clone for the connection's terminal attach below; `watch_worktree`
+    // / `watch_lsp` consume the original.
+    let connection_root = worktree_root.clone();
     if let Some(root) = worktree_root {
         daemon.watch_worktree(root.clone());
         daemon.watch_lsp(root, DocumentSelector::builtin());
@@ -1335,8 +1347,18 @@ where
     drop(handles);
 
     let dispatch = tokio::spawn(daemon.run());
-    // The trailing `None`: production uses the default tmux server for attaches.
-    let result = serve_connection(reader, writer, inbound, events, state, nav_requests, None).await;
+    // The `None`: production uses the default tmux server for attaches.
+    let result = serve_connection(
+        reader,
+        writer,
+        inbound,
+        events,
+        state,
+        nav_requests,
+        None,
+        connection_root,
+    )
+    .await;
     // `serve_connection` dropped its `inbound` clone on return, so the dispatch
     // loop has observed channel closure and will join.
     dispatch.await?;
@@ -1386,7 +1408,10 @@ impl Drop for PidfileGuard {
 ///
 /// With a `worktree_root`, the root is scanned and watched for the daemon's
 /// lifetime; every attaching client receives the current snapshot on its
-/// handshake (see [`Daemon::watch_worktree`]).
+/// handshake (see [`Daemon::watch_worktree`]), and each accepted connection's
+/// terminal attach gets a clone of the root too
+/// (`docs/spec-session-start-directory.md`), so a freshly created tmux session's
+/// default directory is the project root, not `$HOME`.
 ///
 /// If a live daemon already owns `socket_path` this returns an error — the
 /// caller must attach via [`connect_relay`], not spawn. A stale socket left by a
@@ -1428,6 +1453,10 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
     };
 
     let (mut daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
+    // Retained across the accept loop's lifetime so each accepted connection can
+    // clone it for its own terminal attach; `watch_worktree` / `watch_lsp`
+    // consume the original.
+    let connection_root = worktree_root.clone();
     if let Some(root) = worktree_root {
         daemon.watch_worktree(root.clone());
         daemon.watch_lsp(root, DocumentSelector::builtin());
@@ -1460,9 +1489,19 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
         let events = handles.subscribe();
         let state = handles.state.clone();
         let nav_requests = nav_requests.clone();
+        let root = connection_root.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                serve_connection(reader, writer, inbound, events, state, nav_requests, None).await
+            if let Err(e) = serve_connection(
+                reader,
+                writer,
+                inbound,
+                events,
+                state,
+                nav_requests,
+                None,
+                root,
+            )
+            .await
             {
                 // The active sink (stderr or the rotated file) is the daemon's
                 // log; one failed connection must not stop the daemon.
@@ -1925,6 +1964,7 @@ mod tests {
                 state,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -1986,6 +2026,7 @@ mod tests {
                     state,
                     None,
                     None,
+                    None,
                 )
                 .await
             }
@@ -2020,6 +2061,7 @@ mod tests {
                     inbound,
                     events,
                     state,
+                    None,
                     None,
                     None,
                 )
@@ -2464,6 +2506,7 @@ mod tests {
                 state,
                 None,
                 None,
+                None,
             )
             .await;
         });
@@ -2511,6 +2554,7 @@ mod tests {
                 inbound,
                 events,
                 state,
+                None,
                 None,
                 None,
             )
@@ -2601,6 +2645,7 @@ mod tests {
                 inbound,
                 events,
                 state,
+                None,
                 None,
                 None,
             )
@@ -2700,6 +2745,7 @@ mod tests {
             in_rx,
             out_tx,
             Some(server.0.clone()),
+            None,
         ));
 
         in_tx
@@ -2752,6 +2798,7 @@ mod tests {
                 state,
                 None,
                 Some(tmux_name),
+                None,
             )
             .await
         });
@@ -3592,6 +3639,7 @@ mod tests {
                     state,
                     Some(nav),
                     None,
+                    None,
                 )
                 .await
             })
@@ -3615,6 +3663,7 @@ mod tests {
                     events,
                     state,
                     Some(nav),
+                    None,
                     None,
                 )
                 .await
@@ -3720,6 +3769,7 @@ mod tests {
                     state,
                     Some(nav_tx),
                     None,
+                    None,
                 )
                 .await
             })
@@ -3799,6 +3849,7 @@ mod tests {
                     state,
                     Some(nav),
                     None,
+                    None,
                 )
                 .await
             })
@@ -3822,6 +3873,7 @@ mod tests {
                     events,
                     state,
                     Some(nav),
+                    None,
                     None,
                 )
                 .await
