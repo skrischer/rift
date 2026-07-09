@@ -253,6 +253,49 @@ fn spawn_args(session: &str, server_socket: Option<&str>, root: Option<&Path>) -
     args
 }
 
+/// Build the control-mode command that re-roots the just-attached session to
+/// `root` (`docs/spec-session-start-directory.md`). `-c` on `new-session -A`
+/// only takes effect when the session is *created*; a session that already
+/// existed (created outside rift in `$HOME`, or persisted from before this
+/// change) keeps its stale default directory unless re-rooted separately. In
+/// Phase 34 the daemon has exactly one root, so sending this unconditionally on
+/// every attach is idempotent: a no-op for a freshly created session (already
+/// at `root`), a fix for a pre-existing one.
+///
+/// Validated against a real tmux 3.4 server (see the spec's decision log):
+/// `attach-session -c <root>`, sent with **no `-t`**, over the control-mode
+/// connection that is already attached to the target session, sets that
+/// session's `session_path` (the default directory `new-window`/
+/// `split-window` inherit) to `root` — omitting `-t` targets the issuing
+/// client's own current session, so the session name never has to be embedded
+/// (and quoted) in the command line at all. Re-sending it for a session
+/// already at `root` is harmless: tmux applies the same value and the
+/// resulting `%session-changed` for this attach's own (unchanged) session id
+/// is a no-op (see `Event::SessionChanged`'s `switched` check).
+///
+/// Unlike `spawn_args`, this string is not process argv — it is parsed by
+/// tmux's own control-mode command lexer (a shell-like grammar), so `root` is
+/// quoted with [`quote_tmux_arg`]: an unquoted space would otherwise split it
+/// into two tokens (confirmed against real tmux: unquoted, a rooted path
+/// containing a space fails with tmux's `%error … too many arguments`).
+fn reroot_command(root: &Path) -> String {
+    format!(
+        "attach-session -c {}",
+        quote_tmux_arg(&root.to_string_lossy())
+    )
+}
+
+/// Wrap `value` as a single literal tmux control-mode command-line argument:
+/// wrapping in `'...'` and escaping an embedded `'` as `'\''` makes tmux's
+/// lexer treat `value` as exactly one token regardless of whitespace or
+/// metacharacters. Mirrors `crates/terminal/src/tmux_quote.rs::quote_tmux_arg`;
+/// duplicated rather than shared because the daemon and `terminal` crates
+/// stay independent (`docs/constitution.md` crate-boundary rule) and this is
+/// the daemon's only tmux command line that embeds a dynamic, unbounded value.
+fn quote_tmux_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// One client's live tmux control-mode attach.
 struct Attach {
     session: String,
@@ -348,6 +391,14 @@ impl Attach {
         attach
             .send_command(&format!("refresh-client -f pause-after={PAUSE_AFTER_SECS}"))
             .await?;
+        // Re-root a pre-existing session whose default directory predates this
+        // attach (`docs/spec-session-start-directory.md`); a no-op when the
+        // session was just created with `-c root` above. Best-effort: a reply
+        // arrives as an unmatched CommandReply and is silently dropped, same
+        // as any other ack (see `process`'s CommandReply arm).
+        if let Some(root) = root {
+            attach.send_command(&reroot_command(root)).await?;
+        }
         // The task loop already reads stdout (we are subscribed), so any change
         // after this query lands as a live LayoutUpdate — no gap; the snapshot is
         // the current state, updates replace wholesale, so no duplicate either.
@@ -921,6 +972,41 @@ mod tests {
                 "/proj"
             ]
         );
+    }
+
+    #[test]
+    fn test_reroot_command_wraps_root_in_attach_session_c_with_no_target() {
+        let command = reroot_command(Path::new("/home/dev/proj"));
+        assert_eq!(command, "attach-session -c '/home/dev/proj'");
+        // No `-t <session>`: the command targets the issuing client's own
+        // current session (validated against real tmux), so a session name
+        // never needs to be embedded (and quoted) here.
+        assert!(!command.contains("-t"));
+    }
+
+    #[test]
+    fn test_reroot_command_quotes_a_root_containing_a_space() {
+        // Unquoted, real tmux rejects this with `%error … too many
+        // arguments` (validated) because its command lexer splits on
+        // whitespace; the quoting keeps the whole path one argument.
+        let command = reroot_command(Path::new("/tmp/rift reroot project"));
+        assert_eq!(command, "attach-session -c '/tmp/rift reroot project'");
+    }
+
+    #[test]
+    fn test_reroot_command_escapes_an_embedded_single_quote() {
+        let command = reroot_command(Path::new("/tmp/rift's project"));
+        assert_eq!(command, "attach-session -c '/tmp/rift'\\''s project'");
+    }
+
+    #[test]
+    fn test_quote_tmux_arg_plain_wraps_in_single_quotes() {
+        assert_eq!(quote_tmux_arg("proj"), "'proj'");
+    }
+
+    #[test]
+    fn test_quote_tmux_arg_with_single_quote_is_escaped() {
+        assert_eq!(quote_tmux_arg("it's"), "'it'\\''s'");
     }
 
     #[test]
