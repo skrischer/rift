@@ -9,6 +9,11 @@ handshake no longer need a session name up front, a picker (reusing the phase-32
 session surface) sits between connect and cockpit, and the hardcoded `"rift"`
 default on the connect card is retired.
 
+> Visual contract: the **"rift — Session management" Paper artboard** (Paper file
+> `rift`), **Frame B** — the pre-cockpit post-connect picker (session rows: name +
+> "N windows" + attached marker, "+ New session…" footer) with its populated and
+> zero-session states, styled after the "Connection — Startup" artboard.
+
 ## Outcome
 
 - [ ] Connecting to a host no longer requires a session name up front: the

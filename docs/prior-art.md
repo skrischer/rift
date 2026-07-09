@@ -586,6 +586,32 @@ distinct step between connect and cockpit or an optional-session connect card
 that lands on the picker when the field is left blank, and how a killed / renamed
 session racing the picker is reconciled.
 
+## Session ↔ project root coupling — prior-art index (Phases 34–35)
+
+Per-phase prior-art for the session↔project-root block ([roadmap.md](roadmap.md)),
+same shape as the indexes above. Research mode: websearch (2026-07-09) — the
+session-scoped root-storage mechanism and the "one server, many per-context stores"
+daemon shape were topped up with focused lookups; the tmux control-mode plumbing
+resolves against Category 3 already catalogued. All licenses GPL-3.0-compatible.
+
+| Phase | Concern | Reference (repo + path) | License | Verdict |
+|---|---|---|---|---|
+| 34 | Start-directory for new panes / windows / sessions | tmux `new-session -c` / `new-window -c` / `split-window -c` and `attach-session -c` to (re)set a session's default working dir — new windows / panes inherit it ([tmux Advanced-Use wiki](https://github.com/tmux/tmux/wiki/Advanced-Use)); `#{pane_current_path}` inherit-cwd binding pattern ([DJ Adams](https://qmacro.org/blog/posts/2021/04/01/new-tmux-panes-and-windows-in-the-right-directory/)); `workmux` pane `-c` config (Category 3 #4) | ISC / MIT | **reuse** — tmux-native `-c`; AVOID `default-path` (removed in tmux 1.9 → `-c`). Thread the existing single root into `terminal.rs:275` / `session_view.rs:203/2097/2185`; the only site passing `-c` today is the explorer reveal path |
+| 34/35 | "session = project" naming + create-with-dir convention | `joshmedeski/sesh` (folder basename → session name, git-worktree aware); `ThePrimeagen/tmux-sessionizer` + `jrmoulton/tmux-sessionizer` (git repo → session, created in its dir); `tmuxinator` / `smug` (declarative project `root:`) | MIT | **reference (pattern only)** — adopt the session-name = project-dir convention; NOT a dependency — rift is a control-mode client that attaches / creates via `new-session -A` itself, not an external session-spawner CLI |
+| 35 | Session-scoped root storage (the coupling) | tmux **session user option** `@root`: `set -t <session> @root <path>`, query `display -p -t <session> '#{@root}'` — session-scoped, does not pollute the shell env ([tmux Advanced-Use wiki](https://github.com/tmux/tmux/wiki/Advanced-Use)); the session default working dir as a fallback signal; session **environment** (`set-environment -t`) as the rejected alternative | ISC | **reuse** — the `@root` user option is the clean, native, session-scoped coupling; no external project registry needed (tmux holds it). AVOID session-environment (leaks into child shells) and relying on a durable session-start-dir format var (tmux exposes per-pane `#{pane_current_path}`, not a stable session path) |
+| 35 | One server holding N project-root contexts + per-context LSP / git (the per-session daemon shape) | `zed` `HeadlessProject` → `WorktreeStore` holds **multiple** `Worktree` entities at once; `LspStore` / `GitStore` share that store and operate per-worktree ([Project & Worktrees, DeepWiki](https://deepwiki.com/zed-industries/zed/5.1-project-and-worktrees); Category 8 #1); rift's own single-root chokepoint (`crates/daemon/src/lib.rs` — workers spawned once at serve start) + the Phase-3.5 bind-at-spawn / shared-socket decision ([archive/spec-daemon-project-root.md](archive/spec-daemon-project-root.md)) | GPL-3.0 | **reference** — the target shape: the one shared daemon holds a session-keyed map of watched contexts (not a single global root re-scanned on switch), so two app instances attaching different sessions to the one daemon each get their own tree / git / LSP. Rejected: per-project daemon / socket (breaks the reattachable-single-daemon contract, #62 / dogfooding-channels) |
+| 35 | Which session → which root, across restarts + the connect flow | `zed` workspace persistence — root paths serialized per workspace in SQLite, `recent_project_workspaces` for the recents list ([Workspace Persistence, DeepWiki](https://deepwiki.com/zed-industries/zed/3.4-workspace-persistence)); rift's own recents / window-state store (phase 9) | GPL-3.0 | **reference / reuse own pattern** — the durable per-session root lives in tmux `@root`; the app keeps only a lightweight recents mapping (session → last-used root) for the connect / pick flow, reusing the phase-9 store — no bespoke external project-file format (Zed-style workspace files) |
+
+Open design decisions deferred to each phase's `/loopkit:plan` spec (never a
+roadmap guess): phase 34 — session default dir (set once, inherited) vs per-call
+`-c`, and whether a pre-existing `$HOME`-rooted session is re-rooted on attach;
+phase 35 — the durable store (`@root` vs session dir vs app recents; recommendation
+`@root`, written + read in one phase) and the daemon context depth (active-only
+re-scan vs concurrent per-session contexts; recommendation concurrent, the only
+shape correct under two instances sharing one daemon). No root-switch hook is
+pre-baked into the in-flight phase-32/33 work — the `SessionSwitchRequest → Attach`
+seam is already the extension point.
+
 ## Priority reference projects (top 10)
 
 1. **penso/arbor** — Closest existing implementation of rift's exact concept (Rust + GPUI + daemon + SSH outposts + agent state). Read end-to-end before writing any architecture docs.

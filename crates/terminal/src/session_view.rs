@@ -6,6 +6,7 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::{h_flex, v_flex, ActiveTheme, Icon, IconName, Sizable};
 use termy_terminal_ui::TmuxSnapshot;
@@ -14,6 +15,7 @@ use tracing::debug;
 use crate::keytable::{self, KeyTable, PrefixOptions};
 use crate::layout::{self, LayoutNode};
 use crate::pane_view::{measure_cell_size, PaneActivity, PaneView};
+use crate::quote_tmux_arg;
 use crate::{
     CaptureRequest, CaptureResult, ConnectionStatus, KeyTableQueryResult, PaneInput, PaneOutput,
     SelectWindow, SessionListItem, SessionSwitchRequest, SubscriptionUpdate, TermSize,
@@ -164,6 +166,23 @@ struct NewSessionPrompt {
     _subscription: Subscription,
 }
 
+/// An in-progress inline session rename in the title-bar strip (#684,
+/// `docs/spec-session-management.md`), dispatched from a chip's right-click
+/// menu (see [`SessionView::render_session_strip`]). Mirrors [`WindowRename`]:
+/// `session_id` is tmux's rename-stable session id (`SessionListItem::id`,
+/// targeted as `$<id>`), `original_name` lets an unchanged submit no-op, and
+/// `input`/`_subscription` hold the edit state and keep the submit handler
+/// alive while the rename is active. The rename only emits `rename-session`;
+/// the new name arrives via the next `SessionListReply` (and, for the
+/// attached session, the `%session-renamed`-driven layout snapshot), never an
+/// optimistic local mutation.
+struct SessionRename {
+    session_id: u32,
+    original_name: String,
+    input: Entity<InputState>,
+    _subscription: Subscription,
+}
+
 /// An in-progress border drag. `start` is the mouse position along the drag
 /// axis at mouse-down; `emitted_cells` is the whole-cell offset already sent to
 /// tmux, so each move only emits the incremental `resize-pane`.
@@ -179,6 +198,18 @@ struct BorderDrag {
 /// in single quotes, with any embedded single quote escaped as `'\''`.
 fn quote_tmux_name(name: &str) -> String {
     format!("'{}'", name.replace('\'', "'\\''"))
+}
+
+/// tmux `rename-session -t $<id> -- <name>` command for a session chip's
+/// inline rename (#684, `docs/spec-session-management.md`). `id` targets
+/// tmux's rename-stable session id (`SessionListItem::id`), never the
+/// (possibly stale) name, so a concurrent external rename cannot race the
+/// target; `new_name` is passed through [`quote_tmux_arg`] after `--`
+/// (end-of-options), so an untrusted name containing whitespace or tmux
+/// lexer metacharacters can never break the argument boundary or inject a
+/// second command.
+fn rename_session_command(id: u32, new_name: &str) -> String {
+    format!("rename-session -t ${id} -- {}", quote_tmux_arg(new_name))
 }
 
 /// tmux `resize-pane` direction flag for a cell delta. Positive grows the
@@ -426,6 +457,10 @@ pub struct SessionView {
     /// The strip's in-progress inline new-session prompt (trailing "+ New
     /// session..." chip), when active.
     new_session_prompt: Option<NewSessionPrompt>,
+    /// The strip's in-progress inline session rename (#684), dispatched from
+    /// a chip's right-click menu; when active, that chip renders the edit
+    /// input in place of its name.
+    renaming_session: Option<SessionRename>,
     /// Requests an on-demand session-list refresh (forwarded to
     /// `TerminalHandle`'s `session_list_request_rx`); between requests the
     /// daemon's churn-driven pushes keep the strip live.
@@ -656,6 +691,7 @@ impl SessionView {
             key_table_request_tx,
             sessions: Vec::new(),
             new_session_prompt: None,
+            renaming_session: None,
             session_list_request_tx,
             session_switch_tx,
             reconnect_cancel_tx,
@@ -1299,6 +1335,77 @@ impl SessionView {
         }
     }
 
+    /// Begin an inline rename of the session chip `id` (current name
+    /// `current_name`), dispatched by the chip's right-click menu (#684,
+    /// `docs/spec-session-management.md`): seed a text input with the
+    /// current name, focus it, and subscribe for submit/blur — mirrors
+    /// [`Self::start_window_rename`]. Enter commits (see
+    /// [`Self::submit_session_rename`]); Escape/blur cancels. The strip
+    /// remains the source of truth for the resulting name (via the next
+    /// `SessionListReply`), never an optimistic local mutation.
+    fn start_session_rename(
+        &mut self,
+        id: u32,
+        current_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(current_name.clone()));
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            move |this, _input, event: &InputEvent, _window, cx| match event {
+                InputEvent::PressEnter { .. } => this.submit_session_rename(cx),
+                InputEvent::Blur => this.cancel_session_rename(cx),
+                _ => {}
+            },
+        );
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.renaming_session = Some(SessionRename {
+            session_id: id,
+            original_name: current_name,
+            input,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    /// Commit the in-progress session rename (Enter): an empty trimmed name,
+    /// or one unchanged from the original, is a no-op (the spec's "empty or
+    /// unchanged name is a no-op"); otherwise sends the quoted
+    /// `rename-session` over the existing raw tmux-command seam
+    /// (`tmux_command_tx`, the same channel the pane-header split/zoom/
+    /// select-pane controls use). A second submit after the rename already
+    /// committed (or was cancelled) must not re-submit.
+    fn submit_session_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(rename) = self.renaming_session.take() else {
+            return;
+        };
+        let value = rename.input.read(cx).value();
+        let trimmed = value.trim();
+        if !trimmed.is_empty() && trimmed != rename.original_name {
+            if let Err(e) = self
+                .tmux_command_tx
+                .try_send(rename_session_command(rename.session_id, trimmed))
+            {
+                debug!(error = %e, "failed to send session rename command");
+            }
+        }
+        // The inline input unmounts now; return keyboard focus to the pane
+        // (mirrors window rename) so the terminal is not left keyboard-dead.
+        self.needs_focus = true;
+        cx.notify();
+    }
+
+    /// Cancel an in-progress session rename without emitting a command.
+    fn cancel_session_rename(&mut self, cx: &mut Context<Self>) {
+        if self.renaming_session.is_some() {
+            self.renaming_session = None;
+            self.needs_focus = true;
+            cx.notify();
+        }
+    }
+
     fn render_layout(
         &self,
         node: &LayoutNode,
@@ -1415,9 +1522,13 @@ impl SessionView {
     /// background — the same tokens the popover's current row used. A
     /// trailing "+ New session..." chip reuses the popover's own inline-prompt
     /// flow ([`Self::start_new_session_prompt`]/[`Self::submit_new_session_prompt`]).
-    /// All colors are theme tokens. Deliberately not built here: a per-chip
-    /// hover/right-click menu (rename/kill, #684/#685) and drag-reorder
-    /// (#686) — this render is the clean seam those attach to, no more.
+    /// All colors are theme tokens. A per-chip right-click menu
+    /// ([`gpui_component::menu::ContextMenuExt`], the same widget the
+    /// explorer row/editor context menus already ship with) holds "Rename",
+    /// which opens the inline edit below (#684); it is the seam #685 adds
+    /// "Kill" to next (a second `.item(...)` in the same builder closure).
+    /// Deliberately not built here: drag-reorder (#686) — this render is
+    /// the clean seam that attaches to, no more.
     pub fn render_session_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
         let current = self.session_name.clone();
@@ -1451,12 +1562,41 @@ impl SessionView {
             .text_size(px(13.0))
             .font_family("JetBrainsMono Nerd Font Mono");
 
+        // A right-click menu targets a real tmux session id; the synthesized
+        // fallback row (`id: 0` above) is display-only and must stay inert,
+        // so the menu is only attached once the host list has actually
+        // loaded.
+        let has_real_sessions = !self.sessions.is_empty();
+
         for row in &rows {
             let is_current = row.name.as_str() == current.as_ref();
             let name = row.name.clone();
             let row_entity = entity.clone();
-            strip = strip.child(
+
+            let renaming_input = self
+                .renaming_session
+                .as_ref()
+                .filter(|rename| rename.session_id == row.id)
+                .map(|rename| rename.input.clone());
+
+            let chip = if let Some(input) = renaming_input {
+                let cancel_entity = entity.clone();
                 h_flex()
+                    .items_center()
+                    .h(px(SESSION_CHIP_HEIGHT))
+                    .px(px(6.0))
+                    .on_key_down(move |event: &KeyDownEvent, _window, cx| {
+                        if event.keystroke.key.as_str() == "escape" {
+                            cancel_entity.update(cx, |view, cx| {
+                                view.cancel_session_rename(cx);
+                            });
+                            cx.stop_propagation();
+                        }
+                    })
+                    .child(Input::new(&input).xsmall())
+                    .into_any_element()
+            } else {
+                let base = h_flex()
                     .items_center()
                     .gap(px(6.0))
                     .h(px(SESSION_CHIP_HEIGHT))
@@ -1489,8 +1629,35 @@ impl SessionView {
                     .children(
                         row.attached
                             .then(|| div().size(px(6.0)).rounded_full().bg(attached_dot)),
-                    ),
-            );
+                    );
+
+                if has_real_sessions {
+                    let menu_entity = entity.clone();
+                    let session_id = row.id;
+                    let session_name = row.name.clone();
+                    base.context_menu(move |menu, _window, _cx| {
+                        let menu_entity = menu_entity.clone();
+                        let session_name = session_name.clone();
+                        menu.item(PopupMenuItem::new("Rename").on_click(
+                            move |_event, window, cx| {
+                                menu_entity.update(cx, |view, cx| {
+                                    view.start_session_rename(
+                                        session_id,
+                                        session_name.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            },
+                        ))
+                    })
+                    .into_any_element()
+                } else {
+                    base.into_any_element()
+                }
+            };
+
+            strip = strip.child(chip);
         }
 
         let new_session = match &prompt_input {
@@ -1780,7 +1947,11 @@ impl Render for SessionView {
         // Skip pane auto-focus while an inline rename or the switcher's
         // new-session prompt owns focus, so a snapshot arriving mid-edit does
         // not steal the keystroke stream from the input.
-        if self.needs_focus && self.renaming_window.is_none() && self.new_session_prompt.is_none() {
+        if self.needs_focus
+            && self.renaming_window.is_none()
+            && self.new_session_prompt.is_none()
+            && self.renaming_session.is_none()
+        {
             let entity_to_focus = self
                 .active_pane_id
                 .as_ref()
@@ -2209,10 +2380,10 @@ impl Render for SessionView {
 mod tests {
     use super::{
         aggregate_activity, grid_size_for, home_relative, max_vertical_pane_count,
-        new_window_at_command, quote_tmux_name, reconnect_banner_message, resize_direction,
-        select_pane_command, split_command, tab_state_slot, zoom_pane_command, PaneActivity,
-        SessionListItem, SessionSnapshot, SessionView, TabStateSlot, TermSize, TerminalHandle,
-        DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE,
+        new_window_at_command, quote_tmux_name, reconnect_banner_message, rename_session_command,
+        resize_direction, select_pane_command, split_command, tab_state_slot, zoom_pane_command,
+        PaneActivity, SessionListItem, SessionSnapshot, SessionView, TabStateSlot, TermSize,
+        TerminalHandle, DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE,
     };
     use crate::layout::LayoutNode;
     use gpui::{
@@ -2405,6 +2576,30 @@ mod tests {
         assert_eq!(
             new_window_at_command("/proj/src"),
             "new-window -c '/proj/src'"
+        );
+    }
+
+    #[test]
+    fn test_rename_session_command_plain_name_targets_dollar_id() {
+        assert_eq!(
+            rename_session_command(2, "build"),
+            "rename-session -t $2 -- 'build'"
+        );
+    }
+
+    #[test]
+    fn test_rename_session_command_quotes_a_name_with_a_space() {
+        assert_eq!(
+            rename_session_command(0, "my session"),
+            "rename-session -t $0 -- 'my session'"
+        );
+    }
+
+    #[test]
+    fn test_rename_session_command_quotes_a_name_with_a_single_quote() {
+        assert_eq!(
+            rename_session_command(5, "it's"),
+            "rename-session -t $5 -- 'it'\\''s'"
         );
     }
 
@@ -3002,6 +3197,125 @@ mod tests {
                 .try_recv()
                 .expect("duplicate of a non-attached session is a plain switch");
             assert_eq!(request.session, "agent");
+        })
+        .unwrap();
+    }
+
+    /// The chip's right-click "Rename" (#684) commits a changed, non-empty
+    /// name as one quoted `rename-session` on the raw tmux-command seam —
+    /// the same channel the pane-header split/zoom/select-pane controls use
+    /// — targeted by the tmux session id, not the name; a name with a space
+    /// survives the quoting helper. A second submit after the commit must
+    /// not re-send (mirrors issue #467's new-session-prompt guard).
+    #[gpui::test]
+    fn test_submit_session_rename_changed_name_sends_one_quoted_command(cx: &mut TestAppContext) {
+        let (window, session, handle) = windowed_session_and_handle(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            session.update(cx, |view, cx| {
+                view.apply_session_list(
+                    vec![SessionListItem {
+                        id: 3,
+                        name: "rift".into(),
+                        windows: 1,
+                        attached: false,
+                    }],
+                    cx,
+                );
+                view.start_session_rename(3, "rift".to_string(), window, cx);
+            });
+            let input = session
+                .read(cx)
+                .renaming_session
+                .as_ref()
+                .expect("rename active")
+                .input
+                .clone();
+            input.update(cx, |state, cx| state.set_value("my agent", window, cx));
+
+            session.update(cx, |view, cx| view.submit_session_rename(cx));
+
+            assert_eq!(
+                handle.tmux_command_rx.try_recv().expect("command sent"),
+                "rename-session -t $3 -- 'my agent'"
+            );
+            assert!(
+                session.read(cx).renaming_session.is_none(),
+                "rename cleared after commit"
+            );
+
+            session.update(cx, |view, cx| view.submit_session_rename(cx));
+            assert!(
+                handle.tmux_command_rx.try_recv().is_err(),
+                "a second submit after the commit sends nothing"
+            );
+        })
+        .unwrap();
+    }
+
+    /// An empty (or whitespace-only) or unchanged name is a no-op (the
+    /// spec's "empty or unchanged name is a no-op"): nothing is sent and the
+    /// rename clears.
+    #[gpui::test]
+    fn test_submit_session_rename_empty_or_unchanged_name_sends_nothing(cx: &mut TestAppContext) {
+        let (window, session, handle) = windowed_session_and_handle(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            session.update(cx, |view, cx| {
+                view.start_session_rename(1, "rift".to_string(), window, cx);
+            });
+            session.update(cx, |view, cx| view.submit_session_rename(cx));
+            assert!(
+                handle.tmux_command_rx.try_recv().is_err(),
+                "an unchanged name sends nothing"
+            );
+
+            session.update(cx, |view, cx| {
+                view.start_session_rename(1, "rift".to_string(), window, cx);
+            });
+            let input = session
+                .read(cx)
+                .renaming_session
+                .as_ref()
+                .expect("rename active")
+                .input
+                .clone();
+            input.update(cx, |state, cx| state.set_value("   ", window, cx));
+            session.update(cx, |view, cx| view.submit_session_rename(cx));
+            assert!(
+                handle.tmux_command_rx.try_recv().is_err(),
+                "a whitespace-only name sends nothing"
+            );
+            assert!(
+                session.read(cx).renaming_session.is_none(),
+                "rename cleared either way"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Escape/blur cancels an in-progress session rename without sending a
+    /// command.
+    #[gpui::test]
+    fn test_cancel_session_rename_sends_nothing(cx: &mut TestAppContext) {
+        let (window, session, handle) = windowed_session_and_handle(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            session.update(cx, |view, cx| {
+                view.start_session_rename(1, "rift".to_string(), window, cx);
+            });
+            assert!(session.read(cx).renaming_session.is_some());
+
+            session.update(cx, |view, cx| view.cancel_session_rename(cx));
+
+            assert!(
+                session.read(cx).renaming_session.is_none(),
+                "cancel clears the in-progress rename"
+            );
+            assert!(
+                handle.tmux_command_rx.try_recv().is_err(),
+                "cancel sends no command"
+            );
         })
         .unwrap();
     }
