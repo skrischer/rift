@@ -15,8 +15,14 @@
 //!
 //! Bounded to **navigate + open + decorate**, plus inline rename (artboard
 //! **State C**, `docs/spec-explorer-file-ops.md`, #675), the context-menu
-//! write group (artboard **State D**, #676), and drag & drop move (#677):
-//! selecting a file emits [`FileTreeEvent::OpenFile`] carrying its
+//! write group (artboard **State D**, #676), drag & drop move (#677), and an
+//! in-panel fuzzy filter bar (artboard **State B**,
+//! `docs/spec-explorer-search.md`, #679): toggling the header's search
+//! control reveals a `gpui-component` `Input` in the header→tree seam;
+//! typing narrows [`FileTree::visible_rows`] to matching files plus their
+//! force-expanded ancestor directories, over the [`crate::fuzzy_match`]
+//! substrate, without ever touching the real `collapsed` set. Selecting a
+//! file emits [`FileTreeEvent::OpenFile`] carrying its
 //! root-relative path — the clean signal the editor surface (#187)
 //! subscribes to. Rows carry git status and diagnostic severity from the
 //! model, rolled up onto ancestor directories (`compute_rollup`, #329) so a
@@ -62,7 +68,7 @@ use gpui_component::input::{
 };
 use gpui_component::menu::{ContextMenuExt as _, PopupMenu};
 use gpui_component::{
-    h_flex, v_virtual_list, ActiveTheme as _, Icon, IconName, Sizable as _,
+    h_flex, v_virtual_list, ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _,
     VirtualListScrollHandle, WindowExt as _,
 };
 use rift_protocol::{
@@ -70,6 +76,7 @@ use rift_protocol::{
 };
 
 use crate::file_icons::{self, Glyph};
+use crate::fuzzy_match::fuzzy_match;
 use crate::worktree::WorktreeModel;
 
 /// Stable, distinct dock-panel identity for the file tree (`Panel::panel_name`).
@@ -342,6 +349,14 @@ struct Row {
     /// from the model. [`FileTree::render_row`] checks this to swap in
     /// [`FileTree::render_create_row`].
     is_pending_create: bool,
+    /// The matched character positions from the active filter query
+    /// (`docs/spec-explorer-search.md`, Phase 31), re-based onto this row's
+    /// own displayed leaf name ([`leaf_matched_indices`]) — empty with no
+    /// active filter, and always empty on a directory row (an ancestor of a
+    /// match renders unemphasized; only a matched file carries indices).
+    /// [`FileTree::render_row`] splits the name on these for the State B
+    /// match-emphasis highlight.
+    matched_indices: Vec<usize>,
 }
 
 /// A directory's or file's rolled-up git status, ordered by the roll-up's
@@ -541,6 +556,63 @@ fn compute_rollup(model: &WorktreeModel) -> HashMap<String, Rollup> {
 /// yields `["a", "a/b"]`; a top-level path (no separator) yields none.
 fn ancestor_dirs(path: &str) -> impl Iterator<Item = &str> {
     path.match_indices('/').map(|(i, _)| &path[..i])
+}
+
+/// Re-base `matched_indices` — [`fuzzy_match`]'s **character** positions into
+/// the whole `path` it matched against — onto `path`'s own displayed leaf
+/// name ([`FileTree::display_name`]), for [`FileTree::render_row`]'s
+/// emphasis span-splitting (`docs/spec-explorer-search.md`, Phase 31).
+///
+/// The filter bar matches a file's full root-relative path (so a query can
+/// reach into an ancestor segment, e.g. `"app main"` matching
+/// `crates/app/src/main.rs`), but a row only ever displays its own leaf
+/// segment — ancestor segments render on separate ancestor rows, with no
+/// emphasis of their own (the artboard's State B). An index landing before
+/// the leaf's start (matched inside an ancestor segment this row does not
+/// itself render) is dropped rather than mis-rendered; every other index is
+/// shifted left by the leaf's start so it indexes correctly into the leaf
+/// alone.
+fn leaf_matched_indices(path: &str, matched_indices: &[usize]) -> Vec<usize> {
+    let leaf_start = path
+        .rfind('/')
+        .map_or(0, |byte_index| path[..=byte_index].chars().count());
+    matched_indices
+        .iter()
+        .copied()
+        .filter(|&index| index >= leaf_start)
+        .map(|index| index - leaf_start)
+        .collect()
+}
+
+/// Split `name`'s characters into consecutive `(text, matched)` runs from
+/// `matched_indices` (ascending, [`leaf_matched_indices`]-rebased character
+/// positions) — [`FileTree::render_row`]'s span-splitting for the State B
+/// match-emphasis highlight, mirroring `results_panel.rs`'s
+/// `highlight_segments`. An empty `matched_indices` (no active filter, or an
+/// ancestor-of-a-match directory row) returns `name` as a single unmatched
+/// span.
+fn emphasis_segments(name: &str, matched_indices: &[usize]) -> Vec<(String, bool)> {
+    if matched_indices.is_empty() {
+        return vec![(name.to_owned(), false)];
+    }
+
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut current_matched = false;
+    for (index, ch) in name.chars().enumerate() {
+        let matched = matched_indices.contains(&index);
+        if current.is_empty() {
+            current_matched = matched;
+        } else if matched != current_matched {
+            segments.push((std::mem::take(&mut current), current_matched));
+            current_matched = matched;
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        segments.push((current, current_matched));
+    }
+    segments
 }
 
 /// Join a worktree root with a root-relative path into an absolute path —
@@ -797,6 +869,7 @@ fn insert_create_row(rows: &mut Vec<Row>, create: &CreateEditor) {
             git_status: None,
             severity: None,
             is_pending_create: true,
+            matched_indices: Vec::new(),
         },
     );
 }
@@ -898,6 +971,28 @@ pub struct FileTree {
     /// field only drives the follow-up selection once the model already has
     /// the row.
     pending_reveal: Option<String>,
+    /// Whether the in-panel filter bar (artboard **State B**,
+    /// `docs/spec-explorer-search.md`, #679) is open — `render()` mounts
+    /// [`FileTree::render_filter_bar`] in the header→tree seam only while
+    /// this is `true`. Toggled by the header's search/filter action button;
+    /// `Esc` (and toggling the button off) closes it via
+    /// [`FileTree::close_filter`].
+    filter_active: bool,
+    /// The active filter query, mirrored from `filter_input`'s value on
+    /// every `InputEvent::Change` — kept as plain state (rather than reading
+    /// `filter_input` at derivation time) so [`FileTree::visible_rows`] stays
+    /// a pure `&self` derivation with no `cx` dependency, matching every
+    /// other seam in this file. Empty is "no filter" — [`FileTree::visible_rows`]
+    /// falls back to the plain collapse-aware pass unchanged.
+    filter_query: String,
+    /// The filter bar's `gpui-component` `InputState`, `Some` only while
+    /// `filter_active` — reused verbatim (`connection_screen.rs`/`editor.rs`),
+    /// never forked, mirroring [`RenameEditor::input`] / [`CreateEditor::input`].
+    filter_input: Option<Entity<InputState>>,
+    /// Keeps the filter input's `InputEvent::Change` subscription alive for
+    /// as long as `filter_input` is `Some`; dropped (replaced by `None`)
+    /// alongside it, mirroring `_rename_input_sub`.
+    _filter_input_sub: Option<Subscription>,
 }
 
 impl FileTree {
@@ -917,6 +1012,10 @@ impl FileTree {
             create: None,
             _create_input_sub: None,
             pending_reveal: None,
+            filter_active: false,
+            filter_query: String::new(),
+            filter_input: None,
+            _filter_input_sub: None,
         }
     }
 
@@ -1033,6 +1132,70 @@ impl FileTree {
         } else {
             self.collapse_all();
         }
+    }
+
+    /// Toggle the in-panel filter bar (artboard **State B**,
+    /// `docs/spec-explorer-search.md`, #679) — the header's search/filter
+    /// action button's click handler.
+    fn toggle_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.filter_active {
+            self.close_filter(cx);
+        } else {
+            self.open_filter(window, cx);
+        }
+    }
+
+    /// Open the filter bar: seeds a fresh, blank `gpui-component` `InputState`
+    /// — reused verbatim, never forked — and focuses it on the next frame
+    /// (mirrors [`FileTree::open_rename_editor`]'s focus mechanics, minus the
+    /// select-all: a filter starts blank, there is nothing to select). A
+    /// no-op while already open.
+    fn open_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.filter_active {
+            return;
+        }
+
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files..."));
+        let sub = cx.subscribe_in(
+            &input,
+            window,
+            |this, input, event: &InputEvent, _window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.filter_query = input.read(cx).value().trim().to_owned();
+                    this.cache_dirty = true;
+                    cx.notify();
+                }
+            },
+        );
+
+        let focus_target = input.clone();
+        window.on_next_frame(move |window, cx| {
+            focus_target.update(cx, |state, cx| state.focus(window, cx));
+        });
+
+        self.filter_active = true;
+        self.filter_input = Some(input);
+        self._filter_input_sub = Some(sub);
+        self.cache_dirty = true;
+        cx.notify();
+    }
+
+    /// Close the filter bar (`Esc`, or toggling the header control off):
+    /// clears the query and drops the input. `visible_rows` falls back to
+    /// the plain collapse-aware pass the moment `filter_query` is empty
+    /// again, so this restores the exact prior tree — the user's real
+    /// `collapsed` set was never touched by the filtered pass
+    /// (`docs/spec-explorer-search.md`). A no-op while already closed.
+    fn close_filter(&mut self, cx: &mut Context<Self>) {
+        if !self.filter_active {
+            return;
+        }
+        self.filter_active = false;
+        self.filter_query.clear();
+        self.filter_input = None;
+        self._filter_input_sub = None;
+        self.cache_dirty = true;
+        cx.notify();
     }
 
     /// The leaf (final non-empty path segment) of a root's absolute path —
@@ -1594,7 +1757,22 @@ impl FileTree {
     }
 
     /// Build the flattened, depth-annotated, decorated list of currently
-    /// *visible* rows from the model's flat path map.
+    /// *visible* rows from the model's flat path map: the plain
+    /// collapse-aware pass with no active filter query, or the filtered
+    /// narrowing pass (`docs/spec-explorer-search.md`, Phase 31) once one is
+    /// set — see [`FileTree::visible_rows_unfiltered`] /
+    /// [`FileTree::visible_rows_filtered`].
+    fn visible_rows(&self) -> Vec<Row> {
+        if self.filter_query.is_empty() {
+            self.visible_rows_unfiltered()
+        } else {
+            self.visible_rows_filtered(&self.filter_query)
+        }
+    }
+
+    /// The plain collapse-aware visible-row pass — unchanged by the filter
+    /// bar (`docs/spec-explorer-search.md`: "when no query is active the
+    /// derivation is exactly today's collapse-aware pass").
     ///
     /// The model keys entries by their root-relative path in a `BTreeMap`, so
     /// iteration is already lexicographically ordered — which, for slash-
@@ -1606,7 +1784,7 @@ impl FileTree {
     /// Decoration is looked up from [`compute_rollup`], which walks the whole
     /// model (not this collapse-filtered pass) — a collapsed directory's row
     /// still needs its hidden descendants' rolled-up status.
-    fn visible_rows(&self) -> Vec<Row> {
+    fn visible_rows_unfiltered(&self) -> Vec<Row> {
         let rollup = compute_rollup(&self.model);
         let mut rows = Vec::new();
         // The prefix (`dir/`) of the shallowest collapsed directory currently
@@ -1634,6 +1812,7 @@ impl FileTree {
                 git_status: decoration.git_status,
                 severity: decoration.severity,
                 is_pending_create: false,
+                matched_indices: Vec::new(),
             });
 
             if entry.kind == EntryKind::Dir && self.collapsed.contains(path) {
@@ -1643,6 +1822,61 @@ impl FileTree {
         }
 
         rows
+    }
+
+    /// The filtered visible-row pass (`docs/spec-explorer-search.md`, Phase
+    /// 31): matches every **file** in the full `entries()` set against
+    /// `query` via the fuzzy substrate ([`fuzzy_match`]), then walks the
+    /// model once more keeping only matched files and their ancestor
+    /// directories.
+    ///
+    /// This pass never reads `self.collapsed` at all, so a match's ancestors
+    /// are force-expanded by construction regardless of their real collapse
+    /// state, and the real `collapsed` set is neither read nor mutated —
+    /// clearing the query falls back to [`FileTree::visible_rows_unfiltered`],
+    /// which restores the exact prior tree
+    /// (`docs/spec-explorer-search.md`'s "force-expansion is scoped to the
+    /// filtered pass").
+    fn visible_rows_filtered(&self, query: &str) -> Vec<Row> {
+        let rollup = compute_rollup(&self.model);
+
+        // First pass: every ancestor directory of a matched file, so the
+        // second pass below (which walks the model in path order) knows
+        // whether to keep a directory row *before* it ever reaches that
+        // directory's own matching descendant.
+        let mut ancestors: HashSet<&str> = HashSet::new();
+        for (path, entry) in self.model.entries() {
+            if entry.kind == EntryKind::File && fuzzy_match(query, path).is_some() {
+                ancestors.extend(ancestor_dirs(path));
+            }
+        }
+
+        self.model
+            .entries()
+            .iter()
+            .filter_map(|(path, entry)| {
+                let matched_indices = match entry.kind {
+                    EntryKind::File => {
+                        leaf_matched_indices(path, &fuzzy_match(query, path)?.matched_indices)
+                    }
+                    EntryKind::Dir if ancestors.contains(path.as_str()) => Vec::new(),
+                    EntryKind::Dir => return None,
+                };
+
+                let depth = path.bytes().filter(|&b| b == b'/').count();
+                let decoration = rollup.get(path).copied().unwrap_or_default();
+                Some(Row {
+                    path: path.clone(),
+                    kind: entry.kind.clone(),
+                    depth,
+                    ignored: entry.ignored,
+                    git_status: decoration.git_status,
+                    severity: decoration.severity,
+                    is_pending_create: false,
+                    matched_indices,
+                })
+            })
+            .collect()
     }
 
     /// Display name for a row: the final path segment (the model holds full
@@ -1657,14 +1891,15 @@ impl FileTree {
     /// `EXPLORER` label at the artboard's 11px label style, flush against
     /// the panel surface (no distinct elevated tint — the artboard's header
     /// sits transparent over the panel, only a bottom hairline separates
-    /// it) with a right-aligned action row. Ships exactly the two actions
-    /// that map to a real client capability — collapse-all / expand-all (a
-    /// toggle reflecting `all_dirs_collapsed`) and reveal-active — and
-    /// consciously omits the artboard's *search/filter* (Phase 31) and *new
-    /// file* (Phase 30) glyphs (no client capability yet; see the spec's
-    /// prior decisions).
+    /// it) with a right-aligned action row: collapse-all / expand-all (a
+    /// toggle reflecting `all_dirs_collapsed`), reveal-active, and the
+    /// search/filter toggle over `filter_active` (artboard **State B**,
+    /// `docs/spec-explorer-search.md`, #679) — Phase 27's reserved action
+    /// slot, now live. Still consciously omits the artboard's *new file*
+    /// glyph (Phase 30's context-menu "New File…"/"New Folder…" already
+    /// cover that capability; see the spec's prior decisions).
     ///
-    /// Both actions render as real `IconName` glyphs via `Button::icon(...)`
+    /// Every action renders as a real `IconName` glyph via `Button::icon(...)`
     /// — the shipping `rift` binary embeds gpui-component's SVG icon assets
     /// through the `RiftAssets` delegating source (`main.rs`, issue #597), so
     /// the icons resolve in the product build, not only under the dev-only
@@ -1702,6 +1937,21 @@ impl FileTree {
                 cx.emit(FileTreeEvent::RevealActiveRequested);
             }));
 
+        let filter_toggle = Button::new("file-tree-filter-toggle")
+            .ghost()
+            .xsmall()
+            .compact()
+            .icon(IconName::Search)
+            .selected(self.filter_active)
+            .tooltip(if self.filter_active {
+                "Close filter"
+            } else {
+                "Filter files"
+            })
+            .on_click(cx.listener(|this, _event, window, cx| {
+                this.toggle_filter(window, cx);
+            }));
+
         h_flex()
             .flex_shrink_0()
             .items_center()
@@ -1721,9 +1971,57 @@ impl FileTree {
             .child(
                 h_flex()
                     .gap(HEADER_ACTION_GAP)
+                    .child(filter_toggle)
                     .child(collapse_toggle)
                     .child(reveal_active),
             )
+    }
+
+    /// A quiet, centered, muted placeholder filling the tree body in place
+    /// of the row list — shared by the loading/empty-root states
+    /// (`docs/spec-explorer-parity.md`) and the filter bar's "No matches"
+    /// state (`docs/spec-explorer-search.md`, #679).
+    fn render_placeholder(message: &'static str, cx: &Context<Self>) -> AnyElement {
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p(px(16.0))
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(message)
+            .into_any_element()
+    }
+
+    /// The in-panel filter bar (artboard **State B**,
+    /// `docs/spec-explorer-search.md`, #679): a `gpui-component` `Input` in
+    /// the header→tree seam Phase 27 reserved, reusing the shipped
+    /// `InputState`+`Input` pattern (`connection_screen.rs`/`editor.rs`).
+    /// Mounted in [`Render::render`] only while `filter_active`; `None` on
+    /// `filter_input` at that point is unreachable (`open_filter` always
+    /// sets both together) but handled as an empty row rather than
+    /// `.expect()`-ing an invariant an unrelated future refactor could
+    /// silently break.
+    fn render_filter_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(input) = self.filter_input.as_ref() else {
+            return div().into_any_element();
+        };
+
+        div()
+            .flex_shrink_0()
+            .px(HEADER_PADDING_LEFT)
+            .py(px(6.0))
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                Input::new(input).small().w_full().cleanable(true).prefix(
+                    Icon::new(IconName::Search)
+                        .size(px(12.0))
+                        .text_color(cx.theme().muted_foreground),
+                ),
+            )
+            .into_any_element()
     }
 
     /// The workspace-root row (`RIFT` in the design) below the header
@@ -1925,11 +2223,32 @@ impl FileTree {
             GitRollupStatus::Changed => cx.theme().warning,
             GitRollupStatus::Untracked => cx.theme().success,
         });
-        let name_el = div()
+        // Match emphasis (artboard **State B**, `docs/spec-explorer-search.md`,
+        // #679): with an active filter, `row.matched_indices` splits `name`
+        // into alternating spans ([`emphasis_segments`]) and tints the matched
+        // runs with the accent-tint theme token — never a hardcoded hex,
+        // mirroring `results_panel.rs`'s search-match highlight. Empty
+        // `matched_indices` (no filter, or an ancestor-of-a-match directory
+        // row) yields a single unmatched span, identical to the plain `name`
+        // child this replaces.
+        let name_el = h_flex()
             .flex_1()
             .when(is_selected, |el| el.font_weight(FontWeight::BOLD))
             .when_some(git_color, |el, color| el.text_color(color))
-            .child(name);
+            .children(
+                emphasis_segments(&name, &row.matched_indices)
+                    .into_iter()
+                    .map(|(text, matched)| {
+                        let mut span = div().flex_none().child(text);
+                        if matched {
+                            span = span
+                                .text_color(cx.theme().accent_foreground)
+                                .bg(cx.theme().accent.opacity(0.25))
+                                .rounded(px(2.0));
+                        }
+                        span
+                    }),
+            );
 
         // Git-status letter: a single glyph in a fixed-width, right-aligned,
         // centered trailing lane, colored the same as the name tint.
@@ -2216,22 +2535,19 @@ impl Render for FileTree {
         // Restyled to the redesign's rhythm (`docs/spec-explorer-redesign.md`):
         // still quiet, centered, muted, and carrying no action surface — just
         // more generous breathing room than the shipped 8px, matching the
-        // redesign's less cramped density.
+        // redesign's less cramped density. A third case, checked once a
+        // snapshot exists: an active, non-empty filter query the row cache
+        // has zero matches for (`docs/spec-explorer-search.md`, #679) shows
+        // the same quiet placeholder rather than an empty tree body that
+        // could read as an error.
         let content = if let Some(state) = self.empty_state() {
             let message = match state {
                 EmptyState::Loading => "Loading\u{2026}",
                 EmptyState::EmptyRoot => "Empty folder",
             };
-            div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .p(px(16.0))
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(message)
-                .into_any_element()
+            Self::render_placeholder(message, cx)
+        } else if self.filter_active && !self.filter_query.is_empty() && self.row_cache.is_empty() {
+            Self::render_placeholder("No matches", cx)
         } else {
             // One uniform row height per item — the size vector the virtual
             // list measures against. Width is ignored for a vertical list.
@@ -2377,12 +2693,13 @@ impl Render for FileTree {
             .on_action(cx.listener(|this, _: &DeleteSelected, window, cx| {
                 this.confirm_delete(window, cx);
             }))
-            // `Escape` while the rename or create input has focus:
+            // `Escape` while the rename, create, or filter input has focus:
             // `InputState::escape` propagates the action (it is not in
             // `clean_on_escape` mode), so it bubbles here to close whichever
-            // editor is open with no send. A no-op (and re-propagated) when
-            // neither is active, so an ancestor gets a chance at a plain
-            // Escape too.
+            // editor is open with no send — the filter bar clears+closes
+            // (`docs/spec-explorer-search.md`, #679). A no-op (and
+            // re-propagated) when none is active, so an ancestor gets a
+            // chance at a plain Escape too.
             .on_action(cx.listener(|this, _: &Escape, _window, cx| {
                 if this.rename.is_some() {
                     this.cancel_rename();
@@ -2390,11 +2707,16 @@ impl Render for FileTree {
                 } else if this.create.is_some() {
                     this.cancel_create();
                     cx.notify();
+                } else if this.filter_active {
+                    this.close_filter(cx);
                 } else {
                     cx.propagate();
                 }
             }))
             .child(self.render_header(cx))
+            .when(self.filter_active, |el| {
+                el.child(self.render_filter_bar(cx))
+            })
             .child(self.render_root_row(cx))
             .child(div().flex_1().min_h_0().child(content))
             .into_any_element()
@@ -2806,6 +3128,230 @@ mod tests {
                 path: "a.rs".into()
             }
         );
+    }
+
+    // --- filter bar: narrowing + match emphasis (artboard State B, `docs/spec-explorer-search.md`, #679) ---
+
+    #[test]
+    fn test_leaf_matched_indices_rebases_onto_the_leaf_segment() {
+        // "main" matches indices [4,5,6,7] in "src/main.rs" (the `m` of
+        // `main.rs` starts at char index 4, right after "src/"); rebased
+        // onto the leaf "main.rs" alone they become [0,1,2,3].
+        assert_eq!(
+            leaf_matched_indices("src/main.rs", &[4, 5, 6, 7]),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn test_leaf_matched_indices_drops_indices_in_an_ancestor_segment() {
+        // A match landing entirely in the "src/" segment (indices before the
+        // leaf's start) contributes nothing to this row's own emphasis —
+        // that segment renders on a separate ancestor row, not this one.
+        assert_eq!(
+            leaf_matched_indices("src/main.rs", &[0, 1, 2]),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn test_leaf_matched_indices_of_a_top_level_path_is_unchanged() {
+        // No `/` at all: the whole path is the leaf, so indices pass through.
+        assert_eq!(leaf_matched_indices("main.rs", &[0, 1]), vec![0, 1]);
+    }
+
+    #[test]
+    fn test_emphasis_segments_empty_indices_is_a_single_unmatched_span() {
+        assert_eq!(
+            emphasis_segments("main.rs", &[]),
+            vec![("main.rs".to_owned(), false)]
+        );
+    }
+
+    #[test]
+    fn test_emphasis_segments_splits_matched_and_unmatched_runs() {
+        // "main.rs" matched at [0,1,2,3] (`main`) leaves `.rs` unmatched.
+        assert_eq!(
+            emphasis_segments("main.rs", &[0, 1, 2, 3]),
+            vec![("main".to_owned(), true), (".rs".to_owned(), false)]
+        );
+    }
+
+    #[test]
+    fn test_emphasis_segments_handles_non_contiguous_matches() {
+        // Scattered match: "m" (0) and "rs" (5,6) of "main.rs".
+        assert_eq!(
+            emphasis_segments("main.rs", &[0, 5, 6]),
+            vec![
+                ("m".to_owned(), true),
+                ("ain.".to_owned(), false),
+                ("rs".to_owned(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_visible_rows_filtered_matches_files_and_includes_ancestor_dirs() {
+        let mut tree = seed(vec![
+            dir("src"),
+            file("src/main.rs"),
+            file("src/lib.rs"),
+            file("README.md"),
+        ]);
+        tree.filter_query = "main".to_owned();
+
+        let rows = tree.visible_rows();
+        let visible: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(visible, vec!["src", "src/main.rs"]);
+    }
+
+    #[test]
+    fn test_visible_rows_filtered_never_matches_a_directory_by_its_own_name() {
+        // An empty directory has no descendant file to match, so even though
+        // its own name matches the query, it never appears — only files are
+        // matched; a directory row is included solely as a match's ancestor.
+        let mut tree = seed(vec![dir("target"), file("other.rs")]);
+        tree.filter_query = "target".to_owned();
+
+        assert!(tree.visible_rows().is_empty());
+    }
+
+    #[test]
+    fn test_visible_rows_filtered_no_match_query_yields_an_empty_row_set() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs")]);
+        tree.filter_query = "zzz-nope".to_owned();
+
+        assert!(tree.visible_rows().is_empty());
+    }
+
+    #[test]
+    fn test_visible_rows_filtered_force_expands_a_collapsed_ancestor_without_mutating_collapsed() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs"), file("top.rs")]);
+        tree.toggle_dir("src");
+        assert!(tree.is_collapsed("src"));
+
+        tree.filter_query = "main".to_owned();
+        let rows = tree.visible_rows();
+        let visible: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(
+            visible,
+            vec!["src", "src/main.rs"],
+            "a match inside a collapsed directory still shows, its ancestor force-expanded"
+        );
+
+        // The real collapsed set is untouched by the filtered pass.
+        assert!(tree.is_collapsed("src"));
+    }
+
+    #[test]
+    fn test_visible_rows_filtered_carries_leaf_relative_matched_indices_on_the_file_row_only() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs")]);
+        tree.filter_query = "main".to_owned();
+
+        let rows = tree.visible_rows();
+        let dir_row = rows
+            .iter()
+            .find(|r| r.path == "src")
+            .expect("ancestor dir row present");
+        assert!(
+            dir_row.matched_indices.is_empty(),
+            "an ancestor directory row carries no emphasis"
+        );
+
+        let file_row = rows
+            .iter()
+            .find(|r| r.path == "src/main.rs")
+            .expect("matched file row present");
+        assert_eq!(
+            file_row.matched_indices,
+            vec![0, 1, 2, 3],
+            "leaf-relative: main.rs's own `main` is matched"
+        );
+    }
+
+    #[test]
+    fn test_visible_rows_clearing_the_query_restores_the_exact_prior_tree() {
+        let mut tree = seed(vec![
+            dir("src"),
+            dir("src/net"),
+            file("src/net/tcp.rs"),
+            file("src/main.rs"),
+            file("top.rs"),
+        ]);
+        tree.toggle_dir("src/net");
+        let before = tree.visible_rows();
+
+        tree.filter_query = "tcp".to_owned();
+        let filtered = tree.visible_rows();
+        assert_ne!(filtered, before, "the filtered pass narrows the tree");
+
+        tree.filter_query.clear();
+        assert_eq!(
+            tree.visible_rows(),
+            before,
+            "clearing the query restores the exact prior tree"
+        );
+        assert!(
+            tree.is_collapsed("src/net"),
+            "the real collapsed set survived the filtered pass untouched"
+        );
+    }
+
+    #[gpui::test]
+    fn test_open_filter_activates_and_seeds_a_blank_focused_input(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.open_filter(window, cx);
+                });
+            })
+            .expect("open filter");
+
+        cx.update(|cx| {
+            let tree = tree.read(cx);
+            assert!(tree.filter_active);
+            assert!(tree.filter_query.is_empty());
+            let input = tree.filter_input.as_ref().expect("filter input created");
+            assert_eq!(input.read(cx).value().as_ref(), "");
+        });
+    }
+
+    #[gpui::test]
+    fn test_close_filter_clears_the_query_and_deactivates(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.open_filter(window, cx);
+                    tree.filter_query = "main".to_owned();
+                    tree.close_filter(cx);
+                });
+            })
+            .expect("close filter");
+
+        cx.update(|cx| {
+            let tree = tree.read(cx);
+            assert!(!tree.filter_active);
+            assert!(tree.filter_query.is_empty());
+            assert!(tree.filter_input.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn test_toggle_filter_opens_then_closes(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        window
+            .update(cx, |_, window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.toggle_filter(window, cx);
+                    assert!(tree.filter_active);
+
+                    tree.toggle_filter(window, cx);
+                    assert!(!tree.filter_active);
+                });
+            })
+            .expect("toggle filter");
     }
 
     // --- git + diagnostic decoration / ancestor roll-up (#329) ---
@@ -3524,6 +4070,7 @@ mod tests {
             git_status: None,
             severity: None,
             is_pending_create: false,
+            matched_indices: Vec::new(),
         }
     }
 
