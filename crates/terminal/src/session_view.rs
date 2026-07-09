@@ -18,7 +18,8 @@ use crate::pane_view::{measure_cell_size, PaneActivity, PaneView};
 use crate::quote_tmux_arg;
 use crate::{
     CaptureRequest, CaptureResult, ConnectionStatus, KeyTableQueryResult, PaneInput, PaneOutput,
-    SelectWindow, SessionListItem, SessionSwitchRequest, SubscriptionUpdate, TermSize,
+    SelectWindow, SessionListItem, SessionOrderUpdate, SessionSwitchRequest, SubscriptionUpdate,
+    TermSize,
 };
 
 const DEFAULT_FONT_SIZE: f32 = 14.0;
@@ -87,6 +88,15 @@ pub struct TerminalHandle {
     /// re-assert (see [`SessionSwitchRequest`]). Same legacy-path caveat as
     /// `session_list_request_rx`.
     pub session_switch_rx: flume::Receiver<SessionSwitchRequest>,
+    /// A session-order mutation from the strip — a drag-to-reorder commit or
+    /// a rename's slot-preserving key rename (#686,
+    /// `docs/spec-session-management.md`). Routed to `rift-app`'s
+    /// `session_order` store, which persists it and re-sorts + re-pushes the
+    /// current list on `session_list_tx`'s target channel. Unused on the
+    /// legacy tmux path (the strip's drag/rename affordances still emit, but
+    /// nothing is listening — harmless, the same caveat as
+    /// `session_list_request_rx`).
+    pub session_order_rx: flume::Receiver<SessionOrderUpdate>,
     /// The reconnect banner's Cancel (#476,
     /// `docs/spec-connection-robustness.md`): consumed by the SSH-level
     /// reconnect engine between attempts, which stops retrying and answers
@@ -193,9 +203,49 @@ struct SessionRename {
 /// ([`SessionView::cancel_session_kill`]). `session_id` is tmux's
 /// rename-stable session id (`SessionListItem::id`, targeted as `$<id>`);
 /// `session_name` is display-only (the confirm affordance's label/tooltip).
+/// `focus_handle` is moved onto the confirm row on arming (#686 drive-by fix)
+/// so the row's own `on_key_down` actually receives Escape — unlike
+/// [`SessionRename`], nothing here is an `InputState` that self-focuses, so
+/// this state carries its own handle.
 struct SessionKillConfirm {
     session_id: u32,
     session_name: String,
+    focus_handle: FocusHandle,
+}
+
+/// The payload a dragged session chip carries (#686,
+/// `docs/spec-session-management.md`): the session's NAME — the order
+/// store's key, not the tmux id — read by the drop target's `on_drop` handler
+/// ([`SessionView::reorder_sessions`]) via gpui's `on_drag`/`on_drop`, mirroring
+/// the explorer tree's own drag payload (`file_tree.rs`'s `DraggedRow`).
+#[derive(Clone)]
+struct DraggedSession {
+    name: String,
+}
+
+/// The floating preview that follows the cursor while a [`DraggedSession`] is
+/// in flight, mirroring the explorer tree's `DragPreview`
+/// (`file_tree.rs`) and gpui-component's own drag preview
+/// (`dock/tab_panel.rs`'s `DragPanel`). Theme tokens only, never a hardcoded
+/// hex.
+struct SessionDragPreview {
+    name: SharedString,
+}
+
+impl Render for SessionDragPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("session-chip-drag-preview")
+            .px_2()
+            .py_1()
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .text_size(px(13.0))
+            .text_color(cx.theme().foreground)
+            .child(self.name.clone())
+    }
 }
 
 /// An in-progress border drag. `start` is the mouse position along the drag
@@ -499,6 +549,10 @@ pub struct SessionView {
     /// `session_switch_rx`) when a strip chip or the new-session prompt
     /// commits.
     session_switch_tx: flume::Sender<SessionSwitchRequest>,
+    /// Emits a session-order mutation (forwarded to `TerminalHandle`'s
+    /// `session_order_rx`) on a drag-to-reorder drop or a rename commit
+    /// (#686, `docs/spec-session-management.md`).
+    session_order_tx: flume::Sender<SessionOrderUpdate>,
     /// Emits the reconnect banner's Cancel to the SSH-level reconnect engine
     /// (forwarded to `TerminalHandle`'s `reconnect_cancel_rx`).
     reconnect_cancel_tx: flume::Sender<()>,
@@ -521,6 +575,7 @@ impl SessionView {
         let (session_list_tx, session_list_rx) = flume::unbounded::<Vec<SessionListItem>>();
         let (session_list_request_tx, session_list_request_rx) = flume::unbounded::<()>();
         let (session_switch_tx, session_switch_rx) = flume::unbounded::<SessionSwitchRequest>();
+        let (session_order_tx, session_order_rx) = flume::unbounded::<SessionOrderUpdate>();
         let (reconnect_cancel_tx, reconnect_cancel_rx) = flume::unbounded::<()>();
 
         {
@@ -725,6 +780,7 @@ impl SessionView {
             confirming_kill: None,
             session_list_request_tx,
             session_switch_tx,
+            session_order_tx,
             reconnect_cancel_tx,
         };
 
@@ -743,6 +799,7 @@ impl SessionView {
             session_list_tx,
             session_list_request_rx,
             session_switch_rx,
+            session_order_rx,
             reconnect_cancel_rx,
         };
 
@@ -930,6 +987,39 @@ impl SessionView {
             }) {
                 debug!(error = %e, %session, "failed to send session switch request");
             }
+        }
+        cx.notify();
+    }
+
+    /// Commit a drag-to-reorder drop (#686, `docs/spec-session-management.md`,
+    /// Prior decisions: "drag-to-order, a total user-set order"): take
+    /// `dragged`'s current slot out of the live session list and reinsert it
+    /// immediately before `target`, then emit the WHOLE resulting name
+    /// sequence as one [`SessionOrderUpdate::Reorder`] — never a partial
+    /// two-row patch. `rift-app`'s session-order store persists it and
+    /// re-pushes the re-sorted list on the next `SessionListReply`-driven
+    /// push, so the strip is never mutated optimistically here. A drop onto
+    /// itself, or a name no longer in the live list (the daemon's churn push
+    /// raced the drag), is a no-op.
+    fn reorder_sessions(&mut self, dragged: &str, target: &str, cx: &mut Context<Self>) {
+        if dragged == target {
+            return;
+        }
+        let mut names: Vec<String> = self.sessions.iter().map(|s| s.name.clone()).collect();
+        let Some(from) = names.iter().position(|n| n == dragged) else {
+            return;
+        };
+        let dragged_name = names.remove(from);
+        let to = names
+            .iter()
+            .position(|n| n == target)
+            .unwrap_or(names.len());
+        names.insert(to, dragged_name);
+        if let Err(e) = self
+            .session_order_tx
+            .try_send(SessionOrderUpdate::Reorder(names))
+        {
+            debug!(error = %e, "failed to send session reorder update");
         }
         cx.notify();
     }
@@ -1406,8 +1496,12 @@ impl SessionView {
     /// unchanged name is a no-op"); otherwise sends the quoted
     /// `rename-session` over the existing raw tmux-command seam
     /// (`tmux_command_tx`, the same channel the pane-header split/zoom/
-    /// select-pane controls use). A second submit after the rename already
-    /// committed (or was cancelled) must not re-submit.
+    /// select-pane controls use), and a matching [`SessionOrderUpdate::Rename`]
+    /// on `session_order_tx` so the order store renames its key in the SAME
+    /// action, preserving this session's reordered slot (#686,
+    /// `docs/spec-session-management.md`; only an external CLI rename
+    /// re-slots). A second submit after the rename already committed (or was
+    /// cancelled) must not re-submit.
     fn submit_session_rename(&mut self, cx: &mut Context<Self>) {
         let Some(rename) = self.renaming_session.take() else {
             return;
@@ -1420,6 +1514,12 @@ impl SessionView {
                 .try_send(rename_session_command(rename.session_id, trimmed))
             {
                 debug!(error = %e, "failed to send session rename command");
+            }
+            if let Err(e) = self.session_order_tx.try_send(SessionOrderUpdate::Rename {
+                old: rename.original_name,
+                new: trimmed.to_string(),
+            }) {
+                debug!(error = %e, "failed to send session order rename update");
             }
         }
         // The inline input unmounts now; return keyboard focus to the pane
@@ -1441,11 +1541,26 @@ impl SessionView {
     /// the chip's right-click menu's "Kill" item (#685,
     /// `docs/spec-session-management.md`): two-step by design, so a stray
     /// click can never kill a session outright. No command is sent here —
-    /// only [`Self::confirm_session_kill`] sends one.
-    fn start_session_kill_confirm(&mut self, id: u32, name: String, cx: &mut Context<Self>) {
+    /// only [`Self::confirm_session_kill`] sends one. Moves keyboard focus
+    /// onto a fresh handle for the confirm row (#686 drive-by fix): without
+    /// this, nothing in the confirm row ever had focus, so its own
+    /// `on_key_down` Escape handler (see [`Self::render_session_strip`]) never
+    /// fired — Escape kept reaching whatever the terminal pane was doing
+    /// instead. Click-cancel ([`Self::cancel_session_kill`]) is unaffected —
+    /// it never depended on focus.
+    fn start_session_kill_confirm(
+        &mut self,
+        id: u32,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window, cx);
         self.confirming_kill = Some(SessionKillConfirm {
             session_id: id,
             session_name: name,
+            focus_handle,
         });
         cx.notify();
     }
@@ -1604,10 +1719,17 @@ impl SessionView {
     /// All colors are theme tokens. A per-chip right-click menu
     /// ([`gpui_component::menu::ContextMenuExt`], the same widget the
     /// explorer row/editor context menus already ship with) holds "Rename",
-    /// which opens the inline edit below (#684); it is the seam #685 adds
-    /// "Kill" to next (a second `.item(...)` in the same builder closure).
-    /// Deliberately not built here: drag-reorder (#686) — this render is
-    /// the clean seam that attaches to, no more.
+    /// which opens the inline edit below (#684), and "Kill" (#685), which
+    /// arms the inline confirm. Each real chip is also a drag source and drop
+    /// target (#686): dropping one onto another resequences the whole visible
+    /// list and commits it via [`Self::reorder_sessions`], mirroring the
+    /// explorer tree's own drag-to-move (`file_tree.rs`). No `Window` param
+    /// needed here (unlike the spec's draft architecture): every GPUI
+    /// interactive-element closure attached below (`on_click`, `on_drag`,
+    /// `on_drop`, the popup menu's `on_click`) already receives its own
+    /// `&mut Window` at dispatch time — see [`Self::start_session_kill_confirm`]'s
+    /// call site, which reuses the "Kill" menu item's own closure-scoped
+    /// `window` instead of a value threaded from here.
     pub fn render_session_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
         let current = self.session_name.clone();
@@ -1659,11 +1781,11 @@ impl SessionView {
                 .filter(|rename| rename.session_id == row.id)
                 .map(|rename| rename.input.clone());
 
-            let kill_confirm_name = self
+            let kill_confirm = self
                 .confirming_kill
                 .as_ref()
                 .filter(|confirm| confirm.session_id == row.id)
-                .map(|confirm| confirm.session_name.clone());
+                .map(|confirm| (confirm.session_name.clone(), confirm.focus_handle.clone()));
 
             let chip = if let Some(input) = renaming_input {
                 let cancel_entity = entity.clone();
@@ -1681,7 +1803,7 @@ impl SessionView {
                     })
                     .child(Input::new(&input).xsmall())
                     .into_any_element()
-            } else if let Some(kill_name) = kill_confirm_name {
+            } else if let Some((kill_name, kill_focus_handle)) = kill_confirm {
                 let confirm_entity = entity.clone();
                 let cancel_entity = entity.clone();
                 let key_cancel_entity = entity.clone();
@@ -1691,6 +1813,12 @@ impl SessionView {
                     .gap(px(4.0))
                     .h(px(SESSION_CHIP_HEIGHT))
                     .px(px(6.0))
+                    // Moved onto this row when the confirm was armed
+                    // (`Self::start_session_kill_confirm`, #686 drive-by
+                    // fix) so `on_key_down` below actually receives Escape
+                    // — without this, keyboard focus stayed on the terminal
+                    // pane and Escape never reached this handler.
+                    .track_focus(&kill_focus_handle)
                     .on_key_down(move |event: &KeyDownEvent, _window, cx| {
                         if event.keystroke.key.as_str() == "escape" {
                             key_cancel_entity.update(cx, |view, cx| {
@@ -1727,6 +1855,7 @@ impl SessionView {
                     .into_any_element()
             } else {
                 let base = h_flex()
+                    .id(("session-chip", row.id as usize))
                     .items_center()
                     .gap(px(6.0))
                     .h(px(SESSION_CHIP_HEIGHT))
@@ -1745,7 +1874,10 @@ impl SessionView {
                     .when(is_current, |el| el.bg(current_bg))
                     .hover(move |s| s.bg(current_bg))
                     .text_color(if is_current { fg } else { muted })
-                    .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                    // `on_click` (not `on_mouse_down`): GPUI suppresses the click
+                    // after a drag, so dragging a chip to reorder does not also
+                    // fire a session switch (which would reload the whole cockpit).
+                    .on_click(move |_event, _window, cx| {
                         row_entity.update(cx, |view, cx| {
                             view.switch_to_session(&name, cx);
                         });
@@ -1765,6 +1897,45 @@ impl SessionView {
                     let menu_entity = entity.clone();
                     let session_id = row.id;
                     let session_name = row.name.clone();
+
+                    // Drag-to-reorder (#686, `docs/spec-session-management.md`,
+                    // Prior decisions: "drag-to-order, a total user-set
+                    // order"): every real chip is both a drag source (a
+                    // themed floating preview, `SessionDragPreview`) and a
+                    // drop target, mirroring the explorer tree's own
+                    // drag/drop (`file_tree.rs`'s `DraggedRow`/`DragPreview`).
+                    // Dropping one chip onto another resequences the WHOLE
+                    // visible list (never just the two dragged/target rows)
+                    // and commits it via `Self::reorder_sessions`, which
+                    // sends a `SessionOrderUpdate::Reorder` — `rift-app`
+                    // persists it and re-pushes the re-sorted list, so the
+                    // strip never mutates `self.sessions` optimistically.
+                    // `can_drop` refuses a chip dropped onto itself.
+                    let drag_payload = DraggedSession {
+                        name: session_name.clone(),
+                    };
+                    let preview_name = SharedString::from(session_name.clone());
+                    let can_drop_name = session_name.clone();
+                    let drop_target_name = session_name.clone();
+                    let base = base
+                        .on_drag(drag_payload, move |_drag, _point, _window, cx| {
+                            cx.new(|_| SessionDragPreview {
+                                name: preview_name.clone(),
+                            })
+                        })
+                        .drag_over::<DraggedSession>(|style, _drag, _window, cx| {
+                            style.bg(cx.theme().list_active)
+                        })
+                        .can_drop(move |drag: &dyn std::any::Any, _window, _cx| {
+                            drag.downcast_ref::<DraggedSession>()
+                                .is_some_and(|dragged| dragged.name != can_drop_name)
+                        })
+                        .on_drop(
+                            cx.listener(move |this, drag: &DraggedSession, _window, cx| {
+                                this.reorder_sessions(&drag.name, &drop_target_name, cx);
+                            }),
+                        );
+
                     base.context_menu(move |menu, _window, _cx| {
                         let rename_entity = menu_entity.clone();
                         let rename_name = session_name.clone();
@@ -1790,11 +1961,12 @@ impl SessionView {
                             PopupMenuItem::element(|_window, cx| {
                                 div().text_color(cx.theme().danger).child("Kill")
                             })
-                            .on_click(move |_event, _window, cx| {
+                            .on_click(move |_event, window, cx| {
                                 kill_entity.update(cx, |view, cx| {
                                     view.start_session_kill_confirm(
                                         session_id,
                                         kill_name.clone(),
+                                        window,
                                         cx,
                                     );
                                 });
@@ -2094,13 +2266,17 @@ impl Focusable for SessionView {
 
 impl Render for SessionView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Skip pane auto-focus while an inline rename or the switcher's
-        // new-session prompt owns focus, so a snapshot arriving mid-edit does
-        // not steal the keystroke stream from the input.
+        // Skip pane auto-focus while an inline rename, the switcher's
+        // new-session prompt, or an armed kill confirm (#686 drive-by fix)
+        // owns focus, so a snapshot arriving mid-edit does not steal the
+        // keystroke stream from it — the kill confirm has no input of its own
+        // to notice the theft, so without this guard a stray steal-back would
+        // silently break its Escape handler again.
         if self.needs_focus
             && self.renaming_window.is_none()
             && self.new_session_prompt.is_none()
             && self.renaming_session.is_none()
+            && self.confirming_kill.is_none()
         {
             let entity_to_focus = self
                 .active_pane_id
@@ -2532,9 +2708,9 @@ mod tests {
         aggregate_activity, grid_size_for, home_relative, kill_session_command,
         max_vertical_pane_count, new_window_at_command, quote_tmux_name, reconnect_banner_message,
         rename_session_command, resize_direction, select_pane_command, split_command,
-        tab_state_slot, zoom_pane_command, PaneActivity, SessionListItem, SessionSnapshot,
-        SessionView, TabStateSlot, TermSize, TerminalHandle, DEFAULT_FONT_SIZE, MAX_FONT_SIZE,
-        MIN_FONT_SIZE,
+        tab_state_slot, zoom_pane_command, PaneActivity, SessionListItem, SessionOrderUpdate,
+        SessionSnapshot, SessionView, TabStateSlot, TermSize, TerminalHandle, DEFAULT_FONT_SIZE,
+        MAX_FONT_SIZE, MIN_FONT_SIZE,
     };
     use crate::layout::LayoutNode;
     use gpui::{
@@ -3152,6 +3328,113 @@ mod tests {
         });
     }
 
+    /// A chip dropped onto another emits the WHOLE resulting name sequence
+    /// (#686), not just the two rows involved — `reorder_sessions` reinserts
+    /// the dragged name immediately before the target and resequences every
+    /// other known session around it.
+    #[gpui::test]
+    fn test_reorder_sessions_emits_full_sequence_with_dragged_before_target(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let (session, handle) = session_and_handle(cx);
+            session.update(cx, |view, cx| {
+                view.apply_session_list(
+                    vec![
+                        SessionListItem {
+                            id: 0,
+                            name: "rift".into(),
+                            windows: 1,
+                            attached: true,
+                        },
+                        SessionListItem {
+                            id: 1,
+                            name: "agent".into(),
+                            windows: 1,
+                            attached: false,
+                        },
+                        SessionListItem {
+                            id: 2,
+                            name: "tests".into(),
+                            windows: 1,
+                            attached: false,
+                        },
+                    ],
+                    cx,
+                );
+            });
+
+            session.update(cx, |view, cx| view.reorder_sessions("tests", "rift", cx));
+
+            assert_eq!(
+                handle
+                    .session_order_rx
+                    .try_recv()
+                    .expect("reorder update sent"),
+                SessionOrderUpdate::Reorder(vec![
+                    "tests".to_string(),
+                    "rift".to_string(),
+                    "agent".to_string(),
+                ])
+            );
+        });
+    }
+
+    /// A chip dropped onto itself is a no-op — no update crosses the seam.
+    #[gpui::test]
+    fn test_reorder_sessions_dropped_onto_itself_sends_nothing(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, handle) = session_and_handle(cx);
+            session.update(cx, |view, cx| {
+                view.apply_session_list(
+                    vec![SessionListItem {
+                        id: 0,
+                        name: "rift".into(),
+                        windows: 1,
+                        attached: true,
+                    }],
+                    cx,
+                );
+            });
+
+            session.update(cx, |view, cx| view.reorder_sessions("rift", "rift", cx));
+
+            assert!(
+                handle.session_order_rx.try_recv().is_err(),
+                "a drop onto itself sends no reorder update"
+            );
+        });
+    }
+
+    /// A dragged name no longer in the live list (the daemon's churn push
+    /// raced the drag) is a no-op rather than inserting a stale entry.
+    #[gpui::test]
+    fn test_reorder_sessions_unknown_dragged_name_sends_nothing(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, handle) = session_and_handle(cx);
+            session.update(cx, |view, cx| {
+                view.apply_session_list(
+                    vec![SessionListItem {
+                        id: 0,
+                        name: "rift".into(),
+                        windows: 1,
+                        attached: true,
+                    }],
+                    cx,
+                );
+            });
+
+            session.update(cx, |view, cx| {
+                view.reorder_sessions("gone", "rift", cx);
+            });
+
+            assert!(
+                handle.session_order_rx.try_recv().is_err(),
+                "an unknown dragged name sends nothing"
+            );
+        });
+    }
+
     /// A windowed [`session_and_handle`]: the new-session prompt needs a live
     /// window for its `InputState`, so prompt tests build the view inside an
     /// open test window.
@@ -3409,6 +3692,73 @@ mod tests {
         .unwrap();
     }
 
+    /// A committed rename also emits a matching
+    /// `SessionOrderUpdate::Rename { old, new }` on `session_order_rx` (#686,
+    /// `docs/spec-session-management.md`): the order store renames its key in
+    /// the SAME action, so a reordered session keeps its slot instead of
+    /// falling back to the unknown-name default order.
+    #[gpui::test]
+    fn test_submit_session_rename_emits_matching_order_rename_update(cx: &mut TestAppContext) {
+        let (window, session, handle) = windowed_session_and_handle(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            session.update(cx, |view, cx| {
+                view.apply_session_list(
+                    vec![SessionListItem {
+                        id: 3,
+                        name: "rift".into(),
+                        windows: 1,
+                        attached: false,
+                    }],
+                    cx,
+                );
+                view.start_session_rename(3, "rift".to_string(), window, cx);
+            });
+            let input = session
+                .read(cx)
+                .renaming_session
+                .as_ref()
+                .expect("rename active")
+                .input
+                .clone();
+            input.update(cx, |state, cx| state.set_value("my agent", window, cx));
+
+            session.update(cx, |view, cx| view.submit_session_rename(cx));
+
+            assert_eq!(
+                handle
+                    .session_order_rx
+                    .try_recv()
+                    .expect("order update sent"),
+                SessionOrderUpdate::Rename {
+                    old: "rift".to_string(),
+                    new: "my agent".to_string(),
+                }
+            );
+        })
+        .unwrap();
+    }
+
+    /// An unchanged/empty submit (a no-op rename) sends no order update
+    /// either — mirrors `test_submit_session_rename_empty_or_unchanged_name_sends_nothing`.
+    #[gpui::test]
+    fn test_submit_session_rename_unchanged_name_sends_no_order_update(cx: &mut TestAppContext) {
+        let (window, session, handle) = windowed_session_and_handle(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            session.update(cx, |view, cx| {
+                view.start_session_rename(1, "rift".to_string(), window, cx);
+            });
+            session.update(cx, |view, cx| view.submit_session_rename(cx));
+
+            assert!(
+                handle.session_order_rx.try_recv().is_err(),
+                "an unchanged name sends no order update"
+            );
+        })
+        .unwrap();
+    }
+
     /// An empty (or whitespace-only) or unchanged name is a no-op (the
     /// spec's "empty or unchanged name is a no-op"): nothing is sent and the
     /// rename clears.
@@ -3478,25 +3828,36 @@ mod tests {
 
     /// The chip's right-click "Kill" (#685) only ARMS the two-step confirm —
     /// nothing is sent to tmux yet, and needs_focus is left untouched by
-    /// arming (only clearing the confirm, on either path, restores it).
+    /// arming (only clearing the confirm, on either path, restores it). #686
+    /// drive-by fix: arming also moves keyboard focus onto the confirm's own
+    /// handle, so the row's `on_key_down` Escape actually fires — without
+    /// this, focus stayed on the terminal pane and Escape never reached it.
     #[gpui::test]
     fn test_start_session_kill_confirm_arms_without_sending(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            let (session, handle) = session_and_handle(cx);
+        let (window, session, handle) = windowed_session_and_handle(cx);
 
+        cx.update_window(window, |_, window, cx| {
             session.update(cx, |view, cx| {
-                view.start_session_kill_confirm(3, "rift".to_string(), cx);
+                view.start_session_kill_confirm(3, "rift".to_string(), window, cx);
             });
 
+            let confirm = session
+                .read(cx)
+                .confirming_kill
+                .as_ref()
+                .expect("Kill arms the inline confirm")
+                .focus_handle
+                .clone();
             assert!(
-                session.read(cx).confirming_kill.is_some(),
-                "Kill arms the inline confirm"
+                confirm.is_focused(window),
+                "arming moves focus onto the confirm row so Escape reaches it"
             );
             assert!(
                 handle.tmux_command_rx.try_recv().is_err(),
                 "arming the confirm sends no command"
             );
-        });
+        })
+        .unwrap();
     }
 
     /// Confirming an armed kill sends exactly one `kill-session -t $<id>` —
@@ -3508,11 +3869,11 @@ mod tests {
     fn test_confirm_session_kill_sends_one_kill_command_and_restores_focus(
         cx: &mut TestAppContext,
     ) {
-        cx.update(|cx| {
-            let (session, handle) = session_and_handle(cx);
+        let (window, session, handle) = windowed_session_and_handle(cx);
 
+        cx.update_window(window, |_, window, cx| {
             session.update(cx, |view, cx| {
-                view.start_session_kill_confirm(3, "rift".to_string(), cx);
+                view.start_session_kill_confirm(3, "rift".to_string(), window, cx);
                 view.needs_focus = false;
             });
 
@@ -3533,18 +3894,19 @@ mod tests {
                 handle.tmux_command_rx.try_recv().is_err(),
                 "a second confirm after the commit sends nothing"
             );
-        });
+        })
+        .unwrap();
     }
 
     /// Cancel (mirrors Escape, which dispatches the same handler) sends no
     /// command, clears the armed confirm, and restores pane focus.
     #[gpui::test]
     fn test_cancel_session_kill_sends_nothing_and_restores_focus(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            let (session, handle) = session_and_handle(cx);
+        let (window, session, handle) = windowed_session_and_handle(cx);
 
+        cx.update_window(window, |_, window, cx| {
             session.update(cx, |view, cx| {
-                view.start_session_kill_confirm(1, "rift".to_string(), cx);
+                view.start_session_kill_confirm(1, "rift".to_string(), window, cx);
                 view.needs_focus = false;
             });
             assert!(session.read(cx).confirming_kill.is_some());
@@ -3560,7 +3922,8 @@ mod tests {
                 "cancel sends no command"
             );
             assert!(session.read(cx).needs_focus, "focus restored after cancel");
-        });
+        })
+        .unwrap();
     }
 
     /// `font_size()` starts at the same default `apply_font_zoom`'s delta path
