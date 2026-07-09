@@ -1783,10 +1783,19 @@ impl EditorView {
         self.tabs[index].hover_move_generation =
             self.tabs[index].hover_move_generation.wrapping_add(1);
         let generation = self.tabs[index].hover_move_generation;
+        let path = self.tabs[index].path.clone();
         cx.spawn(async move |this, cx| {
             smol::Timer::after(HOVER_MOUSE_DEBOUNCE).await;
             cx.update(|cx| {
                 let _ = this.update(cx, |this, cx| {
+                    // Re-resolve by path, not the captured `index`: a
+                    // `close_tab` between arm and fire can shift indices, so
+                    // trusting the stale position risks reading a different
+                    // tab's generation counter (or missing this one out of
+                    // range) instead of no-op'ing when this tab is gone.
+                    let Some(index) = this.tab_index_for_path(&path) else {
+                        return;
+                    };
                     let Some(tab) = this.tabs.get(index) else {
                         return;
                     };
@@ -4341,6 +4350,83 @@ mod tests {
         {
             ClientMessage::BufferChanged { path, .. } => assert_eq!(path, "b.rs"),
             other => panic!("expected BufferChanged for b.rs, got {other:?}"),
+        }
+    }
+
+    /// Regression test for #411: `arm_hover_debounce`'s timer closure used to
+    /// look the tab up by the raw positional `index` it captured at arm
+    /// time, the same stale-index shape fixed for `arm_loading` and
+    /// `arm_buffer_feed` in #352/#401. Closing an *earlier* tab before the
+    /// debounce fires shifts the armed tab's index down; the old code either
+    /// missed it (out of range) or, worse, could compare against a different
+    /// tab's `hover_move_generation` — it now re-resolves via
+    /// `tab_index_for_path` when the timer fires, so the surviving tab's
+    /// `HoverRequest` still lands for the right path.
+    #[gpui::test]
+    async fn test_closing_an_earlier_tab_before_the_hover_debounce_fires_still_targets_the_survivor(
+        cx: &mut TestAppContext,
+    ) {
+        let (open_file_tx, _open_file_rx) = flume::unbounded();
+        let (save_file_tx, _save_file_rx) = flume::unbounded();
+        let (buffer_change_tx, _buffer_change_rx) = flume::unbounded();
+        let (nav_tx, nav_rx) = flume::unbounded();
+
+        let mut editor: Option<Entity<EditorView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                editor = Some(cx.new(|cx| {
+                    EditorView::new(
+                        open_file_tx,
+                        save_file_tx,
+                        buffer_change_tx,
+                        nav_tx,
+                        window,
+                        cx,
+                    )
+                }));
+                cx.new(|cx| gpui_component::Root::new(editor.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let editor = editor.expect("editor constructed inside the window callback");
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    // A at index 0, B at index 1 — mirror the post-`FileContent`
+                    // reply state hover dispatch requires (`Loaded`).
+                    let a = editor.push_tab("a.rs".into(), false, window, cx);
+                    let b = editor.push_tab("b.rs".into(), false, window, cx);
+                    editor.tabs[a].load_state = TabLoadState::Loaded;
+                    editor.tabs[b].load_state = TabLoadState::Loaded;
+                    editor.active = Some(b);
+
+                    // Mouse rests over B: arms its debounced hover request
+                    // while B still sits at index 1.
+                    editor.arm_hover_debounce(cx);
+
+                    // Close A before the debounce fires — B shifts from
+                    // index 1 down to index 0.
+                    editor.close_tab(a, window, cx);
+                    assert_eq!(editor.tab_index_for_path("b.rs"), Some(0));
+                    assert_eq!(editor.active, Some(0));
+                });
+            })
+            .unwrap();
+
+        // `smol::Timer` (unlike gpui's own timers) isn't driven by the test
+        // executor's virtual clock, so the debounce needs a real sleep here.
+        cx.executor().allow_parking();
+        smol::Timer::after(HOVER_MOUSE_DEBOUNCE + Duration::from_millis(100)).await;
+        cx.run_until_parked();
+
+        match nav_rx
+            .try_recv()
+            .expect("B's hover debounce must still fire after A's close shifts its index")
+        {
+            ClientMessage::HoverRequest { path, .. } => assert_eq!(path, "b.rs"),
+            other => panic!("expected HoverRequest for b.rs, got {other:?}"),
         }
     }
 
