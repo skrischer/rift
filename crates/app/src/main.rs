@@ -16,7 +16,7 @@ use gpui::*;
 use gpui_component::{Root, TitleBar};
 use gpui_component_assets::Assets;
 use rift_app::connection_screen::{
-    ConnectError, ConnectRequest, ConnectionScreen, ConnectionScreenEvent,
+    ConnectError, ConnectRequest, ConnectionScreen, ConnectionScreenEvent, SessionIntent,
 };
 use rift_app::recents::RecentConnection;
 use rift_app::session_picker::{SessionPicker, SessionPickerEvent};
@@ -161,9 +161,10 @@ struct EditorChannels {
 /// leave the fresh tmux child on the attach-default grid.
 struct EngineWatches {
     /// The session the client is currently attached to: seeded once from the
-    /// Connection screen's connect request (its Session field, itself
-    /// prefilled from `RIFT_SESSION` — #477), updated by
-    /// `spawn_session_switch_bridge` per switch the daemon actually saw.
+    /// entry point's resolved [`SessionIntent`] (empty — the unset sentinel —
+    /// for `Preferred`/`Pick`, until the post-connect resolution below seeds
+    /// it), updated by `spawn_session_switch_bridge` per switch the daemon
+    /// actually saw.
     session: tokio::sync::watch::Sender<String>,
     /// The render layer's last known client grid: cached by
     /// `spawn_resize_bridge` per resize (and by the engine's backlog drain),
@@ -173,26 +174,47 @@ struct EngineWatches {
     /// The post-connect picker's cross-thread channels (#706); reached only
     /// when `session` above is the unset sentinel (empty).
     picker: PickerChannels,
+    /// The `SessionIntent::Preferred` name to try against the live host list
+    /// before falling back to the picker (issue #707) — `None` for `Fixed`
+    /// (never reaches the unset branch, seeded straight into `session`
+    /// above) and `Pick` (always the picker). Engine-scoped like the rest of
+    /// this struct: constant across every reconnect attempt while `session`
+    /// stays unset.
+    preferred_session: Option<String>,
 }
 
-/// Cross-thread coordination for the post-connect session picker (#706,
+/// Cross-thread coordination for the post-connect session picker (#706/#707,
 /// `docs/spec-post-connect-picker.md`): the daemon thread (`run_daemon_terminal`,
 /// via [`EngineWatches::picker`]) owns this end, the Shell (GPUI thread) owns
-/// the matching `list_rx`/`choice_tx` pair built alongside it in
+/// the matching `outcome_rx`/`choice_tx` pair built alongside it in
 /// `Shell::connect`. Engine-scoped like the rest of [`EngineWatches`] — a drop
 /// before the pick re-enters the picker branch on the fresh attempt (the
 /// session watch is still unset), a drop after never touches this again (the
 /// watch is seeded).
 #[derive(Clone)]
 struct PickerChannels {
-    /// The live host session list, sent once the daemon's `QuerySessionList`
-    /// reply arrives — the Shell swaps to `ScreenState::Picker` on receiving
-    /// it.
-    list_tx: flume::Sender<Vec<SessionListItem>>,
+    /// What the post-connect list query resolved to (issue #707): either the
+    /// daemon thread attached directly (a `Preferred` name still present on
+    /// the host) or the live list needs a human pick — the Shell swaps to
+    /// `ScreenState::Picker` only for the latter.
+    outcome_tx: flume::Sender<PickerOutcome>,
     /// The user's pick (an existing session name or a fresh one to create),
     /// sent by the Shell once [`rift_app::session_picker::SessionPickerEvent::Pick`]
     /// fires. `run_daemon_terminal` blocks on this before the first `Attach`.
     choice_rx: flume::Receiver<String>,
+}
+
+/// What [`await_session_pick`]'s live-list query resolved to (issue #707):
+/// sent once on [`PickerChannels::outcome_tx`], read by the Shell's
+/// `connect()` continuation.
+enum PickerOutcome {
+    /// A `SessionIntent::Preferred` name is still present on the host: the
+    /// daemon thread attaches it directly without ever showing the picker.
+    /// Carries the name so the Shell can record it in recents.
+    Attached(String),
+    /// No direct attach: either `SessionIntent::Pick`, or a `Preferred` name
+    /// that vanished from the host. Carries the live list to render.
+    ShowPicker(Vec<SessionListItem>),
 }
 
 /// Per-channel log-pair basename, keyed off the same `windowed` feature that
@@ -653,10 +675,10 @@ fn main() {
 /// explicit Connect (or Enter) away from the cockpit.
 enum ScreenState {
     Connection(Entity<ConnectionScreen>),
-    /// The post-connect session picker (#706, `docs/spec-post-connect-picker.md`):
+    /// The post-connect session picker (#706/#707, `docs/spec-post-connect-picker.md`):
     /// shown after the SSH connect + daemon handshake, before the cockpit
-    /// attach, only while the connect request's session was unresolved (this
-    /// PR's interim trigger: the connect card's Session field left blank).
+    /// attach, only when the entry point's [`SessionIntent`] is `Pick`, or a
+    /// `Preferred` name that is no longer present on the live host.
     Picker(Entity<SessionPicker>),
     Workspace(Entity<workspace::WorkspaceView>),
 }
@@ -665,13 +687,46 @@ enum ScreenState {
 /// argument-count threshold: the picker's initial data (`ssh_label`,
 /// `sessions`, the pre-loaded client-side `order`) plus what a pick does next
 /// (`choice_tx` back to the daemon thread, the eagerly built `workspace` to
-/// swap to).
+/// swap to, and `recents` — the target to record a pick into, issue #707).
 struct PickerLaunch {
     ssh_label: SharedString,
     sessions: Vec<SessionListItem>,
     order: Vec<String>,
     choice_tx: flume::Sender<String>,
     workspace: Entity<workspace::WorkspaceView>,
+    recents: Option<(PathBuf, RecentTarget)>,
+}
+
+/// The host/user/port/key identity for a recents entry (issue #707), captured
+/// once in [`Shell::connect`] before `request`'s fields move into the
+/// `SshConfig`. `SessionIntent::Fixed` records immediately (the session is
+/// already known, matching #706's eager record byte-for-byte);
+/// `Preferred`/`Pick` defer the actual [`recents::record`] call until the
+/// session resolves (a [`PickerOutcome::Attached`] or a picker pick), so the
+/// store never carries a pre-pick placeholder.
+#[derive(Clone)]
+struct RecentTarget {
+    host: String,
+    user: String,
+    port: u16,
+    key: String,
+}
+
+impl RecentTarget {
+    fn record(&self, path: &Path, session: &str) {
+        let now = recents::now_unix_secs();
+        let entry = RecentConnection {
+            host: self.host.clone(),
+            user: self.user.clone(),
+            port: self.port,
+            key: self.key.clone(),
+            session: session.to_string(),
+            last_connected_unix_secs: now,
+        };
+        if let Err(e) = recents::record(path, entry, now) {
+            warn!(%e, "failed to record recent connection");
+        }
+    }
 }
 
 struct Shell {
@@ -754,25 +809,26 @@ impl Shell {
         });
     }
 
-    /// Drive a submitted connect attempt: record it in the RECENT store, then
-    /// build the full session pipeline (channels, `SessionView`,
-    /// `WorkspaceView`, the SSH thread) exactly like the pre-#477 startup path
-    /// did unconditionally at launch — now gated behind an explicit Connect
+    /// Drive a submitted connect attempt: record it in the RECENT store (for
+    /// `SessionIntent::Fixed`, whose session is already known — `Preferred`/
+    /// `Pick` defer the record until the session resolves, below), then build
+    /// the full session pipeline (channels, `SessionView`, `WorkspaceView`,
+    /// the SSH thread) exactly like the pre-#477 startup path did
+    /// unconditionally at launch — now gated behind an explicit Connect
     /// instead. A watcher task routes back to a fresh Connection screen once
     /// the session ends ([`Shell::return_to_connection_screen`]).
     fn connect(&mut self, request: ConnectRequest, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(path) = &self.recents_path {
-            let now = recents::now_unix_secs();
-            let entry = RecentConnection {
-                host: request.host.clone(),
-                user: request.user.clone(),
-                port: request.port,
-                key: request.key.display().to_string(),
-                session: request.session.clone(),
-                last_connected_unix_secs: now,
-            };
-            if let Err(e) = recents::record(path, entry, now) {
-                warn!(%e, "failed to record recent connection");
+        // The recents identity (issue #707), captured before `request`'s
+        // fields move into `SshConfig` below.
+        let recent_target = RecentTarget {
+            host: request.host.clone(),
+            user: request.user.clone(),
+            port: request.port,
+            key: request.key.display().to_string(),
+        };
+        if let SessionIntent::Fixed(name) = &request.session_intent {
+            if let Some(path) = &self.recents_path {
+                recent_target.record(path, name);
             }
         }
 
@@ -788,14 +844,15 @@ impl Shell {
             key: request.key,
             passphrase: request.passphrase,
         };
-        let session_name = request.session;
-        // Interim trigger for the post-connect picker (#706,
-        // `docs/spec-post-connect-picker.md`): a blank Session field. Issue
-        // #707 replaces this with full entry-point routing; issue #705
-        // removes the field. A filled field (or one prefilled by
-        // `RIFT_SESSION`) stays byte-for-byte the pre-picker direct-attach
-        // flow below.
-        let session_unset = session_is_unset(&session_name);
+        // The entry point's resolved session intent (issue #707,
+        // `docs/spec-post-connect-picker.md`): `Fixed` stays byte-for-byte
+        // the pre-picker direct-attach flow below; `Preferred`/`Pick` reach
+        // the post-connect picker branch further down. `is_fixed_intent` is
+        // computed here (before `session_intent` moves into the daemon
+        // thread below) since it is still needed after that move, at the
+        // tail of this function.
+        let is_fixed_intent = matches!(request.session_intent, SessionIntent::Fixed(_));
+        let session_intent = request.session_intent;
 
         // Editor surface (#187) wiring: the daemon stream reader forwards
         // worktree structure and `FileContent` replies onto these, and the
@@ -818,11 +875,13 @@ impl Shell {
         let (file_op_result_tx, file_op_result_rx) =
             flume::unbounded::<rift_protocol::DaemonMessage>();
         let (daemon_unavailable_tx, daemon_unavailable_rx) = flume::unbounded::<()>();
-        // Post-connect picker coordination (#706): the daemon thread sends
-        // the live host list once on `picker_list_tx` and blocks on
-        // `picker_choice_rx` for the pick; only reached when `session_unset`
-        // (`run_daemon_terminal`'s own check against the session watch).
-        let (picker_list_tx, picker_list_rx) = flume::unbounded::<Vec<SessionListItem>>();
+        // Post-connect picker coordination (#706/#707): the daemon thread
+        // sends what its live-list query resolved to once on
+        // `picker_outcome_tx` (a direct attach, or the list to show), and
+        // blocks on `picker_choice_rx` for the pick; only reached for
+        // `SessionIntent::Preferred`/`Pick` (`run_daemon_terminal`'s own
+        // check against the session watch).
+        let (picker_outcome_tx, picker_outcome_rx) = flume::unbounded::<PickerOutcome>();
         let (picker_choice_tx, picker_choice_rx) = flume::unbounded::<String>();
         // Fires once when the session pipeline this attempt spawned ends —
         // orderly exit, a canceled reconnect, or a non-retryable failure
@@ -929,10 +988,10 @@ impl Shell {
                         status_tx,
                         cancel_rx: reconnect_cancel_rx,
                         key_exists,
-                        session: session_name,
+                        session_intent,
                         session_ended_tx,
                         picker: PickerChannels {
-                            list_tx: picker_list_tx,
+                            outcome_tx: picker_outcome_tx,
                             choice_rx: picker_choice_rx,
                         },
                     },
@@ -988,49 +1047,73 @@ impl Shell {
         })
         .detach();
 
-        if session_unset {
-            // The Session field was blank (#706): the daemon thread will
-            // show a picker instead of attaching directly. The eagerly built
-            // `workspace` above stays off-screen and unfocused until a pick
-            // lands (`Shell::enter_workspace`) — focusing it now would steal
-            // keyboard input from the picker even though it is not rendered.
+        if is_fixed_intent {
+            self.enter_workspace(workspace, window, cx);
+        } else {
+            // `Preferred`/`Pick` (issue #707): the daemon thread queries the
+            // live host list and either attaches a `Preferred` name directly
+            // or shows the picker — resolved asynchronously, so the eagerly
+            // built `workspace` above stays off-screen and unfocused until
+            // either lands (`Shell::enter_workspace`) — focusing it now would
+            // steal keyboard input from the picker even though it is not
+            // rendered.
             let ssh_label = SharedString::from(ssh_label);
             let order = self
                 .session_order_path
                 .as_deref()
                 .map(session_order::load)
                 .unwrap_or_default();
+            let recents_path = self.recents_path.clone();
             cx.spawn_in(window, async move |this, cx| {
-                let Ok(sessions) = picker_list_rx.recv_async().await else {
+                let Ok(outcome) = picker_outcome_rx.recv_async().await else {
                     return;
                 };
-                let _ = this.update_in(cx, |shell, window, cx| {
-                    shell.show_session_picker(
-                        PickerLaunch {
-                            ssh_label,
-                            sessions,
-                            order,
-                            choice_tx: picker_choice_tx,
-                            workspace,
-                        },
-                        window,
-                        cx,
-                    );
-                });
+                match outcome {
+                    PickerOutcome::Attached(name) => {
+                        // A `Preferred` name is still present on the host:
+                        // attached directly, no picker shown. Record it now —
+                        // the session is finally known — instead of the
+                        // pre-pick placeholder `connect()` deferred at the
+                        // top of this function.
+                        if let Some(path) = &recents_path {
+                            recent_target.record(path, &name);
+                        }
+                        let _ = this.update_in(cx, |shell, window, cx| {
+                            shell.enter_workspace(workspace, window, cx);
+                        });
+                    }
+                    PickerOutcome::ShowPicker(sessions) => {
+                        let recents = recents_path.map(|path| (path, recent_target));
+                        let _ = this.update_in(cx, |shell, window, cx| {
+                            shell.show_session_picker(
+                                PickerLaunch {
+                                    ssh_label,
+                                    sessions,
+                                    order,
+                                    choice_tx: picker_choice_tx,
+                                    workspace,
+                                    recents,
+                                },
+                                window,
+                                cx,
+                            );
+                        });
+                    }
+                }
             })
             .detach();
-        } else {
-            self.enter_workspace(workspace, window, cx);
         }
     }
 
     /// The post-connect picker's live host list arrived (#706): build the
     /// picker (rows sorted via the client-side order store, exactly like the
     /// cockpit strip — `session_order::sort_sessions`) and show it. A pick
-    /// sends the chosen name to the daemon thread over `launch.choice_tx`,
-    /// then swaps straight to `launch.workspace` — the `WorkspaceView` built
-    /// eagerly in `connect`, unchanged since #477, whose session pipeline the
-    /// daemon thread now attaches for real.
+    /// records the chosen name in recents (issue #707 — `launch.recents`,
+    /// `None` when the recents store is unavailable), sends it to the daemon
+    /// thread over `launch.choice_tx`, then swaps straight to
+    /// `launch.workspace` — the `WorkspaceView` built eagerly in `connect`,
+    /// unchanged since #477, whose session pipeline the daemon thread now
+    /// attaches for real.
     fn show_session_picker(
         &mut self,
         launch: PickerLaunch,
@@ -1043,6 +1126,7 @@ impl Shell {
             order,
             choice_tx,
             workspace,
+            recents,
         } = launch;
         let picker = cx.new(|cx| SessionPicker::new(ssh_label, sessions, &order, window, cx));
         cx.subscribe_in(
@@ -1050,6 +1134,9 @@ impl Shell {
             window,
             move |this, _picker, event: &SessionPickerEvent, window, cx| {
                 let SessionPickerEvent::Pick(name) = event;
+                if let Some((path, target)) = &recents {
+                    target.record(path, name);
+                }
                 let _ = choice_tx.send(name.clone());
                 this.enter_workspace(workspace.clone(), window, cx);
             },
@@ -1152,9 +1239,11 @@ struct SessionRunParams {
     status_tx: flume::Sender<ConnectionStatus>,
     cancel_rx: flume::Receiver<()>,
     key_exists: bool,
-    /// The tmux session name to attach to — the connect request's Session
-    /// field, itself prefilled from `RIFT_SESSION` (#477).
-    session: String,
+    /// The entry point's resolved session intent (issue #707): decides
+    /// whether this run attaches directly (`Fixed`), tries a remembered name
+    /// before falling back to the picker (`Preferred`), or always shows the
+    /// picker (`Pick`).
+    session_intent: SessionIntent,
     /// Fires exactly once when this run's loop ends, so the Shell can route
     /// back to a fresh Connection screen (#477). Carries [`ConnectError::Passphrase`]
     /// instead of [`ConnectError::General`] when the failure was the SSH key
@@ -1162,7 +1251,7 @@ struct SessionRunParams {
     /// error at that field rather than only the general banner.
     session_ended_tx: flume::Sender<Option<ConnectError>>,
     /// The post-connect picker's cross-thread channels (#706); reached only
-    /// when `session` above is the unset sentinel (empty).
+    /// for `SessionIntent::Preferred`/`Pick`.
     picker: PickerChannels,
 }
 
@@ -1173,7 +1262,7 @@ fn run_session_with_reconnect(ssh: &SshConfig, params: SessionRunParams) {
         status_tx,
         cancel_rx,
         key_exists,
-        session,
+        session_intent,
         session_ended_tx,
         picker,
     } = params;
@@ -1185,10 +1274,22 @@ fn run_session_with_reconnect(ssh: &SshConfig, params: SessionRunParams) {
     // exit, a canceled reconnect, or the render side going away), which the
     // screen treats as "no error to show", not log-only.
     let mut end_reason: Option<ConnectError> = None;
+    // `Fixed` seeds the session watch directly (byte-for-byte the pre-#706
+    // SET path — never reaches the picker branch below). `Preferred`/`Pick`
+    // seed it with the unset sentinel (empty); `Preferred` additionally
+    // stashes its remembered name in `preferred_session` for
+    // `await_session_pick` to try against the live host list before falling
+    // back to the picker (issue #707).
+    let (initial_session, preferred_session) = match session_intent {
+        SessionIntent::Fixed(name) => (name, None),
+        SessionIntent::Preferred(name) => (String::new(), Some(name)),
+        SessionIntent::Pick => (String::new(), None),
+    };
     let watches = EngineWatches {
-        session: tokio::sync::watch::channel(session).0,
+        session: tokio::sync::watch::channel(initial_session).0,
         viewport: tokio::sync::watch::channel(None::<TermSize>).0,
         picker,
+        preferred_session,
     };
     loop {
         connected.store(false, Ordering::Relaxed);
@@ -1367,16 +1468,15 @@ async fn run_ssh_session(
     // degrading — falling back would hide real skew as silent feature death.
     let daemon_client = provision_daemon(&mut conn).await?;
 
-    // Tmux session name: seeded from the Connection screen's connect request
-    // into the engine's session watch (the screen's Session field defaults
-    // to `RIFT_SESSION`/`rift`, so a second rift instance still mirrors the
-    // same live session, or attaches to an isolated one for destructive
-    // tests, `RIFT_SESSION=rift-dev` — docs/spec-dogfooding-channels.md, by
-    // leaving the field at its prefilled default). Resolved through the
-    // watch, not the request, so an SSH-level reconnect re-attaches the
-    // session a cockpit switch (#509) moved the client to. A blank field
-    // seeds this watch with the unset sentinel (empty — #706,
-    // `docs/spec-post-connect-picker.md`); the daemon-path branch below
+    // Tmux session name: seeded from the entry point's resolved
+    // `SessionIntent` (issue #707, `docs/spec-post-connect-picker.md`) into
+    // the engine's session watch. `RIFT_SESSION` (env, e.g.
+    // `RIFT_SESSION=rift-dev` for the dogfooding dev channel —
+    // docs/spec-dogfooding-channels.md) resolves to `SessionIntent::Fixed`
+    // and seeds this watch directly. Resolved through the watch, not the
+    // request, so an SSH-level reconnect re-attaches the session a cockpit
+    // switch (#509) moved the client to. `Preferred`/`Pick` seed this watch
+    // with the unset sentinel (empty); the daemon-path branch below
     // (`run_daemon_terminal`) resolves it through the post-connect picker
     // before the first `Attach` instead of reading it here directly.
     let session = watches.session.borrow().clone();
@@ -1426,7 +1526,7 @@ async fn run_ssh_session(
         spawn_git_op_bridge(client_rx.clone(), editor.git_op_rx.clone());
         spawn_file_op_bridge(client_rx, editor.file_op_rx.clone());
         tokio::spawn(async move {
-            consume_daemon_messages(&client, None, &editor, None, None).await;
+            consume_daemon_messages(&client, None, &editor, false, None).await;
         });
     } else {
         info!("terminal source: legacy tmux (no daemon configured)");
@@ -1517,17 +1617,23 @@ async fn run_daemon_terminal(
     // the reconnect engine, not an orderly end.
     let session = watches.session.borrow().clone();
     let session = if session_is_unset(&session) {
-        // Post-connect session picker (#706, `docs/spec-post-connect-picker.md`):
-        // the connect card's Session field was left blank, so nothing survived
-        // to this attach. Query the live host list, hand it to the Shell's
-        // picker, and block for the pick before the first `Attach` — the SET
-        // path above (a non-empty watch) never reaches this branch and stays
-        // byte-for-byte the pre-picker flow. Re-entered on every reconnect
-        // attempt while the watch stays unset (SSH dropping before a pick
-        // re-shows the picker instead of a blind attach); the watch is seeded
-        // below so a later reconnect (after a pick) skips straight past this
-        // branch.
-        let picked = await_session_pick(&client, &editor, &watches.picker).await?;
+        // Post-connect session picker (#706/#707, `docs/spec-post-connect-picker.md`):
+        // the entry point's intent was `Preferred`/`Pick`, so nothing survived
+        // to this attach yet. Query the live host list and either attach a
+        // `Preferred` name directly or block for the Shell's pick before the
+        // first `Attach` — the `Fixed` path above (a non-empty watch) never
+        // reaches this branch and stays byte-for-byte the pre-picker flow.
+        // Re-entered on every reconnect attempt while the watch stays unset
+        // (SSH dropping before resolution re-shows the picker instead of a
+        // blind attach); the watch is seeded below so a later reconnect
+        // (after resolution) skips straight past this branch.
+        let picked = await_session_pick(
+            &client,
+            &editor,
+            &watches.picker,
+            watches.preferred_session.as_deref(),
+        )
+        .await?;
         watches.session.send_replace(picked.clone());
         picked
     } else {
@@ -1637,7 +1743,7 @@ async fn run_daemon_terminal(
     };
     let mut current = client;
     loop {
-        if consume_daemon_messages(&current, Some(&sinks), &editor, None, None).await
+        if consume_daemon_messages(&current, Some(&sinks), &editor, false, None).await
             == StreamEnd::TerminalExit
         {
             return Ok(());
@@ -1658,23 +1764,42 @@ async fn run_daemon_terminal(
 
 /// Whether `session` is the post-connect picker's "unset" sentinel (#706,
 /// `docs/spec-post-connect-picker.md`): an empty string, seeded into
-/// `EngineWatches.session` whenever the connect request's session was blank
-/// (this PR's interim trigger — the connect card's Session field left empty).
-/// Checked everywhere that watch is read for an attach: here, and again at
-/// `run_daemon_terminal`'s first `Attach`.
+/// `EngineWatches.session` whenever the entry point's intent was
+/// `SessionIntent::Preferred`/`Pick` (issue #707). Checked everywhere that
+/// watch is read for an attach: here, and again at `run_daemon_terminal`'s
+/// first `Attach`.
 fn session_is_unset(session: &str) -> bool {
     session.is_empty()
 }
 
-/// Pre-cockpit session pick (#706): entered only when `watches.session` is
-/// unset. Issues `QuerySessionList` on the handshaken client and reuses
+/// The `SessionIntent::Preferred` routing decision (issue #707), pure so it
+/// is unit-testable without a daemon round-trip: whether `preferred` is
+/// present in the live host `sessions` list. `Some(name)` attaches directly;
+/// `None` (either `preferred` itself is `None` — `SessionIntent::Pick` — or
+/// the name is no longer on the host) falls back to the picker.
+fn resolve_preferred_session(
+    preferred: Option<&str>,
+    sessions: &[SessionListItem],
+) -> Option<String> {
+    let name = preferred?;
+    sessions
+        .iter()
+        .any(|session| session.name == name)
+        .then(|| name.to_string())
+}
+
+/// Pre-cockpit session pick (#706/#707): entered only when `watches.session`
+/// is unset. Issues `QuerySessionList` on the handshaken client and reuses
 /// [`consume_daemon_messages`]'s own routing table for everything else that
 /// arrives along the way — the daemon's post-Welcome state replay (worktree,
 /// git, diagnostics, LSP health) can interleave with the reply, and this way
 /// none of it is dropped even though no `Attach` has happened yet. The first
-/// call taps the session list; the second blocks for the Shell's pick, racing
-/// it against the same stream so a stream death while the picker is showing
-/// unblocks this await instead of hanging forever.
+/// call captures the session list; if `preferred` ([`resolve_preferred_session`])
+/// is still present there, this returns immediately without ever showing the
+/// picker. Otherwise the list is handed to the Shell's picker and the second
+/// call blocks for the pick, racing it against the same stream so a stream
+/// death while the picker is showing unblocks this await instead of hanging
+/// forever.
 ///
 /// Either failure case returns a [`rift_ssh::SshError::Channel`] rather than
 /// a plain `anyhow!` string: [`is_retryable_session_error`] only recognizes
@@ -1689,6 +1814,7 @@ async fn await_session_pick(
     client: &rift_ssh::DaemonClient,
     editor: &EditorChannels,
     picker: &PickerChannels,
+    preferred: Option<&str>,
 ) -> Result<String> {
     use rift_protocol::ClientMessage;
 
@@ -1697,14 +1823,25 @@ async fn await_session_pick(
         .await
         .context("failed to query the session list for the picker")?;
 
-    let sent = consume_daemon_messages(client, None, editor, Some(&picker.list_tx), None).await;
-    if sent != StreamEnd::SessionListSent {
-        return Err(anyhow::Error::new(rift_ssh::SshError::Channel(
-            "daemon stream closed before the picker's session list arrived".to_string(),
-        )));
+    let sessions = match consume_daemon_messages(client, None, editor, true, None).await {
+        StreamEnd::SessionListSent(sessions) => sessions,
+        _ => {
+            return Err(anyhow::Error::new(rift_ssh::SshError::Channel(
+                "daemon stream closed before the picker's session list arrived".to_string(),
+            )))
+        }
+    };
+
+    if let Some(name) = resolve_preferred_session(preferred, &sessions) {
+        let _ = picker
+            .outcome_tx
+            .send(PickerOutcome::Attached(name.clone()));
+        return Ok(name);
     }
 
-    match consume_daemon_messages(client, None, editor, None, Some(&picker.choice_rx)).await {
+    let _ = picker.outcome_tx.send(PickerOutcome::ShowPicker(sessions));
+
+    match consume_daemon_messages(client, None, editor, false, Some(&picker.choice_rx)).await {
         StreamEnd::Picked(name) => Ok(name),
         _ => Err(anyhow::Error::new(rift_ssh::SshError::Channel(
             "daemon stream closed while awaiting the session pick".to_string(),
@@ -2324,21 +2461,22 @@ async fn provision_daemon(
 /// attach. The structure/buffer sends are best-effort: a closed GPUI-side
 /// receiver (window gone) drops the message rather than fail the loop.
 ///
-/// `session_list_tap` and `pick_rx` are the post-connect picker's seam
-/// (#706, `docs/spec-post-connect-picker.md`), both `None` for every call
-/// site outside [`await_session_pick`]: when `session_list_tap` is `Some`,
-/// the next `SessionListReply` is forwarded there instead of `terminal`'s
-/// sink and ends the call with [`StreamEnd::SessionListSent`]; when `pick_rx`
-/// is `Some`, every iteration also races a receive on it, ending the call
-/// with [`StreamEnd::Picked`] the moment a pick lands. Every other message
-/// arm is unaffected either way, so the picker's two calls still route
-/// worktree/buffer/nav/diagnostics/LSP traffic exactly like a normal call —
-/// nothing arriving during the pre-Attach window is dropped.
+/// `capture_session_list` and `pick_rx` are the post-connect picker's seam
+/// (#706/#707, `docs/spec-post-connect-picker.md`), `false`/`None` for every
+/// call site outside [`await_session_pick`]: when `capture_session_list` is
+/// `true`, the next `SessionListReply` ends the call with
+/// [`StreamEnd::SessionListSent`] (carrying the mapped list) instead of
+/// reaching `terminal`'s sink; when `pick_rx` is `Some`, every iteration also
+/// races a receive on it, ending the call with [`StreamEnd::Picked`] the
+/// moment a pick lands. Every other message arm is unaffected either way, so
+/// the picker's two calls still route worktree/buffer/nav/diagnostics/LSP
+/// traffic exactly like a normal call — nothing arriving during the
+/// pre-Attach window is dropped.
 async fn consume_daemon_messages(
     client: &rift_ssh::DaemonClient,
     terminal: Option<&TerminalSinks>,
     editor: &EditorChannels,
-    session_list_tap: Option<&flume::Sender<Vec<SessionListItem>>>,
+    capture_session_list: bool,
     pick_rx: Option<&flume::Receiver<String>>,
 ) -> StreamEnd {
     use rift_protocol::DaemonMessage;
@@ -2408,13 +2546,12 @@ async fn consume_daemon_messages(
                         attached: entry.attached,
                     })
                     .collect();
-                // The post-connect picker's tap (#706) takes this reply
-                // instead of the normal sink and ends the call right here —
-                // only armed by `await_session_pick`'s first call, never
-                // alongside a live `terminal` sink.
-                if let Some(tap) = session_list_tap {
-                    let _ = tap.send(sessions);
-                    return StreamEnd::SessionListSent;
+                // The post-connect picker's capture (#706/#707) takes this
+                // reply instead of the normal sink and ends the call right
+                // here — only armed by `await_session_pick`'s first call,
+                // never alongside a live `terminal` sink.
+                if capture_session_list {
+                    return StreamEnd::SessionListSent(sessions);
                 }
                 if let Some(sinks) = terminal {
                     let _ = sinks.session_list_tx.send(sessions);
@@ -2518,11 +2655,13 @@ enum StreamEnd {
     /// The daemon reported the tmux attach ended (`%exit`): an orderly end of
     /// the session, not a transport failure to recover from.
     TerminalExit,
-    /// The post-connect picker's session list was forwarded to
-    /// `session_list_tap` (#706) — only reachable when that tap is armed;
+    /// The post-connect picker's session list was captured (#706/#707) —
+    /// only reachable when `capture_session_list` is armed; carries the
+    /// mapped list so [`await_session_pick`] can check a `Preferred` name
+    /// against it before deciding whether to show the picker.
     /// [`await_session_pick`] treats anything else from that call as the
     /// stream dying before the reply arrived.
-    SessionListSent,
+    SessionListSent(Vec<SessionListItem>),
     /// The user picked (or created) a session while `pick_rx` was armed
     /// (#706) — carries the chosen name so [`await_session_pick`]'s caller
     /// can seed the engine's session watch before the first `Attach`.
@@ -3105,9 +3244,9 @@ fn layout_to_snapshot(
 #[cfg(test)]
 mod tests {
     use super::{
-        drain_render_backlog, is_retryable_session_error, layout_to_snapshot, session_is_unset,
-        CaptureRequest, EditorChannels, EngineWatches, PaneInput, PickerChannels, PtyChannels,
-        SessionSwitchRequest, TermSize,
+        drain_render_backlog, is_retryable_session_error, layout_to_snapshot,
+        resolve_preferred_session, session_is_unset, CaptureRequest, EditorChannels, EngineWatches,
+        PaneInput, PickerChannels, PtyChannels, SessionListItem, SessionSwitchRequest, TermSize,
     };
 
     #[test]
@@ -3119,6 +3258,44 @@ mod tests {
     fn test_session_is_unset_non_empty_name_is_set() {
         assert!(!session_is_unset("rift"));
         assert!(!session_is_unset("rift-dev"));
+    }
+
+    fn session_item(name: &str) -> SessionListItem {
+        SessionListItem {
+            id: 1,
+            name: name.to_string(),
+            windows: 1,
+            attached: false,
+        }
+    }
+
+    #[test]
+    fn test_resolve_preferred_session_present_returns_the_name() {
+        let sessions = vec![session_item("work"), session_item("scratch")];
+
+        assert_eq!(
+            resolve_preferred_session(Some("work"), &sessions),
+            Some("work".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_preferred_session_absent_returns_none() {
+        let sessions = vec![session_item("scratch")];
+
+        assert_eq!(resolve_preferred_session(Some("work"), &sessions), None);
+    }
+
+    #[test]
+    fn test_resolve_preferred_session_none_returns_none() {
+        let sessions = vec![session_item("work")];
+
+        assert_eq!(resolve_preferred_session(None, &sessions), None);
+    }
+
+    #[test]
+    fn test_resolve_preferred_session_empty_list_returns_none() {
+        assert_eq!(resolve_preferred_session(Some("work"), &[]), None);
     }
 
     /// The engine-side ends ([`PtyChannels`] / [`EditorChannels`] /
@@ -3210,9 +3387,10 @@ mod tests {
                 session: tokio::sync::watch::channel("rift".to_string()).0,
                 viewport: tokio::sync::watch::channel(None::<TermSize>).0,
                 picker: PickerChannels {
-                    list_tx: flume::unbounded().0,
+                    outcome_tx: flume::unbounded().0,
                     choice_rx: flume::unbounded().1,
                 },
+                preferred_session: None,
             },
             input_tx,
             size_tx,

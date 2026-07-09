@@ -2,14 +2,14 @@
 //! a pre-cockpit `Shell` state shown after the SSH connect + daemon handshake
 //! and before the cockpit attach, but only while the session is unresolved.
 //!
-//! This PR (33a of the phase-33 picker) wires the SAFE-INTERIM trigger: the
-//! Connection screen's Session field left blank. A filled field (or one
-//! prefilled by `RIFT_SESSION`) still attaches directly, exactly like before
-//! — the picker is only reachable by deliberately clearing the field, so the
-//! normal/dogfooding connect path stays untouched even while this surface is
-//! new. Issue #707 replaces the trigger with full entry-point routing (a
-//! remembered recent, `RIFT_SESSION`, or "Connect \u{2192}" always picking);
-//! issue #705 removes the field entirely.
+//! Issue #707 wires the full entry-point routing: `RIFT_SESSION` (env)
+//! resolves to `SessionIntent::Fixed` and attaches directly, no picker (the
+//! dogfooding fast-path); a RECENT row's remembered session resolves to
+//! `SessionIntent::Preferred` and attaches directly if still present on the
+//! live host, else shows this picker; the plain "Connect \u{2192}" button
+//! resolves to `SessionIntent::Pick` and always shows it. Issue #705 removes
+//! the connect card's Session field entirely — `main.rs`'s entry point is the
+//! only session source now.
 //!
 //! Deliberately GPUI-view-only, mirroring [`crate::connection_screen::ConnectionScreen`]:
 //! it emits [`SessionPickerEvent`] and never touches the daemon client or SSH
