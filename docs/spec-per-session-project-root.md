@@ -1,6 +1,6 @@
 # Spec: Per-session project root (root follows the active session)
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-07-09
 > Completed: —
 
@@ -134,9 +134,9 @@ Roadmap Phase 35; codifies "tmux session = project". Depends on Phase 34 (the
 |---|---|---|
 | **Couple via the tmux `@root` session user option**, stamped by the daemon at `new-session`; resolve `@root` → else `#{session_path}` | Native, session-scoped, durable, and shared across the two dogfooding instances without an external project registry (`docs/prior-art.md`, "Session ↔ project root coupling"). `#{session_path}` (the session working dir Phase 34 sets via `-c`) is the natural fallback for externally-created sessions, so "session = project" holds even without an explicit stamp. | 2026-07-09 |
 | **Re-root delivered over the existing `WorktreeSnapshot { root }` / `RepoState` / `Diagnostics` messages** — no new "re-root" message | These are already replace-semantics keyed by root/path (`docs/protocol.md`); a fresh snapshot with the new root *is* the re-root. The client already follows the daemon's streamed root, so the reactive-view change is minimal. | 2026-07-09 |
-| **OPEN — resolved at the gate: daemon-side root resolution (daemon reads `@root`/`session_path` on `Attach` via a `display-message -p` round-trip on the control child) vs app-side (app reads `SessionEntry.root`, passes it in `Attach { session, root }`).** Proposed: **daemon-side** | Refines the roadmap's pre-planning "resolved app-side and passed on attach" guess. `@root` is introduced by this phase — it is not read anywhere today; daemon-side keeps root resolution next to the workers and the control child that already runs correlated queries, and needs **no `Attach` protocol change**. App-side is the roadmap's stated approach and keeps config app-side but adds an `Attach` field (version bump) and app-side per-session root tracking. | 2026-07-09 |
-| **OPEN — resolved at the gate: daemon context structure.** Proposed: **(c) per-root, reference-counted context map** | (a) *single re-rootable State* thrashes when two connections attach different sessions (they contend for the one root); (b) *per-connection context* duplicates the language server for the common same-session dogfooding case (2× rust-analyzer → OOM risk on the ~1-2 GB-free host); **(c)** shares one context per root (no duplicate LSP) yet separates distinct roots (correct under parallel instances) — the Zed `HeadlessProject`/`WorktreeStore` shape (`docs/prior-art.md`). Larger, but the only option that breaks neither rift scenario. | 2026-07-09 |
-| **OPEN — resolved at the gate: per-session-root display.** Proposed: **defer** (keep Phase 35 protocol-free) | Showing each session's project path in the list/picker needs `SessionEntry.root` (+ `#{@root}` in `SESSION_LIST_QUERY`, + a `PROTOCOL_VERSION` bump). It is a UX nicety separable from the re-root mechanism; deferring keeps the architecture refactor un-entangled from a protocol bump. Including it is cheap if wanted with the picker. | 2026-07-09 |
+| **Daemon-side root resolution** — the daemon reads `@root`/`session_path` on `Attach` via a `display-message -p` round-trip on the control child; `Attach` is unchanged | Resolved at the gate. `@root` is introduced by this phase; daemon-side keeps root resolution next to the workers and the control child that already runs correlated queries, and needs **no `Attach` protocol change**. Refines the roadmap's pre-planning "resolved app-side" guess. | 2026-07-09 |
+| **Per-root, reference-counted context map** (Zed `HeadlessProject`/`WorktreeStore` shape) | Resolved at the gate. (a) *single re-rootable State* thrashes when two connections attach different sessions; (b) *per-connection context* duplicates the language server for the same-session dogfooding case (2× rust-analyzer → OOM on the ~1-2 GB-free host); **(c)** shares one context per root (no duplicate LSP) yet separates distinct roots — the only option that breaks neither rift scenario (`docs/prior-art.md`). | 2026-07-09 |
+| **Defer per-session-root display** — Phase 35 stays protocol-free | Resolved at the gate. Showing each session's project path in the list/picker needs `SessionEntry.root` (+ `#{@root}` in `SESSION_LIST_QUERY`, + a `PROTOCOL_VERSION` bump); it is a UX nicety separable from the re-root mechanism and lands with the picker phase, keeping the architecture refactor un-entangled from a protocol bump. | 2026-07-09 |
 | **Detach a connection's open buffers on re-root**; defer cross-switch editor-tab persistence | Prevents a cross-project wrong-root write (a buffer opened in project A, saved after switching to B): the daemon drops the connection's live-buffer feed on re-root and the client closes editor buffers on a project switch, with the `mtime`-conflict check as the backstop. Keeping tabs across a project switch is a picker-era UX, out of scope here. | 2026-07-09 |
 | Scope excludes a project picker and Scenario 2's multi-context UI | Roadmap-bounded: Phase 35 is the coupling mechanism; choosing/saving arbitrary per-session roots and rendering multiple contexts at once are follow-on work (`docs/constitution.md`: no premature abstraction). | 2026-07-09 |
 
@@ -249,3 +249,8 @@ Each issue references this spec path in its body.
   cross-project wrong-root write. Plus the non-blocking fixes (decision count,
   Foundation-impact placement, reconnect/pick + buffer verification lines; the
   `roadmap.md` row-35 "app-side" wording is updated to daemon-side on merge).
+- 2026-07-09: Spec-acceptance gate. Resolved all three open decisions to the
+  proposed answers: **(c) per-root reference-counted context map**, **daemon-side
+  root resolution** (`display-message -p`, no `Attach` change), and **defer
+  per-session-root display** (Phase 35 stays protocol-free). Human prerequisites:
+  none. Status `DRAFT` → `READY`; milestone `Phase 350` created at acceptance.
