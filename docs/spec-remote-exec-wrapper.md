@@ -37,11 +37,22 @@ knowledge baked into rift.
   once at connect from `RIFT_REMOTE_EXEC_WRAPPER` (runtime) with an optional
   `RIFT_DEFAULT_REMOTE_EXEC_WRAPPER` compile-time bake — **OPEN, resolved at the
   spec-acceptance gate** (see Prior decisions).
-- Applying the wrapper at exactly the three non-PTY exec methods that carry
-  daemon work: `exec_capture`, `open_daemon_channel`, `upload_executable`
-  (`crates/ssh/src/connection.rs`). When a wrapper is set, the command string
-  `C` becomes `<wrapper> sh -c <shell_single_quote(C)>`; when unset, `C` is
-  passed through unchanged.
+- A **single shared `wrap(command)` helper** (on `SshConnection` / in the `exec`
+  module) that all three non-PTY exec methods — `exec_capture`,
+  `open_daemon_channel`, `upload_executable` (`crates/ssh/src/connection.rs`) —
+  call, so "wrapped or not" is atomic across every daemon command. When a wrapper
+  is set, the command string `C` becomes `<wrapper> sh -c <shell_single_quote(C)>`;
+  when unset, `C` is passed through unchanged. One shared helper (not three
+  independent edits) is a hard requirement: a method that forgets to wrap would
+  split the deploy — probing in-container while `cat`-ing the binary to the host
+  FS (or vice-versa) — silently.
+- The wrapper is threaded onto `SshConnection` via a **setter/builder**
+  (e.g. `with_remote_exec_wrapper`), NOT as a new `connect()` parameter — so the
+  `ssh` crate keeps its independent green build and issue 1 (ssh) does not force
+  the single `connect()` call site (`crates/app/src/main.rs:1458`) into the same
+  PR. The `<wrapper>` tokens are spliced **raw** (word-split by the host shell
+  into argv, e.g. `docker exec -i devenv`); only `C` is quoted. Same trust model
+  as `RIFT_SSH_KEY`.
 - Reusing the existing `shell_single_quote` helper for the added nesting layer —
   the same double-escaping idiom `launch.rs` already uses for `setsid sh -c`
   (tested there), so composed commands (`>`, `&&`, `if/fi`, `$HOME` expansion)
@@ -49,15 +60,26 @@ knowledge baked into rift.
 - Unit tests on the wrap transform: passthrough when unset; correct
   `<wrapper> sh -c '…'` shape when set; nested single-quote escaping; shell
   metacharacter / injection neutralization (mirroring the `launch.rs` guards).
-- Documentation of the container-target usage (env vars, `RIFT_PROJECT_ROOT`
-  pointing at the in-container root) in `CLAUDE.md` / justfile comments.
+- Documentation of the container-target usage in `CLAUDE.md` / justfile
+  comments: `RIFT_PROJECT_ROOT` must be an **absolute in-container path**
+  (`/workspace`), never `$HOME`-relative (`launch_command` single-quotes
+  `--root` literally, no `$HOME` expansion); and `RIFT_DAEMON_REMOTE_DIR` should
+  be set to an absolute in-container dir when the image does not guarantee
+  `$HOME` (`docker exec` runs no login shell — an unset `$HOME` makes the deploy
+  land in `/.rift/bin`).
 
 ### Out of scope
 
 - **The legacy `tmux -CC` path (`open_pty_exec`).** It requests a PTY (would need
   `-t`), the reactive layer is dead on it anyway, and it is already slated for
   removal (#285). The wrapper is not applied there; the container target is a
-  daemon-path feature.
+  daemon-path feature. **Split-brain caveat:** with the wrapper set AND
+  `RIFT_TERMINAL_LEGACY` selected, the daemon still provisions wrapped (watches
+  the container's `/workspace`) while `run_legacy_terminal` runs host tmux
+  unwrapped (`main.rs:1519-1538`, `:2006`) — explorer/git on the container,
+  terminal on the host. The wrapper is only coherent on the **daemon terminal
+  path** (the default); document that the two must not be combined. Not guarded
+  in code — the legacy hatch is being removed.
 - A connection-screen UI field for the wrapper — env/bake only for this cut
   (proportional; a UI field is a separate later issue if wanted).
 - Any change to the daemon, protocol, or `--root` mechanism: the in-container
@@ -89,6 +111,11 @@ knowledge baked into rift.
   exec methods, so the wrapper is one chokepoint, not ten call-site edits.
 - Constitution: no agent/target detection. The wrapper is an opaque string; rift
   learns nothing about Docker.
+- The wrapper must be a transparent transport: pass stdin through to the inner
+  command, forward EOF, and propagate the inner exit status (docker/podman/wsl
+  `-d`/nsenter/sudo all do). A wrapper that swallows the exit status would break
+  `drain_channel`'s zero-exit contract (`connection.rs:259`). Stated as a
+  requirement on the wrapper, not something rift can enforce.
 
 ## Prior decisions
 
@@ -131,6 +158,11 @@ Each issue references this spec path in its body.
 - [ ] Unit test: with a wrapper set, a composed command
       (`cat > 'x' && mv 'x' 'y'`) becomes `<wrapper> sh -c '<doubly-escaped>'`,
       and a path carrying `$(…)` / backticks stays inert inside the quoting.
+- [ ] Unit test at shipping depth: feed the real `launch_command(...)` output
+      (already `setsid sh -c '…'`, 2-deep) and the `cat_to_executable_command`
+      upload body through `wrap`, asserting the triple-nested shape round-trips
+      and injection stays inert — proves the composition at the depth that ships,
+      not one level shallower.
 - [ ] Behavioral (dev channel, manual QA): with
       `RIFT_REMOTE_EXEC_WRAPPER="docker exec -i <container>"` +
       `RIFT_PROJECT_ROOT=/workspace`, connecting to the homelab host deploys the
