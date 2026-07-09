@@ -3,6 +3,17 @@
 All notable changes to rift are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## v1.2.3 — 2026-07-09 — Session strip fixes (3)
+
+- Clicking a session chip switches sessions again. The strip lives inside the
+  vendored `TitleBar`, whose whole bar is a window-drag region: a left
+  mouse-down there armed a window move that canceled the chips' synthesized
+  `on_click` (and the inline kill-confirm buttons) before the mouse-up, so
+  left-clicks looked inert while the right-click context menu still worked. The
+  strip now swallows its own left mouse-down (as gpui-component's title-bar
+  example does for interactive children), so the drag never arms and the chips'
+  own handlers fire.
+
 ## v1.2.2 — 2026-07-09 — Session strip fixes (2)
 
 More title-bar session-strip fixes found in live use:
