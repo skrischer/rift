@@ -197,3 +197,10 @@ Each issue references this spec path in its body.
   three methods), builder/setter threading (not a `connect()` param), legacy
   split-brain caveat, `$HOME`/`RIFT_DAEMON_REMOTE_DIR` container edge, wrapper
   pass-through requirement, and a shipping-depth (triple-nested) wrap test.
+- 2026-07-09 (issue #763): wrap transform landed as a free `pub(crate) fn
+  wrap_command(wrapper: Option<&str>, command: &str) -> String` in
+  `connection.rs`'s `exec` module (not a `&self` method), so it is
+  unit-testable without an `SshConnection`; `open_daemon_channel`,
+  `exec_capture`, and `upload_executable` all route through it via a new
+  `remote_exec_wrapper` field set by `with_remote_exec_wrapper`.
+  `open_pty`/`open_pty_exec` are untouched per scope.

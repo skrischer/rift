@@ -248,6 +248,32 @@ mod tests {
     }
 
     #[test]
+    fn test_launch_command_wrapped_produces_triple_nested_shape_with_injection_inert() {
+        // Shipping-depth: launch_command already produces a `setsid sh -c '...'`
+        // (2-deep) command; wrap_command adds a third layer
+        // (`<wrapper> sh -c '...'`) when RIFT_REMOTE_EXEC_WRAPPER is set,
+        // covering the exact composition depth that ships.
+        let cmd = launch_command(
+            "/h/bin",
+            "/h/`id`.sock",
+            "/h/d.log",
+            Some("/h/$(touch pwned)"),
+        );
+        let wrapped = crate::connection::exec::wrap_command(Some("docker exec -i devenv"), &cmd);
+
+        assert_eq!(
+            wrapped,
+            format!("docker exec -i devenv sh -c {}", shell_single_quote(&cmd))
+        );
+        assert!(wrapped.starts_with("docker exec -i devenv sh -c "));
+        // The inner command (unwrapped) still carries the injection attempts
+        // only inside its own single-quoted arguments — wrapping adds a layer
+        // of quoting around the whole thing, so they stay inert at every depth.
+        assert!(cmd.contains("'/h/`id`.sock'"));
+        assert!(cmd.contains("--root '\\''/h/$(touch pwned)'\\''"));
+    }
+
+    #[test]
     fn test_launch_command_root_neutralizes_injection() {
         // A root path with shell metacharacters stays single-quoted inside the
         // `setsid sh -c` inner command (doubly-escaped in the final string), so it

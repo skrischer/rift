@@ -50,6 +50,7 @@ pub fn key_requires_passphrase(path: &Path) -> Result<bool, SshError> {
 
 pub struct SshConnection {
     handle: Handle<ClientHandler>,
+    remote_exec_wrapper: Option<String>,
 }
 
 impl SshConnection {
@@ -95,7 +96,23 @@ impl SshConnection {
         }
 
         info!(%host, port, %user, "SSH connection established");
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            remote_exec_wrapper: None,
+        })
+    }
+
+    /// Set the remote exec wrapper (`RIFT_REMOTE_EXEC_WRAPPER`), e.g.
+    /// `docker exec -i devenv`, so every non-PTY exec command
+    /// ([`Self::open_daemon_channel`], [`Self::exec_capture`],
+    /// [`Self::upload_executable`]) runs one hop deeper — inside a container, a
+    /// WSL distro, or under a jump user — instead of the host login shell. A
+    /// setter/builder rather than a `connect()` parameter, so callers that don't
+    /// need the wrapper are unaffected. `None` (the default) is byte-for-byte
+    /// passthrough — see [`exec::wrap_command`].
+    pub fn with_remote_exec_wrapper(mut self, wrapper: Option<String>) -> Self {
+        self.remote_exec_wrapper = wrapper;
+        self
     }
 
     /// Whether the underlying SSH transport has closed (dropped connection,
@@ -143,8 +160,9 @@ impl SshConnection {
     /// no shell — so its stdin/stdout become the daemon transport. The returned
     /// [`DaemonChannel`] is the byte half of the client-side transport seam.
     pub async fn open_daemon_channel(&mut self, command: &str) -> Result<DaemonChannel, SshError> {
+        let wrapped = exec::wrap_command(self.remote_exec_wrapper.as_deref(), command);
         let channel = self.handle.channel_open_session().await?;
-        channel.exec(true, command).await?;
+        channel.exec(true, wrapped.as_str()).await?;
         Ok(DaemonChannel::new(channel))
     }
 
@@ -154,8 +172,9 @@ impl SshConnection {
     ///
     /// Returns [`SshError::Exec`] if the command exits with a non-zero status.
     pub async fn exec_capture(&mut self, command: &str) -> Result<String, SshError> {
+        let wrapped = exec::wrap_command(self.remote_exec_wrapper.as_deref(), command);
         let mut channel = self.handle.channel_open_session().await?;
-        channel.exec(true, command).await?;
+        channel.exec(true, wrapped.as_str()).await?;
 
         let stdout = exec::drain_channel(&mut channel, None).await?;
         Ok(String::from_utf8_lossy(&stdout).into_owned())
@@ -177,8 +196,9 @@ impl SshConnection {
         remote_path: &str,
     ) -> Result<(), SshError> {
         let command = exec::cat_to_executable_command(remote_path);
+        let wrapped = exec::wrap_command(self.remote_exec_wrapper.as_deref(), &command);
         let mut channel = self.handle.channel_open_session().await?;
-        channel.exec(true, command.as_str()).await?;
+        channel.exec(true, wrapped.as_str()).await?;
 
         exec::drain_channel(&mut channel, Some(bytes)).await?;
         Ok(())
@@ -224,6 +244,33 @@ pub(crate) mod exec {
         }
         out.push('\'');
         out
+    }
+
+    /// Apply the remote exec wrapper (`RIFT_REMOTE_EXEC_WRAPPER`, e.g.
+    /// `docker exec -i devenv`) to `command`, so daemon exec commands run one
+    /// hop deeper — inside a container, a WSL distro, or under a jump user —
+    /// instead of directly in the host login shell
+    /// (`docs/spec-remote-exec-wrapper.md`).
+    ///
+    /// When `wrapper` is set (non-empty after trimming), `command` is relocated
+    /// into the wrapper's target as an argument to its `sh -c`:
+    /// `<wrapper> sh -c '<command>'`. The wrapper tokens are spliced **raw** so
+    /// the host shell word-splits them into argv (`docker exec -i devenv` ->
+    /// `docker`, `exec`, `-i`, `devenv`, `sh`, `-c`, `<command>`); only
+    /// `command` is single-quoted via [`shell_single_quote`] — the same
+    /// double-escape idiom [`crate::launch`] uses for `setsid sh -c` — so the
+    /// composed command (`>`, `&&`, `if`/`fi`, `$HOME`) is parsed by the
+    /// wrapper target's shell, not the host's.
+    ///
+    /// When `wrapper` is `None`, empty, or whitespace-only, `command` is
+    /// returned unchanged — byte-for-byte passthrough, no `sh -c` added.
+    pub(crate) fn wrap_command(wrapper: Option<&str>, command: &str) -> String {
+        match wrapper {
+            Some(w) if !w.trim().is_empty() => {
+                format!("{w} sh -c {}", shell_single_quote(command))
+            }
+            _ => command.to_owned(),
+        }
     }
 
     /// Drive an exec channel to completion: write `stdin` (if any) and send EOF,
@@ -319,6 +366,61 @@ pub(crate) mod exec {
                 "cat > '/tmp/$(touch pwned).tmp' && chmod +x '/tmp/$(touch pwned).tmp' \
                  && mv -f '/tmp/$(touch pwned).tmp' '/tmp/$(touch pwned)'"
             );
+        }
+
+        // ── wrap_command ──────────────────────────────────────────────────
+
+        #[test]
+        fn test_wrap_command_no_wrapper_returns_command_unchanged() {
+            assert_eq!(wrap_command(None, "echo hi"), "echo hi");
+        }
+
+        #[test]
+        fn test_wrap_command_empty_or_whitespace_wrapper_returns_command_unchanged() {
+            assert_eq!(wrap_command(Some(""), "echo hi"), "echo hi");
+            assert_eq!(wrap_command(Some("   "), "echo hi"), "echo hi");
+        }
+
+        #[test]
+        fn test_wrap_command_with_wrapper_relocates_command_into_sh_c() {
+            let command = "cat > 'x' && mv 'x' 'y'";
+            let wrapped = wrap_command(Some("docker exec -i c"), command);
+            assert_eq!(
+                wrapped,
+                format!("docker exec -i c sh -c {}", shell_single_quote(command))
+            );
+            // Wrapper tokens are spliced raw (word-split by the host shell);
+            // only the command is quoted.
+            assert!(wrapped.starts_with("docker exec -i c sh -c "));
+        }
+
+        #[test]
+        fn test_wrap_command_neutralizes_injection_inside_quoted_command() {
+            let command = "echo $(touch pwned) `whoami`";
+            let wrapped = wrap_command(Some("docker exec -i c"), command);
+            assert_eq!(
+                wrapped,
+                format!("docker exec -i c sh -c {}", shell_single_quote(command))
+            );
+            // `$(...)` and backticks stay inert inside the single-quoted
+            // argument — they must not execute in the host shell's argv.
+            assert!(wrapped.contains("$(touch pwned)"));
+            assert!(wrapped.contains("`whoami`"));
+        }
+
+        #[test]
+        fn test_wrap_command_wraps_cat_to_executable_command_upload_body() {
+            // Shipping-depth: the actual upload_executable command body, wrapped.
+            let upload_cmd = cat_to_executable_command("/h/rift-daemon-0.1.0");
+            let wrapped = wrap_command(Some("docker exec -i devenv"), &upload_cmd);
+            assert_eq!(
+                wrapped,
+                format!(
+                    "docker exec -i devenv sh -c {}",
+                    shell_single_quote(&upload_cmd)
+                )
+            );
+            assert!(wrapped.starts_with("docker exec -i devenv sh -c "));
         }
     }
 }
