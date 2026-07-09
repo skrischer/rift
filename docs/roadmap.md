@@ -268,6 +268,17 @@ is pre-baked into the in-flight
 phase-32/33 work — the `SessionSwitchRequest → Attach` seam
 (`crates/app/src/main.rs`) is already the extension point Phase 35 plugs into.
 
+Deferred UI concern (recorded 2026-07-09, for phase 36's `/loopkit:plan`): the
+connect flow should surface the remote-exec wrapper — `RIFT_REMOTE_EXEC_WRAPPER`
+(merged track [spec-remote-exec-wrapper.md](spec-remote-exec-wrapper.md),
+[milestone 54](https://github.com/skrischer/rift/milestone/54)), today env/bake
+only — as a per-connection field persisted in Recents, so a container / WSL / jump
+target is chosen in the GUI rather than via a launch-env `.cmd`. Couple it to the
+per-session root, do not build a throwaway connect-screen root field: a container
+connection = wrapper (per-connection) + root (phase-35 `@root` / the phase-36
+remote picker), one coherent flow. Depends on phase 35's `@root` substrate; the
+wrapper stays a transport setting resolved at SSH-connect, orthogonal to the root.
+
 Backing prior art: "Session ↔ project root coupling — prior-art index
 (Phases 34–36)" in [prior-art.md](prior-art.md).
 
