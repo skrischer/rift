@@ -309,6 +309,9 @@ export RIFT_PROJECT_ROOT := env("RIFT_PROJECT_ROOT", "/home/developer/CascadePro
 #   - only coherent on the daemon terminal path (the default); do not combine
 #     with `RIFT_TERMINAL_LEGACY` — the legacy `tmux -CC` path is unwrapped and
 #     would attach to the host's tmux while the daemon watches the container.
+#   - scope it per-launch like RIFT_SSH_HOST/RIFT_PROJECT_ROOT, never `export`
+#     it in a shell profile, or a second plain-host/WSL instance inherits it
+#     and tries `docker exec` against a container that isn't there.
 # Local musl daemon binary to auto-deploy and attach to. Defaults to the musl
 # release build under target/; `dev`/`dev-windows` build it first (via the
 # release-daemon dependency) so the path is always valid. It is absolute so the
