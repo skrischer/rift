@@ -87,11 +87,22 @@ fn encode_keystroke_impl(
     }
 
     // AltGr on Windows/Linux is reported as Ctrl+Alt. When a key_char is present,
-    // it's a composed character (e.g. AltGr+ß → \) — pass it through directly.
-    if ctrl && alt && allow_printable_passthrough {
+    // it's a composed character (e.g. AltGr+ß → \) — pass it through directly,
+    // or (mirroring the plain-printable branch below) leave it to the
+    // platform's separate text-commit channel when that channel is the sole
+    // sender. Either way this returns unconditionally once `key_char` is
+    // present: falling through to `encode_ctrl` below would treat the key's
+    // UNMODIFIED base key (`keystroke.key`, e.g. "8" for German AltGr+8 → "[")
+    // as a plain control combo, emitting a bogus control byte alongside the
+    // character WM_CHAR already delivers (#785 review, B2).
+    if ctrl && alt {
         if let Some(ch) = &keystroke.key_char {
             if !ch.is_empty() {
-                return Some(ch.as_bytes().to_vec());
+                return if allow_printable_passthrough {
+                    Some(ch.as_bytes().to_vec())
+                } else {
+                    None
+                };
             }
         }
     }
@@ -674,7 +685,10 @@ mod tests {
     #[test]
     fn test_encode_control_keystroke_altgr_composed_char_returns_none() {
         // AltGr-composed characters also arrive via WM_CHAR on Windows —
-        // excluded for the same reason as plain printables.
+        // excluded for the same reason as plain printables. "ß" alone would
+        // pass vacuously (its base key is 2-byte UTF-8, so `encode_ctrl`
+        // already returns `None` for it and never reaches the fallthrough
+        // bug); this must stay `None` too.
         let ks = Keystroke {
             modifiers: Modifiers {
                 control: true,
@@ -685,6 +699,56 @@ mod tests {
             key_char: Some("\\".into()),
         };
         assert_eq!(encode_control_keystroke(&ks, normal()), None);
+    }
+
+    #[test]
+    fn test_encode_control_keystroke_altgr_base_key_in_encode_ctrl_returns_none_not_control_byte() {
+        // Regression (#785 review, B2): German keyboard AltGr+8 -> "[".
+        // GPUI reports `key` as the UNMODIFIED base key ("8"), which maps in
+        // `encode_ctrl` (Ctrl+8 -> 0x7f). Before the fix, the AltGr branch
+        // being skipped on the control-only path let this fall through to
+        // the generic `ctrl` handling, emitting a bogus `ESC 0x7f`
+        // (backward-kill-word) alongside the "[" WM_CHAR delivers.
+        let altgr_8 = Keystroke {
+            modifiers: Modifiers {
+                control: true,
+                alt: true,
+                ..Modifiers::none()
+            },
+            key: "8".into(),
+            key_char: Some("[".into()),
+        };
+        assert_eq!(encode_control_keystroke(&altgr_8, normal()), None);
+
+        // AltGr+Q -> "@": base key "q" maps in `encode_ctrl` (Ctrl+Q -> 0x11).
+        let altgr_q = Keystroke {
+            modifiers: Modifiers {
+                control: true,
+                alt: true,
+                ..Modifiers::none()
+            },
+            key: "q".into(),
+            key_char: Some("@".into()),
+        };
+        assert_eq!(encode_control_keystroke(&altgr_q, normal()), None);
+    }
+
+    #[test]
+    fn test_encode_keystroke_altgr_base_key_in_encode_ctrl_still_passes_through() {
+        // `encode_keystroke` (the unchanged, non-Windows-on_key_down path)
+        // must keep composing AltGr+8 into "[", not a control byte — the
+        // invariant `encode_control_keystroke` stays narrower than, this
+        // does not change.
+        let altgr_8 = Keystroke {
+            modifiers: Modifiers {
+                control: true,
+                alt: true,
+                ..Modifiers::none()
+            },
+            key: "8".into(),
+            key_char: Some("[".into()),
+        };
+        assert_eq!(encode_keystroke(&altgr_8, normal()), Some(b"[".to_vec()));
     }
 
     #[test]
