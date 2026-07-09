@@ -1736,6 +1736,9 @@ impl SessionView {
                 name: current.to_string(),
                 windows: self.windows.len() as u32,
                 attached: true,
+                // No `SessionListReply` has landed yet, so no `@root` is
+                // known for this synthesized row either.
+                root: None,
             });
         }
         let prompt_input = self.new_session_prompt.as_ref().map(|p| p.input.clone());
@@ -1888,6 +1891,18 @@ impl SessionView {
                             .truncate()
                             .child(SharedString::from(row.name.clone())),
                     )
+                    // Secondary project-path label (`SessionEntry.root`,
+                    // `docs/spec-session-root-picker.md`) — muted, truncated,
+                    // shown only when the session has been stamped with a
+                    // root; absent otherwise (never shown for `None`).
+                    .children(row.root.as_ref().map(|root| {
+                        div()
+                            .max_w(px(120.0))
+                            .truncate()
+                            .text_size(px(11.0))
+                            .text_color(muted)
+                            .child(SharedString::from(root.clone()))
+                    }))
                     .children(
                         row.attached
                             .then(|| div().size(px(6.0)).rounded_full().bg(attached_dot)),
@@ -3312,6 +3327,7 @@ mod tests {
                 name: "rift".into(),
                 windows: 3,
                 attached: true,
+                root: None,
             }];
             let second = vec![
                 SessionListItem {
@@ -3319,12 +3335,14 @@ mod tests {
                     name: "rift".into(),
                     windows: 3,
                     attached: true,
+                    root: None,
                 },
                 SessionListItem {
                     id: 1,
                     name: "agent".into(),
                     windows: 1,
                     attached: false,
+                    root: None,
                 },
             ];
 
@@ -3354,18 +3372,21 @@ mod tests {
                         name: "rift".into(),
                         windows: 1,
                         attached: true,
+                        root: None,
                     },
                     SessionListItem {
                         id: 1,
                         name: "agent".into(),
                         windows: 1,
                         attached: false,
+                        root: None,
                     },
                     SessionListItem {
                         id: 2,
                         name: "tests".into(),
                         windows: 1,
                         attached: false,
+                        root: None,
                     },
                 ],
                 cx,
@@ -3621,6 +3642,7 @@ mod tests {
                         name: "rift".into(),
                         windows: 2,
                         attached: true,
+                        root: None,
                     }],
                     cx,
                 );
@@ -3662,12 +3684,14 @@ mod tests {
                             name: "rift".into(),
                             windows: 2,
                             attached: true,
+                            root: None,
                         },
                         SessionListItem {
                             id: 1,
                             name: "agent".into(),
                             windows: 1,
                             attached: false,
+                            root: None,
                         },
                     ],
                     cx,
@@ -3706,6 +3730,7 @@ mod tests {
                         name: "rift".into(),
                         windows: 1,
                         attached: false,
+                        root: None,
                     }],
                     cx,
                 );
@@ -3757,6 +3782,7 @@ mod tests {
                         name: "rift".into(),
                         windows: 1,
                         attached: false,
+                        root: None,
                     }],
                     cx,
                 );
