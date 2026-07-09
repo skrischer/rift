@@ -1391,6 +1391,9 @@ impl SessionView {
                 debug!(error = %e, "failed to send session rename command");
             }
         }
+        // The inline input unmounts now; return keyboard focus to the pane
+        // (mirrors window rename) so the terminal is not left keyboard-dead.
+        self.needs_focus = true;
         cx.notify();
     }
 
@@ -1398,6 +1401,7 @@ impl SessionView {
     fn cancel_session_rename(&mut self, cx: &mut Context<Self>) {
         if self.renaming_session.is_some() {
             self.renaming_session = None;
+            self.needs_focus = true;
             cx.notify();
         }
     }
