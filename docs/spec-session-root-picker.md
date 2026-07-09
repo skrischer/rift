@@ -1,6 +1,6 @@
 # Spec: New-session remote root picker
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-07-09
 > Completed: —
 
@@ -25,15 +25,17 @@ and reuses Phase 33's post-connect picker and Phase 32's session strip.
 
 - [ ] The `protocol` message set gains a **directory-browse channel** — a
       `QueryDirEntries { path }` request and a `DirEntriesReply` reply carrying the
-      resolved absolute path, its parent, and the child directory entries — **and a
-      `root: Option<String>` field on `Attach`** (the create-with-root transport),
-      as a deliberate, reviewed API extension: `PROTOCOL_VERSION` bumps `9 → 10`,
-      the fingerprint is re-pinned, and `docs/protocol.md` documents both. The
+      resolved absolute path, its parent, and the child directory entries — a
+      `root: Option<String>` field on `Attach` (the create-with-root transport),
+      and a `root` field on `SessionEntry` (each session's project path) — as a
+      deliberate, reviewed API extension: `PROTOCOL_VERSION` bumps `9 → 10`, the
+      fingerprint is re-pinned, and `docs/protocol.md` documents all three. The
       message contract is fully specified below; the implementer only wires it.
 - [ ] The **daemon serves directory listings** for an absolute path on the host
       via `std::fs::read_dir` on `spawn_blocking`, resolving an empty/`~` request to
       `$HOME` and returning child **directories** (symlinked dirs followed and
-      included, each flagged `is_git_repo`) — **daemon-side, never client SFTP**,
+      included, each flagged `is_git_repo` with its current git branch) —
+      **daemon-side, never client SFTP**,
       and — unlike the Phase-30 write path — **not confined to a worktree root**
       (its purpose is to choose a new root; the capability is a directory
       *enumeration* over reads the SSH user already has, so it adds no new
@@ -55,6 +57,10 @@ and reuses Phase 33's post-connect picker and Phase 32's session strip.
       empty-state screen — connecting to a host with **no sessions** opens the root
       picker directly (the session list shows only when sessions exist).
       `RIFT_SESSION` stays the picker-skipping fast-path.
+- [ ] The picker starts from a **recents list of recently-picked roots** (the
+      phase-9 store), falling back to `$HOME`; a successful create records the
+      picked root. The session list / picker show each session's project path from
+      `SessionEntry.root` (read from `#{@root}`).
 - [ ] The browse never blocks the UI: each directory level is an async round-trip
       to the daemon with a loading state; a denied / missing directory surfaces a
       legible error in the picker without tearing it down.
@@ -109,21 +115,32 @@ Add to `DaemonMessage`:
 
 Add the two supporting types:
 
-- `DirEntry { name: String, is_git_repo: bool }` — one child **directory**
-  (files are omitted: a project root is a directory; dotfile directories are
-  **included**). `is_git_repo` is a cheap `<name>/.git` existence check (no git
-  read), letting the picker flag repos (**OPEN**: whether to include it / the
-  current branch — see Prior decisions).
+- `DirEntry { name: String, is_git_repo: bool, git_branch: Option<String> }` — one
+  child **directory** (files are omitted: a project root is a directory; dotfile
+  directories are **included**). `is_git_repo` is a cheap `<name>/.git` existence
+  check; `git_branch` is the repo's current branch parsed from `<name>/.git/HEAD`
+  (`ref: refs/heads/<branch>` → `<branch>`; a detached HEAD or non-repo → `None`) —
+  a plain file read, **not** a `gix` call (resolved "flag + branch" at the
+  acceptance gate). `git_branch` carries
+  `#[serde(default, skip_serializing_if = "Option::is_none")]`.
 - `DirBrowseError` — a `#[serde(rename_all = "snake_case")]` typed reason
   (mirroring `FileOpError`): `NotFound`, `PermissionDenied`, `NotADirectory`,
   `Io`.
 
+Extend `SessionEntry` (`crates/protocol/src/lib.rs`) with `root: Option<String>`
+(`#[serde(default, skip_serializing_if = "Option::is_none")]`) and the daemon's
+`SESSION_LIST_QUERY` (`crates/daemon/src/terminal.rs`) to read `#{@root}` alongside
+the existing session fields, so `parse_session_line` fills each entry's root and the
+list / picker render each session's project path. Reading `#{@root}` depends on the
+Phase-35 stamp, so this rides the milestone-#53 dependency.
+
 Bump `PROTOCOL_VERSION` `9 → 10`, re-pin `PROTOCOL_FINGERPRINT` (the failing
-fingerprint test prints the new value) — the bump covers **both** the
-directory-browse channel and the new `Attach.root` field — add serde round-trip
-tests for every new/changed variant (valid + unknown-tag rejection, as the
-existing tests do), and extend `docs/protocol.md` with a "Directory-browse
-channel" section, the `Attach.root` addition, and a version-10 history line.
+fingerprint test prints the new value) — the bump covers the directory-browse
+channel, the new `Attach.root` field, and the `SessionEntry.root` field — add serde
+round-trip tests for every new/changed variant (valid + unknown-tag rejection, as
+the existing tests do), and extend `docs/protocol.md` with a "Directory-browse
+channel" section, the `Attach.root` + `SessionEntry.root` additions, and a
+version-10 history line.
 
 **Daemon browse handler (`std::fs`, daemon-side, unconfined read).** A new
 `crates/daemon/src/browse.rs` module in the shape of `file_ops::reply` — an
@@ -142,7 +159,9 @@ Prior decisions). It:
    keeping entries whose **`fs::metadata` (symlink-following) `is_dir()`** holds —
    so a symlinked project directory is **included** (`DirEntry::file_type()` does
    not follow symlinks, so it is not used for the dir test); stamps `is_git_repo`
-   from a `<child>/.git` existence probe; sorts by name.
+   from a `<child>/.git` existence probe and `git_branch` from a `<child>/.git/HEAD`
+   read (`ref: refs/heads/<b>` → `<b>`; a detached HEAD or non-repo → `None`), a
+   plain file read (no `gix`); sorts by name.
 4. Maps any remaining `io::ErrorKind` to `DirBrowseError` (`PermissionDenied` → the
    match; else `Io`).
 
@@ -161,7 +180,11 @@ editable) and a Create button. Selecting a row issues `QueryDirEntries { path:
 `QueryDirEntries` for an ancestor; each pending level shows a loading state and an
 `error` reply renders inline without closing the picker. Reuse the
 Connection-screen / Phase-32 theme tokens and `gpui-component` `InputState` for
-the name field; never fork them.
+the name field; never fork them. The picker's start level is seeded from a
+**recents list of recently-picked roots** (the phase-9 window-state store, extended
+with a roots list; a successful create records the picked root), falling back to
+`$HOME` when empty. Each session row / list entry shows its project path from
+`SessionEntry.root`.
 
 **New-session entry points + create-with-root (`app`).** Route every "new
 session" affordance through the root picker:
@@ -206,8 +229,8 @@ The name defaults to the folder basename and is editable before Create.
   fuzzy index is a possible follow-on (cf. Phase 31's file quick-open).
 - **A durable project registry / workspace files** (Zed-style `.zed` project
   files). The durable per-session root lives in tmux `@root` (Phase 35); Phase 36
-  adds at most a lightweight recents mapping (**OPEN** — see Prior decisions), not
-  a bespoke project-file format.
+  adds a lightweight recents mapping of recently-picked roots (the phase-9 store),
+  not a bespoke project-file format.
 - **A hide-dotfiles toggle** — v1 lists all directories including dotfiles; a
   toggle is a cheap follow-on polish (see Prior decisions).
 
@@ -252,8 +275,9 @@ The name defaults to the folder basename and is editable before Create.
   existing theme roles, never hardcoded hex; layout stays plain constants.
 - **Reuse `gpui-component` / `gpui` primitives, never fork them**: `InputState`
   for the name field, the existing list/scroll primitives for the rows.
-- No new dependency (`std::fs` / `tokio::fs`; git-repo flag is a `.git` existence
-  check, not a `gix` read); crate boundaries via `lib.rs`; English; no emojis.
+- No new dependency (`std::fs` / `tokio::fs`; the git-repo flag is a `.git`
+  existence check and the branch a `.git/HEAD` file-read parse, not a `gix` read);
+  crate boundaries via `lib.rs`; English; no emojis.
 
 ## Prior decisions
 
@@ -268,9 +292,9 @@ The name defaults to the folder basename and is editable before Create.
 | **The root picker is a modal/panel over the Phase-33 picker container and the in-cockpit workspace — not a new `Shell` state** | Phase 33 already introduced the pre-cockpit picker `Shell` state; the root picker is a mode within it (post-connect) and a modal over the workspace (in-cockpit strip "+"). Reusing those containers avoids a fourth top-level state and a second session-creation UI. | 2026-07-09 |
 | **Browse lists directories only, name-sorted, symlinked dirs followed/included, async per level** | A project root is a directory, so files are noise; following symlinks includes a symlinked project dir (the usual picker expectation); per-level round-trips keep each response small and the UI responsive (constitution: async for I/O; never block the render thread). | 2026-07-09 |
 | **v1 lists all child directories including dotfiles; a hide-dotfiles toggle is deferred** | Simplicity — no filter state in v1; a dotfile-heavy `$HOME` is the user's own tree, and hiding it risks concealing a wanted `.dotfiles` / `.local/...` root. A hide toggle is a cheap follow-on polish, not a v1 scope item. | 2026-07-09 |
-| **`is_git_repo` flag / current branch — OPEN, resolved at the spec-acceptance gate** | The "Session flows" mockup shows a git branch badge, but a branch read is a per-directory `gix`/git cost the cheap `.git`-existence flag avoids. Whether to ship the `is_git_repo` flag only, add the branch, or omit git metadata is a scope/UX call neither precedent nor constraint settles. `OPEN — resolved at the spec-acceptance gate`. | 2026-07-09 |
-| **Recents (start level + recently-picked roots) — OPEN, resolved at the spec-acceptance gate** | The picker could start at `$HOME` only, or seed from a phase-9-store recents mapping of recently-picked roots (Phase 35 keeps a lightweight session→root recents). Whether recents ship in Phase 36 or defer is a scope call. `OPEN — resolved at the spec-acceptance gate`. | 2026-07-09 |
-| **Per-session-root display in the session list/picker (`SessionEntry.root`) — OPEN, resolved at the spec-acceptance gate** | Phase 35 deferred showing each session's project path, noting it "lands with the picker phase" — it needs `SESSION_LIST_QUERY` to read `#{@root}` and `SessionEntry` to gain `root` (folded into this phase's protocol bump). Whether to include it now or keep Phase 36 to browse+create is a scope call. `OPEN — resolved at the spec-acceptance gate`. | 2026-07-09 |
+| **Show the `is_git_repo` flag AND the current branch** (resolved at the acceptance gate) | The human chose the fuller signal (the "Session flows" mockup's `⑂ <branch>` badge). The branch is parsed from `<dir>/.git/HEAD` — a plain file read, not a `gix` dependency — so a repo row shows its branch (a detached HEAD / non-repo shows none). The per-directory `.git/HEAD` read runs on `spawn_blocking` with the listing. | 2026-07-09 |
+| **Include a recents list of recently-picked roots** (resolved at the acceptance gate) | The picker starts from a phase-9-store list of recently-picked roots (extending the existing recents store, app-side, no protocol change), falling back to `$HOME`; a successful create records the picked root, so returning to a project does not require re-browsing. | 2026-07-09 |
+| **Include per-session-root display (`SessionEntry.root`)** (resolved at the acceptance gate) | Phase 35 pointed here and the protocol is bumped regardless. `SESSION_LIST_QUERY` reads `#{@root}` and `SessionEntry` gains `root: Option<String>`, so the list / picker show each session's project path. Reading `#{@root}` depends on the Phase-35 stamp (milestone #53). | 2026-07-09 |
 
 ## Prior art
 
@@ -311,8 +335,9 @@ redeployed per session). No new dependency.
 Per the roadmap's recorded Phase-36 impact (never edited from the roadmap):
 
 - `protocol` gains the directory-browse channel (`QueryDirEntries` +
-  `DirEntriesReply` + `DirEntry` + `DirBrowseError`) **and a `root: Option<String>`
-  field on `Attach`** (the create-with-root transport), `PROTOCOL_VERSION` `9 → 10`,
+  `DirEntriesReply` + `DirEntry` + `DirBrowseError`), a `root: Option<String>`
+  field on `Attach` (the create-with-root transport), and a `root` field on
+  `SessionEntry` (per-session project path), `PROTOCOL_VERSION` `9 → 10`,
   documented in `docs/protocol.md` — the daemon's first filesystem **browse** read.
 - `docs/architecture.md`: a one-line note that the daemon exposes an
   **unconfined directory-browse read** (distinct from the root-confined Phase-30
@@ -344,13 +369,15 @@ that traces back here (planning gate).
       value; `docs/protocol.md` documents the directory-browse channel, the
       `Attach.root` field, and a version-10 history line. Serde round-trip tests
       cover every new/changed variant (valid + unknown-tag rejection);
-      `DirEntriesReply` omits `error` on success and `Attach` round-trips with
-      `root` both `None` and `Some`.
+      `DirEntriesReply` omits `error` on success, `Attach` round-trips with `root`
+      both `None` and `Some`, `SessionEntry` round-trips with and without `root`,
+      and `DirEntry` carries `git_branch` (present / absent).
 - [ ] Daemon browse tests (mirroring `file_ops` tests, over a `tempfile` tree):
       `QueryDirEntries` on a directory returns its child directories name-sorted
       (files excluded), including a **symlinked** directory and **dotfile**
-      directories, with `is_git_repo` true for a child containing `.git`; an
-      empty/`~` request resolves to `$HOME` (and degrades to `/` when `HOME` is
+      directories, with `is_git_repo` true and `git_branch` set from `.git/HEAD`
+      for a child containing `.git` (detached HEAD / non-repo → `git_branch`
+      `None`); an empty/`~` request resolves to `$HOME` (and degrades to `/` when `HOME` is
       unset); a missing path replies `NotFound` and a non-directory replies
       `NotADirectory` via the up-front `metadata` check; an unreadable dir replies
       `PermissionDenied` (best-effort — skipped when the suite runs as root); the
@@ -371,6 +398,10 @@ that traces back here (planning gate).
       strip's "+" both open the root picker; a host with **no sessions** opens the
       root picker directly (no empty-state list screen); `RIFT_SESSION` still
       attaches directly with no picker.
+- [ ] Session-list root + recents: `SESSION_LIST_QUERY` parses `#{@root}` into
+      `SessionEntry.root` and the list / picker render each session's project path;
+      the picker's start level comes from the phase-9 recents-of-roots store
+      (falling back to `$HOME`), and a successful create records the picked root.
 - [ ] `grep` confirms no agent detection, no client-side SFTP, no new dependency;
       the daemon browse logic is confined to `crates/daemon/src/browse.rs` and is
       rootless (no `buffer::resolve`, no `State` borrow).
@@ -427,3 +458,10 @@ that traces back here (planning gate).
   rationale corrected (the `OpenFile` carve-out + shell-parity, enumeration is the
   new bit); dotfiles listed in v1 (toggle deferred); the query-reply shape noted; and
   symlink/dotfile/collision + best-effort-`PermissionDenied` verification added.
+- 2026-07-09: Spec-acceptance gate. The three open decisions resolved toward the
+  fuller scope: **git flag + current branch** (parsed from `.git/HEAD`, no `gix`),
+  **recents included** (a phase-9-store list of recently-picked roots, app-side),
+  and **`SessionEntry.root` included** (`SESSION_LIST_QUERY` reads `#{@root}`, the
+  list / picker show each session's path — riding the milestone-#53 dependency).
+  Human prerequisites: none. Status `DRAFT` → `READY`; milestone `Phase 360` created
+  at acceptance with `Depends on milestone: #53`.
