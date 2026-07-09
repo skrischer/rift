@@ -88,6 +88,10 @@ Stable diagnostics: the windowed build has no console — it logs to `%LOCALAPPD
 
 Optional mirror polish: `set -g window-size largest` in the host's `~/.tmux.conf`, so a dev restart's transient 80x24 attach does not reflow stable's view.
 
+### Remote exec wrapper (container target)
+
+`RIFT_REMOTE_EXEC_WRAPPER` (runtime) / `RIFT_DEFAULT_REMOTE_EXEC_WRAPPER` (compile-time bake, unused by default — see the justfile `promote` recipe) run the daemon and tmux one hop deeper than the SSH login, e.g. `docker exec -i devenv` — see `docs/spec-remote-exec-wrapper.md`. Requirements: the wrapper MUST carry `-i`, NEVER `-t` (the daemon transport is PTY-less binary framing; a TTY corrupts it); `RIFT_PROJECT_ROOT` must be an absolute in-container path (`/workspace`, never `$HOME`-relative); set `RIFT_DAEMON_REMOTE_DIR` to an absolute in-container dir when the image does not guarantee `$HOME` (`docker exec` runs no login shell). The wrapper is only coherent on the daemon terminal path (the default) — do not combine with `RIFT_TERMINAL_LEGACY`.
+
 ## Commits
 
 Conventional Commits. Scope matches crate name. Imperative mood, lowercase, no period.
