@@ -513,6 +513,79 @@ token (protocol-hash vs bumped integer) and whether daemon restart stays
 client-driven only; phase 24 — how index-vs-worktree staging semantics surface
 in the UI.
 
+## Explorer overhaul — prior-art index (Phases 27–31)
+
+Per-phase prior-art for the explorer overhaul ([roadmap.md](roadmap.md)), same
+shape as the indexes above. Research mode: websearch (2026-07-08) — the two
+genuinely new concerns (icon-asset embedding, remote file operations) were topped
+up with focused lookups; the rest resolves against Category 5 (File Explorers) and
+Category 1 already catalogued. All licenses GPL-3.0-compatible.
+
+| Phase | Concern | Reference (repo + path) | License | Verdict |
+|---|---|---|---|---|
+| 27 | Explorer visual-language redesign | Paper `rift` design file (Cockpit — IDE explorer + Styleguide); `zed` `crates/project_panel` row anatomy (Category 5 #1); `noh-rs/nohrs` + `sxyazi/yazi` GPUI/async tree density (Category 5 #4/#2) | GPL-3.0 / MIT | reference — anatomy + density only; the durable new artboard is authored in Phase 27's `/loopkit:plan` (reviewed at spec-acceptance), not seeded here |
+| 28 | File-type icon theme + SVG asset embedding | Zed **icon themes** (JSON schema `default_file`/`default_folder`/`default_folder_open`/`file_types` → bundled `./icons/*.svg`, [docs](https://zed.dev/docs/extensions/icon-themes)); `longbridge/gpui-component` `Icon` element (SVGs **not** bundled by default — the exact gap `file_tree.rs` documented); icon sets: Seti (MIT), Material Icon Theme (MIT), `dmhendricks/file-icon-vectors` (MIT / CC-BY), Lucide (ISC) for chrome glyphs | Apache-2.0 / MIT / ISC | **reuse** (gpui-component `Icon` + a bundled MIT icon set embedded via `rust-embed` / gpui assets) / reference (Zed's icon-theme JSON mapping shape; per-extension icon `default_file` fallback + `file_types` extension map) |
+| 29 | Tree context menu | `longbridge/gpui-component` ContextMenu / PopupMenu (Category 1 #1, already vendored); `zed` `crates/project_panel` right-click action taxonomy (Category 5 #1) | Apache-2.0 / GPL-3.0 | **reuse** (gpui-component popup menu) / reference (project_panel's action set — split client-capable actions from write actions, which land with Phase 30, so the menu ships no dead controls) |
+| 30 | Remote file operations (create / rename / delete / move) | `zed` remote model — the daemon owns the fs, ops run **daemon-side** not client SFTP (Category 8 #1); rift's own daemon write precedent (Phase 24 git-write + buffer save); `remotefs-ssh` russh backend + `russh-sftp` (reference fallback only — rift's daemon uses `std::fs` on the remote host it already runs on) | GPL-3.0 / MIT-Apache | reference — file ops become new `protocol` messages executed by the daemon with `std::fs`, mirroring Zed's server-side fs; **not** client-side SFTP. Git-aware moves via the existing `gix` dependency |
+| 31 | In-panel fuzzy filter + quick-open | `Canop/broot` incremental narrowing UX (Category 5 #5); `helix-editor/nucleo` fuzzy matcher (Potential dependencies); `Augani/nexus-explorer` GPUI + nucleo wiring (Category 1 #5); `zed` `crates/file_finder` | MIT / MPL-2.0 / GPL-3.0 | **reuse** (`nucleo` for matching — already a candidate dep, MPL-2.0-compatible) / reference (broot narrowing, Zed file finder; decide at plan time whether quick-open needs a daemon-side project file index or stays over the streamed tree) |
+
+Open design decisions deferred to each phase's `/loopkit:plan` spec (never a
+roadmap guess): phase 28 — which icon set ships and whether icon themes are
+user-swappable (Zed-style) or a single bundled set for v1; phase 30 — the exact
+file-op message shape, conflict / overwrite semantics, and how a rename racing a
+daemon filesystem event is reconciled; phase 31 — whether quick-open indexes the
+whole project daemon-side (jwalk) or narrows only the already-streamed tree.
+
+## Visual UI harness — prior-art index (tooling track)
+
+> Concern: give the coding agent eyes on the real GPUI UI (rift + rift-gallery)
+> plus deterministic E2E and Paper-design-parity checks. GPUI has **no accessibility
+> tree** (AccessKit unintegrated), so a11y/DOM-based external drivers do not apply —
+> the harness is screenshot/vision-based, driven in-process. Research: 2026-07
+> (websearch). Two phases: (1) a Linux/WSLg gpui headless renderer, (2) the harness.
+
+| Concern (phase) | Reference (repo + path) | License | Verdict |
+|---|---|---|---|
+| Headless offscreen render → PNG, the macOS blueprint to port (Phase 1) | `zed` `crates/gpui_macos/src/metal_renderer.rs` (`MetalHeadlessRenderer`, `render_scene_to_image`); `crates/gpui/src/platform.rs` (`PlatformHeadlessRenderer` trait) | GPL-3.0 | **reference** — port the offscreen-texture + readback pattern to `gpui_wgpu` (wgpu `copy_texture_to_buffer`); Linux already renders via wgpu, `lavapipe` as the headless adapter |
+| gpui fork / pin mechanics (Phase 1) | `rift` [archive/spec-gpui-rev-bump.md](archive/spec-gpui-rev-bump.md) | — | **reference** — the single-`gpui`-invariant + termy-fork precedent; here an **additive** `[patch]` fork on the frozen `4bee412` base (no API churn), single-`gpui` trial mandatory before landing |
+| Deterministic in-process UI driving + capture (Phase 2) | `zed` `crates/zed/src/visual_test_runner.rs` (macOS-only today); gpui `TestAppContext` / `VisualTestContext` / `HeadlessAppContext` (`simulate_*`, `dispatch_action`, `run_until_parked`, `capture_screenshot`) | GPL-3.0 | **reference** — the exact drive-then-capture pattern rift needs, ported off-macOS via Phase 1's renderer; steering already works headless, only capture is gated |
+| Agent "eyes" — screenshot-driven review (Phase 2) | `microsoft/playwright-mcp` (snapshot vs vision modes); `sethbang/mcp-screenshot-server`; `dddabtc/winremote-mcp` | MIT | **adopt** the vision (screenshot) mode; GPUI has no a11y tree so Playwright's cheaper snapshot mode is unavailable — rift lives in vision mode. A screenshot MCP/recipe (`claude mcp add`) gives Claude eyes directly |
+| Screenshot-driven native E2E loop (Phase 2) | Anthropic Computer Use (Xvfb + scrot + `xdotool` reference setup) | — | **reference** — the screenshot→act→screenshot loop; blind coordinate driving is the fallback, in-process `TestAppContext` is preferred (deterministic, needs no a11y) |
+| In-app cross-platform screenshot lib, if not shelling out (Phase 2) | `nashaofu/xcap` (X11 + Wayland + Windows); `grim` (WSLg is Wayland, not `scrot`) | MIT | **reference** — optional, only if the harness produces the shot itself instead of Phase 1's headless capture; else `grim` / ImageMagick `import` |
+| Paper design-parity comparison (Phase 2) | rift `paper-reviewer` agent (Playwright/DOM path); Paper MCP `get_screenshot` / `get_computed_styles` | — | **adopt** the reporting pattern (design ↔ impl diff) but with a **native** GPUI screenshot; the Playwright/DOM path does not apply to a native app |
+| Why not external a11y/DOM drivers (non-goal) | `tauri-pilot` (WebView DOM); FlaUI / WinAppDriver (Windows UIA); AT-SPI / dogtail (Linux) | mixed | **avoid** — all require an accessibility or DOM tree; GPUI exposes none (AccessKit unintegrated), so none can see rift's widgets |
+
+Open design decisions deferred to each phase's `/loopkit:plan` spec (never a
+roadmap guess): Phase 1 — whether the fork commit lands as a human-prerequisite
+push to `skrischer/zed` or an in-loop step, and whether `lavapipe` renders in
+headless WSL or the harness runs on the GPU station (the render probe settles it);
+Phase 2 — whether "eyes" ship as a screenshot MCP or a `just` recipe, and whether
+CI pixel-baseline diffing is in scope or the harness stays agent-assisted review.
+
+## Session management & post-connect picker — prior-art index (Phases 32–33)
+
+Per-phase prior-art for the session-management block ([roadmap.md](roadmap.md)),
+same shape as the indexes above. Research mode: websearch (2026-07-08) — the two
+genuinely new concerns (a full session-management surface beyond phase 19's
+switch+new, and picking the session AFTER connecting) were topped up with focused
+lookups; the control-mode plumbing resolves against Category 3 already catalogued.
+
+| Phase | Concern | Reference (repo + path) | License | Verdict |
+|---|---|---|---|---|
+| 32 | Glanceable all-sessions surface (see every session at a glance, no click-to-open) | iTerm2 tmux **Dashboard** (Shell > tmux > Dashboard: view all sessions + windows at a glance, rename, switch — the original `-CC` consumer) ([tmux integration](https://iterm2.com/documentation-tmux-integration.html), [menu items](https://iterm2.com/documentation-menu-items.html)); `zellij` session-manager single-screen (create / attach / resurrect) ([tutorial](https://zellij.dev/tutorials/session-management/)) | GPL-2.0 / MIT | **reference (UX)** — iTerm2's Dashboard is the exact "all sessions at a glance + rename + switch" pattern, over the same control-mode stream rift already parses; render it natively from the phase-19 `SessionListReply` (already streamed). AVOID `choose-tree` (invisible to control clients, per the phase-19 spec) |
+| 32 | Session operations — rename / kill / new from the UI | tmux `rename-session` / `kill-session` / `new-session` under `%begin/%end` guards (Category 3 #1); iTerm2 `-CC` (`kill-session`, `rename`; closing a tab kills the session); `zellij` session-manager + [`endoze/zellij-switcher`](https://github.com/endoze/zellij-switcher) (switch / create / rename / kill / resurrect, index quick-switch 1–9) | ISC / GPL-2.0 / MIT | **reuse** (tmux commands over the existing correlated-command mechanism; new `protocol` rename/kill messages, same shape as phase-19) / **reference** (zellij's unified create-or-attach screen + per-row kill/rename affordances) |
+| 32 | Session reorder | tmux window ops (`swap-window` / `move-window` / `renumber-windows`) as the *window*-level analog — tmux has **no** native session order; `zellij-switcher` index quick-switch (1–9) | ISC / MIT | **greenfield — no external precedent for session reorder**: it is client-side ordering persisted locally (the window-state store pattern, phase 9), not a tmux concept. Closest UX analog is terminal tab drag-reorder; drag-to-order vs pin/favorite is a plan-time call |
+| 33 | Post-connect session pick (connect to the host, THEN pick from a live list) | iTerm2 tmux integration — attach the `-CC` server first, the Dashboard / session list then drives which session shows (the pick is post-attach, never a pre-connect requirement) (Category 3 #5); `wezterm` launcher `ShowLauncherArgs { FUZZY\|WORKSPACES }` (fuzzy pick, create-on-select) ([docs](https://wezterm.org/config/lua/keyassignment/SwitchToWorkspace.html)) | GPL-2.0 / MIT | **reference** — rift already runs `QuerySessionList` post-connect (phase 19); this phase moves the *pick* ahead of the cockpit committing to a session, mirroring iTerm2's attach-server-then-Dashboard flow |
+| 33 | De-hardcode the fixed default session + optional session on connect | rift's own Connection screen (`crates/app/src/connection_screen.rs` `DEFAULT_SESSION`) + connect pipeline (`crates/app/src/main.rs`) | — | greenfield — refactor: make the Session field optional / default-less so the post-connect picker (not a baked `"rift"`) resolves the session; no external precedent needed |
+
+Open design decisions deferred to each phase's `/loopkit:plan` spec (never a
+roadmap guess): phase 32 — whether the glanceable surface replaces or complements
+the phase-21 title-bar popover, and whether reorder ships as drag-to-order or a
+pinned/favorite model with local persistence; phase 33 — whether the picker is a
+distinct step between connect and cockpit or an optional-session connect card
+that lands on the picker when the field is left blank, and how a killed / renamed
+session racing the picker is reconciled.
+
 ## Priority reference projects (top 10)
 
 1. **penso/arbor** — Closest existing implementation of rift's exact concept (Rust + GPUI + daemon + SSH outposts + agent state). Read end-to-end before writing any architecture docs.

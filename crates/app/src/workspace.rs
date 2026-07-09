@@ -82,7 +82,7 @@ use gpui_component::dialog::{AlertDialog, DialogButtonProps};
 use gpui_component::dock::{Dock, DockArea, DockItem, DockPlacement, PanelView};
 use gpui_component::notification::Notification;
 use gpui_component::{ActiveTheme as _, IconName, Root, Sizable as _, WindowExt as _};
-use rift_protocol::{ClientMessage, DaemonMessage, LspServerState};
+use rift_protocol::{ClientMessage, DaemonMessage, EntryKind, LspServerState};
 use rift_terminal::{SessionView, SessionViewEvent};
 use tracing::{debug, warn};
 
@@ -93,6 +93,7 @@ use crate::editor::{EditorEvent, EditorView};
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::outline_panel::{OutlinePanel, OutlinePanelEvent};
 use crate::problems_panel::{ProblemsPanel, ProblemsPanelEvent};
+use crate::quick_open::{OpenQuickOpen, QuickOpen};
 use crate::results_panel::{ResultsPanel, ResultsPanelEvent};
 use crate::settings::{OpenSettings, SettingsView};
 use crate::source_control::{SourceControlEvent, SourceControlPanel};
@@ -245,6 +246,17 @@ pub struct WorkspaceChannels {
     /// echoed into state, the resulting git change arrives on the push
     /// recompute (`docs/spec-source-control-write.md`).
     pub git_op_tx: Sender<ClientMessage>,
+    /// File ops the file tree emits — `CreateFile`, `CreateDir`,
+    /// `RenamePath`, `DeletePath` (`docs/spec-explorer-file-ops.md`, #675).
+    /// The tokio side forwards each onto the protocol verbatim, bridged
+    /// exactly like `git_op_tx`.
+    pub file_op_tx: Sender<ClientMessage>,
+    /// `FileOpResult` replies routed to the file tree for UX transitions only
+    /// (`docs/spec-explorer-file-ops.md`): unlike the git-write channel, this
+    /// reply IS routed back — the tree never mutates `WorktreeModel` from it
+    /// (the push-only `UpdateWorktree` is the single writer), but it does
+    /// close the rename editor on success or re-open it with an error.
+    pub file_op_result_rx: Receiver<DaemonMessage>,
     /// Fires once whenever the tokio side selected the daemon terminal but no
     /// daemon came up (#619, `docs/spec-v1-hardening.md`): the session still
     /// runs over the legacy tmux path, but every daemon-backed IDE feature is
@@ -327,6 +339,10 @@ pub struct WorkspaceView {
     /// (`Ctrl+Shift+P` / `Cmd+Shift+P`) reuses the same list rather than
     /// rebuilding the registry each time.
     command_palette: CommandPalette,
+    /// Jump-to-file quick-open (`docs/spec-explorer-search.md`, Phase 31,
+    /// issue #681): owns its `ListState` entity for the workspace's lifetime,
+    /// hosted beside `command_palette` above (`Ctrl+Shift+O` / `Cmd+Shift+O`).
+    quick_open: QuickOpen,
     /// Where this instance's channel-keyed window-state file lives (#225).
     /// `None` when no platform state directory could be resolved
     /// (`window_state::state_path`'s failure mode) — capture then silently
@@ -367,6 +383,8 @@ impl WorkspaceView {
             nav_tx,
             request_diff_tx,
             git_op_tx,
+            file_op_tx,
+            file_op_result_rx,
             daemon_unavailable_rx,
         } = channels;
 
@@ -390,25 +408,67 @@ impl WorkspaceView {
         // Selecting a file touches nothing but this — no tmux pane/window state.
         // The header/root-row `RevealActiveRequested` action (#604) re-triggers
         // the existing reveal path via the already-present
-        // `reveal_open_file_in_tree` — no new protocol, no new coupling.
-        cx.subscribe_in(
-            &file_tree,
-            window,
-            |this, _tree, event: &FileTreeEvent, window, cx| match event {
-                FileTreeEvent::OpenFile { path } => {
-                    this.editor.update(cx, |editor, cx| {
-                        editor.begin_open(path.clone(), false, window, cx);
-                    });
-                    if let Err(e) = this.open_file_tx.try_send(path.clone()) {
-                        debug!(error = %e, %path, "failed to enqueue open-file request");
+        // `reveal_open_file_in_tree` — no new protocol, no new coupling. The
+        // row context menu's `RevealInTerminalRequested`
+        // (`docs/spec-explorer-context-menu.md`) routes to the existing
+        // `SessionView` this view already owns — a new public method enqueues
+        // a structural `new-window -c <dir>` on the shipped tmux command
+        // channel; no new protocol message. `RenameRequested`
+        // (`docs/spec-explorer-file-ops.md`, #675) is the tree's inline-rename
+        // commit: turned into a `ClientMessage::RenamePath` on `file_op_tx`.
+        // `CreateRequested` / `DeleteRequested` (`docs/spec-explorer-file-ops.md`,
+        // #676 — the context-menu write group) turn into
+        // `ClientMessage::CreateFile` / `CreateDir` / `DeletePath` the same
+        // way. The tree itself holds no protocol channel.
+        {
+            let file_op_tx = file_op_tx.clone();
+            cx.subscribe_in(
+                &file_tree,
+                window,
+                move |this, _tree, event: &FileTreeEvent, window, cx| match event {
+                    FileTreeEvent::OpenFile { path } => {
+                        this.editor.update(cx, |editor, cx| {
+                            editor.begin_open(path.clone(), false, window, cx);
+                        });
+                        if let Err(e) = this.open_file_tx.try_send(path.clone()) {
+                            debug!(error = %e, %path, "failed to enqueue open-file request");
+                        }
                     }
-                }
-                FileTreeEvent::RevealActiveRequested => {
-                    this.reveal_open_file_in_tree(cx);
-                }
-            },
-        )
-        .detach();
+                    FileTreeEvent::RevealActiveRequested => {
+                        this.reveal_open_file_in_tree(cx);
+                    }
+                    FileTreeEvent::RevealInTerminalRequested { dir } => {
+                        this.session_view
+                            .update(cx, |session, _cx| session.open_terminal_at(dir));
+                    }
+                    FileTreeEvent::RenameRequested { from, to } => {
+                        if let Err(e) = file_op_tx.try_send(ClientMessage::RenamePath {
+                            from: from.clone(),
+                            to: to.clone(),
+                        }) {
+                            debug!(error = %e, %from, %to, "failed to enqueue rename");
+                        }
+                    }
+                    FileTreeEvent::CreateRequested { path, kind } => {
+                        let op = match kind {
+                            EntryKind::File => ClientMessage::CreateFile { path: path.clone() },
+                            EntryKind::Dir => ClientMessage::CreateDir { path: path.clone() },
+                        };
+                        if let Err(e) = file_op_tx.try_send(op) {
+                            debug!(error = %e, %path, "failed to enqueue create");
+                        }
+                    }
+                    FileTreeEvent::DeleteRequested { path } => {
+                        if let Err(e) =
+                            file_op_tx.try_send(ClientMessage::DeletePath { path: path.clone() })
+                        {
+                            debug!(error = %e, %path, "failed to enqueue delete");
+                        }
+                    }
+                },
+            )
+            .detach();
+        }
 
         // Worktree structure stream -> file-tree model. Each message folds into
         // the model, then a notify repaints the tree. Routed through this view's
@@ -652,6 +712,34 @@ impl WorkspaceView {
             .detach();
         }
 
+        // File-op reply stream -> file tree, UX transitions only
+        // (`docs/spec-explorer-file-ops.md`, #675): `FileOpResult` routes to
+        // `FileTree::apply_file_op_result`, which never mutates
+        // `WorktreeModel` — the tree structure change (if any) arrives
+        // separately, through the worktree-structure bridge above, as the
+        // ordinary push-only `UpdateWorktree`. Routed through this view's
+        // weak handle so a closed window ends the loop gracefully, mirroring
+        // the diff reply bridge above.
+        {
+            cx.spawn_in(window, async move |this, cx| loop {
+                let Ok(msg) = file_op_result_rx.recv_async().await else {
+                    break;
+                };
+                let result = this.update_in(cx, |view, window, cx| {
+                    let DaemonMessage::FileOpResult { op, ok, error } = msg else {
+                        return;
+                    };
+                    view.file_tree.update(cx, |tree, cx| {
+                        tree.apply_file_op_result(op, ok, error, window, cx);
+                    });
+                });
+                if result.is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
+
         // Daemon-unavailable signal -> a persistent, dismissible notification
         // (#619): the tokio side selected the daemon terminal but no daemon
         // came up, so the legacy tmux path is carrying the session with every
@@ -869,6 +957,7 @@ impl WorkspaceView {
         }
 
         let command_palette = CommandPalette::new(window, cx);
+        let quick_open = QuickOpen::new(file_tree.clone(), window, cx);
         let settings_view = SettingsView::new(session_view.clone());
 
         // Window-state capture (#225, docs/spec-window-state-persistence.md):
@@ -981,6 +1070,7 @@ impl WorkspaceView {
             open_file_tx,
             dock_area,
             command_palette,
+            quick_open,
             window_state_path,
             window_state_save_generation: 0,
             settings_view,
@@ -1216,6 +1306,12 @@ impl WorkspaceView {
         self.command_palette.open(window, cx);
     }
 
+    /// Open the jump-to-file quick-open (`docs/spec-explorer-search.md`,
+    /// Phase 31, issue #681) as a `Root` dialog.
+    fn open_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.quick_open.open(window, cx);
+    }
+
     /// Open the settings surface (issue #366) as a `Root` dialog.
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_view.open(window, cx);
@@ -1339,26 +1435,36 @@ fn duration_to_next_minute() -> Duration {
 
 /// Fold one worktree-family daemon message into the file tree's model. Only the
 /// structure-path messages are routed here; any other variant is ignored (the
-/// tokio side forwards only this family on `worktree_rx`).
+/// tokio side forwards only this family on `worktree_rx`). An `UpdateWorktree`
+/// fold also drives the pending-reveal follow-up
+/// (`docs/spec-explorer-file-ops.md`, #675): a successful create/rename arms
+/// `FileTree::pending_reveal` with the new path, and this is where that path
+/// actually turns into a select + reveal, once the push-only recompute has
+/// added the row to `model` — never before, and never mutating the model a
+/// second time to do it.
 fn apply_worktree_message(tree: &mut FileTree, msg: DaemonMessage) {
     let model = tree.model_mut();
-    match msg {
+    let added_paths = match msg {
         DaemonMessage::WorktreeSnapshot {
             root,
             entries,
             final_chunk,
         } => {
             model.apply_snapshot_chunk(root, entries, final_chunk);
+            None
         }
         DaemonMessage::UpdateWorktree {
             added,
             changed,
             removed,
         } => {
+            let added_paths: Vec<String> = added.iter().map(|entry| entry.path.clone()).collect();
             model.apply_update(added, changed, removed);
+            Some(added_paths)
         }
         DaemonMessage::UpdateGitStatus { changed, cleared } => {
             model.apply_git_update(changed, cleared);
+            None
         }
         DaemonMessage::RepoState {
             branch,
@@ -1367,6 +1473,7 @@ fn apply_worktree_message(tree: &mut FileTree, msg: DaemonMessage) {
             lines_removed,
         } => {
             model.apply_repo_state(branch, ahead_behind, lines_added, lines_removed);
+            None
         }
         DaemonMessage::Diagnostics {
             path,
@@ -1374,8 +1481,12 @@ fn apply_worktree_message(tree: &mut FileTree, msg: DaemonMessage) {
             items,
         } => {
             model.apply_diagnostics(path, server, items);
+            None
         }
-        _ => {}
+        _ => None,
+    };
+    if let Some(added_paths) = added_paths {
+        tree.apply_pending_reveal(&added_paths);
     }
 }
 
@@ -1533,6 +1644,9 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
                 this.open_command_palette(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &OpenQuickOpen, window, cx| {
+                this.open_quick_open(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.open_settings(window, cx);
             }))
@@ -1675,6 +1789,8 @@ mod tests {
         let (nav_tx, _nav_request_rx) = flume::unbounded();
         let (request_diff_tx, _request_diff_rx) = flume::unbounded();
         let (git_op_tx, _git_op_rx) = flume::unbounded();
+        let (file_op_tx, _file_op_rx) = flume::unbounded();
+        let (_file_op_result_tx, file_op_result_rx) = flume::unbounded();
         let (_daemon_unavailable_tx, daemon_unavailable_rx) = flume::unbounded();
         WorkspaceChannels {
             worktree_rx,
@@ -1688,6 +1804,8 @@ mod tests {
             nav_tx,
             request_diff_tx,
             git_op_tx,
+            file_op_tx,
+            file_op_result_rx,
             daemon_unavailable_rx,
         }
     }
@@ -2442,6 +2560,63 @@ mod tests {
                 workspace.read(cx).focus_handle(cx),
                 session_view.read(cx).focus_handle(cx),
                 "dismissing settings leaves the terminal focus delegation untouched"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Jump-to-file quick-open (`docs/spec-explorer-search.md`, Phase 31,
+    /// issue #681): opening sets an active `Root` dialog, mirroring the
+    /// command palette and settings surface above, and closing it clears
+    /// that state without disturbing the workspace's own focus delegation to
+    /// the terminal.
+    #[gpui::test]
+    fn test_open_quick_open_opens_a_dialog_and_close_clears_it(cx: &mut TestAppContext) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let mut session_view: Option<Entity<SessionView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let view = cx.new(|cx| SessionView::new(cx).0);
+                session_view = Some(view.clone());
+                workspace =
+                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+        let session_view =
+            session_view.expect("session view constructed inside the window callback");
+
+        cx.update_window(window.into(), |_, window, cx| {
+            assert!(
+                !window.has_active_dialog(cx),
+                "no dialog is open before the shortcut fires"
+            );
+
+            workspace.update(cx, |view, cx| {
+                view.open_quick_open(window, cx);
+            });
+            assert!(
+                window.has_active_dialog(cx),
+                "OpenQuickOpen opens a Root dialog"
+            );
+            assert_eq!(
+                workspace.read(cx).focus_handle(cx),
+                session_view.read(cx).focus_handle(cx),
+                "opening quick-open does not move the workspace's terminal focus delegation"
+            );
+
+            window.close_dialog(cx);
+            assert!(
+                !window.has_active_dialog(cx),
+                "closing the dialog clears the active-dialog state"
+            );
+            assert_eq!(
+                workspace.read(cx).focus_handle(cx),
+                session_view.read(cx).focus_handle(cx),
+                "dismissing quick-open leaves the terminal focus delegation untouched"
             );
         })
         .unwrap();

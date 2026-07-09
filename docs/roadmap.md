@@ -43,6 +43,13 @@
 | 24 | Source-control write path — stage/unstage/commit, hunk staging, split diff + word-level emphasis | [spec-source-control-write.md](spec-source-control-write.md) | [Phase 240](https://github.com/skrischer/rift/milestone/38) |
 | 25 | Explorer design parity — header actions, git letter lane, diagnostic dots + rollup, empty states | — | — |
 | 26 | Settings shell + theme unification — full settings page, theme-driven terminal palette, hardcoded-hex cleanup | — | — |
+| 27 | Explorer redesign — new Paper artboard + overhauled visual language (row anatomy, density, icon / context-menu / filter / file-op affordances); the visual contract phases 28–31 build on | [spec-explorer-redesign.md](spec-explorer-redesign.md) | [Phase 27](https://github.com/skrischer/rift/milestone/43) |
+| 28 | Explorer file-type icons — SVG icon-theme asset embedding, file-type → icon mapping, folder / open-folder / chevron glyphs replacing today's text markers | [spec-explorer-icons.md](spec-explorer-icons.md) | [Phase 28](https://github.com/skrischer/rift/milestone/45) |
+| 29 | Explorer context menu — right-click action framework over the tree; ships the client-capable actions (open, reveal, copy path / relative path, reveal-in-terminal, collapse-all) | [spec-explorer-context-menu.md](spec-explorer-context-menu.md) | [Phase 29](https://github.com/skrischer/rift/milestone/46) |
+| 30 | Explorer file operations — create / rename / delete / move via a daemon write path, surfaced through the context menu + inline rename + drag & drop | [spec-explorer-file-ops.md](spec-explorer-file-ops.md) | [Phase 30](https://github.com/skrischer/rift/milestone/47) |
+| 31 | Explorer search & filter — in-panel fuzzy narrowing, jump-to-file quick-open, multi-select, keyboard-first navigation | [spec-explorer-search.md](spec-explorer-search.md) | [Phase 31](https://github.com/skrischer/rift/milestone/48) |
+| 32 | Session management — glanceable always-visible session list (see every session at once, click to jump), rename / reorder / kill / new operations; extends the phase-19 switcher (switch + new, click-to-open popover) into a full management surface | [spec-session-management.md](spec-session-management.md) | [Phase 320](https://github.com/skrischer/rift/milestone/49) |
+| 33 | Post-connect session picker — connect to the host first, then pick or create a session from the live list; de-hardcode the fixed default session name ("rift") baked into the connect card | — | — |
 
 A phase gets a Spec link once `/loopkit:plan` drafts it, and a Milestone link once
 it is `READY`. The milestone (open/closed + issue progress) is where status lives.
@@ -109,12 +116,87 @@ PR, never edited from here):
 Backing prior art: "v1.0 polish + robustness phases — prior-art index
 (Phases 19–26)" in [prior-art.md](prior-art.md).
 
+## Explorer overhaul (phases 27–31)
+
+Seeded 2026-07-08 from idea sparring (research mode: websearch) after v1.0.0
+shipped. The file explorer completed Phase 11 (decoration / reveal / keyboard
+nav) and Phase 25 (design parity) as a **read-only** tree with **text-glyph**
+markers — parity explicitly deferred real file-type icons (the product binary
+does not embed SVG icon assets) and file operations (a daemon write capability),
+and the tree still has no context menu, no search / filter, and no quick-open.
+This block is the full overhaul into a first-class explorer.
+
+Ordering is a DAG, not a strict chain: **27 (redesign) is the visual foundation**
+the other four build on; **28 (icons)** and **31 (search)** are independent client
+work against the new artboard; **29 (context menu)** is the interaction shell that
+**30 (file operations)** surfaces its write actions through, so 29 precedes 30.
+Phase 30 carries the only foundation impact.
+
+Foundation impact (authored and ratified in each phase's `/loopkit:plan` spec
+PR, never edited from here):
+
+- Phase 27 — supersedes the "Cockpit — IDE" artboard's explorer panel as the
+  explorer's visual contract; the new artboard is authored in this phase's spec
+  PR (design-doc → issue → PR). No constitution / architecture change — a design
+  artifact plus the client-side visual shell phases 28–31 render against.
+- Phase 30 — `protocol` gains file-operation messages (create / rename / delete /
+  move) — a deliberate, reviewed API extension (`docs/protocol.md`); the daemon
+  gains its file-op write handlers, executing `std::fs` on the remote host (its
+  second write capability after Phase-24 git-write and buffer save). The daemon
+  owns the filesystem, so ops run **daemon-side**, not client-side SFTP — the
+  same model as Zed's remote server. Ratified in Phase 30's spec PR.
+
+Backing prior art: "Explorer overhaul — prior-art index (Phases 27–31)" in
+[prior-art.md](prior-art.md).
+
+## Session management (phases 32–33)
+
+Seeded 2026-07-08 from idea sparring (research mode: websearch). The shipped tmux
+session support — the phase-19 switcher, relocated into the phase-21 title-bar
+connection group — is **switch + new only**, behind a click-to-open popover;
+phase 19 explicitly deferred killing sessions from the picker (destructive) and
+never covered rename-in-UI or reorder. The connection screen (phase 20) still
+requires a session name up front — `DEFAULT_SESSION = "rift"` on the connect card
+(`crates/app/src/connection_screen.rs`), chosen before the SSH connect — with no
+"connect first, then pick from a live list" flow. This block turns tmux sessions
+into a first-class, manageable surface.
+
+Ordering is a chain: **32 (management surface + operations)** is the foundation
+**33 (post-connect picker)** reuses — 33 wires the same live list + create path
+into the connect flow, so 32 precedes 33.
+
+Foundation impact (authored and ratified in each phase's `/loopkit:plan` spec
+PR, never edited from here):
+
+- Phase 32 — **no protocol / daemon change** (corrected at planning from the
+  pre-planning "protocol gains rename/kill messages" estimate): rename / kill ride
+  the existing generic `ClientMessage::TmuxCommand` fire-and-forget seam
+  (`crates/daemon/src/terminal.rs:344`, the same channel the pane-header
+  split / zoom controls use), the codebase's established split of "reply needed →
+  typed correlated message (`QuerySessionList`), fire-and-forget action → generic
+  `TmuxCommand`". The churn-driven `SessionListReply` push refreshes the list;
+  killing the attached session reuses the existing `TerminalExit` path.
+  **Reorder** is client-side ordering persisted locally (the window-state / recents
+  store pattern, phase 9) — tmux has no native session order. `PROTOCOL_VERSION`
+  stays 8; this is a client-only (`[terminal]`/`[app]`) phase.
+- Phase 33 — the connection flow evolves: the Connection screen's Session field
+  becomes optional and default-less, and a session-picker step sits between
+  connect and cockpit (connect to the host → live list → pick / create). This is
+  a deliberate change to the phase-20 "Connection screen is the startup state"
+  contract; whether it also touches `architecture.md`'s connection-flow section
+  is settled in phase 33's spec PR. De-hardcoding the fixed `"rift"` default is
+  part of this phase.
+
+Backing prior art: "Session management & post-connect picker — prior-art index
+(Phases 32–33)" in [prior-art.md](prior-art.md).
+
 ## Tracks (tooling/DX, not product phases)
 
 - **Dogfooding fixes** — living papercut backlog: [spec-dogfooding-fixes.md](spec-dogfooding-fixes.md), grouped by the [`papercut` label](https://github.com/skrischer/rift/labels/papercut); never completes.
 - **Dogfooding channels** — [spec-dogfooding-channels.md](spec-dogfooding-channels.md), [milestone 12](https://github.com/skrischer/rift/milestone/12).
 - **Logging & diagnostics** — professional debug logging for the dev and stable channels: [spec-logging-diagnostics.md](spec-logging-diagnostics.md), [milestone 20](https://github.com/skrischer/rift/milestone/20); prior-art survey in [prior-art.md](prior-art.md) Category 10. Issues are immediately workable (parallel track, no queue edge).
 - **Daemon re-deploy** — a changed same-version daemon binary takes effect on the next relaunch (atomic replace + pidfile restart of the shared daemon): [spec-daemon-redeploy.md](spec-daemon-redeploy.md), [milestone 23](https://github.com/skrischer/rift/milestone/23). Graduated from the reverted papercut #268, after live QA exposed the `ETXTBSY` / reattach-stale seams.
+- **Visual UI harness** — give the coding agent eyes on the real rift / rift-gallery UI plus deterministic E2E (show UI bugs, check design parity against the Paper contract). Two ordered phases: **(1) gpui Linux/WSLg headless renderer** ([spec](spec-gpui-headless-renderer.md) · [milestone 44](https://github.com/skrischer/rift/milestone/44)) — implement the one missing `PlatformHeadlessRenderer` impl for off-macOS (offscreen wgpu texture + readback), unblocking `capture_screenshot` on rift's platforms; **(2) visual/E2E harness** — `capture_screenshot` + `TestAppContext` driving over a named snapshot registry (rift views + gallery components), Paper-MCP diff, optional CI pixel baseline. Foundation impact (Phase 1, ratified in its `/loopkit:plan` spec, never edited from here): an **additive `[patch]` fork** of `gpui` on the frozen `4bee412` base — not a commit bump, so no API churn — redirecting every gpui consumer (rift, gpui-component, `termy_terminal_ui`) to the fork, with a **mandatory single-`gpui`-invariant trial** before landing; pin-mechanics precedent in [archive/spec-gpui-rev-bump.md](archive/spec-gpui-rev-bump.md). Backing prior art: "Visual UI harness — prior-art index" in [prior-art.md](prior-art.md).
 - Completed meta tracks (workflow automation, planning automation, pane & window management, terminal interaction fixes, component gallery, gpui rev bump investigation) live in [archive/](archive/) and their closed milestones. The gpui rev bump investigation (milestone 22) concluded **NO-GO for now**: the candidate rev breaks the single-`gpui` invariant via the `termy_terminal_ui` fork's bare `gpui` pin — see [archive/spec-gpui-rev-bump.md](archive/spec-gpui-rev-bump.md) decision log for the full findings and the ordered prerequisite steps.
 
 ## North star
