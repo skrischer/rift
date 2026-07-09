@@ -142,6 +142,11 @@ const INDENT_BASE: Pixels = px(8.0);
 /// shipped flat 14px-per-level indent.
 const INDENT_PER_LEVEL: f32 = 16.0;
 
+/// Width of one indent guide line (`docs/spec-explorer-polish.md`, #711) — a
+/// hairline, thin enough to read as a lane divider rather than a second
+/// border.
+const INDENT_GUIDE_WIDTH: Pixels = px(1.0);
+
 /// Fixed width of the reserved icon slot, the row's leading slot since the
 /// chevron twisty was removed (`docs/spec-explorer-polish.md`, #710) —
 /// sized to the artboard's icon glyph (`docs/spec-explorer-redesign.md`).
@@ -2306,9 +2311,53 @@ impl FileTree {
         INDENT_BASE + px(depth as f32 * INDENT_PER_LEVEL)
     }
 
+    /// The left offsets of the indent guide lines a row at `depth` renders —
+    /// one per ancestor lane the row is nested under, 1:1 with
+    /// [`FileTree::row_indent`]'s lanes for level `0..depth` (a row's own
+    /// lane, where its icon sits, gets no guide — only the lanes it is
+    /// nested *inside*). A pure function, so the alignment to Phase 27's
+    /// indent geometry is unit-testable without a render pass
+    /// (`docs/spec-explorer-polish.md`, #711).
+    fn indent_guide_positions(depth: usize) -> Vec<Pixels> {
+        (0..depth).map(Self::row_indent).collect()
+    }
+
+    /// Render `depth` thin vertical guide lines in the row's leading indent
+    /// region, one per nesting level, at [`FileTree::indent_guide_positions`]
+    /// (`docs/spec-explorer-polish.md`, #711 — Zed-style legibility for a run
+    /// of nested/expanded levels). Each line spans the full row height and is
+    /// tinted the theme's `border` role — a subtle, muted role rather than a
+    /// second accent — so it reads as a faint lane divider and re-tints on a
+    /// theme switch (never a hardcoded hex). Absolutely positioned: callers
+    /// must set `.relative()` on the row container so these children
+    /// position against the row's own bounds, not the row's `pl(indent)`
+    /// content offset.
+    fn render_indent_guides(depth: usize, cx: &Context<Self>) -> Vec<Div> {
+        let color = cx.theme().border;
+        Self::indent_guide_positions(depth)
+            .into_iter()
+            .map(|left| {
+                div()
+                    .absolute()
+                    .left(left)
+                    .top_0()
+                    .h_full()
+                    .w(INDENT_GUIDE_WIDTH)
+                    .bg(color)
+            })
+            .collect()
+    }
+
     /// Render one row as an interactive element. Clicking a directory selects
     /// it and toggles its expansion; clicking a file selects it and emits the
     /// open signal.
+    ///
+    /// The row container is `w_full` (`docs/spec-explorer-polish.md`, #711 —
+    /// REVISES the shipped content-width row): the hover/selected/multi-select
+    /// background surface now spans the full panel edge-to-edge, while the
+    /// slots below keep their per-depth indent via `pl(indent)`. The row also
+    /// carries [`FileTree::render_indent_guides`] as absolutely positioned
+    /// children, one thin lane-divider line per ancestor depth.
     ///
     /// Slot order, left to right, every slot `flex_shrink_0` so names and the
     /// trailing cluster column-align across rows and depths
@@ -2370,7 +2419,7 @@ impl FileTree {
         if row.is_pending_create {
             if let Some(editor) = self.create.as_ref() {
                 return self
-                    .render_create_row(indent, icon_slot, editor, cx)
+                    .render_create_row(row.depth, indent, icon_slot, editor, cx)
                     .into_any_element();
             }
         }
@@ -2464,6 +2513,8 @@ impl FileTree {
         // running index that would shift as rows scroll in and out.
         let mut root = div()
             .id(gpui::SharedString::from(row.path.clone()))
+            .relative()
+            .w_full()
             .flex()
             .items_center()
             .h(ROW_HEIGHT)
@@ -2475,6 +2526,7 @@ impl FileTree {
             .text_sm()
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().list_hover))
+            .children(Self::render_indent_guides(row.depth, cx))
             // Right mouse-down selects the row so the context menu's unit
             // actions below target it. This listener is attached to the row
             // itself, so it paints (and registers) before `ContextMenuExt`'s
@@ -2604,7 +2656,9 @@ impl FileTree {
     /// slot replaced by `editor.input`, and — on an error re-open — the
     /// inline message in place of the diagnostic-dot / git-letter trailing
     /// lane. No click / context-menu handlers: the row is not selectable or
-    /// openable while its name is being edited.
+    /// openable while its name is being edited. Shares [`FileTree::render_row`]'s
+    /// indent guides (`docs/spec-explorer-polish.md`, #711) so the leading
+    /// region reads identically while a row is mid-rename.
     fn render_rename_row(
         &self,
         row: &Row,
@@ -2625,6 +2679,7 @@ impl FileTree {
 
         div()
             .id(SharedString::from(format!("{}-rename", row.path)))
+            .relative()
             .flex()
             .items_center()
             .h(ROW_HEIGHT)
@@ -2634,6 +2689,7 @@ impl FileTree {
             .gap(ROW_SLOT_GAP)
             .rounded(ROW_RADIUS)
             .text_sm()
+            .children(Self::render_indent_guides(row.depth, cx))
             .child(icon_slot)
             .child(
                 div()
@@ -2651,9 +2707,11 @@ impl FileTree {
     /// `editor.input`, and — on an error re-open — the inline message in the
     /// trailing lane. Mirrors [`FileTree::render_rename_row`]; no click /
     /// context-menu handlers, matching that row's "not yet a real entry"
-    /// affordance.
+    /// affordance. Shares [`FileTree::render_row`]'s indent guides
+    /// (`docs/spec-explorer-polish.md`, #711).
     fn render_create_row(
         &self,
+        depth: usize,
         indent: Pixels,
         icon_slot: Div,
         editor: &CreateEditor,
@@ -2671,6 +2729,7 @@ impl FileTree {
 
         div()
             .id("file-tree-create-row")
+            .relative()
             .flex()
             .items_center()
             .h(ROW_HEIGHT)
@@ -2680,6 +2739,7 @@ impl FileTree {
             .gap(ROW_SLOT_GAP)
             .rounded(ROW_RADIUS)
             .text_sm()
+            .children(Self::render_indent_guides(depth, cx))
             .child(icon_slot)
             .child(
                 div()
@@ -3068,6 +3128,35 @@ mod tests {
         assert_eq!(FileTree::row_indent(3), px(56.0));
     }
 
+    // --- indent guide lines (#711, `docs/spec-explorer-polish.md`) ---
+
+    #[test]
+    fn test_indent_guide_positions_with_zero_depth_is_empty() {
+        // A top-level row is nested under no ancestor lane, so it renders no
+        // guide line at all.
+        assert_eq!(FileTree::indent_guide_positions(0), Vec::<Pixels>::new());
+    }
+
+    #[test]
+    fn test_indent_guide_positions_align_1_to_1_with_the_indent_lanes() {
+        // One guide per ancestor lane the row is nested under (levels
+        // `0..depth`), each matching `row_indent`'s lane for that level — the
+        // row's own lane (where its icon sits) gets no guide.
+        assert_eq!(FileTree::indent_guide_positions(1), vec![px(8.0)]);
+        assert_eq!(FileTree::indent_guide_positions(2), vec![px(8.0), px(24.0)]);
+        assert_eq!(
+            FileTree::indent_guide_positions(3),
+            vec![px(8.0), px(24.0), px(40.0)]
+        );
+    }
+
+    #[test]
+    fn test_indent_guide_count_matches_depth() {
+        for depth in 0..6 {
+            assert_eq!(FileTree::indent_guide_positions(depth).len(), depth);
+        }
+    }
+
     #[test]
     fn test_row_density_constants_match_the_redesigned_artboard() {
         // A grep-friendly lock on the redesigned density: layout pixels, not
@@ -3079,6 +3168,7 @@ mod tests {
         assert_eq!(ROW_SLOT_GAP, px(6.0));
         assert_eq!(INDENT_BASE, px(8.0));
         assert_eq!(INDENT_PER_LEVEL, 16.0);
+        assert_eq!(INDENT_GUIDE_WIDTH, px(1.0));
         assert_eq!(ICON_SLOT_WIDTH, px(14.0));
         assert_eq!(DIAGNOSTIC_DOT_SIZE, px(7.0));
         assert_eq!(GIT_LETTER_SLOT_WIDTH, px(12.0));
