@@ -3,6 +3,18 @@
 All notable changes to rift are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## v1.2.4 — 2026-07-09 — Start with no tmux session
+
+- rift now starts cleanly against a host with no tmux server / no sessions
+  (e.g. after a reboot or an OOM that took every session with it). The
+  post-connect picker queries the session list before attaching, but the daemon
+  only answered that query over an active control-mode attach — so with nothing
+  to attach to, the query was dropped, no reply arrived, and the app silently
+  reconnect-looped instead of showing the picker. The daemon now answers a
+  pre-attach `QuerySessionList` with a one-off `tmux list-sessions`, mapping "no
+  server running" to an empty list, so the picker reaches its zero-session
+  create-only state and the first session can be created from within the app.
+
 ## v1.2.3 — 2026-07-09 — Session strip fixes (3)
 
 - Clicking a session chip switches sessions again. The strip lives inside the
