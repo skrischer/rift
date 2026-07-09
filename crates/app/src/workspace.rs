@@ -93,6 +93,7 @@ use crate::editor::{EditorEvent, EditorView};
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::outline_panel::{OutlinePanel, OutlinePanelEvent};
 use crate::problems_panel::{ProblemsPanel, ProblemsPanelEvent};
+use crate::quick_open::{OpenQuickOpen, QuickOpen};
 use crate::results_panel::{ResultsPanel, ResultsPanelEvent};
 use crate::settings::{OpenSettings, SettingsView};
 use crate::source_control::{SourceControlEvent, SourceControlPanel};
@@ -338,6 +339,10 @@ pub struct WorkspaceView {
     /// (`Ctrl+Shift+P` / `Cmd+Shift+P`) reuses the same list rather than
     /// rebuilding the registry each time.
     command_palette: CommandPalette,
+    /// Jump-to-file quick-open (`docs/spec-explorer-search.md`, Phase 31,
+    /// issue #681): owns its `ListState` entity for the workspace's lifetime,
+    /// hosted beside `command_palette` above (`Ctrl+Shift+O` / `Cmd+Shift+O`).
+    quick_open: QuickOpen,
     /// Where this instance's channel-keyed window-state file lives (#225).
     /// `None` when no platform state directory could be resolved
     /// (`window_state::state_path`'s failure mode) — capture then silently
@@ -952,6 +957,7 @@ impl WorkspaceView {
         }
 
         let command_palette = CommandPalette::new(window, cx);
+        let quick_open = QuickOpen::new(file_tree.clone(), window, cx);
         let settings_view = SettingsView::new(session_view.clone());
 
         // Window-state capture (#225, docs/spec-window-state-persistence.md):
@@ -1064,6 +1070,7 @@ impl WorkspaceView {
             open_file_tx,
             dock_area,
             command_palette,
+            quick_open,
             window_state_path,
             window_state_save_generation: 0,
             settings_view,
@@ -1297,6 +1304,12 @@ impl WorkspaceView {
     /// Open the command palette (issue #359) as a `Root` dialog.
     fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.command_palette.open(window, cx);
+    }
+
+    /// Open the jump-to-file quick-open (`docs/spec-explorer-search.md`,
+    /// Phase 31, issue #681) as a `Root` dialog.
+    fn open_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.quick_open.open(window, cx);
     }
 
     /// Open the settings surface (issue #366) as a `Root` dialog.
@@ -1630,6 +1643,9 @@ impl Render for WorkspaceView {
             }))
             .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
                 this.open_command_palette(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenQuickOpen, window, cx| {
+                this.open_quick_open(window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.open_settings(window, cx);
@@ -2544,6 +2560,63 @@ mod tests {
                 workspace.read(cx).focus_handle(cx),
                 session_view.read(cx).focus_handle(cx),
                 "dismissing settings leaves the terminal focus delegation untouched"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Jump-to-file quick-open (`docs/spec-explorer-search.md`, Phase 31,
+    /// issue #681): opening sets an active `Root` dialog, mirroring the
+    /// command palette and settings surface above, and closing it clears
+    /// that state without disturbing the workspace's own focus delegation to
+    /// the terminal.
+    #[gpui::test]
+    fn test_open_quick_open_opens_a_dialog_and_close_clears_it(cx: &mut TestAppContext) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let mut session_view: Option<Entity<SessionView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let view = cx.new(|cx| SessionView::new(cx).0);
+                session_view = Some(view.clone());
+                workspace =
+                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+        let session_view =
+            session_view.expect("session view constructed inside the window callback");
+
+        cx.update_window(window.into(), |_, window, cx| {
+            assert!(
+                !window.has_active_dialog(cx),
+                "no dialog is open before the shortcut fires"
+            );
+
+            workspace.update(cx, |view, cx| {
+                view.open_quick_open(window, cx);
+            });
+            assert!(
+                window.has_active_dialog(cx),
+                "OpenQuickOpen opens a Root dialog"
+            );
+            assert_eq!(
+                workspace.read(cx).focus_handle(cx),
+                session_view.read(cx).focus_handle(cx),
+                "opening quick-open does not move the workspace's terminal focus delegation"
+            );
+
+            window.close_dialog(cx);
+            assert!(
+                !window.has_active_dialog(cx),
+                "closing the dialog clears the active-dialog state"
+            );
+            assert_eq!(
+                workspace.read(cx).focus_handle(cx),
+                session_view.read(cx).focus_handle(cx),
+                "dismissing quick-open leaves the terminal focus delegation untouched"
             );
         })
         .unwrap();
