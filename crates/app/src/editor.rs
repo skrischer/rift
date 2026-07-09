@@ -394,10 +394,9 @@ enum SaveState {
     Failed(Option<BufferErrorReason>),
 }
 
-/// Events the editor emits for the workspace to route to the right-dock results
-/// panel (`docs/spec-editor-chrome.md` §3, #529). The panel owns both nav
-/// overlay consumers — find-references and multi-target go-to-definition — so
-/// these carry the result set to it and signal when the editor closed it.
+/// Events the editor emits for the workspace to route onward — to the
+/// right-dock results panel (`docs/spec-editor-chrome.md` §3, #529) or to the
+/// explorer tree (#404).
 #[derive(Debug, Clone, PartialEq)]
 pub enum EditorEvent {
     /// A references or multi-target definition response arrived: show it in the
@@ -411,6 +410,16 @@ pub enum EditorEvent {
     /// The user closed the results panel from the editor (Escape); the
     /// workspace hides the panel.
     CloseResults,
+    /// [`EditorView::open_or_switch`] switched to a tab that was already
+    /// open (cross-file go-to-definition or `go_back` landing on a file with
+    /// no fresh `OpenFile` round-trip, #404) — unlike opening a new tab, this
+    /// carries no `OpenFile`/`FileContent` reply for `WorkspaceView` to key
+    /// its reveal off, so the editor signals the switch itself. The
+    /// workspace reads the switched-to path back off the editor (mirroring
+    /// the tree's `RevealActiveRequested` wiring) rather than this event
+    /// carrying it, since by the time it is handled `self.active` already
+    /// names the right tab.
+    ActiveTabChanged,
 }
 
 /// Owned render data for the inline diagnostic card shown under the cursor
@@ -874,6 +883,10 @@ impl EditorView {
             } else {
                 cx.notify();
             }
+            // No `OpenFile` round-trip follows an already-open switch (unlike
+            // a fresh tab), so nothing else signals the explorer to reveal
+            // this tab (#404) — emit it here instead.
+            cx.emit(EditorEvent::ActiveTabChanged);
             return false;
         }
 
@@ -6452,5 +6465,54 @@ mod tests {
         assert!(matches!(events[0], EditorEvent::ShowResults { .. }));
         assert!(matches!(events[1], EditorEvent::CloseResults));
         assert!(matches!(events[2], EditorEvent::ShowResults { .. }));
+    }
+
+    // --- explorer reveal on tab switch (#404) ---
+
+    /// `open_or_switch`'s already-open branch (shared by every switch path —
+    /// cross-file go-to-definition, `go_back`, and a tree click that lands on
+    /// an already-open tab) emits `ActiveTabChanged` so `WorkspaceView` can
+    /// reveal the switched-to file even though no `OpenFile`/`FileContent`
+    /// round-trip follows. Opening a brand-new path takes the other branch
+    /// and emits nothing — that case already has its own reveal trigger via
+    /// the `FileContent` load, which this event must not duplicate.
+    #[gpui::test]
+    fn test_switching_to_an_already_open_tab_emits_active_tab_changed(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+        let events: Rc<std::cell::RefCell<Vec<EditorEvent>>> = Rc::new(Default::default());
+
+        {
+            let sink = events.clone();
+            cx.update(|cx| {
+                cx.subscribe(&editor, move |_editor, event: &EditorEvent, _cx| {
+                    sink.borrow_mut().push(event.clone());
+                })
+                .detach();
+            });
+        }
+
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    // Two fresh opens: the new-tab branch, no event expected.
+                    editor.begin_open("a.rs".into(), false, window, cx);
+                    editor.begin_open("b.rs".into(), false, window, cx);
+                    assert_eq!(editor.active, Some(1), "b.rs is now the active tab");
+
+                    // Switching back to the already-open a.rs takes the
+                    // already-open branch and must emit the event.
+                    editor.begin_open("a.rs".into(), false, window, cx);
+                    assert_eq!(editor.active, Some(0), "switched back to a.rs's tab");
+                });
+            })
+            .unwrap();
+
+        let events = events.borrow();
+        assert_eq!(
+            events.len(),
+            1,
+            "only the already-open switch emits an event, not the two fresh opens"
+        );
+        assert!(matches!(events[0], EditorEvent::ActiveTabChanged));
     }
 }
