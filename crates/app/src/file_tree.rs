@@ -2005,9 +2005,20 @@ impl FileTree {
     fn visible_rows_unfiltered(&self) -> Vec<Row> {
         let rollup = compute_rollup(&self.model);
         let mut rows = Vec::new();
-        // The prefix (`dir/`) of the shallowest collapsed directory currently
-        // being skipped. While set, any path starting with it is a hidden
-        // descendant; the first path that does not is past the subtree.
+        // The prefix (`dir/`) of the collapsed directory currently being
+        // skipped. While set, any path starting with it is a hidden
+        // descendant. Clearing it on the first non-descendant is unsound on
+        // its own: because entries are keyed by raw path string in a
+        // `BTreeMap`, a same-depth sibling whose name is the directory's name
+        // plus a byte less than `/` (0x2F) — most commonly a `.ext` sibling,
+        // e.g. `src.rs` next to `src` — sorts *between* the directory and its
+        // own children (`"src" < "src.rs" < "src/main.rs"`), so clearing on
+        // that sibling alone would let the real descendants that follow leak
+        // back into view. Mirrors `compute_rollup`'s ancestor-eviction
+        // containment check: only clear once the path has moved lexically
+        // *past* the whole `dir/` prefix range (`path >= prefix` as well as
+        // failing `starts_with`) — a path that merely sorts before the range
+        // (like `src.rs`) leaves the skip armed without being hidden itself.
         let mut skip_prefix: Option<String> = None;
 
         for (path, entry) in self.model.entries() {
@@ -2015,7 +2026,9 @@ impl FileTree {
                 if path.starts_with(prefix.as_str()) {
                     continue;
                 }
-                skip_prefix = None;
+                if path.as_str() >= prefix.as_str() {
+                    skip_prefix = None;
+                }
             }
 
             // Depth is the number of path separators: a top-level entry has
@@ -3112,6 +3125,28 @@ mod tests {
         let rows = tree.visible_rows();
         let visible: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(visible, vec!["src", "src2", "src2/b.rs"]);
+    }
+
+    #[test]
+    fn test_collapse_not_reopened_by_a_lexically_interleaved_sibling() {
+        // BTreeMap order is by raw path string, and `.` (0x2E) sorts below `/`
+        // (0x2F), so `src.rs` sorts *between* `src` and `src/main.rs`:
+        // "src" < "src.rs" < "src/main.rs". Clearing `skip_prefix` on the
+        // first non-`starts_with` entry alone mistakes `src.rs` (a same-depth
+        // sibling, not a descendant) for the end of `src`'s collapsed
+        // subtree, so `src/main.rs` leaks back into the visible list even
+        // though `src` stays collapsed (#405, same class as #329).
+        let mut tree = seed(vec![dir("src"), file("src.rs"), file("src/main.rs")]);
+
+        tree.toggle_dir("src");
+        let rows = tree.visible_rows();
+        let visible: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(
+            visible,
+            vec!["src", "src.rs"],
+            "src/main.rs must stay hidden while src is collapsed, and the \
+             lexically-interleaved sibling src.rs must still show"
+        );
     }
 
     #[test]
