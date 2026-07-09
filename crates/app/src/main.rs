@@ -2578,6 +2578,7 @@ async fn consume_daemon_messages(
                         name: entry.name,
                         windows: entry.windows,
                         attached: entry.attached,
+                        root: entry.root,
                     })
                     .collect();
                 // The post-connect picker's capture (#706/#707) takes this
@@ -3303,6 +3304,7 @@ mod tests {
             name: name.to_string(),
             windows: 1,
             attached: false,
+            root: None,
         }
     }
 

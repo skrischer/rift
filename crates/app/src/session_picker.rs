@@ -46,6 +46,11 @@ pub struct SessionRow {
     /// render closure.
     pub windows_caption: SharedString,
     pub attached: bool,
+    /// The session's project root (`SessionListItem::root`,
+    /// `docs/spec-session-root-picker.md`), rendered as a secondary path
+    /// label below the name. `None` when the session has never been stamped
+    /// with `@root`.
+    pub root: Option<String>,
 }
 
 /// Pluralize the window count for [`SessionRow::windows_caption`].
@@ -68,6 +73,7 @@ pub fn build_rows(sessions: Vec<SessionListItem>, order: &[String]) -> Vec<Sessi
             name: item.name,
             windows_caption: windows_caption(item.windows),
             attached: item.attached,
+            root: item.root,
         })
         .collect()
 }
@@ -279,14 +285,28 @@ fn render_row(cx: &mut Context<SessionPicker>, row: &SessionRow) -> AnyElement {
             }),
         )
         .child(
-            div()
+            v_flex()
                 .flex_1()
                 .min_w_0()
-                .font_family(mono)
-                .text_size(px(13.0))
-                .text_color(foreground)
-                .truncate()
-                .child(name),
+                .gap(px(1.0))
+                .child(
+                    div()
+                        .font_family(mono)
+                        .text_size(px(13.0))
+                        .text_color(foreground)
+                        .truncate()
+                        .child(name),
+                )
+                // Secondary project-path label (`SessionEntry.root`,
+                // `docs/spec-session-root-picker.md`) — muted, truncated,
+                // omitted for a session never stamped with a root.
+                .children(row.root.as_ref().map(|root| {
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(muted)
+                        .truncate()
+                        .child(SharedString::from(root.clone()))
+                })),
         )
         .child(
             div()
@@ -441,6 +461,7 @@ mod tests {
             name: name.to_string(),
             windows,
             attached,
+            root: None,
         }
     }
 
@@ -469,6 +490,17 @@ mod tests {
         assert_eq!(rows[0].name, "work");
         assert_eq!(rows[0].windows_caption.as_ref(), "2 windows");
         assert!(rows[0].attached);
+        assert_eq!(rows[0].root, None);
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_build_rows_carries_root_when_present() {
+        let mut session = item(7, "work", 2, true);
+        session.root = Some("/home/dev/work".to_string());
+
+        let rows = build_rows(vec![session], &[]);
+
+        assert_eq!(rows[0].root, Some("/home/dev/work".to_string()));
     }
 
     #[::core::prelude::v1::test]

@@ -178,6 +178,7 @@ mod tests {
             name: name.to_string(),
             windows: 1,
             attached: false,
+            root: None,
         }
     }
 
