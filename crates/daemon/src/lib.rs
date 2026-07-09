@@ -4,6 +4,7 @@ use std::time::Duration;
 
 mod buffer;
 mod diff;
+mod file_ops;
 mod git_write;
 pub mod lsp;
 mod terminal;
@@ -1088,13 +1089,31 @@ where
                             writer.write_all(&frame).await?;
                             writer.flush().await?;
                         }
+                        // The file-operation requests (`docs/spec-explorer-file-ops.md`,
+                        // #674) are per-connection request/response, exactly like
+                        // the source-control write ops above: apply the op
+                        // against the confined worktree root with `std::fs` and
+                        // write the single `FileOpResult` straight back to this
+                        // socket. The resulting tree change is never in the
+                        // reply — it arrives through the existing push-only
+                        // `UpdateWorktree` recompute the worktree watcher
+                        // triggers, the same self-inflicted-op contract the
+                        // git-write channel established.
+                        ClientMessage::CreateFile { .. }
+                        | ClientMessage::CreateDir { .. }
+                        | ClientMessage::RenamePath { .. }
+                        | ClientMessage::DeletePath { .. } => {
+                            let reply = file_ops::reply(&state, msg).await;
+                            let frame = encode_frame(&reply)?;
+                            writer.write_all(&frame).await?;
+                            writer.flush().await?;
+                        }
                         // The live-buffer feed goes to the shared loop: the LSP
                         // worker that consumes the buffer events lives off that
                         // single loop (one document model + servers for the
                         // daemon), not per connection. Push-only — no reply here;
                         // diagnostics return on the shared broadcast bus.
-                        ClientMessage::BufferChanged { .. }
-                        | ClientMessage::BufferClosed { .. } => {
+                        ClientMessage::BufferChanged { .. } | ClientMessage::BufferClosed { .. } => {
                             if inbound.send(msg).await.is_err() {
                                 // Dispatch loop gone; nothing left to serve.
                                 break 'serve;
@@ -1653,6 +1672,10 @@ impl Core {
             // answered per connection by `git_write::reply` (request/response
             // back to that socket), so they never reach this loop; their arms
             // below are a defensive no-op.
+            //
+            // The file-operation requests (#674) are answered per connection
+            // by `file_ops::reply` the same way, so they never reach this loop
+            // either; their arms below are a defensive no-op too.
             ClientMessage::Hello { .. }
             | ClientMessage::Attach { .. }
             | ClientMessage::Input { .. }
@@ -1672,7 +1695,11 @@ impl Core {
             | ClientMessage::UnstageFile { .. }
             | ClientMessage::StageHunk { .. }
             | ClientMessage::DiscardFile { .. }
-            | ClientMessage::Commit { .. } => {}
+            | ClientMessage::Commit { .. }
+            | ClientMessage::CreateFile { .. }
+            | ClientMessage::CreateDir { .. }
+            | ClientMessage::RenamePath { .. }
+            | ClientMessage::DeletePath { .. } => {}
         }
     }
 

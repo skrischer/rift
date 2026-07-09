@@ -3,6 +3,47 @@
 All notable changes to rift are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## v1.1.0 — 2026-07-09 — Explorer overhaul
+
+Turns the file explorer from a read-only tree into a first-class file manager: a
+redesigned visual language, real file-type icons, a right-click context menu,
+create / rename / delete / move file operations over the remote daemon, and
+in-panel fuzzy search with quick-open — all agent-agnostic, driven only by the
+streamed worktree model, and rendered from the new "Explorer — Redesign" Paper
+contract.
+
+### Explorer redesign
+- New row anatomy: a reserved icon slot, a re-spaced trailing decoration cluster
+  (diagnostic dot + right-aligned git-letter lane), redesigned density, and
+  refined hover / selected treatment — the visual baseline the rest builds on.
+- Redesigned `EXPLORER` header band + action row, re-densified workspace-root
+  row, and restyled loading / empty-root placeholders.
+
+### File-type icons
+- Real folder, open-folder, chevron, and language-tinted file-type glyphs replace
+  the text-glyph markers — a curated MIT Seti icon set embedded in the release
+  binary via a delegating asset source (no dev-only gallery gate).
+- Extension → icon / tint mapping in the Zed icon-theme shape; tints follow theme
+  tokens, not hardcoded colors.
+
+### Context menu
+- Right-click menu over tree rows: Open, Reveal in tree, Copy path, Copy relative
+  path, Reveal in terminal (an agent-agnostic new tmux window at the target), and
+  Collapse all — reusing gpui-component, pointer-only so terminal keys stay untouched.
+
+### File operations
+- Create file / create folder, rename (inline editor), delete (with a confirm
+  dialog), and move (drag & drop) — executed daemon-side with `std::fs` on the
+  remote host over a new protocol file-operation channel (PROTOCOL_VERSION 8 → 9),
+  reconciled through the single-writer push-only worktree stream (no flicker,
+  no double-apply).
+
+### Search & filter
+- In-panel fuzzy filter bar with match emphasis that narrows the tree and
+  force-expands the ancestors of matches (nucleo-matcher).
+- Jump-to-file quick-open modal over the streamed worktree.
+- Discrete multi-select with keyboard range extension and open-many.
+
 ## v1.0.0 — 2026-07-08
 
 First tagged release. rift is an agent-centric IDE: a native GPUI shell that

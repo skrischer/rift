@@ -4,6 +4,7 @@
 // GPUI runtime-shader path); off by default so dev keeps its RUST_LOG console.
 #![cfg_attr(feature = "windowed", windows_subsystem = "windows")]
 
+use std::borrow::Cow;
 use std::env;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -124,6 +125,18 @@ struct EditorChannels {
     /// daemon's `GitOpResult` reply is not routed back, the resulting state
     /// arrives on the worktree stream as `UpdateGitStatus` / `RepoState`.
     git_op_rx: flume::Receiver<rift_protocol::ClientMessage>,
+    /// File ops the file tree emits (`docs/spec-explorer-file-ops.md`, #675) —
+    /// `CreateFile`, `CreateDir`, `RenamePath`, `DeletePath`; forwarded onto
+    /// the protocol verbatim by the file-op bridge, exactly like `git_op_rx`.
+    /// Unlike the git-write channel, the daemon's `FileOpResult` reply IS
+    /// routed back (on `file_op_result_tx` below) — the tree needs it for UX
+    /// transitions (close the rename editor, surface an error), never for the
+    /// tree mutation itself, which stays push-only via `UpdateWorktree`.
+    file_op_rx: flume::Receiver<rift_protocol::ClientMessage>,
+    /// `FileOpResult` replies routed to the file tree for UX transitions only
+    /// (`docs/spec-explorer-file-ops.md`): `WorktreeModel` is never mutated
+    /// from a file op — the push-only `UpdateWorktree` is the single writer.
+    file_op_result_tx: flume::Sender<rift_protocol::DaemonMessage>,
     /// Fires once whenever `run_ssh_session` selects the daemon terminal but
     /// `provision_daemon` came back empty (#619): no daemon binary configured,
     /// or a provisioning step failed. The session still runs — the legacy tmux
@@ -221,6 +234,45 @@ fn init_logging() {
     rift_logging::install_panic_hook();
 }
 
+/// Rift's own file-type glyph SVGs (a curated MIT Seti UI subset,
+/// `crates/app/assets/file_icons/`), embedded via `rust-embed`. Kept as a
+/// separate embed target from `gpui_component_assets::Assets` — GPUI's
+/// `AssetSource` is disjoint per path prefix, not merged automatically.
+#[derive(rust_embed::RustEmbed)]
+#[folder = "assets"]
+#[include = "file_icons/**/*.svg"]
+struct RiftFileIcons;
+
+/// Delegating `AssetSource`: serves rift's own `file_icons/*.svg` glyphs from
+/// [`RiftFileIcons`] and hands every other path straight through to
+/// `gpui_component_assets::Assets` unchanged. `with_assets` accepts exactly one
+/// source, so this is the single source registered for the product build;
+/// gpui-component's `IconName` glyphs (activity rail, window controls) keep
+/// resolving through the delegate exactly as before (#597). Routing is by the
+/// `file_icons/` prefix, not trial-and-error fallthrough: gpui-component's own
+/// `Assets::load` returns `Err`, not `Ok(None)`, on a miss, so a fallthrough
+/// attempt would surface the wrong asset source's error on a genuine miss.
+struct RiftAssets;
+
+impl AssetSource for RiftAssets {
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if path.starts_with("file_icons/") {
+            return Ok(RiftFileIcons::get(path).map(|file| file.data));
+        }
+        Assets.load(path)
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        if path.starts_with("file_icons/") {
+            return Ok(RiftFileIcons::iter()
+                .filter(|asset_path| asset_path.starts_with(path))
+                .map(SharedString::from)
+                .collect());
+        }
+        Assets.list(path)
+    }
+}
+
 fn main() {
     // The stable profile keeps debug-assertions on, so GPUI resolves its
     // compile-time CARGO_MANIFEST_DIR paths at runtime (shader sources,
@@ -243,11 +295,13 @@ fn main() {
     );
 
     Application::with_platform(gpui_platform::current_platform(false))
-        // Register gpui-component's icon SVGs so the activity rail and window
-        // controls render their glyphs (blank otherwise — #597). Mirrors
-        // `gallery::run`; the embedding lives in the product build via the
-        // gpui-component-assets + rust-embed `debug-embed` dependencies.
-        .with_assets(Assets)
+        // Register the delegating RiftAssets source: gpui-component's icon SVGs
+        // keep resolving through it exactly as `Assets` alone did (activity
+        // rail / window controls — blank otherwise, #597), and it additionally
+        // serves rift's own vendored file-type glyphs (`file_icons/*.svg`,
+        // #668) so the explorer's icon slot can render real glyphs in the
+        // shipping binary, not only under the dev-only `gallery` feature.
+        .with_assets(RiftAssets)
         .run(|cx: &mut App| {
             gpui_component::init(cx);
             // Restore the persisted theme choice (`docs/spec-theme-settings.md`); a
@@ -282,6 +336,17 @@ fn main() {
                     rift_app::command_palette::OpenCommandPalette,
                     None,
                 ),
+            ]);
+            // Jump-to-file quick-open (`docs/spec-explorer-search.md`, Phase 31,
+            // #681): Ctrl+Shift+O / Cmd+Shift+O opens it, mirroring Xcode's
+            // "Open Quickly" muscle memory and the command palette's
+            // Ctrl+Shift+P pattern above — a terminal-safe `Ctrl/Cmd+Shift`
+            // chord, never the bare `Ctrl+P` the terminal's readline claims.
+            // Unscoped (`None`), so the shortcut reaches quick-open regardless
+            // of which surface is focused, including the terminal.
+            cx.bind_keys([
+                KeyBinding::new("ctrl-shift-o", rift_app::quick_open::OpenQuickOpen, None),
+                KeyBinding::new("cmd-shift-o", rift_app::quick_open::OpenQuickOpen, None),
             ]);
             // Settings surface (#366, `docs/spec-theme-settings.md`): Ctrl+, /
             // Cmd+, opens it, mirroring the editor-convention shortcut. Unscoped
@@ -428,6 +493,25 @@ fn main() {
                 KeyBinding::new(
                     "end",
                     rift_app::file_tree::SelectLast,
+                    Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
+                ),
+                KeyBinding::new(
+                    "f2",
+                    rift_app::file_tree::StartRename,
+                    Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
+                ),
+                // Discrete multi-select keyboard extension
+                // (`docs/spec-explorer-search.md`, Phase 31, #680): `Shift+Up`/
+                // `Shift+Down` grow the multi-select set from the cursor, the
+                // keyboard counterpart of `Ctrl/Cmd+Click`/`Shift+Click`.
+                KeyBinding::new(
+                    "shift-up",
+                    rift_app::file_tree::ExtendSelectionUp,
+                    Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
+                ),
+                KeyBinding::new(
+                    "shift-down",
+                    rift_app::file_tree::ExtendSelectionDown,
                     Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
                 ),
             ]);
@@ -644,6 +728,9 @@ impl Shell {
         let (diff_tx, diff_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
         let (request_diff_tx, request_diff_rx) = flume::unbounded::<String>();
         let (git_op_tx, git_op_rx) = flume::unbounded::<rift_protocol::ClientMessage>();
+        let (file_op_tx, file_op_rx) = flume::unbounded::<rift_protocol::ClientMessage>();
+        let (file_op_result_tx, file_op_result_rx) =
+            flume::unbounded::<rift_protocol::DaemonMessage>();
         let (daemon_unavailable_tx, daemon_unavailable_rx) = flume::unbounded::<()>();
         // Fires once when the session pipeline this attempt spawned ends —
         // orderly exit, a canceled reconnect, or a non-retryable failure
@@ -705,6 +792,8 @@ impl Shell {
                 diff_tx,
                 request_diff_rx,
                 git_op_rx,
+                file_op_rx,
+                file_op_result_tx,
                 daemon_unavailable_tx,
             };
 
@@ -756,6 +845,8 @@ impl Shell {
                     nav_tx: nav_request_tx,
                     request_diff_tx,
                     git_op_tx,
+                    file_op_tx,
+                    file_op_result_rx,
                     daemon_unavailable_rx,
                 },
                 state_path,
@@ -1028,7 +1119,8 @@ fn drain_render_backlog(ch: &PtyChannels, editor: &EditorChannels, watches: &Eng
         + editor.buffer_change_rx.drain().count()
         + editor.nav_request_rx.drain().count()
         + editor.request_diff_rx.drain().count()
-        + editor.git_op_rx.drain().count();
+        + editor.git_op_rx.drain().count()
+        + editor.file_op_rx.drain().count();
     if dropped > 0 {
         debug!(
             dropped,
@@ -1119,7 +1211,8 @@ async fn run_ssh_session(
         spawn_buffer_change_bridge(client_rx.clone(), editor.buffer_change_rx.clone());
         spawn_nav_bridge(client_rx.clone(), editor.nav_request_rx.clone());
         spawn_request_diff_bridge(client_rx.clone(), editor.request_diff_rx.clone());
-        spawn_git_op_bridge(client_rx, editor.git_op_rx.clone());
+        spawn_git_op_bridge(client_rx.clone(), editor.git_op_rx.clone());
+        spawn_file_op_bridge(client_rx, editor.file_op_rx.clone());
         tokio::spawn(async move {
             consume_daemon_messages(&client, None, &editor).await;
         });
@@ -1294,7 +1387,13 @@ async fn run_daemon_terminal(
     // unstage / discard / commit actions forward verbatim. Push-only from here —
     // the resulting git change returns on the worktree stream, not as a routed
     // reply.
-    spawn_git_op_bridge(client_rx, editor.git_op_rx.clone());
+    spawn_git_op_bridge(client_rx.clone(), editor.git_op_rx.clone());
+    // File op reverse path (`docs/spec-explorer-file-ops.md`, #675): the file
+    // tree's create/rename/delete/move actions forward verbatim. The
+    // `FileOpResult` reply returns via `consume_daemon_messages` on
+    // `editor.file_op_result_tx` — routed back for UX only, never the tree
+    // mutation, which stays push-only via `UpdateWorktree`.
+    spawn_file_op_bridge(client_rx, editor.file_op_rx.clone());
 
     // Forward path: fold the daemon stream into the render channels (pane output,
     // layout snapshots, capture replies), the file tree, and the editor. Blocks
@@ -2070,6 +2169,14 @@ async fn consume_daemon_messages(
             msg @ DaemonMessage::FileDiff { .. } => {
                 let _ = editor.diff_tx.send(msg);
             }
+            // --- file-op reply -> file tree (every mode) ---
+            // The reply to a `CreateFile` / `CreateDir` / `RenamePath` /
+            // `DeletePath`: forward to the file tree for UX transitions only
+            // (`docs/spec-explorer-file-ops.md`, #675) — the tree mutation
+            // itself stays push-only via the worktree-family messages above.
+            msg @ DaemonMessage::FileOpResult { .. } => {
+                let _ = editor.file_op_result_tx.send(msg);
+            }
             other => debug!(?other, "daemon message without a consumer yet"),
         }
     }
@@ -2150,6 +2257,28 @@ fn spawn_git_op_bridge(
     tokio::spawn(async move {
         while let Ok(msg) = git_op_rx.recv_async().await {
             debug!(op = ?msg, "sending git write op");
+            let client = client_rx.borrow().clone();
+            let _ = client.send(msg).await;
+        }
+    });
+}
+
+/// Forward the file tree's file ops onto the protocol
+/// (`docs/spec-explorer-file-ops.md`, #675): each `CreateFile` / `CreateDir` /
+/// `RenamePath` / `DeletePath` the tree built (via `FileTreeEvent`, turned
+/// into a `ClientMessage` by `workspace.rs`) is sent verbatim — the same
+/// shape as [`spawn_git_op_bridge`]. Unlike the git-write channel, the
+/// daemon's `FileOpResult` reply IS routed back (`consume_daemon_messages` on
+/// `editor.file_op_result_tx`), since the tree needs it for UX transitions;
+/// the resulting tree change still arrives only through the push-only
+/// `UpdateWorktree` recompute. Ends when the render-side channel closes.
+fn spawn_file_op_bridge(
+    client_rx: DaemonClientWatch,
+    file_op_rx: flume::Receiver<rift_protocol::ClientMessage>,
+) {
+    tokio::spawn(async move {
+        while let Ok(msg) = file_op_rx.recv_async().await {
+            debug!(op = ?msg, "sending file op");
             let client = client_rx.borrow().clone();
             let _ = client.send(msg).await;
         }
@@ -2559,6 +2688,7 @@ mod tests {
         nav_tx: flume::Sender<rift_protocol::ClientMessage>,
         request_diff_tx: flume::Sender<String>,
         git_op_tx: flume::Sender<rift_protocol::ClientMessage>,
+        file_op_tx: flume::Sender<rift_protocol::ClientMessage>,
     }
 
     fn backlog_harness() -> BacklogHarness {
@@ -2587,6 +2717,8 @@ mod tests {
         let (diff_tx, _) = flume::unbounded();
         let (request_diff_tx, request_diff_rx) = flume::unbounded();
         let (git_op_tx, git_op_rx) = flume::unbounded();
+        let (file_op_tx, file_op_rx) = flume::unbounded();
+        let (file_op_result_tx, _) = flume::unbounded();
         let (daemon_unavailable_tx, _) = flume::unbounded();
         BacklogHarness {
             ch: PtyChannels {
@@ -2617,6 +2749,8 @@ mod tests {
                 diff_tx,
                 request_diff_rx,
                 git_op_rx,
+                file_op_rx,
+                file_op_result_tx,
                 daemon_unavailable_tx,
             },
             watches: EngineWatches {
@@ -2636,6 +2770,7 @@ mod tests {
             nav_tx,
             request_diff_tx,
             git_op_tx,
+            file_op_tx,
         }
     }
 
@@ -2702,6 +2837,12 @@ mod tests {
                 path: "src/main.rs".into(),
             })
             .expect("send git op");
+        h.file_op_tx
+            .send(rift_protocol::ClientMessage::RenamePath {
+                from: "src/main.rs".into(),
+                to: "src/lib.rs".into(),
+            })
+            .expect("send file op");
 
         drain_render_backlog(&h.ch, &h.editor, &h.watches);
 
@@ -2717,6 +2858,7 @@ mod tests {
         assert!(h.editor.nav_request_rx.is_empty());
         assert!(h.editor.request_diff_rx.is_empty());
         assert!(h.editor.git_op_rx.is_empty());
+        assert!(h.editor.file_op_rx.is_empty());
     }
 
     #[test]
@@ -2888,5 +3030,26 @@ mod tests {
             .expect("icon asset load must not error")
             .expect("gpui-component icon must be embedded in the product build");
         assert!(!icon.is_empty(), "embedded icon SVG must not be empty");
+    }
+
+    #[test]
+    fn test_rift_file_icon_asset_is_embedded_in_product_build() {
+        use gpui::AssetSource as _;
+
+        use super::RiftAssets;
+
+        // A vendored file-type glyph (`crates/app/assets/file_icons/rust.svg`)
+        // must resolve through the delegating RiftAssets source registered by
+        // `main` (#668), so the explorer's icon slot can render real file-type
+        // glyphs in the shipping binary, not only under the dev-only `gallery`
+        // feature.
+        let icon = RiftAssets
+            .load("file_icons/rust.svg")
+            .expect("file-type icon asset load must not error")
+            .expect("vendored file-type icon must be embedded in the product build");
+        assert!(
+            !icon.is_empty(),
+            "embedded file-type icon SVG must not be empty"
+        );
     }
 }
