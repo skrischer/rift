@@ -1770,7 +1770,7 @@ impl Render for PaneView {
                     *term.mode()
                 };
 
-                if let Some(bytes) = keyboard::encode_keystroke(ks, mode) {
+                if let Some(bytes) = keyboard::encode_keystroke_for_key_down(ks, mode) {
                     {
                         let mut term = this.terminal.lock().expect("term lock poisoned");
                         if term.grid().display_offset() > 0 {
@@ -2364,6 +2364,7 @@ mod ime_input_handler_tests {
     use gpui::{AnyWindowHandle, AppContext as _, Entity, EntityInputHandler, TestAppContext};
 
     use super::{KeyTable, PaneInput, PaneView, PrefixOptions};
+    use crate::keyboard;
 
     /// A [`PaneView`] built inside an open test window — `EntityInputHandler`
     /// methods take a live `&mut Window` argument even though these tests
@@ -2427,6 +2428,96 @@ mod ime_input_handler_tests {
             .try_recv()
             .expect("committed text forwarded to the PTY");
         assert_eq!(sent.bytes, "\u{e9}".as_bytes());
+    }
+
+    /// Regression for PR #785's review (B1): on Windows, `WM_KEYDOWN` and
+    /// `WM_CHAR` both fire, unconditionally, for every character-producing
+    /// key — `on_key_down` and the input handler are two independent
+    /// delivery channels for the exact same keystroke there. This drives
+    /// both, the way they'd genuinely both fire for one Windows keypress,
+    /// and asserts the PTY receives the character exactly once.
+    ///
+    /// This does not use `TestAppContext::simulate_input`: that helper's own
+    /// `Window::dispatch_keystroke` fallback unconditionally forwards
+    /// `key_char` into the input handler whenever `on_key_down` does not
+    /// call `stop_propagation` (true here, on every platform) — a test-only
+    /// convenience bridge that does not model any real platform's actual
+    /// event delivery, so it would not exercise this regression correctly.
+    /// Driving the two real production entry points directly
+    /// (`encode_keystroke_for_key_down`, `replace_text_in_range`) does.
+    #[gpui::test]
+    fn test_windows_key_down_and_input_handler_send_printable_char_exactly_once(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, pane, input_rx) = windowed_pane_and_input_rx(cx);
+        let keystroke = gpui::Keystroke {
+            modifiers: gpui::Modifiers::none(),
+            key: "a".into(),
+            key_char: Some("a".into()),
+        };
+
+        // What `on_key_down` calls on Windows: excludes plain printables, so
+        // it contributes nothing here (the WM_CHAR-equivalent below is the
+        // sole sender).
+        assert_eq!(
+            keyboard::encode_control_keystroke(
+                &keystroke,
+                alacritty_terminal::term::TermMode::empty()
+            ),
+            None,
+            "on_key_down must not also forward a plain printable character"
+        );
+
+        // The WM_CHAR-equivalent: the platform's own text-commit channel.
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |view, cx| {
+                view.replace_text_in_range(None, "a", window, cx);
+            });
+        })
+        .unwrap();
+
+        let sent = input_rx.try_recv().expect("the character reaches the PTY");
+        assert_eq!(sent.bytes, b"a");
+        assert!(
+            input_rx.try_recv().is_err(),
+            "exactly one send for the one keypress, not two"
+        );
+    }
+
+    /// Control/nav keys are unaffected by the #501/#785 split: they still
+    /// encode via the same function `on_key_down` uses on every platform
+    /// (`WM_CHAR` never fires for them on Windows, so there is no second
+    /// channel to deduplicate against).
+    #[test]
+    fn test_windows_key_down_control_and_nav_keys_still_encode() {
+        let ctrl_c = gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                control: true,
+                ..gpui::Modifiers::none()
+            },
+            key: "c".into(),
+            key_char: None,
+        };
+        assert_eq!(
+            keyboard::encode_control_keystroke(
+                &ctrl_c,
+                alacritty_terminal::term::TermMode::empty()
+            ),
+            Some(vec![0x03])
+        );
+
+        let up_arrow = gpui::Keystroke {
+            modifiers: gpui::Modifiers::none(),
+            key: "up".into(),
+            key_char: None,
+        };
+        assert_eq!(
+            keyboard::encode_control_keystroke(
+                &up_arrow,
+                alacritty_terminal::term::TermMode::empty()
+            ),
+            Some(b"\x1b[A".to_vec())
+        );
     }
 
     /// An in-progress composition step (e.g. a dead key waiting for its base

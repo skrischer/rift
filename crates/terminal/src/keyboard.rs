@@ -22,7 +22,60 @@ pub fn encode_paste(text: &str, mode: TermMode) -> Vec<u8> {
     }
 }
 
+/// Encodes a keystroke into PTY bytes — control/nav/chord sequences AND
+/// plain/AltGr-composed printable-character passthrough. This is the
+/// original (pre-#501) behavior, unchanged; it stays the entry point for
+/// every caller that owns the sole delivery channel for a keystroke's text.
 pub fn encode_keystroke(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
+    encode_keystroke_impl(keystroke, mode, true)
+}
+
+/// The control/navigation/chord/escape-sequence subset of [`encode_keystroke`]
+/// — never includes plain-printable or AltGr-composed-character passthrough.
+///
+/// Once a pane has a GPUI `EntityInputHandler` registered (#501), printable
+/// text arrives a second time via the platform's own text-commit channel.
+/// On Windows this is unconditional and synchronous: every character-
+/// producing key fires both `WM_KEYDOWN` (`on_key_down`) and, immediately
+/// after, `WM_CHAR` (`replace_text_in_range`) — so forwarding printable
+/// bytes from `on_key_down` there double-inserts every typed character (the
+/// PR #785 review's blocking defect). Nav/ctrl/basic keys are unaffected —
+/// `WM_CHAR` never fires for those — so this still encodes them exactly like
+/// [`encode_keystroke`].
+///
+/// `on_key_down`'s call site picks between the two based on target platform
+/// (see `pane_view.rs`); this only needs to be strictly narrower than
+/// [`encode_keystroke`] (never emit bytes it wouldn't), so a caller that
+/// picks it unconditionally is always safe, just possibly over-cautious on
+/// platforms where the second channel does not exist.
+pub fn encode_control_keystroke(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
+    encode_keystroke_impl(keystroke, mode, false)
+}
+
+/// `on_key_down`'s actual entry point: [`encode_control_keystroke`] on
+/// Windows (WM_CHAR independently and unconditionally delivers printable/
+/// AltGr text there — see that function's doc), [`encode_keystroke`]
+/// (unchanged, current behavior) everywhere else.
+///
+/// Linux/X11 is deliberately left on the full, printable-passthrough-
+/// including path: unlike Windows' unconditional dual dispatch, a plain
+/// key's delivery there is not confirmed to also reach the pane's
+/// `EntityInputHandler` in the common (no active IME composition) case —
+/// switching it to `encode_control_keystroke` risks under-delivery (typing
+/// nothing) rather than the over-delivery bug this fixes on Windows.
+pub fn encode_keystroke_for_key_down(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
+    if cfg!(target_os = "windows") {
+        encode_control_keystroke(keystroke, mode)
+    } else {
+        encode_keystroke(keystroke, mode)
+    }
+}
+
+fn encode_keystroke_impl(
+    keystroke: &Keystroke,
+    mode: TermMode,
+    allow_printable_passthrough: bool,
+) -> Option<Vec<u8>> {
     let key = keystroke.key.as_str();
     let ctrl = keystroke.modifiers.control;
     let alt = keystroke.modifiers.alt;
@@ -35,7 +88,7 @@ pub fn encode_keystroke(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>
 
     // AltGr on Windows/Linux is reported as Ctrl+Alt. When a key_char is present,
     // it's a composed character (e.g. AltGr+ß → \) — pass it through directly.
-    if ctrl && alt {
+    if ctrl && alt && allow_printable_passthrough {
         if let Some(ch) = &keystroke.key_char {
             if !ch.is_empty() {
                 return Some(ch.as_bytes().to_vec());
@@ -76,17 +129,19 @@ pub fn encode_keystroke(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>
     }
 
     // Printable character passthrough
-    if let Some(ch) = &keystroke.key_char {
-        if !ch.is_empty() {
-            let bytes = ch.as_bytes().to_vec();
-            return if alt {
-                let mut prefixed = Vec::with_capacity(1 + bytes.len());
-                prefixed.push(0x1b);
-                prefixed.extend_from_slice(&bytes);
-                Some(prefixed)
-            } else {
-                Some(bytes)
-            };
+    if allow_printable_passthrough {
+        if let Some(ch) = &keystroke.key_char {
+            if !ch.is_empty() {
+                let bytes = ch.as_bytes().to_vec();
+                return if alt {
+                    let mut prefixed = Vec::with_capacity(1 + bytes.len());
+                    prefixed.push(0x1b);
+                    prefixed.extend_from_slice(&bytes);
+                    Some(prefixed)
+                } else {
+                    Some(bytes)
+                };
+            }
         }
     }
 
@@ -603,6 +658,56 @@ mod tests {
             key_char: Some("\\".into()),
         };
         assert_eq!(encode_keystroke(&ks, normal()), Some(vec![b'\\']));
+    }
+
+    // --- encode_control_keystroke: printable passthrough excluded (#501/#785) ---
+
+    #[test]
+    fn test_encode_control_keystroke_plain_printable_returns_none() {
+        // The regression from PR #785's review: on Windows this same "a"
+        // also arrives via WM_CHAR -> replace_text_in_range, so on_key_down
+        // must not independently forward it too.
+        let ks = key_with_char("a", "a");
+        assert_eq!(encode_control_keystroke(&ks, normal()), None);
+    }
+
+    #[test]
+    fn test_encode_control_keystroke_altgr_composed_char_returns_none() {
+        // AltGr-composed characters also arrive via WM_CHAR on Windows —
+        // excluded for the same reason as plain printables.
+        let ks = Keystroke {
+            modifiers: Modifiers {
+                control: true,
+                alt: true,
+                ..Modifiers::none()
+            },
+            key: "ß".into(),
+            key_char: Some("\\".into()),
+        };
+        assert_eq!(encode_control_keystroke(&ks, normal()), None);
+    }
+
+    #[test]
+    fn test_encode_control_keystroke_ctrl_combo_still_encodes() {
+        // Ctrl+C never triggers WM_CHAR on Windows (ToUnicode yields no
+        // character for it), so control sequences are unaffected.
+        let ks = ctrl_key("c");
+        assert_eq!(encode_control_keystroke(&ks, normal()), Some(vec![0x03]));
+    }
+
+    #[test]
+    fn test_encode_control_keystroke_nav_key_still_encodes() {
+        let ks = key("up");
+        assert_eq!(
+            encode_control_keystroke(&ks, normal()),
+            Some(b"\x1b[A".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_encode_control_keystroke_basic_key_still_encodes() {
+        let ks = key("enter");
+        assert_eq!(encode_control_keystroke(&ks, normal()), Some(vec![b'\r']));
     }
 
     // --- Alt on basic keys gets ESC prefix ---
