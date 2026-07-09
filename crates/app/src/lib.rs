@@ -22,6 +22,7 @@ pub mod problems_panel;
 pub mod quick_open;
 pub mod recents;
 pub mod results_panel;
+pub mod root_picker;
 pub mod session_order;
 pub mod session_picker;
 pub mod settings;
