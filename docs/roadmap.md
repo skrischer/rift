@@ -49,7 +49,7 @@
 | 30 | Explorer file operations — create / rename / delete / move via a daemon write path, surfaced through the context menu + inline rename + drag & drop | [spec-explorer-file-ops.md](spec-explorer-file-ops.md) | [Phase 30](https://github.com/skrischer/rift/milestone/47) |
 | 31 | Explorer search & filter — in-panel fuzzy narrowing, jump-to-file quick-open, multi-select, keyboard-first navigation | [spec-explorer-search.md](spec-explorer-search.md) | [Phase 31](https://github.com/skrischer/rift/milestone/48) |
 | 32 | Session management — glanceable always-visible session list (see every session at once, click to jump), rename / reorder / kill / new operations; extends the phase-19 switcher (switch + new, click-to-open popover) into a full management surface | [spec-session-management.md](spec-session-management.md) | [Phase 320](https://github.com/skrischer/rift/milestone/49) |
-| 33 | Post-connect session picker — connect to the host first, then pick or create a session from the live list; de-hardcode the fixed default session name ("rift") baked into the connect card | — | — |
+| 33 | Post-connect session picker — connect to the host first, then pick or create a session from the live list; de-hardcode the fixed default session name ("rift") baked into the connect card | [spec-post-connect-picker.md](spec-post-connect-picker.md) | [Phase 330](https://github.com/skrischer/rift/milestone/50) |
 
 A phase gets a Spec link once `/loopkit:plan` drafts it, and a Milestone link once
 it is `READY`. The milestone (open/closed + issue progress) is where status lives.
@@ -179,13 +179,17 @@ PR, never edited from here):
   **Reorder** is client-side ordering persisted locally (the window-state / recents
   store pattern, phase 9) — tmux has no native session order. `PROTOCOL_VERSION`
   stays 8; this is a client-only (`[terminal]`/`[app]`) phase.
-- Phase 33 — the connection flow evolves: the Connection screen's Session field
-  becomes optional and default-less, and a session-picker step sits between
-  connect and cockpit (connect to the host → live list → pick / create). This is
-  a deliberate change to the phase-20 "Connection screen is the startup state"
-  contract; whether it also touches `architecture.md`'s connection-flow section
-  is settled in phase 33's spec PR. De-hardcoding the fixed `"rift"` default is
-  part of this phase.
+- Phase 33 — the connection flow evolves to connect → session-pick → cockpit,
+  and the connect card's Session field + `DEFAULT_SESSION` are removed. The ENTRY
+  POINT decides (planning refinement): `RIFT_SESSION` (env) attaches directly
+  (dogfooding fast-path), a recent-connection reattaches its remembered session if
+  present on the host else shows the picker, and the "Connect →" button always
+  shows the picker. `app`-only, no protocol/daemon change (the picker drives the
+  existing `QuerySessionList` + `Attach` and reuses phase 32's session-row
+  component). Foundation impact ratified in phase 33's spec PR (#688): the phase-20
+  `docs/architecture.md` "Connection robustness contract" gained two amendments —
+  the connect → pick → cockpit startup flow and the re-Attach's
+  unset-session-until-pick precondition.
 
 Backing prior art: "Session management & post-connect picker — prior-art index
 (Phases 32–33)" in [prior-art.md](prior-art.md).
