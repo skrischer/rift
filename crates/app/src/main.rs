@@ -19,14 +19,14 @@ use rift_app::connection_screen::{
     ConnectError, ConnectRequest, ConnectionScreen, ConnectionScreenEvent,
 };
 use rift_app::recents::RecentConnection;
-use rift_app::{apply_persisted_theme, recents, window_state, workspace};
+use rift_app::{apply_persisted_theme, recents, session_order, window_state, workspace};
 use rift_logging::{
     LogTarget, RotatingMakeWriter, SizedWriter, DEFAULT_MAX_BYTES, FORCE_CONSOLE_ENV,
 };
 use rift_terminal::{
     CaptureRequest, CaptureResult, ConnectionStatus, KeyTableQueryResult, PaneInput, PaneOutput,
-    SelectWindow, SessionListItem, SessionSnapshot, SessionSwitchRequest, SessionView,
-    SubscriptionUpdate, TermSize, TERMINAL_KEY_CONTEXT,
+    SelectWindow, SessionListItem, SessionOrderUpdate, SessionSnapshot, SessionSwitchRequest,
+    SessionView, SubscriptionUpdate, TermSize, TERMINAL_KEY_CONTEXT,
 };
 use tracing::{debug, error, info, warn};
 
@@ -545,6 +545,18 @@ fn main() {
                     None
                 }
             };
+            // Session-order store (#686, `docs/spec-session-management.md`):
+            // beside the window-state/recents files, same per-channel keying,
+            // same tolerant-degrade-on-error contract. Only the path is held
+            // here (mirroring `recents_path`) — the order itself is loaded
+            // fresh per connect attempt by `spawn_session_order_actor`.
+            let session_order_path = match session_order::session_order_path() {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    warn!(%e, "session-order persistence disabled");
+                    None
+                }
+            };
             let window_bounds =
                 workspace::initial_window_bounds(&restored, &workspace::display_rects(cx));
             // Per-channel window title (matching the per-channel taskbar icons), so the
@@ -585,8 +597,16 @@ fn main() {
                     // launch (no auto-connect, per the spec's gate decision): the
                     // Shell renders it first, and only builds the session
                     // pipeline below once the user submits the connect card.
-                    let shell =
-                        cx.new(|cx| Shell::new(state_path, recents_path, font_size_px, window, cx));
+                    let shell = cx.new(|cx| {
+                        Shell::new(
+                            state_path,
+                            recents_path,
+                            session_order_path,
+                            font_size_px,
+                            window,
+                            cx,
+                        )
+                    });
                     cx.new(|cx| Root::new(shell, window, cx))
                 },
             )
@@ -612,6 +632,12 @@ struct Shell {
     screen: ScreenState,
     state_path: Option<PathBuf>,
     recents_path: Option<PathBuf>,
+    /// The client-side session-order store's file (#686,
+    /// `docs/spec-session-management.md`), threaded into every `connect()`
+    /// attempt exactly like `recents_path` — only the path lives here, the
+    /// order itself is loaded fresh per attempt by
+    /// `spawn_session_order_actor`.
+    session_order_path: Option<PathBuf>,
     font_size_px: f32,
 }
 
@@ -619,6 +645,7 @@ impl Shell {
     fn new(
         state_path: Option<PathBuf>,
         recents_path: Option<PathBuf>,
+        session_order_path: Option<PathBuf>,
         font_size_px: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -630,6 +657,7 @@ impl Shell {
             screen: ScreenState::Connection(screen),
             state_path,
             recents_path,
+            session_order_path,
             font_size_px,
         }
     }
@@ -741,6 +769,7 @@ impl Shell {
 
         let font_size_px = self.font_size_px;
         let state_path = self.state_path.clone();
+        let session_order_path = self.session_order_path.clone();
         let session_view = cx.new(|cx| {
             let (mut view, handle) = SessionView::new(cx);
             // Font-size restore (#225): set before the first tmux snapshot
@@ -763,6 +792,24 @@ impl Shell {
             let status_tx = handle.connection_status_tx.clone();
             let reconnect_cancel_rx = handle.reconnect_cancel_rx.clone();
 
+            // Session-order actor (#686, `docs/spec-session-management.md`):
+            // intercepts the daemon-facing session-list slot with a fresh
+            // local channel (`raw_session_list_tx`) instead of wiring
+            // `handle.session_list_tx` — SessionView's REAL render channel —
+            // straight through. The actor sorts every raw list by the
+            // persisted client-side order before it ever reaches the strip,
+            // and folds in the strip's own reorder/rename mutations
+            // (`handle.session_order_rx`).
+            let (raw_session_list_tx, raw_session_list_rx) =
+                flume::unbounded::<Vec<SessionListItem>>();
+            spawn_session_order_actor(
+                session_order_path.clone(),
+                raw_session_list_rx,
+                handle.session_order_rx,
+                handle.session_list_tx,
+                cx,
+            );
+
             let channels = PtyChannels {
                 pane_output_tx: handle.pane_output_tx,
                 input_rx: handle.input_rx,
@@ -775,7 +822,7 @@ impl Shell {
                 connection_status_tx: handle.connection_status_tx,
                 key_table_request_rx: handle.key_table_request_rx,
                 key_table_result_tx: handle.key_table_result_tx,
-                session_list_tx: handle.session_list_tx,
+                session_list_tx: raw_session_list_tx,
                 session_list_request_rx: handle.session_list_request_rx,
                 session_switch_rx: handle.session_switch_rx,
             };
@@ -2566,6 +2613,114 @@ fn spawn_session_switch_bridge(
             let _ = client.send(resize).await;
         }
     });
+}
+
+/// The session-order actor's input (#686, `docs/spec-session-management.md`):
+/// merges the daemon's raw `SessionListReply` push and the title-bar strip's
+/// own order mutations onto one channel, so [`spawn_session_order_actor`]'s
+/// read-modify-write loop over the persisted order stays a single owner —
+/// no `Arc<Mutex<...>>` (`docs/constitution.md`: "state flows through
+/// channels").
+enum SessionOrderEvent {
+    /// A fresh session list from the daemon (an explicit refresh or the
+    /// unprompted churn-driven push), still in server order.
+    RawList(Vec<SessionListItem>),
+    /// A client-initiated order mutation from the strip: a drag-to-reorder
+    /// commit, or a rename that must preserve its slot.
+    Update(SessionOrderUpdate),
+}
+
+/// Wire the client-side session-order store (`rift_app::session_order`)
+/// between the daemon's raw session-list push and the strip's real render
+/// channel (#686, `docs/spec-session-management.md`). `raw_rx` carries every
+/// raw `SessionListReply` (intercepted at `channels.session_list_tx` instead
+/// of `handle.session_list_tx` directly — see the call site); `order_rx` is
+/// `handle.session_order_rx`, the strip's own mutations; `final_tx` is the
+/// REAL `handle.session_list_tx` wired into `SessionView`'s render channel.
+/// Every raw list is sorted by the persisted order before reaching
+/// `final_tx`; every order mutation is applied, persisted to `order_path`,
+/// and immediately re-sorted against the latest known list, so a
+/// drag-to-reorder or an in-UI rename takes effect without waiting for the
+/// next daemon push.
+///
+/// Runs entirely on GPUI's own executor (`cx.spawn`, not `tokio::spawn` —
+/// this task must outlive any single reconnect attempt's ephemeral tokio
+/// runtime, see `run_session_with_reconnect`). Two small forwarder tasks fold
+/// `raw_rx` and `order_rx` onto one merged channel so the actual
+/// read-modify-write loop is a single task rather than two racing the same
+/// `Vec<String>`. All three tasks are detached; they end on their own once
+/// every sender clone drops (the session pipeline tearing down at session
+/// end, or a reconnect dropping the ssh-thread's clone of `raw_rx`'s sender).
+fn spawn_session_order_actor(
+    order_path: Option<PathBuf>,
+    raw_rx: flume::Receiver<Vec<SessionListItem>>,
+    order_rx: flume::Receiver<SessionOrderUpdate>,
+    final_tx: flume::Sender<Vec<SessionListItem>>,
+    cx: &mut Context<SessionView>,
+) {
+    let (merged_tx, merged_rx) = flume::unbounded::<SessionOrderEvent>();
+
+    {
+        let merged_tx = merged_tx.clone();
+        cx.spawn(async move |_this, _cx| {
+            while let Ok(sessions) = raw_rx.recv_async().await {
+                if merged_tx
+                    .send(SessionOrderEvent::RawList(sessions))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+    {
+        cx.spawn(async move |_this, _cx| {
+            while let Ok(update) = order_rx.recv_async().await {
+                if merged_tx.send(SessionOrderEvent::Update(update)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    cx.spawn(async move |_this, _cx| {
+        let mut order = order_path
+            .as_deref()
+            .map(session_order::load)
+            .unwrap_or_default();
+        let mut latest: Vec<SessionListItem> = Vec::new();
+        while let Ok(event) = merged_rx.recv_async().await {
+            match event {
+                SessionOrderEvent::RawList(sessions) => {
+                    latest = sessions;
+                }
+                SessionOrderEvent::Update(update) => {
+                    order = match update {
+                        SessionOrderUpdate::Reorder(seq) => {
+                            session_order::apply_reorder(&order, seq)
+                        }
+                        SessionOrderUpdate::Rename { old, new } => {
+                            session_order::apply_rename(&order, &old, &new)
+                        }
+                    };
+                    if let Some(path) = order_path.as_deref() {
+                        if let Err(e) = session_order::save(path, &order) {
+                            warn!(%e, "failed to persist session order");
+                        }
+                    }
+                }
+            }
+            if final_tx
+                .send(session_order::sort_sessions(latest.clone(), &order))
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+    .detach();
 }
 
 /// Parse tmux's `%N` pane id into the protocol's integer pane id. A render-side

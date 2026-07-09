@@ -105,6 +105,26 @@ pub struct SessionSwitchRequest {
     pub size: TermSize,
 }
 
+/// A session-order mutation emitted by the title-bar strip (#686,
+/// `docs/spec-session-management.md`): a drag-to-reorder commit resequences
+/// the whole visible session list; a chip rename additionally renames the
+/// order-store's key so the reordered slot survives the rename (only an
+/// external CLI rename re-slots — the store's own self-healing rule). Routed
+/// to `rift-app`'s session-order store via [`TerminalHandle::session_order_rx`];
+/// the store's mutation, persistence, and the resulting render-time re-sort
+/// are all `rift-app`'s concern — `rift-terminal` only emits the mutation and
+/// never depends on `rift-app` (crate boundary,
+/// `docs/constitution.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionOrderUpdate {
+    /// Replace the stored order with this full sequence of session names —
+    /// the user's new drag-committed order (a total order, not a subset).
+    Reorder(Vec<String>),
+    /// Rename the order-store's key for a session (`old` -> `new`) so its
+    /// slot survives an in-UI rename.
+    Rename { old: String, new: String },
+}
+
 /// A tmux format-subscription update (`%subscription-changed`). `name` is the
 /// subscription registered via [`termy_terminal_ui::TmuxClient::subscribe`];
 /// `pane` is `-` for window- or session-scoped subscriptions.
