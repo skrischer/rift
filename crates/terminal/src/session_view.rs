@@ -1751,7 +1751,17 @@ impl SessionView {
             .items_center()
             .gap(px(4.0))
             .text_size(px(13.0))
-            .font_family("JetBrainsMono Nerd Font Mono");
+            .font_family("JetBrainsMono Nerd Font Mono")
+            // The strip lives inside the vendored `TitleBar`, whose whole bar
+            // is a `WindowControlArea::Drag`: a left mouse-down there arms a
+            // window move that `start_window_move()`s on the next mouse-move,
+            // canceling the chips' synthesized `on_click` (switch) and the
+            // inline kill-confirm buttons before the mouse-up — so a click
+            // looked inert. Swallow the left mouse-down here (the
+            // gpui-component title-bar example guards interactive children the
+            // same way) so the drag never arms; chips are visited first in the
+            // bubble phase, so their own handlers still fire.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
 
         // A right-click menu targets a real tmux session id; the synthesized
         // fallback row (`id: 0` above) is display-only and must stay inert,
