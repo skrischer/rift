@@ -15,14 +15,14 @@
 //! here. Its default 34px height is styled up to the design's 38px via its
 //! `Styled` impl (the spec's prior decision: never fork the widget).
 //!
-//! The connection group hosts the always-visible session strip (#683,
-//! `docs/spec-session-management.md`), relocated here from its interim
-//! statusbar anchor and, before that, the phase-19 click-to-open popover
-//! (`docs/spec-session-switch.md`): `rift_terminal::SessionView`'s
-//! `render_session_strip` renders the chips, `workspace::WorkspaceView`
-//! embeds it via [`ConnectionGroup::connected`]. The Connection screen's
-//! group has no live session yet, so [`ConnectionGroup::not_connected`]
-//! renders a bare label instead.
+//! The left group hosts the always-visible session strip (#683,
+//! `docs/spec-session-management.md`, left-aligned per #750), relocated here
+//! from its interim statusbar anchor and, before that, the phase-19
+//! click-to-open popover (`docs/spec-session-switch.md`):
+//! `rift_terminal::SessionView`'s `render_session_strip` renders the chips,
+//! `workspace::WorkspaceView` passes it into [`render`] alongside the
+//! connection group. The Connection screen and the session picker have no
+//! live session yet, so they pass `None` and no strip renders.
 //!
 //! [`connection_screen::ConnectionScreen`]: crate::connection_screen::ConnectionScreen
 //! [`workspace::WorkspaceView`]: crate::workspace::WorkspaceView
@@ -36,81 +36,72 @@ use gpui_component::{h_flex, ActiveTheme as _, Icon, IconName, Sizable as _, Tit
 /// Design-contract height of the custom title bar.
 pub const HEIGHT: Pixels = px(38.0);
 
-/// The connection/session group's live content: a status-dot color, the
-/// plain-text label beside it, and (when a live session exists) the
-/// always-visible session strip anchored right after the label. Callers
-/// build one from their own state — the cockpit's live `SessionView` fields
-/// via [`ConnectionGroup::connected`], or [`ConnectionGroup::not_connected`]
-/// on the Connection screen, before any session exists.
+/// The connection/session group's live content: a status-dot color and the
+/// plain-text label beside it. Callers build one from their own state — the
+/// cockpit's live `SessionView` fields via [`ConnectionGroup::connected`], or
+/// [`ConnectionGroup::not_connected`] on the Connection screen, before any
+/// session exists.
 pub struct ConnectionGroup {
     pub dot_color: Hsla,
     pub label: SharedString,
-    /// The always-visible session strip (#683, `docs/spec-session-management.md`,
-    /// `SessionView::render_session_strip`), relocated here from the interim
-    /// statusbar anchor and, before that, the phase-19 click-to-open popover.
-    /// `None` when there is no live session to render chips for — the
-    /// Connection screen's group, or the cockpit before the first layout
-    /// snapshot names the attached session.
-    pub session_strip: Option<AnyElement>,
 }
 
 impl ConnectionGroup {
     /// The Connection screen's group before any session exists: a muted dot
     /// and a plain "not connected" label — same anatomy as the cockpit's
-    /// group, just no live session to describe yet, so no strip.
+    /// group, just no live session to describe yet.
     pub fn not_connected(cx: &App) -> Self {
         Self {
             dot_color: cx.theme().muted_foreground,
             label: SharedString::from("not connected"),
-            session_strip: None,
         }
     }
 
     /// The cockpit's live group (#512/#683): `ssh_label` (e.g. `user@host`)
-    /// is always plain text; `session_strip` — the chip strip built by
-    /// `SessionView::render_session_strip` — renders right after it,
-    /// separated by "·", when a live session exists (the group's own flex
-    /// gap supplies the surrounding whitespace, so the label carries no
-    /// trailing space). Before the first layout snapshot names the attached
-    /// session (`session_strip` is `None`) the group falls back to the bare
-    /// host label, matching the statusbar's own guard.
-    pub fn connected(
-        dot_color: Hsla,
-        ssh_label: SharedString,
-        session_strip: Option<AnyElement>,
-    ) -> Self {
-        let label = if session_strip.is_some() {
-            SharedString::from(format!("{ssh_label} \u{b7}"))
-        } else {
-            ssh_label
-        };
+    /// renders as plain text beside the status dot. The session strip is no
+    /// longer part of this group (#750, left-aligned beside the brand
+    /// instead) — see [`render`]'s `session_strip` parameter.
+    pub fn connected(dot_color: Hsla, ssh_label: SharedString) -> Self {
         Self {
             dot_color,
-            label,
-            session_strip,
+            label: ssh_label,
         }
     }
 }
 
-/// Build the custom title bar: the rift logo + wordmark flush against the
-/// left edge, the connection group and (when supplied) the settings gear
-/// flush against the window controls. `settings_button` is `None` on the
-/// Connection screen — the settings surface needs a live `SessionView`
-/// (#366), so no gear renders there rather than shipping a dead control
-/// (the spec's "every rendered icon acts" constraint).
+/// Build the custom title bar: the rift logo + wordmark and (when supplied)
+/// the always-visible session strip on the left, the connection group and
+/// (when supplied) the settings gear flush against the window controls on
+/// the right. `session_strip` is `None` before a live session names the
+/// attached session (#683, `SessionView::render_session_strip`) or on
+/// surfaces with no live session yet (Connection screen, session picker).
+/// `settings_button` is `None` on the Connection screen — the settings
+/// surface needs a live `SessionView` (#366), so no gear renders there
+/// rather than shipping a dead control (the spec's "every rendered icon
+/// acts" constraint).
 pub fn render(
     connection: ConnectionGroup,
+    session_strip: Option<AnyElement>,
     settings_button: Option<AnyElement>,
     cx: &App,
 ) -> impl IntoElement {
-    TitleBar::new().h(HEIGHT).child(render_brand(cx)).child(
-        h_flex()
-            .items_center()
-            .gap(px(12.0))
-            .pr(px(4.0))
-            .child(render_connection_group(connection, cx))
-            .children(settings_button),
-    )
+    TitleBar::new()
+        .h(HEIGHT)
+        .child(
+            h_flex()
+                .items_center()
+                .gap(px(12.0))
+                .child(render_brand(cx))
+                .children(session_strip),
+        )
+        .child(
+            h_flex()
+                .items_center()
+                .gap(px(12.0))
+                .pr(px(4.0))
+                .child(render_connection_group(connection, cx))
+                .children(settings_button),
+        )
 }
 
 /// The rift logo tile + mono-bold wordmark — the same icon the Connection
@@ -162,7 +153,6 @@ fn render_connection_group(connection: ConnectionGroup, cx: &App) -> impl IntoEl
                 .bg(connection.dot_color),
         )
         .child(connection.label)
-        .children(connection.session_strip)
 }
 
 #[cfg(test)]
@@ -177,31 +167,17 @@ mod tests {
             let group = ConnectionGroup::not_connected(cx);
             assert_eq!(group.label.as_ref(), "not connected");
             assert_eq!(group.dot_color, cx.theme().muted_foreground);
-            assert!(
-                group.session_strip.is_none(),
-                "no session strip to render yet"
-            );
         });
     }
 
     #[test]
-    fn test_connection_group_connected_with_session_strip_appends_separator_before_it() {
-        let group = ConnectionGroup::connected(
-            Hsla::default(),
-            SharedString::from("dev@100.64.0.1"),
-            Some(div().into_any_element()),
-        );
-
-        assert_eq!(group.label.as_ref(), "dev@100.64.0.1 \u{b7}");
-        assert!(group.session_strip.is_some());
-    }
-
-    #[test]
-    fn test_connection_group_connected_without_session_strip_keeps_the_bare_host_label() {
+    fn test_connection_group_connected_keeps_the_bare_host_label() {
+        // The session strip moved out of the connection group (#750, now
+        // left-aligned beside the brand via `render`'s own parameter), so
+        // the label never grows a trailing separator here.
         let group =
-            ConnectionGroup::connected(Hsla::default(), SharedString::from("dev@100.64.0.1"), None);
+            ConnectionGroup::connected(Hsla::default(), SharedString::from("dev@100.64.0.1"));
 
         assert_eq!(group.label.as_ref(), "dev@100.64.0.1");
-        assert!(group.session_strip.is_none());
     }
 }

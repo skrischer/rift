@@ -376,8 +376,8 @@ fn render_new_session_footer(
 impl Render for SessionPicker {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let connection =
-            title_bar::ConnectionGroup::connected(cx.theme().success, self.ssh_label.clone(), None);
-        let title_bar = title_bar::render(connection, None, cx);
+            title_bar::ConnectionGroup::connected(cx.theme().success, self.ssh_label.clone());
+        let title_bar = title_bar::render(connection, None, None, cx);
 
         let caption = SharedString::from(format!(
             "connected to {} \u{b7} pick a session",

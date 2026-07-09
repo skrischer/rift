@@ -17,6 +17,7 @@
 //! resumed as soon as that channel has room, so the loop never deadlocks.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -89,10 +90,15 @@ enum Flow {
 /// resize, raw command); `outbound` is the connection's bounded event channel,
 /// drained by the socket writer. `server_socket` selects the tmux server: `None`
 /// uses the default server (production); tests pass a unique `-L` name to isolate.
+/// `root` is the daemon's watched project root (`docs/spec-session-start-directory.md`):
+/// when present, a freshly created session's default working directory is set to
+/// it (`Attach::spawn`), so every later window and split inherits the project
+/// root instead of `$HOME`. `None` in the rootless test call sites.
 pub(crate) async fn terminal_task(
     mut inbound: mpsc::Receiver<ClientMessage>,
     outbound: mpsc::Sender<DaemonMessage>,
     server_socket: Option<String>,
+    root: Option<PathBuf>,
 ) {
     let mut attach: Option<Attach> = None;
     let mut buf = vec![0u8; TERM_READ_BUFFER];
@@ -123,7 +129,13 @@ pub(crate) async fn terminal_task(
                 Some(ClientMessage::Attach { session }) => {
                     // Re-attach: tear the current child down before opening anew.
                     detach(&mut attach).await;
-                    attach = open_attach(session, server_socket.as_deref(), &outbound).await;
+                    attach = open_attach(
+                        session,
+                        server_socket.as_deref(),
+                        root.as_deref(),
+                        &outbound,
+                    )
+                    .await;
                 }
                 Some(other) => {
                     if let Some(a) = attach.as_mut() {
@@ -194,9 +206,10 @@ async fn terminal_down(
 async fn open_attach(
     session: String,
     server_socket: Option<&str>,
+    root: Option<&Path>,
     outbound: &mpsc::Sender<DaemonMessage>,
 ) -> Option<Attach> {
-    match Attach::spawn(session.clone(), server_socket).await {
+    match Attach::spawn(session.clone(), server_socket, root).await {
         Ok(attach) => Some(attach),
         Err(err) => {
             error!(%session, %err, "tmux attach failed");
@@ -209,6 +222,95 @@ async fn open_attach(
             None
         }
     }
+}
+
+/// Build the argv (excluding the `tmux` program name itself) for the attach's
+/// control-mode child: an optional `-L <server_socket>`, then the fixed
+/// `-C new-session -A -s <session>`, then an optional `-c <root>`
+/// (`docs/spec-session-start-directory.md`) so a freshly created session's
+/// default working directory is the project root — inherited by every later
+/// `new-window`/`split-window` that omits its own `-c` (tmux >=1.9). `-c` only
+/// takes effect when `new-session -A` actually creates the session; attaching
+/// an existing one leaves its default directory untouched (the re-root path is
+/// separate). Extracted as a pure function so the argv shape is unit-tested
+/// without spawning tmux; each entry is its own argv element, never a shell
+/// string, so a root path cannot inject extra arguments.
+fn spawn_args(session: &str, server_socket: Option<&str>, root: Option<&Path>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(socket) = server_socket {
+        args.push("-L".to_owned());
+        args.push(socket.to_owned());
+    }
+    args.push("-C".to_owned());
+    args.push("new-session".to_owned());
+    args.push("-A".to_owned());
+    args.push("-s".to_owned());
+    args.push(session.to_owned());
+    if let Some(root) = root {
+        args.push("-c".to_owned());
+        args.push(root.to_string_lossy().into_owned());
+    }
+    args
+}
+
+/// Build the control-mode command that re-roots the just-attached session to
+/// `root` (`docs/spec-session-start-directory.md`). `-c` on `new-session -A`
+/// only takes effect when the session is *created*; a session that already
+/// existed (created outside rift in `$HOME`, or persisted from before this
+/// change) keeps its stale default directory unless re-rooted separately. In
+/// Phase 34 the daemon has exactly one root, so sending this unconditionally on
+/// every attach is idempotent: a no-op for a freshly created session (already
+/// at `root`), a fix for a pre-existing one.
+///
+/// Validated against a real tmux 3.4 server (see the spec's decision log):
+/// `attach-session -c <root>`, sent with **no `-t`**, over the control-mode
+/// connection that is already attached to the target session, sets that
+/// session's `session_path` (the default directory `new-window`/
+/// `split-window` inherit) to `root` — omitting `-t` targets the issuing
+/// client's own current session, so the session name never has to be embedded
+/// (and quoted) in the command line at all. Re-sending it for a session
+/// already at `root` is harmless: tmux applies the same value and the
+/// resulting `%session-changed` for this attach's own (unchanged) session id
+/// is a no-op (see `Event::SessionChanged`'s `switched` check).
+///
+/// Unlike `spawn_args`, this string is not process argv — it is parsed by
+/// tmux's own control-mode command lexer (a shell-like grammar), so `root` is
+/// quoted with [`quote_tmux_arg`]: an unquoted space would otherwise split it
+/// into two tokens (confirmed against real tmux: unquoted, a rooted path
+/// containing a space fails with tmux's `%error … too many arguments`).
+///
+/// Quoting alone cannot neutralize a `\n`/`\r` in `root`: [`Attach::send_command`]
+/// frames each command as one control-mode *line*, terminated before tmux's
+/// own lexer (and hence `quote_tmux_arg`'s `'...'` escaping) ever runs — a
+/// literal newline in the path would split this into two control-mode
+/// commands, the second one unquoted and attacker-controlled (POSIX paths may
+/// legally contain `\n`; only `/` and NUL are forbidden). Returns `None` for
+/// such a `root` instead of building an unsafe command; the caller skips the
+/// re-root and logs rather than sending it (best-effort degrade, matching the
+/// spec's "never abort the daemon" risk mitigation, narrowed here to "never
+/// send a malformed command").
+fn reroot_command(root: &Path) -> Option<String> {
+    let root = root.to_string_lossy();
+    if root.contains('\n') || root.contains('\r') {
+        return None;
+    }
+    Some(format!("attach-session -c {}", quote_tmux_arg(&root)))
+}
+
+/// Wrap `value` as a single literal tmux control-mode command-line argument:
+/// wrapping in `'...'` and escaping an embedded `'` as `'\''` makes tmux's
+/// *lexer* treat `value` as exactly one token regardless of in-line
+/// whitespace or metacharacters (`"`, `;`, a leading `-`, `$`, `#`). This is a
+/// within-line, lexer-level defense only — it says nothing about a `\n`/`\r`
+/// in `value`, which breaks the control-mode *line framing* the lexer never
+/// even sees (guarded separately by [`reroot_command`]'s `None` case; do not
+/// rely on this function for that). Mirrors
+/// `crates/terminal/src/tmux_quote.rs::quote_tmux_arg`; duplicated rather
+/// than shared because the daemon and `terminal` crates stay independent
+/// (`docs/constitution.md` crate-boundary rule) and this is the daemon's only
+/// tmux command line that embeds a dynamic, unbounded value.
+fn quote_tmux_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// One client's live tmux control-mode attach.
@@ -266,13 +368,14 @@ struct KeyTableQuery {
 }
 
 impl Attach {
-    async fn spawn(session: String, server_socket: Option<&str>) -> anyhow::Result<Self> {
+    async fn spawn(
+        session: String,
+        server_socket: Option<&str>,
+        root: Option<&Path>,
+    ) -> anyhow::Result<Self> {
         let mut command = tokio::process::Command::new("tmux");
-        if let Some(socket) = server_socket {
-            command.args(["-L", socket]);
-        }
         command
-            .args(["-C", "new-session", "-A", "-s", &session])
+            .args(spawn_args(&session, server_socket, root))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -305,6 +408,25 @@ impl Attach {
         attach
             .send_command(&format!("refresh-client -f pause-after={PAUSE_AFTER_SECS}"))
             .await?;
+        // Re-root a pre-existing session whose default directory predates this
+        // attach (`docs/spec-session-start-directory.md`); a no-op when the
+        // session was just created with `-c root` above. Best-effort: a reply
+        // arrives as an unmatched CommandReply and is silently dropped, same
+        // as any other ack (see `process`'s CommandReply arm). A root that
+        // cannot be safely framed as one control-mode line (`\n`/`\r`) skips
+        // the re-root rather than sending a malformed command — see
+        // `reroot_command`.
+        if let Some(root) = root {
+            match reroot_command(root) {
+                Some(cmd) => {
+                    attach.send_command(&cmd).await?;
+                }
+                None => warn!(
+                    root = %root.display(),
+                    "skipping session re-root: root path contains a control character that cannot be safely sent over tmux control mode"
+                ),
+            }
+        }
         // The task loop already reads stdout (we are subscribed), so any change
         // after this query lands as a live LayoutUpdate — no gap; the snapshot is
         // the current state, updates replace wholesale, so no duplicate either.
@@ -838,6 +960,99 @@ mod tests {
     }
 
     #[test]
+    fn test_spawn_args_with_root_appends_c_flag_after_new_session() {
+        let args = spawn_args("rift", None, Some(Path::new("/home/dev/proj")));
+        assert_eq!(
+            args,
+            vec![
+                "-C",
+                "new-session",
+                "-A",
+                "-s",
+                "rift",
+                "-c",
+                "/home/dev/proj"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_spawn_args_without_root_omits_c_flag() {
+        let args = spawn_args("rift", None, None);
+        assert_eq!(args, vec!["-C", "new-session", "-A", "-s", "rift"]);
+        assert!(!args.iter().any(|a| a == "-c"));
+    }
+
+    #[test]
+    fn test_spawn_args_with_server_socket_prepends_l_flag() {
+        let args = spawn_args("rift", Some("mysock"), Some(Path::new("/proj")));
+        assert_eq!(
+            args,
+            vec![
+                "-L",
+                "mysock",
+                "-C",
+                "new-session",
+                "-A",
+                "-s",
+                "rift",
+                "-c",
+                "/proj"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_reroot_command_wraps_root_in_attach_session_c_with_no_target() {
+        let command = reroot_command(Path::new("/home/dev/proj")).expect("plain root is safe");
+        assert_eq!(command, "attach-session -c '/home/dev/proj'");
+        // No `-t <session>`: the command targets the issuing client's own
+        // current session (validated against real tmux), so a session name
+        // never needs to be embedded (and quoted) here.
+        assert!(!command.contains("-t"));
+    }
+
+    #[test]
+    fn test_reroot_command_quotes_a_root_containing_a_space() {
+        // Unquoted, real tmux rejects this with `%error … too many
+        // arguments` (validated) because its command lexer splits on
+        // whitespace; the quoting keeps the whole path one argument.
+        let command = reroot_command(Path::new("/tmp/rift reroot project"))
+            .expect("a space is a lexer-level, not line-framing, character");
+        assert_eq!(command, "attach-session -c '/tmp/rift reroot project'");
+    }
+
+    #[test]
+    fn test_reroot_command_escapes_an_embedded_single_quote() {
+        let command = reroot_command(Path::new("/tmp/rift's project"))
+            .expect("an embedded quote is a lexer-level, not line-framing, character");
+        assert_eq!(command, "attach-session -c '/tmp/rift'\\''s project'");
+    }
+
+    #[test]
+    fn test_reroot_command_with_newline_in_root_returns_none() {
+        // `Attach::send_command` frames each command as one control-mode
+        // line, terminated before tmux's lexer (and quote_tmux_arg's
+        // escaping) ever runs; a literal `\n` would split this into two
+        // control-mode commands, the second unquoted and attacker-controlled.
+        // A POSIX path may legally contain `\n` (only `/` and NUL are
+        // forbidden), so this must degrade to "no re-root", never send the
+        // malformed command.
+        assert_eq!(reroot_command(Path::new("/tmp/a\nkill-server")), None);
+        assert_eq!(reroot_command(Path::new("/tmp/a\rkill-server")), None);
+    }
+
+    #[test]
+    fn test_quote_tmux_arg_plain_wraps_in_single_quotes() {
+        assert_eq!(quote_tmux_arg("proj"), "'proj'");
+    }
+
+    #[test]
+    fn test_quote_tmux_arg_with_single_quote_is_escaped() {
+        assert_eq!(quote_tmux_arg("it's"), "'it'\\''s'");
+    }
+
+    #[test]
     fn test_parse_layout_line_full_fields() {
         let parsed =
             parse_layout_line("@0\t3\t1\t%1\t1\t51\t0\t49\t30\tnvim\t/home/dev/proj\t0\tbash")
@@ -1089,7 +1304,7 @@ mod tests {
         let (in_tx, in_rx) = mpsc::channel(64);
         let (out_tx, out_rx) = mpsc::channel(outbound_cap);
         let socket = server.name.clone();
-        let handle = tokio::spawn(terminal_task(in_rx, out_tx, Some(socket)));
+        let handle = tokio::spawn(terminal_task(in_rx, out_tx, Some(socket), None));
         (in_tx, out_rx, handle)
     }
 

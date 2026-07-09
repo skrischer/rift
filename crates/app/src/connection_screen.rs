@@ -805,7 +805,12 @@ impl Render for ConnectionScreen {
         // Connection screen's "not connected" group — no settings gear here,
         // the settings surface needs a live `SessionView` that does not exist
         // before a connection succeeds (#366).
-        let title_bar = title_bar::render(title_bar::ConnectionGroup::not_connected(cx), None, cx);
+        let title_bar = title_bar::render(
+            title_bar::ConnectionGroup::not_connected(cx),
+            None,
+            None,
+            cx,
+        );
 
         div()
             .size_full()

@@ -3,6 +3,18 @@
 All notable changes to rift are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## v1.2.2 — 2026-07-09 — Session strip fixes (2)
+
+More title-bar session-strip fixes found in live use:
+
+- The strip now populates with all host sessions immediately on connect. The
+  initial session-list request `SessionView::new` fires was being discarded by
+  the pre-attach disconnect-drain, so the strip only ever showed the attached
+  session; the idempotent list-refresh request is no longer drained and the
+  daemon's first `SessionListReply` reaches the strip on attach.
+- The session chips are left-aligned in the title bar (next to the logo); the
+  connection status dot / label and the settings gear stay on the right.
+
 ## v1.2.1 — 2026-07-09 — Session strip fixes
 
 Fixes three regressions in the v1.2.0 title-bar session strip, found while
