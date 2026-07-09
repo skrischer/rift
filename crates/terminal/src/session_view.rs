@@ -1446,6 +1446,11 @@ impl SessionView {
         let mut rows = self.sessions.clone();
         if rows.is_empty() && !current.is_empty() {
             rows.push(SessionListItem {
+                // No real tmux session id is known client-side before the
+                // first `SessionListReply` arrives; this synthesized row is
+                // display-only (never a rename/kill target), so `0` is a
+                // harmless placeholder.
+                id: 0,
                 name: current.to_string(),
                 windows: self.windows.len() as u32,
                 attached: true,
@@ -2821,17 +2826,20 @@ mod tests {
             let (session, _handle) = session_and_handle(cx);
 
             let first = vec![SessionListItem {
+                id: 0,
                 name: "rift".into(),
                 windows: 3,
                 attached: true,
             }];
             let second = vec![
                 SessionListItem {
+                    id: 0,
                     name: "rift".into(),
                     windows: 3,
                     attached: true,
                 },
                 SessionListItem {
+                    id: 1,
                     name: "agent".into(),
                     windows: 1,
                     attached: false,
@@ -3002,6 +3010,7 @@ mod tests {
                 view.session_name = SharedString::from("rift");
                 view.apply_session_list(
                     vec![SessionListItem {
+                        id: 0,
                         name: "rift".into(),
                         windows: 2,
                         attached: true,
@@ -3043,11 +3052,13 @@ mod tests {
                 view.apply_session_list(
                     vec![
                         SessionListItem {
+                            id: 0,
                             name: "rift".into(),
                             windows: 2,
                             attached: true,
                         },
                         SessionListItem {
+                            id: 1,
                             name: "agent".into(),
                             windows: 1,
                             attached: false,

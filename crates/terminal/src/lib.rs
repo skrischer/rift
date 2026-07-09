@@ -7,6 +7,7 @@ pub mod pane_view;
 pub mod prefix;
 mod search;
 mod session_view;
+mod tmux_quote;
 
 pub use keytable::{
     classify_command, keystroke_to_tmux_key, normalize_tmux_key, parse_list_keys, parse_options,
@@ -18,6 +19,7 @@ pub use session_view::{
     MIN_FONT_SIZE,
 };
 pub use termy_terminal_ui::TerminalUiRenderMetricsSnapshot;
+pub use tmux_quote::quote_tmux_arg;
 
 use alacritty_terminal::grid::Dimensions;
 
@@ -77,6 +79,10 @@ pub struct KeyTableQueryResult {
 /// owns that (the truthful-indicator contract).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionListItem {
+    /// tmux's `$<n>` session id (`rift_protocol::SessionEntry::id`) — the
+    /// rename-stable target for rename/kill commands (`docs/spec-session-management.md`),
+    /// unlike `name`, which changes on rename.
+    pub id: u32,
     pub name: String,
     /// The session's window count (`#{session_windows}`).
     pub windows: u32,

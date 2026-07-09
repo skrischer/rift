@@ -2089,6 +2089,7 @@ async fn consume_daemon_messages(
                     let sessions = sessions
                         .into_iter()
                         .map(|entry| SessionListItem {
+                            id: entry.id,
                             name: entry.name,
                             windows: entry.windows,
                             attached: entry.attached,
