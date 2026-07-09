@@ -152,7 +152,9 @@ Editing uses a deliberate request/response buffer channel over the daemon transp
 ## Connection robustness contract (phase 20)
 
 > Ratified with `spec-connection-robustness.md` (2026-07-05). Governs every
-> transport seam; supersedes the earlier quit-on-disconnect behavior.
+> transport seam; supersedes the earlier quit-on-disconnect behavior. Amended by
+> `spec-post-connect-picker.md` (phase 33, 2026-07-09) — the session-pick step and
+> its re-Attach precondition (marked below).
 
 - **Protocol versioning:** `PROTOCOL_VERSION` (crates/protocol) reflects the
   message set — every message-set change bumps it, enforced by a pinned
@@ -168,11 +170,18 @@ Editing uses a deliberate request/response buffer channel over the daemon transp
   plus a terminal re-Attach (fresh-LayoutSnapshot reset). An SSH drop enters a
   visible bounded-backoff reconnect loop (`ConnectionStatus::Reconnecting`)
   instead of quitting; tmux session persistence makes the terminal lossless
-  across it.
+  across it. _(Phase 33)_ The re-Attach targets the current-session watch; when it
+  is unset — a post-connect session pick not yet made — the reconnect re-shows the
+  session picker instead of blind-attaching, and re-attaches the picked session
+  once it is seeded.
 - **Not-connected is a UI state**, owned by the Connection screen (design
   "Connection — Startup"), never a blind exit. The screen is also the startup
   state on every launch (prefilled config, explicit Connect) — the app never
-  auto-connects blindly.
+  auto-connects blindly. _(Phase 33)_ The session is chosen AFTER connect, not on
+  the connect card: the flow is connect → session-pick → cockpit. The entry point
+  decides — `RIFT_SESSION` or a recent's still-present remembered session attaches
+  directly; a fresh "Connect →", or a recent whose session is gone, shows the
+  post-connect picker.
 
 ## Technology map
 
