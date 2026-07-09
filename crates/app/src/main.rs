@@ -489,6 +489,20 @@ fn main() {
                     rift_app::file_tree::StartRename,
                     Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
                 ),
+                // Discrete multi-select keyboard extension
+                // (`docs/spec-explorer-search.md`, Phase 31, #680): `Shift+Up`/
+                // `Shift+Down` grow the multi-select set from the cursor, the
+                // keyboard counterpart of `Ctrl/Cmd+Click`/`Shift+Click`.
+                KeyBinding::new(
+                    "shift-up",
+                    rift_app::file_tree::ExtendSelectionUp,
+                    Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
+                ),
+                KeyBinding::new(
+                    "shift-down",
+                    rift_app::file_tree::ExtendSelectionDown,
+                    Some(rift_app::file_tree::FILE_TREE_KEY_CONTEXT),
+                ),
             ]);
             // Window-state restore (#225, docs/spec-window-state-persistence.md):
             // resolve this instance's channel-keyed state file, load it (defaulting

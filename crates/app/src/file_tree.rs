@@ -21,11 +21,17 @@
 //! control reveals a `gpui-component` `Input` in the header→tree seam;
 //! typing narrows [`FileTree::visible_rows`] to matching files plus their
 //! force-expanded ancestor directories, over the [`crate::fuzzy_match`]
-//! substrate, without ever touching the real `collapsed` set. Selecting a
+//! substrate, without ever touching the real `collapsed` set; and a discrete
+//! multi-select (artboard **State B**, `docs/spec-explorer-search.md`, #680):
+//! `Ctrl`/`Cmd+Click` toggles a path, `Shift+Click` ranges from the cursor,
+//! and `Shift+Up`/`Shift+Down` extend it from the keyboard, alongside — never
+//! replacing — the single `selected` cursor below. Selecting a
 //! file emits [`FileTreeEvent::OpenFile`] carrying its
 //! root-relative path — the clean signal the editor surface (#187)
-//! subscribes to. Rows carry git status and diagnostic severity from the
-//! model, rolled up onto ancestor directories (`compute_rollup`, #329) so a
+//! subscribes to; activating a multi-selection emits it once per selected
+//! file (open-many into the editor's existing `TabPanel`). Rows carry git
+//! status and diagnostic severity from the model, rolled up onto ancestor
+//! directories (`compute_rollup`, #329) so a
 //! collapsed folder still surfaces a modified/errored descendant; a deleted
 //! tracked file, whose own row is gone, rolls its status up onto surviving
 //! ancestors the same way (#480). Selecting changes no tmux pane/window
@@ -55,10 +61,10 @@ use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, px, AnyElement, App, AppContext as _, ClipboardItem, Context, Div, Entity, EventEmitter,
-    FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement as _, Pixels, Render, ScrollStrategy, SharedString, Size,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window,
+    div, px, AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Div, Entity,
+    EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement,
+    MouseButton, MouseDownEvent, ParentElement as _, Pixels, Render, ScrollStrategy, SharedString,
+    Size, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
 };
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_component::dialog::{AlertDialog, DialogButtonProps};
@@ -191,6 +197,20 @@ pub struct SelectFirst;
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = rift, no_json)]
 pub struct SelectLast;
+
+/// Extend the multi-select set (artboard **State B**,
+/// `docs/spec-explorer-search.md`, Phase 31, #680) to include the previous
+/// visible row, moving the cursor there too — the keyboard counterpart of
+/// `Shift+Click`. Bound to `Shift+Up`, scoped to [`FILE_TREE_KEY_CONTEXT`].
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct ExtendSelectionUp;
+
+/// Extend the multi-select set to include the next visible row, moving the
+/// cursor there too. Bound to `Shift+Down`.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct ExtendSelectionDown;
 
 /// Reveal the selected row in the tree — expand its ancestors, select it, and
 /// scroll it into view (reuses [`FileTree::reveal`]). Dispatched by the row
@@ -929,6 +949,19 @@ pub struct FileTree {
     collapsed: HashSet<String>,
     /// The currently selected entry's path, or `None` when nothing is selected.
     selected: Option<String>,
+    /// The multi-select set (artboard **State B**'s discrete flat-surface
+    /// fill, `docs/spec-explorer-search.md`, Phase 31, #680): every path
+    /// `Ctrl`/`Cmd+Click`, `Shift+Click`, or `Shift+Up`/`Shift+Down` has added,
+    /// alongside — never replacing — the single `selected` cursor above. A
+    /// plain click clears it ([`FileTree::click_dir`] /
+    /// [`FileTree::click_file`], "standard tree behavior"); `render_row`
+    /// renders a member row with the flat `secondary` fill (no accent bar)
+    /// unless it is also the cursor row, which keeps the accent-bar
+    /// treatment instead. Pruned the same lazy way `selected` is: a stale
+    /// path (removed from the model, or collapsed out of view) simply
+    /// matches no row at render/use time ([`FileTree::open_many_targets`]);
+    /// `selection` itself is never actively swept.
+    selection: HashSet<String>,
     scroll_handle: VirtualListScrollHandle,
     /// Lazily created on first [`Focusable::focus_handle`] call (needs an `App`
     /// the plain [`FileTree::new`] does not take, so the tree stays constructible
@@ -1003,6 +1036,7 @@ impl FileTree {
             model: WorktreeModel::default(),
             collapsed: HashSet::new(),
             selected: None,
+            selection: HashSet::new(),
             scroll_handle: VirtualListScrollHandle::new(),
             focus_handle: RefCell::new(None),
             row_cache: Vec::new(),
@@ -1061,10 +1095,143 @@ impl FileTree {
     /// Handle a click on a directory row (#481): select it, then toggle its
     /// expansion. Without the selection, arrow-key navigation right after a
     /// click resumed from whatever was selected before, not the row just
-    /// clicked.
+    /// clicked. Clears the multi-select set (`docs/spec-explorer-search.md`'s
+    /// "a plain click still sets the cursor and clears the multi-set" —
+    /// standard tree behavior).
     fn click_dir(&mut self, path: &str) {
         self.selected = Some(path.to_owned());
+        self.selection.clear();
         self.toggle_dir(path);
+    }
+
+    /// Handle a plain click on a file row: select it and emit the open
+    /// signal — [`FileTree::render_row`]'s `on_click` no-modifier branch, and
+    /// [`FileTree::open_selected`]'s single-file fallback. Clears the
+    /// multi-select set, mirroring [`FileTree::click_dir`]'s "standard tree
+    /// behavior" clause (`docs/spec-explorer-search.md`, Phase 31, #680).
+    fn click_file(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.selected = Some(path.to_owned());
+        self.selection.clear();
+        self.cache_dirty = true;
+        cx.emit(FileTreeEvent::OpenFile {
+            path: path.to_owned(),
+        });
+    }
+
+    /// Toggle `path`'s membership in the multi-select set (`Ctrl`/`Cmd+Click`,
+    /// `docs/spec-explorer-search.md`, Phase 31, #680): removes it if already
+    /// present, inserts it otherwise, and moves the cursor to `path` too — so
+    /// a following `Shift+Click` or keyboard extend continues from the row
+    /// just toggled. Additive to the rest of the multi-set: unlike a plain
+    /// click, this never clears it.
+    fn toggle_selection(&mut self, path: &str) {
+        if !self.selection.remove(path) {
+            self.selection.insert(path.to_owned());
+        }
+        self.selected = Some(path.to_owned());
+        self.cache_dirty = true;
+    }
+
+    /// Select the contiguous visible range between the cursor
+    /// (`self.selected`) and `path` (`Shift+Click`,
+    /// `docs/spec-explorer-search.md`, Phase 31, #680): replaces the
+    /// multi-set with every row between the two (inclusive) in
+    /// [`FileTree::row_cache`]'s visible order, regardless of which one comes
+    /// first, then moves the cursor to `path`. Falls back to selecting `path`
+    /// alone when there is no cursor yet, or either endpoint is not
+    /// currently visible (hidden by a collapsed ancestor or the active
+    /// filter) — there is no well-defined visible range to compute then.
+    ///
+    /// Because this also moves the cursor, a second `Shift+Click` re-ranges
+    /// from wherever the previous one landed, not a fixed original anchor —
+    /// the two-field `selected`/`selection` design
+    /// (`docs/spec-explorer-search.md`) keeps no separate anchor; a
+    /// documented v1 simplification.
+    fn range_select(&mut self, path: &str) {
+        self.refresh_row_cache();
+        let anchor = self.selected.clone();
+        self.selected = Some(path.to_owned());
+        self.cache_dirty = true;
+
+        let range = anchor
+            .as_deref()
+            .and_then(|anchor| row_index(&self.row_cache, anchor))
+            .zip(row_index(&self.row_cache, path));
+
+        self.selection = match range {
+            Some((a, b)) => {
+                let (start, end) = (a.min(b), a.max(b));
+                self.row_cache[start..=end]
+                    .iter()
+                    .map(|row| row.path.clone())
+                    .collect()
+            }
+            None => HashSet::from([path.to_owned()]),
+        };
+    }
+
+    /// Extend the multi-select set by one row toward the previous visible
+    /// row (`ExtendSelectionUp`, `Shift+Up`, `docs/spec-explorer-search.md`,
+    /// Phase 31, #680): seeds the set with the current cursor (a no-op
+    /// insert on the second-and-later press, since it is already a member),
+    /// then moves the cursor up and adds the new row — repeated presses grow
+    /// a contiguous range. Mirrors [`FileTree::select_up`]'s
+    /// clamp-at-the-first-row and empty-selection-picks-the-first-row
+    /// behavior, so it is safe with nothing selected yet. Reversing
+    /// direction mid-extend (an `ExtendSelectionDown` right after an
+    /// `ExtendSelectionUp`) keeps *adding* toward the far edge rather than
+    /// shrinking the near one back off: the multi-set has no separate anchor
+    /// beyond the cursor itself, matching the two-field
+    /// `selected`/`selection` design — a documented v1 simplification.
+    fn extend_selection_up(&mut self) {
+        self.refresh_row_cache();
+        let Some(current) = self.selected.clone() else {
+            self.select_first();
+            return;
+        };
+        self.selection.insert(current.clone());
+        if let Some(previous) = selection_after_up(&self.row_cache, Some(&current)) {
+            self.selection.insert(previous.clone());
+            self.selected = Some(previous);
+        }
+        self.scroll_selected_into_view();
+    }
+
+    /// Extend the multi-select set by one row toward the next visible row
+    /// ([`ExtendSelectionDown`], `Shift+Down`) — mirrors
+    /// [`FileTree::extend_selection_up`], see its doc for the growth and
+    /// clamp behavior.
+    fn extend_selection_down(&mut self) {
+        self.refresh_row_cache();
+        let Some(current) = self.selected.clone() else {
+            self.select_first();
+            return;
+        };
+        self.selection.insert(current.clone());
+        if let Some(next) = selection_after_down(&self.row_cache, Some(&current)) {
+            self.selection.insert(next.clone());
+            self.selected = Some(next);
+        }
+        self.scroll_selected_into_view();
+    }
+
+    /// The root-relative file paths [`FileTree::open_selected`] opens as tabs
+    /// when the multi-select set is non-empty — the open-many consumer that
+    /// keeps the multi-selected state reachable rather than dead UI
+    /// (`docs/spec-explorer-search.md`, Phase 31, #680): every path in
+    /// `selection` that [`FileTree::row_cache`] still renders as a file, in
+    /// visible-row order (not `HashSet` iteration order, which is
+    /// unspecified) so the emitted `OpenFile` sequence is stable and matches
+    /// what the user saw highlighted. A path the model no longer has, or
+    /// that now names a directory, is simply absent from `row_cache` (or
+    /// present with a different `kind`) and is skipped — the same lazy
+    /// pruning `selected` gets; `selection` itself is never actively swept.
+    fn open_many_targets(&self) -> Vec<String> {
+        self.row_cache
+            .iter()
+            .filter(|row| row.kind == EntryKind::File && self.selection.contains(&row.path))
+            .map(|row| row.path.clone())
+            .collect()
     }
 
     /// Which placeholder the panel shows in place of the tree, or `None` when
@@ -1721,9 +1888,22 @@ impl FileTree {
 
     /// Open the selected file, or toggle the selected directory
     /// ([`OpenSelected`]) — the keyboard equivalent of [`FileTree::render_row`]'s
-    /// `on_click`.
+    /// `on_click`. With a non-empty multi-select set, activates it instead
+    /// (artboard **State B**'s open-many consumer,
+    /// `docs/spec-explorer-search.md`, Phase 31, #680): emits
+    /// [`FileTreeEvent::OpenFile`] once per [`FileTree::open_many_targets`],
+    /// opening every selected file as an editor tab through the existing
+    /// path. A multi-set holding only directories yields no targets and
+    /// falls through to the single-cursor behavior below.
     fn open_selected(&mut self, cx: &mut Context<Self>) {
         self.refresh_row_cache();
+        let targets = self.open_many_targets();
+        if !targets.is_empty() {
+            for path in targets {
+                cx.emit(FileTreeEvent::OpenFile { path });
+            }
+            return;
+        }
         let Some(selected) = self.selected.clone() else {
             return;
         };
@@ -2313,12 +2493,20 @@ impl FileTree {
             .child(severity_dot)
             .child(git_letter);
 
+        // Selection fill: the cursor row keeps Phase 27's inset accent bar +
+        // active-surface tint; a multi-selected row that is *not* the cursor
+        // gets the artboard's discrete flat-surface fill instead (a neutral
+        // `secondary` theme role, distinct from `list_active`/`accent` — no
+        // accent bar, `docs/spec-explorer-search.md`, Phase 31, #680). The
+        // cursor's own treatment always wins when a row is both.
         if is_selected {
             root = root
                 .bg(cx.theme().list_active)
                 .border_l_2()
                 .border_color(cx.theme().accent)
                 .text_color(cx.theme().foreground);
+        } else if self.selection.contains(&row.path) {
+            root = root.bg(cx.theme().secondary);
         }
 
         // Drag & drop move (`docs/spec-explorer-file-ops.md`, #677): every
@@ -2367,16 +2555,24 @@ impl FileTree {
         // row (`FileTree::start_create`); *Rename* reuses the shipped
         // `StartRename` action (State C), same as "Open" reuses
         // `OpenSelected`; *Delete* opens the destructive confirm dialog.
-        root.on_click(cx.listener(move |this, _event, _window, cx| {
-            if is_dir {
+        //
+        // Discrete multi-select (`docs/spec-explorer-search.md`, Phase 31,
+        // #680): `event.modifiers()` distinguishes a plain click from
+        // `Ctrl`/`Cmd+Click` (toggle) and `Shift+Click` (range) before
+        // falling back to the plain dir-toggle / file-open behavior above.
+        root.on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
+            let modifiers = event.modifiers();
+            if modifiers.secondary() {
+                this.toggle_selection(&path);
+            } else if modifiers.shift {
+                this.range_select(&path);
+            } else if is_dir {
                 this.click_dir(&path);
             } else {
-                this.selected = Some(path.clone());
-                this.cache_dirty = true;
                 // The open signal the editor surface consumes. Selecting a file
                 // is the only thing that touches anything outside this view — and
                 // it touches nothing but this event; no tmux pane/window state.
-                cx.emit(FileTreeEvent::OpenFile { path: path.clone() });
+                this.click_file(&path, cx);
             }
             cx.notify();
         }))
@@ -2630,6 +2826,16 @@ impl Render for FileTree {
             }))
             .on_action(cx.listener(|this, _: &SelectLast, _window, cx| {
                 this.select_last();
+                cx.notify();
+            }))
+            // Discrete multi-select keyboard extension (`Shift+Up`/
+            // `Shift+Down`, `docs/spec-explorer-search.md`, Phase 31, #680).
+            .on_action(cx.listener(|this, _: &ExtendSelectionUp, _window, cx| {
+                this.extend_selection_up();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ExtendSelectionDown, _window, cx| {
+                this.extend_selection_down();
                 cx.notify();
             }))
             // Row context-menu actions (`docs/spec-explorer-context-menu.md`):
@@ -4356,6 +4562,294 @@ mod tests {
         tree.expand_or_select_child();
 
         assert_eq!(tree.selected(), Some("a"));
+    }
+
+    // --- discrete multi-select (artboard State B flat fill, `docs/spec-explorer-search.md`, #680) ---
+
+    #[test]
+    fn test_click_dir_clears_an_existing_multi_selection() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs"), file("top.rs")]);
+        tree.selection = HashSet::from(["top.rs".to_owned()]);
+
+        tree.click_dir("src");
+
+        assert!(tree.selection.is_empty());
+    }
+
+    #[test]
+    fn test_toggle_selection_adds_then_removes_a_path() {
+        let mut tree = seed(vec![file("a.rs"), file("b.rs")]);
+
+        tree.toggle_selection("a.rs");
+        assert!(tree.selection.contains("a.rs"));
+        assert_eq!(tree.selected(), Some("a.rs"));
+
+        tree.toggle_selection("a.rs");
+        assert!(!tree.selection.contains("a.rs"));
+    }
+
+    #[test]
+    fn test_toggle_selection_is_additive_and_moves_the_cursor() {
+        let mut tree = seed(vec![file("a.rs"), file("b.rs"), file("c.rs")]);
+
+        tree.toggle_selection("a.rs");
+        tree.toggle_selection("c.rs");
+
+        assert_eq!(
+            tree.selection,
+            HashSet::from(["a.rs".to_owned(), "c.rs".to_owned()])
+        );
+        // The cursor follows the most recently toggled path.
+        assert_eq!(tree.selected(), Some("c.rs"));
+    }
+
+    #[test]
+    fn test_range_select_selects_every_row_between_cursor_and_target() {
+        let mut tree = seed(vec![file("a.rs"), file("b.rs"), file("c.rs"), file("d.rs")]);
+        tree.selected = Some("a.rs".into());
+
+        tree.range_select("c.rs");
+
+        assert_eq!(
+            tree.selection,
+            HashSet::from(["a.rs".to_owned(), "b.rs".to_owned(), "c.rs".to_owned()])
+        );
+        assert_eq!(tree.selected(), Some("c.rs"));
+    }
+
+    #[test]
+    fn test_range_select_with_target_above_the_cursor_still_orders_low_to_high() {
+        let mut tree = seed(vec![file("a.rs"), file("b.rs"), file("c.rs")]);
+        tree.selected = Some("c.rs".into());
+
+        tree.range_select("a.rs");
+
+        assert_eq!(
+            tree.selection,
+            HashSet::from(["a.rs".to_owned(), "b.rs".to_owned(), "c.rs".to_owned()])
+        );
+    }
+
+    #[test]
+    fn test_range_select_with_no_cursor_selects_only_the_target() {
+        let mut tree = seed(vec![file("a.rs"), file("b.rs")]);
+
+        tree.range_select("b.rs");
+
+        assert_eq!(tree.selection, HashSet::from(["b.rs".to_owned()]));
+        assert_eq!(tree.selected(), Some("b.rs"));
+    }
+
+    #[test]
+    fn test_range_select_re_ranges_from_wherever_the_cursor_last_landed() {
+        // A second Shift+Click re-ranges from the row the first one left the
+        // cursor on (`b.rs`), not the original `a.rs` anchor — the documented
+        // v1 simplification (no separate anchor field).
+        let mut tree = seed(vec![file("a.rs"), file("b.rs"), file("c.rs"), file("d.rs")]);
+        tree.selected = Some("a.rs".into());
+        tree.range_select("b.rs");
+        assert_eq!(
+            tree.selection,
+            HashSet::from(["a.rs".to_owned(), "b.rs".to_owned()])
+        );
+
+        tree.range_select("d.rs");
+
+        assert_eq!(
+            tree.selection,
+            HashSet::from(["b.rs".to_owned(), "c.rs".to_owned(), "d.rs".to_owned()])
+        );
+    }
+
+    #[test]
+    fn test_extend_selection_down_grows_a_contiguous_range_from_the_cursor() {
+        let mut tree = seed(vec![file("a.rs"), file("b.rs"), file("c.rs"), file("d.rs")]);
+        tree.selected = Some("a.rs".into());
+
+        tree.extend_selection_down();
+        assert_eq!(tree.selected(), Some("b.rs"));
+        assert_eq!(
+            tree.selection,
+            HashSet::from(["a.rs".to_owned(), "b.rs".to_owned()])
+        );
+
+        tree.extend_selection_down();
+        assert_eq!(tree.selected(), Some("c.rs"));
+        assert_eq!(
+            tree.selection,
+            HashSet::from(["a.rs".to_owned(), "b.rs".to_owned(), "c.rs".to_owned()])
+        );
+    }
+
+    #[test]
+    fn test_extend_selection_up_grows_a_contiguous_range_from_the_cursor() {
+        let mut tree = seed(vec![file("a.rs"), file("b.rs"), file("c.rs")]);
+        tree.selected = Some("c.rs".into());
+
+        tree.extend_selection_up();
+
+        assert_eq!(tree.selected(), Some("b.rs"));
+        assert_eq!(
+            tree.selection,
+            HashSet::from(["c.rs".to_owned(), "b.rs".to_owned()])
+        );
+    }
+
+    #[test]
+    fn test_extend_selection_down_clamps_at_the_last_row() {
+        let mut tree = seed(vec![file("a.rs"), file("b.rs")]);
+        tree.selected = Some("b.rs".into());
+
+        tree.extend_selection_down();
+
+        assert_eq!(tree.selected(), Some("b.rs"));
+        assert_eq!(tree.selection, HashSet::from(["b.rs".to_owned()]));
+    }
+
+    #[test]
+    fn test_extend_selection_down_selects_the_first_row_when_nothing_was_selected() {
+        let mut tree = seed(vec![file("a.rs"), file("b.rs")]);
+
+        tree.extend_selection_down();
+
+        assert_eq!(tree.selected(), Some("a.rs"));
+        assert!(tree.selection.is_empty());
+    }
+
+    #[test]
+    fn test_open_many_targets_excludes_directories() {
+        let mut tree = seed(vec![dir("src"), file("src/main.rs"), file("top.rs")]);
+        tree.selection = HashSet::from(["src".to_owned(), "top.rs".to_owned()]);
+        tree.refresh_row_cache();
+
+        assert_eq!(tree.open_many_targets(), vec!["top.rs".to_owned()]);
+    }
+
+    #[test]
+    fn test_open_many_targets_are_ordered_by_visible_row_not_hashset_order() {
+        let mut tree = seed(vec![file("a.rs"), file("m.rs"), file("z.rs")]);
+        tree.selection = HashSet::from(["z.rs".to_owned(), "a.rs".to_owned(), "m.rs".to_owned()]);
+        tree.refresh_row_cache();
+
+        assert_eq!(
+            tree.open_many_targets(),
+            vec!["a.rs".to_owned(), "m.rs".to_owned(), "z.rs".to_owned()]
+        );
+    }
+
+    #[test]
+    fn test_open_many_targets_prunes_paths_the_model_no_longer_has() {
+        // The multi-set is pruned against the visible set the same lazy way
+        // `selected` is: `selection` itself is never actively swept, but a
+        // stale path simply matches no row here (`docs/spec-explorer-search.md`).
+        let mut tree = seed(vec![file("a.rs"), file("b.rs")]);
+        tree.selection = HashSet::from(["a.rs".to_owned(), "b.rs".to_owned()]);
+        tree.refresh_row_cache();
+        assert_eq!(
+            tree.open_many_targets(),
+            vec!["a.rs".to_owned(), "b.rs".to_owned()]
+        );
+
+        tree.model_mut()
+            .apply_snapshot_chunk("/proj".into(), vec![file("a.rs")], true);
+        tree.refresh_row_cache();
+
+        assert_eq!(tree.open_many_targets(), vec!["a.rs".to_owned()]);
+        assert!(
+            tree.selection.contains("b.rs"),
+            "selection itself is not actively pruned"
+        );
+    }
+
+    #[gpui::test]
+    fn test_click_file_sets_cursor_clears_multiset_and_emits_open_file(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tree, window) = open_tree(cx);
+        let events = subscribe_events(&tree, cx);
+        window
+            .update(cx, |_, _window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut().apply_snapshot_chunk(
+                        "/proj".into(),
+                        vec![file("a.rs"), file("b.rs")],
+                        true,
+                    );
+                    tree.selection = HashSet::from(["a.rs".to_owned()]);
+                    tree.click_file("b.rs", cx);
+                });
+            })
+            .expect("click file");
+
+        cx.update(|cx| {
+            let tree = tree.read(cx);
+            assert_eq!(tree.selected(), Some("b.rs"));
+            assert!(tree.selection.is_empty());
+            assert_eq!(
+                events.borrow().as_slice(),
+                [FileTreeEvent::OpenFile {
+                    path: "b.rs".into()
+                }]
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn test_open_selected_with_a_multiselection_emits_open_file_per_selected_file(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tree, window) = open_tree(cx);
+        let events = subscribe_events(&tree, cx);
+        window
+            .update(cx, |_, _window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut().apply_snapshot_chunk(
+                        "/proj".into(),
+                        vec![file("a.rs"), file("b.rs"), file("c.rs")],
+                        true,
+                    );
+                    tree.selection = HashSet::from(["a.rs".to_owned(), "c.rs".to_owned()]);
+                    tree.open_selected(cx);
+                });
+            })
+            .expect("open selected");
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                FileTreeEvent::OpenFile {
+                    path: "a.rs".into()
+                },
+                FileTreeEvent::OpenFile {
+                    path: "c.rs".into()
+                },
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn test_open_selected_with_an_empty_multiselection_falls_back_to_the_cursor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (tree, window) = open_tree(cx);
+        let events = subscribe_events(&tree, cx);
+        window
+            .update(cx, |_, _window, cx| {
+                tree.update(cx, |tree, cx| {
+                    tree.model_mut()
+                        .apply_snapshot_chunk("/proj".into(), vec![file("a.rs")], true);
+                    tree.selected = Some("a.rs".into());
+                    tree.open_selected(cx);
+                });
+            })
+            .expect("open selected");
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            [FileTreeEvent::OpenFile {
+                path: "a.rs".into()
+            }]
+        );
     }
 
     // --- rename_target / describe_file_op_error (pure helpers) -------------
