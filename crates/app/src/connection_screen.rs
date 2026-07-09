@@ -352,11 +352,15 @@ impl ConnectionScreen {
 
     /// Read the inputs and validate them into a [`ConnectRequest`]. Host and
     /// User must be non-empty; Port must parse as a `u16`; the SSH key path
-    /// must be non-empty; an empty Session defaults to `"rift"` rather than
-    /// erroring, mirroring the pre-#477 `RIFT_SESSION` fallback. When the key
-    /// is detected as encrypted, the passphrase field must be non-empty too
-    /// (#478) — surfaced via [`ConnectError::Passphrase`] so it renders at
-    /// that field rather than the bottom banner.
+    /// must be non-empty. An empty Session is passed through as-is rather
+    /// than defaulting to `"rift"` (issue #706, `docs/spec-post-connect-picker.md`):
+    /// a blank field is the interim trigger for the post-connect session
+    /// picker — `main.rs` treats an empty `ConnectRequest::session` as
+    /// unresolved and shows the picker after the handshake instead of
+    /// attaching directly. When the key is detected as encrypted, the
+    /// passphrase field must be non-empty too (#478) — surfaced via
+    /// [`ConnectError::Passphrase`] so it renders at that field rather than
+    /// the bottom banner.
     fn build_request(&self, cx: &App) -> Result<ConnectRequest, ConnectError> {
         let host = self.host_input.read(cx).value().trim().to_string();
         if host.is_empty() {
@@ -389,11 +393,6 @@ impl ConnectionScreen {
             None
         };
         let session = self.session_input.read(cx).value().trim().to_string();
-        let session = if session.is_empty() {
-            DEFAULT_SESSION.to_string()
-        } else {
-            session
-        };
 
         Ok(ConnectRequest {
             host,

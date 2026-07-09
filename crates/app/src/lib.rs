@@ -23,6 +23,7 @@ pub mod quick_open;
 pub mod recents;
 pub mod results_panel;
 pub mod session_order;
+pub mod session_picker;
 pub mod settings;
 pub mod source_control;
 pub mod status_bar;
