@@ -1,6 +1,6 @@
 # Spec: Remote exec wrapper (container / WSL / jump target)
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-07-09
 > Completed: —
 
@@ -34,9 +34,11 @@ knowledge baked into rift.
 ### In scope
 
 - A `remote_exec_wrapper: Option<String>` carried on `SshConnection`, resolved
-  once at connect from `RIFT_REMOTE_EXEC_WRAPPER` (runtime) with an optional
-  `RIFT_DEFAULT_REMOTE_EXEC_WRAPPER` compile-time bake — **OPEN, resolved at the
-  spec-acceptance gate** (see Prior decisions).
+  once at connect from `RIFT_REMOTE_EXEC_WRAPPER` (runtime) with a
+  `RIFT_DEFAULT_REMOTE_EXEC_WRAPPER` compile-time bake — runtime wins over the
+  bake, mirroring the `RIFT_SSH_KEY` / `RIFT_DEFAULT_SSH_KEY` and
+  `RIFT_PROJECT_ROOT` / `RIFT_DEFAULT_PROJECT_ROOT` splits, so the dogfooding
+  stable channel (`just promote`) can target the container without runtime env.
 - A **single shared `wrap(command)` helper** (on `SshConnection` / in the `exec`
   module) that all three non-PTY exec methods — `exec_capture`,
   `open_daemon_channel`, `upload_executable` (`crates/ssh/src/connection.rs`) —
@@ -127,7 +129,7 @@ knowledge baked into rift.
 | `docker exec -i`, never `-t` | The daemon transport is PTY-less binary framing; a TTY corrupts the frames | 2026-07-09 |
 | Wrapper applied at the `SshConnection` exec chokepoint via `<wrapper> sh -c <quoted>` reusing `shell_single_quote` | The nesting idiom is already proven in `launch.rs`'s `setsid sh -c` (double-escape tested); one seam covers all daemon commands | 2026-07-09 |
 | In-container root via existing `RIFT_PROJECT_ROOT`; legacy tmux path excluded | No new `--root` plumbing; `open_pty_exec` needs a PTY and is being removed (#285) | 2026-07-09 |
-| **OPEN — resolved at the spec-acceptance gate:** env-only (`RIFT_REMOTE_EXEC_WRAPPER`) vs env + compile-time bake (`RIFT_DEFAULT_REMOTE_EXEC_WRAPPER`) | The bake mirrors the `RIFT_SSH_KEY` / `RIFT_DEFAULT_SSH_KEY` split and lets the dogfooding **stable** channel target the container; env-only is the smaller cut. Recommendation: include the bake | 2026-07-09 |
+| Config surface = env + compile-time bake: `RIFT_REMOTE_EXEC_WRAPPER` (runtime) wins over `RIFT_DEFAULT_REMOTE_EXEC_WRAPPER` (bake) | Mirrors the `RIFT_SSH_KEY` / `RIFT_DEFAULT_SSH_KEY` split so the dogfooding **stable** channel can target the container without runtime env — the daily-driver use case. Resolved at the spec-acceptance gate | 2026-07-09 |
 
 ## Prior art
 
@@ -188,3 +190,10 @@ Each issue references this spec path in its body.
   the legacy `tmux -CC` path is being removed (#285), and the daemon lifecycle is
   self-contained in the binary — so one wrapper at three methods covers deploy,
   probe, launch, relay, and stop.
+- 2026-07-09 (spec-acceptance gate): config surface resolved to **env + bake**
+  (`RIFT_REMOTE_EXEC_WRAPPER` runtime wins over `RIFT_DEFAULT_REMOTE_EXEC_WRAPPER`
+  bake), so the stable dogfooding channel can target the container. Review
+  findings folded in pre-merge: single shared `wrap()` helper (atomic across the
+  three methods), builder/setter threading (not a `connect()` param), legacy
+  split-brain caveat, `$HOME`/`RIFT_DAEMON_REMOTE_DIR` container edge, wrapper
+  pass-through requirement, and a shipping-depth (triple-nested) wrap test.
