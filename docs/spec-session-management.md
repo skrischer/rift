@@ -9,6 +9,11 @@ popover) into a first-class management surface: every host tmux session visible 
 a glance, one click to jump, plus rename, reorder, and kill — all agent-agnostic,
 all client-side (no protocol or daemon change).
 
+> Visual contract: the **"rift — Session management" Paper artboard** (Paper file
+> `rift`), **Frame A** — the title-bar session strip (chips: name + window count +
+> attached/current marker, "+ New session…") and its interaction states (per-chip
+> rename / kill-confirm menu, inline-rename, drag-to-reorder).
+
 ## Outcome
 
 - [ ] Every tmux session on the host is visible at a glance in the cockpit
