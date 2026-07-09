@@ -43,11 +43,11 @@
 | 24 | Source-control write path — stage/unstage/commit, hunk staging, split diff + word-level emphasis | [spec-source-control-write.md](spec-source-control-write.md) | [Phase 240](https://github.com/skrischer/rift/milestone/38) |
 | 25 | Explorer design parity — header actions, git letter lane, diagnostic dots + rollup, empty states | — | — |
 | 26 | Settings shell + theme unification — full settings page, theme-driven terminal palette, hardcoded-hex cleanup | — | — |
-| 27 | Explorer redesign — new Paper artboard + overhauled visual language (row anatomy, density, icon / context-menu / filter / file-op affordances); the visual contract phases 28–31 build on | — | — |
-| 28 | Explorer file-type icons — SVG icon-theme asset embedding, file-type → icon mapping, folder / open-folder / chevron glyphs replacing today's text markers | — | — |
-| 29 | Explorer context menu — right-click action framework over the tree; ships the client-capable actions (open, reveal, copy path / relative path, reveal-in-terminal, collapse-all) | — | — |
-| 30 | Explorer file operations — create / rename / delete / move via a daemon write path, surfaced through the context menu + inline rename + drag & drop | — | — |
-| 31 | Explorer search & filter — in-panel fuzzy narrowing, jump-to-file quick-open, multi-select, keyboard-first navigation | — | — |
+| 27 | Explorer redesign — new Paper artboard + overhauled visual language (row anatomy, density, icon / context-menu / filter / file-op affordances); the visual contract phases 28–31 build on | [spec-explorer-redesign.md](spec-explorer-redesign.md) | [Phase 27](https://github.com/skrischer/rift/milestone/43) |
+| 28 | Explorer file-type icons — SVG icon-theme asset embedding, file-type → icon mapping, folder / open-folder / chevron glyphs replacing today's text markers | [spec-explorer-icons.md](spec-explorer-icons.md) | [Phase 28](https://github.com/skrischer/rift/milestone/45) |
+| 29 | Explorer context menu — right-click action framework over the tree; ships the client-capable actions (open, reveal, copy path / relative path, reveal-in-terminal, collapse-all) | [spec-explorer-context-menu.md](spec-explorer-context-menu.md) | [Phase 29](https://github.com/skrischer/rift/milestone/46) |
+| 30 | Explorer file operations — create / rename / delete / move via a daemon write path, surfaced through the context menu + inline rename + drag & drop | [spec-explorer-file-ops.md](spec-explorer-file-ops.md) | [Phase 30](https://github.com/skrischer/rift/milestone/47) |
+| 31 | Explorer search & filter — in-panel fuzzy narrowing, jump-to-file quick-open, multi-select, keyboard-first navigation | [spec-explorer-search.md](spec-explorer-search.md) | [Phase 31](https://github.com/skrischer/rift/milestone/48) |
 | 32 | Session management — glanceable always-visible session list (see every session at once, click to jump), rename / reorder / kill / new operations; extends the phase-19 switcher (switch + new, click-to-open popover) into a full management surface | [spec-session-management.md](spec-session-management.md) | [Phase 320](https://github.com/skrischer/rift/milestone/49) |
 | 33 | Post-connect session picker — connect to the host first, then pick or create a session from the live list; de-hardcode the fixed default session name ("rift") baked into the connect card | — | — |
 
