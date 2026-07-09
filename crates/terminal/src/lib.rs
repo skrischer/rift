@@ -7,6 +7,7 @@ pub mod pane_view;
 pub mod prefix;
 mod search;
 mod session_view;
+mod tmux_quote;
 
 pub use keytable::{
     classify_command, keystroke_to_tmux_key, normalize_tmux_key, parse_list_keys, parse_options,
@@ -18,6 +19,7 @@ pub use session_view::{
     MIN_FONT_SIZE,
 };
 pub use termy_terminal_ui::TerminalUiRenderMetricsSnapshot;
+pub use tmux_quote::quote_tmux_arg;
 
 use alacritty_terminal::grid::Dimensions;
 
@@ -77,6 +79,10 @@ pub struct KeyTableQueryResult {
 /// owns that (the truthful-indicator contract).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionListItem {
+    /// tmux's `$<n>` session id (`rift_protocol::SessionEntry::id`) — the
+    /// rename-stable target for rename/kill commands (`docs/spec-session-management.md`),
+    /// unlike `name`, which changes on rename.
+    pub id: u32,
     pub name: String,
     /// The session's window count (`#{session_windows}`).
     pub windows: u32,
@@ -97,6 +103,26 @@ pub struct SessionListItem {
 pub struct SessionSwitchRequest {
     pub session: String,
     pub size: TermSize,
+}
+
+/// A session-order mutation emitted by the title-bar strip (#686,
+/// `docs/spec-session-management.md`): a drag-to-reorder commit resequences
+/// the whole visible session list; a chip rename additionally renames the
+/// order-store's key so the reordered slot survives the rename (only an
+/// external CLI rename re-slots — the store's own self-healing rule). Routed
+/// to `rift-app`'s session-order store via [`TerminalHandle::session_order_rx`];
+/// the store's mutation, persistence, and the resulting render-time re-sort
+/// are all `rift-app`'s concern — `rift-terminal` only emits the mutation and
+/// never depends on `rift-app` (crate boundary,
+/// `docs/constitution.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionOrderUpdate {
+    /// Replace the stored order with this full sequence of session names —
+    /// the user's new drag-committed order (a total order, not a subset).
+    Reorder(Vec<String>),
+    /// Rename the order-store's key for a session (`old` -> `new`) so its
+    /// slot survives an in-UI rename.
+    Rename { old: String, new: String },
 }
 
 /// A tmux format-subscription update (`%subscription-changed`). `name` is the

@@ -162,17 +162,19 @@ pub struct FocusTerminal;
 #[action(namespace = rift, no_json)]
 pub struct ZoomActivePanel;
 
-/// Open the session switcher (`docs/spec-session-switch.md`): the popover
-/// anchored to the statusbar session label, listing every host tmux session.
-/// Handled at the workspace root (not inside the terminal) so the palette's
-/// dispatch reaches it regardless of which surface holds focus.
+/// Request an on-demand session-list refresh (`docs/spec-session-management.md`).
+/// The always-visible title-bar session strip (#683) replaced the phase-19
+/// click-to-open popover this used to open, so this is now a manual nudge
+/// rather than a toggle. Handled at the workspace root (not inside the
+/// terminal) so the palette's dispatch reaches it regardless of which surface
+/// holds focus.
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = rift, no_json)]
 pub struct SwitchSession;
 
-/// Open the session switcher with its new-session prompt active
-/// (`docs/spec-session-switch.md`): naming a fresh session attach-creates it
-/// (the daemon child command is `new-session -A -s <name>`).
+/// Activate the session strip's trailing new-session prompt
+/// (`docs/spec-session-management.md`): naming a fresh session attach-creates
+/// it (the daemon child command is `new-session -A -s <name>`).
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = rift, no_json)]
 pub struct NewSession;
@@ -1503,10 +1505,10 @@ impl Render for WorkspaceView {
         // The custom title bar (#511/#512, `docs/spec-cockpit-chrome.md`): the
         // connection group reads the live `SessionView` fields the terminal
         // crate's own statusbar shows, so the two never disagree, and hosts
-        // the session-switcher popover itself (relocated from the interim
-        // statusbar anchor) once a live session names it. The settings gear
-        // dispatches through the same `open_settings` path as the
-        // `OpenSettings` action below.
+        // the always-visible session strip itself (#683, relocated from the
+        // interim statusbar anchor) once a live session names it. The
+        // settings gear dispatches through the same `open_settings` path as
+        // the `OpenSettings` action below.
         let connection = {
             let (dot_color, ssh_label, has_session) = {
                 let session = self.session_view.read(cx);
@@ -1517,12 +1519,12 @@ impl Render for WorkspaceView {
                     !session.session_name().is_empty(),
                 )
             };
-            let switcher = has_session.then(|| {
+            let session_strip = has_session.then(|| {
                 self.session_view.update(cx, |session, cx| {
-                    session.render_session_switcher(cx).into_any_element()
+                    session.render_session_strip(cx).into_any_element()
                 })
             });
-            title_bar::ConnectionGroup::connected(dot_color, ssh_label, switcher)
+            title_bar::ConnectionGroup::connected(dot_color, ssh_label, session_strip)
         };
         let settings_button = Button::new("title-bar-settings")
             .ghost()
@@ -1629,9 +1631,7 @@ impl Render for WorkspaceView {
                 this.zoom_active_panel(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SwitchSession, _window, cx| {
-                this.session_view.update(cx, |session, cx| {
-                    session.open_session_switcher(cx);
-                });
+                this.session_view.read(cx).open_session_switcher();
             }))
             .on_action(cx.listener(|this, _: &NewSession, window, cx| {
                 this.session_view.update(cx, |session, cx| {
@@ -1951,11 +1951,12 @@ mod tests {
     }
 
     /// Dock interaction (`docs/spec-ide-shell.md`, issue #325): every surface
-    /// stays zoomable to fill the shell and restore. None of `FileTree`,
-    /// `EditorView`, `TerminalPanel`, or `ProblemsPanel` override
-    /// `Panel::zoomable`, so the default reaches the dock's native
-    /// zoom-in/zoom-out control for all four — this locks that invariant
-    /// against an accidental future override.
+    /// stays zoomable to fill the shell and restore. `FileTree`, `EditorView`,
+    /// `TerminalPanel`, and `ProblemsPanel` all override `Panel::zoomable` to
+    /// `Some(PanelControl::Toolbar)` (`docs/spec-dogfooding-fixes.md`, #716)
+    /// so the zoom control renders as a direct header button instead of the
+    /// "..." overflow menu — this locks the "stays zoomable" invariant
+    /// against an accidental future override that drops it to `None`.
     #[gpui::test]
     fn test_all_dock_surfaces_stay_zoomable(cx: &mut TestAppContext) {
         let mut workspace: Option<Entity<WorkspaceView>> = None;
@@ -1984,23 +1985,34 @@ mod tests {
                 )
             };
 
-            assert!(
-                file_tree.read(cx).zoomable(cx).is_some(),
-                "the explorer stays zoomable"
-            );
-            assert!(
-                editor.read(cx).zoomable(cx).is_some(),
-                "the editor stays zoomable"
-            );
-            assert!(
-                problems_panel.read(cx).zoomable(cx).is_some(),
-                "the problems panel stays zoomable"
-            );
+            for (name, control) in [
+                ("the explorer", file_tree.read(cx).zoomable(cx)),
+                ("the editor", editor.read(cx).zoomable(cx)),
+                ("the problems panel", problems_panel.read(cx).zoomable(cx)),
+            ] {
+                let control = control.unwrap_or_else(|| panic!("{name} stays zoomable"));
+                assert!(
+                    control.toolbar_visible(),
+                    "{name}'s zoom renders as a direct header button, not the \"...\" menu"
+                );
+                assert!(
+                    !control.menu_visible(),
+                    "{name}'s zoom is pulled out of the \"...\" overflow menu"
+                );
+            }
 
             let terminal_panel = cx.new(|_| TerminalPanel::new(session_view));
+            let terminal_control = terminal_panel
+                .read(cx)
+                .zoomable(cx)
+                .expect("the terminal stays zoomable");
             assert!(
-                terminal_panel.read(cx).zoomable(cx).is_some(),
-                "the terminal stays zoomable"
+                terminal_control.toolbar_visible(),
+                "the terminal's zoom renders as a direct header button, not the \"...\" menu"
+            );
+            assert!(
+                !terminal_control.menu_visible(),
+                "the terminal's zoom is pulled out of the \"...\" overflow menu"
             );
         });
     }

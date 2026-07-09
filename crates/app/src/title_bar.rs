@@ -15,13 +15,14 @@
 //! here. Its default 34px height is styled up to the design's 38px via its
 //! `Styled` impl (the spec's prior decision: never fork the widget).
 //!
-//! The connection group hosts the phase-19 session-switcher popover (#512),
-//! relocated here from its interim statusbar anchor
+//! The connection group hosts the always-visible session strip (#683,
+//! `docs/spec-session-management.md`), relocated here from its interim
+//! statusbar anchor and, before that, the phase-19 click-to-open popover
 //! (`docs/spec-session-switch.md`): `rift_terminal::SessionView`'s
-//! `render_session_switcher` renders the trigger + popover content,
-//! `workspace::WorkspaceView` embeds it via [`ConnectionGroup::connected`].
-//! The Connection screen's group has no live session yet, so
-//! [`ConnectionGroup::not_connected`] renders a bare label instead.
+//! `render_session_strip` renders the chips, `workspace::WorkspaceView`
+//! embeds it via [`ConnectionGroup::connected`]. The Connection screen's
+//! group has no live session yet, so [`ConnectionGroup::not_connected`]
+//! renders a bare label instead.
 //!
 //! [`connection_screen::ConnectionScreen`]: crate::connection_screen::ConnectionScreen
 //! [`workspace::WorkspaceView`]: crate::workspace::WorkspaceView
@@ -37,47 +38,48 @@ pub const HEIGHT: Pixels = px(38.0);
 
 /// The connection/session group's live content: a status-dot color, the
 /// plain-text label beside it, and (when a live session exists) the
-/// session-switcher popover trigger anchored right after the label. Callers
+/// always-visible session strip anchored right after the label. Callers
 /// build one from their own state — the cockpit's live `SessionView` fields
 /// via [`ConnectionGroup::connected`], or [`ConnectionGroup::not_connected`]
 /// on the Connection screen, before any session exists.
 pub struct ConnectionGroup {
     pub dot_color: Hsla,
     pub label: SharedString,
-    /// The phase-19 session-switcher popover (trigger + content), relocated
-    /// here from the interim statusbar anchor (#512,
-    /// `docs/spec-session-switch.md`). `None` when there is no live session
-    /// to switch between — the Connection screen's group, or the cockpit
-    /// before the first layout snapshot names the attached session.
-    pub switcher: Option<AnyElement>,
+    /// The always-visible session strip (#683, `docs/spec-session-management.md`,
+    /// `SessionView::render_session_strip`), relocated here from the interim
+    /// statusbar anchor and, before that, the phase-19 click-to-open popover.
+    /// `None` when there is no live session to render chips for — the
+    /// Connection screen's group, or the cockpit before the first layout
+    /// snapshot names the attached session.
+    pub session_strip: Option<AnyElement>,
 }
 
 impl ConnectionGroup {
     /// The Connection screen's group before any session exists: a muted dot
     /// and a plain "not connected" label — same anatomy as the cockpit's
-    /// group, just no live session to describe yet, so no switcher.
+    /// group, just no live session to describe yet, so no strip.
     pub fn not_connected(cx: &App) -> Self {
         Self {
             dot_color: cx.theme().muted_foreground,
             label: SharedString::from("not connected"),
-            switcher: None,
+            session_strip: None,
         }
     }
 
-    /// The cockpit's live group (#512): `ssh_label` (e.g. `user@host`) is
-    /// always plain text; `switcher` — the "session <name>" popover trigger
-    /// built by `SessionView::render_session_switcher` — renders right after
-    /// it, separated by "·", when a live session exists (the group's own
-    /// flex gap supplies the surrounding whitespace, so the label carries no
+    /// The cockpit's live group (#512/#683): `ssh_label` (e.g. `user@host`)
+    /// is always plain text; `session_strip` — the chip strip built by
+    /// `SessionView::render_session_strip` — renders right after it,
+    /// separated by "·", when a live session exists (the group's own flex
+    /// gap supplies the surrounding whitespace, so the label carries no
     /// trailing space). Before the first layout snapshot names the attached
-    /// session (`switcher` is `None`) the group falls back to the bare host
-    /// label, matching the statusbar's own guard.
+    /// session (`session_strip` is `None`) the group falls back to the bare
+    /// host label, matching the statusbar's own guard.
     pub fn connected(
         dot_color: Hsla,
         ssh_label: SharedString,
-        switcher: Option<AnyElement>,
+        session_strip: Option<AnyElement>,
     ) -> Self {
-        let label = if switcher.is_some() {
+        let label = if session_strip.is_some() {
             SharedString::from(format!("{ssh_label} \u{b7}"))
         } else {
             ssh_label
@@ -85,7 +87,7 @@ impl ConnectionGroup {
         Self {
             dot_color,
             label,
-            switcher,
+            session_strip,
         }
     }
 }
@@ -160,7 +162,7 @@ fn render_connection_group(connection: ConnectionGroup, cx: &App) -> impl IntoEl
                 .bg(connection.dot_color),
         )
         .child(connection.label)
-        .children(connection.switcher)
+        .children(connection.session_strip)
 }
 
 #[cfg(test)]
@@ -175,12 +177,15 @@ mod tests {
             let group = ConnectionGroup::not_connected(cx);
             assert_eq!(group.label.as_ref(), "not connected");
             assert_eq!(group.dot_color, cx.theme().muted_foreground);
-            assert!(group.switcher.is_none(), "no session to switch between yet");
+            assert!(
+                group.session_strip.is_none(),
+                "no session strip to render yet"
+            );
         });
     }
 
     #[test]
-    fn test_connection_group_connected_with_switcher_appends_separator_before_it() {
+    fn test_connection_group_connected_with_session_strip_appends_separator_before_it() {
         let group = ConnectionGroup::connected(
             Hsla::default(),
             SharedString::from("dev@100.64.0.1"),
@@ -188,15 +193,15 @@ mod tests {
         );
 
         assert_eq!(group.label.as_ref(), "dev@100.64.0.1 \u{b7}");
-        assert!(group.switcher.is_some());
+        assert!(group.session_strip.is_some());
     }
 
     #[test]
-    fn test_connection_group_connected_without_switcher_keeps_the_bare_host_label() {
+    fn test_connection_group_connected_without_session_strip_keeps_the_bare_host_label() {
         let group =
             ConnectionGroup::connected(Hsla::default(), SharedString::from("dev@100.64.0.1"), None);
 
         assert_eq!(group.label.as_ref(), "dev@100.64.0.1");
-        assert!(group.switcher.is_none());
+        assert!(group.session_strip.is_none());
     }
 }

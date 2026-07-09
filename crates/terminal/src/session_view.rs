@@ -6,7 +6,7 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::popover::Popover;
+use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::{h_flex, v_flex, ActiveTheme, Icon, IconName, Sizable};
 use termy_terminal_ui::TmuxSnapshot;
@@ -15,9 +15,11 @@ use tracing::debug;
 use crate::keytable::{self, KeyTable, PrefixOptions};
 use crate::layout::{self, LayoutNode};
 use crate::pane_view::{measure_cell_size, PaneActivity, PaneView};
+use crate::quote_tmux_arg;
 use crate::{
     CaptureRequest, CaptureResult, ConnectionStatus, KeyTableQueryResult, PaneInput, PaneOutput,
-    SelectWindow, SessionListItem, SessionSwitchRequest, SubscriptionUpdate, TermSize,
+    SelectWindow, SessionListItem, SessionOrderUpdate, SessionSwitchRequest, SubscriptionUpdate,
+    TermSize,
 };
 
 const DEFAULT_FONT_SIZE: f32 = 14.0;
@@ -38,11 +40,9 @@ const PANE_HEADER_HEIGHT: f32 = 32.0;
 /// one-shot timer that re-renders once the deadline passes, so the overlay
 /// self-clears without a recurring poll.
 const RESIZE_OVERLAY_DURATION: Duration = Duration::from_millis(900);
-/// Width of the session-switcher popover content
-/// (`docs/spec-session-switch.md` UI contract).
-const SESSION_SWITCHER_WIDTH: f32 = 260.0;
-/// Height of one session row (and the new-session footer row) in the switcher.
-const SESSION_SWITCHER_ROW_HEIGHT: f32 = 30.0;
+/// Height of one session chip (and the trailing new-session chip) in the
+/// title-bar strip (#683, `docs/spec-session-management.md`).
+const SESSION_CHIP_HEIGHT: f32 = 24.0;
 
 /// A tmux layout snapshot paired with the per-pane `is_shell` flags (#510).
 /// termy's `TmuxPaneState` is a vendored upstream type that cannot carry the
@@ -72,22 +72,31 @@ pub struct TerminalHandle {
     /// The parsed-ready `list-keys`/`show-options` reply for a refresh request
     /// (including the daemon's own unprompted attach-time query).
     pub key_table_result_tx: flume::Sender<KeyTableQueryResult>,
-    /// The host's session list (`docs/spec-session-switch.md`): every
+    /// The host's session list (`docs/spec-session-management.md`): every
     /// `SessionListReply` — the reply to an explicit refresh below or the
-    /// daemon's unprompted churn-driven push — replaces the switcher's whole
-    /// list.
+    /// daemon's unprompted churn-driven push — replaces the title-bar strip's
+    /// whole list.
     pub session_list_tx: flume::Sender<Vec<SessionListItem>>,
-    /// An explicit session-list refresh request (opening the switcher) —
+    /// An explicit session-list refresh request (`open_session_switcher`) —
     /// forwarded onto the protocol as `ClientMessage::QuerySessionList`.
     /// Unused on the legacy tmux path (`RIFT_TERMINAL_LEGACY`): the receiver
-    /// drops there and a request is a harmless no-op, so the switcher is
-    /// inert (the legacy path is slated for removal, #285).
+    /// drops there and a request is a harmless no-op, so the strip stays on
+    /// its single-row fallback (the legacy path is slated for removal, #285).
     pub session_list_request_rx: flume::Receiver<()>,
-    /// A cockpit switch from the session switcher — forwarded onto the
+    /// A cockpit switch from the session strip — forwarded onto the
     /// protocol as `ClientMessage::Attach { session }` followed by a viewport
     /// re-assert (see [`SessionSwitchRequest`]). Same legacy-path caveat as
     /// `session_list_request_rx`.
     pub session_switch_rx: flume::Receiver<SessionSwitchRequest>,
+    /// A session-order mutation from the strip — a drag-to-reorder commit or
+    /// a rename's slot-preserving key rename (#686,
+    /// `docs/spec-session-management.md`). Routed to `rift-app`'s
+    /// `session_order` store, which persists it and re-sorts + re-pushes the
+    /// current list on `session_list_tx`'s target channel. Unused on the
+    /// legacy tmux path (the strip's drag/rename affordances still emit, but
+    /// nothing is listening — harmless, the same caveat as
+    /// `session_list_request_rx`).
+    pub session_order_rx: flume::Receiver<SessionOrderUpdate>,
     /// The reconnect banner's Cancel (#476,
     /// `docs/spec-connection-robustness.md`): consumed by the SSH-level
     /// reconnect engine between attempts, which stops retrying and answers
@@ -167,6 +176,78 @@ struct NewSessionPrompt {
     _subscription: Subscription,
 }
 
+/// An in-progress inline session rename in the title-bar strip (#684,
+/// `docs/spec-session-management.md`), dispatched from a chip's right-click
+/// menu (see [`SessionView::render_session_strip`]). Mirrors [`WindowRename`]:
+/// `session_id` is tmux's rename-stable session id (`SessionListItem::id`,
+/// targeted as `$<id>`), `original_name` lets an unchanged submit no-op, and
+/// `input`/`_subscription` hold the edit state and keep the submit handler
+/// alive while the rename is active. The rename only emits `rename-session`;
+/// the new name arrives via the next `SessionListReply` (and, for the
+/// attached session, the `%session-renamed`-driven layout snapshot), never an
+/// optimistic local mutation.
+struct SessionRename {
+    session_id: u32,
+    original_name: String,
+    input: Entity<InputState>,
+    _subscription: Subscription,
+}
+
+/// An in-progress inline kill confirmation for a session chip (#685,
+/// `docs/spec-session-management.md`), armed by a chip's right-click menu's
+/// "Kill" item (see [`SessionView::render_session_strip`]). Two-step by
+/// design: the menu item only arms this state (see
+/// [`SessionView::start_session_kill_confirm`]) — nothing reaches tmux until
+/// the confirm control commits (see [`SessionView::confirm_session_kill`]);
+/// Escape or the cancel control aborts with no command sent
+/// ([`SessionView::cancel_session_kill`]). `session_id` is tmux's
+/// rename-stable session id (`SessionListItem::id`, targeted as `$<id>`);
+/// `session_name` is display-only (the confirm affordance's label/tooltip).
+/// `focus_handle` is moved onto the confirm row on arming (#686 drive-by fix)
+/// so the row's own `on_key_down` actually receives Escape — unlike
+/// [`SessionRename`], nothing here is an `InputState` that self-focuses, so
+/// this state carries its own handle.
+struct SessionKillConfirm {
+    session_id: u32,
+    session_name: String,
+    focus_handle: FocusHandle,
+}
+
+/// The payload a dragged session chip carries (#686,
+/// `docs/spec-session-management.md`): the session's NAME — the order
+/// store's key, not the tmux id — read by the drop target's `on_drop` handler
+/// ([`SessionView::reorder_sessions`]) via gpui's `on_drag`/`on_drop`, mirroring
+/// the explorer tree's own drag payload (`file_tree.rs`'s `DraggedRow`).
+#[derive(Clone)]
+struct DraggedSession {
+    name: String,
+}
+
+/// The floating preview that follows the cursor while a [`DraggedSession`] is
+/// in flight, mirroring the explorer tree's `DragPreview`
+/// (`file_tree.rs`) and gpui-component's own drag preview
+/// (`dock/tab_panel.rs`'s `DragPanel`). Theme tokens only, never a hardcoded
+/// hex.
+struct SessionDragPreview {
+    name: SharedString,
+}
+
+impl Render for SessionDragPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("session-chip-drag-preview")
+            .px_2()
+            .py_1()
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .text_size(px(13.0))
+            .text_color(cx.theme().foreground)
+            .child(self.name.clone())
+    }
+}
+
 /// An in-progress border drag. `start` is the mouse position along the drag
 /// axis at mouse-down; `emitted_cells` is the whole-cell offset already sent to
 /// tmux, so each move only emits the incremental `resize-pane`.
@@ -182,6 +263,28 @@ struct BorderDrag {
 /// in single quotes, with any embedded single quote escaped as `'\''`.
 fn quote_tmux_name(name: &str) -> String {
     format!("'{}'", name.replace('\'', "'\\''"))
+}
+
+/// tmux `rename-session -t $<id> -- <name>` command for a session chip's
+/// inline rename (#684, `docs/spec-session-management.md`). `id` targets
+/// tmux's rename-stable session id (`SessionListItem::id`), never the
+/// (possibly stale) name, so a concurrent external rename cannot race the
+/// target; `new_name` is passed through [`quote_tmux_arg`] after `--`
+/// (end-of-options), so an untrusted name containing whitespace or tmux
+/// lexer metacharacters can never break the argument boundary or inject a
+/// second command.
+fn rename_session_command(id: u32, new_name: &str) -> String {
+    format!("rename-session -t ${id} -- {}", quote_tmux_arg(new_name))
+}
+
+/// tmux `kill-session -t $<id>` command for a session chip's kill-confirm
+/// (#685, `docs/spec-session-management.md`). `id` targets tmux's
+/// rename-stable session id (`SessionListItem::id`), never the (possibly
+/// stale) name; a numeric `$<id>` target needs no quoting helper — quoting
+/// only matters for untrusted text arguments like a session name (see
+/// [`rename_session_command`]).
+fn kill_session_command(id: u32) -> String {
+    format!("kill-session -t ${id}")
 }
 
 /// tmux `resize-pane` direction flag for a cell delta. Positive grows the
@@ -419,25 +522,37 @@ pub struct SessionView {
     /// mutation on the same seam (`spawn_command_bridge` in `crates/app`) — not
     /// carried on this channel.
     key_table_request_tx: flume::Sender<()>,
-    /// The host's tmux session list (`docs/spec-session-switch.md`), replaced
-    /// wholesale by every `SessionListReply` (explicit refresh or the daemon's
-    /// unprompted churn-driven push). The ACTUAL attached session is NOT read
-    /// from here — `session_name` (fed by the layout stream) owns that.
+    /// The host's tmux session list (`docs/spec-session-management.md`),
+    /// replaced wholesale by every `SessionListReply` (explicit refresh or
+    /// the daemon's unprompted churn-driven push). The ACTUAL attached
+    /// session is NOT read from here — `session_name` (fed by the layout
+    /// stream) owns that. Rendered as the always-visible title-bar chip strip
+    /// (#683), which replaced the phase-19 click-to-open popover.
     sessions: Vec<SessionListItem>,
-    /// Whether the session-switcher popover (anchored to the title bar's
-    /// connection group, #512) is open. Controlled state, so the command
-    /// palette can open the same switcher programmatically.
-    switcher_open: bool,
-    /// The switcher footer's in-progress new-session prompt, when active.
+    /// The strip's in-progress inline new-session prompt (trailing "+ New
+    /// session..." chip), when active.
     new_session_prompt: Option<NewSessionPrompt>,
+    /// The strip's in-progress inline session rename (#684), dispatched from
+    /// a chip's right-click menu; when active, that chip renders the edit
+    /// input in place of its name.
+    renaming_session: Option<SessionRename>,
+    /// The strip's in-progress inline kill confirmation (#685), armed from a
+    /// chip's right-click menu's "Kill" item; when active, that chip renders
+    /// a compact confirm affordance ("Kill?" + confirm/cancel) in place of
+    /// its normal row. Two-step by design — see [`SessionKillConfirm`].
+    confirming_kill: Option<SessionKillConfirm>,
     /// Requests an on-demand session-list refresh (forwarded to
-    /// `TerminalHandle`'s `session_list_request_rx`), sent when the switcher
-    /// opens; between opens the daemon's churn-driven pushes keep the list live.
+    /// `TerminalHandle`'s `session_list_request_rx`); between requests the
+    /// daemon's churn-driven pushes keep the strip live.
     session_list_request_tx: flume::Sender<()>,
     /// Emits a cockpit switch (forwarded to `TerminalHandle`'s
-    /// `session_switch_rx`) when a switcher row or the new-session prompt
+    /// `session_switch_rx`) when a strip chip or the new-session prompt
     /// commits.
     session_switch_tx: flume::Sender<SessionSwitchRequest>,
+    /// Emits a session-order mutation (forwarded to `TerminalHandle`'s
+    /// `session_order_rx`) on a drag-to-reorder drop or a rename commit
+    /// (#686, `docs/spec-session-management.md`).
+    session_order_tx: flume::Sender<SessionOrderUpdate>,
     /// Emits the reconnect banner's Cancel to the SSH-level reconnect engine
     /// (forwarded to `TerminalHandle`'s `reconnect_cancel_rx`).
     reconnect_cancel_tx: flume::Sender<()>,
@@ -460,6 +575,7 @@ impl SessionView {
         let (session_list_tx, session_list_rx) = flume::unbounded::<Vec<SessionListItem>>();
         let (session_list_request_tx, session_list_request_rx) = flume::unbounded::<()>();
         let (session_switch_tx, session_switch_rx) = flume::unbounded::<SessionSwitchRequest>();
+        let (session_order_tx, session_order_rx) = flume::unbounded::<SessionOrderUpdate>();
         let (reconnect_cancel_tx, reconnect_cancel_rx) = flume::unbounded::<()>();
 
         {
@@ -659,10 +775,12 @@ impl SessionView {
             prefix_options: PrefixOptions::default(),
             key_table_request_tx,
             sessions: Vec::new(),
-            switcher_open: false,
             new_session_prompt: None,
+            renaming_session: None,
+            confirming_kill: None,
             session_list_request_tx,
             session_switch_tx,
+            session_order_tx,
             reconnect_cancel_tx,
         };
 
@@ -681,6 +799,7 @@ impl SessionView {
             session_list_tx,
             session_list_request_rx,
             session_switch_rx,
+            session_order_rx,
             reconnect_cancel_rx,
         };
 
@@ -828,7 +947,7 @@ impl SessionView {
         cx.notify();
     }
 
-    /// Replace the switcher's session list wholesale (replace semantics, like
+    /// Replace the strip's session list wholesale (replace semantics, like
     /// the layout stream) — every `SessionListReply` arrival lands here.
     fn apply_session_list(&mut self, sessions: Vec<SessionListItem>, cx: &mut Context<Self>) {
         if self.sessions != sessions {
@@ -837,44 +956,29 @@ impl SessionView {
         }
     }
 
-    /// Open the session-switcher popover (`docs/spec-session-switch.md`) —
-    /// the target of the command palette's "Switch Session..." entry, routed
-    /// through the workspace. The statusbar label's own click toggles the
-    /// popover directly and syncs back via [`Self::set_switcher_open`].
-    pub fn open_session_switcher(&mut self, cx: &mut Context<Self>) {
-        self.set_switcher_open(true, cx);
+    /// Request an on-demand session-list refresh — the target of the command
+    /// palette's "Switch Session..." entry, routed through the workspace.
+    /// #683 replaced the phase-19 click-to-open popover with the
+    /// always-visible title-bar strip ([`Self::render_session_strip`]), which
+    /// stays live via the daemon's own churn-driven `SessionListReply` push;
+    /// this remains as a manual nudge (e.g. a stale first paint before the
+    /// initial reply lands) rather than an open/close toggle.
+    pub fn open_session_switcher(&self) {
+        let _ = self.session_list_request_tx.try_send(());
     }
 
-    /// Open the switcher with the new-session prompt already active — the
-    /// command palette's "New Session..." entry, routed through the workspace.
+    /// Activate the strip's inline new-session prompt — the command palette's
+    /// "New Session..." entry, routed through the workspace.
     pub fn open_new_session_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_session_switcher(cx);
         self.start_new_session_prompt(window, cx);
-    }
-
-    /// The single open/close choke point: the palette entry, the statusbar
-    /// trigger's own toggle, and the popover's dismiss paths (click-out,
-    /// Escape) all land here. Opening requests an on-demand list refresh
-    /// (`docs/protocol.md`); between opens the daemon's churn-driven pushes
-    /// keep the list live, so no polling anywhere.
-    fn set_switcher_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        if self.switcher_open == open {
-            return;
-        }
-        self.switcher_open = open;
-        if open {
-            let _ = self.session_list_request_tx.try_send(());
-        } else {
-            self.new_session_prompt = None;
-        }
-        cx.notify();
     }
 
     /// Switch the cockpit to `session`: emit the switch request (the app seam
     /// re-sends `Attach { session }` — attach-or-create, so a fresh name
-    /// creates the session) and close the switcher. The indicator and the
-    /// terminal model reset on the fresh `LayoutSnapshot`, never optimistically
-    /// here. Switching to the already-attached session only closes the popover.
+    /// creates the session). The indicator and the terminal model reset on
+    /// the fresh `LayoutSnapshot`, never optimistically here. Switching to
+    /// the already-attached session is a no-op — the strip stays visible
+    /// either way, unlike the removed popover, which this used to close.
     fn switch_to_session(&mut self, session: &str, cx: &mut Context<Self>) {
         if session != self.session_name.as_ref() {
             if let Err(e) = self.session_switch_tx.try_send(SessionSwitchRequest {
@@ -884,11 +988,43 @@ impl SessionView {
                 debug!(error = %e, %session, "failed to send session switch request");
             }
         }
-        self.set_switcher_open(false, cx);
         cx.notify();
     }
 
-    /// Activate the switcher footer's new-session prompt: seed an empty input,
+    /// Commit a drag-to-reorder drop (#686, `docs/spec-session-management.md`,
+    /// Prior decisions: "drag-to-order, a total user-set order"): take
+    /// `dragged`'s current slot out of the live session list and reinsert it
+    /// immediately before `target`, then emit the WHOLE resulting name
+    /// sequence as one [`SessionOrderUpdate::Reorder`] — never a partial
+    /// two-row patch. `rift-app`'s session-order store persists it and
+    /// re-pushes the re-sorted list on the next `SessionListReply`-driven
+    /// push, so the strip is never mutated optimistically here. A drop onto
+    /// itself, or a name no longer in the live list (the daemon's churn push
+    /// raced the drag), is a no-op.
+    fn reorder_sessions(&mut self, dragged: &str, target: &str, cx: &mut Context<Self>) {
+        if dragged == target {
+            return;
+        }
+        let mut names: Vec<String> = self.sessions.iter().map(|s| s.name.clone()).collect();
+        let Some(from) = names.iter().position(|n| n == dragged) else {
+            return;
+        };
+        let dragged_name = names.remove(from);
+        let to = names
+            .iter()
+            .position(|n| n == target)
+            .unwrap_or(names.len());
+        names.insert(to, dragged_name);
+        if let Err(e) = self
+            .session_order_tx
+            .try_send(SessionOrderUpdate::Reorder(names))
+        {
+            debug!(error = %e, "failed to send session reorder update");
+        }
+        cx.notify();
+    }
+
+    /// Activate the strip's trailing new-session prompt: seed an empty input,
     /// focus it, and subscribe for submit/blur (mirroring the window-rename
     /// prompt). Enter with a non-empty name switches to it (attach-or-create);
     /// blur cancels.
@@ -915,7 +1051,7 @@ impl SessionView {
     /// to it — the daemon child command is attach-or-create (`new-session -A`),
     /// so a fresh name creates the session and a duplicate of an existing one
     /// simply attaches (issue #467). An empty name sends nothing and dismisses
-    /// the prompt back to the footer row (the popover stays open). A second
+    /// the prompt back to the trailing "+ New session..." chip. A second
     /// submit after the prompt already committed (or was cancelled) must not
     /// re-submit.
     fn submit_new_session_prompt(&mut self, cx: &mut Context<Self>) {
@@ -931,7 +1067,7 @@ impl SessionView {
     }
 
     /// Cancel an in-progress new-session prompt without emitting anything,
-    /// restoring the footer's "+ New session..." row (the popover stays open).
+    /// restoring the trailing "+ New session..." chip.
     fn cancel_new_session_prompt(&mut self, cx: &mut Context<Self>) {
         if self.new_session_prompt.is_some() {
             self.new_session_prompt = None;
@@ -1320,6 +1456,150 @@ impl SessionView {
         }
     }
 
+    /// Begin an inline rename of the session chip `id` (current name
+    /// `current_name`), dispatched by the chip's right-click menu (#684,
+    /// `docs/spec-session-management.md`): seed a text input with the
+    /// current name, focus it, and subscribe for submit/blur — mirrors
+    /// [`Self::start_window_rename`]. Enter commits (see
+    /// [`Self::submit_session_rename`]); Escape/blur cancels. The strip
+    /// remains the source of truth for the resulting name (via the next
+    /// `SessionListReply`), never an optimistic local mutation.
+    fn start_session_rename(
+        &mut self,
+        id: u32,
+        current_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(current_name.clone()));
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            move |this, _input, event: &InputEvent, _window, cx| match event {
+                InputEvent::PressEnter { .. } => this.submit_session_rename(cx),
+                InputEvent::Blur => this.cancel_session_rename(cx),
+                _ => {}
+            },
+        );
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.renaming_session = Some(SessionRename {
+            session_id: id,
+            original_name: current_name,
+            input,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    /// Commit the in-progress session rename (Enter): an empty trimmed name,
+    /// or one unchanged from the original, is a no-op (the spec's "empty or
+    /// unchanged name is a no-op"); otherwise sends the quoted
+    /// `rename-session` over the existing raw tmux-command seam
+    /// (`tmux_command_tx`, the same channel the pane-header split/zoom/
+    /// select-pane controls use), and a matching [`SessionOrderUpdate::Rename`]
+    /// on `session_order_tx` so the order store renames its key in the SAME
+    /// action, preserving this session's reordered slot (#686,
+    /// `docs/spec-session-management.md`; only an external CLI rename
+    /// re-slots). A second submit after the rename already committed (or was
+    /// cancelled) must not re-submit.
+    fn submit_session_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(rename) = self.renaming_session.take() else {
+            return;
+        };
+        let value = rename.input.read(cx).value();
+        let trimmed = value.trim();
+        if !trimmed.is_empty() && trimmed != rename.original_name {
+            if let Err(e) = self
+                .tmux_command_tx
+                .try_send(rename_session_command(rename.session_id, trimmed))
+            {
+                debug!(error = %e, "failed to send session rename command");
+            }
+            if let Err(e) = self.session_order_tx.try_send(SessionOrderUpdate::Rename {
+                old: rename.original_name,
+                new: trimmed.to_string(),
+            }) {
+                debug!(error = %e, "failed to send session order rename update");
+            }
+        }
+        // The inline input unmounts now; return keyboard focus to the pane
+        // (mirrors window rename) so the terminal is not left keyboard-dead.
+        self.needs_focus = true;
+        cx.notify();
+    }
+
+    /// Cancel an in-progress session rename without emitting a command.
+    fn cancel_session_rename(&mut self, cx: &mut Context<Self>) {
+        if self.renaming_session.is_some() {
+            self.renaming_session = None;
+            self.needs_focus = true;
+            cx.notify();
+        }
+    }
+
+    /// Arm the kill confirmation for chip `id` (name `name`), dispatched by
+    /// the chip's right-click menu's "Kill" item (#685,
+    /// `docs/spec-session-management.md`): two-step by design, so a stray
+    /// click can never kill a session outright. No command is sent here —
+    /// only [`Self::confirm_session_kill`] sends one. Moves keyboard focus
+    /// onto a fresh handle for the confirm row (#686 drive-by fix): without
+    /// this, nothing in the confirm row ever had focus, so its own
+    /// `on_key_down` Escape handler (see [`Self::render_session_strip`]) never
+    /// fired — Escape kept reaching whatever the terminal pane was doing
+    /// instead. Click-cancel ([`Self::cancel_session_kill`]) is unaffected —
+    /// it never depended on focus.
+    fn start_session_kill_confirm(
+        &mut self,
+        id: u32,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window, cx);
+        self.confirming_kill = Some(SessionKillConfirm {
+            session_id: id,
+            session_name: name,
+            focus_handle,
+        });
+        cx.notify();
+    }
+
+    /// Commit an armed kill confirmation: send `kill-session -t $<id>` over
+    /// the existing raw tmux-command seam (`tmux_command_tx`, the same
+    /// channel rename and the pane-header split/zoom/select-pane controls
+    /// use). The strip drops the session live via the daemon's
+    /// `%sessions-changed` churn push (`SessionListReply`); killing the
+    /// ATTACHED session surfaces the existing `TerminalExit` path — no new
+    /// teardown here. A second confirm after the kill already committed (or
+    /// was cancelled) must not re-send.
+    fn confirm_session_kill(&mut self, cx: &mut Context<Self>) {
+        let Some(confirm) = self.confirming_kill.take() else {
+            return;
+        };
+        if let Err(e) = self
+            .tmux_command_tx
+            .try_send(kill_session_command(confirm.session_id))
+        {
+            debug!(error = %e, "failed to send session kill command");
+        }
+        // The inline confirm unmounts now; return keyboard focus to the pane
+        // (mirrors session/window rename) so the terminal is not left
+        // keyboard-dead.
+        self.needs_focus = true;
+        cx.notify();
+    }
+
+    /// Cancel an armed kill confirmation without emitting a command
+    /// (Escape or the cancel control).
+    fn cancel_session_kill(&mut self, cx: &mut Context<Self>) {
+        if self.confirming_kill.is_some() {
+            self.confirming_kill = None;
+            self.needs_focus = true;
+            cx.notify();
+        }
+    }
+
     fn render_layout(
         &self,
         node: &LayoutNode,
@@ -1424,28 +1704,46 @@ impl SessionView {
         handle.into_any_element()
     }
 
-    /// The session-switcher popover trigger + content (`docs/spec-session-switch.md`),
+    /// The always-visible session strip (#683, `docs/spec-session-management.md`),
     /// anchored to the title bar's connection group (#512,
     /// `docs/spec-cockpit-chrome.md`) — `app::workspace::WorkspaceView` embeds
-    /// this via `title_bar::ConnectionGroup::connected`, so the popover lives
+    /// this via `title_bar::ConnectionGroup::connected`, so the strip lives
     /// beside the plain `user@host` label rather than the statusbar, which
-    /// now shows a plain (non-interactive) session name. The trigger reads
-    /// "session <name>" (ghost button); the popover lists every host
-    /// session — mono name, "N windows" muted caption, a fixed attached-dot
-    /// lane — with the current session marked by a 2px primary left bar on a
-    /// surface background, and a "+ New session..." footer. All colors are
-    /// theme tokens. Controlled open state, so the command palette opens the
-    /// same switcher; the popover's own toggle/dismiss paths sync back
-    /// through [`Self::set_switcher_open`].
-    pub fn render_session_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// shows a plain (non-interactive) session name. REPLACES the phase-19
+    /// click-to-open popover: every host session renders as a chip (mono
+    /// name, a fixed attached-dot lane) with no open/close step; the current
+    /// session's chip keeps the 2px primary left bar on a surface
+    /// background — the same tokens the popover's current row used. A
+    /// trailing "+ New session..." chip reuses the popover's own inline-prompt
+    /// flow ([`Self::start_new_session_prompt`]/[`Self::submit_new_session_prompt`]).
+    /// All colors are theme tokens. A per-chip right-click menu
+    /// ([`gpui_component::menu::ContextMenuExt`], the same widget the
+    /// explorer row/editor context menus already ship with) holds "Rename",
+    /// which opens the inline edit below (#684), and "Kill" (#685), which
+    /// arms the inline confirm. Each real chip is also a drag source and drop
+    /// target (#686): dropping one onto another resequences the whole visible
+    /// list and commits it via [`Self::reorder_sessions`], mirroring the
+    /// explorer tree's own drag-to-move (`file_tree.rs`). No `Window` param
+    /// needed here (unlike the spec's draft architecture): every GPUI
+    /// interactive-element closure attached below (`on_click`, `on_drag`,
+    /// `on_drop`, the popup menu's `on_click`) already receives its own
+    /// `&mut Window` at dispatch time — see [`Self::start_session_kill_confirm`]'s
+    /// call site, which reuses the "Kill" menu item's own closure-scoped
+    /// `window` instead of a value threaded from here.
+    pub fn render_session_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
         let current = self.session_name.clone();
         // The live host list; before the first reply (or on the legacy tmux
         // path, where the list channel is inert) fall back to the attached
-        // session alone so the picker never renders an empty shell.
+        // session alone so the strip never renders empty.
         let mut rows = self.sessions.clone();
         if rows.is_empty() && !current.is_empty() {
             rows.push(SessionListItem {
+                // No real tmux session id is known client-side before the
+                // first `SessionListReply` arrives; this synthesized row is
+                // display-only (never a rename/kill target), so `0` is a
+                // harmless placeholder.
+                id: 0,
                 name: current.to_string(),
                 windows: self.windows.len() as u32,
                 attached: true,
@@ -1453,131 +1751,276 @@ impl SessionView {
         }
         let prompt_input = self.new_session_prompt.as_ref().map(|p| p.input.clone());
 
-        let on_open_entity = entity.clone();
-        Popover::new("session-switcher")
-            // Top-anchored: the trigger now lives in the title bar (top of
-            // the window, #512), so the popover opens downward beneath it —
-            // the inverse of the interim statusbar's `Anchor::BottomLeft`.
-            .anchor(Anchor::TopLeft)
-            .trigger(
-                Button::new("session-switcher-trigger")
-                    .ghost()
-                    .xsmall()
-                    .label(SharedString::from(format!("session {current}"))),
-            )
-            .open(self.switcher_open)
-            .on_open_change(move |open, _window, cx| {
-                on_open_entity.update(cx, |view, cx| view.set_switcher_open(*open, cx));
-            })
-            .content(move |_state, _window, cx| {
-                let border = cx.theme().border;
-                let fg = cx.theme().popover_foreground;
-                let muted = cx.theme().muted_foreground;
-                let current_bg = cx.theme().list_active;
-                let primary = cx.theme().primary;
-                let attached_dot = cx.theme().success;
+        let fg = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+        let current_bg = cx.theme().list_active;
+        let primary = cx.theme().primary;
+        let attached_dot = cx.theme().success;
+        let danger = cx.theme().danger;
 
-                let mut list = v_flex()
-                    .w(px(SESSION_SWITCHER_WIDTH))
-                    .text_size(px(13.0))
-                    .text_color(fg)
-                    .font_family("JetBrainsMono Nerd Font Mono");
+        let mut strip = h_flex()
+            .items_center()
+            .gap(px(4.0))
+            .text_size(px(13.0))
+            .font_family("JetBrainsMono Nerd Font Mono");
 
-                for row in &rows {
-                    let is_current = row.name.as_str() == current.as_ref();
-                    let name = row.name.clone();
-                    let row_entity = entity.clone();
-                    list =
-                        list.child(
-                            h_flex()
-                                .w_full()
-                                .h(px(SESSION_SWITCHER_ROW_HEIGHT))
-                                .items_center()
-                                .gap(px(8.0))
-                                .px(px(8.0))
-                                // Every row carries the 2px left-bar slot (the
-                                // current row colors it primary), so the current
-                                // row's content never shifts against the others.
-                                .border_l_2()
-                                .border_color(if is_current {
-                                    primary
-                                } else {
-                                    transparent_black()
-                                })
-                                .when(is_current, |el| el.bg(current_bg))
-                                .hover(move |s| s.bg(current_bg))
-                                .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
-                                    row_entity.update(cx, |view, cx| {
-                                        view.switch_to_session(&name, cx);
-                                    });
-                                })
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .truncate()
-                                        .child(SharedString::from(row.name.clone())),
-                                )
-                                .child(
-                                    div().text_xs().text_color(muted).child(SharedString::from(
-                                        format!("{} windows", row.windows),
-                                    )),
-                                )
-                                // Fixed attached-dot lane, so names and counts
-                                // align whether or not a session is attached.
-                                .child(h_flex().flex_none().w(px(10.0)).justify_center().children(
-                                    row.attached.then(|| {
-                                        div().size(px(6.0)).rounded_full().bg(attached_dot)
-                                    }),
-                                )),
-                        );
-                }
+        // A right-click menu targets a real tmux session id; the synthesized
+        // fallback row (`id: 0` above) is display-only and must stay inert,
+        // so the menu is only attached once the host list has actually
+        // loaded.
+        let has_real_sessions = !self.sessions.is_empty();
 
-                let footer = match &prompt_input {
-                    Some(input) => {
-                        let cancel_entity = entity.clone();
-                        h_flex()
-                            .w_full()
-                            .h(px(SESSION_SWITCHER_ROW_HEIGHT))
-                            .items_center()
-                            .px(px(8.0))
-                            .border_t_1()
-                            .border_color(border)
-                            .on_key_down(move |event: &KeyDownEvent, _window, cx| {
-                                if event.keystroke.key.as_str() == "escape" {
-                                    cancel_entity.update(cx, |view, cx| {
-                                        view.cancel_new_session_prompt(cx);
-                                    });
-                                    cx.stop_propagation();
-                                }
-                            })
-                            .child(Input::new(input).xsmall())
-                            .into_any_element()
-                    }
-                    None => {
-                        let prompt_entity = entity.clone();
-                        h_flex()
-                            .w_full()
-                            .h(px(SESSION_SWITCHER_ROW_HEIGHT))
-                            .items_center()
-                            .px(px(8.0))
-                            .border_t_1()
-                            .border_color(border)
-                            .text_color(muted)
-                            .cursor_pointer()
-                            .hover(move |s| s.text_color(fg))
-                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                                prompt_entity.update(cx, |view, cx| {
-                                    view.start_new_session_prompt(window, cx);
+        for row in &rows {
+            let is_current = row.name.as_str() == current.as_ref();
+            let name = row.name.clone();
+            let row_entity = entity.clone();
+
+            let renaming_input = self
+                .renaming_session
+                .as_ref()
+                .filter(|rename| rename.session_id == row.id)
+                .map(|rename| rename.input.clone());
+
+            let kill_confirm = self
+                .confirming_kill
+                .as_ref()
+                .filter(|confirm| confirm.session_id == row.id)
+                .map(|confirm| (confirm.session_name.clone(), confirm.focus_handle.clone()));
+
+            let chip = if let Some(input) = renaming_input {
+                let cancel_entity = entity.clone();
+                h_flex()
+                    .items_center()
+                    .h(px(SESSION_CHIP_HEIGHT))
+                    .px(px(6.0))
+                    .on_key_down(move |event: &KeyDownEvent, _window, cx| {
+                        if event.keystroke.key.as_str() == "escape" {
+                            cancel_entity.update(cx, |view, cx| {
+                                view.cancel_session_rename(cx);
+                            });
+                            cx.stop_propagation();
+                        }
+                    })
+                    .child(Input::new(&input).xsmall())
+                    .into_any_element()
+            } else if let Some((kill_name, kill_focus_handle)) = kill_confirm {
+                let confirm_entity = entity.clone();
+                let cancel_entity = entity.clone();
+                let key_cancel_entity = entity.clone();
+                let confirm_id = row.id;
+                h_flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .h(px(SESSION_CHIP_HEIGHT))
+                    .px(px(6.0))
+                    // Moved onto this row when the confirm was armed
+                    // (`Self::start_session_kill_confirm`, #686 drive-by
+                    // fix) so `on_key_down` below actually receives Escape
+                    // — without this, keyboard focus stayed on the terminal
+                    // pane and Escape never reached this handler.
+                    .track_focus(&kill_focus_handle)
+                    .on_key_down(move |event: &KeyDownEvent, _window, cx| {
+                        if event.keystroke.key.as_str() == "escape" {
+                            key_cancel_entity.update(cx, |view, cx| {
+                                view.cancel_session_kill(cx);
+                            });
+                            cx.stop_propagation();
+                        }
+                    })
+                    .child(div().text_color(danger).child("Kill?"))
+                    .child(
+                        Button::new(("session-kill-confirm", confirm_id as usize))
+                            .xsmall()
+                            .danger()
+                            .icon(IconName::Check)
+                            .tooltip(SharedString::from(format!("Kill \"{kill_name}\"")))
+                            .on_click(move |_event, _window, cx| {
+                                confirm_entity.update(cx, |view, cx| {
+                                    view.confirm_session_kill(cx);
                                 });
-                            })
-                            .child("+ New session...")
-                            .into_any_element()
-                    }
-                };
+                            }),
+                    )
+                    .child(
+                        Button::new(("session-kill-cancel", confirm_id as usize))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tooltip("Cancel")
+                            .on_click(move |_event, _window, cx| {
+                                cancel_entity.update(cx, |view, cx| {
+                                    view.cancel_session_kill(cx);
+                                });
+                            }),
+                    )
+                    .into_any_element()
+            } else {
+                let base = h_flex()
+                    .id(("session-chip", row.id as usize))
+                    .items_center()
+                    .gap(px(6.0))
+                    .h(px(SESSION_CHIP_HEIGHT))
+                    .px(px(8.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    // Every chip carries the 2px left-bar slot (the current
+                    // chip colors it primary), so the current chip's content
+                    // never shifts against the others.
+                    .border_l_2()
+                    .border_color(if is_current {
+                        primary
+                    } else {
+                        transparent_black()
+                    })
+                    .when(is_current, |el| el.bg(current_bg))
+                    .hover(move |s| s.bg(current_bg))
+                    .text_color(if is_current { fg } else { muted })
+                    // `on_click` (not `on_mouse_down`): GPUI suppresses the click
+                    // after a drag, so dragging a chip to reorder does not also
+                    // fire a session switch (which would reload the whole cockpit).
+                    .on_click(move |_event, _window, cx| {
+                        row_entity.update(cx, |view, cx| {
+                            view.switch_to_session(&name, cx);
+                        });
+                    })
+                    .child(
+                        div()
+                            .max_w(px(140.0))
+                            .truncate()
+                            .child(SharedString::from(row.name.clone())),
+                    )
+                    .children(
+                        row.attached
+                            .then(|| div().size(px(6.0)).rounded_full().bg(attached_dot)),
+                    );
 
-                list.child(footer)
-            })
+                if has_real_sessions {
+                    let menu_entity = entity.clone();
+                    let session_id = row.id;
+                    let session_name = row.name.clone();
+
+                    // Drag-to-reorder (#686, `docs/spec-session-management.md`,
+                    // Prior decisions: "drag-to-order, a total user-set
+                    // order"): every real chip is both a drag source (a
+                    // themed floating preview, `SessionDragPreview`) and a
+                    // drop target, mirroring the explorer tree's own
+                    // drag/drop (`file_tree.rs`'s `DraggedRow`/`DragPreview`).
+                    // Dropping one chip onto another resequences the WHOLE
+                    // visible list (never just the two dragged/target rows)
+                    // and commits it via `Self::reorder_sessions`, which
+                    // sends a `SessionOrderUpdate::Reorder` — `rift-app`
+                    // persists it and re-pushes the re-sorted list, so the
+                    // strip never mutates `self.sessions` optimistically.
+                    // `can_drop` refuses a chip dropped onto itself.
+                    let drag_payload = DraggedSession {
+                        name: session_name.clone(),
+                    };
+                    let preview_name = SharedString::from(session_name.clone());
+                    let can_drop_name = session_name.clone();
+                    let drop_target_name = session_name.clone();
+                    let base = base
+                        .on_drag(drag_payload, move |_drag, _point, _window, cx| {
+                            cx.new(|_| SessionDragPreview {
+                                name: preview_name.clone(),
+                            })
+                        })
+                        .drag_over::<DraggedSession>(|style, _drag, _window, cx| {
+                            style.bg(cx.theme().list_active)
+                        })
+                        .can_drop(move |drag: &dyn std::any::Any, _window, _cx| {
+                            drag.downcast_ref::<DraggedSession>()
+                                .is_some_and(|dragged| dragged.name != can_drop_name)
+                        })
+                        .on_drop(
+                            cx.listener(move |this, drag: &DraggedSession, _window, cx| {
+                                this.reorder_sessions(&drag.name, &drop_target_name, cx);
+                            }),
+                        );
+
+                    base.context_menu(move |menu, _window, _cx| {
+                        let rename_entity = menu_entity.clone();
+                        let rename_name = session_name.clone();
+                        let kill_entity = menu_entity.clone();
+                        let kill_name = session_name.clone();
+                        menu.item(PopupMenuItem::new("Rename").on_click(
+                            move |_event, window, cx| {
+                                rename_entity.update(cx, |view, cx| {
+                                    view.start_session_rename(
+                                        session_id,
+                                        rename_name.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            },
+                        ))
+                        .item(
+                            // "Kill" only ARMS the chip's inline confirm
+                            // (#685, `docs/spec-session-management.md`); the
+                            // danger token marks it destructive at the menu
+                            // level too, matching the confirm affordance.
+                            PopupMenuItem::element(|_window, cx| {
+                                div().text_color(cx.theme().danger).child("Kill")
+                            })
+                            .on_click(move |_event, window, cx| {
+                                kill_entity.update(cx, |view, cx| {
+                                    view.start_session_kill_confirm(
+                                        session_id,
+                                        kill_name.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }),
+                        )
+                    })
+                    .into_any_element()
+                } else {
+                    base.into_any_element()
+                }
+            };
+
+            strip = strip.child(chip);
+        }
+
+        let new_session = match &prompt_input {
+            Some(input) => {
+                let cancel_entity = entity.clone();
+                h_flex()
+                    .items_center()
+                    .h(px(SESSION_CHIP_HEIGHT))
+                    .px(px(6.0))
+                    .on_key_down(move |event: &KeyDownEvent, _window, cx| {
+                        if event.keystroke.key.as_str() == "escape" {
+                            cancel_entity.update(cx, |view, cx| {
+                                view.cancel_new_session_prompt(cx);
+                            });
+                            cx.stop_propagation();
+                        }
+                    })
+                    .child(Input::new(input).xsmall())
+                    .into_any_element()
+            }
+            None => {
+                let prompt_entity = entity.clone();
+                h_flex()
+                    .items_center()
+                    .h(px(SESSION_CHIP_HEIGHT))
+                    .px(px(8.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .text_color(muted)
+                    .hover(move |s| s.text_color(fg))
+                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        prompt_entity.update(cx, |view, cx| {
+                            view.start_new_session_prompt(window, cx);
+                        });
+                    })
+                    .child("+ New session...")
+                    .into_any_element()
+            }
+        };
+
+        strip.child(new_session)
     }
 
     /// The reconnect banner's Cancel action: ask the SSH-level reconnect
@@ -1823,10 +2266,18 @@ impl Focusable for SessionView {
 
 impl Render for SessionView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Skip pane auto-focus while an inline rename or the switcher's
-        // new-session prompt owns focus, so a snapshot arriving mid-edit does
-        // not steal the keystroke stream from the input.
-        if self.needs_focus && self.renaming_window.is_none() && self.new_session_prompt.is_none() {
+        // Skip pane auto-focus while an inline rename, the switcher's
+        // new-session prompt, or an armed kill confirm (#686 drive-by fix)
+        // owns focus, so a snapshot arriving mid-edit does not steal the
+        // keystroke stream from it — the kill confirm has no input of its own
+        // to notice the theft, so without this guard a stray steal-back would
+        // silently break its Escape handler again.
+        if self.needs_focus
+            && self.renaming_window.is_none()
+            && self.new_session_prompt.is_none()
+            && self.renaming_session.is_none()
+            && self.confirming_kill.is_none()
+        {
             let entity_to_focus = self
                 .active_pane_id
                 .as_ref()
@@ -2254,11 +2705,12 @@ impl Render for SessionView {
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_activity, grid_size_for, home_relative, max_vertical_pane_count,
-        new_window_at_command, quote_tmux_name, reconnect_banner_message, resize_direction,
-        select_pane_command, split_command, tab_state_slot, zoom_pane_command, PaneActivity,
-        SessionListItem, SessionSnapshot, SessionView, TabStateSlot, TermSize, TerminalHandle,
-        DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE,
+        aggregate_activity, grid_size_for, home_relative, kill_session_command,
+        max_vertical_pane_count, new_window_at_command, quote_tmux_name, reconnect_banner_message,
+        rename_session_command, resize_direction, select_pane_command, split_command,
+        tab_state_slot, zoom_pane_command, PaneActivity, SessionListItem, SessionOrderUpdate,
+        SessionSnapshot, SessionView, TabStateSlot, TermSize, TerminalHandle, DEFAULT_FONT_SIZE,
+        MAX_FONT_SIZE, MIN_FONT_SIZE,
     };
     use crate::layout::LayoutNode;
     use gpui::{
@@ -2452,6 +2904,35 @@ mod tests {
             new_window_at_command("/proj/src"),
             "new-window -c '/proj/src'"
         );
+    }
+
+    #[test]
+    fn test_rename_session_command_plain_name_targets_dollar_id() {
+        assert_eq!(
+            rename_session_command(2, "build"),
+            "rename-session -t $2 -- 'build'"
+        );
+    }
+
+    #[test]
+    fn test_rename_session_command_quotes_a_name_with_a_space() {
+        assert_eq!(
+            rename_session_command(0, "my session"),
+            "rename-session -t $0 -- 'my session'"
+        );
+    }
+
+    #[test]
+    fn test_rename_session_command_quotes_a_name_with_a_single_quote() {
+        assert_eq!(
+            rename_session_command(5, "it's"),
+            "rename-session -t $5 -- 'it'\\''s'"
+        );
+    }
+
+    #[test]
+    fn test_kill_session_command_targets_dollar_id() {
+        assert_eq!(kill_session_command(3), "kill-session -t $3");
     }
 
     #[test]
@@ -2730,45 +3211,40 @@ mod tests {
         });
     }
 
-    /// Opening the switcher (any entry point — statusbar trigger or palette
-    /// command) marks it open and issues exactly one on-demand list refresh;
-    /// re-opening while already open must not spam a second query
-    /// (`docs/spec-session-switch.md`).
+    /// `open_session_switcher` (the command palette's "Switch Session..."
+    /// entry) is a manual refresh nudge now that the strip is always visible
+    /// (#683) — unlike the removed popover's open/close toggle, every call
+    /// issues its own on-demand list refresh.
     #[gpui::test]
-    fn test_open_session_switcher_marks_open_and_requests_one_list_refresh(
-        cx: &mut TestAppContext,
-    ) {
+    fn test_open_session_switcher_requests_a_list_refresh_each_call(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let (session, handle) = session_and_handle(cx);
 
-            session.update(cx, |view, cx| view.open_session_switcher(cx));
-
-            assert!(session.read(cx).switcher_open, "switcher marked open");
+            session.read(cx).open_session_switcher();
             assert!(
                 handle.session_list_request_rx.try_recv().is_ok(),
-                "opening requests an on-demand list refresh"
+                "requests an on-demand list refresh"
             );
 
-            session.update(cx, |view, cx| view.open_session_switcher(cx));
+            session.read(cx).open_session_switcher();
             assert!(
-                handle.session_list_request_rx.try_recv().is_err(),
-                "opening an already-open switcher sends no second refresh"
+                handle.session_list_request_rx.try_recv().is_ok(),
+                "a second call requests another refresh (no open/close state to dedupe against)"
             );
         });
     }
 
     /// Selecting another session emits one switch request carrying the current
-    /// client grid (so the fresh control child reflows to the live viewport)
-    /// and closes the switcher; the indicator itself only updates on the fresh
-    /// snapshot, never optimistically.
+    /// client grid (so the fresh control child reflows to the live viewport);
+    /// the indicator itself only updates on the fresh snapshot, never
+    /// optimistically.
     #[gpui::test]
-    fn test_switch_to_session_sends_the_request_and_closes_the_switcher(cx: &mut TestAppContext) {
+    fn test_switch_to_session_sends_the_request(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let (session, handle) = session_and_handle(cx);
 
             session.update(cx, |view, cx| {
                 view.session_name = SharedString::from("rift");
-                view.open_session_switcher(cx);
                 view.switch_to_session("agent", cx);
             });
 
@@ -2782,7 +3258,6 @@ mod tests {
                 TermSize { cols: 80, rows: 24 },
                 "carries the current client grid"
             );
-            assert!(!session.read(cx).switcher_open, "switcher closed");
             assert_eq!(
                 session.read(cx).session_name.as_ref(),
                 "rift",
@@ -2791,8 +3266,8 @@ mod tests {
         });
     }
 
-    /// Selecting the already-attached session only closes the popover — no
-    /// pointless re-attach crosses the seam.
+    /// Selecting the already-attached session sends nothing — no pointless
+    /// re-attach crosses the seam.
     #[gpui::test]
     fn test_switch_to_session_attached_session_sends_nothing(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -2800,7 +3275,6 @@ mod tests {
 
             session.update(cx, |view, cx| {
                 view.session_name = SharedString::from("rift");
-                view.open_session_switcher(cx);
                 view.switch_to_session("rift", cx);
             });
 
@@ -2808,7 +3282,6 @@ mod tests {
                 handle.session_switch_rx.try_recv().is_err(),
                 "no switch request for the attached session"
             );
-            assert!(!session.read(cx).switcher_open, "switcher still closes");
         });
     }
 
@@ -2821,17 +3294,20 @@ mod tests {
             let (session, _handle) = session_and_handle(cx);
 
             let first = vec![SessionListItem {
+                id: 0,
                 name: "rift".into(),
                 windows: 3,
                 attached: true,
             }];
             let second = vec![
                 SessionListItem {
+                    id: 0,
                     name: "rift".into(),
                     windows: 3,
                     attached: true,
                 },
                 SessionListItem {
+                    id: 1,
                     name: "agent".into(),
                     windows: 1,
                     attached: false,
@@ -2848,6 +3324,113 @@ mod tests {
             assert!(
                 session.read(cx).sessions.is_empty(),
                 "an empty reply clears the list rather than merging"
+            );
+        });
+    }
+
+    /// A chip dropped onto another emits the WHOLE resulting name sequence
+    /// (#686), not just the two rows involved — `reorder_sessions` reinserts
+    /// the dragged name immediately before the target and resequences every
+    /// other known session around it.
+    #[gpui::test]
+    fn test_reorder_sessions_emits_full_sequence_with_dragged_before_target(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let (session, handle) = session_and_handle(cx);
+            session.update(cx, |view, cx| {
+                view.apply_session_list(
+                    vec![
+                        SessionListItem {
+                            id: 0,
+                            name: "rift".into(),
+                            windows: 1,
+                            attached: true,
+                        },
+                        SessionListItem {
+                            id: 1,
+                            name: "agent".into(),
+                            windows: 1,
+                            attached: false,
+                        },
+                        SessionListItem {
+                            id: 2,
+                            name: "tests".into(),
+                            windows: 1,
+                            attached: false,
+                        },
+                    ],
+                    cx,
+                );
+            });
+
+            session.update(cx, |view, cx| view.reorder_sessions("tests", "rift", cx));
+
+            assert_eq!(
+                handle
+                    .session_order_rx
+                    .try_recv()
+                    .expect("reorder update sent"),
+                SessionOrderUpdate::Reorder(vec![
+                    "tests".to_string(),
+                    "rift".to_string(),
+                    "agent".to_string(),
+                ])
+            );
+        });
+    }
+
+    /// A chip dropped onto itself is a no-op — no update crosses the seam.
+    #[gpui::test]
+    fn test_reorder_sessions_dropped_onto_itself_sends_nothing(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, handle) = session_and_handle(cx);
+            session.update(cx, |view, cx| {
+                view.apply_session_list(
+                    vec![SessionListItem {
+                        id: 0,
+                        name: "rift".into(),
+                        windows: 1,
+                        attached: true,
+                    }],
+                    cx,
+                );
+            });
+
+            session.update(cx, |view, cx| view.reorder_sessions("rift", "rift", cx));
+
+            assert!(
+                handle.session_order_rx.try_recv().is_err(),
+                "a drop onto itself sends no reorder update"
+            );
+        });
+    }
+
+    /// A dragged name no longer in the live list (the daemon's churn push
+    /// raced the drag) is a no-op rather than inserting a stale entry.
+    #[gpui::test]
+    fn test_reorder_sessions_unknown_dragged_name_sends_nothing(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, handle) = session_and_handle(cx);
+            session.update(cx, |view, cx| {
+                view.apply_session_list(
+                    vec![SessionListItem {
+                        id: 0,
+                        name: "rift".into(),
+                        windows: 1,
+                        attached: true,
+                    }],
+                    cx,
+                );
+            });
+
+            session.update(cx, |view, cx| {
+                view.reorder_sessions("gone", "rift", cx);
+            });
+
+            assert!(
+                handle.session_order_rx.try_recv().is_err(),
+                "an unknown dragged name sends nothing"
             );
         });
     }
@@ -2883,33 +3466,24 @@ mod tests {
             .clone()
     }
 
-    /// The palette's "New Session..." entry opens the switcher with the footer
-    /// prompt already active (and still triggers the on-open list refresh).
+    /// The palette's "New Session..." entry activates the strip's trailing
+    /// prompt directly (#683 dropped the popover open/close step).
     #[gpui::test]
-    fn test_open_new_session_prompt_opens_switcher_with_prompt_active(cx: &mut TestAppContext) {
-        let (window, session, handle) = windowed_session_and_handle(cx);
+    fn test_open_new_session_prompt_activates_the_prompt(cx: &mut TestAppContext) {
+        let (window, session, _handle) = windowed_session_and_handle(cx);
 
         cx.update_window(window, |_, window, cx| {
             session.update(cx, |view, cx| view.open_new_session_prompt(window, cx));
 
-            assert!(session.read(cx).switcher_open, "switcher opened");
             assert!(
                 session.read(cx).new_session_prompt.is_some(),
                 "new-session prompt active"
-            );
-            assert!(
-                handle.session_list_request_rx.try_recv().is_ok(),
-                "opening still requests the list refresh"
             );
 
             session.update(cx, |view, cx| view.cancel_new_session_prompt(cx));
             assert!(
                 session.read(cx).new_session_prompt.is_none(),
-                "cancel restores the footer row"
-            );
-            assert!(
-                session.read(cx).switcher_open,
-                "cancelling the prompt keeps the switcher open"
+                "cancel restores the trailing chip"
             );
         })
         .unwrap();
@@ -2917,10 +3491,10 @@ mod tests {
 
     /// Submitting a fresh name sends one switch request carrying the trimmed
     /// name (the daemon's attach-or-create child creates the session) and
-    /// closes the switcher; a second submit after the commit must not
-    /// re-attach (issue #467).
+    /// clears the prompt; a second submit after the commit must not re-attach
+    /// (issue #467).
     #[gpui::test]
-    fn test_submit_new_session_prompt_fresh_name_sends_trimmed_switch_and_closes(
+    fn test_submit_new_session_prompt_fresh_name_sends_trimmed_switch_and_clears(
         cx: &mut TestAppContext,
     ) {
         let (window, session, handle) = windowed_session_and_handle(cx);
@@ -2940,7 +3514,6 @@ mod tests {
                 .try_recv()
                 .expect("switch request sent");
             assert_eq!(request.session, "agent", "name is trimmed");
-            assert!(!session.read(cx).switcher_open, "switcher closed");
             assert!(
                 session.read(cx).new_session_prompt.is_none(),
                 "prompt cleared"
@@ -2956,10 +3529,10 @@ mod tests {
     }
 
     /// An empty (or whitespace-only) name sends nothing across the seam: the
-    /// prompt dismisses back to the "+ New session..." footer and the popover
-    /// stays open — no dead state (issue #467).
+    /// prompt dismisses back to the "+ New session..." chip — no dead state
+    /// (issue #467).
     #[gpui::test]
-    fn test_submit_new_session_prompt_empty_name_sends_nothing_and_keeps_popover_open(
+    fn test_submit_new_session_prompt_empty_name_sends_nothing_and_dismisses(
         cx: &mut TestAppContext,
     ) {
         let (window, session, handle) = windowed_session_and_handle(cx);
@@ -2977,24 +3550,18 @@ mod tests {
             );
             assert!(
                 session.read(cx).new_session_prompt.is_none(),
-                "prompt dismissed back to the footer row"
-            );
-            assert!(
-                session.read(cx).switcher_open,
-                "popover stays open for another attempt"
+                "prompt dismissed back to the trailing chip"
             );
         })
         .unwrap();
     }
 
     /// A name duplicating the already-attached session sends no pointless
-    /// re-attach — the switcher just closes; any other existing name takes the
-    /// same path as a fresh one (attach-or-create attaches instead of
-    /// creating), so duplicates can never error (issue #467).
+    /// re-attach; any other existing name takes the same path as a fresh one
+    /// (attach-or-create attaches instead of creating), so duplicates can
+    /// never error (issue #467).
     #[gpui::test]
-    fn test_submit_new_session_prompt_attached_session_name_sends_nothing_and_closes(
-        cx: &mut TestAppContext,
-    ) {
+    fn test_submit_new_session_prompt_attached_session_name_sends_nothing(cx: &mut TestAppContext) {
         let (window, session, handle) = windowed_session_and_handle(cx);
 
         cx.update_window(window, |_, window, cx| {
@@ -3002,6 +3569,7 @@ mod tests {
                 view.session_name = SharedString::from("rift");
                 view.apply_session_list(
                     vec![SessionListItem {
+                        id: 0,
                         name: "rift".into(),
                         windows: 2,
                         attached: true,
@@ -3019,7 +3587,6 @@ mod tests {
                 handle.session_switch_rx.try_recv().is_err(),
                 "no re-attach for the already-attached session"
             );
-            assert!(!session.read(cx).switcher_open, "switcher still closes");
             assert!(
                 session.read(cx).new_session_prompt.is_none(),
                 "prompt cleared"
@@ -3043,11 +3610,13 @@ mod tests {
                 view.apply_session_list(
                     vec![
                         SessionListItem {
+                            id: 0,
                             name: "rift".into(),
                             windows: 2,
                             attached: true,
                         },
                         SessionListItem {
+                            id: 1,
                             name: "agent".into(),
                             windows: 1,
                             attached: false,
@@ -3067,7 +3636,292 @@ mod tests {
                 .try_recv()
                 .expect("duplicate of a non-attached session is a plain switch");
             assert_eq!(request.session, "agent");
-            assert!(!session.read(cx).switcher_open, "switcher closed");
+        })
+        .unwrap();
+    }
+
+    /// The chip's right-click "Rename" (#684) commits a changed, non-empty
+    /// name as one quoted `rename-session` on the raw tmux-command seam —
+    /// the same channel the pane-header split/zoom/select-pane controls use
+    /// — targeted by the tmux session id, not the name; a name with a space
+    /// survives the quoting helper. A second submit after the commit must
+    /// not re-send (mirrors issue #467's new-session-prompt guard).
+    #[gpui::test]
+    fn test_submit_session_rename_changed_name_sends_one_quoted_command(cx: &mut TestAppContext) {
+        let (window, session, handle) = windowed_session_and_handle(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            session.update(cx, |view, cx| {
+                view.apply_session_list(
+                    vec![SessionListItem {
+                        id: 3,
+                        name: "rift".into(),
+                        windows: 1,
+                        attached: false,
+                    }],
+                    cx,
+                );
+                view.start_session_rename(3, "rift".to_string(), window, cx);
+            });
+            let input = session
+                .read(cx)
+                .renaming_session
+                .as_ref()
+                .expect("rename active")
+                .input
+                .clone();
+            input.update(cx, |state, cx| state.set_value("my agent", window, cx));
+
+            session.update(cx, |view, cx| view.submit_session_rename(cx));
+
+            assert_eq!(
+                handle.tmux_command_rx.try_recv().expect("command sent"),
+                "rename-session -t $3 -- 'my agent'"
+            );
+            assert!(
+                session.read(cx).renaming_session.is_none(),
+                "rename cleared after commit"
+            );
+
+            session.update(cx, |view, cx| view.submit_session_rename(cx));
+            assert!(
+                handle.tmux_command_rx.try_recv().is_err(),
+                "a second submit after the commit sends nothing"
+            );
+        })
+        .unwrap();
+    }
+
+    /// A committed rename also emits a matching
+    /// `SessionOrderUpdate::Rename { old, new }` on `session_order_rx` (#686,
+    /// `docs/spec-session-management.md`): the order store renames its key in
+    /// the SAME action, so a reordered session keeps its slot instead of
+    /// falling back to the unknown-name default order.
+    #[gpui::test]
+    fn test_submit_session_rename_emits_matching_order_rename_update(cx: &mut TestAppContext) {
+        let (window, session, handle) = windowed_session_and_handle(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            session.update(cx, |view, cx| {
+                view.apply_session_list(
+                    vec![SessionListItem {
+                        id: 3,
+                        name: "rift".into(),
+                        windows: 1,
+                        attached: false,
+                    }],
+                    cx,
+                );
+                view.start_session_rename(3, "rift".to_string(), window, cx);
+            });
+            let input = session
+                .read(cx)
+                .renaming_session
+                .as_ref()
+                .expect("rename active")
+                .input
+                .clone();
+            input.update(cx, |state, cx| state.set_value("my agent", window, cx));
+
+            session.update(cx, |view, cx| view.submit_session_rename(cx));
+
+            assert_eq!(
+                handle
+                    .session_order_rx
+                    .try_recv()
+                    .expect("order update sent"),
+                SessionOrderUpdate::Rename {
+                    old: "rift".to_string(),
+                    new: "my agent".to_string(),
+                }
+            );
+        })
+        .unwrap();
+    }
+
+    /// An unchanged/empty submit (a no-op rename) sends no order update
+    /// either — mirrors `test_submit_session_rename_empty_or_unchanged_name_sends_nothing`.
+    #[gpui::test]
+    fn test_submit_session_rename_unchanged_name_sends_no_order_update(cx: &mut TestAppContext) {
+        let (window, session, handle) = windowed_session_and_handle(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            session.update(cx, |view, cx| {
+                view.start_session_rename(1, "rift".to_string(), window, cx);
+            });
+            session.update(cx, |view, cx| view.submit_session_rename(cx));
+
+            assert!(
+                handle.session_order_rx.try_recv().is_err(),
+                "an unchanged name sends no order update"
+            );
+        })
+        .unwrap();
+    }
+
+    /// An empty (or whitespace-only) or unchanged name is a no-op (the
+    /// spec's "empty or unchanged name is a no-op"): nothing is sent and the
+    /// rename clears.
+    #[gpui::test]
+    fn test_submit_session_rename_empty_or_unchanged_name_sends_nothing(cx: &mut TestAppContext) {
+        let (window, session, handle) = windowed_session_and_handle(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            session.update(cx, |view, cx| {
+                view.start_session_rename(1, "rift".to_string(), window, cx);
+            });
+            session.update(cx, |view, cx| view.submit_session_rename(cx));
+            assert!(
+                handle.tmux_command_rx.try_recv().is_err(),
+                "an unchanged name sends nothing"
+            );
+
+            session.update(cx, |view, cx| {
+                view.start_session_rename(1, "rift".to_string(), window, cx);
+            });
+            let input = session
+                .read(cx)
+                .renaming_session
+                .as_ref()
+                .expect("rename active")
+                .input
+                .clone();
+            input.update(cx, |state, cx| state.set_value("   ", window, cx));
+            session.update(cx, |view, cx| view.submit_session_rename(cx));
+            assert!(
+                handle.tmux_command_rx.try_recv().is_err(),
+                "a whitespace-only name sends nothing"
+            );
+            assert!(
+                session.read(cx).renaming_session.is_none(),
+                "rename cleared either way"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Escape/blur cancels an in-progress session rename without sending a
+    /// command.
+    #[gpui::test]
+    fn test_cancel_session_rename_sends_nothing(cx: &mut TestAppContext) {
+        let (window, session, handle) = windowed_session_and_handle(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            session.update(cx, |view, cx| {
+                view.start_session_rename(1, "rift".to_string(), window, cx);
+            });
+            assert!(session.read(cx).renaming_session.is_some());
+
+            session.update(cx, |view, cx| view.cancel_session_rename(cx));
+
+            assert!(
+                session.read(cx).renaming_session.is_none(),
+                "cancel clears the in-progress rename"
+            );
+            assert!(
+                handle.tmux_command_rx.try_recv().is_err(),
+                "cancel sends no command"
+            );
+        })
+        .unwrap();
+    }
+
+    /// The chip's right-click "Kill" (#685) only ARMS the two-step confirm —
+    /// nothing is sent to tmux yet, and needs_focus is left untouched by
+    /// arming (only clearing the confirm, on either path, restores it). #686
+    /// drive-by fix: arming also moves keyboard focus onto the confirm's own
+    /// handle, so the row's `on_key_down` Escape actually fires — without
+    /// this, focus stayed on the terminal pane and Escape never reached it.
+    #[gpui::test]
+    fn test_start_session_kill_confirm_arms_without_sending(cx: &mut TestAppContext) {
+        let (window, session, handle) = windowed_session_and_handle(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            session.update(cx, |view, cx| {
+                view.start_session_kill_confirm(3, "rift".to_string(), window, cx);
+            });
+
+            let confirm = session
+                .read(cx)
+                .confirming_kill
+                .as_ref()
+                .expect("Kill arms the inline confirm")
+                .focus_handle
+                .clone();
+            assert!(
+                confirm.is_focused(window),
+                "arming moves focus onto the confirm row so Escape reaches it"
+            );
+            assert!(
+                handle.tmux_command_rx.try_recv().is_err(),
+                "arming the confirm sends no command"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Confirming an armed kill sends exactly one `kill-session -t $<id>` —
+    /// targeted by the numeric tmux session id, so no quoting is needed —
+    /// clears the confirm state, and restores pane focus (mirrors
+    /// `submit_session_rename`). A second confirm after the commit must not
+    /// re-send.
+    #[gpui::test]
+    fn test_confirm_session_kill_sends_one_kill_command_and_restores_focus(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, session, handle) = windowed_session_and_handle(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            session.update(cx, |view, cx| {
+                view.start_session_kill_confirm(3, "rift".to_string(), window, cx);
+                view.needs_focus = false;
+            });
+
+            session.update(cx, |view, cx| view.confirm_session_kill(cx));
+
+            assert_eq!(
+                handle.tmux_command_rx.try_recv().expect("command sent"),
+                "kill-session -t $3"
+            );
+            assert!(
+                session.read(cx).confirming_kill.is_none(),
+                "confirm cleared after commit"
+            );
+            assert!(session.read(cx).needs_focus, "focus restored after confirm");
+
+            session.update(cx, |view, cx| view.confirm_session_kill(cx));
+            assert!(
+                handle.tmux_command_rx.try_recv().is_err(),
+                "a second confirm after the commit sends nothing"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Cancel (mirrors Escape, which dispatches the same handler) sends no
+    /// command, clears the armed confirm, and restores pane focus.
+    #[gpui::test]
+    fn test_cancel_session_kill_sends_nothing_and_restores_focus(cx: &mut TestAppContext) {
+        let (window, session, handle) = windowed_session_and_handle(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            session.update(cx, |view, cx| {
+                view.start_session_kill_confirm(1, "rift".to_string(), window, cx);
+                view.needs_focus = false;
+            });
+            assert!(session.read(cx).confirming_kill.is_some());
+
+            session.update(cx, |view, cx| view.cancel_session_kill(cx));
+
+            assert!(
+                session.read(cx).confirming_kill.is_none(),
+                "cancel clears the in-progress kill confirm"
+            );
+            assert!(
+                handle.tmux_command_rx.try_recv().is_err(),
+                "cancel sends no command"
+            );
+            assert!(session.read(cx).needs_focus, "focus restored after cancel");
         })
         .unwrap();
     }

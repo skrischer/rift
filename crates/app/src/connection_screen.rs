@@ -1,9 +1,9 @@
 //! The Connection screen (issue #477, `docs/spec-connection-robustness.md`):
 //! the app's startup state on every launch — a centered connect card
-//! (Host / User+Port / SSH key / Session, prefilled from env and baked
-//! defaults), a RECENT list backed by [`crate::recents`], and the surface
-//! that owns a connect failure or a canceled reconnect (`main.rs` routes back
-//! here instead of leaving a dead cockpit up). Auto-connect-on-launch is
+//! (Host / User+Port / SSH key, prefilled from env and baked defaults), a
+//! RECENT list backed by [`crate::recents`], and the surface that owns a
+//! connect failure or a canceled reconnect (`main.rs` routes back here
+//! instead of leaving a dead cockpit up). Auto-connect-on-launch is
 //! deliberately not implemented (gate decision in the spec): the user always
 //! takes the explicit Connect step, even when every field is already correct.
 //!
@@ -13,6 +13,16 @@
 //! encrypted; the value is carried on [`ConnectRequest`] but never persisted
 //! (excluded from [`crate::recents::RecentConnection`]) and never logged
 //! ([`ConnectRequest`]'s `Debug` impl redacts it below).
+//!
+//! Issues #706/#707/#705 (`docs/spec-post-connect-picker.md`) retire the
+//! card's Session field: the card no longer picks a session at all, and a
+//! [`SessionIntent`] carried on [`ConnectRequest`] tells `main.rs`'s entry
+//! point how to resolve one instead — `RIFT_SESSION` set (read at connect
+//! time) is [`SessionIntent::Fixed`] (the dogfooding fast-path, no picker); a
+//! RECENT row whose stored session is non-empty is [`SessionIntent::Preferred`]
+//! (attached directly if still present on the live host, else the picker); a
+//! plain Connect click or an empty recent session is [`SessionIntent::Pick`]
+//! (always the picker).
 //!
 //! This module is deliberately GPUI-view-only: it emits [`ConnectionScreenEvent`]
 //! and never touches SSH, threads, or the recents *file* directly — `main.rs`
@@ -40,7 +50,6 @@ const CONNECT_BUTTON_HEIGHT: f32 = 40.0;
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_USER: &str = "developer";
 const DEFAULT_PORT: u16 = 22;
-const DEFAULT_SESSION: &str = "rift";
 const WINDOWS_FALLBACK_HOME: &str = "C:\\Users\\Default";
 const UNIX_FALLBACK_HOME: &str = "/home/developer";
 
@@ -54,7 +63,6 @@ pub struct ConnectDefaults {
     pub user: String,
     pub port: u16,
     pub key: PathBuf,
-    pub session: String,
 }
 
 /// Explicit inputs to [`resolve_defaults`], grouped into a struct so the
@@ -68,7 +76,6 @@ pub struct DefaultsInputs<'a> {
     pub key: Option<&'a str>,
     pub baked_key: Option<&'a str>,
     pub home: Option<&'a str>,
-    pub session: Option<&'a str>,
     pub windows: bool,
 }
 
@@ -91,14 +98,12 @@ pub fn resolve_defaults(inputs: DefaultsInputs) -> ConnectDefaults {
         .or(inputs.baked_key)
         .map(PathBuf::from)
         .unwrap_or_else(|| default_key_path(inputs.home, inputs.windows));
-    let session = inputs.session.unwrap_or(DEFAULT_SESSION).to_string();
 
     ConnectDefaults {
         host,
         user,
         port,
         key,
-        session,
     }
 }
 
@@ -115,9 +120,11 @@ fn default_key_path(home: Option<&str>, windows: bool) -> PathBuf {
 }
 
 /// [`resolve_defaults`] read from the live environment: `RIFT_SSH_HOST`/
-/// `RIFT_SSH_USER`/`RIFT_SSH_PORT`/`RIFT_SSH_KEY`/`RIFT_SESSION` (runtime),
+/// `RIFT_SSH_USER`/`RIFT_SSH_PORT`/`RIFT_SSH_KEY` (runtime),
 /// `RIFT_DEFAULT_SSH_KEY` (the `just promote` compile-time bake), and
-/// `USERPROFILE`/`HOME` for the last-resort key path.
+/// `USERPROFILE`/`HOME` for the last-resort key path. `RIFT_SESSION` is read
+/// separately, at connect time, by [`session_intent_from_env`] (issue #707) —
+/// not here, since it no longer prefills a card field.
 pub fn live_defaults() -> ConnectDefaults {
     let host = std::env::var("RIFT_SSH_HOST").ok();
     let user = std::env::var("RIFT_SSH_USER").ok();
@@ -126,7 +133,6 @@ pub fn live_defaults() -> ConnectDefaults {
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .ok();
-    let session = std::env::var("RIFT_SESSION").ok();
 
     resolve_defaults(DefaultsInputs {
         host: host.as_deref(),
@@ -135,9 +141,28 @@ pub fn live_defaults() -> ConnectDefaults {
         key: key.as_deref(),
         baked_key: option_env!("RIFT_DEFAULT_SSH_KEY"),
         home: home.as_deref(),
-        session: session.as_deref(),
         windows: cfg!(target_os = "windows"),
     })
+}
+
+/// How the entry point that triggered a connect resolves the session (issue
+/// #707, `docs/spec-post-connect-picker.md`): the connect card carries no
+/// Session field of its own, so `main.rs`'s Shell derives one of these from
+/// which entry point fired and threads it end-to-end instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionIntent {
+    /// `RIFT_SESSION` is set (env, e.g. the dogfooding dev channel):
+    /// attach-or-create this session directly — no picker, the pre-#706
+    /// behavior byte-for-byte.
+    Fixed(String),
+    /// A RECENT row whose stored session is non-empty: attach it directly if
+    /// still present on the live host session list; if it is gone, show the
+    /// picker instead of a blind attach.
+    Preferred(String),
+    /// The plain "Connect \u{2192}" button with no `RIFT_SESSION` set, or a
+    /// RECENT row whose stored session is empty: always show the post-connect
+    /// picker.
+    Pick,
 }
 
 /// A submitted connect attempt: the Connect button, Enter in any field, or a
@@ -152,7 +177,7 @@ pub struct ConnectRequest {
     pub user: String,
     pub port: u16,
     pub key: PathBuf,
-    pub session: String,
+    pub session_intent: SessionIntent,
     /// The passphrase entered for an encrypted SSH key (#478); `None` for a
     /// plain key. Never persisted to the recents store and never logged.
     pub passphrase: Option<String>,
@@ -165,12 +190,36 @@ impl std::fmt::Debug for ConnectRequest {
             .field("user", &self.user)
             .field("port", &self.port)
             .field("key", &self.key)
-            .field("session", &self.session)
+            .field("session_intent", &self.session_intent)
             .field(
                 "passphrase",
                 &self.passphrase.as_ref().map(|_| "<redacted>"),
             )
             .finish()
+    }
+}
+
+/// Resolve the plain "Connect \u{2192}" button's session intent (issue #707):
+/// `RIFT_SESSION` read at connect time, not prefilled at screen-construction
+/// time — a set, non-empty value attaches directly (the dogfooding
+/// fast-path, unchanged from #706's SET path); unset or empty always shows
+/// the post-connect picker.
+fn session_intent_from_env(rift_session: Option<&str>) -> SessionIntent {
+    match rift_session {
+        Some(name) if !name.is_empty() => SessionIntent::Fixed(name.to_string()),
+        _ => SessionIntent::Pick,
+    }
+}
+
+/// Resolve a RECENT row's session intent (issue #707): a non-empty stored
+/// session is tried directly against the live host list before falling back
+/// to the picker ([`SessionIntent::Preferred`]); an empty one (an older
+/// recents entry whose session was never resolved) always shows the picker.
+fn session_intent_from_recent(recent_session: &str) -> SessionIntent {
+    if recent_session.is_empty() {
+        SessionIntent::Pick
+    } else {
+        SessionIntent::Preferred(recent_session.to_string())
     }
 }
 
@@ -219,7 +268,6 @@ pub struct ConnectionScreen {
     port_input: Entity<InputState>,
     key_input: Entity<InputState>,
     passphrase_input: Entity<InputState>,
-    session_input: Entity<InputState>,
     recents: Vec<RecentConnection>,
     /// The card's bottom banner (host/user/port/key validation, or a general
     /// connect failure).
@@ -254,8 +302,6 @@ impl ConnectionScreen {
             InputState::new(window, cx).default_value(defaults.key.display().to_string())
         });
         let passphrase_input = cx.new(|cx| InputState::new(window, cx).masked(true));
-        let session_input =
-            cx.new(|cx| InputState::new(window, cx).default_value(defaults.session.clone()));
 
         // Enter in any field submits the card, matching the design contract
         // ("one click connects" applies equally to Enter).
@@ -265,7 +311,6 @@ impl ConnectionScreen {
             &port_input,
             &key_input,
             &passphrase_input,
-            &session_input,
         ] {
             cx.subscribe_in(
                 input,
@@ -307,7 +352,6 @@ impl ConnectionScreen {
             port_input,
             key_input,
             passphrase_input,
-            session_input,
             recents,
             error,
             passphrase_error,
@@ -352,11 +396,13 @@ impl ConnectionScreen {
 
     /// Read the inputs and validate them into a [`ConnectRequest`]. Host and
     /// User must be non-empty; Port must parse as a `u16`; the SSH key path
-    /// must be non-empty; an empty Session defaults to `"rift"` rather than
-    /// erroring, mirroring the pre-#477 `RIFT_SESSION` fallback. When the key
-    /// is detected as encrypted, the passphrase field must be non-empty too
-    /// (#478) — surfaced via [`ConnectError::Passphrase`] so it renders at
-    /// that field rather than the bottom banner.
+    /// must be non-empty. The session is no longer a card field (issues
+    /// #706/#707/#705, `docs/spec-post-connect-picker.md`): the plain
+    /// "Connect \u{2192}" button's [`SessionIntent`] is resolved from
+    /// `RIFT_SESSION`, read at connect time via [`session_intent_from_env`].
+    /// When the key is detected as encrypted, the passphrase field must be
+    /// non-empty too (#478) — surfaced via [`ConnectError::Passphrase`] so it
+    /// renders at that field rather than the bottom banner.
     fn build_request(&self, cx: &App) -> Result<ConnectRequest, ConnectError> {
         let host = self.host_input.read(cx).value().trim().to_string();
         if host.is_empty() {
@@ -388,19 +434,13 @@ impl ConnectionScreen {
         } else {
             None
         };
-        let session = self.session_input.read(cx).value().trim().to_string();
-        let session = if session.is_empty() {
-            DEFAULT_SESSION.to_string()
-        } else {
-            session
-        };
 
         Ok(ConnectRequest {
             host,
             user,
             port,
             key: PathBuf::from(key_text),
-            session,
+            session_intent: session_intent_from_env(std::env::var("RIFT_SESSION").ok().as_deref()),
             passphrase,
         })
     }
@@ -408,12 +448,14 @@ impl ConnectionScreen {
     /// A RECENT row click: prefill every field with that entry's values (so
     /// a failed attempt still shows what was tried) and emit `Connect`
     /// immediately — "clickable (prefill + connect)" per the issue's
-    /// acceptance. Recents never carry a passphrase (never persisted —
-    /// #478), so a click landing on an encrypted key stops short of
-    /// connecting and prompts for it instead of spinning up a connect
-    /// attempt that would deterministically fail. Silently ignored if
-    /// `index` is stale (the list changed under a slow click), rather than
-    /// panicking.
+    /// acceptance. The recent's remembered session (issue #707) becomes a
+    /// [`SessionIntent::Preferred`] via [`session_intent_from_recent`] —
+    /// validated against the live host list once connected, not attached
+    /// blindly. Recents never carry a passphrase (never persisted — #478),
+    /// so a click landing on an encrypted key stops short of connecting and
+    /// prompts for it instead of spinning up a connect attempt that would
+    /// deterministically fail. Silently ignored if `index` is stale (the
+    /// list changed under a slow click), rather than panicking.
     fn connect_from_recent(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(recent) = self.recents.get(index).cloned() else {
             return;
@@ -432,9 +474,6 @@ impl ConnectionScreen {
         });
         self.passphrase_input
             .update(cx, |input, cx| input.set_value(String::new(), window, cx));
-        self.session_input.update(cx, |input, cx| {
-            input.set_value(recent.session.clone(), window, cx)
-        });
         self.refresh_key_encrypted(cx);
 
         if self.key_encrypted {
@@ -451,7 +490,7 @@ impl ConnectionScreen {
             user: recent.user,
             port: recent.port,
             key: PathBuf::from(recent.key),
-            session: recent.session,
+            session_intent: session_intent_from_recent(&recent.session),
             passphrase: None,
         }));
         cx.notify();
@@ -529,18 +568,6 @@ fn render_passphrase_field(
         .gap(px(8.0))
         .child(render_field(cx, "Passphrase", input, IconName::Asterisk))
         .children(error.map(|message| render_error_banner(cx, message)))
-}
-
-/// The right-aligned mono caption below the Session field (design contract:
-/// "caption right `tmux -CC -A` mono").
-fn render_tmux_caption(cx: &mut Context<ConnectionScreen>) -> impl IntoElement {
-    div()
-        .w_full()
-        .text_right()
-        .text_size(px(11.0))
-        .font_family(cx.theme().mono_font_family.clone())
-        .text_color(cx.theme().muted_foreground)
-        .child("tmux -CC -A")
 }
 
 /// The connect-failure banner (design §7 shape, reused here for a connect
@@ -762,13 +789,6 @@ impl Render for ConnectionScreen {
             )
             .child(render_field(cx, "SSH key", &self.key_input, IconName::File))
             .children(passphrase_row)
-            .child(render_field(
-                cx,
-                "Session",
-                &self.session_input,
-                IconName::SquareTerminal,
-            ))
-            .child(render_tmux_caption(cx))
             .children(error_banner)
             .child(
                 Button::new("connect-button")
@@ -819,7 +839,6 @@ mod tests {
         assert_eq!(defaults.host, DEFAULT_HOST);
         assert_eq!(defaults.user, DEFAULT_USER);
         assert_eq!(defaults.port, DEFAULT_PORT);
-        assert_eq!(defaults.session, DEFAULT_SESSION);
         assert_eq!(
             defaults.key,
             PathBuf::from(UNIX_FALLBACK_HOME)
@@ -837,7 +856,6 @@ mod tests {
             key: Some("/keys/mine"),
             baked_key: Some("/keys/baked"),
             home: Some("/home/alice"),
-            session: Some("work"),
             windows: false,
         });
 
@@ -845,7 +863,6 @@ mod tests {
         assert_eq!(defaults.user, "alice");
         assert_eq!(defaults.port, 2222);
         assert_eq!(defaults.key, PathBuf::from("/keys/mine"));
-        assert_eq!(defaults.session, "work");
     }
 
     #[::core::prelude::v1::test]
@@ -916,7 +933,7 @@ mod tests {
             user: "developer".to_string(),
             port: 22,
             key: PathBuf::from("/home/developer/.ssh/id_ed25519"),
-            session: "rift".to_string(),
+            session_intent: SessionIntent::Fixed("rift".to_string()),
             passphrase: passphrase.map(str::to_string),
         }
     }
@@ -934,5 +951,38 @@ mod tests {
         let debug = format!("{:?}", sample_request(None));
 
         assert!(debug.contains("passphrase: None"));
+    }
+
+    // ── SessionIntent (entry-point routing, issue #707) ────────────────────
+
+    #[::core::prelude::v1::test]
+    fn test_session_intent_from_env_set_returns_fixed() {
+        assert_eq!(
+            session_intent_from_env(Some("rift-dev")),
+            SessionIntent::Fixed("rift-dev".to_string())
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_session_intent_from_env_unset_returns_pick() {
+        assert_eq!(session_intent_from_env(None), SessionIntent::Pick);
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_session_intent_from_env_empty_returns_pick() {
+        assert_eq!(session_intent_from_env(Some("")), SessionIntent::Pick);
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_session_intent_from_recent_present_returns_preferred() {
+        assert_eq!(
+            session_intent_from_recent("work"),
+            SessionIntent::Preferred("work".to_string())
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_session_intent_from_recent_empty_returns_pick() {
+        assert_eq!(session_intent_from_recent(""), SessionIntent::Pick);
     }
 }

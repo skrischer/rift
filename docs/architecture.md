@@ -97,6 +97,13 @@ The decision to drive tmux through control mode (`-CC`) rather than as a normal 
 └───────────────────────────┘       └────────────────────────────────┘
 ```
 
+Since phase 35 the daemon holds **one reactive context per project root** (a
+worktree snapshot, git status, and language servers), reference-counted by the
+sessions attached to it — the Zed `HeadlessProject` / `WorktreeStore` shape (one
+server, N per-root contexts). The watched root follows the active tmux session
+(see the Connection robustness contract below), so it is no longer a single
+process-global root bound at daemon start (`spec-per-session-project-root.md`).
+
 ### Why LSP runs on the remote
 
 Language servers need access to the full project environment — `node_modules`, `target/`, `venv/`, `$GOPATH` — to resolve types and dependencies. These directories are not in git, platform-specific, and often gigabytes in size. Syncing them to the local host would require either mirroring the entire dependency tree (hundreds of MB, platform mismatches) or running a parallel package install locally. Every other remote-capable IDE (VS Code Remote, JetBrains Gateway, Zed) runs LSP on the remote for this reason.
@@ -152,7 +159,11 @@ Editing uses a deliberate request/response buffer channel over the daemon transp
 ## Connection robustness contract (phase 20)
 
 > Ratified with `spec-connection-robustness.md` (2026-07-05). Governs every
-> transport seam; supersedes the earlier quit-on-disconnect behavior.
+> transport seam; supersedes the earlier quit-on-disconnect behavior. Amended by
+> `spec-post-connect-picker.md` (phase 33, 2026-07-09) — the session-pick step and
+> its re-Attach precondition — and by `spec-per-session-project-root.md` (phase 35,
+> 2026-07-09) — the current-session watch also driving the daemon's watched root
+> (marked below).
 
 - **Protocol versioning:** `PROTOCOL_VERSION` (crates/protocol) reflects the
   message set — every message-set change bumps it, enforced by a pinned
@@ -168,11 +179,27 @@ Editing uses a deliberate request/response buffer channel over the daemon transp
   plus a terminal re-Attach (fresh-LayoutSnapshot reset). An SSH drop enters a
   visible bounded-backoff reconnect loop (`ConnectionStatus::Reconnecting`)
   instead of quitting; tmux session persistence makes the terminal lossless
-  across it.
+  across it. _(Phase 33)_ The re-Attach targets the current-session watch; when it
+  is unset — a post-connect session pick not yet made — the reconnect re-shows the
+  session picker instead of blind-attaching, and re-attaches the picked session
+  once it is seeded.
 - **Not-connected is a UI state**, owned by the Connection screen (design
   "Connection — Startup"), never a blind exit. The screen is also the startup
   state on every launch (prefilled config, explicit Connect) — the app never
-  auto-connects blindly.
+  auto-connects blindly. _(Phase 33)_ The session is chosen AFTER connect, not on
+  the connect card: the flow is connect → session-pick → cockpit. The entry point
+  decides — `RIFT_SESSION` or a recent's still-present remembered session attaches
+  directly; a fresh "Connect →", or a recent whose session is gone, shows the
+  post-connect picker.
+- _(Phase 35)_ **The current-session watch also drives the daemon's watched root.**
+  A session's project root is coupled to the tmux session via a session-scoped
+  `@root` user option (stamped by the daemon at `new-session`, resolved daemon-side
+  on `Attach` via `display-message -p`, falling back to `#{session_path}`). A
+  session switch — and reconnect / post-connect pick, which both flow through
+  `Attach` — re-roots the reactive layer (file tree, git, LSP) to the new session's
+  root, not only the terminal attach. The watched root is no longer the single
+  connect-time `--root` pinned for the daemon's lifetime
+  (`spec-per-session-project-root.md`).
 
 ## Technology map
 

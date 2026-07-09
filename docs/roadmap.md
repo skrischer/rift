@@ -49,7 +49,9 @@
 | 30 | Explorer file operations — create / rename / delete / move via a daemon write path, surfaced through the context menu + inline rename + drag & drop | [spec-explorer-file-ops.md](spec-explorer-file-ops.md) | [Phase 30](https://github.com/skrischer/rift/milestone/47) |
 | 31 | Explorer search & filter — in-panel fuzzy narrowing, jump-to-file quick-open, multi-select, keyboard-first navigation | [spec-explorer-search.md](spec-explorer-search.md) | [Phase 31](https://github.com/skrischer/rift/milestone/48) |
 | 32 | Session management — glanceable always-visible session list (see every session at once, click to jump), rename / reorder / kill / new operations; extends the phase-19 switcher (switch + new, click-to-open popover) into a full management surface | [spec-session-management.md](spec-session-management.md) | [Phase 320](https://github.com/skrischer/rift/milestone/49) |
-| 33 | Post-connect session picker — connect to the host first, then pick or create a session from the live list; de-hardcode the fixed default session name ("rift") baked into the connect card | — | — |
+| 33 | Post-connect session picker — connect to the host first, then pick or create a session from the live list; de-hardcode the fixed default session name ("rift") baked into the connect card | [spec-post-connect-picker.md](spec-post-connect-picker.md) | [Phase 330](https://github.com/skrischer/rift/milestone/50) |
+| 34 | Session start-directory — new panes / windows / sessions spawn in the session's project root (`-c` on new-session / new-window / split-window + `attach-session -c` to re-root a pre-existing session), replacing the `$HOME` landing; single-root (no per-session dynamize yet) | [spec-session-start-directory.md](spec-session-start-directory.md) | [Phase 340](https://github.com/skrischer/rift/milestone/52) |
+| 35 | Per-session project root — the daemon watched root follows the active session; the root is coupled to the tmux session via a session-scoped `@root` user option, resolved daemon-side on attach, superseding the single baked `RIFT_PROJECT_ROOT`; a session switch re-roots the reactive layer (file tree / git / LSP). session = project | [spec-per-session-project-root.md](spec-per-session-project-root.md) | [Phase 350](https://github.com/skrischer/rift/milestone/53) |
 
 A phase gets a Spec link once `/loopkit:plan` drafts it, and a Milestone link once
 it is `READY`. The milestone (open/closed + issue progress) is where status lives.
@@ -179,16 +181,76 @@ PR, never edited from here):
   **Reorder** is client-side ordering persisted locally (the window-state / recents
   store pattern, phase 9) — tmux has no native session order. `PROTOCOL_VERSION`
   stays 8; this is a client-only (`[terminal]`/`[app]`) phase.
-- Phase 33 — the connection flow evolves: the Connection screen's Session field
-  becomes optional and default-less, and a session-picker step sits between
-  connect and cockpit (connect to the host → live list → pick / create). This is
-  a deliberate change to the phase-20 "Connection screen is the startup state"
-  contract; whether it also touches `architecture.md`'s connection-flow section
-  is settled in phase 33's spec PR. De-hardcoding the fixed `"rift"` default is
-  part of this phase.
+- Phase 33 — the connection flow evolves to connect → session-pick → cockpit,
+  and the connect card's Session field + `DEFAULT_SESSION` are removed. The ENTRY
+  POINT decides (planning refinement): `RIFT_SESSION` (env) attaches directly
+  (dogfooding fast-path), a recent-connection reattaches its remembered session if
+  present on the host else shows the picker, and the "Connect →" button always
+  shows the picker. `app`-only, no protocol/daemon change (the picker drives the
+  existing `QuerySessionList` + `Attach` and reuses phase 32's session-row
+  component). Foundation impact ratified in phase 33's spec PR (#688): the phase-20
+  `docs/architecture.md` "Connection robustness contract" gained two amendments —
+  the connect → pick → cockpit startup flow and the re-Attach's
+  unset-session-until-pick precondition.
 
 Backing prior art: "Session management & post-connect picker — prior-art index
 (Phases 32–33)" in [prior-art.md](prior-art.md).
+
+## Session ↔ project root coupling (phases 34–35)
+
+Seeded 2026-07-09 from idea sparring (research mode: websearch). Codifies the
+long-standing "tmux session = project" decision and picks up the three items the
+Phase-3.5 daemon-project-root spec deliberately parked as out of scope
+([archive/spec-daemon-project-root.md](archive/spec-daemon-project-root.md)): the
+tmux session's working directory (agent cwd), multi-root / per-worktree contexts,
+and a runtime project-switch affordance. Today the project root is a single value
+baked into the app (`RIFT_PROJECT_ROOT` / the `RIFT_DEFAULT_PROJECT_ROOT`
+compile-time default, `justfile:293`), the daemon watches exactly one global root
+bound at first spawn (`crates/daemon/src/lib.rs` — the single-root chokepoint), new
+panes / windows inherit tmux's `$HOME` cwd (no `-c` except the explorer's
+reveal-in-terminal path), and a session is only a tmux name with no root binding —
+so switching sessions (built in phases 32–33) re-attaches the terminal but leaves
+the reactive layer on the old root.
+
+Ordering is a chain: **34 (start-directory)** is the single-root quick win that
+stops panes landing in `$HOME`; **35 (per-session root)** dynamizes the root and
+couples it to the session, and depends on both 34 and the session-management block
+(32–33) whose switch / list / pick flow it extends.
+
+Foundation impact (authored and ratified in each phase's `/loopkit:plan` spec PR,
+never edited from here):
+
+- Phase 34 — none. Client / daemon tmux-command change only: `-c <root>` (the
+  existing single root) threaded into the new-session / new-window / split-window
+  call sites (`crates/daemon/src/terminal.rs`, `crates/terminal/src/session_view.rs`),
+  plus `attach-session -c` to re-root a session created outside rift.
+- Phase 35 — `architecture.md`: the daemon's single-root assumption (one global
+  watched root bound at first spawn — the Phase-3.5 shared-socket / bind-at-spawn
+  decision) is superseded by a per-session watched context inside the one shared
+  daemon (the Zed `HeadlessProject` / `WorktreeStore` shape: one server, N
+  per-context stores). `protocol` gains the session→root plumbing — the root
+  travels with the attach, and the phase-19 `QuerySessionList` format carries each
+  session's `@root`. Ties to vision Scenario 2 (per-worktree diagnostics), but the
+  simultaneous multi-pane explorer UI stays deferred; Phase 35 delivers only "root
+  follows the active session" plus the daemon-side per-session substrate.
+
+Open design decisions deferred to each phase's `/loopkit:plan` spec (never a
+roadmap guess): phase 34 — whether the root is set once via the session default
+directory (`new-session -c` / `attach-session -c`, inherited by windows / panes) or
+`-c` is passed on every spawn call, and whether a pre-existing `$HOME`-rooted
+session is re-rooted on attach or left alone; phase 35 — the durable per-session
+root store (tmux `@root` user option vs the session default dir vs an app-side
+recents mapping; recommendation: `@root`, written and read in the same phase so
+there is no dead data) and the daemon context depth (only the active context,
+re-scanned on switch — simpler — vs concurrent per-session contexts, which alone is
+correct when two app instances attach different sessions to the one shared daemon;
+recommendation: concurrent, since the single-root chokepoint is being touched
+regardless). No speculative root-switch hook is pre-baked into the in-flight
+phase-32/33 work — the `SessionSwitchRequest → Attach` seam
+(`crates/app/src/main.rs`) is already the extension point Phase 35 plugs into.
+
+Backing prior art: "Session ↔ project root coupling — prior-art index
+(Phases 34–35)" in [prior-art.md](prior-art.md).
 
 ## Tracks (tooling/DX, not product phases)
 
