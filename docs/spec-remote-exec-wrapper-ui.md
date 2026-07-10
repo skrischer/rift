@@ -177,3 +177,15 @@ container connection can be set up and re-run from the UI without an env var.
   `resolve_remote_exec_wrapper()` directly (it becomes the prefill); the RECENT-row
   wrapper indicator's exact form is settled at visual QA. Human prerequisites:
   none. Status `DRAFT` → `READY`.
+- 2026-07-10: Issue #789 implemented (field + connect threading; recents
+  persistence deferred to #790). Two decisions made to keep the two issues'
+  scopes clean: (1) `resolve_remote_exec_wrapper()` in `main.rs` was removed
+  rather than kept alongside a new prefill path — its runtime-over-bake
+  resolution moved into `connection_screen::resolve_defaults`/`live_defaults`,
+  the same place host/user/port/key already resolve their prefills, so there
+  is exactly one resolution path instead of two. (2) `connect_from_recent`
+  leaves the wrapper input field untouched (unlike host/user/port/key) and
+  reads its current value at connect, since `RecentConnection` does not carry
+  a wrapper yet (#790) — this avoids a `None` regression on the RECENT click
+  path for anyone using the env/bake wrapper today; #790 will start
+  overwriting the field per-recent once the store carries the value.
