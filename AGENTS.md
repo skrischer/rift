@@ -77,12 +77,12 @@ Worktrees live in a sibling container `../rift-worktrees/<branch-with-slashes-as
 
 ### Dogfooding channels
 
-Two side-by-side instances share tmux session `rift` (one daemon, mirrored views) — see `docs/spec-dogfooding-channels.md`:
+Two side-by-side instances attach the same tmux session `rift` on the same host (one daemon, mirrored views) — see `docs/spec-dogfooding-channels.md`. Each channel picks/creates that session once via connect-and-list; later launches reattach it directly via the per-channel recents `Preferred` path (a remembered still-live session attaches with no picker). Recents are per-channel (`rift-stable-recents.json` vs `rift-dev-recents.json`).
 
-- **Stable** — the daily driver. `just promote` (HEAD must be `develop`, ff-synced to `origin/develop`) builds the optimized `stable` profile, pins the exe at `%LOCALAPPDATA%\rift\rift-stable.exe` (outside `target/`, so `cargo clean` cannot touch it; own image name, so the dev loop's taskkill cannot either) and relaunches it detached. `just stable` relaunches without rebuilding (e.g. after a reboot).
-- **Dev** — `just dev-windows[-watch]`, the acceptance/visual gate. Mirrors session `rift` by default; `RIFT_SESSION=rift-dev just dev-windows-watch` isolates destructive tests on a throwaway session.
+- **Stable** — the daily driver. `just promote` (HEAD must be `develop`, ff-synced to `origin/develop`) builds the optimized `stable` profile, pins the exe at `%LOCALAPPDATA%\rift\rift-stable.exe` (outside `target/`, so `cargo clean` cannot touch it; own image name, so the dev loop's taskkill cannot either) and relaunches it detached; it lands on connect-and-list and reattaches its session from recents. `just stable` relaunches without rebuilding (e.g. after a reboot).
+- **Dev** — `just dev-windows[-watch]`, the acceptance/visual gate. Mirrors stable's session via connect-and-list (reattached from recents after the first pick). For isolated/destructive tests, pick/create a throwaway session (e.g. `rift-dev`) in the picker — no env knob.
 
-One-time Windows launcher setup (manual, no recipe — it never recurs): create a Desktop shortcut to `%LOCALAPPDATA%\rift\rift-stable.exe` and pin it to the taskbar by hand. No env setup is needed: `promote` bakes the SSH key path (justfile `windows_ssh_key`) into the stable exe as a compile-time default (runtime `RIFT_SSH_KEY` still overrides); host/user/port/session match the app defaults, and the daemon is skipped while `RIFT_DAEMON_BINARY` is unset.
+One-time Windows launcher setup (manual, no recipe — it never recurs): create a Desktop shortcut to `%LOCALAPPDATA%\rift\rift-stable.exe` and pin it to the taskbar by hand. No env setup is needed: `promote` bakes the SSH key path (justfile `windows_ssh_key`) into the stable exe as a compile-time default (runtime `RIFT_SSH_KEY` still overrides); host/user/port match the app defaults, the session is chosen via connect-and-list, and the daemon is skipped while `RIFT_DAEMON_BINARY` is unset.
 
 Stable diagnostics: the windowed build has no console — it logs to `%LOCALAPPDATA%\rift\rift-stable.log` (fresh file per start, panics included). If a launch dies silently, read that file.
 

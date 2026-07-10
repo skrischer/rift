@@ -11,6 +11,14 @@ never take down the tool the developer works in. The stable channel is launchabl
 without a terminal — a Windows desktop shortcut to the pinned binary — so it is a true
 daily driver, not a recipe invocation.
 
+> **Superseded (Phase 38, 2026-07-10):** the `RIFT_SESSION` session-name knob this
+> spec introduced has been retired — see `spec-retire-fixed-session.md`. The two
+> channels now mirror via connect-and-list + per-channel recents (re-specified in the
+> Outcome below), not a baked `RIFT_SESSION=rift`. The remaining `RIFT_SESSION`
+> mentions elsewhere in this spec (Scope, Constraints, Prior decisions, Verification,
+> Risks) are the historical record of this spec's original implementation, not live
+> instructions.
+
 ## Why
 
 rift is now dogfooded as the primary work tool. The current loop runs
@@ -40,14 +48,18 @@ What is true when this work is done:
       `rift`, and is never rebuilt or killed by the dev watch loop.
 - [ ] `just promote` rebuilds stable from the accepted source and restarts it in one
       step; the tmux session (and any running agent work) survives the restart.
-- [ ] The dev channel (`just dev-windows[-watch]`) attaches **by default to the same
-      session `rift`** (mirror); a single env override points it at a throwaway
-      `rift-dev` session for isolated/destructive tests.
+- [ ] Stable and dev mirror by attaching the **same session on the same host**: each
+      channel picks/creates that session once via connect-and-list, and later launches
+      of that channel reattach it directly via the recents `Preferred` path (a
+      remembered still-live session attaches with no picker). Recents are per-channel
+      (`rift-stable-recents.json` vs `rift-dev-recents.json`), so each channel records
+      its own first pick. Isolated/destructive tests use a throwaway session (e.g.
+      `rift-dev`) picked/created in the picker — no env knob.
 - [ ] A broken dev build leaves stable running and promptable — the original pain no
       longer reproduces.
-- [ ] The tmux session name is read from `RIFT_SESSION` (default `rift`); the daemon
-      isolation knob is `RIFT_DAEMON_REMOTE_DIR` (already read by the app, not yet
-      surfaced in the dev recipes).
+- [ ] The mirror session is chosen via connect-and-list (per-channel recents), not a
+      baked `RIFT_SESSION` name; the daemon isolation knob is `RIFT_DAEMON_REMOTE_DIR`
+      (already read by the app, not yet surfaced in the dev recipes).
 - [ ] A Windows desktop shortcut launches the pinned `rift-stable.exe` **without a
       terminal** (no console window) and always reflects the latest promoted build —
       the shortcut targets the fixed Windows-native path
