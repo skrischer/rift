@@ -200,11 +200,9 @@ struct EngineWatches {
     /// when `session` above is the unset sentinel (empty).
     picker: PickerChannels,
     /// The `SessionIntent::Preferred` name to try against the live host list
-    /// before falling back to the picker (issue #707) — `None` for `Fixed`
-    /// (never reaches the unset branch, seeded straight into `session`
-    /// above) and `Pick` (always the picker). Engine-scoped like the rest of
-    /// this struct: constant across every reconnect attempt while `session`
-    /// stays unset.
+    /// before falling back to the picker (issue #707) — `None` for `Pick`
+    /// (always the picker). Engine-scoped like the rest of this struct:
+    /// constant across every reconnect attempt while `session` stays unset.
     preferred_session: Option<String>,
 }
 
@@ -1952,11 +1950,11 @@ async fn run_daemon_terminal(
     let session = watches.session.borrow().clone();
     let picked = if session_is_unset(&session) {
         // Post-connect session picker (#706/#707, `docs/spec-post-connect-picker.md`):
-        // the entry point's intent was `Preferred`/`Pick`, so nothing survived
-        // to this attach yet. Query the live host list and either attach a
-        // `Preferred` name directly or block for the Shell's pick before the
-        // first `Attach` — the `Fixed` path above (a non-empty watch) never
-        // reaches this branch and stays byte-for-byte the pre-picker flow.
+        // the entry point's intent is always `Preferred`/`Pick` (issue #808
+        // retires the `Fixed` fast-path), so nothing survives to this attach
+        // yet on the first connect — both variants seed the watch unset.
+        // Query the live host list and either attach a `Preferred` name
+        // directly or block for the Shell's pick before the first `Attach`.
         // Re-entered on every reconnect attempt while the watch stays unset
         // (SSH dropping before resolution re-shows the picker instead of a
         // blind attach); the watch is seeded below so a later reconnect
@@ -2130,9 +2128,9 @@ fn resolve_preferred_session(
 /// (issue #769, `docs/spec-session-root-picker.md`): `picked` is `Some` only
 /// when `watches.session` was unset and `await_session_pick` resolved it
 /// (either a `Preferred` attach, `root: None`, or a root-picker create,
-/// `root: Some(picked)`); `None` when the watch was already set (a `Fixed`
-/// entry point, or a later reconnect), which always attaches with `root:
-/// None` — today's unchanged configured-root behavior. A pure function so
+/// `root: Some(picked)`); `None` when the watch was already set (a later
+/// reconnect), which always attaches with `root: None` — today's unchanged
+/// configured-root behavior. A pure function so
 /// this is unit-tested without a live daemon connection: the app-side half
 /// of `Attach.root`'s round-trip (the wire encoding itself is `protocol`'s
 /// own test).
