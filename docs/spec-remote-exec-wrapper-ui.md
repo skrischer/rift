@@ -62,8 +62,8 @@ container connection can be set up and re-run from the UI without an env var.
   responsibility, exactly as the env var is today).
 - Per-session (as opposed to per-connection) wrapper scoping; the wrapper is a
   connection-level concern (it wraps every non-PTY exec on that `SshConnection`).
-- Legacy terminal path: the wrapper is only coherent on the daemon terminal
-  path, never `RIFT_TERMINAL_LEGACY` (archived spec) — unchanged here.
+- The wrapper is only coherent on the daemon terminal path — the daemon is the
+  sole terminal source (#285), so this is unconditional now — unchanged here.
 
 ## Constraints
 

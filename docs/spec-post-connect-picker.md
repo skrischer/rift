@@ -111,9 +111,10 @@ default on the connect card is retired.
 - Agent-agnostic; theme tokens only (the picker reuses the Connection-screen +
   phase-32 tokens); no `.unwrap()` in libs; crate boundaries via `lib.rs`;
   English; no emojis.
-- The `RIFT_TERMINAL_LEGACY` escape hatch has no daemon transport, so it cannot
-  query a session list — it keeps its current fixed-session behavior (the legacy
-  path is slated for removal, #285).
+- The daemon is the sole terminal source (#285): a session connects only once
+  the daemon transport is up, so the picker's `QuerySessionList` is always
+  available; an unavailable daemon fails the connection cleanly before any
+  picker is reached.
 
 ## Prior decisions
 
