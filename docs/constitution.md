@@ -23,7 +23,11 @@
 ## Architecture principles
 
 - Agent-agnostic: no code path detects or special-cases a specific agent. All IDE
-  features derive from exactly two signals — PTY byte streams and filesystem events.
+  features derive only from agent-agnostic host observables — PTY byte streams,
+  filesystem events, and host resource state (`/proc`: CPU / memory / swap / load) —
+  never from an agent's internals. Host resource state is host-global (the machine,
+  not any pane); attributing it to a pane keys on the tmux pane's process, never on
+  which agent runs there.
 - Crate boundaries are contracts: public API through `lib.rs` only; `protocol` is
   the shared language — both sides depend on it, never on each other.
 - Plugins extend, core stays agnostic: process-specific pane awareness lives in
