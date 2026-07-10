@@ -214,6 +214,31 @@ const ROOT_RESOLVED_CAPACITY: usize = 4;
 /// registry hanging forever.
 const CONTEXT_RELEASE_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long [`keep_warm_supervisor`] waits, after the primary/`--root`
+/// context's last client disconnects, before releasing it via
+/// [`ContextMap::release`] — tearing down its `rust-analyzer` (#551, the
+/// observed multi-GB orphan). Re-acquired (fresh scan + LSP spawn) on the
+/// next connection, so a returning client still gets a working reactive
+/// layer.
+///
+/// Must clear the mid-session daemon-stream recovery window
+/// (`reconnect_daemon` in `crates/app/src/main.rs`, #475): 10 attempts under
+/// `rift_ssh::ReconnectBackoff`'s capped schedule sum to ~190s worst case with
+/// jitter (`docs/spec-connection-robustness.md` calls the unjittered sum
+/// "~2 min") before that layer gives up — well inside this grace, so a
+/// transient SSH drop always reattaches to the still-warm context. A longer
+/// outage falls through to the SSH-level reconnect engine (#476, unlimited
+/// retries); intentionally not covered here — the context is simply
+/// re-acquired on the eventual reconnect, per the issue's "or at minimum stop
+/// its spawned language servers" acceptance.
+const KEEP_WARM_RELEASE_GRACE: Duration = Duration::from_secs(240);
+
+/// Bound on outstanding `serve_uds` accept-loop <-> [`keep_warm_supervisor`]
+/// traffic — a handful of connections at a time
+/// (`docs/spec-dogfooding-channels.md`), so a small fixed capacity never
+/// backs up.
+const KEEP_WARM_EVENT_CAPACITY: usize = 16;
+
 /// Per-connection navigation-reply channel bound (#482): the private inbox the
 /// LSP worker's spawned nav tasks send this connection's hover/definition/
 /// references answers to. Nav responses are user-paced (one per hover or click),
@@ -1903,14 +1928,19 @@ impl Drop for PidfileGuard {
 /// only that connection; a reconnect attaches to the same running daemon rather
 /// than spawning a second one.
 ///
-/// With a `worktree_root`, the root's [`Context`] is acquired once up front
-/// (see [`ContextMap::acquire`]) and scanned/watched for the daemon's
-/// lifetime; every attaching client receives the current snapshot on its
-/// handshake, and each accepted connection's terminal attach gets a clone of
-/// the root too (`docs/spec-session-start-directory.md`), so a freshly
-/// created tmux session's default directory is the project root, not `$HOME`.
-/// A single root stays a special case — one context for the daemon's whole
-/// lifetime; per-connection re-rooting on `Attach` is a later step (#737).
+/// With a `worktree_root`, the root's [`Context`] is acquired up front (see
+/// [`ContextMap::acquire`]) and handed to [`keep_warm_supervisor`], which owns
+/// it for the daemon's lifetime: scanned/watched while at least one client is
+/// connected, released [`KEEP_WARM_RELEASE_GRACE`] after the last one
+/// disconnects, and re-acquired (fresh scan + LSP spawn) on the next
+/// connection (#551, releasing the memory an indefinitely-orphaned language
+/// server would otherwise hold). Every attaching client receives the current
+/// snapshot on its handshake, and each accepted connection's terminal attach
+/// gets a clone of the root too (`docs/spec-session-start-directory.md`), so a
+/// freshly created tmux session's default directory is the project root, not
+/// `$HOME`. Per-connection re-rooting on `Attach` (#737) is independent of
+/// this: it tracks its own root reference and releases it on that
+/// connection's own disconnect, untouched by the keep-warm grace timer.
 ///
 /// If a live daemon already owns `socket_path` this returns an error — the
 /// caller must attach via [`connect_relay`], not spawn. A stale socket left by a
@@ -1951,16 +1981,13 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
         }
     };
 
-    // Acquired once, up front, and held (never released) for the accept
-    // loop's entire lifetime, so the dispatch loop and its `State` stay alive
-    // even while no client is attached — exactly like the pre-context-map
-    // `handles`/`_dispatch` did. `context_map` itself is now shared with every
-    // accepted connection too (#737): each one's own `Attach` can resolve a
-    // DIFFERENT session root and re-root against the SAME registry, without
-    // disturbing this keep-warm reference.
+    // `context_map` is shared with every accepted connection (#737): each
+    // one's own `Attach` can resolve a DIFFERENT session root and re-root
+    // against the SAME registry, without disturbing the primary reference
+    // below.
     let context_map = Arc::new(ContextMap::new());
     let connection_root = worktree_root.clone();
-    let context = match worktree_root {
+    let primary = match worktree_root {
         // Canonicalized for the SAME reason as `serve`'s keep-warm acquire
         // above (#737 review, B1): a later `Attach` re-rooting to this same
         // directory keys through `canonicalize_root` too
@@ -1968,10 +1995,24 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
         // identically here or the two build TWO live contexts — two
         // `LspWorker`s — for one project. `connection_root` below (handed to
         // each connection's terminal attach) stays RAW.
-        Some(root) => context_map.acquire(canonicalize_root(root).await).await,
-        None => standalone_context(),
+        Some(root) => {
+            let canonical_root = canonicalize_root(root).await;
+            let context = context_map.acquire(canonical_root.clone()).await;
+            let (keep_warm_tx, keep_warm_rx) = mpsc::channel(KEEP_WARM_EVENT_CAPACITY);
+            tokio::spawn(keep_warm_supervisor(
+                Arc::clone(&context_map),
+                canonical_root,
+                context,
+                KEEP_WARM_RELEASE_GRACE,
+                keep_warm_rx,
+            ));
+            PrimaryContext::KeepWarm(keep_warm_tx)
+        }
+        // Rootless daemons keep the pre-#551 behavior unchanged: one
+        // standalone context (no `ContextMap` entry, no LSP), held for the
+        // process's whole lifetime — nothing to release.
+        None => PrimaryContext::Standalone(standalone_context()),
     };
-    let nav_requests = context.nav_requests.clone();
 
     loop {
         let (stream, _addr) = match listener.accept().await {
@@ -1986,11 +2027,36 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
                 continue;
             }
         };
+
+        // Resolve this connection's context. `KeepWarm` asks the supervisor
+        // (arming/disarming the release grace timer, re-acquiring first if
+        // the previous last client's grace already released it); `Standalone`
+        // just clones the one process-lifetime context.
+        let (context, keep_warm_tx) = match &primary {
+            PrimaryContext::KeepWarm(keep_warm_tx) => {
+                let (reply_tx, mut reply_rx) = mpsc::channel(1);
+                if keep_warm_tx
+                    .send(KeepWarmEvent::Connected(reply_tx))
+                    .await
+                    .is_err()
+                {
+                    warn!("keep-warm supervisor gone; dropping connection");
+                    continue;
+                }
+                let Some(context) = reply_rx.recv().await else {
+                    warn!("keep-warm supervisor dropped without a reply; dropping connection");
+                    continue;
+                };
+                (context, Some(keep_warm_tx.clone()))
+            }
+            PrimaryContext::Standalone(context) => (context.clone(), None),
+        };
+
         let (reader, writer) = stream.into_split();
         let inbound = context.handles.inbound.clone();
         let events = context.handles.subscribe();
         let state = context.handles.state.clone();
-        let nav_requests = nav_requests.clone();
+        let nav_requests = context.nav_requests.clone();
         let root = connection_root.clone();
         let context_map = Arc::clone(&context_map);
         tokio::spawn(async move {
@@ -2011,7 +2077,110 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
                 // log; one failed connection must not stop the daemon.
                 warn!(err = %e, "connection ended with error");
             }
+            // Tell the supervisor this connection is gone, so it can notice
+            // the last client leaving and arm the release grace timer (#551).
+            // `serve_connection` above has already returned by this point, so
+            // every clone of `context` it owned is already dropped — the
+            // "drop before the disconnect signal" discipline
+            // `ContextMap::release` and `reroot_connection` document.
+            if let Some(keep_warm_tx) = keep_warm_tx {
+                let _ = keep_warm_tx.send(KeepWarmEvent::Disconnected).await;
+            }
         });
+    }
+}
+
+/// [`serve_uds`]'s primary/`--root` context: either routed through
+/// [`keep_warm_supervisor`] (a rooted daemon, releasable and re-acquirable,
+/// #551) or a single process-lifetime standalone context (a rootless daemon,
+/// unchanged pre-#551 behavior — no root to key a [`ContextMap`] entry by).
+enum PrimaryContext {
+    KeepWarm(mpsc::Sender<KeepWarmEvent>),
+    Standalone(Context),
+}
+
+/// One event [`serve_uds`]'s accept loop reports to [`keep_warm_supervisor`]
+/// about the primary/`--root` context's connection lifecycle (#551).
+enum KeepWarmEvent {
+    /// A new connection needs the current context. The supervisor sends
+    /// exactly one [`Context`] back on `reply` — re-acquiring first (fresh
+    /// scan + LSP spawn) if the previous last client's grace already
+    /// released it — before dropping it.
+    Connected(mpsc::Sender<Context>),
+    /// A connection this supervisor previously handed a `Context` to (via a
+    /// `Connected` reply) has ended.
+    Disconnected,
+}
+
+/// Own the primary/`--root` [`Context`] for [`serve_uds`]'s whole process
+/// lifetime: hand it out on every `Connected` event (re-acquiring via
+/// [`ContextMap::acquire`] first if it was released), and release it (see
+/// [`ContextMap::release`]) `grace` after the connection count implied by
+/// `Connected`/`Disconnected` events drops to zero (#551) — unless a
+/// `Connected` arrives first, which cancels the pending release.
+///
+/// Runs as its own task, off `serve_uds`'s accept loop: this single-tasked
+/// event loop serializes every `Connected`/`Disconnected` it receives, so a
+/// `Connected` racing an in-flight re-acquire simply queues behind it and
+/// observes the same freshly built context — never a duplicate. The accept
+/// loop awaits each connection's `Connected` reply before accepting the next,
+/// so a re-acquire's worktree scan briefly delays only the connection that
+/// triggered it — the same one-time cost the original up-front acquire always
+/// paid at daemon startup, just possibly repeated.
+///
+/// `events` closing (every sender dropped) means the process is going down;
+/// this task exits without releasing — exit already frees everything.
+async fn keep_warm_supervisor(
+    context_map: Arc<ContextMap>,
+    root: PathBuf,
+    initial: Context,
+    grace: Duration,
+    mut events: mpsc::Receiver<KeepWarmEvent>,
+) {
+    let mut context = Some(initial);
+    let mut active: usize = 0;
+    let sleep = tokio::time::sleep(grace);
+    tokio::pin!(sleep);
+    let mut grace_armed = false;
+
+    loop {
+        tokio::select! {
+            event = events.recv() => {
+                match event {
+                    Some(KeepWarmEvent::Connected(reply)) => {
+                        active += 1;
+                        grace_armed = false;
+                        if context.is_none() {
+                            context = Some(context_map.acquire(root.clone()).await);
+                        }
+                        if let Some(ctx) = &context {
+                            let _ = reply.send(ctx.clone()).await;
+                        }
+                    }
+                    Some(KeepWarmEvent::Disconnected) => {
+                        active = active.saturating_sub(1);
+                        if active == 0 {
+                            sleep.as_mut().reset(tokio::time::Instant::now() + grace);
+                            grace_armed = true;
+                        }
+                    }
+                    None => return,
+                }
+            }
+            () = &mut sleep, if grace_armed => {
+                grace_armed = false;
+                // Drop this supervisor's own reference BEFORE releasing (the
+                // same discipline `ContextMap::release`'s doc comment and
+                // `reroot_connection` follow): every per-connection clone is
+                // already gone by the time `active` reached zero above, so
+                // this is the last one, and the release below tears the
+                // context down instead of blocking on a lingering clone.
+                if let Some(ctx) = context.take() {
+                    drop(ctx);
+                    context_map.release(&root).await;
+                }
+            }
+        }
     }
 }
 
@@ -4962,6 +5131,183 @@ mod tests {
 
         drop(ctx);
         map.release(&tmp.path).await;
+    }
+
+    // ── keep_warm_supervisor: the release grace timer (#551) ─────────────────
+
+    /// A short grace so these tests do not wait real seconds — the production
+    /// [`KEEP_WARM_RELEASE_GRACE`] is minutes, `keep_warm_supervisor` takes it
+    /// as a plain parameter for exactly this reason.
+    const TEST_KEEP_WARM_GRACE: Duration = Duration::from_millis(30);
+
+    /// Drive one `Connected` round-trip through a running supervisor and
+    /// return the `Context` it handed back.
+    async fn connect(events: &mpsc::Sender<KeepWarmEvent>) -> Context {
+        let (reply_tx, mut reply_rx) = mpsc::channel(1);
+        events
+            .send(KeepWarmEvent::Connected(reply_tx))
+            .await
+            .expect("supervisor task alive");
+        reply_rx
+            .recv()
+            .await
+            .expect("supervisor replies with a context")
+    }
+
+    /// Loop `changed()` until it errors (the `State` sender dropped), so an
+    /// unrelated intervening update — e.g. the context's own worktree scan
+    /// completing while the test waits out the grace timer — is not mistaken
+    /// for the teardown this waits for. Bounded by the caller's own
+    /// `tokio::time::timeout`.
+    async fn wait_for_state_closed(state: &mut watch::Receiver<State>) {
+        loop {
+            if state.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// The last client disconnecting, followed by the grace window fully
+    /// elapsing with no reconnect, releases the keep-warm context — its
+    /// `State` sender is dropped, exactly [`ContextMap::release`]'s own
+    /// teardown signal (mirroring `test_context_map_release_to_zero_tears_down_context`).
+    #[tokio::test]
+    async fn test_keep_warm_supervisor_last_disconnect_then_grace_expiry_releases_context() {
+        let tmp = TempDir::new("keepwarm-release");
+        let map = Arc::new(ContextMap::new());
+        let initial = map.acquire(tmp.path.clone()).await;
+        let (events_tx, events_rx) = mpsc::channel(KEEP_WARM_EVENT_CAPACITY);
+        tokio::spawn(keep_warm_supervisor(
+            Arc::clone(&map),
+            tmp.path.clone(),
+            initial,
+            TEST_KEEP_WARM_GRACE,
+            events_rx,
+        ));
+
+        let context = connect(&events_tx).await;
+        let mut state = context.handles.state.clone();
+        drop(context);
+        events_tx
+            .send(KeepWarmEvent::Disconnected)
+            .await
+            .expect("supervisor task alive");
+
+        tokio::time::timeout(Duration::from_secs(5), wait_for_state_closed(&mut state))
+            .await
+            .expect(
+                "the grace expiring with no reconnect must release the context \
+                 (its State sender dropped) within the timeout",
+            );
+    }
+
+    /// A disconnect immediately followed by a reconnect WITHIN the grace
+    /// window keeps the context alive: the supervisor hands back the SAME
+    /// context (no re-acquire), and it survives well past the original grace
+    /// deadline.
+    #[tokio::test]
+    async fn test_keep_warm_supervisor_reconnect_within_grace_keeps_context_alive() {
+        let tmp = TempDir::new("keepwarm-reconnect");
+        let map = Arc::new(ContextMap::new());
+        let initial = map.acquire(tmp.path.clone()).await;
+        let (events_tx, events_rx) = mpsc::channel(KEEP_WARM_EVENT_CAPACITY);
+        tokio::spawn(keep_warm_supervisor(
+            Arc::clone(&map),
+            tmp.path.clone(),
+            initial,
+            TEST_KEEP_WARM_GRACE,
+            events_rx,
+        ));
+
+        let first = connect(&events_tx).await;
+        let inbound_before = first.handles.inbound.clone();
+        drop(first);
+        events_tx
+            .send(KeepWarmEvent::Disconnected)
+            .await
+            .expect("supervisor task alive");
+
+        // Reconnect immediately — well inside `TEST_KEEP_WARM_GRACE`.
+        let second = connect(&events_tx).await;
+        assert!(
+            second.handles.inbound.same_channel(&inbound_before),
+            "a reconnect within the grace window must reuse the SAME context, \
+             not re-acquire a fresh one"
+        );
+        let state = second.handles.state.clone();
+
+        // Outlive the original grace deadline: the timer must have been
+        // canceled by the reconnect above, so the context stays live.
+        tokio::time::sleep(TEST_KEEP_WARM_GRACE * 4).await;
+        assert!(
+            state.has_changed().is_ok(),
+            "the context must survive past the original grace deadline once \
+             a reconnect canceled the pending release"
+        );
+
+        drop(second);
+        events_tx
+            .send(KeepWarmEvent::Disconnected)
+            .await
+            .expect("supervisor task alive");
+    }
+
+    /// A connection arriving after the grace already released the context
+    /// gets a freshly re-acquired one (a working reactive layer again),
+    /// distinct from the one that was released.
+    #[tokio::test]
+    async fn test_keep_warm_supervisor_connect_after_release_reacquires_a_fresh_context() {
+        let tmp = TempDir::new("keepwarm-reacquire");
+        let map = Arc::new(ContextMap::new());
+        let initial = map.acquire(tmp.path.clone()).await;
+        let (events_tx, events_rx) = mpsc::channel(KEEP_WARM_EVENT_CAPACITY);
+        tokio::spawn(keep_warm_supervisor(
+            Arc::clone(&map),
+            tmp.path.clone(),
+            initial,
+            TEST_KEEP_WARM_GRACE,
+            events_rx,
+        ));
+
+        let first = connect(&events_tx).await;
+        // Only `state_before` (a `watch::Receiver`, which never keeps a
+        // channel open the way an `mpsc::Sender` clone would) survives past
+        // the drop below, so nothing here holds up the release this test
+        // waits for next.
+        let mut state_before = first.handles.state.clone();
+        drop(first);
+        events_tx
+            .send(KeepWarmEvent::Disconnected)
+            .await
+            .expect("supervisor task alive");
+
+        // Wait out the release, proven the same way as the release test above.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_state_closed(&mut state_before),
+        )
+        .await
+        .expect("the first context must be released before the reconnect below");
+
+        // A fresh, live context — not the released one (its own scan
+        // completing is exercised generically by
+        // `test_context_map_reacquire_after_full_teardown_builds_a_fresh_working_context`).
+        let second = connect(&events_tx).await;
+        assert!(
+            !second.handles.state.same_channel(&state_before),
+            "a connection after the release must get a freshly re-acquired \
+             context, not the torn-down one"
+        );
+        assert!(
+            second.handles.state.has_changed().is_ok(),
+            "the re-acquired context must be alive (State sender not closed)"
+        );
+
+        drop(second);
+        events_tx
+            .send(KeepWarmEvent::Disconnected)
+            .await
+            .expect("supervisor task alive");
     }
 
     // ── reroot_connection: the Attach seam (#737) ────────────────────────────
