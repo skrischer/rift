@@ -27,10 +27,12 @@ on the same host" via the recents reattach path, not a fixed env name.
       env read are deleted and every connect is `Pick`.
 - [ ] The dogfooding-channels mirror is re-specified: stable + dev no longer
       auto-share session `rift` via a baked env; they mirror by attaching the same
-      session on the same host — the first launch picks it, later launches
-      reattach it via the recents `Preferred` path (a remembered session still on
-      the host attaches directly, no picker). `docs/spec-dogfooding-channels.md`
-      and the `CLAUDE.md` dogfooding-channels section reflect this.
+      session on the same host — each channel picks it once, then later launches of
+      that channel reattach it via the recents `Preferred` path (a remembered
+      still-live session attaches directly, no picker). Recents are per-channel
+      (`rift-stable-recents.json` vs `rift-dev-recents.json`), so each channel
+      records its own first pick. `docs/spec-dogfooding-channels.md` and the
+      `CLAUDE.md` dogfooding-channels section reflect this.
 - [ ] Empty **and** unset `RIFT_SESSION` both resolve to `Pick`
       (`session_intent_from_env`), verified — the recipe change depends on it.
 - [ ] No protocol / daemon change; the connect-and-list UI (Phases 33/36) is
@@ -48,14 +50,24 @@ on the same host" via the recents reattach path, not a fixed env name.
   `RIFT_SESSION=rift-dev just dev-windows-watch` isolation invocation keeps
   working.
 - **`RIFT_SESSION` env knob**: [keep as optional override | remove entirely] per
-  the acceptance-gate decision, with the app code
-  (`connection_screen.rs::session_intent_from_env`, `SessionIntent::Fixed`) and
-  the doc-comments updated to match.
-- **Docs**: `docs/spec-dogfooding-channels.md` + `CLAUDE.md` (the
-  dogfooding-channels section and every `RIFT_SESSION` mention) updated to the
-  connect-and-list default and the recents-based mirror. The Paper "Session
-  flows" artboard's `RIFT_SESSION` fast-path route is re-annotated
-  (deprecated/optional) at the visual-QA gate.
+  the acceptance-gate decision, with the app code and doc-comments updated to
+  match. The **keep** branch touches no app code (only demotes the knob in docs).
+  The **remove** branch is compiler-enforced and cascades beyond
+  `connection_screen.rs::session_intent_from_env` + `SessionIntent::Fixed` to the
+  three functional consumers in `crates/app/src/main.rs`: the eager-recents-record
+  branch (~L916), `is_fixed_intent` gating direct-attach vs picker (~L942), and
+  the `initial_session`/`preferred_session` seeding match (~L1622-1626).
+- **Docs**: `docs/spec-dogfooding-channels.md` (a live operational contract whose
+  Outcome — "`RIFT_SESSION` (default `rift`)" — becomes factually wrong, so it is
+  **edited**) + `CLAUDE.md` (a symlink to `AGENTS.md`; the dogfooding-channels
+  section and every `RIFT_SESSION` mention) + `docs/roadmap.md` (the "attaches
+  directly (dogfooding fast-path)" / "stays the picker-skipping fast-path" notes
+  at ~L189/L252 — the latter goes stale even under keep-as-override, since the
+  fast-path is demoted from default to override) updated to the connect-and-list
+  default and the recents-based mirror. The `crates/protocol` doc-comments and
+  `docs/protocol.md` `RIFT_SESSION` mentions are left as historical phase notes.
+  The Paper "Session flows" artboard's `RIFT_SESSION` fast-path route is
+  re-annotated (deprecated/optional) at the visual-QA gate.
 
 ### Out of scope
 
@@ -105,7 +117,9 @@ on the same host" via the recents reattach path, not a fixed env name.
   fixed session default is the anomaly being retired.
 - Supersedes the "`RIFT_SESSION` is the picker-skipping fast-path" stance recorded
   in `spec-post-connect-picker.md` (Phase 33) and `spec-session-root-picker.md`
-  (Phase 36); those specs stay as historical record.
+  (Phase 36). Those two are historical phase records, so they are
+  decision-log-superseded here, not edited; `spec-dogfooding-channels.md` is a
+  live operational contract with a now-false Outcome, so it is edited directly.
 
 ## Human prerequisites
 
@@ -142,9 +156,11 @@ on the same host" via the recents reattach path, not a fixed env name.
   re-enable the old fast-path. Mitigation: keeping the knob is by design an
   override; the docs note it. If the knob is removed, the env is simply ignored.
 - **The stable channel launches detached** — with no session it lands on the
-  connect screen. That is the Phase-20 startup state; the detached `stable` /
-  `promote` launch already opens to the connect screen and the user connects. No
-  regression.
+  connect screen. Today `promote` / `stable` pass a literal `rift` and auto-attach;
+  after this change they land on the connect screen instead (the Phase-20 startup
+  state — the same state an env-free desktop-shortcut launch already opens to), and
+  the user connects. Not a regression, but a deliberate behaviour change for the
+  detached launches, called out here.
 
 ## Tracking
 
