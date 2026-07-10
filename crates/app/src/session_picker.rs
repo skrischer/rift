@@ -29,6 +29,12 @@ use crate::title_bar;
 /// contract: "card ~470px") — this screen is styled as its direct sibling.
 const CARD_WIDTH: f32 = 470.0;
 
+/// The max height of the rows region before it scrolls internally (issue
+/// #792: an unbounded list runs the card off-screen with many sessions),
+/// matching `quick_open::QUICK_OPEN_LIST_MAX_HEIGHT` /
+/// `command_palette::PALETTE_LIST_MAX_HEIGHT`'s own cap.
+const ROWS_MAX_HEIGHT: f32 = 360.0;
+
 /// One session row's display-ready fields: the pure mapping from the daemon's
 /// [`SessionListItem`] (sorted by the client-side order store, exactly like
 /// the cockpit strip) into what [`render_row`] draws. Split out from the
@@ -327,7 +333,16 @@ impl Render for SessionPicker {
         let body = if rows.is_empty() {
             render_empty_state(cx)
         } else {
-            v_flex().gap(px(4.0)).children(rows).into_any_element()
+            // Bounded height + internal scroll (issue #792): a short list
+            // still renders compact since `max_h` only caps growth, and
+            // `overflow_y_scroll` only kicks in once the rows exceed it.
+            v_flex()
+                .id("session-picker-rows")
+                .gap(px(4.0))
+                .max_h(px(ROWS_MAX_HEIGHT))
+                .overflow_y_scroll()
+                .children(rows)
+                .into_any_element()
         };
 
         let footer = render_new_session_footer(cx);
