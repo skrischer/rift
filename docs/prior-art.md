@@ -649,6 +649,21 @@ Per-concern prior art for the connected-but-sessionless mid-session state (Phase
 
 Notes — ADOPT: tmux's `detach-on-destroy off` semantics (switch, don't disconnect), rendered as rift's picker; the connection-vs-session separation from VS Code Remote / Zed / rift's own daemon-as-proxy. AVOID: auto-attach on kill (the user chose always-picker), tmux's default detach-to-shell (rift stays in-app), and any teardown of the SSH/daemon on a session end. Sources: tmux(1) man page (`detach-on-destroy`); VS Code Remote-SSH docs.
 
+## Clone-a-repository into a session — prior-art index (Phase 42)
+
+Seeded 2026-07-10 from idea sparring (research mode: websearch). The
+clone-from-URL-then-open pattern, adapted to rift's remote-native
+session=project model: the daemon (already on the remote) clones with the
+host's own git credentials and the new session is born rooted at the checkout.
+
+| Concern | Reference | Verdict |
+|---|---|---|
+| Clone-from-URL → open as workspace/session | VS Code "Git: Clone" (URL → destination folder → prompt "Open" → workspace-trust) ([Working with repositories](https://code.visualstudio.com/docs/sourcecontrol/repos-remotes)); DevPod `devpod up <git-url>` (workspace from a git URL, optional `@ref`) ([DevPod create-a-workspace](https://devpod.sh/docs/developing-in-workspaces/create-a-workspace)); Gitpod / JetBrains Gateway (paste a source-control URL to start) | reference — adopt URL → parent → name(=basename) → clone → auto-create session; rift binds clone directly to session=project (`@root`), not clone→open-folder |
+| git clone execution (pure-Rust, musl-clean) | `gix` (GitoxideLabs/gitoxide) clone/fetch — already the daemon's git dependency (see Potential dependencies); Cargo uses gix for production dependency fetching | reuse — clone via gix in the daemon (no libgit2, no system-`git` target dependency). PLAN-TIME CHECK: verify gix performs a full worktree-checkout clone at the pinned rev; only if not, fall back to system `git` (a target dependency — decide at /plan) |
+| Remote-native credential model | rift's own daemon runs ON the remote / container with its ambient git creds (e.g. the homelab devenv `GIT_AUTH_TOKEN`) vs DevPod / VS Code credential *forwarding* to the remote | greenfield / differentiation — no credential forwarding: the daemon clones with the host's own credentials. AVOID a forwarding / auth-UI path at v1 |
+
+Notes — ADOPT: the URL → parent → name → clone → open-as-session flow (VS Code / DevPod / Gitpod), rebound to session=project; gix for the clone (already an approved dependency). AVOID: credential forwarding (the remote-native daemon uses the host's own creds), a git-remote-manager scope, and branch / PR-slug parsing at v1 (DevPod has it; defer). Foundation impact (recorded here, authored + ratified at Phase 42's /loopkit:plan spec-acceptance, never edited from here): a new `crates/protocol` clone channel is a deliberate API addition (`PROTOCOL_VERSION` bump), and the daemon gains git-clone execution (gix) with progress / error reporting. Sources: VS Code source-control docs; DevPod create-a-workspace docs; gitoxide (gix) project.
+
 ## Priority reference projects (top 10)
 
 1. **penso/arbor** — Closest existing implementation of rift's exact concept (Rust + GPUI + daemon + SSH outposts + agent state). Read end-to-end before writing any architecture docs.

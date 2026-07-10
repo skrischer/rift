@@ -17,12 +17,12 @@
 //! Issues #706/#707/#705 (`docs/spec-post-connect-picker.md`) retire the
 //! card's Session field: the card no longer picks a session at all, and a
 //! [`SessionIntent`] carried on [`ConnectRequest`] tells `main.rs`'s entry
-//! point how to resolve one instead — `RIFT_SESSION` set (read at connect
-//! time) is [`SessionIntent::Fixed`] (the dogfooding fast-path, no picker); a
-//! RECENT row whose stored session is non-empty is [`SessionIntent::Preferred`]
-//! (attached directly if still present on the live host, else the picker); a
-//! plain Connect click or an empty recent session is [`SessionIntent::Pick`]
-//! (always the picker).
+//! point how to resolve one instead — a RECENT row whose stored session is
+//! non-empty is [`SessionIntent::Preferred`] (attached directly if still
+//! present on the live host, else the picker); a plain Connect click or an
+//! empty recent session is [`SessionIntent::Pick`] (always the picker; issue
+//! #808 retires the `RIFT_SESSION`-driven `Fixed` fast-path, so every plain
+//! Connect now resolves `Pick`).
 //!
 //! This module is deliberately GPUI-view-only: it emits [`ConnectionScreenEvent`]
 //! and never touches SSH, threads, or the recents *file* directly — `main.rs`
@@ -145,9 +145,7 @@ fn default_key_path(home: Option<&str>, windows: bool) -> PathBuf {
 /// [`resolve_defaults`] read from the live environment: `RIFT_SSH_HOST`/
 /// `RIFT_SSH_USER`/`RIFT_SSH_PORT`/`RIFT_SSH_KEY` (runtime),
 /// `RIFT_DEFAULT_SSH_KEY` (the `just promote` compile-time bake), and
-/// `USERPROFILE`/`HOME` for the last-resort key path. `RIFT_SESSION` is read
-/// separately, at connect time, by [`session_intent_from_env`] (issue #707) —
-/// not here, since it no longer prefills a card field. `RIFT_REMOTE_EXEC_WRAPPER`
+/// `USERPROFILE`/`HOME` for the last-resort key path. `RIFT_REMOTE_EXEC_WRAPPER`
 /// / `RIFT_DEFAULT_REMOTE_EXEC_WRAPPER` (issue #789) resolve the Remote exec
 /// wrapper field's fresh-card prefill the same way — the field itself is
 /// authoritative at connect (`build_request`), this is only the seed value.
@@ -180,17 +178,12 @@ pub fn live_defaults() -> ConnectDefaults {
 /// which entry point fired and threads it end-to-end instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionIntent {
-    /// `RIFT_SESSION` is set (env, e.g. the dogfooding dev channel):
-    /// attach-or-create this session directly — no picker, the pre-#706
-    /// behavior byte-for-byte.
-    Fixed(String),
     /// A RECENT row whose stored session is non-empty: attach it directly if
     /// still present on the live host session list; if it is gone, show the
     /// picker instead of a blind attach.
     Preferred(String),
-    /// The plain "Connect \u{2192}" button with no `RIFT_SESSION` set, or a
-    /// RECENT row whose stored session is empty: always show the post-connect
-    /// picker.
+    /// The plain "Connect \u{2192}" button, or a RECENT row whose stored
+    /// session is empty: always show the post-connect picker.
     Pick,
 }
 
@@ -232,18 +225,6 @@ impl std::fmt::Debug for ConnectRequest {
                 &self.passphrase.as_ref().map(|_| "<redacted>"),
             )
             .finish()
-    }
-}
-
-/// Resolve the plain "Connect \u{2192}" button's session intent (issue #707):
-/// `RIFT_SESSION` read at connect time, not prefilled at screen-construction
-/// time — a set, non-empty value attaches directly (the dogfooding
-/// fast-path, unchanged from #706's SET path); unset or empty always shows
-/// the post-connect picker.
-fn session_intent_from_env(rift_session: Option<&str>) -> SessionIntent {
-    match rift_session {
-        Some(name) if !name.is_empty() => SessionIntent::Fixed(name.to_string()),
-        _ => SessionIntent::Pick,
     }
 }
 
@@ -456,10 +437,10 @@ impl ConnectionScreen {
     /// Read the inputs and validate them into a [`ConnectRequest`]. Host and
     /// User must be non-empty; Port must parse as a `u16`; the SSH key path
     /// must be non-empty. The session is no longer a card field (issues
-    /// #706/#707/#705, `docs/spec-post-connect-picker.md`): the plain
-    /// "Connect \u{2192}" button's [`SessionIntent`] is resolved from
-    /// `RIFT_SESSION`, read at connect time via [`session_intent_from_env`].
-    /// When the key is detected as encrypted, the passphrase field must be
+    /// #706/#707/#705/#808, `docs/spec-post-connect-picker.md`,
+    /// `docs/spec-retire-fixed-session.md`): the plain "Connect \u{2192}"
+    /// button always resolves [`SessionIntent::Pick`]. When the key is
+    /// detected as encrypted, the passphrase field must be
     /// non-empty too (#478) — surfaced via [`ConnectError::Passphrase`] so it
     /// renders at that field rather than the bottom banner.
     fn build_request(&self, cx: &App) -> Result<ConnectRequest, ConnectError> {
@@ -502,7 +483,7 @@ impl ConnectionScreen {
             port,
             key: PathBuf::from(key_text),
             remote_exec_wrapper,
-            session_intent: session_intent_from_env(std::env::var("RIFT_SESSION").ok().as_deref()),
+            session_intent: SessionIntent::Pick,
             passphrase,
         })
     }
@@ -1151,7 +1132,7 @@ mod tests {
             port: 22,
             key: PathBuf::from("/home/developer/.ssh/id_ed25519"),
             remote_exec_wrapper: None,
-            session_intent: SessionIntent::Fixed("rift".to_string()),
+            session_intent: SessionIntent::Pick,
             passphrase: passphrase.map(str::to_string),
         }
     }
@@ -1182,24 +1163,6 @@ mod tests {
     }
 
     // ── SessionIntent (entry-point routing, issue #707) ────────────────────
-
-    #[::core::prelude::v1::test]
-    fn test_session_intent_from_env_set_returns_fixed() {
-        assert_eq!(
-            session_intent_from_env(Some("rift-dev")),
-            SessionIntent::Fixed("rift-dev".to_string())
-        );
-    }
-
-    #[::core::prelude::v1::test]
-    fn test_session_intent_from_env_unset_returns_pick() {
-        assert_eq!(session_intent_from_env(None), SessionIntent::Pick);
-    }
-
-    #[::core::prelude::v1::test]
-    fn test_session_intent_from_env_empty_returns_pick() {
-        assert_eq!(session_intent_from_env(Some("")), SessionIntent::Pick);
-    }
 
     #[::core::prelude::v1::test]
     fn test_session_intent_from_recent_present_returns_preferred() {

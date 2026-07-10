@@ -58,6 +58,7 @@
 | 39 | Workspace visibility rail — the left activity rail toggles each workspace area's visibility (inactive = not rendered, not merely collapsed); Explorer+Editor count as one area, plus Terminal / Diagnostics / Git; the per-area zoom becomes a solo mode (all other areas deselected), and re-toggling an area from the rail adds it back into the workspace | [spec-workspace-visibility-rail.md](spec-workspace-visibility-rail.md) | [Phase 390](https://github.com/skrischer/rift/milestone/59) |
 | 40 | Mid-session session lifecycle — killing or exiting the active session returns to the pre-cockpit picker (the session picker if ≥1 session remains — always, even for one; else the zero-sessions root picker) while keeping the SSH/daemon connection alive; the connection screen is entered only on a real transport loss, so "session ended" stops meaning "disconnected" | [spec-session-lifecycle.md](spec-session-lifecycle.md) | [Phase 400](https://github.com/skrischer/rift/milestone/58) |
 | 41 | Retire the `RIFT_PROJECT_ROOT` env root — the daemon's watched root is no longer a baked launch default (`RIFT_PROJECT_ROOT` / `RIFT_DEFAULT_PROJECT_ROOT`); it starts root-less and follows the active session's `@root` (or `session_path` for externally-created sessions), superseding the single global seed that leaked a host path into a remote session. Mirrors Phase 38 for the project root; completes the Phase 34–36 session↔root coupling | [spec-retire-project-root-env.md](spec-retire-project-root-env.md) | [Phase 410](https://github.com/skrischer/rift/milestone/60) |
+| 42 | Clone-a-repository into a new session — a "Clone from URL" path in the new-session / root-picker flow: enter a git URL, the daemon clones it (`gix`) into the browsed parent as `<parent>/<name>`, then a session is created rooted at the checkout (`@root` stamped), binding clone → session=project in one step. Closes the cold-start gap (connecting to a parent like `/workspace` with nothing cloned yet); extends the root picker (Frame C). Foundation impact: a new `crates/protocol` clone channel (`PROTOCOL_VERSION` bump) + daemon git-clone (gix), authored + ratified at this phase's /loopkit:plan spec-acceptance | [spec-clone-repo.md](spec-clone-repo.md) | [Phase 420](https://github.com/skrischer/rift/milestone/61) |
 
 A phase gets a Spec link once `/loopkit:plan` drafts it, and a Milestone link once
 it is `READY`. The milestone (open/closed + issue progress) is where status lives.
@@ -189,10 +190,11 @@ PR, never edited from here):
   stays 8; this is a client-only (`[terminal]`/`[app]`) phase.
 - Phase 33 — the connection flow evolves to connect → session-pick → cockpit,
   and the connect card's Session field + `DEFAULT_SESSION` are removed. The ENTRY
-  POINT decides (planning refinement): `RIFT_SESSION` (env) attaches directly
-  (dogfooding fast-path), a recent-connection reattaches its remembered session if
-  present on the host else shows the picker, and the "Connect →" button always
-  shows the picker. `app`-only, no protocol/daemon change (the picker drives the
+  POINT decides (planning refinement): a recent-connection reattaches its remembered
+  session if present on the host else shows the picker, and the "Connect →" button
+  always shows the picker. (Phase 33 also shipped a `RIFT_SESSION` env fast-path that
+  attached directly; Phase 38 retired it — connect-and-list is now the default on
+  every launch, with no fixed-session bypass.) `app`-only, no protocol/daemon change (the picker drives the
   existing `QuerySessionList` + `Attach` and reuses phase 32's session-row
   component). Foundation impact ratified in phase 33's spec PR (#688): the phase-20
   `docs/architecture.md` "Connection robustness contract" gained two amendments —
@@ -252,8 +254,9 @@ never edited from here):
   in sparring (recorded in the spec's decision log at plan time): the picker
   supersedes the zero-sessions empty-state screen (with no sessions, Connect opens
   the picker directly; the session list shows only when sessions exist), the session
-  name defaults to the folder basename, and `RIFT_SESSION` stays the picker-skipping
-  fast-path.
+  name defaults to the folder basename. (Phase 36 kept `RIFT_SESSION` as a
+  picker-skipping fast-path; Phase 38 retired it — connect-and-list is now the default
+  on every launch, with no fixed-session bypass.)
 
 Open design decisions deferred to each phase's `/loopkit:plan` spec (never a
 roadmap guess): phase 34 — whether the root is set once via the session default
