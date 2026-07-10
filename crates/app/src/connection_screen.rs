@@ -63,6 +63,12 @@ pub struct ConnectDefaults {
     pub user: String,
     pub port: u16,
     pub key: PathBuf,
+    /// The Remote exec wrapper field's fresh-card prefill (issue #789,
+    /// `docs/spec-remote-exec-wrapper-ui.md`) — the same runtime-over-bake
+    /// value `main.rs`'s pre-#789 `resolve_remote_exec_wrapper()` resolved,
+    /// now folded into this struct so the card's fields all prefill through
+    /// one path. `None` prefills an empty field (a normal host connection).
+    pub remote_exec_wrapper: Option<String>,
 }
 
 /// Explicit inputs to [`resolve_defaults`], grouped into a struct so the
@@ -77,6 +83,11 @@ pub struct DefaultsInputs<'a> {
     pub baked_key: Option<&'a str>,
     pub home: Option<&'a str>,
     pub windows: bool,
+    /// `RIFT_REMOTE_EXEC_WRAPPER` (runtime).
+    pub remote_exec_wrapper: Option<&'a str>,
+    /// `RIFT_DEFAULT_REMOTE_EXEC_WRAPPER` (the `just promote` compile-time
+    /// bake).
+    pub baked_remote_exec_wrapper: Option<&'a str>,
 }
 
 /// Resolve the connect card's prefill values from explicit inputs (pure, for
@@ -98,12 +109,23 @@ pub fn resolve_defaults(inputs: DefaultsInputs) -> ConnectDefaults {
         .or(inputs.baked_key)
         .map(PathBuf::from)
         .unwrap_or_else(|| default_key_path(inputs.home, inputs.windows));
+    // Mirrors the pre-#789 `resolve_remote_exec_wrapper()` in `main.rs`
+    // byte-for-byte: the runtime value wins only if non-empty after trim,
+    // else the baked value is tried, and the value that is actually used is
+    // filtered again (covers a blank baked fallback too).
+    let remote_exec_wrapper = inputs
+        .remote_exec_wrapper
+        .filter(|s| !s.trim().is_empty())
+        .or(inputs.baked_remote_exec_wrapper)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
 
     ConnectDefaults {
         host,
         user,
         port,
         key,
+        remote_exec_wrapper,
     }
 }
 
@@ -124,7 +146,10 @@ fn default_key_path(home: Option<&str>, windows: bool) -> PathBuf {
 /// `RIFT_DEFAULT_SSH_KEY` (the `just promote` compile-time bake), and
 /// `USERPROFILE`/`HOME` for the last-resort key path. `RIFT_SESSION` is read
 /// separately, at connect time, by [`session_intent_from_env`] (issue #707) —
-/// not here, since it no longer prefills a card field.
+/// not here, since it no longer prefills a card field. `RIFT_REMOTE_EXEC_WRAPPER`
+/// / `RIFT_DEFAULT_REMOTE_EXEC_WRAPPER` (issue #789) resolve the Remote exec
+/// wrapper field's fresh-card prefill the same way — the field itself is
+/// authoritative at connect (`build_request`), this is only the seed value.
 pub fn live_defaults() -> ConnectDefaults {
     let host = std::env::var("RIFT_SSH_HOST").ok();
     let user = std::env::var("RIFT_SSH_USER").ok();
@@ -133,6 +158,7 @@ pub fn live_defaults() -> ConnectDefaults {
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .ok();
+    let remote_exec_wrapper = std::env::var("RIFT_REMOTE_EXEC_WRAPPER").ok();
 
     resolve_defaults(DefaultsInputs {
         host: host.as_deref(),
@@ -142,6 +168,8 @@ pub fn live_defaults() -> ConnectDefaults {
         baked_key: option_env!("RIFT_DEFAULT_SSH_KEY"),
         home: home.as_deref(),
         windows: cfg!(target_os = "windows"),
+        remote_exec_wrapper: remote_exec_wrapper.as_deref(),
+        baked_remote_exec_wrapper: option_env!("RIFT_DEFAULT_REMOTE_EXEC_WRAPPER"),
     })
 }
 
@@ -177,6 +205,12 @@ pub struct ConnectRequest {
     pub user: String,
     pub port: u16,
     pub key: PathBuf,
+    /// The Remote exec wrapper field's value at connect (issue #789,
+    /// `docs/spec-remote-exec-wrapper-ui.md`), e.g. `docker exec -i devenv`;
+    /// `None` for an empty/whitespace field (byte-for-byte passthrough, a
+    /// normal host connection). Not a secret — logged in full, unlike
+    /// `passphrase` below.
+    pub remote_exec_wrapper: Option<String>,
     pub session_intent: SessionIntent,
     /// The passphrase entered for an encrypted SSH key (#478); `None` for a
     /// plain key. Never persisted to the recents store and never logged.
@@ -190,6 +224,7 @@ impl std::fmt::Debug for ConnectRequest {
             .field("user", &self.user)
             .field("port", &self.port)
             .field("key", &self.key)
+            .field("remote_exec_wrapper", &self.remote_exec_wrapper)
             .field("session_intent", &self.session_intent)
             .field(
                 "passphrase",
@@ -257,7 +292,20 @@ fn key_needs_passphrase(path: &Path) -> bool {
     rift_ssh::key_requires_passphrase(path).unwrap_or(false)
 }
 
-/// The Connection screen view: the connect card's six inputs (the passphrase
+/// The Remote exec wrapper field's connect-time value (issue #789): the field
+/// is authoritative, mirroring `resolve_defaults`'s runtime-wrapper filter —
+/// an empty/whitespace value is `None` (byte-for-byte passthrough), a
+/// non-empty value is carried through as-is (not trimmed, exactly like the
+/// env var it replaces at the connect site).
+fn remote_exec_wrapper_from_field(value: &str) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+/// The Connection screen view: the connect card's inputs (the passphrase
 /// row renders only while `key_encrypted`), the RECENT list it was
 /// constructed with, and the two error slots a previous connect attempt (or
 /// this screen's own field validation) may have set — never both at once
@@ -267,6 +315,9 @@ pub struct ConnectionScreen {
     user_input: Entity<InputState>,
     port_input: Entity<InputState>,
     key_input: Entity<InputState>,
+    /// The Remote exec wrapper field (issue #789,
+    /// `docs/spec-remote-exec-wrapper-ui.md`); optional, free text.
+    remote_exec_wrapper_input: Entity<InputState>,
     passphrase_input: Entity<InputState>,
     recents: Vec<RecentConnection>,
     /// The card's bottom banner (host/user/port/key validation, or a general
@@ -301,6 +352,11 @@ impl ConnectionScreen {
         let key_input = cx.new(|cx| {
             InputState::new(window, cx).default_value(defaults.key.display().to_string())
         });
+        let remote_exec_wrapper_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(defaults.remote_exec_wrapper.clone().unwrap_or_default())
+                .placeholder("docker exec -i <container>")
+        });
         let passphrase_input = cx.new(|cx| InputState::new(window, cx).masked(true));
 
         // Enter in any field submits the card, matching the design contract
@@ -310,6 +366,7 @@ impl ConnectionScreen {
             &user_input,
             &port_input,
             &key_input,
+            &remote_exec_wrapper_input,
             &passphrase_input,
         ] {
             cx.subscribe_in(
@@ -351,6 +408,7 @@ impl ConnectionScreen {
             user_input,
             port_input,
             key_input,
+            remote_exec_wrapper_input,
             passphrase_input,
             recents,
             error,
@@ -434,12 +492,15 @@ impl ConnectionScreen {
         } else {
             None
         };
+        let remote_exec_wrapper =
+            remote_exec_wrapper_from_field(&self.remote_exec_wrapper_input.read(cx).value());
 
         Ok(ConnectRequest {
             host,
             user,
             port,
             key: PathBuf::from(key_text),
+            remote_exec_wrapper,
             session_intent: session_intent_from_env(std::env::var("RIFT_SESSION").ok().as_deref()),
             passphrase,
         })
@@ -454,8 +515,14 @@ impl ConnectionScreen {
     /// blindly. Recents never carry a passphrase (never persisted — #478),
     /// so a click landing on an encrypted key stops short of connecting and
     /// prompts for it instead of spinning up a connect attempt that would
-    /// deterministically fail. Silently ignored if `index` is stale (the
-    /// list changed under a slow click), rather than panicking.
+    /// deterministically fail. `RecentConnection` does not carry a wrapper
+    /// yet either (recents persistence for it is issue #790, out of scope
+    /// here), so — unlike host/user/port/key — the wrapper field is left
+    /// untouched by a recent click and read as-is at connect, the same way
+    /// a plain Connect click reads it (no regression to the fresh-card
+    /// env/bake prefill when a recent is picked instead). Silently ignored
+    /// if `index` is stale (the list changed under a slow click), rather
+    /// than panicking.
     fn connect_from_recent(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(recent) = self.recents.get(index).cloned() else {
             return;
@@ -485,11 +552,14 @@ impl ConnectionScreen {
 
         self.error = None;
         self.passphrase_error = None;
+        let remote_exec_wrapper =
+            remote_exec_wrapper_from_field(&self.remote_exec_wrapper_input.read(cx).value());
         cx.emit(ConnectionScreenEvent::Connect(ConnectRequest {
             host: recent.host,
             user: recent.user,
             port: recent.port,
             key: PathBuf::from(recent.key),
+            remote_exec_wrapper,
             session_intent: session_intent_from_recent(&recent.session),
             passphrase: None,
         }));
@@ -788,6 +858,12 @@ impl Render for ConnectionScreen {
                     ))),
             )
             .child(render_field(cx, "SSH key", &self.key_input, IconName::File))
+            .child(render_field(
+                cx,
+                "Remote exec wrapper",
+                &self.remote_exec_wrapper_input,
+                IconName::SquareTerminal,
+            ))
             .children(passphrase_row)
             .children(error_banner)
             .child(
@@ -862,12 +938,18 @@ mod tests {
             baked_key: Some("/keys/baked"),
             home: Some("/home/alice"),
             windows: false,
+            remote_exec_wrapper: Some("docker exec -i devenv"),
+            baked_remote_exec_wrapper: Some("docker exec -i baked"),
         });
 
         assert_eq!(defaults.host, "100.64.0.1");
         assert_eq!(defaults.user, "alice");
         assert_eq!(defaults.port, 2222);
         assert_eq!(defaults.key, PathBuf::from("/keys/mine"));
+        assert_eq!(
+            defaults.remote_exec_wrapper,
+            Some("docker exec -i devenv".to_string())
+        );
     }
 
     #[::core::prelude::v1::test]
@@ -916,6 +998,66 @@ mod tests {
         );
     }
 
+    // ── resolve_defaults: remote_exec_wrapper prefill (issue #789) ─────────
+
+    #[::core::prelude::v1::test]
+    fn test_resolve_defaults_remote_exec_wrapper_unset_is_none() {
+        let defaults = resolve_defaults(DefaultsInputs::default());
+
+        assert_eq!(defaults.remote_exec_wrapper, None);
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_resolve_defaults_remote_exec_wrapper_prefers_runtime_over_baked() {
+        let defaults = resolve_defaults(DefaultsInputs {
+            remote_exec_wrapper: Some("docker exec -i runtime"),
+            baked_remote_exec_wrapper: Some("docker exec -i baked"),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            defaults.remote_exec_wrapper,
+            Some("docker exec -i runtime".to_string())
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_resolve_defaults_remote_exec_wrapper_falls_back_to_baked_when_runtime_unset() {
+        let defaults = resolve_defaults(DefaultsInputs {
+            baked_remote_exec_wrapper: Some("docker exec -i baked"),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            defaults.remote_exec_wrapper,
+            Some("docker exec -i baked".to_string())
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_resolve_defaults_remote_exec_wrapper_blank_runtime_falls_back_to_baked() {
+        let defaults = resolve_defaults(DefaultsInputs {
+            remote_exec_wrapper: Some("   "),
+            baked_remote_exec_wrapper: Some("docker exec -i baked"),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            defaults.remote_exec_wrapper,
+            Some("docker exec -i baked".to_string())
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_resolve_defaults_remote_exec_wrapper_blank_baked_is_none() {
+        let defaults = resolve_defaults(DefaultsInputs {
+            baked_remote_exec_wrapper: Some("   "),
+            ..Default::default()
+        });
+
+        assert_eq!(defaults.remote_exec_wrapper, None);
+    }
+
     // ── key_needs_passphrase ──────────────────────────────────────────────
     //
     // The detection algorithm itself (encrypted vs. plain vs. malformed key)
@@ -930,6 +1072,54 @@ mod tests {
         assert!(!key_needs_passphrase(path));
     }
 
+    // ── remote_exec_wrapper_from_field (issue #789, connect-time field) ────
+
+    #[::core::prelude::v1::test]
+    fn test_remote_exec_wrapper_from_field_non_empty_returns_some() {
+        assert_eq!(
+            remote_exec_wrapper_from_field("docker exec -i devenv"),
+            Some("docker exec -i devenv".to_string())
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_remote_exec_wrapper_from_field_empty_returns_none() {
+        assert_eq!(remote_exec_wrapper_from_field(""), None);
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_remote_exec_wrapper_from_field_whitespace_returns_none() {
+        assert_eq!(remote_exec_wrapper_from_field("   "), None);
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_remote_exec_wrapper_no_interaction_matches_resolved_default() {
+        // A fresh card prefills the field from `resolve_defaults`'s wrapper
+        // value (`ConnectionScreen::new`); with no edit, reading the field
+        // back at connect (`remote_exec_wrapper_from_field`) must reproduce
+        // exactly what the prefill resolved — the "env/bake dogfooding path
+        // must not regress" requirement, without depending on live env vars.
+        let defaults = resolve_defaults(DefaultsInputs {
+            remote_exec_wrapper: Some("docker exec -i devenv"),
+            ..Default::default()
+        });
+        let field_value = defaults.remote_exec_wrapper.clone().unwrap_or_default();
+
+        assert_eq!(
+            remote_exec_wrapper_from_field(&field_value),
+            defaults.remote_exec_wrapper
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_remote_exec_wrapper_no_interaction_empty_default_stays_none() {
+        let defaults = resolve_defaults(DefaultsInputs::default());
+        let field_value = defaults.remote_exec_wrapper.clone().unwrap_or_default();
+
+        assert_eq!(defaults.remote_exec_wrapper, None);
+        assert_eq!(remote_exec_wrapper_from_field(&field_value), None);
+    }
+
     // ── ConnectRequest (Debug redaction) ──────────────────────────────────
 
     fn sample_request(passphrase: Option<&str>) -> ConnectRequest {
@@ -938,6 +1128,7 @@ mod tests {
             user: "developer".to_string(),
             port: 22,
             key: PathBuf::from("/home/developer/.ssh/id_ed25519"),
+            remote_exec_wrapper: None,
             session_intent: SessionIntent::Fixed("rift".to_string()),
             passphrase: passphrase.map(str::to_string),
         }
@@ -956,6 +1147,16 @@ mod tests {
         let debug = format!("{:?}", sample_request(None));
 
         assert!(debug.contains("passphrase: None"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_connect_request_debug_shows_remote_exec_wrapper_unredacted() {
+        let mut request = sample_request(None);
+        request.remote_exec_wrapper = Some("docker exec -i devenv".to_string());
+
+        let debug = format!("{:?}", request);
+
+        assert!(debug.contains("docker exec -i devenv"));
     }
 
     // ── SessionIntent (entry-point routing, issue #707) ────────────────────
