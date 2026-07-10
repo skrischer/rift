@@ -306,9 +306,6 @@ export RIFT_PROJECT_ROOT := env("RIFT_PROJECT_ROOT", "/home/developer/CascadePro
 #   - set `RIFT_DAEMON_REMOTE_DIR` to an absolute in-container dir when the
 #     image does not guarantee `$HOME` (`docker exec` runs no login shell, so
 #     an unset `$HOME` resolves the default `$HOME/.rift/bin` to `/.rift/bin`).
-#   - only coherent on the daemon terminal path (the default); do not combine
-#     with `RIFT_TERMINAL_LEGACY` — the legacy `tmux -CC` path is unwrapped and
-#     would attach to the host's tmux while the daemon watches the container.
 #   - scope it per-launch like RIFT_SSH_HOST/RIFT_PROJECT_ROOT, never `export`
 #     it in a shell profile, or a second plain-host/WSL instance inherits it
 #     and tries `docker exec` against a container that isn't there.
@@ -370,22 +367,18 @@ _launch-windows exe detach="":
     # RIFT_PROJECT_ROOT carries no `/p`: it is a path on the SSH host (Linux), not
     # a Windows path, so it must cross to the native exe verbatim (only
     # RIFT_DAEMON_BINARY needs WSL->Windows translation for the local read).
-    # RIFT_TERMINAL_LEGACY (the #205 fallback switch) crosses verbatim too — any
-    # non-empty value selects the legacy direct `tmux -CC` path; unset/empty leaves
-    # the daemon terminal as the default.
     # RIFT_LOG_CONSOLE crosses verbatim too — the app's TTY-based sink selection
     # (crates/logging) forces the console sink when set truthy; unset/empty leaves
     # the live TTY check to decide. dev-windows[-watch] pins it (see below): the
     # WSL binfmt interop relay is a pipe, not a TTY, so without the override the
     # dev console would silently divert to the rotated file sink.
-    export WSLENV="RUST_LOG:RIFT_SSH_HOST:RIFT_SSH_USER:RIFT_SSH_PORT:RIFT_SSH_KEY:RIFT_PROJECT_ROOT:RIFT_TERMINAL_LEGACY:RIFT_LOG_CONSOLE:RIFT_DAEMON_BINARY/p"
+    export WSLENV="RUST_LOG:RIFT_SSH_HOST:RIFT_SSH_USER:RIFT_SSH_PORT:RIFT_SSH_KEY:RIFT_PROJECT_ROOT:RIFT_LOG_CONSOLE:RIFT_DAEMON_BINARY/p"
     export RUST_LOG=rift=debug,rift_ssh=debug
     export RIFT_SSH_HOST="{{RIFT_SSH_HOST}}"
     export RIFT_SSH_USER="{{RIFT_SSH_USER}}"
     export RIFT_SSH_PORT="{{RIFT_SSH_PORT}}"
     export RIFT_SSH_KEY="{{windows_ssh_key}}"
     export RIFT_PROJECT_ROOT="{{RIFT_PROJECT_ROOT}}"
-    export RIFT_TERMINAL_LEGACY="${RIFT_TERMINAL_LEGACY:-}"
     export RIFT_LOG_CONSOLE="${RIFT_LOG_CONSOLE:-}"
     export RIFT_DAEMON_BINARY="{{RIFT_DAEMON_BINARY}}"
     if [ -n "{{detach}}" ]; then

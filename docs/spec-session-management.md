@@ -118,9 +118,9 @@ all client-side (no protocol or daemon change).
   on hover; the kill confirm uses the danger token. No emojis.
 - No `.unwrap()` in library code; crate boundaries via `lib.rs`; the order store is
   GPUI-free and unit-testable (the recents.rs precedent).
-- Requires the daemon transport (`TmuxCommand`/`Attach` are protocol messages); on
-  the `RIFT_TERMINAL_LEGACY` escape hatch the surface is inert, as the phase-19
-  switcher already is (the legacy path is slated for removal, #285).
+- Requires the daemon transport (`TmuxCommand`/`Attach` are protocol messages) —
+  the daemon is the sole terminal source (#285), so this is always available
+  once a session is connected.
 
 ## Prior decisions
 
