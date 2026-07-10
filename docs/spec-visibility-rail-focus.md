@@ -45,26 +45,35 @@ focus-dependent action dispatch.
 
 ### In scope
 
-- **Stable workspace focus anchor** (`crates/app/src/workspace.rs`): a dedicated
-  `FocusHandle` owned by `WorkspaceView`, tracked on the root render `div`
-  (`.track_focus(&self.focus_handle)` + a `key_context`) so the node carrying the
-  `on_action` handlers is present in the dispatch tree every frame — even when no
-  panel is rendered/focused. The default startup focus still moves to the
-  Terminal via an explicit focus call (preserving #358), rather than implicitly
-  through the old `focus_handle`-delegates-to-terminal wiring.
+- **Stable workspace focus anchor** (`crates/app/src/workspace.rs` +
+  `crates/app/src/main.rs`): a dedicated `FocusHandle` owned by `WorkspaceView`,
+  tracked on the root render `div` (`.track_focus(&self.focus_handle)` +
+  `.key_context("Workspace")`) so the node carrying the `on_action` handlers is
+  present in the dispatch tree every frame — even when no panel is
+  rendered/focused. Because `WorkspaceView::focus_handle` (`workspace.rs:2269`)
+  stops delegating to the Terminal, the #358 "Terminal focused by default"
+  behaviour — realized in `main.rs::enter_workspace` (~L1516:
+  `workspace.focus_handle(cx).focus(...)`) — MUST be switched to an explicit
+  terminal-focus call there; left unchanged it would silently focus the root
+  anchor and regress #358.
 - **Focus re-homing on hide/solo**: a single helper picks the preferred
   still-visible area and, whenever a visibility/solo change removes the area that
   currently contains focus, moves focus there — used by `toggle_area`,
   `toggle_solo_area`, and `reconcile_visibility`. Preference order **Terminal →
   Explorer+Editor → Diagnostics → Git**, falling back to the workspace root
   anchor when nothing is visible. Focus is only moved when the focused area
-  actually became hidden; an unaffected focus is left untouched.
+  actually became hidden; an unaffected focus is left untouched. Detecting which
+  `Area` currently holds focus **reuses the per-panel `contains_focused` pattern
+  already in `zoom_active_panel`** (`workspace.rs:1889-1905`) so the two
+  focus-detection paths stay consistent.
 - **Rail dispatch decoupling** (`crates/app/src/activity_rail.rs` +
-  `workspace.rs`): the area icons invoke the workspace's toggle path directly
-  (an `Entity<WorkspaceView>` listener / passed callback), not
-  `window.dispatch_action`. The `Toggle*` / `Solo*` `Action`s and their root
-  `on_action` handlers stay in place for the keyboard, command palette, and any
-  agent-driven dispatch.
+  `workspace.rs`) — **architectural hardening, not required for the freeze fix**
+  (re-home + anchor already resolve it; this makes the rail focus-immune by
+  construction): the area icons invoke the workspace's toggle path directly
+  (a `cx.listener` bound to the `Entity<WorkspaceView>` — a weak reference, no
+  retain cycle — not `window.dispatch_action`). The `Toggle*` / `Solo*` `Action`s
+  and their root `on_action` handlers stay in place for the keyboard, command
+  palette, and any agent-driven dispatch.
 
 ### Out of scope
 
@@ -111,10 +120,12 @@ focus-dependent action dispatch.
 ## Prior art
 
 - `docs/prior-art.md` "Workspace visibility rail — prior-art index (Phase 39)"
-  (the dock substrate row): **Zed `crates/workspace/src/dock.rs`** + the Zed
-  Workspace focus model — a workspace-level focus handle with `focus_in` /
-  `focus_out` and per-panel focus lifecycle. Referenced for the **workspace-owned
-  focus anchor + re-home on panel hide** pattern; **study-only** (Zed's
+  (the dock-substrate row): **Zed `crates/workspace/src/dock.rs`** — Dock
+  entities, panel open / zoom lifecycle. The **workspace-owned focus anchor +
+  re-home on panel hide** pattern is extrapolated from the Zed monorepo
+  (`crates/workspace/src/workspace.rs`'s workspace-level focus handle +
+  `focus_in`/`focus_out` + per-panel focus lifecycle) — beyond the letter of the
+  index row, noted here as the spec's own elaboration; **study-only** (Zed's
   Workspace/Project focus is tightly coupled, GPL-3.0), reimplemented minimally
   against rift's own `WorkspaceView`.
 - Extends the focus/dispatch wiring introduced by
@@ -132,6 +143,14 @@ focus-dependent action dispatch.
       visible area for a given visible-set / solo state (Terminal-first; falls
       back down Explorer+Editor → Diagnostics → Git; yields the root-anchor
       fallback when nothing is visible). Pure-logic, directly testable.
+- [ ] The three existing tests that encode the old
+      `focus_handle == session_view.focus_handle` delegation contract are updated
+      to the new anchor semantics, not left red:
+      `test_workspace_focus_delegates_to_the_terminal` (`workspace.rs:3193`) and
+      the command-palette / settings dialog tests (`workspace.rs` ~L4040 /
+      ~L4064). The replacements assert the workspace root anchor is focusable and
+      hosts the root `on_action` handlers, and that startup focus
+      (`main.rs::enter_workspace`) still lands on the Terminal.
 - [ ] Behavioural (dev-channel QA): with the Terminal focused, hide it from the
       rail → every rail icon still toggles its area, and the Terminal re-shows;
       keyboard shortcuts still route.
@@ -178,3 +197,15 @@ focus-dependent action dispatch.
   persistence / grid change; no protocol / daemon change. No genuinely-open
   decisions carried to the acceptance gate (the milestone / roadmap framing of a
   Phase-39 follow-up fix is confirmed there).
+- 2026-07-11: Spec-review refinements folded pre-acceptance (VERDICT was
+  REQUEST_CHANGES; the root-cause diagnosis was CONFIRMED against the pinned gpui
+  rev `4bee412` — `dispatch_path(root_node)` excludes the WorkspaceView div's
+  handler node once the focused panel is unpainted). Folded: (blocking) added
+  `main.rs::enter_workspace` (~L1516) to scope as the #358 startup-focus call
+  site that must switch to an explicit terminal-focus, and named the three
+  existing `focus_handle`-delegation tests (`workspace.rs:3193`, ~L4040, ~L4064)
+  that must be updated to the anchor semantics; (non-blocking) reused
+  `zoom_active_panel`'s `contains_focused` pattern for focused-area detection,
+  named the `key_context` (`"Workspace"`), softened the Zed focus-model prior-art
+  attribution to the spec's own elaboration, and marked the rail decoupling as
+  architectural hardening (not required for the freeze fix).
