@@ -199,8 +199,19 @@ fn describe_clone_error(error: CloneError) -> &'static str {
         CloneError::AuthFailed => "Authentication failed for this repository",
         CloneError::TargetExists => "A folder with that name already exists",
         CloneError::Network => "Could not reach the repository",
+        CloneError::GitUnavailable => "git is not installed on the host",
         CloneError::Other => "Clone failed",
     }
+}
+
+/// True when `name` cannot be a clone target directory name — mirrors the
+/// daemon's own `clone::validate_name` (`docs/spec-clone-repo.md`, issue
+/// #841): empty, `.`, `..`, or containing a path separator. Checked
+/// client-side before sending `CloneRepo` (issue #839) so a doomed request
+/// never round-trips to the daemon and leaves the spinner with no resolved
+/// path to correlate against.
+fn invalid_clone_name(name: &str) -> bool {
+    name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\'])
 }
 
 /// Which surface the root picker's card body renders (issue #829, "Browse ⇄
@@ -295,6 +306,15 @@ pub struct RootPicker {
     /// The last clone failure, rendered inline; cleared by the next
     /// [`Self::start_clone`] call or a successful [`Self::apply_clone_result`].
     clone_error: Option<CloneError>,
+    /// A client-side rejection of the name field, set by [`Self::start_clone`]
+    /// instead of emitting [`RootPickerEvent::Clone`] (issue #839): a name
+    /// containing a path separator, `.`, or `..` would make the daemon's own
+    /// `validate_name` reject the request early and never round-trip a
+    /// resolved path, so the picker catches it before send rather than
+    /// leaving the spinner with nothing to correlate against. Distinct from
+    /// [`Self::clone_error`] (a daemon-reported [`CloneError`]) since this
+    /// never reaches the wire.
+    clone_name_error: Option<&'static str>,
 }
 
 impl RootPicker {
@@ -366,6 +386,7 @@ impl RootPicker {
             clone_name_touched: false,
             cloning: false,
             clone_error: None,
+            clone_name_error: None,
         }
     }
 
@@ -471,7 +492,12 @@ impl RootPicker {
     /// trimmed URL/parent/name via [`RootPickerEvent::Clone`]. A no-op while
     /// a clone is already in flight, or until all three fields hold
     /// non-whitespace text — mirroring [`Self::browse`]'s in-flight guard and
-    /// [`Self::create`]'s blank-field guard.
+    /// [`Self::create`]'s blank-field guard. A `name` [`invalid_clone_name`]
+    /// rejects (a path separator, `.`, or `..`) is caught here rather than
+    /// sent (issue #839): the daemon would reject it too, but only after
+    /// echoing an unresolved path nothing downstream can correlate — this
+    /// picker shows the reason inline instead and never sends the doomed
+    /// request.
     fn start_clone(&mut self, cx: &mut Context<Self>) {
         if self.cloning {
             return;
@@ -482,8 +508,14 @@ impl RootPicker {
         if url.is_empty() || parent.is_empty() || name.is_empty() {
             return;
         }
+        if invalid_clone_name(&name) {
+            self.clone_name_error = Some("Name must not be '.', '..', or contain a path separator");
+            cx.notify();
+            return;
+        }
         self.cloning = true;
         self.clone_error = None;
+        self.clone_name_error = None;
         cx.emit(RootPickerEvent::Clone { url, parent, name });
         cx.notify();
     }
@@ -799,9 +831,14 @@ fn render_clone_body(
     name_input: &Entity<InputState>,
     cloning: bool,
     error: Option<CloneError>,
+    name_error: Option<&'static str>,
     can_clone: bool,
 ) -> impl IntoElement {
-    let error_banner = error.map(|error| render_error_banner(cx, describe_clone_error(error)));
+    // The client-side name rejection (issue #839) takes priority — it is the
+    // more specific, more recent explanation for why nothing was sent.
+    let error_banner = name_error
+        .map(|message| render_error_banner(cx, message))
+        .or_else(|| error.map(|error| render_error_banner(cx, describe_clone_error(error))));
     v_flex()
         .gap(px(12.0))
         .child(render_clone_field(
@@ -922,6 +959,7 @@ impl Render for RootPicker {
                         &name_input,
                         self.cloning,
                         self.clone_error,
+                        self.clone_name_error,
                         can_clone,
                     )
                     .into_any_element()
@@ -1052,6 +1090,7 @@ mod tests {
             describe_clone_error(CloneError::AuthFailed),
             describe_clone_error(CloneError::TargetExists),
             describe_clone_error(CloneError::Network),
+            describe_clone_error(CloneError::GitUnavailable),
             describe_clone_error(CloneError::Other),
         ];
         let unique: std::collections::HashSet<_> = messages.iter().collect();
@@ -1060,6 +1099,18 @@ mod tests {
             messages.len(),
             "every reason reads distinctly"
         );
+    }
+
+    #[test]
+    fn test_invalid_clone_name_rejects_empty_dot_dotdot_and_separators() {
+        for name in ["", ".", "..", "a/b", "a\\b"] {
+            assert!(invalid_clone_name(name), "name {name:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn test_invalid_clone_name_accepts_a_plain_component() {
+        assert!(!invalid_clone_name("repo"));
     }
 
     #[test]
@@ -1469,6 +1520,32 @@ mod tests {
             "a blank parent field never starts a clone"
         );
         cx.update(|cx| assert!(!picker.read(cx).cloning));
+    }
+
+    #[gpui::test]
+    fn test_start_clone_rejects_a_name_with_a_path_separator(cx: &mut TestAppContext) {
+        let (picker, window) = build_picker(cx);
+        set_clone_fields(
+            &picker,
+            &window,
+            cx,
+            "https://github.com/org/repo.git",
+            "/workspace",
+            "a/b",
+        );
+        let events = subscribe_events(&picker, cx);
+
+        cx.update(|cx| picker.update(cx, |picker, cx| picker.start_clone(cx)));
+
+        assert!(
+            events.borrow().is_empty(),
+            "an invalid name is caught before ever sending a request (issue #839)"
+        );
+        cx.update(|cx| {
+            let picker = picker.read(cx);
+            assert!(!picker.cloning);
+            assert!(picker.clone_name_error.is_some());
+        });
     }
 
     #[gpui::test]

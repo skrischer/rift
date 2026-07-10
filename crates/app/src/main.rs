@@ -725,9 +725,9 @@ struct RootPickerScreen {
     picker: Entity<RootPicker>,
     pending_browse: Option<String>,
     /// The `<parent>/<name>` last sent on `ClientMessage::CloneRepo` (issue
-    /// #829), checked against an incoming `CloneResult`'s echoed `path`
-    /// before routing it into `picker` — the clone-channel counterpart of
-    /// `pending_browse`.
+    /// #829), checked against an incoming `CloneResult`'s echoed `path` via
+    /// [`root_picker::browse_reply_matches`] (issue #839) before routing it
+    /// into `picker` — the clone-channel counterpart of `pending_browse`.
     pending_clone: Option<String>,
 }
 
@@ -1465,13 +1465,18 @@ impl Shell {
         }
     }
 
-    /// Route a `CloneResult` (issue #829, `docs/spec-clone-repo.md`) to
+    /// Route a `CloneResult` (issue #829/#839, `docs/spec-clone-repo.md`) to
     /// whichever picker is currently showing, mirroring
     /// [`Self::apply_dir_entries_reply`]'s dispatch and correlation-guard
-    /// shape — `pending_clone` in place of `pending_browse`, an exact-match
-    /// check rather than [`root_picker::browse_reply_matches`] since every
-    /// `CloneRepo` echoes the client-sent `<parent>/<name>` verbatim (no
-    /// seed-request case, unlike browse's `""`/`~` start level).
+    /// shape — `pending_clone` in place of `pending_browse`, checked with
+    /// [`root_picker::browse_reply_matches`]'s **same** `~`-tolerant
+    /// comparison (issue #839's fix): the daemon echoes the RESOLVED
+    /// `<parent>/<name>` (`~` expanded to the remote `$HOME`), which never
+    /// exact-matches a `~`-prefixed `pending_clone` sent for a `~`-parent
+    /// clone, and it also echoes the resolved path (never empty) on an
+    /// early-rejected clone now (`crates/daemon/src/clone.rs`), so this
+    /// tolerant check clears `pending_clone` and surfaces the error instead
+    /// of leaving the spinner stuck forever.
     fn apply_clone_result(
         &mut self,
         path: String,
@@ -1480,7 +1485,7 @@ impl Shell {
     ) {
         match &mut self.screen {
             ScreenState::RootPicker(screen) => {
-                if screen.pending_clone.as_deref() != Some(path.as_str()) {
+                if !root_picker::browse_reply_matches(screen.pending_clone.as_deref(), &path) {
                     return;
                 }
                 screen.pending_clone = None;
