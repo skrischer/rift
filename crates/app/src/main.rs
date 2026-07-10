@@ -143,16 +143,19 @@ struct EditorChannels {
     /// (`docs/spec-explorer-file-ops.md`): `WorktreeModel` is never mutated
     /// from a file op — the push-only `UpdateWorktree` is the single writer.
     file_op_result_tx: flume::Sender<rift_protocol::DaemonMessage>,
-    /// Root-picker browse requests (issue #769, `docs/spec-session-root-picker.md`):
-    /// every `ClientMessage::QueryDirEntries` either root picker (pre-cockpit
-    /// or in-cockpit) issues, forwarded onto the protocol verbatim by
+    /// Root-picker browse/clone requests (issue #769,
+    /// `docs/spec-session-root-picker.md`; clone added by issue #829,
+    /// `docs/spec-clone-repo.md`): every `ClientMessage::QueryDirEntries` /
+    /// `ClientMessage::CloneRepo` either root picker (pre-cockpit or
+    /// in-cockpit) issues, forwarded onto the protocol verbatim by
     /// `spawn_dir_browse_bridge`. Unlike the other reverse-path channels
     /// above, this bridge is spawned early in `run_daemon_terminal` — before
     /// any session is attached — since the pre-cockpit picker needs it.
     dir_browse_rx: flume::Receiver<rift_protocol::ClientMessage>,
-    /// `DirEntriesReply` replies, routed by `consume_daemon_messages` to
-    /// whichever picker's owner (`Shell` for both the pre-cockpit and, via
-    /// `WorkspaceView::apply_dir_entries_reply`, the in-cockpit picker) is
+    /// `DirEntriesReply` / `CloneResult` replies, routed by
+    /// `consume_daemon_messages` to whichever picker's owner (`Shell` for
+    /// both the pre-cockpit and, via `WorkspaceView::apply_dir_entries_reply`
+    /// / `WorkspaceView::apply_clone_result`, the in-cockpit picker) is
     /// currently showing.
     dir_browse_reply_tx: flume::Sender<rift_protocol::DaemonMessage>,
 }
@@ -721,6 +724,11 @@ struct RootPickerScreen {
     ssh_label: SharedString,
     picker: Entity<RootPicker>,
     pending_browse: Option<String>,
+    /// The `<parent>/<name>` last sent on `ClientMessage::CloneRepo` (issue
+    /// #829), checked against an incoming `CloneResult`'s echoed `path`
+    /// before routing it into `picker` — the clone-channel counterpart of
+    /// `pending_browse`.
+    pending_clone: Option<String>,
 }
 
 /// [`Shell::show_session_picker`]'s arguments, bundled to stay under clippy's
@@ -1118,31 +1126,37 @@ impl Shell {
         })
         .detach();
 
-        // Directory-browse reply routing (issue #769,
-        // `docs/spec-session-root-picker.md`): every `DirEntriesReply` is
+        // Directory-browse / clone reply routing (issue #769,
+        // `docs/spec-session-root-picker.md`; clone added by issue #829,
+        // `docs/spec-clone-repo.md`): every `DirEntriesReply`/`CloneResult` is
         // dispatched to whichever picker currently owns the outstanding
         // request — the pre-cockpit root picker (`ScreenState::RootPicker`)
         // or the in-cockpit one hosted inside `WorkspaceView` — via
-        // `Shell::apply_dir_entries_reply`, rather than each picker draining
-        // its own receiver (only one `flume::Receiver` exists; it cannot be
-        // split across two independent consumers). Engine-attempt-scoped
-        // like the watcher above, for the same reason.
+        // `Shell::apply_dir_entries_reply`/`Shell::apply_clone_result`, rather
+        // than each picker draining its own receiver (only one
+        // `flume::Receiver` exists; it cannot be split across two independent
+        // consumers). Engine-attempt-scoped like the watcher above, for the
+        // same reason.
         cx.spawn_in(window, async move |this, cx| loop {
             let Ok(msg) = dir_browse_reply_rx.recv_async().await else {
                 break;
             };
-            let rift_protocol::DaemonMessage::DirEntriesReply {
-                path,
-                parent,
-                entries,
-                error,
-            } = msg
-            else {
-                continue;
+            let result = match msg {
+                rift_protocol::DaemonMessage::DirEntriesReply {
+                    path,
+                    parent,
+                    entries,
+                    error,
+                } => this.update_in(cx, |shell, window, cx| {
+                    shell.apply_dir_entries_reply(path, parent, entries, error, window, cx);
+                }),
+                rift_protocol::DaemonMessage::CloneResult { path, error } => {
+                    this.update_in(cx, |shell, _window, cx| {
+                        shell.apply_clone_result(path, error, cx);
+                    })
+                }
+                _ => continue,
             };
-            let result = this.update_in(cx, |shell, window, cx| {
-                shell.apply_dir_entries_reply(path, parent, entries, error, window, cx);
-            });
             if result.is_err() {
                 break;
             }
@@ -1335,6 +1349,7 @@ impl Shell {
             ssh_label,
             picker: picker.clone(),
             pending_browse: Some(start.clone()),
+            pending_clone: None,
         });
 
         cx.subscribe_in(
@@ -1347,6 +1362,17 @@ impl Shell {
                     });
                     if let ScreenState::RootPicker(screen) = &mut this.screen {
                         screen.pending_browse = Some(path.clone());
+                    }
+                }
+                RootPickerEvent::Clone { url, parent, name } => {
+                    let target = root_picker::join_child(parent, name);
+                    let _ = dir_browse_tx.try_send(rift_protocol::ClientMessage::CloneRepo {
+                        url: url.clone(),
+                        parent: parent.clone(),
+                        name: name.clone(),
+                    });
+                    if let ScreenState::RootPicker(screen) = &mut this.screen {
+                        screen.pending_clone = Some(target);
                     }
                 }
                 RootPickerEvent::Picked { root, name } => {
@@ -1415,6 +1441,40 @@ impl Shell {
                 let workspace = workspace.clone();
                 workspace.update(cx, |workspace, cx| {
                     workspace.apply_dir_entries_reply(path, parent, entries, error, window, cx);
+                });
+            }
+            ScreenState::Connection(_) | ScreenState::Picker(_) => {}
+        }
+    }
+
+    /// Route a `CloneResult` (issue #829, `docs/spec-clone-repo.md`) to
+    /// whichever picker is currently showing, mirroring
+    /// [`Self::apply_dir_entries_reply`]'s dispatch and correlation-guard
+    /// shape — `pending_clone` in place of `pending_browse`, an exact-match
+    /// check rather than [`root_picker::browse_reply_matches`] since every
+    /// `CloneRepo` echoes the client-sent `<parent>/<name>` verbatim (no
+    /// seed-request case, unlike browse's `""`/`~` start level).
+    fn apply_clone_result(
+        &mut self,
+        path: String,
+        error: Option<rift_protocol::CloneError>,
+        cx: &mut Context<Self>,
+    ) {
+        match &mut self.screen {
+            ScreenState::RootPicker(screen) => {
+                if screen.pending_clone.as_deref() != Some(path.as_str()) {
+                    return;
+                }
+                screen.pending_clone = None;
+                let picker = screen.picker.clone();
+                picker.update(cx, |picker, cx| {
+                    picker.apply_clone_result(path, error, cx);
+                });
+            }
+            ScreenState::Workspace(workspace) => {
+                let workspace = workspace.clone();
+                workspace.update(cx, |workspace, cx| {
+                    workspace.apply_clone_result(path, error, cx);
                 });
             }
             ScreenState::Connection(_) | ScreenState::Picker(_) => {}
@@ -2722,14 +2782,17 @@ async fn consume_daemon_messages(
             msg @ DaemonMessage::FileOpResult { .. } => {
                 let _ = editor.file_op_result_tx.send(msg);
             }
-            // --- directory-browse reply -> whichever root picker is
-            // currently showing (issue #769, `docs/spec-session-root-picker.md`) ---
+            // --- directory-browse / clone reply -> whichever root picker is
+            // currently showing (issue #769, `docs/spec-session-root-picker.md`;
+            // clone added by issue #829, `docs/spec-clone-repo.md`) ---
             // Forwarded unconditionally in every mode (like `FileDiff`
             // above), including during the pre-cockpit picker phase's own
             // `consume_daemon_messages` calls (`await_session_pick`) — the
-            // pre-cockpit root picker needs its browse replies before any
-            // session is attached.
-            msg @ DaemonMessage::DirEntriesReply { .. } => {
+            // pre-cockpit root picker needs its browse/clone replies before
+            // any session is attached. Both share `dir_browse_reply_tx`
+            // (the clone channel reuses the browse bridge/reply transport,
+            // `docs/spec-clone-repo.md`'s "message shape follows browse").
+            msg @ (DaemonMessage::DirEntriesReply { .. } | DaemonMessage::CloneResult { .. }) => {
                 let _ = editor.dir_browse_reply_tx.send(msg);
             }
             other => debug!(?other, "daemon message without a consumer yet"),
@@ -2832,16 +2895,19 @@ fn spawn_git_op_bridge(
     });
 }
 
-/// Forward every root picker's browse requests onto the protocol as
-/// [`rift_protocol::ClientMessage::QueryDirEntries`] (issue #769,
-/// `docs/spec-session-root-picker.md`): both the pre-cockpit and the
-/// in-cockpit root picker share this one bridge (their owners hold clones of
-/// the same sender), so the single transport is also a single reverse-path
-/// bridge. Spawned early in `run_daemon_terminal` — before any session is
-/// attached, unlike every other reverse-path bridge — since the pre-cockpit
-/// picker needs it. The reply (`DaemonMessage::DirEntriesReply`) returns
-/// through `consume_daemon_messages` on `editor.dir_browse_reply_tx`. Ends
-/// when the render-side channel closes.
+/// Forward every root picker's browse and clone requests onto the protocol as
+/// [`rift_protocol::ClientMessage::QueryDirEntries`] /
+/// [`rift_protocol::ClientMessage::CloneRepo`] (issue #769,
+/// `docs/spec-session-root-picker.md`; clone added by issue #829,
+/// `docs/spec-clone-repo.md`): both the pre-cockpit and the in-cockpit root
+/// picker share this one bridge (their owners hold clones of the same
+/// sender), so the single transport is also a single reverse-path bridge —
+/// generic over `ClientMessage`, so no clone-specific branch is needed here.
+/// Spawned early in `run_daemon_terminal` — before any session is attached,
+/// unlike every other reverse-path bridge — since the pre-cockpit picker
+/// needs it. The reply (`DaemonMessage::DirEntriesReply` /
+/// `DaemonMessage::CloneResult`) returns through `consume_daemon_messages` on
+/// `editor.dir_browse_reply_tx`. Ends when the render-side channel closes.
 fn spawn_dir_browse_bridge(
     client_rx: DaemonClientWatch,
     dir_browse_rx: flume::Receiver<rift_protocol::ClientMessage>,
