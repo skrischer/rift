@@ -1650,13 +1650,14 @@ fn worktree_root_switched(previous: Option<&str>, new: Option<&str>) -> bool {
 /// second time to do it.
 fn apply_worktree_message(tree: &mut FileTree, msg: DaemonMessage) {
     let model = tree.model_mut();
+    let mut snapshot_completed = false;
     let added_paths = match msg {
         DaemonMessage::WorktreeSnapshot {
             root,
             entries,
             final_chunk,
         } => {
-            model.apply_snapshot_chunk(root, entries, final_chunk);
+            snapshot_completed = model.apply_snapshot_chunk(root, entries, final_chunk);
             None
         }
         DaemonMessage::UpdateWorktree {
@@ -1691,6 +1692,13 @@ fn apply_worktree_message(tree: &mut FileTree, msg: DaemonMessage) {
         }
         _ => None,
     };
+    // Default the explorer to collapsed on the very first completed
+    // snapshot (#795, `docs/spec-dogfooding-fixes.md`); a no-op on every
+    // later one, so a reattach or project switch never re-collapses a
+    // directory the user has since expanded.
+    if snapshot_completed {
+        tree.seed_collapsed_on_first_snapshot();
+    }
     if let Some(added_paths) = added_paths {
         tree.apply_pending_reveal(&added_paths);
     }
