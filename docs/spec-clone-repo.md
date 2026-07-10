@@ -265,3 +265,21 @@ under the milestone. This spec owns the design; the issues own progress.
   sparring aid, NOT the durable design; the Frame C clone-mode is authored in
   implementation / visual-QA). Human prerequisites: none to deliver. Status
   DRAFT → READY.
+- 2026-07-10 (issue #829, `crates/app`): the Frame C clone mode implemented.
+  The `Browse ⇄ Clone` toggle reuses `diff_view`'s `ButtonGroup` two-tab
+  pattern rather than a bespoke widget. `RootPicker` gains a `PickerMode`
+  switch, clone-mode URL/parent/name `InputState`s (parent defaults to and
+  is reseeded with the current browse level; name defaults to
+  `repo_basename_from_url` until the user edits it directly), and
+  `start_clone`/`apply_clone_result` mirroring the browse path's
+  `browse`/`apply_dir_entries_reply` shape. `apply_clone_result`'s success
+  case emits the same `RootPickerEvent::Picked { root, name }` the
+  browse-and-pick Create emits, so both `Shell` (pre-cockpit) and
+  `WorkspaceView` (in-cockpit) drive the existing create-with-root
+  `Attach { root: Some(...) }` path with no clone-specific branch. The
+  `CloneRepo`/`CloneResult` reply is correlated with an exact-match
+  `pending_clone: Option<String>` against the daemon-echoed `<parent>/<name>`
+  (no seed-request ambiguity like browse's `""`/`~` start level, so no
+  `browse_reply_matches`-style fuzzy match is needed). Both owners share the
+  existing `dir_browse_rx`/`dir_browse_reply_tx` bridge — no new channel
+  plumbing, since the clone channel reuses browse's transport by design.
