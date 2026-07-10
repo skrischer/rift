@@ -23,7 +23,8 @@
 use gpui::{
     div, px, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
     FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement as _, Render, SharedString, Styled as _, Subscription, Window,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -36,6 +37,11 @@ use rift_protocol::{DirBrowseError, DirEntry};
 /// rather than exported from either sibling module, mirroring their own
 /// precedent for small duplicated visual primitives.
 const CARD_WIDTH: f32 = 470.0;
+
+/// The max height of the rows region before it scrolls internally (issue
+/// #802, mirroring #792's `session_picker::ROWS_MAX_HEIGHT`): an unbounded
+/// directory list runs the card off-screen with many entries.
+const ROWS_MAX_HEIGHT: f32 = 360.0;
 
 /// Whether an incoming `DirEntriesReply`'s resolved `path` answers the
 /// currently outstanding `QueryDirEntries` request (issue #769: the owner's
@@ -543,7 +549,17 @@ impl Render for RootPicker {
         let body = if rows.is_empty() {
             render_empty_state(cx, loading).into_any_element()
         } else {
-            v_flex().gap(px(2.0)).children(rows).into_any_element()
+            // Bounded height + internal scroll (issue #802, mirroring
+            // #792): a short list still renders compact since `max_h` only
+            // caps growth, and `overflow_y_scroll` only kicks in once the
+            // rows exceed it.
+            v_flex()
+                .id("root-picker-rows")
+                .gap(px(2.0))
+                .max_h(px(ROWS_MAX_HEIGHT))
+                .overflow_y_scroll()
+                .children(rows)
+                .into_any_element()
         };
 
         let error_banner = error.map(|error| render_error_banner(cx, error));
