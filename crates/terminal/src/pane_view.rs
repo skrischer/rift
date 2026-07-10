@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -276,6 +277,18 @@ pub struct PaneView {
     /// Scrollback search: query input + match state against the live `Term`
     /// (`docs/spec-v1-hardening.md`). `None` when the search bar is closed.
     search: Option<SearchPrompt>,
+    /// IME preedit (composing) text from [`EntityInputHandler::
+    /// replace_and_mark_text_in_range`], tracked locally only. The pane has no
+    /// addressable text buffer to preview into — its content is the PTY's own
+    /// screen, not client-side text — so composition stays invisible until
+    /// [`EntityInputHandler::replace_text_in_range`] commits it
+    /// (`docs/spec-dogfooding-fixes.md`, #501; mirrors Zed's terminal
+    /// `ImeState`).
+    ime_marked_text: Option<String>,
+    /// Latest known cursor grid cell (col, row), refreshed every render.
+    /// Positions the platform IME candidate window via
+    /// [`EntityInputHandler::bounds_for_range`].
+    cursor_cell: (usize, usize),
 }
 
 impl PaneView {
@@ -433,6 +446,8 @@ impl PaneView {
             prefix_engine: PrefixEngine::new(),
             activity: ActivityTracker::default(),
             search: None,
+            ime_marked_text: None,
+            cursor_cell: (0, 0),
         }
     }
 
@@ -1180,6 +1195,122 @@ impl Focusable for PaneView {
     }
 }
 
+/// Routes committed/composed text (IME, dead-key composition) into the same
+/// `send_input` byte-forwarding path `on_key_down` already uses — agnostic to
+/// what produced the text (`docs/constitution.md`: no agent detection, bytes
+/// only). Registered each frame via [`Window::handle_input`] in `render`'s
+/// bounds-observer canvas, gated on `self.focus_handle` so it only takes
+/// effect while the pane itself (not the search input) is focused.
+///
+/// The pane has no addressable text buffer, unlike a normal text field: its
+/// visible content is whatever the PTY streamed back, not client-side state.
+/// So `text_for_range`/`character_index_for_point` have nothing to answer,
+/// and preedit (marked) text is tracked only in `ime_marked_text` — never
+/// rendered into the grid and never sent to the PTY — until it resolves to a
+/// final commit. This mirrors Zed's own terminal `ImeState`/`commit_text`.
+impl EntityInputHandler for PaneView {
+    fn text_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        _adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: 0..0,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.ime_marked_text
+            .as_ref()
+            .map(|text| 0..text.encode_utf16().count())
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.ime_marked_text.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The IME's final commit for this composition (or a plain, non-IME
+    /// `insertText`). Any pending preedit is dropped without ever having
+    /// reached the PTY; only this resolved text is forwarded, as bytes,
+    /// through the same seam `on_key_down` uses.
+    fn replace_text_in_range(
+        &mut self,
+        _range_utf16: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ime_marked_text = None;
+        if !text.is_empty() {
+            self.send_input(text.as_bytes().to_vec());
+        }
+        cx.notify();
+    }
+
+    /// An in-progress IME composition step (e.g. the first half of a dead-key
+    /// sequence, or a CJK candidate being typed). Tracked locally only —
+    /// never forwarded to the PTY — since sending it now and again at commit
+    /// would double-insert it; the pane also has no preedit overlay to render
+    /// it into.
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range_utf16: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ime_marked_text = if new_text.is_empty() {
+            None
+        } else {
+            Some(new_text.to_string())
+        };
+        cx.notify();
+    }
+
+    /// Positions the platform IME candidate window at the terminal cursor
+    /// cell, the closest analog this grid has to a caret.
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let (col, row) = self.cursor_cell;
+        let origin =
+            element_bounds.origin + point(self.cell_size.width * col, self.cell_size.height * row);
+        Some(Bounds::new(origin, self.cell_size))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
 pub fn measure_cell_size(window: &mut Window, font_size: Pixels) -> Size<Pixels> {
     let text_system = window.text_system();
     let font = Font {
@@ -1403,6 +1534,12 @@ impl Render for PaneView {
         let cursor_point = term.grid().cursor.point;
         let cursor_row = cursor_point.line.0 as usize;
         let cursor_col = cursor_point.column.0;
+        // Refreshed every render so `EntityInputHandler::bounds_for_range`
+        // always positions the platform IME candidate window at the current
+        // cursor cell, not a stale one.
+        if cursor_row < new_size.rows {
+            self.cursor_cell = (cursor_col.min(new_size.cols.saturating_sub(1)), cursor_row);
+        }
         let cursor_style = term.cursor_style();
         let cursor_shape = if mode.contains(TermMode::SHOW_CURSOR) {
             cursor_style.shape
@@ -1519,13 +1656,24 @@ impl Render for PaneView {
         };
 
         let entity = cx.entity().clone();
+        let input_entity = cx.entity().clone();
+        let input_focus_handle = self.focus_handle.clone();
         let bounds_observer = canvas(
             move |bounds: Bounds<Pixels>, _window: &mut Window, cx: &mut App| {
                 entity.update(cx, |view: &mut Self, _cx| {
                     view.content_origin = bounds.origin;
                 });
             },
-            |_, _, _, _| {},
+            move |bounds: Bounds<Pixels>, _, window: &mut Window, cx: &mut App| {
+                // `handle_input` only actually registers when
+                // `input_focus_handle` is focused, so this is a no-op while
+                // e.g. the search bar's own input holds focus instead.
+                window.handle_input(
+                    &input_focus_handle,
+                    ElementInputHandler::new(bounds, input_entity),
+                    cx,
+                );
+            },
         )
         .absolute()
         .size_full();
@@ -1622,7 +1770,7 @@ impl Render for PaneView {
                     *term.mode()
                 };
 
-                if let Some(bytes) = keyboard::encode_keystroke(ks, mode) {
+                if let Some(bytes) = keyboard::encode_keystroke_for_key_down(ks, mode) {
                     {
                         let mut term = this.terminal.lock().expect("term lock poisoned");
                         if term.grid().display_offset() > 0 {
@@ -2200,5 +2348,251 @@ mod tests {
 
         tracker.set_window_active(false);
         assert_eq!(tracker.state(false, false), PaneActivity::Free);
+    }
+}
+
+/// [`EntityInputHandler`] adoption tests (#501). Kept out of `mod tests`
+/// deliberately: that module does `use super::*`, which pulls in this file's
+/// top-level `use gpui::*` and shadows `#[test]` with `gpui::test`, so
+/// `#[gpui::test]`'s own generated `#[test]` recurses unboundedly. Explicit,
+/// non-glob imports here sidestep that (mirrors `session_view.rs`'s test
+/// module, the crate's existing convention for `#[gpui::test]`).
+#[cfg(test)]
+mod ime_input_handler_tests {
+    use std::sync::Arc;
+
+    use gpui::{AnyWindowHandle, AppContext as _, Entity, EntityInputHandler, TestAppContext};
+
+    use super::{KeyTable, PaneInput, PaneView, PrefixOptions};
+    use crate::keyboard;
+
+    /// A [`PaneView`] built inside an open test window — `EntityInputHandler`
+    /// methods take a live `&mut Window` argument even though these tests
+    /// call them directly rather than through a real platform IME event —
+    /// alongside the receiving end of the PTY-forward channel.
+    fn windowed_pane_and_input_rx(
+        cx: &mut TestAppContext,
+    ) -> (
+        AnyWindowHandle,
+        Entity<PaneView>,
+        flume::Receiver<PaneInput>,
+    ) {
+        let (_pty_tx, pty_rx) = flume::unbounded();
+        let (input_tx, input_rx) = flume::unbounded();
+        let (size_changed_tx, _size_changed_rx) = flume::unbounded();
+        let (capture_request_tx, _capture_request_rx) = flume::unbounded();
+        let (font_zoom_tx, _font_zoom_rx) = flume::unbounded();
+        let (tmux_command_tx, _tmux_command_rx) = flume::unbounded();
+
+        let mut built = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |_window, cx| {
+                let pane = cx.new(|cx| {
+                    PaneView::new(
+                        cx,
+                        pty_rx,
+                        input_tx,
+                        size_changed_tx,
+                        capture_request_tx,
+                        font_zoom_tx,
+                        tmux_command_tx,
+                        Arc::new(KeyTable::default()),
+                        PrefixOptions::default(),
+                    )
+                });
+                built = Some(pane.clone());
+                pane
+            })
+            .unwrap()
+        });
+        let pane = built.expect("pane constructed inside the window callback");
+        (window.into(), pane, input_rx)
+    }
+
+    /// The core adoption behavior for #501: an IME/composed-text commit
+    /// reaches the pane's PTY-forward path (`send_input`) as the exact
+    /// committed bytes, the same seam `on_key_down` already uses.
+    #[gpui::test]
+    fn test_replace_text_in_range_committed_text_forwards_bytes_to_pty(cx: &mut TestAppContext) {
+        let (window, pane, input_rx) = windowed_pane_and_input_rx(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |view, cx| {
+                view.replace_text_in_range(None, "\u{e9}", window, cx);
+            });
+        })
+        .unwrap();
+
+        let sent = input_rx
+            .try_recv()
+            .expect("committed text forwarded to the PTY");
+        assert_eq!(sent.bytes, "\u{e9}".as_bytes());
+    }
+
+    /// Regression for PR #785's review (B1): on Windows, `WM_KEYDOWN` and
+    /// `WM_CHAR` both fire, unconditionally, for every character-producing
+    /// key — `on_key_down` and the input handler are two independent
+    /// delivery channels for the exact same keystroke there. This drives
+    /// both, the way they'd genuinely both fire for one Windows keypress,
+    /// and asserts the PTY receives the character exactly once.
+    ///
+    /// This does not use `TestAppContext::simulate_input`: that helper's own
+    /// `Window::dispatch_keystroke` fallback unconditionally forwards
+    /// `key_char` into the input handler whenever `on_key_down` does not
+    /// call `stop_propagation` (true here, on every platform) — a test-only
+    /// convenience bridge that does not model any real platform's actual
+    /// event delivery, so it would not exercise this regression correctly.
+    /// Driving the two real production entry points directly
+    /// (`encode_keystroke_for_key_down`, `replace_text_in_range`) does.
+    #[gpui::test]
+    fn test_windows_key_down_and_input_handler_send_printable_char_exactly_once(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, pane, input_rx) = windowed_pane_and_input_rx(cx);
+        let keystroke = gpui::Keystroke {
+            modifiers: gpui::Modifiers::none(),
+            key: "a".into(),
+            key_char: Some("a".into()),
+        };
+
+        // What `on_key_down` calls on Windows: excludes plain printables, so
+        // it contributes nothing here (the WM_CHAR-equivalent below is the
+        // sole sender).
+        assert_eq!(
+            keyboard::encode_control_keystroke(
+                &keystroke,
+                alacritty_terminal::term::TermMode::empty()
+            ),
+            None,
+            "on_key_down must not also forward a plain printable character"
+        );
+
+        // The WM_CHAR-equivalent: the platform's own text-commit channel.
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |view, cx| {
+                view.replace_text_in_range(None, "a", window, cx);
+            });
+        })
+        .unwrap();
+
+        let sent = input_rx.try_recv().expect("the character reaches the PTY");
+        assert_eq!(sent.bytes, b"a");
+        assert!(
+            input_rx.try_recv().is_err(),
+            "exactly one send for the one keypress, not two"
+        );
+    }
+
+    /// Control/nav keys are unaffected by the #501/#785 split: they still
+    /// encode via the same function `on_key_down` uses on every platform
+    /// (`WM_CHAR` never fires for them on Windows, so there is no second
+    /// channel to deduplicate against).
+    #[test]
+    fn test_windows_key_down_control_and_nav_keys_still_encode() {
+        let ctrl_c = gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                control: true,
+                ..gpui::Modifiers::none()
+            },
+            key: "c".into(),
+            key_char: None,
+        };
+        assert_eq!(
+            keyboard::encode_control_keystroke(
+                &ctrl_c,
+                alacritty_terminal::term::TermMode::empty()
+            ),
+            Some(vec![0x03])
+        );
+
+        let up_arrow = gpui::Keystroke {
+            modifiers: gpui::Modifiers::none(),
+            key: "up".into(),
+            key_char: None,
+        };
+        assert_eq!(
+            keyboard::encode_control_keystroke(
+                &up_arrow,
+                alacritty_terminal::term::TermMode::empty()
+            ),
+            Some(b"\x1b[A".to_vec())
+        );
+    }
+
+    /// An in-progress composition step (e.g. a dead key waiting for its base
+    /// character) is tracked locally, never forwarded — sending it now and
+    /// again at commit would double-insert it, and the pane has no preedit
+    /// overlay to render it into.
+    #[gpui::test]
+    fn test_replace_and_mark_text_in_range_preedit_never_reaches_pty(cx: &mut TestAppContext) {
+        let (window, pane, input_rx) = windowed_pane_and_input_rx(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |view, cx| {
+                view.replace_and_mark_text_in_range(None, "\u{b4}", None, window, cx);
+                assert_eq!(
+                    view.marked_text_range(window, cx),
+                    Some(0..1),
+                    "preedit tracked locally"
+                );
+            });
+        })
+        .unwrap();
+
+        assert!(
+            input_rx.try_recv().is_err(),
+            "an in-progress composition step must never leak to the PTY"
+        );
+    }
+
+    /// A dead-key sequence end to end: the preedit step sends nothing, and
+    /// the resolving commit sends exactly the final composed character —
+    /// never the preedit text, never twice (#501's acceptance criterion).
+    #[gpui::test]
+    fn test_replace_text_in_range_after_mark_clears_preedit_and_sends_final_text(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, pane, input_rx) = windowed_pane_and_input_rx(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |view, cx| {
+                view.replace_and_mark_text_in_range(None, "\u{b4}", None, window, cx);
+                view.replace_text_in_range(None, "\u{e9}", window, cx);
+                assert_eq!(
+                    view.marked_text_range(window, cx),
+                    None,
+                    "commit clears the preedit"
+                );
+            });
+        })
+        .unwrap();
+
+        let sent = input_rx
+            .try_recv()
+            .expect("final commit forwarded, not the preedit step");
+        assert_eq!(sent.bytes, "\u{e9}".as_bytes());
+        assert!(
+            input_rx.try_recv().is_err(),
+            "exactly one send for the whole composition"
+        );
+    }
+
+    /// `unmark_text` (composition cancelled, e.g. focus lost mid-sequence)
+    /// clears the tracked preedit without ever sending anything to the PTY.
+    #[gpui::test]
+    fn test_unmark_text_clears_preedit_without_sending(cx: &mut TestAppContext) {
+        let (window, pane, input_rx) = windowed_pane_and_input_rx(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |view, cx| {
+                view.replace_and_mark_text_in_range(None, "\u{b4}", None, window, cx);
+                view.unmark_text(window, cx);
+                assert_eq!(view.marked_text_range(window, cx), None);
+            });
+        })
+        .unwrap();
+
+        assert!(input_rx.try_recv().is_err(), "cancelling sends nothing");
     }
 }
