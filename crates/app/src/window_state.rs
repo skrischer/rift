@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use gpui_component::ThemeMode;
 use serde::{Deserialize, Serialize};
 
+use crate::workspace::Area;
+
 /// Schema version of the on-disk file. Bumped only if a future change breaks
 /// the additive-fields-with-defaults contract ("Forward-compatible schema" in
 /// the spec) — v1 needs no migration logic, only tolerant defaults.
@@ -128,6 +130,67 @@ pub struct WindowState {
     /// create records the picked root here via [`record_recent_root`] (the
     /// call site is issue #769 — this store only owns the persistence).
     pub recent_roots: Vec<String>,
+    /// Which workspace areas are visible right now
+    /// (`docs/spec-workspace-visibility-rail.md`, issue #822), mirroring
+    /// `recent_roots`'s additive shape: a field missing from the on-disk
+    /// JSON falls back to [`default_visible_areas`] — every area visible —
+    /// never the empty `Vec::default()`, which would restore to a blank
+    /// workspace. A present entry naming an area this build does not
+    /// recognize (an older/future schema) is dropped rather than failing
+    /// the whole parse, via [`deserialize_tolerant_areas`] — see "State
+    /// drift on area set changes" in the spec's Risks.
+    #[serde(
+        default = "default_visible_areas",
+        deserialize_with = "deserialize_tolerant_areas"
+    )]
+    pub visible_areas: Vec<Area>,
+    /// The soloed area, if any (the rail's zoom-as-solo interaction, issue
+    /// #820 wires the setter that ever sets this away from `None`) — `None`
+    /// means no area is soloed, the field's default. Same drop-not-fail
+    /// tolerance as `visible_areas` for an unrecognized value, via
+    /// [`deserialize_tolerant_solo_area`].
+    #[serde(default, deserialize_with = "deserialize_tolerant_solo_area")]
+    pub solo_area: Option<Area>,
+}
+
+/// [`WindowState::visible_areas`]'s field-level default (issue #822): every
+/// area visible, the fallback for a state file predating this field —
+/// deliberately not `Vec::default()`, which is empty and would restore to a
+/// blank workspace. Reuses [`Area::ALL`] (the rail's own left-to-right
+/// order) rather than a second hardcoded list.
+fn default_visible_areas() -> Vec<Area> {
+    Area::ALL.to_vec()
+}
+
+/// Deserialize a present `visible_areas` array tolerantly (issue #822,
+/// spec risk "State drift on area set changes"): each element is parsed as
+/// an [`Area`] independently, and one that fails to match a known variant
+/// (a persisted name a future/older build removed or renamed) is dropped
+/// rather than failing the whole field. Plain `Vec<Area>` deserialization
+/// would instead fail the entire array on one bad element, which — since
+/// container-level `#[serde(default)]` only fills *missing* fields, not a
+/// *present*-but-invalid one — would propagate up and reset the whole
+/// [`WindowState`] to default, losing bounds/theme/recents along with it.
+fn deserialize_tolerant_areas<'de, D>(deserializer: D) -> Result<Vec<Area>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<Area>(value).ok())
+        .collect())
+}
+
+/// Same tolerance as [`deserialize_tolerant_areas`] for the single optional
+/// `solo_area` slot: a present-but-unrecognized value degrades to `None`
+/// (no solo) instead of failing the parse.
+fn deserialize_tolerant_solo_area<'de, D>(deserializer: D) -> Result<Option<Area>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| serde_json::from_value::<Area>(value).ok()))
 }
 
 /// Recent roots beyond this count are dropped (oldest first) on every
@@ -151,6 +214,8 @@ impl Default for WindowState {
             ui_font_family: String::new(),
             mono_font_family: String::new(),
             recent_roots: Vec::new(),
+            visible_areas: default_visible_areas(),
+            solo_area: None,
         }
     }
 }
@@ -206,6 +271,22 @@ pub fn save_ui_font_family(path: &Path, font_family: &str) -> Result<(), StoreEr
 pub fn save_mono_font_family(path: &Path, font_family: &str) -> Result<(), StoreError> {
     let mut state = load(path);
     state.mono_font_family = font_family.to_string();
+    save(path, &state)
+}
+
+/// Persist the workspace visible-area set + solo target into the store at
+/// `path`: a read-modify-write that updates only `visible_areas`/
+/// `solo_area`, leaving whatever bounds/theme/fonts/recents are already on
+/// disk untouched — mirrors [`save_diff_view_mode`]'s shape (issue #822).
+/// The save-on-toggle counterpart to `load`'s startup restore.
+pub fn save_visibility(
+    path: &Path,
+    visible_areas: Vec<Area>,
+    solo_area: Option<Area>,
+) -> Result<(), StoreError> {
+    let mut state = load(path);
+    state.visible_areas = visible_areas;
+    state.solo_area = solo_area;
     save(path, &state)
 }
 
@@ -486,6 +567,8 @@ mod tests {
             ui_font_family: "Inter".to_string(),
             mono_font_family: "JetBrains Mono".to_string(),
             recent_roots: vec!["/home/dev/rift".to_string()],
+            visible_areas: vec![Area::ExplorerEditor, Area::Git],
+            solo_area: Some(Area::Git),
         }
     }
 
@@ -519,6 +602,12 @@ mod tests {
         assert_eq!(parsed.ui_font_family, "");
         assert_eq!(parsed.mono_font_family, "");
         assert!(parsed.recent_roots.is_empty());
+        assert_eq!(
+            parsed.visible_areas,
+            default_visible_areas(),
+            "absent visible_areas falls back to all areas visible, not empty"
+        );
+        assert_eq!(parsed.solo_area, None);
     }
 
     #[test]
@@ -551,6 +640,12 @@ mod tests {
             DiffViewMode::Unified,
             "a field this JSON predates falls back to its default"
         );
+        assert_eq!(
+            parsed.visible_areas,
+            default_visible_areas(),
+            "a field this JSON predates falls back too"
+        );
+        assert_eq!(parsed.solo_area, None);
     }
 
     /// A pre-Phase-17 on-disk file (#224's original fields only, no theme
@@ -781,6 +876,96 @@ mod tests {
 
         let loaded = load(&path);
         assert_eq!(loaded.diff_view_mode, DiffViewMode::Split);
+        assert_eq!(loaded.theme_name, crate::DEFAULT_THEME_NAME);
+        assert_eq!(loaded.bounds, Rect::default());
+    }
+
+    // --- workspace visibility persistence (#822) ----------------------------
+
+    #[test]
+    fn test_visible_areas_and_solo_area_round_trip_through_json() {
+        let state = WindowState {
+            visible_areas: vec![Area::Terminal, Area::Diagnostics],
+            solo_area: Some(Area::Terminal),
+            ..sample_state()
+        };
+        let json = serde_json::to_string(&state).expect("serialize");
+        let parsed: WindowState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.visible_areas, state.visible_areas);
+        assert_eq!(parsed.solo_area, state.solo_area);
+    }
+
+    #[test]
+    fn test_visibility_fields_absent_load_to_all_visible_no_solo() {
+        // A state file predating issue #822: no `visible_areas`/`solo_area`
+        // keys at all, only an unrelated field, mirroring the other
+        // additive-field tests' shape.
+        let parsed: WindowState = serde_json::from_str(r#"{"maximized": true}"#).expect("parse");
+
+        assert_eq!(parsed.visible_areas, default_visible_areas());
+        assert_eq!(parsed.solo_area, None);
+    }
+
+    /// The spec's "State drift on area set changes" risk: a persisted
+    /// `visible_areas` naming an area this build does not recognize must
+    /// drop only that entry, not fail the whole parse and reset
+    /// bounds/theme/recents to default along with it.
+    #[test]
+    fn test_unknown_area_variant_in_visible_areas_is_dropped_not_fatal() {
+        let json = r#"{
+            "theme_name": "Catppuccin Mocha",
+            "recent_roots": ["/home/dev/rift"],
+            "visible_areas": ["terminal", "some_future_area", "git"],
+            "solo_area": "some_future_area"
+        }"#;
+        let parsed: WindowState =
+            serde_json::from_str(json).expect("parse despite an unknown Area variant");
+
+        assert_eq!(
+            parsed.visible_areas,
+            vec![Area::Terminal, Area::Git],
+            "the unrecognized entry is dropped, the recognized ones kept"
+        );
+        assert_eq!(
+            parsed.solo_area, None,
+            "an unrecognized solo_area degrades to no solo"
+        );
+        assert_eq!(
+            parsed.theme_name, "Catppuccin Mocha",
+            "unrelated fields are unaffected by the tolerant array"
+        );
+        assert_eq!(parsed.recent_roots, vec!["/home/dev/rift".to_string()]);
+    }
+
+    #[test]
+    fn test_save_visibility_updates_only_that_field_and_preserves_the_rest() {
+        let scratch = Scratch::new("save_visibility");
+        let path = scratch.path("state.json");
+        let initial = sample_state();
+        save(&path, &initial).expect("initial save");
+
+        save_visibility(&path, vec![Area::Terminal], Some(Area::Terminal))
+            .expect("save_visibility");
+
+        let loaded = load(&path);
+        assert_eq!(loaded.visible_areas, vec![Area::Terminal]);
+        assert_eq!(loaded.solo_area, Some(Area::Terminal));
+        assert_eq!(loaded.theme_name, initial.theme_name);
+        assert_eq!(loaded.bounds, initial.bounds);
+        assert_eq!(loaded.maximized, initial.maximized);
+        assert_eq!(loaded.font_size_px, initial.font_size_px);
+    }
+
+    #[test]
+    fn test_save_visibility_on_missing_file_starts_from_defaults() {
+        let scratch = Scratch::new("save_visibility_missing");
+        let path = scratch.path("does-not-exist.json");
+
+        save_visibility(&path, vec![Area::Git], None).expect("save_visibility");
+
+        let loaded = load(&path);
+        assert_eq!(loaded.visible_areas, vec![Area::Git]);
+        assert_eq!(loaded.solo_area, None);
         assert_eq!(loaded.theme_name, crate::DEFAULT_THEME_NAME);
         assert_eq!(loaded.bounds, Rect::default());
     }
