@@ -253,3 +253,16 @@ grid-resize-on-reshow work is the accepted cost.
   demotes the terminal (the agent's star). The grid-resize-on-reshow work is
   accepted. The design artboard's Section-B mocks are corrected to the real
   side-by-side layout (Explorer | Editor | Terminal), not terminal-under-editor.
+- 2026-07-10 (issue #822): `Area` gained a **field-level tolerant
+  deserializer** for `WindowState::visible_areas`/`solo_area` (deserializing
+  each entry as `serde_json::Value` first, dropping one that fails to convert
+  to `Area`) rather than `#[serde(other)]` on the enum itself — a catch-all
+  variant would force every exhaustive `match area { .. }` in `workspace.rs`
+  (e.g. `toggle_area`) to grow an arm for a value that can only ever arise
+  from stale persisted data, never from a live rail click. The dock
+  construction that used to hardcode "left open, right/bottom collapsed" now
+  derives each dock's initial open state (and the Explorer+Editor center
+  split) directly from the loaded `Visibility`, so `WindowState::default`'s
+  all-visible seed takes effect on a fresh install exactly as it does after a
+  toggle — the pre-existing construction-time tests asserting a collapsed
+  right/bottom by default were updated to assert open (all-visible) instead.
