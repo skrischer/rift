@@ -76,7 +76,7 @@ use gpui_component::dialog::{AlertDialog, DialogButtonProps};
 use gpui_component::dock::{Dock, DockArea, DockItem, DockPlacement, PanelView};
 use gpui_component::{ActiveTheme as _, IconName, Root, Sizable as _, WindowExt as _};
 use rift_protocol::{
-    ClientMessage, DaemonMessage, DirBrowseError, DirEntry, EntryKind, LspServerState,
+    ClientMessage, CloneError, DaemonMessage, DirBrowseError, DirEntry, EntryKind, LspServerState,
 };
 use rift_terminal::{SessionView, SessionViewEvent};
 use serde::{Deserialize, Serialize};
@@ -606,6 +606,11 @@ pub struct WorkspaceView {
 struct RootPickerSession {
     picker: Entity<RootPicker>,
     pending_browse: Option<String>,
+    /// The `<parent>/<name>` last sent on `ClientMessage::CloneRepo` (issue
+    /// #829, `docs/spec-clone-repo.md`), the clone-channel counterpart of
+    /// `pending_browse` — checked against an incoming `CloneResult`'s echoed
+    /// `path` before routing it into `picker`.
+    pending_clone: Option<String>,
     _subscription: Subscription,
 }
 
@@ -1954,6 +1959,17 @@ impl WorkspaceView {
                         session.pending_browse = Some(path.clone());
                     }
                 }
+                RootPickerEvent::Clone { url, parent, name } => {
+                    let target = root_picker::join_child(parent, name);
+                    let _ = dir_browse_tx.try_send(ClientMessage::CloneRepo {
+                        url: url.clone(),
+                        parent: parent.clone(),
+                        name: name.clone(),
+                    });
+                    if let Some(session) = this.root_picker_session.as_mut() {
+                        session.pending_clone = Some(target);
+                    }
+                }
                 RootPickerEvent::Picked { root, name } => {
                     let existing: Vec<String> = session_view
                         .read(cx)
@@ -1982,6 +1998,7 @@ impl WorkspaceView {
         self.root_picker_session = Some(RootPickerSession {
             picker: picker.clone(),
             pending_browse: Some(start.clone()),
+            pending_clone: None,
             _subscription: subscription,
         });
         picker.update(cx, |picker, cx| picker.browse(start, cx));
@@ -2019,6 +2036,32 @@ impl WorkspaceView {
         let picker = session.picker.clone();
         picker.update(cx, |picker, cx| {
             picker.apply_dir_entries_reply(path, parent, entries, error, window, cx);
+        });
+    }
+
+    /// Route a `CloneResult` to the in-cockpit root picker, if one is open
+    /// (issue #829, `docs/spec-clone-repo.md`) — called directly by
+    /// `main.rs`'s `Shell`, mirroring [`Self::apply_dir_entries_reply`]'s
+    /// dispatch shape with an exact-match correlation check against
+    /// `pending_clone` in place of [`root_picker::browse_reply_matches`]
+    /// (every `CloneRepo` echoes its `<parent>/<name>` verbatim, no seed-
+    /// request case).
+    pub fn apply_clone_result(
+        &mut self,
+        path: String,
+        error: Option<CloneError>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.root_picker_session.as_mut() else {
+            return;
+        };
+        if session.pending_clone.as_deref() != Some(path.as_str()) {
+            return;
+        }
+        session.pending_clone = None;
+        let picker = session.picker.clone();
+        picker.update(cx, |picker, cx| {
+            picker.apply_clone_result(path, error, cx);
         });
     }
 

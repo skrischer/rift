@@ -26,12 +26,15 @@ use gpui::{
     ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _,
     Styled as _, Subscription, Window,
 };
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::{Scrollbar, ScrollbarShow};
-use gpui_component::{h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName};
+use gpui_component::{
+    h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _,
+    Sizable as _,
+};
 
-use rift_protocol::{DirBrowseError, DirEntry};
+use rift_protocol::{CloneError, DirBrowseError, DirEntry};
 
 /// Card width, matching `session_picker`/`connection_screen`'s own
 /// `CARD_WIDTH` (design contract: "card ~470px") — kept as its own constant
@@ -118,12 +121,42 @@ fn basename(path: &str) -> String {
 /// the remote host regardless of the client's own OS, so
 /// `std::path::Path::join` (which would use the client's separator) is
 /// deliberately not used here.
-fn join_child(parent: &str, name: &str) -> String {
+///
+/// Also used by `main.rs`/`workspace.rs` (issue #829) to predict the
+/// `<parent>/<name>` a `ClientMessage::CloneRepo` will echo back on
+/// `DaemonMessage::CloneResult::path`, the same correlation role
+/// [`browse_reply_matches`] plays for browse replies — `pub`, since those
+/// owners reach it through the `rift_app` library crate's public surface
+/// (`rift_app::root_picker::join_child`), the same boundary
+/// [`browse_reply_matches`]/[`disambiguate_session_name`]/[`start_path`]
+/// already cross.
+pub fn join_child(parent: &str, name: &str) -> String {
     if parent.ends_with('/') {
         format!("{parent}{name}")
     } else {
         format!("{parent}/{name}")
     }
+}
+
+/// Derive the clone-mode name field's default from a git `url`
+/// (`docs/spec-clone-repo.md`'s "name ... default = the repo basename from
+/// the URL"): the last `/`-separated path segment, with a trailing `.git`
+/// stripped. Handles scp-like remotes (`git@host:org/repo.git`) by also
+/// splitting on `:` when the final segment still carries one (no `/` in the
+/// whole URL, e.g. a bare `host:repo.git`). Returns an empty string for a
+/// blank/whitespace-only `url` — the picker leaves the name field blank
+/// until a URL is entered, rather than guessing.
+pub fn repo_basename_from_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let after_slash = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    let after_colon = after_slash.rsplit(':').next().unwrap_or(after_slash);
+    after_colon
+        .strip_suffix(".git")
+        .unwrap_or(after_colon)
+        .to_string()
 }
 
 /// One clickable breadcrumb segment: its display label and the absolute
@@ -157,6 +190,28 @@ fn describe_dir_browse_error(error: DirBrowseError) -> &'static str {
     }
 }
 
+/// Short, user-facing text for a [`CloneError`], mirroring
+/// [`describe_dir_browse_error`]'s shape for the clone channel
+/// (`docs/spec-clone-repo.md`).
+fn describe_clone_error(error: CloneError) -> &'static str {
+    match error {
+        CloneError::InvalidUrl => "Not a valid git URL",
+        CloneError::AuthFailed => "Authentication failed for this repository",
+        CloneError::TargetExists => "A folder with that name already exists",
+        CloneError::Network => "Could not reach the repository",
+        CloneError::Other => "Clone failed",
+    }
+}
+
+/// Which surface the root picker's card body renders (issue #829, "Browse ⇄
+/// Clone toggle", `docs/spec-clone-repo.md`'s "clone surface is a mode inside
+/// Frame C" decision) — a browse-and-pick level, or a clone-from-URL form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickerMode {
+    Browse,
+    Clone,
+}
+
 /// Emitted by [`RootPicker`]; the owner never touches this view's internals
 /// directly, mirroring [`crate::session_picker::SessionPickerEvent`].
 pub enum RootPickerEvent {
@@ -166,8 +221,22 @@ pub enum RootPickerEvent {
     /// by every [`RootPicker::browse`] call: the caller's initial seed, a
     /// row click, a breadcrumb segment, or the parent affordance.
     Browse(String),
-    /// The user confirmed Create: the picked root (the current resolved
-    /// level) and the session name (the name field's value, trimmed).
+    /// Ask the owner to send `ClientMessage::CloneRepo { url, parent, name }`
+    /// (issue #829, `docs/spec-clone-repo.md`) — the owner sends the request
+    /// and later feeds the reply back through
+    /// [`RootPicker::apply_clone_result`]. Emitted by
+    /// [`RootPicker::start_clone`] (the Clone action / an Enter press in the
+    /// URL or name field).
+    Clone {
+        url: String,
+        parent: String,
+        name: String,
+    },
+    /// The user confirmed Create (browse mode) or a clone finished
+    /// successfully (clone mode, `path` as the root): the picked root and
+    /// the session name. Both paths drive the same create-with-root
+    /// `Attach { root: Some(...) }` flow — the owner does not distinguish
+    /// where the root came from.
     Picked { root: String, name: String },
 }
 
@@ -201,6 +270,31 @@ pub struct RootPicker {
     /// the scrolling `v_flex` (`.track_scroll`) and the overlay [`Scrollbar`]
     /// so the thumb reflects and drives the same scroll position.
     scroll_handle: ScrollHandle,
+    /// Which body the card currently renders — the Browse ⇄ Clone toggle
+    /// (issue #829).
+    mode: PickerMode,
+    /// The clone-mode git-URL field.
+    clone_url_input: Entity<InputState>,
+    _clone_url_subscription: Subscription,
+    /// The clone-mode target-parent field, defaulting to (and reseeded on
+    /// every successful browse alongside [`Self::name_input`] with) the
+    /// currently browsed level — editable, so the operator can clone
+    /// somewhere other than where they last browsed to.
+    clone_parent_input: Entity<InputState>,
+    /// The clone-mode target-name field, defaulting to
+    /// [`repo_basename_from_url`] of the URL field's value; editable, and
+    /// once a user edit is observed (`clone_name_touched`) no longer
+    /// overwritten by further URL edits.
+    clone_name_input: Entity<InputState>,
+    _clone_name_subscription: Subscription,
+    clone_name_touched: bool,
+    /// True while a `CloneRepo` request is in flight — the Clone action is a
+    /// no-op while set, mirroring `loading`'s guard against overlapping
+    /// browse requests.
+    cloning: bool,
+    /// The last clone failure, rendered inline; cleared by the next
+    /// [`Self::start_clone`] call or a successful [`Self::apply_clone_result`].
+    clone_error: Option<CloneError>,
 }
 
 impl RootPicker {
@@ -221,6 +315,38 @@ impl RootPicker {
                 }
             },
         );
+
+        let clone_url_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("https://github.com/org/repo.git"));
+        let clone_url_subscription = cx.subscribe_in(
+            &clone_url_input,
+            window,
+            |this, _input, event: &InputEvent, window, cx| match event {
+                InputEvent::Change if !this.clone_name_touched => {
+                    let url = this.clone_url_input.read(cx).value().to_string();
+                    let suggested = repo_basename_from_url(&url);
+                    this.clone_name_input
+                        .update(cx, |input, cx| input.set_value(suggested, window, cx));
+                }
+                InputEvent::PressEnter { .. } => this.start_clone(cx),
+                _ => {}
+            },
+        );
+
+        let clone_parent_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("parent folder"));
+
+        let clone_name_input = cx.new(|cx| InputState::new(window, cx).placeholder("repo name"));
+        let clone_name_subscription = cx.subscribe_in(
+            &clone_name_input,
+            window,
+            |this, _input, event: &InputEvent, _window, cx| match event {
+                InputEvent::Change => this.clone_name_touched = true,
+                InputEvent::PressEnter { .. } => this.start_clone(cx),
+                _ => {}
+            },
+        );
+
         Self {
             current_path: String::new(),
             parent: None,
@@ -231,6 +357,15 @@ impl RootPicker {
             _name_subscription: subscription,
             focus_handle: cx.focus_handle(),
             scroll_handle: ScrollHandle::default(),
+            mode: PickerMode::Browse,
+            clone_url_input,
+            _clone_url_subscription: clone_url_subscription,
+            clone_parent_input,
+            clone_name_input,
+            _clone_name_subscription: clone_name_subscription,
+            clone_name_touched: false,
+            cloning: false,
+            clone_error: None,
         }
     }
 
@@ -253,8 +388,12 @@ impl RootPicker {
     /// destructures the enum variant, mirroring
     /// `EditorView::apply_document_symbol_response`'s shape rather than
     /// taking the raw `DaemonMessage`). On success, replaces the displayed
-    /// level and reseeds the name field with the new path's basename; on
-    /// failure, keeps the last good level and renders `error` inline
+    /// level and reseeds the name field with the new path's basename, and
+    /// the clone-mode target-parent field with the resolved path itself
+    /// (issue #829's "default = the current browse path" — reseeded here,
+    /// alongside the name field, rather than only on a mode switch, so it
+    /// always reflects the level last browsed to); on failure, keeps the
+    /// last good level and renders `error` inline
     /// (`docs/spec-session-root-picker.md`'s browse-error mitigation — never
     /// tears down).
     pub fn apply_dir_entries_reply(
@@ -279,6 +418,9 @@ impl RootPicker {
         let seeded = basename(&self.current_path);
         self.name_input
             .update(cx, |input, cx| input.set_value(seeded, window, cx));
+        let current_path = self.current_path.clone();
+        self.clone_parent_input
+            .update(cx, |input, cx| input.set_value(current_path, window, cx));
         cx.notify();
     }
 
@@ -312,6 +454,67 @@ impl RootPicker {
             root: self.current_path.clone(),
             name,
         });
+    }
+
+    /// The Browse ⇄ Clone toggle: switches which body the card renders. A
+    /// no-op when already in `mode` — this only flips a display switch, the
+    /// underlying browse level and clone fields are untouched either way.
+    fn set_mode(&mut self, mode: PickerMode, cx: &mut Context<Self>) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        cx.notify();
+    }
+
+    /// The Clone action / an Enter press in the URL or name field: emit the
+    /// trimmed URL/parent/name via [`RootPickerEvent::Clone`]. A no-op while
+    /// a clone is already in flight, or until all three fields hold
+    /// non-whitespace text — mirroring [`Self::browse`]'s in-flight guard and
+    /// [`Self::create`]'s blank-field guard.
+    fn start_clone(&mut self, cx: &mut Context<Self>) {
+        if self.cloning {
+            return;
+        }
+        let url = self.clone_url_input.read(cx).value().trim().to_string();
+        let parent = self.clone_parent_input.read(cx).value().trim().to_string();
+        let name = self.clone_name_input.read(cx).value().trim().to_string();
+        if url.is_empty() || parent.is_empty() || name.is_empty() {
+            return;
+        }
+        self.cloning = true;
+        self.clone_error = None;
+        cx.emit(RootPickerEvent::Clone { url, parent, name });
+        cx.notify();
+    }
+
+    /// Feed back the daemon's reply to the most recent [`Self::start_clone`]
+    /// call — the owner calls this with a `DaemonMessage::CloneResult`'s
+    /// fields when one arrives while this picker is showing, mirroring
+    /// [`Self::apply_dir_entries_reply`]'s shape. On success, emits
+    /// [`RootPickerEvent::Picked`] with `path` as the root and the clone's
+    /// name field as the session name — the exact event the browse-and-pick
+    /// Create emits, so the owner drives the same create-with-root path
+    /// without a clone-specific branch (`docs/spec-clone-repo.md`: "drive the
+    /// existing create-with-root path ... reuse it, do not reinvent"). On
+    /// failure, renders `error` inline and leaves the clone form in place for
+    /// a retry.
+    pub fn apply_clone_result(
+        &mut self,
+        path: String,
+        error: Option<CloneError>,
+        cx: &mut Context<Self>,
+    ) {
+        self.cloning = false;
+        if let Some(error) = error {
+            self.clone_error = Some(error);
+            cx.notify();
+            return;
+        }
+        self.clone_error = None;
+        let name = self.clone_name_input.read(cx).value().trim().to_string();
+        cx.emit(RootPickerEvent::Picked { root: path, name });
+        cx.notify();
     }
 }
 
@@ -481,10 +684,12 @@ fn render_empty_state(cx: &mut Context<RootPicker>, loading: bool) -> impl IntoE
         .child(label)
 }
 
-/// The inline browse-error banner (`docs/spec-session-root-picker.md`'s
-/// "renders inline without closing the picker"), mirroring
-/// `connection_screen::render_error_banner`'s shape.
-fn render_error_banner(cx: &mut Context<RootPicker>, error: DirBrowseError) -> impl IntoElement {
+/// The inline error banner, shared by the browse and clone modes
+/// (`docs/spec-session-root-picker.md`'s "renders inline without closing the
+/// picker", extended to clone errors by `docs/spec-clone-repo.md`), mirroring
+/// `connection_screen::render_error_banner`'s shape. `message` is a
+/// mode-specific `describe_*_error` call at each of the two call sites.
+fn render_error_banner(cx: &mut Context<RootPicker>, message: &'static str) -> impl IntoElement {
     let danger = cx.theme().danger;
     h_flex()
         .w_full()
@@ -503,7 +708,7 @@ fn render_error_banner(cx: &mut Context<RootPicker>, error: DirBrowseError) -> i
                 .min_w_0()
                 .text_size(px(12.0))
                 .text_color(cx.theme().foreground)
-                .child(describe_dir_browse_error(error)),
+                .child(message),
         )
 }
 
@@ -530,60 +735,198 @@ fn render_footer(
         )
 }
 
+/// The Browse ⇄ Clone toggle (issue #829): a compact, outlined
+/// [`ButtonGroup`] of two tabs, styled after `diff_view`'s Unified/Split
+/// toggle — the same "two-option mode switch" widget, reused rather than a
+/// bespoke tab bar.
+fn render_mode_toggle(cx: &mut Context<RootPicker>, mode: PickerMode) -> impl IntoElement {
+    ButtonGroup::new("root-picker-mode")
+        .compact()
+        .outline()
+        .xsmall()
+        .child(
+            Button::new("root-picker-mode-browse")
+                .label("Browse")
+                .selected(mode == PickerMode::Browse),
+        )
+        .child(
+            Button::new("root-picker-mode-clone")
+                .label("Clone")
+                .selected(mode == PickerMode::Clone),
+        )
+        .on_click(cx.listener(|this, clicks: &Vec<usize>, _window, cx| {
+            let mode = if clicks.contains(&1) {
+                PickerMode::Clone
+            } else {
+                PickerMode::Browse
+            };
+            this.set_mode(mode, cx);
+        }))
+}
+
+/// One clone-mode labeled input row: a small muted label above a mono-valued,
+/// leading-icon input, mirroring `connection_screen::render_field`'s shape.
+fn render_clone_field(
+    cx: &mut Context<RootPicker>,
+    label: &'static str,
+    input: &Entity<InputState>,
+    icon: IconName,
+    disabled: bool,
+) -> impl IntoElement {
+    let muted = cx.theme().muted_foreground;
+    let mono = cx.theme().mono_font_family.clone();
+    v_flex()
+        .gap(px(4.0))
+        .child(div().text_size(px(12.0)).text_color(muted).child(label))
+        .child(
+            Input::new(input)
+                .font_family(mono)
+                .disabled(disabled)
+                .prefix(Icon::new(icon).text_color(muted)),
+        )
+}
+
+/// The clone-mode body (issue #829, `docs/spec-clone-repo.md`): URL / target
+/// parent / name fields, an inline error when the last clone failed, and the
+/// Clone action — disabled until every field holds non-whitespace text, and
+/// showing its own in-progress state (fields disabled, button labeled
+/// "Cloning…" with a spinner) while a request is in flight.
+#[allow(clippy::too_many_arguments)]
+fn render_clone_body(
+    cx: &mut Context<RootPicker>,
+    url_input: &Entity<InputState>,
+    parent_input: &Entity<InputState>,
+    name_input: &Entity<InputState>,
+    cloning: bool,
+    error: Option<CloneError>,
+    can_clone: bool,
+) -> impl IntoElement {
+    let error_banner = error.map(|error| render_error_banner(cx, describe_clone_error(error)));
+    v_flex()
+        .gap(px(12.0))
+        .child(render_clone_field(
+            cx,
+            "Repository URL",
+            url_input,
+            IconName::Github,
+            cloning,
+        ))
+        .child(render_clone_field(
+            cx,
+            "Parent folder",
+            parent_input,
+            IconName::Folder,
+            cloning,
+        ))
+        .child(render_clone_field(
+            cx,
+            "Name",
+            name_input,
+            IconName::Frame,
+            cloning,
+        ))
+        .children(error_banner)
+        .child(
+            h_flex().w_full().items_center().justify_end().child(
+                Button::new("root-picker-clone")
+                    .primary()
+                    .label(if cloning { "Cloning\u{2026}" } else { "Clone" })
+                    .loading(cloning)
+                    .disabled(cloning || !can_clone)
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.start_clone(cx);
+                    })),
+            ),
+        )
+}
+
 impl Render for RootPicker {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let breadcrumb = breadcrumb_segments(&self.current_path);
-        let has_parent = self.parent.is_some();
-        let loading = self.loading;
-        let error = self.error;
-        let can_create =
-            !self.current_path.is_empty() && !self.name_input.read(cx).value().trim().is_empty();
+        let mode = self.mode;
+        let mode_toggle = render_mode_toggle(cx, mode);
 
-        let breadcrumb_el = render_breadcrumb(cx, &breadcrumb, loading);
+        let content =
+            match mode {
+                PickerMode::Browse => {
+                    let breadcrumb = breadcrumb_segments(&self.current_path);
+                    let has_parent = self.parent.is_some();
+                    let loading = self.loading;
+                    let error = self.error;
+                    let can_create = !self.current_path.is_empty()
+                        && !self.name_input.read(cx).value().trim().is_empty();
 
-        let mut rows: Vec<gpui::AnyElement> = Vec::new();
-        if has_parent {
-            rows.push(render_parent_row(cx).into_any_element());
-        }
-        rows.extend(
-            self.entries
-                .iter()
-                .enumerate()
-                .map(|(index, entry)| render_entry_row(cx, index, entry).into_any_element()),
-        );
+                    let breadcrumb_el = render_breadcrumb(cx, &breadcrumb, loading);
 
-        let body = if rows.is_empty() {
-            render_empty_state(cx, loading).into_any_element()
-        } else {
-            // Bounded height + internal scroll (issue #802, mirroring
-            // #792): a short list still renders compact since `max_h` only
-            // caps growth, and `overflow_y_scroll` only kicks in once the
-            // rows exceed it.
-            // The vertical `Scrollbar` (issue #804) is a sibling overlay in
-            // a `relative()` wrapper, bound to the same `scroll_handle` the
-            // rows track via `track_scroll` — gpui-component only paints it
-            // once the tracked content overflows the capped height, so a
-            // short list still stays scrollbar-free.
-            div()
-                .relative()
-                .child(
+                    let mut rows: Vec<gpui::AnyElement> = Vec::new();
+                    if has_parent {
+                        rows.push(render_parent_row(cx).into_any_element());
+                    }
+                    rows.extend(self.entries.iter().enumerate().map(|(index, entry)| {
+                        render_entry_row(cx, index, entry).into_any_element()
+                    }));
+
+                    let body = if rows.is_empty() {
+                        render_empty_state(cx, loading).into_any_element()
+                    } else {
+                        // Bounded height + internal scroll (issue #802, mirroring
+                        // #792): a short list still renders compact since `max_h` only
+                        // caps growth, and `overflow_y_scroll` only kicks in once the
+                        // rows exceed it.
+                        // The vertical `Scrollbar` (issue #804) is a sibling overlay in
+                        // a `relative()` wrapper, bound to the same `scroll_handle` the
+                        // rows track via `track_scroll` — gpui-component only paints it
+                        // once the tracked content overflows the capped height, so a
+                        // short list still stays scrollbar-free.
+                        div()
+                            .relative()
+                            .child(
+                                v_flex()
+                                    .id("root-picker-rows")
+                                    .gap(px(2.0))
+                                    .max_h(px(ROWS_MAX_HEIGHT))
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.scroll_handle)
+                                    .children(rows),
+                            )
+                            .child(
+                                Scrollbar::vertical(&self.scroll_handle)
+                                    .scrollbar_show(ScrollbarShow::Always),
+                            )
+                            .into_any_element()
+                    };
+
+                    let error_banner = error
+                        .map(|error| render_error_banner(cx, describe_dir_browse_error(error)));
+                    let name_input = self.name_input.clone();
+                    let footer = render_footer(cx, &name_input, can_create);
+
                     v_flex()
-                        .id("root-picker-rows")
-                        .gap(px(2.0))
-                        .max_h(px(ROWS_MAX_HEIGHT))
-                        .overflow_y_scroll()
-                        .track_scroll(&self.scroll_handle)
-                        .children(rows),
-                )
-                .child(
-                    Scrollbar::vertical(&self.scroll_handle).scrollbar_show(ScrollbarShow::Always),
-                )
-                .into_any_element()
-        };
-
-        let error_banner = error.map(|error| render_error_banner(cx, error));
-        let name_input = self.name_input.clone();
-        let footer = render_footer(cx, &name_input, can_create);
+                        .gap(px(16.0))
+                        .child(breadcrumb_el)
+                        .children(error_banner)
+                        .child(body)
+                        .child(footer)
+                        .into_any_element()
+                }
+                PickerMode::Clone => {
+                    let url_input = self.clone_url_input.clone();
+                    let parent_input = self.clone_parent_input.clone();
+                    let name_input = self.clone_name_input.clone();
+                    let can_clone = !url_input.read(cx).value().trim().is_empty()
+                        && !parent_input.read(cx).value().trim().is_empty()
+                        && !name_input.read(cx).value().trim().is_empty();
+                    render_clone_body(
+                        cx,
+                        &url_input,
+                        &parent_input,
+                        &name_input,
+                        self.cloning,
+                        self.clone_error,
+                        can_clone,
+                    )
+                    .into_any_element()
+                }
+            };
 
         v_flex()
             .w(px(CARD_WIDTH))
@@ -595,10 +938,8 @@ impl Render for RootPicker {
             .rounded(px(12.0))
             .track_focus(&self.focus_handle)
             .child(render_header(cx))
-            .child(breadcrumb_el)
-            .children(error_banner)
-            .child(body)
-            .child(footer)
+            .child(mode_toggle)
+            .child(content)
     }
 }
 
@@ -704,6 +1045,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_describe_clone_error_maps_every_variant_to_distinct_text() {
+        let messages = [
+            describe_clone_error(CloneError::InvalidUrl),
+            describe_clone_error(CloneError::AuthFailed),
+            describe_clone_error(CloneError::TargetExists),
+            describe_clone_error(CloneError::Network),
+            describe_clone_error(CloneError::Other),
+        ];
+        let unique: std::collections::HashSet<_> = messages.iter().collect();
+        assert_eq!(
+            unique.len(),
+            messages.len(),
+            "every reason reads distinctly"
+        );
+    }
+
+    #[test]
+    fn test_repo_basename_from_url_https_with_and_without_git_suffix() {
+        assert_eq!(
+            repo_basename_from_url("https://github.com/org/repo.git"),
+            "repo"
+        );
+        assert_eq!(
+            repo_basename_from_url("https://github.com/org/repo"),
+            "repo"
+        );
+    }
+
+    #[test]
+    fn test_repo_basename_from_url_strips_a_trailing_slash() {
+        assert_eq!(
+            repo_basename_from_url("https://github.com/org/repo/"),
+            "repo"
+        );
+        assert_eq!(
+            repo_basename_from_url("https://github.com/org/repo.git/"),
+            "repo"
+        );
+    }
+
+    #[test]
+    fn test_repo_basename_from_url_handles_scp_like_remotes() {
+        assert_eq!(repo_basename_from_url("git@host:org/repo.git"), "repo");
+        assert_eq!(repo_basename_from_url("git@host:repo.git"), "repo");
+    }
+
+    #[test]
+    fn test_repo_basename_from_url_blank_url_returns_empty() {
+        assert_eq!(repo_basename_from_url(""), "");
+        assert_eq!(repo_basename_from_url("   "), "");
+    }
+
     // --- entity behavior -------------------------------------------------------
     //
     // `browse`/`select_entry`/`go_to_parent`/`create` only need `Context`, so
@@ -737,6 +1131,9 @@ mod tests {
             cx.subscribe(picker, move |_picker, event: &RootPickerEvent, _cx| {
                 sink.borrow_mut().push(match event {
                     RootPickerEvent::Browse(path) => format!("browse:{path}"),
+                    RootPickerEvent::Clone { url, parent, name } => {
+                        format!("clone:{url}:{parent}:{name}")
+                    }
                     RootPickerEvent::Picked { root, name } => format!("picked:{root}:{name}"),
                 });
             })
@@ -982,5 +1379,192 @@ mod tests {
         let events = subscribe_events(&picker, cx);
         cx.update(|cx| picker.update(cx, |picker, cx| picker.create(cx)));
         assert!(events.borrow().is_empty(), "a blank name never creates");
+    }
+
+    #[gpui::test]
+    fn test_load_level_also_seeds_the_clone_parent_input(cx: &mut TestAppContext) {
+        let (picker, window) = build_picker(cx);
+        load(
+            &picker,
+            &window,
+            cx,
+            "",
+            "/home/dev",
+            Some("/home"),
+            Vec::new(),
+        );
+
+        cx.update(|cx| {
+            let picker = picker.read(cx);
+            assert_eq!(
+                picker.clone_parent_input.read(cx).value().as_ref(),
+                "/home/dev"
+            );
+        });
+    }
+
+    /// Set the clone mode's three fields directly (mirroring `load`'s
+    /// shorthand role for browse tests).
+    fn set_clone_fields(
+        picker: &Entity<RootPicker>,
+        window: &gpui::WindowHandle<gpui_component::Root>,
+        cx: &mut TestAppContext,
+        url: &str,
+        parent: &str,
+        name: &str,
+    ) {
+        window
+            .update(cx, |_, window, cx| {
+                picker.update(cx, |picker, cx| {
+                    let url_input = picker.clone_url_input.clone();
+                    url_input.update(cx, |input, cx| input.set_value(url, window, cx));
+                    let parent_input = picker.clone_parent_input.clone();
+                    parent_input.update(cx, |input, cx| input.set_value(parent, window, cx));
+                    let name_input = picker.clone_name_input.clone();
+                    name_input.update(cx, |input, cx| input.set_value(name, window, cx));
+                });
+            })
+            .expect("set clone fields");
+    }
+
+    #[gpui::test]
+    fn test_start_clone_emits_clone_with_the_trimmed_fields(cx: &mut TestAppContext) {
+        let (picker, window) = build_picker(cx);
+        set_clone_fields(
+            &picker,
+            &window,
+            cx,
+            "  https://github.com/org/repo.git  ",
+            "  /workspace  ",
+            "  repo  ",
+        );
+        let events = subscribe_events(&picker, cx);
+
+        cx.update(|cx| picker.update(cx, |picker, cx| picker.start_clone(cx)));
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["clone:https://github.com/org/repo.git:/workspace:repo"]
+        );
+        cx.update(|cx| assert!(picker.read(cx).cloning));
+    }
+
+    #[gpui::test]
+    fn test_start_clone_is_noop_with_a_blank_field(cx: &mut TestAppContext) {
+        let (picker, window) = build_picker(cx);
+        set_clone_fields(
+            &picker,
+            &window,
+            cx,
+            "https://github.com/org/repo.git",
+            "",
+            "repo",
+        );
+        let events = subscribe_events(&picker, cx);
+
+        cx.update(|cx| picker.update(cx, |picker, cx| picker.start_clone(cx)));
+
+        assert!(
+            events.borrow().is_empty(),
+            "a blank parent field never starts a clone"
+        );
+        cx.update(|cx| assert!(!picker.read(cx).cloning));
+    }
+
+    #[gpui::test]
+    fn test_start_clone_suppresses_an_overlapping_request(cx: &mut TestAppContext) {
+        let (picker, window) = build_picker(cx);
+        set_clone_fields(
+            &picker,
+            &window,
+            cx,
+            "https://github.com/org/repo.git",
+            "/workspace",
+            "repo",
+        );
+        let events = subscribe_events(&picker, cx);
+
+        cx.update(|cx| {
+            picker.update(cx, |picker, cx| {
+                picker.start_clone(cx);
+                picker.start_clone(cx); // already in flight -> suppressed
+            });
+        });
+
+        assert_eq!(
+            events.borrow().len(),
+            1,
+            "a clone already in flight suppresses the second request"
+        );
+    }
+
+    #[gpui::test]
+    fn test_apply_clone_result_success_emits_picked_with_the_checkout_and_name(
+        cx: &mut TestAppContext,
+    ) {
+        let (picker, window) = build_picker(cx);
+        set_clone_fields(
+            &picker,
+            &window,
+            cx,
+            "https://github.com/org/repo.git",
+            "/workspace",
+            "repo",
+        );
+        cx.update(|cx| picker.update(cx, |picker, cx| picker.start_clone(cx)));
+        let events = subscribe_events(&picker, cx);
+
+        cx.update(|cx| {
+            picker.update(cx, |picker, cx| {
+                picker.apply_clone_result("/workspace/repo".to_string(), None, cx);
+            });
+        });
+
+        assert_eq!(events.borrow().as_slice(), ["picked:/workspace/repo:repo"]);
+        cx.update(|cx| assert!(!picker.read(cx).cloning));
+    }
+
+    #[gpui::test]
+    fn test_apply_clone_result_error_sets_the_error_and_clears_cloning(cx: &mut TestAppContext) {
+        let (picker, window) = build_picker(cx);
+        set_clone_fields(
+            &picker,
+            &window,
+            cx,
+            "https://github.com/org/repo.git",
+            "/workspace",
+            "repo",
+        );
+        cx.update(|cx| picker.update(cx, |picker, cx| picker.start_clone(cx)));
+        let events = subscribe_events(&picker, cx);
+
+        cx.update(|cx| {
+            picker.update(cx, |picker, cx| {
+                picker.apply_clone_result(
+                    "/workspace/repo".to_string(),
+                    Some(CloneError::TargetExists),
+                    cx,
+                );
+            });
+        });
+
+        assert!(events.borrow().is_empty(), "a failed clone never picks");
+        cx.update(|cx| {
+            let picker = picker.read(cx);
+            assert!(!picker.cloning);
+            assert_eq!(picker.clone_error, Some(CloneError::TargetExists));
+        });
+    }
+
+    #[gpui::test]
+    fn test_set_mode_switches_between_browse_and_clone(cx: &mut TestAppContext) {
+        let (picker, _window) = build_picker(cx);
+        cx.update(|cx| assert_eq!(picker.read(cx).mode, PickerMode::Browse));
+
+        cx.update(|cx| picker.update(cx, |picker, cx| picker.set_mode(PickerMode::Clone, cx)));
+        cx.update(|cx| assert_eq!(picker.read(cx).mode, PickerMode::Clone));
+
+        cx.update(|cx| picker.update(cx, |picker, cx| picker.set_mode(PickerMode::Browse, cx)));
+        cx.update(|cx| assert_eq!(picker.read(cx).mode, PickerMode::Browse));
     }
 }

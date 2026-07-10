@@ -265,3 +265,61 @@ under the milestone. This spec owns the design; the issues own progress.
   sparring aid, NOT the durable design; the Frame C clone-mode is authored in
   implementation / visual-QA). Human prerequisites: none to deliver. Status
   DRAFT → READY.
+- 2026-07-10 (issue #829, `crates/app`): the Frame C clone mode implemented.
+  The `Browse ⇄ Clone` toggle reuses `diff_view`'s `ButtonGroup` two-tab
+  pattern rather than a bespoke widget. `RootPicker` gains a `PickerMode`
+  switch, clone-mode URL/parent/name `InputState`s (parent defaults to and
+  is reseeded with the current browse level; name defaults to
+  `repo_basename_from_url` until the user edits it directly), and
+  `start_clone`/`apply_clone_result` mirroring the browse path's
+  `browse`/`apply_dir_entries_reply` shape. `apply_clone_result`'s success
+  case emits the same `RootPickerEvent::Picked { root, name }` the
+  browse-and-pick Create emits, so both `Shell` (pre-cockpit) and
+  `WorkspaceView` (in-cockpit) drive the existing create-with-root
+  `Attach { root: Some(...) }` path with no clone-specific branch. The
+  `CloneRepo`/`CloneResult` reply is correlated with an exact-match
+  `pending_clone: Option<String>` against the daemon-echoed `<parent>/<name>`
+  (no seed-request ambiguity like browse's `""`/`~` start level, so no
+  `browse_reply_matches`-style fuzzy match is needed). Both owners share the
+  existing `dir_browse_rx`/`dir_browse_reply_tx` bridge — no new channel
+  plumbing, since the clone channel reuses browse's transport by design.
+- 2026-07-10 (issue #828, daemon clone execution): the spike confirmed the
+  named gix 0.84 feature set end-to-end — `prepare_clone` -> `fetch_then_checkout`
+  -> `main_worktree` cloned a real public HTTPS repo and a local `file://` bare
+  repo, with no curl/OpenSSL in the dependency tree (pure `reqwest`/rustls).
+  Findings folded into `crates/daemon/src/clone.rs`:
+  - gix's own URL parser is **lenient**: an unrecognized string parses as a
+    *relative local path* rather than erroring, so the module validates the
+    URL's scheme itself before calling gix (`https`/`http`/`ssh`/`git`, an
+    explicit `file://`, or the scp-like `user@host:path` shorthand) rather
+    than trusting gix's parse alone.
+  - A bare username with no password in the URL makes gix attempt an
+    **interactive terminal prompt** for credentials, which fails immediately
+    in the headless daemon (no TTY) rather than hanging — confirming a bare
+    `GIT_AUTH_TOKEN` needs explicit wiring. The daemon embeds it as
+    `x-access-token:<token>@` into an `http(s)` URL that carries no
+    credentials of its own (gix's `set_user`/`set_password` +
+    `to_bstring()`), only ever reading the daemon **host's** environment.
+  - Pre-setting `should_interrupt` aborts the clone immediately with no
+    directory left behind, confirming the Drop-cleanup "no partial tree"
+    mechanism holds under interruption, not just under a plain failure.
+  - gix's fetch-error type is a deep, version-shifting chain through
+    `gix-transport`/`gix-protocol` internals not meant for external pattern
+    matching; classification onto the wire `CloneError` instead keys off its
+    stable `Display` message (each layer forwards transparently to its
+    cause), confirmed against the spike's actual auth/network failure
+    modes — best-effort, defaulting to `CloneError::Other` rather than
+    guessing.
+  - `blocking-http-transport-reqwest-rust-tls` pulls `rustls-platform-verifier`
+    -> `webpki-root-certs` (`CDLA-Permissive-2.0`, a permissive data license,
+    no share-alike clause) unconditionally in `reqwest` 0.13 — there is no
+    reqwest feature combination that reaches rustls without it. Added to
+    `deny.toml`'s allow list alongside the other permissive entries;
+    `cargo deny check licenses` passes.
+  - Private-repo (token-auth) clone against a real host credential was not
+    re-verified live in the implementation environment (no `GIT_AUTH_TOKEN`/
+    private repo available there); the URL-embedding mechanism itself was
+    exercised against a real (rejected, bogus-token) HTTPS credential, which
+    surfaced cleanly as `CloneError::AuthFailed` with no partial tree. Full
+    private-repo behavioural confirmation stays the dev-channel QA item the
+    spec already scopes it as.
