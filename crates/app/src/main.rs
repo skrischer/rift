@@ -39,6 +39,16 @@ struct SshConfig {
     port: u16,
     user: String,
     key: PathBuf,
+    /// The Connection screen's Remote exec wrapper field value (issue #789,
+    /// `docs/spec-remote-exec-wrapper-ui.md`), e.g. `docker exec -i devenv` —
+    /// threaded onto [`rift_ssh::SshConnection::with_remote_exec_wrapper`] in
+    /// [`run_ssh_session`] so the daemon and every non-PTY exec run one hop
+    /// deeper. `None` is byte-for-byte passthrough, a normal host connection.
+    /// The connect site no longer resolves this itself from
+    /// `RIFT_REMOTE_EXEC_WRAPPER`/`RIFT_DEFAULT_REMOTE_EXEC_WRAPPER` — that
+    /// resolution moved to the card's fresh-open prefill
+    /// (`connection_screen::live_defaults`); the field is authoritative here.
+    remote_exec_wrapper: Option<String>,
     /// The Connection screen's passphrase field value for an encrypted key
     /// (#478, `docs/spec-connection-robustness.md`) — `None` for a plain key.
     /// Deliberately not `Debug`-derived on this struct: never format this
@@ -912,6 +922,7 @@ impl Shell {
             user: request.user,
             port: request.port,
             key: request.key,
+            remote_exec_wrapper: request.remote_exec_wrapper,
             passphrase: request.passphrase,
         };
         // The entry point's resolved session intent (issue #707,
@@ -1767,22 +1778,6 @@ fn drain_render_backlog(ch: &PtyChannels, editor: &EditorChannels, watches: &Eng
     }
 }
 
-/// Opaque remote exec wrapper (`docs/spec-remote-exec-wrapper.md`), e.g.
-/// `docker exec -i devenv`, so the daemon and every non-PTY exec command run
-/// one hop deeper than the SSH login. Runtime `RIFT_REMOTE_EXEC_WRAPPER`
-/// (non-empty) wins over the `just promote` compile-time bake
-/// `RIFT_DEFAULT_REMOTE_EXEC_WRAPPER`, mirroring the `RIFT_DAEMON_BINARY` /
-/// `RIFT_DEFAULT_DAEMON_BINARY` and `RIFT_PROJECT_ROOT` /
-/// `RIFT_DEFAULT_PROJECT_ROOT` splits. Both unset/empty yields `None`, which
-/// is byte-for-byte passthrough — a normal host connection.
-fn resolve_remote_exec_wrapper() -> Option<String> {
-    env::var("RIFT_REMOTE_EXEC_WRAPPER")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| option_env!("RIFT_DEFAULT_REMOTE_EXEC_WRAPPER").map(String::from))
-        .filter(|s| !s.trim().is_empty())
-}
-
 async fn run_ssh_session(
     ssh: &SshConfig,
     ch: PtyChannels,
@@ -1801,7 +1796,7 @@ async fn run_ssh_session(
     )
     .await
     .context("SSH connection failed")?
-    .with_remote_exec_wrapper(resolve_remote_exec_wrapper());
+    .with_remote_exec_wrapper(ssh.remote_exec_wrapper.clone());
 
     // Provision the daemon ahead of the terminal: detect the platform, upload the
     // versioned binary when absent, then attach — spawning it detached if none is
