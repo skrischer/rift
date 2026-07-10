@@ -951,9 +951,21 @@ struct CreateEditor {
 pub struct FileTree {
     model: WorktreeModel,
     /// Directories the user has collapsed (their subtrees are hidden). A
-    /// directory absent from this set is expanded — the tree starts fully
-    /// expanded, matching how a fresh snapshot reads.
+    /// directory absent from this set is expanded. Seeded with every
+    /// directory the first time a snapshot completes
+    /// ([`Self::seed_collapsed_on_first_snapshot`]), so the tree defaults to
+    /// fully collapsed; the user's own toggles own it from then on — until a
+    /// project re-root wipes it ([`Self::reset_collapse_seed`]) so the new
+    /// project defaults to collapsed too, instead of inheriting stale
+    /// per-path state from the old one.
     collapsed: HashSet<String>,
+    /// First-load guard for the default-collapsed seeding (#795,
+    /// `docs/spec-dogfooding-fixes.md`): set the moment a worktree snapshot
+    /// completes, so a later same-project snapshot (reconnect) never
+    /// re-collapses directories the user has since expanded. Cleared by
+    /// [`Self::reset_collapse_seed`] on a project re-root (#738), so the
+    /// next completed snapshot re-seeds for the new project.
+    collapsed_seeded: bool,
     /// The currently selected entry's path, or `None` when nothing is selected.
     selected: Option<String>,
     /// The multi-select set (artboard **State B**'s discrete flat-surface
@@ -1053,6 +1065,7 @@ impl FileTree {
         Self {
             model: WorktreeModel::default(),
             collapsed: HashSet::new(),
+            collapsed_seeded: false,
             selected: None,
             selection: HashSet::new(),
             scroll_handle: VirtualListScrollHandle::new(),
@@ -1302,6 +1315,41 @@ impl FileTree {
                 self.collapsed.insert(entry.path.clone());
             }
         }
+        self.cache_dirty = true;
+    }
+
+    /// Default the tree to fully collapsed the first time a worktree
+    /// snapshot completes (#795, `docs/spec-dogfooding-fixes.md`) — a
+    /// first-load guard around [`FileTree::collapse_all`]. A no-op on a
+    /// later same-project snapshot (reconnect): `collapsed_seeded` stays set
+    /// so a directory the user has since expanded stays expanded across a
+    /// re-snapshot. [`FileTree::reset_collapse_seed`] clears the guard on a
+    /// project re-root, so this fires again — fresh — for the new project.
+    /// Called from `workspace.rs`'s worktree-message handler right after a
+    /// `WorktreeSnapshot` fold reports it completed the tree (and, on a
+    /// re-root, right after the reset below).
+    pub(crate) fn seed_collapsed_on_first_snapshot(&mut self) {
+        if self.collapsed_seeded {
+            return;
+        }
+        self.collapsed_seeded = true;
+        self.collapse_all();
+    }
+
+    /// Un-set the default-collapsed guard and drop the whole `collapsed` set
+    /// on a project re-root (#795 follow-up, #738, `docs/spec-dogfooding-fixes.md`):
+    /// without this, a switched-to project would inherit the OLD project's
+    /// per-path collapse state — same-named directories (e.g. both projects
+    /// having `src`) would read as collapsed by accident, and every other
+    /// directory would render expanded, since [`FileTree::
+    /// seed_collapsed_on_first_snapshot`] no-ops once `collapsed_seeded` is
+    /// set. Called from `workspace.rs` at the re-root hook, BEFORE
+    /// `seed_collapsed_on_first_snapshot` runs for the switch-completing
+    /// snapshot, so that call re-seeds the new project from a clean slate
+    /// instead of no-opping against the stale guard.
+    pub(crate) fn reset_collapse_seed(&mut self) {
+        self.collapsed_seeded = false;
+        self.collapsed.clear();
         self.cache_dirty = true;
     }
 
@@ -3466,6 +3514,74 @@ mod tests {
 
         assert!(tree.is_collapsed("a"));
         assert!(tree.is_collapsed("b"));
+    }
+
+    // --- default-collapsed explorer on first snapshot (#795, `docs/spec-dogfooding-fixes.md`) ---
+
+    #[test]
+    fn test_seed_collapsed_on_first_snapshot_collapses_every_directory() {
+        let mut tree = seed(vec![
+            dir("a"),
+            dir("a/b"),
+            file("a/b/c.rs"),
+            dir("z"),
+            file("top.rs"),
+        ]);
+
+        tree.seed_collapsed_on_first_snapshot();
+
+        assert!(tree.is_collapsed("a"));
+        assert!(tree.is_collapsed("a/b"));
+        assert!(tree.is_collapsed("z"));
+        assert!(tree.all_dirs_collapsed());
+    }
+
+    #[test]
+    fn test_seed_collapsed_on_first_snapshot_does_not_recollapse_a_user_expanded_dir_on_a_later_snapshot(
+    ) {
+        let mut tree = seed(vec![dir("a"), file("a/x.rs"), dir("b"), file("b/y.rs")]);
+        tree.seed_collapsed_on_first_snapshot();
+        assert!(tree.all_dirs_collapsed());
+
+        // The user opens what they need.
+        tree.toggle_dir("a");
+        assert!(!tree.is_collapsed("a"));
+
+        // A later snapshot (reattach, project switch, #738 re-root) completes
+        // with the same tree; the first-load guard must not fire again.
+        tree.model_mut().apply_snapshot_chunk(
+            "/proj".into(),
+            vec![dir("a"), file("a/x.rs"), dir("b"), file("b/y.rs")],
+            true,
+        );
+        tree.seed_collapsed_on_first_snapshot();
+
+        assert!(
+            !tree.is_collapsed("a"),
+            "a directory the user expanded stays expanded across a re-snapshot"
+        );
+        assert!(
+            tree.is_collapsed("b"),
+            "a directory the user never touched keeps its original collapsed default"
+        );
+    }
+
+    #[test]
+    fn test_reveal_expands_the_target_path_after_the_default_collapsed_seed() {
+        let mut tree = seed(vec![
+            dir("src"),
+            dir("src/nested"),
+            file("src/nested/main.rs"),
+        ]);
+        tree.seed_collapsed_on_first_snapshot();
+        assert!(tree.is_collapsed("src"));
+        assert!(tree.is_collapsed("src/nested"));
+
+        tree.reveal("src/nested/main.rs");
+
+        assert!(!tree.is_collapsed("src"));
+        assert!(!tree.is_collapsed("src/nested"));
+        assert_eq!(tree.selected(), Some("src/nested/main.rs"));
     }
 
     // --- workspace-root row whole-tree collapse (`docs/spec-explorer-polish.md`, #710) ---
