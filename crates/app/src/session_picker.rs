@@ -18,6 +18,7 @@
 //! swap on a pick.
 
 use gpui::*;
+use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 use gpui_component::{h_flex, v_flex, ActiveTheme, Icon, IconName};
 
 use rift_terminal::SessionListItem;
@@ -104,6 +105,10 @@ pub struct SessionPicker {
     ssh_label: SharedString,
     rows: Vec<SessionRow>,
     focus_handle: FocusHandle,
+    /// Tracks the rows region's scroll offset (issue #804): shared between
+    /// the scrolling `v_flex` (`.track_scroll`) and the overlay [`Scrollbar`]
+    /// so the thumb reflects and drives the same scroll position.
+    scroll_handle: ScrollHandle,
 }
 
 impl SessionPicker {
@@ -121,6 +126,7 @@ impl SessionPicker {
             ssh_label,
             rows: build_rows(sessions, order),
             focus_handle: cx.focus_handle(),
+            scroll_handle: ScrollHandle::default(),
         }
     }
 
@@ -336,12 +342,25 @@ impl Render for SessionPicker {
             // Bounded height + internal scroll (issue #792): a short list
             // still renders compact since `max_h` only caps growth, and
             // `overflow_y_scroll` only kicks in once the rows exceed it.
-            v_flex()
-                .id("session-picker-rows")
-                .gap(px(4.0))
-                .max_h(px(ROWS_MAX_HEIGHT))
-                .overflow_y_scroll()
-                .children(rows)
+            // The vertical `Scrollbar` (issue #804) is a sibling overlay in
+            // a `relative()` wrapper, bound to the same `scroll_handle` the
+            // rows track via `track_scroll` — gpui-component only paints it
+            // once the tracked content overflows the capped height, so a
+            // short list still stays scrollbar-free.
+            div()
+                .relative()
+                .child(
+                    v_flex()
+                        .id("session-picker-rows")
+                        .gap(px(4.0))
+                        .max_h(px(ROWS_MAX_HEIGHT))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll_handle)
+                        .children(rows),
+                )
+                .child(
+                    Scrollbar::vertical(&self.scroll_handle).scrollbar_show(ScrollbarShow::Always),
+                )
                 .into_any_element()
         };
 
