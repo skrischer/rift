@@ -59,6 +59,10 @@
 | 40 | Mid-session session lifecycle — killing or exiting the active session returns to the pre-cockpit picker (the session picker if ≥1 session remains — always, even for one; else the zero-sessions root picker) while keeping the SSH/daemon connection alive; the connection screen is entered only on a real transport loss, so "session ended" stops meaning "disconnected" | [spec-session-lifecycle.md](spec-session-lifecycle.md) | [Phase 400](https://github.com/skrischer/rift/milestone/58) |
 | 41 | Retire the `RIFT_PROJECT_ROOT` env root — the daemon's watched root is no longer a baked launch default (`RIFT_PROJECT_ROOT` / `RIFT_DEFAULT_PROJECT_ROOT`); it starts root-less and follows the active session's `@root` (or `session_path` for externally-created sessions), superseding the single global seed that leaked a host path into a remote session. Mirrors Phase 38 for the project root; completes the Phase 34–36 session↔root coupling | [spec-retire-project-root-env.md](spec-retire-project-root-env.md) | [Phase 410](https://github.com/skrischer/rift/milestone/60) |
 | 42 | Clone-a-repository into a new session — a "Clone from URL" path in the new-session / root-picker flow: enter a git URL, the daemon clones it (`gix`) into the browsed parent as `<parent>/<name>`, then a session is created rooted at the checkout (`@root` stamped), binding clone → session=project in one step. Closes the cold-start gap (connecting to a parent like `/workspace` with nothing cloned yet); extends the root picker (Frame C). Foundation impact: a new `crates/protocol` clone channel (`PROTOCOL_VERSION` bump) + daemon git-clone (gix), authored + ratified at this phase's /loopkit:plan spec-acceptance | [spec-clone-repo.md](spec-clone-repo.md) | [Phase 420](https://github.com/skrischer/rift/milestone/61) |
+| 43 | Host resource telemetry core — the daemon samples host CPU / RAM / swap / load average via `sysinfo` (/proc) on a timer, pushes a new host-metrics message (`PROTOCOL_VERSION` bump), and surfaces an always-visible compact status-line indicator (RAM% / CPU%). The dogfooding root: intensive sessions hit the host RAM limit and today only the Windows Task Manager shows it (the WSL VM from outside); the daemon runs inside the host and reads /proc directly. Foundation impact: constitution — the "exactly two signals (PTY bytes + filesystem events)" principle is extended to admit host resource state (/proc) as a third agent-agnostic observable; architecture — the daemon gains a periodic resource sampler + host-metrics channel. New dependency `sysinfo` (MIT), named in the spec. Authored + ratified at this phase's /loopkit:plan spec-acceptance | — | — |
+| 44 | Memory-pressure warning — a proactive warning before the host wedges, on a portable baseline (`MemAvailable` ratio + swap-in-use + load trend) that works on every host incl. WSL2, with Linux PSI (`/proc/pressure/memory`) as an optional enhancement gated on file existence (the stock `microsoft-standard-WSL2` kernel ships no `CONFIG_PSI` — confirmed live, so PSI is absent on the dogfooding host); warning UX = indicator recolour + toast. Depends on 43 | — | — |
+| 45 | Per-pane resource attribution — `pane_pid` → /proc process-subtree RSS / CPU roll-up per tmux pane, surfaced as a per-pane breakdown popover ("which pane is the cause"); strictly agent-agnostic — the pane label is `pane_current_command` / `pane_title`, never agent detection. Extends the phase-43 host-metrics channel with per-pane metrics. Depends on 43 | — | — |
+| 46 | Telemetry detail + disk headroom — a detail popover (memory breakdown used / cached / buffers / available, load 1·5·15, uptime, cores), a client-side sparkline history (trend toward the limit), and a project-filesystem disk-headroom indicator (worktree `target/` dirs are heavy). Depends on 43 | — | — |
 
 A phase gets a Spec link once `/loopkit:plan` drafts it, and a Milestone link once
 it is `READY`. The milestone (open/closed + issue progress) is where status lives.
@@ -347,6 +351,57 @@ transport-loss distinction** (only a transport loss routes to the connection scr
 Authored + ratified in the phase's `/loopkit:plan` spec PR, never here.
 
 Backing prior art: "Mid-session session lifecycle — prior-art index (Phase 40)" in
+[prior-art.md](prior-art.md).
+
+## Host resource telemetry (phases 43–46)
+
+Seeded 2026-07-11 from idea sparring (research mode: websearch) — a dogfooding
+result. Intensive sessions hit the host RAM limit, and today the only way to see it
+is the Windows Task Manager, which shows the WSL VM from *outside* as one opaque
+number. rift's daemon already runs *inside* the host and reads /proc-shaped signals
+for files / git / LSP; host resource telemetry is the same reactive-signal pattern
+with a new source — the daemon becomes the host's own vantage point, fully
+agent-agnostic (/proc knows nothing about agents). This block surfaces host resource
+state reactively in the cockpit — no second tool — and (Phase 45) attributes it to
+the tmux pane that is causing the pressure.
+
+Existence check: btop / bottom (btm) / htop / glances / netdata all show host
+resources — but in a *separate* tool/pane, exactly the "open the Task Manager"
+context-switch this block removes. Verdict: reference-only, except `sysinfo` (MIT),
+adopted as the metrics dependency so there is no hand-rolled /proc parser.
+
+Ordering is a **fan-out, not a chain**: **43 (core)** is the foundation — the /proc
+sampler, the host-metrics protocol channel, and the status-line indicator — that
+**44 (warning)**, **45 (attribution)**, and **46 (enrichment)** each build on; the
+latter three depend only on 43 and are otherwise independent.
+
+PSI reality-check (settled in sparring, recorded here): the stock
+`microsoft-standard-WSL2` kernel ships without `CONFIG_PSI`, so `/proc/pressure` is
+absent on the developer's own host (confirmed live). Phase 44's guaranteed signal is
+therefore the portable `MemAvailable` / swap / load baseline (works on VPS + WSL);
+PSI is an optional enhancement gated on file existence, never the primary path.
+
+Foundation impact (authored and ratified in each phase's `/loopkit:plan` spec PR,
+never edited from here):
+
+- Phase 43 — **constitution**: the architecture principle "All IDE features derive
+  from exactly two signals — PTY byte streams and filesystem events" is extended to
+  admit **host resource state read from /proc** as a third agent-agnostic observable
+  (still a side effect, never agent internals). **architecture.md**: the daemon gains
+  a periodic resource sampler and a host-metrics push channel. **protocol** gains the
+  host-metrics message — a deliberate API addition (`PROTOCOL_VERSION` bump). New
+  dependency `sysinfo` (MIT, `cargo deny`-clean), named in the spec.
+- Phase 44 — none to the foundation docs (43 already admits the /proc signal); the
+  host-metrics message gains pressure fields (a protocol extension). The portable
+  baseline is the guaranteed path; PSI stays optional and file-gated.
+- Phase 45 — **protocol** gains per-pane metrics (extends the phase-43 host-metrics
+  channel). Guardrail: the per-pane label derives from `pane_current_command` /
+  `pane_title`, never agent detection (constitution: "No agent detection").
+- Phase 46 — none to the foundation docs; the metrics message may gain disk +
+  memory-breakdown fields (a protocol extension); the sparkline history is a
+  client-side ring buffer.
+
+Backing prior art: "Host resource telemetry — prior-art index (Phases 43–46)" in
 [prior-art.md](prior-art.md).
 
 ## Tracks (tooling/DX, not product phases)
