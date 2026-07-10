@@ -189,10 +189,11 @@ PR, never edited from here):
   stays 8; this is a client-only (`[terminal]`/`[app]`) phase.
 - Phase 33 — the connection flow evolves to connect → session-pick → cockpit,
   and the connect card's Session field + `DEFAULT_SESSION` are removed. The ENTRY
-  POINT decides (planning refinement): `RIFT_SESSION` (env) attaches directly
-  (dogfooding fast-path), a recent-connection reattaches its remembered session if
-  present on the host else shows the picker, and the "Connect →" button always
-  shows the picker. `app`-only, no protocol/daemon change (the picker drives the
+  POINT decides (planning refinement): a recent-connection reattaches its remembered
+  session if present on the host else shows the picker, and the "Connect →" button
+  always shows the picker. (Phase 33 also shipped a `RIFT_SESSION` env fast-path that
+  attached directly; Phase 38 retired it — connect-and-list is now the default on
+  every launch, with no fixed-session bypass.) `app`-only, no protocol/daemon change (the picker drives the
   existing `QuerySessionList` + `Attach` and reuses phase 32's session-row
   component). Foundation impact ratified in phase 33's spec PR (#688): the phase-20
   `docs/architecture.md` "Connection robustness contract" gained two amendments —
@@ -252,8 +253,9 @@ never edited from here):
   in sparring (recorded in the spec's decision log at plan time): the picker
   supersedes the zero-sessions empty-state screen (with no sessions, Connect opens
   the picker directly; the session list shows only when sessions exist), the session
-  name defaults to the folder basename, and `RIFT_SESSION` stays the picker-skipping
-  fast-path.
+  name defaults to the folder basename. (Phase 36 kept `RIFT_SESSION` as a
+  picker-skipping fast-path; Phase 38 retired it — connect-and-list is now the default
+  on every launch, with no fixed-session bypass.)
 
 Open design decisions deferred to each phase's `/loopkit:plan` spec (never a
 roadmap guess): phase 34 — whether the root is set once via the session default
