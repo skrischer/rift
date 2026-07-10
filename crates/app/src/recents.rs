@@ -36,6 +36,13 @@ pub struct RecentConnection {
     /// through a text input either way).
     pub key: String,
     pub session: String,
+    /// The connect card's Remote exec wrapper field value at connect time
+    /// (issue #790, `docs/spec-remote-exec-wrapper-ui.md`), e.g.
+    /// `docker exec -i devenv`; empty for a normal host connection. Additive
+    /// over the pre-#790 schema — `#[serde(default)]` on the struct plus this
+    /// hand-written `Default` keep a field-absent entry (written before this
+    /// change) loading as `""` (the tolerant-load contract, #477).
+    pub remote_exec_wrapper: String,
     /// Unix seconds this entry was last connected (or reconnected) with —
     /// the RECENT row's relative-time caption is computed from this.
     pub last_connected_unix_secs: u64,
@@ -49,6 +56,7 @@ impl Default for RecentConnection {
             port: 22,
             key: String::new(),
             session: String::new(),
+            remote_exec_wrapper: String::new(),
             last_connected_unix_secs: 0,
         }
     }
@@ -58,9 +66,16 @@ impl Default for RecentConnection {
 /// dedupe/move-to-front purposes. The session name is deliberately excluded:
 /// reconnecting to the same host/user/port/key under a different session name
 /// still updates the one existing recent (to the newest session), rather than
-/// growing the list per session tried against the same host.
+/// growing the list per session tried against the same host. The wrapper
+/// (issue #790) joins the key: a container recent (host + wrapper) and a
+/// bare-host recent to the same host are distinct functional targets, so both
+/// stay re-runnable rather than one clobbering the other's wrapper.
 fn same_target(a: &RecentConnection, b: &RecentConnection) -> bool {
-    a.host == b.host && a.user == b.user && a.port == b.port && a.key == b.key
+    a.host == b.host
+        && a.user == b.user
+        && a.port == b.port
+        && a.key == b.key
+        && a.remote_exec_wrapper == b.remote_exec_wrapper
 }
 
 /// Load the recents list at `path`, tolerating everything exactly like
@@ -216,6 +231,7 @@ mod tests {
             port: 22,
             key: "/home/developer/.ssh/id_ed25519".to_string(),
             session: "rift".to_string(),
+            remote_exec_wrapper: String::new(),
             last_connected_unix_secs: 0,
         }
     }
@@ -260,6 +276,44 @@ mod tests {
         save(&path, &recents).expect("save");
 
         assert_eq!(load(&path), recents);
+    }
+
+    #[test]
+    fn test_save_then_load_round_trips_remote_exec_wrapper() {
+        let scratch = Scratch::new("roundtrip_wrapper");
+        let path = scratch.path("recents.json");
+        let mut entry = sample("100.64.0.1");
+        entry.remote_exec_wrapper = "docker exec -i devenv".to_string();
+        let recents = vec![entry];
+
+        save(&path, &recents).expect("save");
+
+        let loaded = load(&path);
+        assert_eq!(loaded, recents);
+        assert_eq!(loaded[0].remote_exec_wrapper, "docker exec -i devenv");
+    }
+
+    #[test]
+    fn test_load_field_absent_remote_exec_wrapper_defaults_to_empty() {
+        let scratch = Scratch::new("wrapper_absent");
+        let path = scratch.path("recents.json");
+        // Hand-written JSON without `remote_exec_wrapper`, simulating an
+        // entry written before this field existed (#790's tolerant-load
+        // contract, #477).
+        let json = r#"[{
+            "host": "100.64.0.1",
+            "user": "developer",
+            "port": 22,
+            "key": "/home/developer/.ssh/id_ed25519",
+            "session": "rift",
+            "last_connected_unix_secs": 1000
+        }]"#;
+        fs::write(&path, json).expect("write field-absent json");
+
+        let recents = load(&path);
+
+        assert_eq!(recents.len(), 1);
+        assert_eq!(recents[0].remote_exec_wrapper, "");
     }
 
     #[test]
@@ -338,6 +392,45 @@ mod tests {
         let recents = record(&path, other_port, 2_000).expect("distinct port");
 
         assert_eq!(recents.len(), 2, "differing port is a distinct target");
+    }
+
+    #[test]
+    fn test_same_target_same_host_different_wrapper_is_not_same_target() {
+        let mut container = sample("100.64.0.1");
+        container.remote_exec_wrapper = "docker exec -i devenv".to_string();
+        let bare_host = sample("100.64.0.1");
+
+        assert!(
+            !same_target(&container, &bare_host),
+            "a container recent and a bare-host recent to the same host are distinct targets"
+        );
+    }
+
+    #[test]
+    fn test_same_target_identical_including_wrapper_is_same_target() {
+        let mut a = sample("100.64.0.1");
+        a.remote_exec_wrapper = "docker exec -i devenv".to_string();
+        let mut b = sample("100.64.0.1");
+        b.remote_exec_wrapper = "docker exec -i devenv".to_string();
+
+        assert!(same_target(&a, &b));
+    }
+
+    #[test]
+    fn test_record_same_host_different_wrapper_stays_distinct() {
+        let scratch = Scratch::new("record_wrapper_distinct");
+        let path = scratch.path("recents.json");
+
+        record(&path, sample("100.64.0.1"), 1_000).expect("bare host record");
+        let mut container = sample("100.64.0.1");
+        container.remote_exec_wrapper = "docker exec -i devenv".to_string();
+        let recents = record(&path, container, 2_000).expect("container record");
+
+        assert_eq!(
+            recents.len(),
+            2,
+            "same host with a different wrapper is a distinct, re-runnable target"
+        );
     }
 
     #[test]

@@ -189,3 +189,12 @@ container connection can be set up and re-run from the UI without an env var.
   a wrapper yet (#790) — this avoids a `None` regression on the RECENT click
   path for anyone using the env/bake wrapper today; #790 will start
   overwriting the field per-recent once the store carries the value.
+- 2026-07-10: Issue #790 implemented (recents persistence). `RecentConnection`
+  gains an additive `remote_exec_wrapper: String` (`#[serde(default)]` +
+  hand-written `Default`), captured on connect via `RecentTarget` (the single
+  capture point feeding every `record` site in `main.rs`), restored as the
+  connect-card prefill by `connect_from_recent` (now resets the wrapper field
+  like its host/user/port/key siblings, retiring #789's transitional
+  leave-it-untouched behavior), and joined into `same_target`'s dedupe key
+  per the spec's accepted decision. The RECENT row shows a small muted pill
+  with the stored wrapper text, rendered only when non-empty.

@@ -777,9 +777,10 @@ struct RootPickerLaunch {
     state_path: Option<PathBuf>,
 }
 
-/// The host/user/port/key identity for a recents entry (issue #707), captured
-/// once in [`Shell::connect`] before `request`'s fields move into the
-/// `SshConfig`. `SessionIntent::Fixed` records immediately (the session is
+/// The host/user/port/key/wrapper identity for a recents entry (issue #707,
+/// wrapper added by #790), captured once in [`Shell::connect`] before
+/// `request`'s fields move into the `SshConfig`. `SessionIntent::Fixed`
+/// records immediately (the session is
 /// already known, matching #706's eager record byte-for-byte);
 /// `Preferred`/`Pick` defer the actual [`recents::record`] call until the
 /// session resolves (a [`PickerOutcome::Attached`] or a picker pick), so the
@@ -790,6 +791,10 @@ struct RecentTarget {
     user: String,
     port: u16,
     key: String,
+    /// The connect-time Remote exec wrapper field value (issue #790), empty
+    /// for a normal host connection — persisted onto the recorded
+    /// [`RecentConnection`] so a container recent stays re-runnable.
+    remote_exec_wrapper: String,
 }
 
 impl RecentTarget {
@@ -801,6 +806,7 @@ impl RecentTarget {
             port: self.port,
             key: self.key.clone(),
             session: session.to_string(),
+            remote_exec_wrapper: self.remote_exec_wrapper.clone(),
             last_connected_unix_secs: now,
         };
         if let Err(e) = recents::record(path, entry, now) {
@@ -905,6 +911,7 @@ impl Shell {
             user: request.user.clone(),
             port: request.port,
             key: request.key.display().to_string(),
+            remote_exec_wrapper: request.remote_exec_wrapper.clone().unwrap_or_default(),
         };
         if let SessionIntent::Fixed(name) = &request.session_intent {
             if let Some(path) = &self.recents_path {
