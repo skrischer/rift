@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
 mod browse;
 mod buffer;
+mod clone;
 mod diff;
 mod file_ops;
 mod git_write;
@@ -244,6 +246,12 @@ const KEEP_WARM_EVENT_CAPACITY: usize = 16;
 /// references answers to. Nav responses are user-paced (one per hover or click),
 /// so a small buffer absorbs a burst without ever backing up the worker.
 const NAV_REPLY_CAPACITY: usize = 32;
+
+/// Per-connection clone-reply channel bound (#828, `docs/spec-clone-repo.md`):
+/// the private inbox each connection's detached `clone::run` tasks post their
+/// single `CloneResult` to. A clone is an operator-paced, rare action (unlike
+/// terminal or nav traffic), so a small buffer is ample.
+const CLONE_REPLY_CAPACITY: usize = 8;
 
 /// Queue depth for worktree events flowing from the blocking worker into the
 /// dispatch loop. Bounds how far the worker may run ahead while the loop is busy.
@@ -1042,6 +1050,18 @@ where
     let (nav_reply_tx, mut nav_reply_rx) = mpsc::channel::<DaemonMessage>(NAV_REPLY_CAPACITY);
     let mut nav_gate = NavStaleGate::default();
 
+    // This connection's private clone reply path (#828, `docs/spec-clone-repo.md`):
+    // each `CloneRepo` is answered by a DETACHED task (`clone::run`, spawned
+    // below, never awaited inline) that posts its single `CloneResult` here
+    // and only here — mirroring the nav reply path above, minus the
+    // staleness gate (a clone reply always answers exactly the request that
+    // spawned it, no superseding). `clone_interrupts` tracks each in-flight
+    // clone's cooperative interrupt flag so every one still running is
+    // flipped when this connection ends, instead of running unbounded after
+    // nothing is left to hear its answer.
+    let (clone_reply_tx, mut clone_reply_rx) = mpsc::channel::<DaemonMessage>(CLONE_REPLY_CAPACITY);
+    let mut clone_interrupts: Vec<Arc<AtomicBool>> = Vec::new();
+
     // This connection's own tmux attach: terminal `ClientMessage`s are routed to
     // a dedicated `terminal_task` (each client gets its own `tmux -C` child), and
     // its outbound events are multiplexed onto this socket alongside the shared
@@ -1214,19 +1234,33 @@ where
                             writer.write_all(&frame).await?;
                             writer.flush().await?;
                         }
-                        // The clone request (`docs/spec-clone-repo.md`, #827)
+                        // The clone request (`docs/spec-clone-repo.md`, #828)
                         // is a request/reply pair too, but — unlike every
                         // other arm above — it must NOT be awaited inline
                         // here: a clone is unbounded (seconds to minutes), so
                         // awaiting it in this loop would stall this
                         // connection's terminal output and every other
-                        // inbound message for the clone's duration. The
-                        // daemon-side execution (a detached `spawn_blocking`
-                        // task posting one `CloneResult` on completion) lands
-                        // in a follow-on issue (#828); this arm is a
-                        // placeholder no-op until then, deliberately not
-                        // wired the way `QueryDirEntries` is above.
-                        ClientMessage::CloneRepo { .. } => {}
+                        // inbound message for the clone's duration. Spawn a
+                        // DETACHED task instead: dispatch returns immediately,
+                        // the task runs the clone (`clone::run`, itself
+                        // `spawn_blocking` internally) and posts the single
+                        // `CloneResult` on `clone_reply_tx` — this
+                        // connection's own private inbox, drained by the
+                        // `clone_reply_rx` branch below, mirroring the nav
+                        // reply path. `should_interrupt` is tracked in
+                        // `clone_interrupts` so it can be flipped when this
+                        // connection ends (below), the cooperative
+                        // cancellation gix's `fetch_then_checkout`/
+                        // `main_worktree` honor.
+                        ClientMessage::CloneRepo { .. } => {
+                            let should_interrupt = Arc::new(AtomicBool::new(false));
+                            clone_interrupts.push(should_interrupt.clone());
+                            let reply_tx = clone_reply_tx.clone();
+                            tokio::spawn(async move {
+                                let reply = clone::run(msg, should_interrupt).await;
+                                let _ = reply_tx.send(reply).await;
+                            });
+                        }
                         // The live-buffer feed goes to the shared loop: the LSP
                         // worker that consumes the buffer events lives off that
                         // single loop (one document model + servers for the
@@ -1392,7 +1426,35 @@ where
                     }
                 }
             }
+            // This connection's private clone answers (#828), off the shared
+            // bus: each detached `clone::run` task (spawned by the
+            // `CloneRepo` arm above) sends its single `CloneResult` here.
+            // Unlike nav, no staleness gate — a clone reply always answers
+            // exactly the request that spawned it. `clone_reply_tx` is held
+            // by this task for the connection's lifetime (and by every
+            // still-running clone task), so this branch never yields `None`
+            // — no guard is needed and it cannot busy-loop.
+            clone_reply = clone_reply_rx.recv() => {
+                if let Some(msg) = clone_reply {
+                    if handshaken {
+                        let frame = encode_frame(&msg)?;
+                        writer.write_all(&frame).await?;
+                        writer.flush().await?;
+                    }
+                }
+            }
         }
+    }
+
+    // Interrupt every clone this connection started that is still running
+    // (#828, `docs/spec-clone-repo.md`): nothing is left to hear its
+    // `CloneResult` once this connection is gone, so flipping the flag here
+    // lets gix's cooperative check inside `fetch_then_checkout`/
+    // `main_worktree` abort it instead of running unbounded. A clone that
+    // already finished holds no other reference to its flag, so this is a
+    // no-op for it.
+    for should_interrupt in &clone_interrupts {
+        should_interrupt.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     // End this connection's tmux attach. The task then detaches the control
