@@ -86,6 +86,7 @@ use rift_protocol::{
     ClientMessage, DaemonMessage, DirBrowseError, DirEntry, EntryKind, LspServerState,
 };
 use rift_terminal::{SessionView, SessionViewEvent};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::activity_rail;
@@ -348,8 +349,20 @@ pub struct WorkspaceChannels {
 /// center `h_split` half. `Diagnostics`/`Git` are the existing bottom/right
 /// docks. The Terminal is always visible in this issue (becoming toggleable
 /// is issue #821).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Area {
+///
+/// `Serialize`/`Deserialize` (issue #822, `window_state.rs`) use
+/// `rename_all = "snake_case"` tags (`"explorer_editor"`, `"terminal"`, ...)
+/// so the persisted JSON stays readable; `window_state.rs` deserializes each
+/// entry independently and drops one that fails to match a known variant
+/// (a future/older schema's area) instead of failing the whole array — see
+/// `window_state::deserialize_tolerant_areas`.
+// `pub`, not `pub(crate)`: `window_state::WindowState`'s `visible_areas`/
+// `solo_area` fields are `pub` (mirroring every other `WindowState` field,
+// e.g. `DiffViewMode`), and a public field cannot expose a less-visible
+// type (`private_interfaces`, denied workspace-wide).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Area {
     ExplorerEditor,
     Terminal,
     Diagnostics,
@@ -357,8 +370,10 @@ pub(crate) enum Area {
 }
 
 impl Area {
-    /// Every area, in the rail's left-to-right order.
-    const ALL: [Area; 4] = [
+    /// Every area, in the rail's left-to-right order — also
+    /// `window_state::default_visible_areas`'s source of truth for
+    /// `WindowState::default`'s all-visible seed (issue #822).
+    pub(crate) const ALL: [Area; 4] = [
         Area::ExplorerEditor,
         Area::Terminal,
         Area::Diagnostics,
@@ -388,16 +403,32 @@ pub(crate) struct Visibility {
 }
 
 impl Visibility {
-    /// Every area visible, no solo target — the fallback default an absent
-    /// (or old-format) persisted state loads to (issue #822). `WorkspaceView::
-    /// new` mirrors the dock tree's own construction-time seeding instead of
-    /// using this directly, until #822 replaces that seeding with a loaded
-    /// `Visibility`.
-    fn all_visible() -> Self {
+    /// Build from a persisted visible-area list + solo target
+    /// (`WindowState::visible_areas`/`solo_area`, issue #822):
+    /// `window_state`'s tolerant deserializer has already dropped any
+    /// unrecognized `Area` entry before this runs, so this only rebuilds the
+    /// set from what is left — an empty `visible_areas` (a corrupted-but-
+    /// parseable store) starts with nothing visible rather than silently
+    /// substituting `Area::ALL`'s all-visible default, since that degenerate
+    /// case is indistinguishable from a deliberately-cleared set at this
+    /// layer. `WorkspaceView::new` reaches the all-visible/no-solo default
+    /// through this same constructor: `window_state::load` already degrades
+    /// an absent/unreadable state file to `WindowState::default`'s
+    /// `visible_areas: Area::ALL.to_vec(), solo_area: None`.
+    fn from_persisted(visible_areas: &[Area], solo_area: Option<Area>) -> Self {
         Self {
-            visible: Area::ALL.into_iter().collect(),
-            solo: None,
+            visible: visible_areas.iter().copied().collect(),
+            solo: solo_area,
         }
+    }
+
+    /// The current visible-area list + solo target in the persisted store's
+    /// shape (`Vec`/`Option`, not `BTreeSet`) — the write half of
+    /// [`Visibility::from_persisted`], read by [`WorkspaceView::
+    /// persist_visibility`] after every [`WorkspaceView::toggle_area`] /
+    /// [`WorkspaceView::toggle_solo_area`] mutation.
+    fn to_persisted(&self) -> (Vec<Area>, Option<Area>) {
+        (self.visible.iter().copied().collect(), self.solo)
     }
 
     /// Whether `area` renders right now: the solo target alone when solo is
@@ -527,10 +558,11 @@ pub struct WorkspaceView {
     /// (`docs/spec-workspace-visibility-rail.md`), authoritative over dock
     /// rendering: the rail's active-icon state and `toggle_area`'s dock-tree
     /// reconciliation both read/mutate this rather than `dock_area`'s own
-    /// per-dock `open` bool. Initialized to mirror the dock tree's own
-    /// construction-time seeding just below (left dock open, right/bottom
-    /// collapsed) rather than [`Visibility::all_visible`] — replacing that
-    /// seeding with a loaded value is issue #822.
+    /// per-dock `open` bool. Seeded from the loaded `WindowState`'s
+    /// `visible_areas`/`solo_area` (issue #822, `window_state.rs`) — an
+    /// absent or unreadable state file degrades to `WindowState::default`'s
+    /// all-visible/no-solo. Every mutation in `toggle_area` is persisted
+    /// back through the same store.
     visibility: Visibility,
     /// The command palette (`docs/spec-command-palette.md`, issue #359): owns
     /// its `ListState` entity for the workspace's lifetime, so reopening it
@@ -1041,6 +1073,24 @@ impl WorkspaceView {
             .detach();
         }
 
+        // Persisted workspace visibility (`docs/spec-workspace-visibility-
+        // rail.md`, issue #822): loaded up front so the dock construction
+        // below seeds each dock's open state and the center split directly
+        // from it, replacing the former hardcoded "left open, right/bottom
+        // collapsed" construction-time seeding. `window_state::load` already
+        // degrades a missing/corrupt/pre-#822 state file (or no
+        // `window_state_path` at all) to `WindowState::default`'s
+        // all-visible/no-solo.
+        let persisted_state = window_state_path
+            .as_deref()
+            .map(window_state::load)
+            .unwrap_or_default();
+        let visibility =
+            Visibility::from_persisted(&persisted_state.visible_areas, persisted_state.solo_area);
+        let explorer_editor_visible = visibility.is_visible(Area::ExplorerEditor);
+        let diagnostics_visible = visibility.is_visible(Area::Diagnostics);
+        let git_visible = visibility.is_visible(Area::Git);
+
         // Dock shell (`docs/spec-ide-shell.md`, issue #324): explorer (left) +
         // editor|terminal (center split) + source control + diff view split
         // (right, #337, #338) + problems panel (bottom, #342). Built after the
@@ -1174,21 +1224,30 @@ impl WorkspaceView {
         .detach();
 
         let left_item = DockItem::tab(file_tree.clone(), &weak_dock_area, window, cx);
-        let center_item = DockItem::h_split(
-            vec![
-                DockItem::tab(editor.clone(), &weak_dock_area, window, cx),
-                DockItem::tab(terminal_panel.clone(), &weak_dock_area, window, cx),
-            ],
-            &weak_dock_area,
-            window,
-            cx,
-        );
-        // Both real, collapsed docks (not placeholder views) — a single-tab
-        // `TabPanel`, collapsed by default until the user opens it. The right
-        // dock is a vertical split (#338): the changed-file list stays compact
-        // on top, the diff view takes the remaining height below it — both
-        // signal panels visible together, matching the review flow (select a
-        // file, read its diff, without switching tabs).
+        // The Explorer+Editor area (issue #822): the center starts as the
+        // editor|terminal split when visible, or the Terminal alone — filling
+        // the freed half — when the loaded state left it hidden, mirroring
+        // `apply_explorer_editor_visibility`'s own branch.
+        let center_item = if explorer_editor_visible {
+            DockItem::h_split(
+                vec![
+                    DockItem::tab(editor.clone(), &weak_dock_area, window, cx),
+                    DockItem::tab(terminal_panel.clone(), &weak_dock_area, window, cx),
+                ],
+                &weak_dock_area,
+                window,
+                cx,
+            )
+        } else {
+            DockItem::tab(terminal_panel.clone(), &weak_dock_area, window, cx)
+        };
+        // Both real docks (not placeholder views) — a single-tab `TabPanel`,
+        // open/collapsed per the loaded visibility below rather than always
+        // collapsed. The right dock is a vertical split (#338): the
+        // changed-file list stays compact on top, the diff view takes the
+        // remaining height below it — both signal panels visible together,
+        // matching the review flow (select a file, read its diff, without
+        // switching tabs).
         let right_item = DockItem::split_with_sizes(
             Axis::Vertical,
             vec![
@@ -1204,9 +1263,27 @@ impl WorkspaceView {
 
         dock_area.update(cx, |dock, cx| {
             dock.set_center(center_item, window, cx);
-            dock.set_left_dock(left_item, Some(px(LEFT_DOCK_WIDTH)), true, window, cx);
-            dock.set_right_dock(right_item, Some(px(RIGHT_DOCK_WIDTH)), false, window, cx);
-            dock.set_bottom_dock(bottom_item, Some(px(BOTTOM_DOCK_HEIGHT)), false, window, cx);
+            dock.set_left_dock(
+                left_item,
+                Some(px(LEFT_DOCK_WIDTH)),
+                explorer_editor_visible,
+                window,
+                cx,
+            );
+            dock.set_right_dock(
+                right_item,
+                Some(px(RIGHT_DOCK_WIDTH)),
+                git_visible,
+                window,
+                cx,
+            );
+            dock.set_bottom_dock(
+                bottom_item,
+                Some(px(BOTTOM_DOCK_HEIGHT)),
+                diagnostics_visible,
+                window,
+                cx,
+            );
         });
 
         // Terminal reflow on dock layout change (#596): toggling or dragging a
@@ -1346,16 +1423,6 @@ impl WorkspaceView {
         })
         .detach();
 
-        // Mirrors the dock tree's own construction-time seeding above (left
-        // dock open, right/bottom collapsed) by toggling the two areas that
-        // start collapsed off the all-visible default — this issue only
-        // rewires the rail's *toggle* mechanic, not the initial layout it
-        // starts from (`docs/spec-workspace-visibility-rail.md`; replacing
-        // this seeding with a loaded value is issue #822).
-        let mut visibility = Visibility::all_visible();
-        visibility.toggle(Area::Diagnostics);
-        visibility.toggle(Area::Git);
-
         Self {
             file_tree,
             editor,
@@ -1488,40 +1555,45 @@ impl WorkspaceView {
         });
     }
 
-    /// Toggle `area`'s membership in the rift-owned visible set and
-    /// reconcile the dock tree to match — the rail's `on_action` handlers
-    /// below call this per [`Area`], replacing the old direct
-    /// `dock_area.toggle_dock` forwarding. `Visibility::toggle` exits solo
-    /// when called while soloed (issue #820), which changes every area's
-    /// effective visibility at once, not just `area`'s — so that case
-    /// reconciles all of them via [`Self::reconcile_visibility`] rather than
-    /// only the clicked one.
+    /// Toggle `area`'s membership in the rift-owned visible set, reconcile
+    /// the dock tree to match, and best-effort persist the new set (issue
+    /// #822) — the rail's `on_action` handlers below call this per [`Area`],
+    /// replacing the old direct `dock_area.toggle_dock` forwarding.
+    /// `Visibility::toggle` exits solo when called while soloed (issue
+    /// #820), which changes every area's effective visibility at once, not
+    /// just `area`'s — so that case reconciles all of them via
+    /// [`Self::reconcile_visibility`] rather than only the clicked one.
     fn toggle_area(&mut self, area: Area, window: &mut Window, cx: &mut Context<Self>) {
         let was_soloed = self.visibility.solo.is_some();
         self.visibility.toggle(area);
         if was_soloed {
             self.reconcile_visibility(window, cx);
-            return;
+        } else {
+            self.apply_area_visibility(area, self.visibility.is_visible(area), window, cx);
         }
-        self.apply_area_visibility(area, self.visibility.is_visible(area), window, cx);
+        self.persist_visibility();
     }
 
-    /// Toggle `area` as the solo target — the per-area header button's
-    /// solo/zoom trigger (issue #820, dispatched as a `Solo*` action from
-    /// each panel's `toolbar_buttons()`) and [`Self::zoom_active_panel`]'s
-    /// focus-based command-palette path. Entering or exiting solo changes
-    /// every area's effective visibility at once, so this always
-    /// reconciles all of them rather than only the target.
+    /// Toggle `area` as the solo target and best-effort persist the new solo
+    /// target (issue #822) — the per-area header button's solo/zoom trigger
+    /// (issue #820, dispatched as a `Solo*` action from each panel's
+    /// `toolbar_buttons()`) and [`Self::zoom_active_panel`]'s focus-based
+    /// command-palette path. Entering or exiting solo changes every area's
+    /// effective visibility at once, so this always reconciles all of them
+    /// rather than only the target.
     fn toggle_solo_area(&mut self, area: Area, window: &mut Window, cx: &mut Context<Self>) {
         self.visibility.toggle_solo(area);
         self.reconcile_visibility(window, cx);
+        self.persist_visibility();
     }
 
     /// Reconcile every area's dock rendering with its current
     /// [`Visibility::is_visible`] — unlike a plain rail toggle (which only
     /// ever changes one area's own effective visibility and can call just
     /// its matching `apply_*_visibility`), a solo transition changes what
-    /// every area's `is_visible` returns at once.
+    /// every area's `is_visible` returns at once. Callers persist once
+    /// themselves afterward; looping `apply_area_visibility` per area here
+    /// must not also persist per area (redundant saves of the same result).
     fn reconcile_visibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for area in Area::ALL {
             let visible = self.visibility.is_visible(area);
@@ -1545,6 +1617,21 @@ impl WorkspaceView {
             Area::Diagnostics => self.apply_diagnostics_visibility(visible, window, cx),
             Area::Git => self.apply_git_visibility(visible, window, cx),
             Area::Terminal => {}
+        }
+    }
+
+    /// Best-effort persist the current visibility set + solo target into the
+    /// window-state store (issue #822), mirroring `DiffView::set_view_mode`'s
+    /// "the live change already applied regardless, only log on failure"
+    /// contract. A missing `window_state_path` (no platform state directory
+    /// resolved at startup) silently no-ops, like every other save site.
+    fn persist_visibility(&self) {
+        let Some(path) = self.window_state_path.as_deref() else {
+            return;
+        };
+        let (visible_areas, solo_area) = self.visibility.to_persisted();
+        if let Err(e) = window_state::save_visibility(path, visible_areas, solo_area) {
+            warn!(%e, "failed to persist workspace visibility");
         }
     }
 
@@ -2360,7 +2447,7 @@ mod tests {
 
     #[test]
     fn test_visibility_all_visible_marks_every_area_visible() {
-        let visibility = Visibility::all_visible();
+        let visibility = Visibility::from_persisted(&Area::ALL, None);
         for area in Area::ALL {
             assert!(visibility.is_visible(area), "{area:?} should start visible");
         }
@@ -2368,7 +2455,7 @@ mod tests {
 
     #[test]
     fn test_toggle_hides_one_area_and_a_second_toggle_restores_it() {
-        let mut visibility = Visibility::all_visible();
+        let mut visibility = Visibility::from_persisted(&Area::ALL, None);
 
         visibility.toggle(Area::Git);
         assert!(!visibility.is_visible(Area::Git), "Git is now hidden");
@@ -2412,7 +2499,7 @@ mod tests {
     /// solo-toggle entry point rather than a hand-built `Visibility`.
     #[test]
     fn test_toggle_solo_on_a_non_terminal_area_hides_the_terminal_too() {
-        let mut visibility = Visibility::all_visible();
+        let mut visibility = Visibility::from_persisted(&Area::ALL, None);
 
         visibility.toggle_solo(Area::Diagnostics);
 
@@ -2433,7 +2520,7 @@ mod tests {
     /// Terminal as the target rather than the odd one out.
     #[test]
     fn test_toggle_solo_on_the_terminal_shows_only_the_terminal() {
-        let mut visibility = Visibility::all_visible();
+        let mut visibility = Visibility::from_persisted(&Area::ALL, None);
 
         visibility.toggle_solo(Area::Terminal);
 
@@ -2448,7 +2535,7 @@ mod tests {
     /// `visible` membership, so nothing here needed re-adding.
     #[test]
     fn test_toggle_solo_on_the_soloed_area_again_exits_solo() {
-        let mut visibility = Visibility::all_visible();
+        let mut visibility = Visibility::from_persisted(&Area::ALL, None);
         visibility.toggle(Area::Git); // Git starts hidden, pre-solo.
 
         visibility.toggle_solo(Area::Diagnostics);
@@ -2470,7 +2557,7 @@ mod tests {
     /// exactly like every other non-target area.
     #[test]
     fn test_toggle_solo_on_a_different_area_switches_the_target() {
-        let mut visibility = Visibility::all_visible();
+        let mut visibility = Visibility::from_persisted(&Area::ALL, None);
         visibility.toggle_solo(Area::Diagnostics);
 
         visibility.toggle_solo(Area::Git);
@@ -2487,7 +2574,7 @@ mod tests {
     /// area exits solo, keeping that area visible among the restored set.
     #[test]
     fn test_toggle_area_on_the_soloed_area_exits_solo_and_keeps_it_visible() {
-        let mut visibility = Visibility::all_visible();
+        let mut visibility = Visibility::from_persisted(&Area::ALL, None);
         visibility.toggle_solo(Area::Diagnostics);
 
         visibility.toggle(Area::Diagnostics);
@@ -2505,7 +2592,7 @@ mod tests {
     /// it", not a blind flip of a membership bit solo made irrelevant.
     #[test]
     fn test_toggle_area_on_a_different_area_while_soloed_exits_solo_and_shows_it() {
-        let mut visibility = Visibility::all_visible();
+        let mut visibility = Visibility::from_persisted(&Area::ALL, None);
         visibility.toggle(Area::Git); // Git hidden before solo engages.
         visibility.toggle_solo(Area::Diagnostics);
 
@@ -2520,6 +2607,42 @@ mod tests {
             visibility.is_visible(Area::Diagnostics),
             "the previously-soloed area stays visible too (never removed from the set)"
         );
+    }
+
+    // --- persisted-shape adapter (issue #822) -----------------------------
+
+    #[test]
+    fn test_from_persisted_rebuilds_the_visible_set_and_solo() {
+        let visibility =
+            Visibility::from_persisted(&[Area::Terminal, Area::Git], Some(Area::Terminal));
+
+        assert!(visibility.is_visible(Area::Terminal), "the solo target");
+        for area in [Area::ExplorerEditor, Area::Diagnostics, Area::Git] {
+            assert!(
+                !visibility.is_visible(area),
+                "{area:?} is hidden while Terminal is soloed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_persisted_empty_list_starts_with_nothing_visible() {
+        let visibility = Visibility::from_persisted(&[], None);
+
+        for area in Area::ALL {
+            assert!(!visibility.is_visible(area), "{area:?} should be hidden");
+        }
+    }
+
+    #[test]
+    fn test_to_persisted_round_trips_through_from_persisted() {
+        let mut visibility = Visibility::from_persisted(&Area::ALL, None);
+        visibility.toggle(Area::Diagnostics);
+
+        let (visible_areas, solo_area) = visibility.to_persisted();
+        let rebuilt = Visibility::from_persisted(&visible_areas, solo_area);
+
+        assert_eq!(rebuilt, visibility);
     }
 
     // --- unsaved-changes window-close guard message (spec-v1-hardening) -------
@@ -2652,12 +2775,14 @@ mod tests {
         }
     }
 
-    /// Panel-tree construction (`docs/spec-ide-shell.md`, issue #324): the
-    /// default layout must put the explorer in an open left dock, an
-    /// editor|terminal horizontal split in the center, and collapsed (but
-    /// real) right/bottom docks — the gate decision the spec pins.
+    /// Panel-tree construction (`docs/spec-ide-shell.md`, issue #324;
+    /// updated by `docs/spec-workspace-visibility-rail.md`, issue #822): with
+    /// no persisted state (`window_state_path: None`), the workspace seeds
+    /// from `WindowState::default`'s all-areas-visible `visible_areas` — the
+    /// explorer, the editor|terminal split, and real, *open* right/bottom
+    /// docks, not the old hardcoded collapsed right/bottom.
     #[gpui::test]
-    fn test_default_layout_has_left_explorer_center_split_and_collapsed_right_bottom(
+    fn test_default_layout_has_left_explorer_center_split_and_all_areas_visible(
         cx: &mut TestAppContext,
     ) {
         let mut workspace: Option<Entity<WorkspaceView>> = None;
@@ -2687,8 +2812,8 @@ mod tests {
 
             let right_dock = dock_area.right_dock().expect("right dock must exist");
             assert!(
-                !dock_area.is_dock_open(DockPlacement::Right, cx),
-                "right dock starts collapsed"
+                dock_area.is_dock_open(DockPlacement::Right, cx),
+                "right dock starts open (Git is visible by default)"
             );
             match right_dock.read(cx).panel() {
                 DockItem::Split { axis, items, .. } => {
@@ -2725,8 +2850,8 @@ mod tests {
 
             assert!(dock_area.bottom_dock().is_some(), "bottom dock must exist");
             assert!(
-                !dock_area.is_dock_open(DockPlacement::Bottom, cx),
-                "bottom dock starts collapsed"
+                dock_area.is_dock_open(DockPlacement::Bottom, cx),
+                "bottom dock starts open (Diagnostics is visible by default)"
             );
 
             match dock_area.center() {
@@ -2936,8 +3061,8 @@ mod tests {
                 "the bottom dock exists and now carries the problems panel"
             );
             assert!(
-                !dock_area.read(cx).is_dock_open(DockPlacement::Bottom, cx),
-                "the bottom dock starts collapsed, matching the other reserved docks"
+                dock_area.read(cx).is_dock_open(DockPlacement::Bottom, cx),
+                "the bottom dock starts open (Diagnostics is visible by default, issue #822)"
             );
             assert!(
                 problems_panel.read(cx).summary(cx).groups.is_empty(),
@@ -3207,11 +3332,14 @@ mod tests {
     }
 
     /// Results panel (`docs/spec-editor-chrome.md` §3, #529): showing it adds
-    /// its tab to the right dock and opens the (collapsed-by-default) dock;
-    /// hiding it removes the tab and re-collapses the dock, since the panel is
-    /// why the dock opened. The live inner `TabPanel` (not the stale
-    /// construction-time `DockItem::Tabs { items }` snapshot) is read to see the
-    /// added tab, per the outline test's note.
+    /// its tab to the right dock and opens the dock if collapsed; hiding it
+    /// removes the tab and re-collapses the dock, since the panel is why the
+    /// dock opened. The right dock is visible by default (issue #822), so the
+    /// Git area is explicitly hidden first — mirroring the outline test's
+    /// left-dock note — to exercise `show_results_panel`'s own open/collapse
+    /// tracking rather than reusing an already-open dock. The live inner
+    /// `TabPanel` (not the stale construction-time `DockItem::Tabs { items }`
+    /// snapshot) is read to see the added tab.
     #[gpui::test]
     fn test_show_and_hide_results_panel_toggles_the_right_dock(cx: &mut TestAppContext) {
         fn right_top_active(dock_area: &Entity<DockArea>, cx: &App) -> Option<&'static str> {
@@ -3246,8 +3374,16 @@ mod tests {
             .update(cx, |_, window, cx| {
                 let dock_area = workspace.read(cx).dock_area.clone();
                 assert!(
+                    dock_area.read(cx).is_dock_open(DockPlacement::Right, cx),
+                    "right dock starts open (Git is visible by default)"
+                );
+
+                workspace.update(cx, |view, cx| {
+                    view.toggle_area(Area::Git, window, cx);
+                });
+                assert!(
                     !dock_area.read(cx).is_dock_open(DockPlacement::Right, cx),
-                    "right dock starts collapsed"
+                    "hiding Git collapses the right dock"
                 );
 
                 workspace.update(cx, |view, cx| view.show_results_panel(window, cx));
@@ -3278,12 +3414,13 @@ mod tests {
     }
 
     /// Shell command action (issue #358; rewired by `docs/spec-workspace-
-    /// visibility-rail.md`, issue #819): `ToggleProblems` now flips
-    /// `Area::Diagnostics`'s membership in the rift-owned visibility set,
-    /// opens/closes the bottom dock (home to the problems panel, #342 —
-    /// which starts collapsed), and attaches/detaches the panel's tab itself
-    /// so a hidden Diagnostics area is not rendered (`TabPanel` falls back to
-    /// `Empty` with zero tabs) rather than merely collapsed.
+    /// visibility-rail.md`, issue #819; default flipped to visible by #822):
+    /// `ToggleProblems` flips `Area::Diagnostics`'s membership in the
+    /// rift-owned visibility set, opens/closes the bottom dock (home to the
+    /// problems panel, #342 — visible by default), and attaches/detaches the
+    /// panel's tab itself so a hidden Diagnostics area is not rendered
+    /// (`TabPanel` falls back to `Empty` with zero tabs) rather than merely
+    /// collapsed.
     #[gpui::test]
     fn test_toggle_area_diagnostics_attaches_and_detaches_the_problems_panel(
         cx: &mut TestAppContext,
@@ -3322,26 +3459,17 @@ mod tests {
             .update(cx, |_, window, cx| {
                 let dock_area = workspace.read(cx).dock_area.clone();
                 assert!(
-                    !dock_area.read(cx).is_dock_open(DockPlacement::Bottom, cx),
-                    "problems dock starts collapsed"
-                );
-                assert!(
-                    !workspace.read(cx).visibility.is_visible(Area::Diagnostics),
-                    "the area starts hidden, matching the collapsed dock"
-                );
-
-                workspace.update(cx, |view, cx| {
-                    view.toggle_area(Area::Diagnostics, window, cx);
-                });
-                assert!(
                     dock_area.read(cx).is_dock_open(DockPlacement::Bottom, cx),
-                    "ToggleProblems opens the bottom dock"
+                    "problems dock starts open (Diagnostics is visible by default, issue #822)"
                 );
-                assert!(workspace.read(cx).visibility.is_visible(Area::Diagnostics));
+                assert!(
+                    workspace.read(cx).visibility.is_visible(Area::Diagnostics),
+                    "the area starts visible, matching the open dock"
+                );
                 assert_eq!(
                     bottom_active_tab_name(&dock_area, cx),
                     Some(PROBLEMS_PANEL_NAME),
-                    "showing the area attaches the problems panel's tab"
+                    "the problems panel's tab is attached from the start"
                 );
 
                 workspace.update(cx, |view, cx| {
@@ -3349,7 +3477,7 @@ mod tests {
                 });
                 assert!(
                     !dock_area.read(cx).is_dock_open(DockPlacement::Bottom, cx),
-                    "toggling again re-collapses the bottom dock"
+                    "ToggleProblems closes the bottom dock"
                 );
                 assert!(!workspace.read(cx).visibility.is_visible(Area::Diagnostics));
                 assert_eq!(
@@ -3357,15 +3485,30 @@ mod tests {
                     None,
                     "hiding the area detaches the problems panel's tab, so it is not rendered"
                 );
+
+                workspace.update(cx, |view, cx| {
+                    view.toggle_area(Area::Diagnostics, window, cx);
+                });
+                assert!(
+                    dock_area.read(cx).is_dock_open(DockPlacement::Bottom, cx),
+                    "toggling again re-opens the bottom dock"
+                );
+                assert!(workspace.read(cx).visibility.is_visible(Area::Diagnostics));
+                assert_eq!(
+                    bottom_active_tab_name(&dock_area, cx),
+                    Some(PROBLEMS_PANEL_NAME),
+                    "showing the area re-attaches the problems panel's tab"
+                );
             })
             .unwrap();
     }
 
     /// Shell command action (issue #358; rewired by `docs/spec-workspace-
-    /// visibility-rail.md`, issue #819): `ToggleSourceControl` now flips
-    /// `Area::Git`'s membership in the rift-owned visibility set and
-    /// opens/closes the right dock (reserved for the source control + diff
-    /// panels, #338), which starts collapsed.
+    /// visibility-rail.md`, issue #819; default flipped to visible by #822):
+    /// `ToggleSourceControl` flips `Area::Git`'s membership in the
+    /// rift-owned visibility set and opens/closes the right dock (reserved
+    /// for the source control + diff panels, #338), which is visible by
+    /// default.
     #[gpui::test]
     fn test_toggle_area_git_flips_right_dock_open_state(cx: &mut TestAppContext) {
         let mut workspace: Option<Entity<WorkspaceView>> = None;
@@ -3387,8 +3530,17 @@ mod tests {
             .update(cx, |_, window, cx| {
                 let dock_area = workspace.read(cx).dock_area.clone();
                 assert!(
+                    dock_area.read(cx).is_dock_open(DockPlacement::Right, cx),
+                    "source control dock starts open (Git is visible by default, issue #822)"
+                );
+                assert!(workspace.read(cx).visibility.is_visible(Area::Git));
+
+                workspace.update(cx, |view, cx| {
+                    view.toggle_area(Area::Git, window, cx);
+                });
+                assert!(
                     !dock_area.read(cx).is_dock_open(DockPlacement::Right, cx),
-                    "source control dock starts collapsed"
+                    "ToggleSourceControl closes the right dock"
                 );
                 assert!(!workspace.read(cx).visibility.is_visible(Area::Git));
 
@@ -3397,7 +3549,7 @@ mod tests {
                 });
                 assert!(
                     dock_area.read(cx).is_dock_open(DockPlacement::Right, cx),
-                    "ToggleSourceControl opens the right dock"
+                    "toggling again re-opens the right dock"
                 );
                 assert!(workspace.read(cx).visibility.is_visible(Area::Git));
             })
@@ -3432,34 +3584,35 @@ mod tests {
             .update(cx, |_, window, cx| {
                 let dock_area = workspace.read(cx).dock_area.clone();
 
-                // Git on, Diagnostics still off (the default) — a mixed
-                // pre-solo state, so restoring it is a real assertion.
+                // The default (no persisted state, issue #822): every area
+                // starts visible/open. Turn Diagnostics off explicitly for a
+                // mixed pre-solo state, so restoring it is a real assertion.
                 workspace.update(cx, |view, cx| {
-                    view.toggle_area(Area::Git, window, cx);
+                    view.toggle_area(Area::Diagnostics, window, cx);
                 });
                 assert!(dock_area.read(cx).is_dock_open(DockPlacement::Left, cx));
                 assert!(dock_area.read(cx).is_dock_open(DockPlacement::Right, cx));
                 assert!(!dock_area.read(cx).is_dock_open(DockPlacement::Bottom, cx));
 
                 workspace.update(cx, |view, cx| {
-                    view.toggle_solo_area(Area::Diagnostics, window, cx);
+                    view.toggle_solo_area(Area::Git, window, cx);
                 });
                 assert!(
                     !dock_area.read(cx).is_dock_open(DockPlacement::Left, cx),
-                    "soloing Diagnostics closes the left (Explorer) dock"
+                    "soloing Git closes the left (Explorer) dock"
                 );
                 assert!(
-                    !dock_area.read(cx).is_dock_open(DockPlacement::Right, cx),
-                    "soloing Diagnostics closes the right (Git) dock, even though it was open"
-                );
-                assert!(
-                    dock_area.read(cx).is_dock_open(DockPlacement::Bottom, cx),
+                    dock_area.read(cx).is_dock_open(DockPlacement::Right, cx),
                     "the soloed area's own dock opens"
                 );
-                assert!(workspace.read(cx).visibility.is_visible(Area::Diagnostics));
+                assert!(
+                    !dock_area.read(cx).is_dock_open(DockPlacement::Bottom, cx),
+                    "the bottom dock, already closed pre-solo, stays closed"
+                );
+                assert!(workspace.read(cx).visibility.is_visible(Area::Git));
 
                 workspace.update(cx, |view, cx| {
-                    view.toggle_area(Area::Diagnostics, window, cx);
+                    view.toggle_area(Area::Git, window, cx);
                 });
                 assert!(
                     dock_area.read(cx).is_dock_open(DockPlacement::Left, cx),
@@ -3470,8 +3623,8 @@ mod tests {
                     "exiting solo restores the right dock to its pre-solo (open) state"
                 );
                 assert!(
-                    dock_area.read(cx).is_dock_open(DockPlacement::Bottom, cx),
-                    "re-adding Diagnostics from the rail keeps it visible post-solo"
+                    !dock_area.read(cx).is_dock_open(DockPlacement::Bottom, cx),
+                    "the bottom dock stays at its pre-solo (closed) state, not re-added"
                 );
             })
             .unwrap();
