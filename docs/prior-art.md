@@ -437,6 +437,44 @@ How the reference projects solve debug logging for GUI apps (console vs file, ro
 
 **Takeaways for rift**: keep the existing `tracing`/`EnvFilter` facade — the gaps are sink strategy, rotation, and the daemon. (1) Zed's TTY-detection beats the current `windowed`-feature gate: it handles dev console, windowed stable, and redirected output with one runtime check. (2) Zed's `.log`/`.log.old` 1 MB pair beats per-run truncation (current `rift-stable.log` loses the previous run's evidence) and beats unbounded append; note `tracing-appender` only rotates by *time* (minutely/daily/never), not size — size rotation needs a small custom writer like Zed's `SizedWriter` (~50 lines). (3) The daemon's stdout carries protocol frames; stderr is its log sink — wezterm's per-run PID-keyed files with age pruning is the model if the daemon ever needs a file sink on the remote host. (4) Panic-into-log via `log::error!`/`tracing::error!` in the hook (Zed, wezterm) — rift's stable build already does this; extend it to all sinks. (5) Surfacing: Alacritty's "tell the user where the log is, only on error" and wezterm's ring-buffer debug overlay are cheap, high-value follow-ups once a status/message surface exists.
 
+### Category 11: Host Resource Monitoring
+
+Prior art for reading host resource state (CPU / memory / swap / load / disk, plus
+per-process attribution) from the daemon on the remote host, and surfacing it
+reactively in the cockpit — never by embedding a separate monitor. All verified
+2026-07 (websearch). Backs roadmap Phases 43–46.
+
+#### 1. GuillaumeGomez/sysinfo (TOP PRIORITY — the dependency)
+- **URL**: https://crates.io/crates/sysinfo ; https://docs.rs/sysinfo
+- **License**: MIT
+- **What it does**: cross-platform `System` / `Process` / `Disks` API; on Linux it reads `/proc`. Exposes total / used / available memory, total / used swap, load average, per-CPU usage, and per-process RSS + CPU% + parent PID.
+- **Relevant for rift**: the daemon's metrics source for Phase 43 (host CPU/RAM/swap/load), Phase 45 (per-PID RSS/CPU + parent PID for pane attribution), and Phase 46 (`Disks` for disk headroom) — no hand-rolled /proc parser. Caveat: instantiate `System` once and **reuse** it; CPU% needs two samples spaced by a refresh interval (`MINIMUM_CPU_UPDATE_INTERVAL`), so the daemon's sampler holds state across ticks.
+- **Usable as dependency?**: **Yes** — MIT, `cargo deny`-clean; listed in Potential dependencies below.
+
+#### 2. ClementTsang/bottom (btm)
+- **URL**: https://github.com/ClementTsang/bottom
+- **License**: MIT (Rust)
+- **Relevant for rift**: reference for metric selection, sampling cadence, and time-series / sparkline history widgets (Phase 46). A polished Rust /proc consumer to read for "what to show and how often" without adopting its TUI.
+
+#### 3. aristocratos/btop
+- **URL**: https://github.com/aristocratos/btop
+- **License**: Apache-2.0 (C++)
+- **Relevant for rift**: reference for the process-tree parent/child view — the model for Phase 45's per-pane subtree roll-up and Phase 46's detail panels. UX only (C++, not a dependency).
+
+#### 4. Linux PSI — Pressure Stall Information
+- **URL**: https://docs.kernel.org/accounting/psi.html ; systemd-oomd ; Netdata PSI collector
+- **What it provides**: `/proc/pressure/{cpu,memory,io}` — the share of walltime tasks are stalled on a resource, averaged over 10s / 1m / 5m; plus a trigger interface (write e.g. `some 150000 1000000`, then poll the fd) for early warning before an OOM. systemd-oomd and Netdata both act on PSI to catch memory death-spirals before the kernel OOM.
+- **Relevant for rift**: Phase 44's optional precision enhancement. **Reality-check: absent on the stock `microsoft-standard-WSL2` kernel (`CONFIG_PSI` off — confirmed live), so `/proc/pressure` cannot be the primary signal.** Gate on file existence; the portable `MemAvailable` / swap / load baseline is the guaranteed path.
+
+#### 5. YlanAllouche/tmux-task-monitor
+- **URL**: https://github.com/YlanAllouche/tmux-task-monitor
+- **License**: MIT
+- **Relevant for rift**: the exact precedent for Phase 45 — CPU / MEM of the child processes of tmux panes, grouped by window / session, via `pane_pid` → /proc children (`/proc/$pid/task/$tid/children`, recursive). Confirms the attribution method; reference only (a TUI popup plugin).
+
+#### What to AVOID
+- **Embedding or shelling out to a TUI monitor** (btop / htop / glances) in a pane — that IS the "open the Task Manager" context-switch this milestone removes; rift renders the metrics natively in the cockpit.
+- **Any agent-name-based labeling** of resource usage — Phase 45's pane label comes from `pane_current_command` / `pane_title`, never agent detection (constitution: "No agent detection").
+
 ---
 
 ## v1.0.0 cockpit phases — prior-art index (Phases 10–17)
@@ -664,6 +702,32 @@ host's own git credentials and the new session is born rooted at the checkout.
 
 Notes — ADOPT: the URL → parent → name → clone → open-as-session flow (VS Code / DevPod / Gitpod), rebound to session=project; **shell out to the host's `git` for the clone** (Phase 42 re-plan verdict — the pure-Rust gix HTTPS path pulls C crypto, see the verdict cell above; the daemon stays pure-Rust and inherits host credential-helper auth for free). AVOID: credential forwarding (the remote-native daemon uses the host's own creds), a git-remote-manager scope, and branch / PR-slug parsing at v1 (DevPod has it; defer). Foundation impact (recorded here, authored + ratified at Phase 42's /loopkit:plan spec-acceptance, never edited from here): a new `crates/protocol` clone channel is a deliberate API addition (`PROTOCOL_VERSION` bump), and the daemon gains git-clone execution (gix) with progress / error reporting. Sources: VS Code source-control docs; DevPod create-a-workspace docs; gitoxide (gix) project.
 
+## Host resource telemetry — prior-art index (Phases 43–46)
+
+Seeded 2026-07-11 from idea sparring (research mode: websearch). Per-phase prior
+art for the host-telemetry block ([roadmap.md](roadmap.md)), same shape as the
+indexes above; see Category 11 for the full entries.
+
+| Phase | Concern | Reference (repo + path) | License | Verdict |
+|---|---|---|---|---|
+| 43 | Cross-platform host metrics from /proc (CPU / RAM / swap / load) | `GuillaumeGomez/sysinfo` (Category 11 #1) | MIT | **reuse (dependency)** — the daemon's `System` sampler; no hand-rolled /proc parser. Instantiate once, two-sample CPU%, hold state across ticks |
+| 43 | Metric selection + sampling cadence + the status-line indicator | `ClementTsang/bottom` (Category 11 #2); rift's own composite status line (Phase 22, [spec-status-line.md](spec-status-line.md)) | MIT | reference (what to show, how often) / **reuse own** (a new segment on the phase-22 status line) |
+| 44 | Memory-pressure signal (portable — the guaranteed path) | `/proc/meminfo` `MemAvailable` + swap + `/proc/loadavg`, via `sysinfo` (Category 11 #1) | MIT | **reuse** — `MemAvailable` ratio + swap-in-use + load trend; works on every host incl. WSL2 |
+| 44 | Memory pressure as stall-time (optional enhancement) | Linux **PSI** `/proc/pressure/memory` (Category 11 #4); systemd-oomd + Netdata PSI triggers | kernel (GPL-2.0) / ref | reference — the trigger / poll pattern where /proc/pressure exists; **absent on the stock WSL2 kernel (`CONFIG_PSI` off, confirmed live)** → gate on file existence, never primary |
+| 45 | Per-pane process-subtree attribution | `YlanAllouche/tmux-task-monitor` (Category 11 #5: `pane_pid` → /proc children, grouped per window / session); `aristocratos/btop` process tree (Category 11 #3); `sysinfo` per-PID RSS/CPU + parent PID | MIT / Apache-2.0 / MIT | reference (method + tree UX) — roll up the `pane_pid` subtree; **agnostic label from `pane_current_command`, never agent detection** |
+| 46 | Sparkline history + detail breakdown + disk headroom | `ClementTsang/bottom` time-series widgets (Category 11 #2); `btop` detail panels (Category 11 #3); `sysinfo` `Disks` | MIT / Apache-2.0 / MIT | reference (history + breakdown UX) / **reuse** (`sysinfo` disks for project-FS headroom); history is a client-side ring buffer |
+
+Open design decisions deferred to each phase's `/loopkit:plan` spec (never a
+roadmap guess): phase 43 — the sampling interval and whether the daemon pushes on a
+timer or the client polls (recommendation: daemon timer push on the existing stream,
+coalesced), and the host-metrics message shape; phase 44 — the warning thresholds
+(available-memory % and swap-in-use %) plus hysteresis to avoid flapping, and whether
+the toast is dismissible / rate-limited; phase 45 — subtree cost at sampling cadence
+(walk `/proc/<pane_pid>` descendants vs a parent-PID index built once per tick) and
+how a short-lived child racing a sample is handled; phase 46 — which filesystem the
+disk indicator tracks (the session `@root` mount vs the daemon's own) and the
+sparkline retention window.
+
 ## Priority reference projects (top 10)
 
 1. **penso/arbor** — Closest existing implementation of rift's exact concept (Rust + GPUI + daemon + SSH outposts + agent state). Read end-to-end before writing any architecture docs.
@@ -697,6 +761,7 @@ Crates rift could pull in directly (license-compatible with GPL-3.0):
 | `portable-pty` | `wezterm/wezterm` (sub-crate) | MIT | Cross-platform PTY abstraction |
 | `nucleo` | `helix-editor/nucleo` | MPL-2.0 | Fuzzy matching (used by Nexus Explorer) |
 | `jwalk` | `Byron/jwalk` | MIT | Parallel directory traversal |
+| `sysinfo` | `GuillaumeGomez/sysinfo` | MIT | Host + per-process resource metrics (/proc-backed on Linux; CPU / RAM / swap / load / disks) |
 
 Crates inside monorepos to study (likely fork-and-adapt rather than direct dep):
 - `zed/crates/remote`, `zed/crates/remote_server`, `zed/crates/lsp`, `zed/crates/project_panel`, `zed/crates/git`, `zed/crates/terminal`, `zed/crates/workspace`
