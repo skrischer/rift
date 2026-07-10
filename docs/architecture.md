@@ -190,7 +190,7 @@ Editing uses a deliberate request/response buffer channel over the daemon transp
   state on every launch (prefilled config, explicit Connect) — the app never
   auto-connects blindly. _(Phase 33)_ The session is chosen AFTER connect, not on
   the connect card: the flow is connect → session-pick → cockpit. The entry point
-  decides — `RIFT_SESSION` or a recent's still-present remembered session attaches
+  decides — a recent's still-present remembered session attaches
   directly; a fresh "Connect →", or a recent whose session is gone, shows the
   post-connect picker.
 - _(Phase 40)_ **"Session ended" is a mid-session transition, not a disconnect.**
