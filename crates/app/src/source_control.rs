@@ -42,6 +42,7 @@ use gpui_component::{
 use rift_protocol::{ClientMessage, GitStatusCode};
 
 use crate::file_tree::FileTree;
+use crate::workspace::{solo_button, SoloGit};
 use crate::worktree::WorktreeModel;
 
 /// Stable, distinct dock-panel identity for the source-control panel
@@ -594,13 +595,24 @@ impl Panel for SourceControlPanel {
         SharedString::from("Source Control")
     }
 
-    // Direct header button rather than the "..." overflow menu default
-    // (`docs/spec-dogfooding-fixes.md`, #716): `Panel::zoomable` defaults to
-    // `PanelControl::Menu`, which buries zoom in/out inside the Ellipsis
-    // menu. `Toolbar` renders it as a `Maximize`/`Minimize` button in the
-    // panel header instead, reusing gpui-component's own extension point.
+    // gpui-component's own native zoom disabled (issue #820, superseding
+    // #716): its `ToggleZoom` -> `PanelEvent` path would flip `TabPanel.
+    // zoomed` + `DockArea.zoom_view` independently of the rift-owned
+    // visible set (`docs/spec-workspace-visibility-rail.md`, "Single source
+    // of truth for solo"). `toolbar_buttons` below replaces it with a header
+    // button that solos this area through that set instead.
     fn zoomable(&self, _cx: &App) -> Option<PanelControl> {
-        Some(PanelControl::Toolbar)
+        None
+    }
+
+    fn toolbar_buttons(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Vec<Button>> {
+        Some(vec![solo_button(|_, window, cx| {
+            window.dispatch_action(Box::new(SoloGit), cx);
+        })])
     }
 }
 
@@ -1102,25 +1114,36 @@ mod tests {
         });
     }
 
-    // Dock header control (`docs/spec-dogfooding-fixes.md`, #716): zoom must
-    // render as a direct toolbar button, not inside the "..." overflow menu.
+    // Dock header control, superseded by `docs/spec-workspace-visibility-
+    // rail.md` (issue #820): gpui-component's native zoom is now disabled
+    // (`Panel::zoomable` -> `None`, was `Some(PanelControl::Toolbar)` per
+    // #716) so its `ToggleZoom` -> `PanelEvent` path can never flip
+    // `TabPanel.zoomed` + `DockArea.zoom_view` behind the rift-owned
+    // visible set's back; `toolbar_buttons()` supplies the solo header
+    // button in its place.
     #[gpui::test]
-    fn test_zoomable_returns_toolbar_control_not_menu(cx: &mut TestAppContext) {
-        let (_file_tree, panel, _rx, _window) = open_panel(cx);
+    fn test_zoomable_is_disabled_and_toolbar_buttons_supplies_the_solo_button(
+        cx: &mut TestAppContext,
+    ) {
+        let (_file_tree, panel, _rx, window) = open_panel(cx);
 
-        cx.update(|cx| {
-            let control = panel
-                .read(cx)
-                .zoomable(cx)
-                .expect("source control panel stays zoomable");
-            assert!(
-                control.toolbar_visible(),
-                "zoom renders as a direct header button"
-            );
-            assert!(
-                !control.menu_visible(),
-                "zoom is pulled out of the \"...\" overflow menu"
-            );
-        });
+        window
+            .update(cx, |_, window, cx| {
+                panel.update(cx, |panel, cx| {
+                    assert!(
+                        panel.zoomable(cx).is_none(),
+                        "native zoom is disabled in favor of the solo header button"
+                    );
+                    let buttons = panel
+                        .toolbar_buttons(window, cx)
+                        .expect("the panel supplies a header button");
+                    assert_eq!(
+                        buttons.len(),
+                        1,
+                        "exactly the solo button, not a native zoom button too"
+                    );
+                });
+            })
+            .unwrap();
     }
 }

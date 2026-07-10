@@ -192,6 +192,7 @@ use gpui::{
     MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels, Point, Render, SharedString, Size,
     Styled as _, Subscription, Window,
 };
+use gpui_component::button::Button;
 use gpui_component::dialog::{AlertDialog, Dialog, DialogButtonProps};
 use gpui_component::dock::{Panel, PanelControl, PanelEvent};
 use gpui_component::highlighter::{
@@ -211,6 +212,7 @@ use rift_protocol::{
 };
 
 use crate::results_panel::ResultsKind;
+use crate::workspace::{solo_button, SoloExplorerEditor};
 
 /// Stable, distinct dock-panel identity for the editor (`Panel::panel_name`).
 /// Once shipped this must not change — it is the persisted panel identifier.
@@ -2471,13 +2473,25 @@ impl Panel for EditorView {
         SharedString::from(title)
     }
 
-    // Direct header button rather than the "..." overflow menu default
-    // (`docs/spec-dogfooding-fixes.md`, #716): `Panel::zoomable` defaults to
-    // `PanelControl::Menu`, which buries zoom in/out inside the Ellipsis
-    // menu. `Toolbar` renders it as a `Maximize`/`Minimize` button in the
-    // panel header instead, reusing gpui-component's own extension point.
+    // gpui-component's own native zoom disabled (issue #820, superseding
+    // #716): its `ToggleZoom` -> `PanelEvent` path would flip `TabPanel.
+    // zoomed` + `DockArea.zoom_view` independently of the rift-owned
+    // visible set (`docs/spec-workspace-visibility-rail.md`, "Single source
+    // of truth for solo"). `toolbar_buttons` below replaces it with a header
+    // button that solos this area (Explorer+Editor) through that set
+    // instead.
     fn zoomable(&self, _cx: &App) -> Option<PanelControl> {
-        Some(PanelControl::Toolbar)
+        None
+    }
+
+    fn toolbar_buttons(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Vec<Button>> {
+        Some(vec![solo_button(|_, window, cx| {
+            window.dispatch_action(Box::new(SoloExplorerEditor), cx);
+        })])
     }
 }
 
