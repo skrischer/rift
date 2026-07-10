@@ -112,7 +112,7 @@ remain. The connection screen is entered only on a real SSH/transport loss.
 | Keep the SSH connection, daemon client, tokio runtime, and reverse-path bridges alive across the session end; re-`Attach` over the same live client | This IS the "connected, no active session" first-class mid-session state; a re-`Attach`'s fresh `LayoutSnapshot` resets the render layer exactly like a cockpit switch/reconnect, and the phase-35 re-root follows the new session's `@root` | 2026-07-10 |
 | A mid-session pick returns to the same eagerly-built `WorkspaceView` (re-rooted by the `Attach`), and records the pick into recents | Matches the cockpit-switch + phase-35 re-root model (stale tabs closed on root change); reusing `show_session_picker`'s Pick handler keeps recents consistent between post-connect and mid-session picks | 2026-07-10 |
 | App-only; `PROTOCOL_VERSION` unchanged | Every reused message and the picker seam already exist; this is a `crates/app` state-machine restructure, no `protocol`/daemon touch | 2026-07-10 |
-| Depends on Phase 38 (#808, milestone #57): retire the `SessionIntent::Fixed` (`RIFT_SESSION`) fast-path | The mid-session re-picker reuses the Preferred/Pick picker machinery, which the `Fixed` fast-path bypasses (no Shell picker handler, watch seeded non-empty). Phase 38 removes `Fixed`, so post-#808 every connection wires the picker and the re-picker covers it uniformly with no special-casing. **OPEN — confirmed vs. also-handle-Fixed, resolved at the spec-acceptance gate** | 2026-07-10 |
+| Depends on Phase 38 (#808, milestone #57): retire the `SessionIntent::Fixed` (`RIFT_SESSION`) fast-path | The mid-session re-picker reuses the Preferred/Pick picker machinery, which the `Fixed` fast-path bypasses (no Shell picker handler, watch seeded non-empty). Phase 38 removes `Fixed`, so post-#808 every connection wires the picker and the re-picker covers it uniformly with no special-casing. **Resolved at the acceptance gate (2026-07-10): depend on #808 — Phase 40's implementation waits for #808 to merge; no Fixed special-casing** | 2026-07-10 |
 | Foundation impact: `docs/architecture.md` Connection robustness contract gains the mid-session sessionless state + session-end-vs-transport-loss distinction | Authored in this spec PR, ratified at the acceptance gate; the phase-20 contract currently ties any `run_daemon_terminal` end to a teardown | 2026-07-10 |
 
 ## Tracking
@@ -168,3 +168,7 @@ Human milestone-QA gate (dev channel, `just dev-windows-watch`):
   hatch and non-attached-session kills are explicitly out of scope.
 - 2026-07-10: Confirmed no protocol change — the re-query/re-attach/picker seam all
   pre-exist; this is a `crates/app` state-machine restructure.
+- 2026-07-10: Acceptance gate — Phase 40 depends on Phase 38 #808 (retire the
+  `SessionIntent::Fixed` fast-path); Phase 40's issues carry a `Depends on: #808`
+  edge and the milestone a `Depends on milestone: #57`. No standalone Fixed
+  handling. Spec accepted.
