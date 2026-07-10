@@ -50,7 +50,9 @@ binary, never by tolerating it (`docs/spec-connection-robustness.md`).
   a healthy concurrent connection's stream (relevant for the shared stable+dev
   daemon).
 
-History: version 10 adds the directory-browse channel — `query_dir_entries`
+History: version 11 adds the clone channel — `clone_repo` answered by one
+`clone_result` carrying the resolved checkout `path` and an optional typed
+`CloneError` (`docs/spec-clone-repo.md`); version 10 adds the directory-browse channel — `query_dir_entries`
 answered by one `dir_entries_reply` carrying `DirEntry` children and an
 optional typed `DirBrowseError` — plus a `root: Option<String>` field on
 `attach` (the create-with-root transport) and a `root: Option<String>` field
@@ -671,6 +673,42 @@ before a session is created. Specified by
   existence check), and an optional `git_branch` parsed from
   `<name>/.git/HEAD` (`ref: refs/heads/<branch>` → `<branch>`; a detached
   HEAD or non-repo → omitted) — a plain file read, not a `gix` call.
+
+## Clone channel
+
+The clone channel is the **ninth request/response family in the protocol**,
+backing the root picker's clone-from-URL mode — the cold-start path that
+clones a repo on the daemon host and precedes creating a session rooted at
+the checkout. Specified by `docs/spec-clone-repo.md`.
+
+```json
+// client → daemon
+{ "type": "clone_repo", "url": "https://example.com/org/repo.git", "parent": "/home/dev/projects", "name": "repo" }
+// daemon → client
+{ "type": "clone_result", "path": "/home/dev/projects/repo" }
+{ "type": "clone_result", "path": "/home/dev/projects/repo", "error": "target_exists" }
+```
+
+- `clone_repo` requests a clone of `url` into `<parent>/<name>` — `parent` is
+  an absolute host path (the same key space as `query_dir_entries`); `name`
+  is the target directory name under it. The clone runs daemon-side via
+  `gix`, using the host's own git credentials — the client never sends a
+  token.
+- `clone_result` is the **single reply shape**: `path` is the resolved
+  `<parent>/<name>` clone target. On failure the checkout is never persisted
+  at `path` and `error` is a typed `CloneError` (`invalid_url` /
+  `auth_failed` / `target_exists` / `network` / `other`), present only on
+  failure (omitted, never `null`, on success) — a **query-reply** shape
+  (success = `error` absent), deliberately not the `ok: bool` op-result shape
+  of `file_op_result`: a clone returns a path or an error, not an ack.
+- Unlike every other request/response pair in the protocol, the daemon does
+  **not** await the clone inline before replying: a clone is unbounded
+  (seconds to minutes), so the daemon dispatches it as a detached task and
+  posts `clone_result` whenever the clone finishes — a hung or in-progress
+  clone never stalls the connection's terminal stream or other inbound
+  messages.
+- The daemon refuses a `<parent>/<name>` that already exists (`target_exists`,
+  no clobber) and never leaves a partial checkout on disk on failure.
 
 ## Rules
 
