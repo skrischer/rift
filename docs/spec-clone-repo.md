@@ -21,10 +21,13 @@ credentials — no credential forwarding.
       cloned tree with no manual `git clone` and no throwaway parent session.
 - [ ] The clone runs entirely daemon-side with the host's own git credentials
       (no token is sent from the client, no credential forwarding); a **public**
-      repo clones with no configuration, and a **private** repo clones against the
-      host's ambient git auth — the daemon's `git clone` inherits the host's
-      credential helpers / `GIT_AUTH_TOKEN` exactly as a terminal `git clone`
-      would.
+      repo clones with no configuration. A **private** repo clones against the
+      host's ambient git auth **when the host has a git credential helper
+      configured** — the daemon's `git clone` inherits the host's credential
+      helper / SSH agent / `gh` setup exactly as a terminal `git clone` would. A
+      bare `GIT_AUTH_TOKEN` env var alone is NOT consumed by plain `git` (see the
+      Remote-native auth constraint); the host must have a helper that resolves
+      it.
 - [ ] A failed clone (bad URL, auth failure, target already exists, network
       error) surfaces a clear error in the picker and creates **no** session and
       **no** partial directory — never a half-clone left on disk.
@@ -62,13 +65,20 @@ credentials — no credential forwarding.
   The clone therefore runs as a **detached task**: the dispatch returns
   immediately, the task runs `git clone -- <url> <target>` as a child process
   (via `tokio::process::Command`), and posts one `CloneResult` on the connection
-  when the child exits. Cancellation kills the child process (the task tracks the
-  child handle; on `should_interrupt` it sends `start_kill` and reaps it), so a
-  wrong/hung clone is abortable without wedging the connection. The module
-  resolves `<parent>/<name>` under the same path-resolution/validation as browse,
-  validates the URL's scheme up front (so a bogus string is not handed to `git`
-  as an ambiguous argument) and passes it after a `--` separator, and refuses when
-  the target already exists (no clobber). **No partial tree on failure**: `git
+  when the child exits. Cancellation kills the child process: the task holds the
+  child handle and `select!`s the child's exit against the interrupt signal (a
+  `watch`/`Notify` — `should_interrupt` is no longer a cooperatively-polled flag
+  inside gix, so the task must actively watch it alongside `child.wait()`),
+  sending `start_kill` and reaping the child on interrupt, so a wrong/hung clone
+  is abortable without wedging the connection. The module resolves
+  `<parent>/<name>` under the same path-resolution/validation as browse, validates
+  the URL's scheme up front — a **gix-free** check (a scheme allow-list plus
+  scp-shorthand detection, since the daemon no longer carries a direct `gix` dep
+  to borrow `gix::url::parse` from; its remaining job, now that `--` neutralizes
+  option injection, is rejecting local-path-looking strings) — passes it after a
+  `--` separator, and refuses when the target already exists (no clobber). The
+  child is spawned with `LC_ALL=C` so `git`'s stderr is locale-stable for error
+  classification. **No partial tree on failure**: `git
   clone` removes its own target on a failed clone, and the task additionally
   removes `<target>` on any non-success exit or on interrupt-kill, so a partial
   tree never survives. Auth is left to the host's git configuration (credential
@@ -153,13 +163,18 @@ credentials — no credential forwarding.
   survives (a daemon kill mid-clone that skips the cleanup is the one accepted v1
   edge — `git clone` will itself have removed most of it).
 - **Remote-native auth is a differentiator, not a gap.** Because the daemon runs
-  on the target, its `git clone` uses the target's own credentials — the homelab
-  devenv already provisions `GIT_AUTH_TOKEN`, and the host's git credential
-  helpers, `gh` credential helper, and SSH agent all apply transparently. This is
-  strictly simpler than the embedded-transport path (which had to hand-wire a bare
-  `GIT_AUTH_TOKEN` into the URL because gix's config-credential path did not honor
-  it): a subprocess `git clone` inherits all of it for free. Still no client-sent
-  token.
+  on the target, its `git clone` uses the target's own credentials — a configured
+  git credential helper, the `gh` credential helper, `insteadOf` rules, and the
+  SSH agent all apply transparently to the subprocess for free (strictly simpler
+  than the embedded-transport path, which had to hand-wire a token into the URL).
+  **One precise caveat:** plain `git` does **not** read a bare `GIT_AUTH_TOKEN`
+  env var — there is no such standard git variable; the host must have a
+  credential helper (or `insteadOf` / `.git-credentials`) configured to resolve
+  its ambient credentials for `git`. The spec's retained #828 finding recorded
+  exactly this (the gix impl had to embed the bare token because git's
+  config-credential path did not honor it); the shell-out path faces the same
+  constraint, now met by host git configuration rather than by rift. Still no
+  client-sent token.
 - **Design phase not enabled.** `docs/design.md` does not exist, so no formal
   `/loopkit:design` step runs; the Frame C artboard in the Paper `rift` file is
   the visual contract, and the clone-mode extension is authored against it during
@@ -193,9 +208,15 @@ credentials — no credential forwarding.
   The daemon reports a clear error if it is missing (see Risks), rather than
   failing opaquely.
 - Behavioural QA of **private**-repo clone needs the target host/container to
-  hold git credentials the daemon's `git clone` can use — a configured credential
-  helper or `GIT_AUTH_TOKEN` in the daemon's environment. The homelab devenv
-  provisions `GIT_AUTH_TOKEN` (present); no NEW provisioning is required.
+  hold git credentials the daemon's `git clone` can use — a **configured git
+  credential helper** (e.g. `gh auth setup-git`, a `credential.helper`, or an
+  `insteadOf` rule that injects the token), **not** merely a bare `GIT_AUTH_TOKEN`
+  env var (plain `git` does not consume that on its own). The homelab devenv
+  provisions `GIT_AUTH_TOKEN`; confirm the container's git is configured with a
+  helper that resolves it — if the prior gix impl relied on rift embedding the
+  bare token, this is the one behavioural item to re-verify so private-repo clone
+  does not silently regress. Public-repo clone — the primary cold-start case —
+  needs no credentials.
 
 ## Prior decisions
 
@@ -240,7 +261,8 @@ under the milestone. This spec owns the design; the issues own progress.
       and the checkout is present; an existing target is refused with
       `CloneError::TargetExists`; a bogus URL yields `CloneError::InvalidUrl` and
       leaves no directory behind; an unreachable/failed clone leaves no directory
-      behind.
+      behind; a missing `git` binary surfaces as `CloneError::Other` with no panic
+      and no directory left behind.
 - [ ] The clone dispatch is **non-blocking**: a clone in progress does not stall
       the connection — a live terminal in the same session keeps producing output
       during the clone (dev-channel QA), and the daemon-side clone task is
@@ -260,8 +282,8 @@ under the milestone. This spec owns the design; the issues own progress.
 
 | Risk | Mitigation |
 |---|---|
-| `git` is absent on the target host/container | The daemon detects a missing `git` (spawn `NotFound`) and returns a clear `CloneError` (VS Code-style "git not found"), rather than failing opaquely; documented as a host prerequisite. A dev/agent host running tmux agents has `git`. |
-| `git clone` error classification onto the wire `CloneError` | Map the child's exit status + stderr onto `CloneError` by recognizable substrings (authentication vs. could-not-resolve-host/network vs. already-exists vs. other), best-effort defaulting to `CloneError::Other` — the same "stable human-readable surface, no guessing" approach the first implementation used for gix's error `Display`. |
+| `git` is absent on the target host/container | The daemon detects a missing `git` (spawn `NotFound`) and logs a clear "git not found" `warn!`. On the wire this can only be `CloneError::Other` — the frozen 5-variant enum carries no message payload, so a missing `git` reads in the picker as a generic failure (clear only in the daemon log); acceptable since `git`-present is a documented host prerequisite and adding a variant would break the "protocol unchanged" claim. A dev/agent host running tmux agents has `git`. |
+| `git clone` error classification onto the wire `CloneError` | Map the child's exit status + stderr onto `CloneError` by recognizable substrings (authentication vs. could-not-resolve-host/network vs. already-exists vs. other), with `LC_ALL=C` set on the child so the substrings are locale-stable; best-effort defaulting to `CloneError::Other` — the same "stable surface, no guessing" approach the first implementation used for gix's error `Display`. |
 | An interrupt (connection drop) leaves a `git` child running or a partial dir | The task holds the child handle and `start_kill`s + reaps it on `should_interrupt`; the target dir is removed on any non-success/interrupt exit. |
 | A slow clone with only a coarse in-progress state feels unresponsive | Acceptable for v1 (proportional); the channel is shaped so streamed progress (`git clone --progress`) can be added later without breaking the request/reply base. |
 
@@ -317,3 +339,19 @@ under the milestone. This spec owns the design; the issues own progress.
   channel (#827) and the app clone UI (#829/#835) are mechanism-agnostic and stay
   as shipped; only the daemon clone module + its dependency posture change. The
   daemon step is re-opened as a new issue for the shell-out reimplementation.
+- 2026-07-10 (re-plan spec review): folded in the review's findings pre-gate.
+  BLOCKING B1 — `docs/prior-art.md`'s "Notes — ADOPT" clause still said "gix for
+  the clone", contradicting the flipped verdict cell; flipped it to "shell out to
+  the host's `git`". BLOCKING B2 — the private-repo auth wording overclaimed: plain
+  `git` does not consume a bare `GIT_AUTH_TOKEN` env var (no such standard git
+  variable), and the spec's own retained #828 finding records exactly that; the
+  Outcome / Remote-native-auth constraint / Human-prerequisites now state that
+  private-repo auth requires a host **credential helper** (`gh auth setup-git` /
+  `credential.helper` / `insteadOf`), flagged as the one behavioural item to
+  re-verify so private-repo clone does not silently regress (public-repo
+  cold-start unaffected). Non-blocking, also folded in: `LC_ALL=C` on the `git`
+  child for locale-stable stderr classification; a missing `git` surfaces as
+  `CloneError::Other` on the wire (frozen enum, no message payload — clear only in
+  the daemon log); the up-front URL validation is now gix-free (allow-list +
+  scp-shorthand, no `gix::url::parse`); `should_interrupt` is watched via a
+  `select!` on `child.wait()` since it is no longer a gix-internal polled flag.
