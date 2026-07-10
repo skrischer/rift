@@ -66,7 +66,15 @@ remain. The connection screen is entered only on a real SSH/transport loss.
   detection (`docs/constitution.md`).
 - The reverse-path bridges resolve their client via `client_rx` per send and must
   survive a re-`Attach` (the phase-20/33 switch/reconnect model): they are spawned
-  once, not per session-lifecycle iteration.
+  once, not per session-lifecycle iteration. To spawn them once outside the new
+  outer loop, the post-`Attach` bridge block (`main.rs` ~2035-2092) moves above the
+  first `await_session_pick` — safe (no render events fire pre-cockpit; mirrors the
+  already-early `spawn_dir_browse_bridge`).
+- The mid-session re-`Attach` / re-pick targets the **current** client handle —
+  the one the recovery engine may have swapped via `client_tx.send_replace` after
+  a daemon reconnect (`main.rs` ~2105/2120) — not the original handle passed to the
+  first `await_session_pick`. (A reconnect-then-`TerminalExit` within one session
+  must re-pick over the reconnected client.)
 - `run_daemon_terminal` returns `Err` (a transport-shaped `rift_ssh::SshError` in
   the chain) only on a genuine transport loss, so `is_retryable_session_error`
   keeps driving the reconnect loop; a `TerminalExit` must no longer surface as the
@@ -100,7 +108,7 @@ remain. The connection screen is entered only on a real SSH/transport loss.
 |---|---|---|
 | On the attached session ending with the connection alive, re-enter the pre-cockpit picker over the LIVE daemon client, not the connection screen | The connection screen (phase 20) owns transport-loss only; a session kill loses no transport. "Session ended" becomes a mid-session transition (prior-art: tmux `detach-on-destroy off` / VS Code Remote connection-vs-session separation) | 2026-07-10 |
 | Route by remaining count: ≥1 → session picker; 0 → zero-sessions root picker | Reuses the existing `PickerOutcome::ShowPicker(sessions)` empty-vs-non-empty routing (`main.rs`), superseding the empty-state per phase 36 — one routing rule for post-connect and mid-session | 2026-07-10 |
-| The mid-session re-pick ALWAYS shows the picker — never auto-attaches, even for exactly one remaining session | The user's explicit choice (roadmap seed / prior-art): unlike the post-connect first entry (which may honor a `Preferred`/recent name), the mid-session re-entry passes `preferred = None` to `await_session_pick` so it never short-circuits to a direct attach | 2026-07-10 |
+| The mid-session re-pick ALWAYS shows the picker — never auto-attaches, even for exactly one remaining session | The user's explicit choice (roadmap seed / prior-art): unlike the post-connect first entry (which may honor a `Preferred`/recent name), the mid-session re-entry passes `preferred = None` to `await_session_pick` so it never short-circuits to a direct attach (`resolve_preferred_session(None, …)` returns `None`, so `ShowPicker` is always emitted). The outer loop distinguishes first-attach (pass `watches.preferred_session`) from every re-entry (pass `None`) | 2026-07-10 |
 | Keep the SSH connection, daemon client, tokio runtime, and reverse-path bridges alive across the session end; re-`Attach` over the same live client | This IS the "connected, no active session" first-class mid-session state; a re-`Attach`'s fresh `LayoutSnapshot` resets the render layer exactly like a cockpit switch/reconnect, and the phase-35 re-root follows the new session's `@root` | 2026-07-10 |
 | A mid-session pick returns to the same eagerly-built `WorkspaceView` (re-rooted by the `Attach`), and records the pick into recents | Matches the cockpit-switch + phase-35 re-root model (stale tabs closed on root change); reusing `show_session_picker`'s Pick handler keeps recents consistent between post-connect and mid-session picks | 2026-07-10 |
 | App-only; `PROTOCOL_VERSION` unchanged | Every reused message and the picker seam already exist; this is a `crates/app` state-machine restructure, no `protocol`/daemon touch | 2026-07-10 |
@@ -121,10 +129,14 @@ Machine gates (`docs/workflow.md`):
 - [ ] `just ci` green (fmt-check + clippy `-D warnings` + tests, workspace excl.
       `rift-app`).
 - [ ] CI `app-check` compiles `rift-app`.
-- [ ] Unit tests cover the mid-session routing: session-end with an empty remaining
-      list resolves to the root picker and a non-empty list to the session picker,
-      and the mid-session re-entry forces the picker (`preferred = None`) rather
-      than auto-attaching.
+- [ ] The mid-session routing is unit-tested at whatever pure seam the
+      implementation exposes: the empty-vs-non-empty routing (`ShowPicker(sessions)
+      if sessions.is_empty()`) lives in the GPUI Shell handler today, so testing it
+      as a pure function needs a small helper extraction (a
+      `route_picker(sessions) -> RootPicker | SessionPicker` classifier); the
+      `preferred = None` forces-the-picker behavior is testable directly via
+      `resolve_preferred_session`. Whichever is behavioral-only is covered by the
+      human QA gate below, not asserted as a pure test.
 
 Human milestone-QA gate (dev channel, `just dev-windows-watch`):
 
@@ -147,7 +159,7 @@ Human milestone-QA gate (dev channel, `just dev-windows-watch`):
 |---|---|
 | Restructuring `run_daemon_terminal` into an outer session-lifecycle loop re-spawns the reverse-path bridges each iteration (duplicate input/resize/… handlers) | Spawn the bridges once, before/outside the lifecycle loop; only the resolve → `Attach` → re-assert-viewport → consume segment repeats, mirroring how a re-`Attach` already reuses the live bridges |
 | A daemon stream death while the mid-session picker is showing hangs the pick forever | Reuse `await_session_pick`'s existing race: the pick is consumed against the same stream, so a stream death unblocks it as a transport error → the reconnect loop re-shows the picker (the watch stays unset), exactly like the post-connect picker's reconnect |
-| The Shell picker-outcome handler is a single `recv` + `.detach()` today, so a second (mid-session) `ShowPicker` is never received | Make the handler loop over repeated outcomes for the connection's life; a mid-session pick returns to the workspace and the loop keeps serving the next session end |
+| The Shell picker-outcome handler is a single `recv` + `.detach()` today, so a second (mid-session) `ShowPicker` is never received | Make the handler loop over repeated outcomes for the connection's life; a mid-session pick returns to the workspace and the loop keeps serving the next session end. The loop must clone the per-iteration captures (`workspace`, `recent_target`, `picker_choice_tx`) rather than move-consume them once (`main.rs` ~1206-1265) — the picker channels are `flume` clones, so this is a mechanical change |
 | Landing before Phase 38 leaves the `SessionIntent::Fixed` path (no picker machinery) with an undefined mid-session kill | Depends-on Phase 38 #808 (the recommended resolution of the open decision); if the human chooses to land earlier, the Fixed mid-session kill is defined explicitly as a second issue |
 
 ## Decision log
