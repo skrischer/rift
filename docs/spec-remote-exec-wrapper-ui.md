@@ -46,8 +46,9 @@ container connection can be set up and re-run from the UI without an env var.
   user can override the prefill); an empty/whitespace field resolves to `None`.
 - **Recents persistence**: extend `RecentConnection`
   (`crates/app/src/recents.rs`) with the wrapper, recorded on connect, restored
-  as the prefill when a recent is selected, and shown in the RECENT row so a
-  container connection is distinguishable from a plain one.
+  as the prefill when a recent is selected, and shown on the RECENT row as a
+  muted trailing indicator so a container connection is distinguishable from a
+  plain one (exact visual form settled at the milestone visual-QA gate).
 
 ### Out of scope
 
@@ -96,6 +97,7 @@ container connection can be set up and re-run from the UI without an env var.
 | Decision | Rationale | Date |
 |---|---|---|
 | The **card field is authoritative at connect**, prefilled (recent → else env → else bake), empty → `None` | Mirrors host/user/port/key exactly: the card field is the source of truth the connect uses, seeded from recents/env/defaults. Keeps `resolve_remote_exec_wrapper`'s runtime-over-bake precedence as the fresh-card prefill so the env/bake stable path is unchanged when the user does not touch the field. | 2026-07-10 |
+| The connect site **stops calling `resolve_remote_exec_wrapper()` directly** (`main.rs:1804`); that resolution moves to the fresh-card **prefill**, and at connect the **threaded field value** reaches `with_remote_exec_wrapper` | Prevents the footgun of threading the field yet leaving the direct env call, which would silently override the field. The value rides the existing connect plumbing — `ConnectRequest` → `SshConfig` → `run_ssh_session` → `with_remote_exec_wrapper`, and into `RecentTarget` (the single capture point at `main.rs:778-800` feeding every `record` site) — exactly mirroring the existing `passphrase` field's path. | 2026-07-10 |
 | **Recents persistence is additive** — a `remote_exec_wrapper` string on `RecentConnection`, `#[serde(default)]` "" | The store is already `#[serde(default)]` + tolerant-load (#477); an old file loads the field as "" → `None`. Persisting it is what makes a container recent re-runnable (the requesting need: a recent without its wrapper connects to the bare host). | 2026-07-10 |
 | **Client-only, no protocol/daemon change** | The wrapper mechanism (`SshConnection` builder, `exec::wrap_command`) and its rules are already merged (archived `spec-remote-exec-wrapper.md`); this is purely the deferred UI + recents surface over them. | 2026-07-10 |
 | Free-text field, no container picker / validation | Proportional (archived spec's "a UI field is a separate later issue if wanted"): the env var is free text today; the field matches. Validation/auto-detect is a later nicety. | 2026-07-10 |
