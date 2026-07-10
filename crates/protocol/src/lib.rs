@@ -15,7 +15,7 @@ pub use frame::{encode_frame, FrameDecoder, FrameError, MAX_FRAME_LEN};
 /// is wire-compatible in one direction. The message set is pinned by the
 /// fingerprint test beside `PROTOCOL_FINGERPRINT` below, so a message-set
 /// change without a bump cannot pass CI.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Pinned fingerprint of the protocol message set, checked by the
 /// `fingerprint_tests` module: an FNV-1a hash over the serde-visible surface
@@ -25,7 +25,7 @@ pub const PROTOCOL_VERSION: u32 = 10;
 /// [`PROTOCOL_VERSION`] above and re-pin this value (the failing test prints
 /// the new fingerprint).
 #[cfg(test)]
-const PROTOCOL_FINGERPRINT: u64 = 0x4dd8_1f8a_47ef_a5b8;
+const PROTOCOL_FINGERPRINT: u64 = 0x5d2e_d727_84eb_6f0a;
 
 /// Messages the client sends to the daemon.
 ///
@@ -117,6 +117,23 @@ pub enum ClientMessage {
     /// client SFTP.
     QueryDirEntries {
         path: String,
+    },
+    /// Clone `url` into `<parent>/<name>` on the daemon host
+    /// (`docs/spec-clone-repo.md`), the cold-start path that precedes
+    /// creating a session rooted at the checkout. `parent` is an absolute
+    /// host path (the same key space as [`ClientMessage::QueryDirEntries`]);
+    /// `name` is the target directory name under it — the daemon refuses the
+    /// request when `<parent>/<name>` already exists (no clobber). The clone
+    /// runs daemon-side via `gix`, using the host's own git credentials — the
+    /// client never sends a token. The daemon answers with exactly one
+    /// [`DaemonMessage::CloneResult`]; unlike [`ClientMessage::QueryDirEntries`]
+    /// the reply is not necessarily prompt — a clone is unbounded (seconds to
+    /// minutes), so the daemon dispatches it as a detached task rather than
+    /// awaiting it inline, and posts the result whenever the clone finishes.
+    CloneRepo {
+        url: String,
+        parent: String,
+        name: String,
     },
     /// Read request on the buffer channel: pull the current content of the file
     /// at `path` (relative to the worktree root, the same key space as
@@ -423,6 +440,19 @@ pub enum DaemonMessage {
         entries: Vec<DirEntry>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<DirBrowseError>,
+    },
+    /// The reply to a [`ClientMessage::CloneRepo`]: `path` is the resolved
+    /// `<parent>/<name>` clone target (so the client can correlate the
+    /// reply and drive the create-with-root path on success). On failure the
+    /// checkout is never persisted at `path` and `error` is set (omitted on
+    /// success via `skip_serializing_if = "Option::is_none"`). Deliberately
+    /// a **query-reply** shape (success = `error.is_none()`), like
+    /// [`DirEntriesReply`](DaemonMessage::DirEntriesReply), not the `ok: bool`
+    /// op-result shape of [`FileOpResult`](DaemonMessage::FileOpResult).
+    CloneResult {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<CloneError>,
     },
     /// The complete window/pane layout for `session`, sent once per attach as the
     /// baseline of the consistency contract (see the type-level docs). The client
@@ -798,6 +828,29 @@ pub enum DirBrowseError {
     NotADirectory,
     /// A generic I/O failure not covered by the more specific reasons above.
     Io,
+}
+
+/// Why the daemon refused a [`ClientMessage::CloneRepo`] request, carried by
+/// [`DaemonMessage::CloneResult::error`] (`docs/spec-clone-repo.md`).
+///
+/// rift's own type, deliberately independent of `std::io::Error` and `gix`'s
+/// error types — the same precedent as [`DirBrowseError`] / [`FileOpError`]:
+/// no third-party or `std` error type crosses the wire. The daemon maps
+/// `gix`'s clone/fetch/checkout errors onto one of these variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloneError {
+    /// `url` is not a valid git URL the daemon can parse.
+    InvalidUrl,
+    /// The remote rejected the daemon's credentials (or none were available).
+    AuthFailed,
+    /// `<parent>/<name>` already exists — the daemon never clobbers it.
+    TargetExists,
+    /// The clone failed to reach or transfer from the remote (DNS, connection
+    /// refused, transport-level failure mid-fetch).
+    Network,
+    /// A generic clone failure not covered by the more specific reasons above.
+    Other,
 }
 
 /// A single worktree entry, keyed by its path relative to the worktree root.
@@ -1442,6 +1495,33 @@ mod tests {
         assert!(
             err.is_err(),
             "query_dir_entries without a path must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_clone_repo_roundtrip_preserves_fields() {
+        let msg = ClientMessage::CloneRepo {
+            url: "https://example.com/org/repo.git".to_owned(),
+            parent: "/home/dev/projects".to_owned(),
+            name: "repo".to_owned(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize CloneRepo");
+        assert_eq!(
+            json,
+            r#"{"type":"clone_repo","url":"https://example.com/org/repo.git","parent":"/home/dev/projects","name":"repo"}"#
+        );
+        let parsed: ClientMessage = serde_json::from_str(&json).expect("deserialize CloneRepo");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_clone_repo_missing_field_is_rejected() {
+        let err = serde_json::from_str::<ClientMessage>(
+            r#"{"type":"clone_repo","url":"https://example.com/org/repo.git","parent":"/home/dev"}"#,
+        );
+        assert!(
+            err.is_err(),
+            "clone_repo without a name must not deserialize"
         );
     }
 
@@ -3924,6 +4004,76 @@ mod tests {
         assert!(
             err.is_err(),
             "unknown daemon message type must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_clone_error_variants_roundtrip_snake_case() {
+        for (reason, tag) in [
+            (CloneError::InvalidUrl, "invalid_url"),
+            (CloneError::AuthFailed, "auth_failed"),
+            (CloneError::TargetExists, "target_exists"),
+            (CloneError::Network, "network"),
+            (CloneError::Other, "other"),
+        ] {
+            let json = serde_json::to_string(&reason).expect("serialize CloneError");
+            assert_eq!(json, format!(r#""{tag}""#));
+            assert_eq!(
+                serde_json::from_str::<CloneError>(&json).expect("deserialize CloneError"),
+                reason
+            );
+        }
+    }
+
+    #[test]
+    fn test_clone_error_unknown_variant_is_rejected() {
+        assert!(serde_json::from_str::<CloneError>(r#""frobnicated""#).is_err());
+    }
+
+    #[test]
+    fn test_clone_result_success_omits_error() {
+        // Success = `error.is_none()` — `error` must be omitted on the wire,
+        // never serialized as `null` (mirrors `DirEntriesReply`).
+        let msg = DaemonMessage::CloneResult {
+            path: "/home/dev/projects/repo".to_owned(),
+            error: None,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize CloneResult");
+        assert!(json.contains(r#""type":"clone_result""#));
+        assert!(
+            !json.contains("error"),
+            "error must be omitted on success: {json}"
+        );
+        let parsed: DaemonMessage = serde_json::from_str(&json).expect("deserialize CloneResult");
+        assert_eq!(parsed, msg);
+        match parsed {
+            DaemonMessage::CloneResult { path, error } => {
+                assert_eq!(path, "/home/dev/projects/repo");
+                assert_eq!(error, None);
+            }
+            other => panic!("expected CloneResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_clone_result_failure_carries_typed_error() {
+        let msg = DaemonMessage::CloneResult {
+            path: "/home/dev/projects/repo".to_owned(),
+            error: Some(CloneError::TargetExists),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize CloneResult error");
+        assert!(json.contains(r#""error":"target_exists""#));
+        let parsed: DaemonMessage =
+            serde_json::from_str(&json).expect("deserialize CloneResult error");
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_clone_result_missing_path_field_is_rejected() {
+        let err = serde_json::from_str::<DaemonMessage>(r#"{"type":"clone_result"}"#);
+        assert!(
+            err.is_err(),
+            "clone_result without a path must not deserialize"
         );
     }
 }

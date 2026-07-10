@@ -699,6 +699,10 @@ impl Attach {
             // `QueryDirEntries` (the directory-browse channel, #766) is
             // likewise not a terminal message: it is answered per connection
             // by `browse::reply`, so it never reaches the terminal task.
+            // `CloneRepo` (the clone channel, #827) is likewise not a
+            // terminal message: the daemon-side clone execution lands in a
+            // follow-on issue (#828) — silently dropped here in the
+            // meantime, same convention.
             ClientMessage::Input { .. }
             | ClientMessage::Attach { .. }
             | ClientMessage::OpenFile { .. }
@@ -720,6 +724,7 @@ impl Attach {
             | ClientMessage::RenamePath { .. }
             | ClientMessage::DeletePath { .. }
             | ClientMessage::QueryDirEntries { .. }
+            | ClientMessage::CloneRepo { .. }
             | ClientMessage::Hello { .. } => {}
         }
         Ok(())
