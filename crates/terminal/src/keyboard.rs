@@ -171,7 +171,12 @@ fn encode_basic_key(key: &str, ctrl: bool, shift: bool) -> Option<Vec<u8>> {
         // (`\x1b[1;5D`); it is also the sequence Alt+Backspace already emits.
         "backspace" if ctrl => Some(vec![0x1b, 0x7f]),
         "backspace" => Some(vec![0x7f]),
-        "space" => Some(vec![0x20]),
+        // Space is intentionally NOT handled here: it must flow through the
+        // `allow_printable_passthrough`-gated printable branch below (its
+        // `key_char` is `" "`) like every other printable, so it is deduped
+        // against the platform text-commit channel the same way. Handling it
+        // here bypassed that gate and doubled every space keystroke (#791).
+        // Ctrl+Space is unaffected — it is resolved earlier by `encode_ctrl`.
         _ => None,
     }
 }
@@ -385,6 +390,28 @@ mod tests {
     fn test_encode_printable_passthrough() {
         let ks = key_with_char("a", "a");
         assert_eq!(encode_keystroke(&ks, normal()), Some(vec![0x61]));
+    }
+
+    #[test]
+    fn test_encode_space_emits_single_space_via_printable_passthrough() {
+        // Regression (#791): space used to be special-cased in
+        // `encode_basic_key`, bypassing the `allow_printable_passthrough`
+        // gate that dedups every other printable against the platform's
+        // text-commit channel and doubling the keystroke. It must now flow
+        // through the same printable branch as any other character and
+        // produce exactly one 0x20 byte.
+        let ks = key_with_char("space", " ");
+        assert_eq!(encode_keystroke(&ks, normal()), Some(vec![0x20]));
+    }
+
+    #[test]
+    fn test_encode_control_keystroke_space_returns_none() {
+        // Mirrors `test_encode_control_keystroke_plain_printable_returns_none`:
+        // on the on_key_down path that coexists with a platform text-commit
+        // channel (Windows), space must be suppressed just like any other
+        // printable so it is not delivered twice.
+        let ks = key_with_char("space", " ");
+        assert_eq!(encode_control_keystroke(&ks, normal()), None);
     }
 
     #[test]
