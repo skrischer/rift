@@ -23,7 +23,7 @@
 ## Architecture principles
 
 - Agent-agnostic: no code path detects or special-cases a specific agent. All IDE
-  features derive only from agent-agnostic host observables — PTY byte streams,
+  features derive from three agent-agnostic host signals — PTY byte streams,
   filesystem events, and host resource state (`/proc`: CPU / memory / swap / load) —
   never from an agent's internals. Host resource state is host-global (the machine,
   not any pane); attributing it to a pane keys on the tmux pane's process, never on

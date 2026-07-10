@@ -19,12 +19,15 @@ per-pane attribution, 46 detail + disk) build on.
 - [ ] The daemon samples host CPU%, total/available RAM, total/used swap, and load
       average (1/5/15) from `/proc` via `sysinfo` on a fixed interval, and pushes a
       `DaemonMessage::HostMetrics` to every attached client — push-only, the same
-      shape as `lsp_status` / `repo_state`. A freshly connected client receives the
-      latest sample immediately (replayed once behind `welcome`), so the indicator
-      appears without waiting a full interval.
+      shape as `lsp_status` / `repo_state`. The latest sample is cached and replayed
+      once behind `welcome`, so a reconnecting or second client sees it immediately;
+      the **first** client on an idle daemon waits ~one interval (plus the CPU
+      priming tick — see Risks), since sampling only starts on its connect.
 - [ ] The composite status line (Phase 22) shows an always-visible right-side
-      segment reading host `MEM% · CPU%` (RAM% computed from `MemAvailable`:
-      `(mem_total − mem_available) / mem_total`). It is hidden until the first
+      segment reading host memory and CPU as `MEM <n>% · CPU <n>%` (both percentages
+      integer-rounded, a middot `·` separator, literal `MEM` / `CPU` labels — the
+      exact string `metrics_text` asserts in its unit tests). RAM% is computed from
+      `MemAvailable`: `(mem_total − mem_available) / mem_total`. It is hidden until the first
       sample arrives (like the LSP dot before a server is known) and updates live
       as samples arrive. Phase 43 renders it in the neutral status-line color — the
       threshold coloring and the pressure warning are Phase 44.
@@ -56,7 +59,7 @@ per-pane attribution, 46 detail + disk) build on.
   `DaemonMessage::HostMetrics { cpu, mem_total, mem_available, swap_total,
   swap_used, load, cpu_count }` (wire tag `host_metrics`, `snake_case`), modeled on
   the existing push-only decoration messages (`LspStatus` `lib.rs:568`, `RepoState`
-  `lib.rs:525`). `load` is a small typed `LoadAverage { one, five, fifteen }`
+  `lib.rs:529`). `load` is a small typed `LoadAverage { one, five, fifteen }`
   (f64), mirroring how `RepoState` nests `AheadBehind`. Field types: `cpu: f32`
   (0.0–100.0 aggregate), `mem_total`/`mem_available`/`swap_total`/`swap_used: u64`
   bytes, `cpu_count: u32`. `PROTOCOL_VERSION` 12 → 13 (next free at merge),
@@ -71,10 +74,17 @@ per-pane attribution, 46 detail + disk) build on.
   Each `serve_connection` subscribes to that global bus (an added `select!` branch
   alongside its per-context `events` bus, `lib.rs:1318`) and writes the frames to
   its socket, and on `Hello` replays the latest cached sample right after
-  `write_snapshot` (`lib.rs:1183`), so a fresh client sees current metrics at once.
-  The sampler is **connection-gated**: a process-global connection count (the accept
-  loop already emits connect/disconnect via `KeepWarmEvent`, `lib.rs:2178`) gates
-  sampling, so an idle daemon with zero clients polls nothing.
+  `write_snapshot` (`lib.rs:1183`), so a reconnecting or second client sees current
+  metrics at once. The sampler is **connection-gated** by an **explicit
+  process-global connection counter** maintained in the `serve_uds` accept loop —
+  incremented immediately before `tokio::spawn(serve_connection …)` (`lib.rs:2137`)
+  and decremented in that task's cleanup (`lib.rs:2158-2163`), **independent of
+  `KeepWarmEvent`** (which is per-context, `mpsc`-consumed only by the rooted
+  keep-warm supervisor, and absent on the rootless `Standalone` path — so it cannot
+  serve as a process-global gate). When the count is zero the sampler skips its
+  `/proc` read and pushes nothing, so an idle daemon polls nothing. The
+  single-connection `serve` path (`lib.rs:1873`) has exactly one connection for its
+  lifetime, so the sampler simply runs there.
 - **`crates/daemon` dependency**: add `sysinfo` — declared once in the root
   `[workspace.dependencies]` and referenced `sysinfo.workspace = true` in
   `crates/daemon/Cargo.toml`, with `default-features = false, features =
@@ -100,7 +110,9 @@ per-pane attribution, 46 detail + disk) build on.
   neutral status-line color (`theme.muted_foreground` / `theme.foreground`) — no
   threshold coloring in Phase 43.
 - **`docs/protocol.md`**: a "Host metrics" push section and a `version 13` history
-  line (documenting the shipped wire contract).
+  line (documenting the shipped wire contract); also **backfill the missing
+  `version 12` history line** (the constant is already `12` but the History block
+  stops at `11`) while adding `13`.
 - **Foundation docs (authored on the spec branch, ratified at the acceptance
   gate)**: `docs/constitution.md` + `docs/architecture.md` per the Outcome's last
   item.
@@ -231,7 +243,9 @@ under the milestone. This spec owns the design; the issues own progress.
       the host, and against the Windows Task Manager's WSL figure (the dogfooding
       motivator); the number moves under load (e.g. run a `cargo build` in a pane).
       Two channels (stable + dev) attached to the one daemon both show the same
-      figure (one daemon-global sample).
+      figure (one daemon-global sample). Note the **first** client after an idle
+      daemon may take ~one interval to first show the segment (sampling starts on
+      connect + CPU priming) — that is expected, not a defect.
 - [ ] The daemon binary embeds **no C dependency** for telemetry (`sysinfo`'s
       Windows/macOS-only C crates absent from the musl `Cargo.lock` graph); the
       sampler adds no measurable idle load (2 s cadence, connection-gated).
@@ -249,9 +263,10 @@ under the milestone. This spec owns the design; the issues own progress.
 ## Decision log
 
 - 2026-07-11: Spec drafted from the Phase-43 seed. Codebase mapped: push-only bus
-  + `welcome`-replay (`write_snapshot`, `lib.rs:1183`), the `Daemon::run` timer
-  seam, the composite status-line segment template (`status_bar.rs`), and the
-  client ingest path (`main.rs:2734` → `WorkspaceView`). Central decision:
+  + `welcome`-replay (`write_snapshot`, `lib.rs:1183`), the daemon-process-level
+  sampler seam (the `serve_uds` accept loop — NOT the per-context `Daemon::run`
+  loop), the composite status-line segment template (`status_bar.rs`), and the
+  client ingest path (`main.rs:2709` → `WorkspaceView`). Central decision:
   host telemetry is a **daemon-global** signal (one sampler, all connections), not
   per-context. One open item — the exact constitution/architecture wording of the
   third-signal amendment — carried to the acceptance gate for ratification.
