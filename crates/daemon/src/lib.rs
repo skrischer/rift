@@ -1214,6 +1214,19 @@ where
                             writer.write_all(&frame).await?;
                             writer.flush().await?;
                         }
+                        // The clone request (`docs/spec-clone-repo.md`, #827)
+                        // is a request/reply pair too, but — unlike every
+                        // other arm above — it must NOT be awaited inline
+                        // here: a clone is unbounded (seconds to minutes), so
+                        // awaiting it in this loop would stall this
+                        // connection's terminal output and every other
+                        // inbound message for the clone's duration. The
+                        // daemon-side execution (a detached `spawn_blocking`
+                        // task posting one `CloneResult` on completion) lands
+                        // in a follow-on issue (#828); this arm is a
+                        // placeholder no-op until then, deliberately not
+                        // wired the way `QueryDirEntries` is above.
+                        ClientMessage::CloneRepo { .. } => {}
                         // The live-buffer feed goes to the shared loop: the LSP
                         // worker that consumes the buffer events lives off that
                         // single loop (one document model + servers for the
@@ -2392,6 +2405,11 @@ impl Core {
             // The directory-browse request (#766) is answered per connection
             // by `browse::reply`, same pattern; its arm below is a defensive
             // no-op too.
+            //
+            // The clone request (#827) will likewise be answered per
+            // connection, as a detached task (`docs/spec-clone-repo.md`); the
+            // daemon-side execution lands in a follow-on issue (#828) — its
+            // arm below is a defensive no-op until then.
             ClientMessage::Hello { .. }
             | ClientMessage::Attach { .. }
             | ClientMessage::Input { .. }
@@ -2416,7 +2434,8 @@ impl Core {
             | ClientMessage::CreateDir { .. }
             | ClientMessage::RenamePath { .. }
             | ClientMessage::DeletePath { .. }
-            | ClientMessage::QueryDirEntries { .. } => {}
+            | ClientMessage::QueryDirEntries { .. }
+            | ClientMessage::CloneRepo { .. } => {}
         }
     }
 
