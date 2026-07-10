@@ -161,8 +161,10 @@ Editing uses a deliberate request/response buffer channel over the daemon transp
 > Ratified with `spec-connection-robustness.md` (2026-07-05). Governs every
 > transport seam; supersedes the earlier quit-on-disconnect behavior. Amended by
 > `spec-post-connect-picker.md` (phase 33, 2026-07-09) — the session-pick step and
-> its re-Attach precondition — and by `spec-per-session-project-root.md` (phase 35,
+> its re-Attach precondition —, by `spec-per-session-project-root.md` (phase 35,
 > 2026-07-09) — the current-session watch also driving the daemon's watched root
+> (marked below) —, and by `spec-session-lifecycle.md` (phase 40, 2026-07-10) — the
+> mid-session sessionless state and the session-end-vs-transport-loss distinction
 > (marked below).
 
 - **Protocol versioning:** `PROTOCOL_VERSION` (crates/protocol) reflects the
@@ -191,6 +193,18 @@ Editing uses a deliberate request/response buffer channel over the daemon transp
   decides — `RIFT_SESSION` or a recent's still-present remembered session attaches
   directly; a fresh "Connect →", or a recent whose session is gone, shows the
   post-connect picker.
+- _(Phase 40)_ **"Session ended" is a mid-session transition, not a disconnect.**
+  The active tmux session ending while the connection is alive — killed from the
+  cockpit, or its attach otherwise exiting (`TerminalExit`) — is a first-class
+  **connected, no active session** state, distinct from a transport loss. The app
+  keeps the SSH connection, daemon client, and reverse-path bridges alive and
+  re-enters the pre-cockpit picker over the live client: the session picker when
+  ≥1 session remains (always shown — no auto-attach, even for exactly one), the
+  zero-sessions root picker (the phase-36 create flow) when none remain. The
+  re-`Attach` after the mid-session pick re-roots the reactive layer (phase 35),
+  exactly like a switch. **Only a real SSH/transport loss routes to the reconnect
+  loop and then the Connection screen** — a session end never does
+  (`spec-session-lifecycle.md`).
 - _(Phase 35)_ **The current-session watch also drives the daemon's watched root.**
   A session's project root is coupled to the tmux session via a session-scoped
   `@root` user option (stamped by the daemon at `new-session`, resolved daemon-side
