@@ -33,15 +33,12 @@ notify = "7"
 # is deliberately NOT enabled — `status` + `dirwalk` over the default pure-Rust
 # zlib keep the daemon statically linkable. `blob-diff` (spec-source-control.md)
 # enables `gix-diff/blob` (`gix-imara-diff`) for the source-control panel's
-# per-file diff, without pulling in a new top-level diff crate.
-# `blocking-http-transport-reqwest-rust-tls` (transitively enables
-# `blocking-network-client`) and `worktree-mutation` (`docs/spec-clone-repo.md`)
-# add clone support for the daemon's `crates/daemon/src/clone.rs`: a `reqwest`
-# HTTP transport on **rustls** (pure-Rust TLS, no OpenSSL) plus the checkout
-# machinery `PrepareFetch::fetch_then_checkout`/`PrepareCheckout::main_worktree`
-# need. Still musl-static-clean — curl/OpenSSL transports are deliberately not
-# enabled.
-gix = { version = "0.84", default-features = false, features = ["status", "dirwalk", "revision", "sha1", "max-performance-safe", "blob-diff", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation"] }
+# per-file diff, without pulling in a new top-level diff crate. Local-read-only:
+# no network/HTTP-transport features — the clone channel
+# (`crates/daemon/src/clone.rs`, `docs/spec-clone-repo.md`) shells out to the
+# host's `git` instead of cloning in-process, so it needs none of `gix`'s
+# transport machinery and does not depend on this crate directly.
+gix = { version = "0.84", default-features = false, features = ["status", "dirwalk", "revision", "sha1", "max-performance-safe", "blob-diff"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # LSP client stack (daemon-side, gpui-free, musl-clean). `async-lsp` pins

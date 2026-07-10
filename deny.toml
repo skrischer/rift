@@ -23,12 +23,6 @@ allow = [
     "LGPL-3.0-or-later",
     "GPL-3.0-only",
     "GPL-3.0-or-later",
-    # `webpki-root-certs` (bundled CA root data, pulled by `rustls-platform-verifier`
-    # via the clone channel's `reqwest`/rustls HTTP transport,
-    # `docs/spec-clone-repo.md`): a permissive data license (no share-alike/
-    # copyleft clause), same GPL-compatibility class as the other permissive
-    # entries above.
-    "CDLA-Permissive-2.0",
 ]
 unused-allowed-license = "allow"
 confidence-threshold = 0.8

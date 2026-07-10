@@ -383,3 +383,20 @@ under the milestone. This spec owns the design; the issues own progress.
   a credential helper for private-repo clone) confirmed as the delivery / QA
   handover; the operator verifies the devenv's git + credential-helper config
   before private-repo QA (public-repo cold-start unaffected). Spec accepted.
+- 2026-07-10 (issues #841 + #839): daemon clone reimplemented as host `git
+  clone` shell-out (gix transport + reqwest/rustls/aws-lc-rs reverted; C-free
+  musl confirmed via Cargo.lock — the four crates the gix HTTP-transport
+  feature pulled, `reqwest`/`aws-lc-rs`/`aws-lc-sys`/`webpki-root-certs`, are
+  fully absent; one unrelated pre-existing `rustls` entry remains, pulled by
+  the app crate's `gpui-component-assets`→`zed-reqwest` dependency via `ring`,
+  unreachable from `rift-daemon`'s own dependency tree); `CloneError::GitUnavailable`
+  added (`PROTOCOL_VERSION` 11→12, fingerprint re-pinned — unchanged
+  numerically, since the fingerprint's extraction covers only the
+  `ClientMessage`/`DaemonMessage` enum bodies, and neither's literal text
+  changed by adding a `CloneError` variant). App clone-reply correlation made
+  `~`-tolerant (issue #839's fix: `main.rs`/`workspace.rs` now check
+  `pending_clone` via `root_picker::browse_reply_matches`, the same tolerant
+  comparison `pending_browse` already used, instead of an exact-match check)
+  + `name` validated client-side before send (`root_picker::invalid_clone_name`,
+  mirroring the daemon's own `clone::validate_name`), using the reply's
+  resolved path as the session root.

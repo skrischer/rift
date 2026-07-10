@@ -15,7 +15,7 @@ pub use frame::{encode_frame, FrameDecoder, FrameError, MAX_FRAME_LEN};
 /// is wire-compatible in one direction. The message set is pinned by the
 /// fingerprint test beside `PROTOCOL_FINGERPRINT` below, so a message-set
 /// change without a bump cannot pass CI.
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// Pinned fingerprint of the protocol message set, checked by the
 /// `fingerprint_tests` module: an FNV-1a hash over the serde-visible surface
@@ -124,8 +124,9 @@ pub enum ClientMessage {
     /// host path (the same key space as [`ClientMessage::QueryDirEntries`]);
     /// `name` is the target directory name under it — the daemon refuses the
     /// request when `<parent>/<name>` already exists (no clobber). The clone
-    /// runs daemon-side via `gix`, using the host's own git credentials — the
-    /// client never sends a token. The daemon answers with exactly one
+    /// runs daemon-side by shelling out to the host's `git clone`, using the
+    /// host's own git credentials — the client never sends a token. The
+    /// daemon answers with exactly one
     /// [`DaemonMessage::CloneResult`]; unlike [`ClientMessage::QueryDirEntries`]
     /// the reply is not necessarily prompt — a clone is unbounded (seconds to
     /// minutes), so the daemon dispatches it as a detached task rather than
@@ -833,10 +834,11 @@ pub enum DirBrowseError {
 /// Why the daemon refused a [`ClientMessage::CloneRepo`] request, carried by
 /// [`DaemonMessage::CloneResult::error`] (`docs/spec-clone-repo.md`).
 ///
-/// rift's own type, deliberately independent of `std::io::Error` and `gix`'s
-/// error types — the same precedent as [`DirBrowseError`] / [`FileOpError`]:
-/// no third-party or `std` error type crosses the wire. The daemon maps
-/// `gix`'s clone/fetch/checkout errors onto one of these variants.
+/// rift's own type, deliberately independent of `std::io::Error` and `git`'s
+/// own exit-status/stderr shape — the same precedent as [`DirBrowseError`] /
+/// [`FileOpError`]: no third-party or `std` error type crosses the wire. The
+/// daemon shells out to the host's `git clone` and maps the child's spawn
+/// failure / exit status / stderr onto one of these variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CloneError {
@@ -849,6 +851,10 @@ pub enum CloneError {
     /// The clone failed to reach or transfer from the remote (DNS, connection
     /// refused, transport-level failure mid-fetch).
     Network,
+    /// The daemon host has no `git` binary on `PATH` (`docs/spec-clone-repo.md`,
+    /// issue #841) — the clone shells out to it, so its absence is a distinct,
+    /// actionable failure rather than a generic [`CloneError::Other`].
+    GitUnavailable,
     /// A generic clone failure not covered by the more specific reasons above.
     Other,
 }
@@ -4014,6 +4020,7 @@ mod tests {
             (CloneError::AuthFailed, "auth_failed"),
             (CloneError::TargetExists, "target_exists"),
             (CloneError::Network, "network"),
+            (CloneError::GitUnavailable, "git_unavailable"),
             (CloneError::Other, "other"),
         ] {
             let json = serde_json::to_string(&reason).expect("serialize CloneError");

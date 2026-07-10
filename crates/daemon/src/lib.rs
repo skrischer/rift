@@ -1249,9 +1249,9 @@ where
                         // `clone_reply_rx` branch below, mirroring the nav
                         // reply path. `should_interrupt` is tracked in
                         // `clone_interrupts` so it can be flipped when this
-                        // connection ends (below), the cooperative
-                        // cancellation gix's `fetch_then_checkout`/
-                        // `main_worktree` honor.
+                        // connection ends (below); `clone::run` watches it
+                        // alongside the `git` child's exit and kills the
+                        // child on interrupt.
                         ClientMessage::CloneRepo { .. } => {
                             let should_interrupt = Arc::new(AtomicBool::new(false));
                             clone_interrupts.push(should_interrupt.clone());
@@ -1447,12 +1447,11 @@ where
     }
 
     // Interrupt every clone this connection started that is still running
-    // (#828, `docs/spec-clone-repo.md`): nothing is left to hear its
+    // (#828/#841, `docs/spec-clone-repo.md`): nothing is left to hear its
     // `CloneResult` once this connection is gone, so flipping the flag here
-    // lets gix's cooperative check inside `fetch_then_checkout`/
-    // `main_worktree` abort it instead of running unbounded. A clone that
-    // already finished holds no other reference to its flag, so this is a
-    // no-op for it.
+    // makes `clone::run`'s `select!` kill the `git` child instead of letting
+    // it run unbounded. A clone that already finished holds no other
+    // reference to its flag, so this is a no-op for it.
     for should_interrupt in &clone_interrupts {
         should_interrupt.store(true, std::sync::atomic::Ordering::Relaxed);
     }

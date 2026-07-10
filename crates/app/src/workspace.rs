@@ -609,7 +609,8 @@ struct RootPickerSession {
     /// The `<parent>/<name>` last sent on `ClientMessage::CloneRepo` (issue
     /// #829, `docs/spec-clone-repo.md`), the clone-channel counterpart of
     /// `pending_browse` — checked against an incoming `CloneResult`'s echoed
-    /// `path` before routing it into `picker`.
+    /// `path` via [`root_picker::browse_reply_matches`] (issue #839) before
+    /// routing it into `picker`.
     pending_clone: Option<String>,
     _subscription: Subscription,
 }
@@ -2040,12 +2041,14 @@ impl WorkspaceView {
     }
 
     /// Route a `CloneResult` to the in-cockpit root picker, if one is open
-    /// (issue #829, `docs/spec-clone-repo.md`) — called directly by
+    /// (issue #829/#839, `docs/spec-clone-repo.md`) — called directly by
     /// `main.rs`'s `Shell`, mirroring [`Self::apply_dir_entries_reply`]'s
-    /// dispatch shape with an exact-match correlation check against
-    /// `pending_clone` in place of [`root_picker::browse_reply_matches`]
-    /// (every `CloneRepo` echoes its `<parent>/<name>` verbatim, no seed-
-    /// request case).
+    /// dispatch shape, now with the **same** [`root_picker::browse_reply_matches`]
+    /// tolerant check `pending_browse` uses (issue #839's fix): the daemon
+    /// echoes the RESOLVED `<parent>/<name>` (`~` expanded), which never
+    /// exact-matches a `~`-prefixed `pending_clone`, and echoes the resolved
+    /// path (never empty) on an early-rejected clone too, so this clears
+    /// `pending_clone` and surfaces the error instead of a stuck spinner.
     pub fn apply_clone_result(
         &mut self,
         path: String,
@@ -2055,7 +2058,7 @@ impl WorkspaceView {
         let Some(session) = self.root_picker_session.as_mut() else {
             return;
         };
-        if session.pending_clone.as_deref() != Some(path.as_str()) {
+        if !root_picker::browse_reply_matches(session.pending_clone.as_deref(), &path) {
             return;
         }
         session.pending_clone = None;
@@ -4398,6 +4401,94 @@ mod tests {
                     .pending_browse,
                 None,
                 "the matching reply clears the outstanding request"
+            );
+        })
+        .unwrap();
+    }
+
+    /// [`WorkspaceView::apply_clone_result`]'s `~`-tolerant correlation
+    /// (issue #839): the picker records `pending_clone` as the RAW,
+    /// unresolved `<parent>/<name>` it sent (`~/code/repo`), but the daemon
+    /// echoes the RESOLVED path (`~` expanded to the remote `$HOME`) — an
+    /// exact-match check (the pre-fix behavior) would never match this and
+    /// drop the reply forever, leaving the spinner stuck. The
+    /// `root_picker::browse_reply_matches` tolerant check clears
+    /// `pending_clone` and lets the `Picked` flow (session created at the
+    /// reply's resolved root) proceed instead.
+    #[gpui::test]
+    fn test_apply_clone_result_tilde_parent_correlates_and_closes_the_picker(
+        cx: &mut TestAppContext,
+    ) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let view = cx.new(|cx| SessionView::new(cx).0);
+                workspace =
+                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+
+        cx.update_window(window.into(), |_, window, cx| {
+            workspace.update(cx, |view, cx| {
+                view.open_root_picker(window, cx);
+            });
+        })
+        .unwrap();
+
+        // Emit the `Clone` request the picker's Clone-mode action would send
+        // for a `~`-prefixed parent (bypassing the private
+        // `RootPicker::start_clone`, unreachable from this owner module).
+        cx.update_window(window.into(), |_, _window, cx| {
+            let picker = workspace
+                .read(cx)
+                .root_picker_session
+                .as_ref()
+                .unwrap()
+                .picker
+                .clone();
+            picker.update(cx, |_picker, cx| {
+                cx.emit(RootPickerEvent::Clone {
+                    url: "https://example.com/org/repo.git".to_string(),
+                    parent: "~/code".to_string(),
+                    name: "repo".to_string(),
+                });
+            });
+        })
+        .unwrap();
+        cx.update_window(window.into(), |_, _window, cx| {
+            assert_eq!(
+                workspace
+                    .read(cx)
+                    .root_picker_session
+                    .as_ref()
+                    .unwrap()
+                    .pending_clone,
+                Some("~/code/repo".to_string()),
+                "the raw, unresolved target is the outstanding request"
+            );
+        })
+        .unwrap();
+
+        // The daemon's reply carries the RESOLVED path (`~` expanded to the
+        // remote `$HOME`) — never an exact match against `~/code/repo`.
+        cx.update_window(window.into(), |_, _window, cx| {
+            workspace.update(cx, |view, cx| {
+                view.apply_clone_result("/home/dev/code/repo".to_string(), None, cx);
+            });
+        })
+        .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            assert!(
+                !window.has_active_dialog(cx),
+                "a tolerant-matched success clears the picker instead of leaving it stuck"
+            );
+            assert!(
+                workspace.read(cx).root_picker_session.is_none(),
+                "the Picked flow ran through to completion"
             );
         })
         .unwrap();
