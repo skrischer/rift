@@ -53,6 +53,13 @@ What is true when this work is done (done-criteria, not a progress tracker):
   (`Root::render_notification_layer`, `crates/app/src/workspace.rs`) or the
   connection-screen status banner (`crates/app/src/connection_screen.rs`).
 
+  > **Superseded (2026-07-10, #285):** the legacy `tmux -CC` fallback was
+  > removed — the daemon is now the sole terminal source — so there is no
+  > "degraded but running" mode to banner. A daemon-unavailable connect now
+  > fails cleanly to the connection-screen status banner (the fallback
+  > surface this spec already anticipates under Risks). The Root-notification
+  > degraded-mode banner (#619) is retired with the legacy path.
+
 - **Buffer-channel error replies** (`crates/protocol`, `crates/daemon`,
   `crates/app`). Add `OpenError` / `SaveError` daemon→client variants carrying a
   typed reason (`Binary`, `NotUtf8`, `PermissionDenied`, `NotFound`,
@@ -235,3 +242,8 @@ progresses.
   `crates/app/src/workspace.rs`, `crates/app/src/editor.rs`,
   `crates/daemon/src/lib.rs`, `crates/daemon/src/buffer.rs`,
   `crates/protocol/src/lib.rs`, and `crates/terminal/src/pane_view.rs`.
+- 2026-07-10: Daemon-unavailable UX superseded by #285 — the legacy fallback
+  was removed, so daemon-unavailable now fails cleanly to the connection
+  screen instead of degrading to legacy with a Root banner (#619 retired).
+  The connection-screen status-banner surface this spec already anticipated
+  becomes the sole daemon-unavailable treatment.

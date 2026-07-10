@@ -86,9 +86,9 @@ label + command palette; the custom title bar relocates it in phase 21).
   session name mono 13px + "N windows" muted caption right + attached-dot lane
   (fixed slot); current session row = surface bg (ref #313244) + 2px primary
   left bar; footer row "+ New session…" (ghost button style). No emojis.
-- The switcher requires the daemon transport (`Attach` is a protocol message);
-  on the `RIFT_TERMINAL_LEGACY` escape hatch it is inert (acceptable — the
-  legacy path is slated for removal, #285).
+- The switcher requires the daemon transport (`Attach` is a protocol message) —
+  the daemon is the sole terminal source (#285), so this is always available
+  once a session is connected.
 
 ## Prior decisions
 

@@ -52,9 +52,8 @@ remain. The connection screen is entered only on a real SSH/transport loss.
 - Killing a **non-attached** session from the always-visible session strip
   (phase 32): that already works — it is a `kill-session` `TmuxCommand` on another
   session and never ends the attach, so no `TerminalExit` fires. Untouched.
-- The legacy `tmux -CC` escape hatch (`RIFT_TERMINAL_LEGACY`): no daemon client,
-  no picker machinery, and recovery is already scoped to the daemon path (#475).
-  A session kill there keeps its pre-phase-40 behavior.
+- The legacy `tmux -CC` escape hatch, removed by #285: the daemon is now the
+  sole terminal source, so this scenario no longer arises.
 - Protocol / daemon changes. Every message this reuses (`QuerySessionList`,
   `Attach`, `TerminalExit`, the picker channels) already exists.
 - The zero-sessions root-picker create flow itself (phase 36) and the per-session

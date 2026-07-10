@@ -30,7 +30,7 @@ use rift_logging::{
 use rift_terminal::{
     CaptureRequest, CaptureResult, ConnectionStatus, KeyTableQueryResult, PaneInput, PaneOutput,
     SelectWindow, SessionListItem, SessionOrderUpdate, SessionSnapshot, SessionSwitchRequest,
-    SessionView, SubscriptionUpdate, TermSize, TERMINAL_KEY_CONTEXT,
+    SessionView, TermSize, TERMINAL_KEY_CONTEXT,
 };
 use tracing::{debug, error, info, warn};
 
@@ -66,17 +66,13 @@ struct PtyChannels {
     size_changed_rx: flume::Receiver<TermSize>,
     snapshot_tx: flume::Sender<SessionSnapshot>,
     tmux_command_rx: flume::Receiver<String>,
-    subscription_tx: flume::Sender<SubscriptionUpdate>,
     capture_request_rx: flume::Receiver<CaptureRequest>,
     capture_result_tx: flume::Sender<CaptureResult>,
     connection_status_tx: flume::Sender<ConnectionStatus>,
     /// An explicit key-table refresh request from the render layer's statusbar
-    /// button; forwarded onto the protocol as `ClientMessage::QueryKeyTable` in
-    /// daemon mode. (A binding-mutating dispatch's refresh is issued
-    /// server-side by `spawn_command_bridge`, not carried on this channel.)
-    /// Unused in the legacy tmux path (`docs/spec-tmux-keytable-mirroring.md`
-    /// scopes the live refresh to the daemon seam) — a request there is a
-    /// harmless no-op once its receiver drops.
+    /// button; forwarded onto the protocol as `ClientMessage::QueryKeyTable`.
+    /// (A binding-mutating dispatch's refresh is issued server-side by
+    /// `spawn_command_bridge`, not carried on this channel.)
     key_table_request_rx: flume::Receiver<()>,
     /// The parsed-ready reply to a key-table refresh, routed to `SessionView`.
     key_table_result_tx: flume::Sender<KeyTableQueryResult>,
@@ -85,14 +81,10 @@ struct PtyChannels {
     /// daemon's unprompted churn-driven push) replaces the whole list.
     session_list_tx: flume::Sender<Vec<SessionListItem>>,
     /// An explicit session-list refresh (opening the switcher); forwarded onto
-    /// the protocol as `ClientMessage::QuerySessionList` in daemon mode.
-    /// Unused in the legacy tmux path — the receiver drops there, so the
-    /// session switcher is inert on `RIFT_TERMINAL_LEGACY` (documented
-    /// limitation; the legacy path is slated for removal, #285).
+    /// the protocol as `ClientMessage::QuerySessionList`.
     session_list_request_rx: flume::Receiver<()>,
     /// A cockpit switch from the session switcher; forwarded onto the protocol
-    /// as `ClientMessage::Attach { session }` plus a viewport re-assert in
-    /// daemon mode. Same legacy-path caveat as `session_list_request_rx`.
+    /// as `ClientMessage::Attach { session }` plus a viewport re-assert.
     session_switch_rx: flume::Receiver<SessionSwitchRequest>,
 }
 
@@ -151,15 +143,6 @@ struct EditorChannels {
     /// (`docs/spec-explorer-file-ops.md`): `WorktreeModel` is never mutated
     /// from a file op — the push-only `UpdateWorktree` is the single writer.
     file_op_result_tx: flume::Sender<rift_protocol::DaemonMessage>,
-    /// Fires once whenever `run_ssh_session` selects the daemon terminal but
-    /// `provision_daemon` came back empty (#619): no daemon binary configured,
-    /// or a provisioning step failed. The session still runs — the legacy tmux
-    /// path takes over — but every daemon-backed IDE feature (file explorer,
-    /// diagnostics, git status, LSP) is dead for the session, so this is the
-    /// only render-side signal that anything is missing. Sent once per attempt
-    /// (a reconnect resends it if the daemon is still unavailable); the
-    /// workspace's notification dedups by id so this never stacks duplicates.
-    daemon_unavailable_tx: flume::Sender<()>,
     /// Root-picker browse requests (issue #769, `docs/spec-session-root-picker.md`):
     /// every `ClientMessage::QueryDirEntries` either root picker (pre-cockpit
     /// or in-cockpit) issues, forwarded onto the protocol verbatim by
@@ -948,7 +931,6 @@ impl Shell {
         let (file_op_tx, file_op_rx) = flume::unbounded::<rift_protocol::ClientMessage>();
         let (file_op_result_tx, file_op_result_rx) =
             flume::unbounded::<rift_protocol::DaemonMessage>();
-        let (daemon_unavailable_tx, daemon_unavailable_rx) = flume::unbounded::<()>();
         // Directory-browse channel (issue #769, `docs/spec-session-root-picker.md`):
         // `dir_browse_tx` carries every `ClientMessage::QueryDirEntries` a root
         // picker issues — the pre-cockpit `Shell`-owned one (a clone, captured
@@ -1030,7 +1012,6 @@ impl Shell {
                 size_changed_rx: handle.size_changed_rx,
                 snapshot_tx: handle.snapshot_tx,
                 tmux_command_rx: handle.tmux_command_rx,
-                subscription_tx: handle.subscription_tx,
                 capture_request_rx: handle.capture_request_rx,
                 capture_result_tx: handle.capture_result_tx,
                 connection_status_tx: handle.connection_status_tx,
@@ -1055,7 +1036,6 @@ impl Shell {
                 git_op_rx,
                 file_op_rx,
                 file_op_result_tx,
-                daemon_unavailable_tx,
                 dir_browse_rx,
                 dir_browse_reply_tx,
             };
@@ -1114,7 +1094,6 @@ impl Shell {
                     git_op_tx,
                     file_op_tx,
                     file_op_result_rx,
-                    daemon_unavailable_rx,
                     dir_browse_tx: dir_browse_tx.clone(),
                 },
                 state_path,
@@ -1787,85 +1766,27 @@ async fn run_ssh_session(
     // running — and confirm the transport with a handshake. The detached daemon
     // survives SSH drops, so a reconnect reattaches instead of spawning a second
     // one (#62). Returns the live client on success; `None` when no daemon binary
-    // is configured (or a step fails), in which case the legacy tmux path still
-    // runs without daemon-backed features. A protocol version mismatch that
-    // survives the stale-daemon replacement fails the session instead of
-    // degrading — falling back would hide real skew as silent feature death.
+    // is configured (or a step fails) — the daemon is the only terminal source
+    // (#285), so that fails the session cleanly below rather than degrading. A
+    // protocol version mismatch that survives the stale-daemon replacement fails
+    // the session the same way instead of degrading — falling back would hide
+    // real skew as silent feature death.
     let daemon_client = provision_daemon(&mut conn).await?;
 
-    // Tmux session name: seeded from the entry point's resolved
-    // `SessionIntent` (issue #707, `docs/spec-post-connect-picker.md`) into
-    // the engine's session watch. Resolved through the watch, not the
-    // request, so an SSH-level reconnect re-attaches the session a cockpit
-    // switch (#509) moved the client to. `Preferred`/`Pick` (issue #808
-    // retires the `RIFT_SESSION`-driven `Fixed` variant) seed this watch with
-    // the unset sentinel (empty); the daemon-path branch below
-    // (`run_daemon_terminal`) resolves it through the post-connect picker
-    // before the first `Attach` instead of reading it here directly.
-    let session = watches.session.borrow().clone();
-
-    // Terminal byte source (Phase 6 swap, #205): the daemon protocol is the
-    // default; the legacy direct `tmux -CC` over an SSH PTY stays as an
-    // env-selected escape hatch until the milestone QA gate (gate decision in
-    // docs/spec-terminal-streaming.md). The render stack is identical either way —
-    // only where the bytes come from changes.
-    if use_daemon_terminal() {
-        match daemon_client {
-            Some((client, endpoint)) => {
-                info!("terminal source: daemon protocol");
-                return run_daemon_terminal(
-                    &mut conn, client, endpoint, watches, ch, editor, connected,
-                )
-                .await;
-            }
-            None => {
-                warn!(
-                    "daemon terminal selected but no daemon available; \
-                     falling back to the legacy tmux path"
-                );
-                // Reactive layer is dead for this session (#619): the legacy
-                // tmux path below still runs the terminal, but the explorer,
-                // diagnostics, git status, and LSP never light up. Tell the
-                // workspace so it can surface that, rather than leaving it
-                // silent.
-                let _ = editor.daemon_unavailable_tx.send(());
-            }
+    // Terminal byte source: the daemon protocol is the only source (#285 removed
+    // the legacy direct `tmux -CC` over an SSH PTY escape hatch). No daemon means
+    // no terminal for this session; the real provisioning reason was already
+    // logged inside `provision_daemon` (`warn!`).
+    match daemon_client {
+        Some((client, endpoint)) => {
+            info!("terminal source: daemon protocol");
+            run_daemon_terminal(&mut conn, client, endpoint, watches, ch, editor, connected).await
         }
-    } else if let Some((client, _endpoint)) = daemon_client {
-        // Legacy terminal, but keep the daemon's worktree/git/diagnostics +
-        // buffer-channel stream alive on its own task (today's behavior) while
-        // tmux drives the terminal. No mid-session daemon recovery on this
-        // escape hatch (#475 scopes it to the daemon terminal path): the watch
-        // sender is dropped right away, so the bridges resolve this one client
-        // for the whole session.
-        info!("terminal source: legacy tmux (daemon worktree stream active)");
-        let client = std::sync::Arc::new(client);
-        let (_client_tx, client_rx) = tokio::sync::watch::channel(client.clone());
-        spawn_open_file_bridge(client_rx.clone(), editor.open_file_rx.clone());
-        spawn_save_file_bridge(client_rx.clone(), editor.save_file_rx.clone());
-        spawn_buffer_change_bridge(client_rx.clone(), editor.buffer_change_rx.clone());
-        spawn_nav_bridge(client_rx.clone(), editor.nav_request_rx.clone());
-        spawn_request_diff_bridge(client_rx.clone(), editor.request_diff_rx.clone());
-        spawn_git_op_bridge(client_rx.clone(), editor.git_op_rx.clone());
-        spawn_file_op_bridge(client_rx, editor.file_op_rx.clone());
-        tokio::spawn(async move {
-            consume_daemon_messages(&client, None, &editor, false, None).await;
-        });
-    } else {
-        info!("terminal source: legacy tmux (no daemon configured)");
+        None => Err(anyhow::anyhow!(
+            "daemon unavailable: the daemon is the only terminal source \
+             (RIFT_DAEMON_BINARY unset/empty, or provisioning failed — see the log for the reason)"
+        )),
     }
-
-    run_legacy_terminal(conn, session, ch, connected).await
-}
-
-/// Whether the terminal sources its bytes from the daemon protocol (the default)
-/// rather than the legacy direct `tmux -CC` path. Any non-empty
-/// `RIFT_TERMINAL_LEGACY` selects the legacy escape hatch; the dev recipes
-/// forward the var so the fallback is operable end-to-end.
-fn use_daemon_terminal() -> bool {
-    // True (daemon) unless RIFT_TERMINAL_LEGACY is set non-empty: none-or-empty
-    // selects the daemon path, a non-empty value the legacy escape hatch.
-    env::var_os("RIFT_TERMINAL_LEGACY").is_none_or(|v| v.is_empty())
 }
 
 /// Drive the terminal entirely over the daemon protocol: open this client's tmux
@@ -2345,207 +2266,6 @@ async fn try_daemon_reconnect(
     Ok(std::sync::Arc::new(client))
 }
 
-/// The legacy terminal path: open a `tmux -CC` control-mode session over an SSH
-/// PTY and stream it through termy's [`TmuxClient`]. Identical to the pre-#205
-/// behavior; retained as the env-selected fallback until the milestone QA gate.
-async fn run_legacy_terminal(
-    mut conn: rift_ssh::SshConnection,
-    session: String,
-    ch: PtyChannels,
-    connected: &AtomicBool,
-) -> Result<()> {
-    use termy_terminal_ui::{TmuxClient, TmuxNotification, TmuxSocketTarget};
-
-    let pty = conn
-        .open_pty_exec(80, 24, &format!("tmux -CC new-session -A -s {session}"))
-        .await
-        .context("failed to start tmux control mode")?;
-
-    let reader = pty.sync_reader();
-    let writer = pty.sync_writer();
-
-    let (wakeup_tx, wakeup_rx) = flume::bounded::<()>(1);
-
-    let tmux_client = TmuxClient::from_streams(
-        writer,
-        reader,
-        session,
-        "tmux".to_string(),
-        TmuxSocketTarget::Default,
-        Some(wakeup_tx),
-    )
-    .context("failed to create tmux control client")?;
-
-    tmux_client
-        .set_client_size(80, 24)
-        .context("failed to set initial tmux client size")?;
-
-    tmux_client
-        .send_command_async("refresh-client -f pause-after=5")
-        .context("failed to activate flow control")?;
-
-    // Register format subscriptions so pane/window state changes (cd, command,
-    // window rename) stream in within ~1s instead of waiting for a structural
-    // refresh. Requires tmux 3.4+; on older servers each call returns an error
-    // and we degrade to snapshot-only rather than failing the session.
-    for (name, scope, format) in [
-        ("rift_pane_path", "%*", "#{pane_current_path}"),
-        ("rift_pane_command", "%*", "#{pane_current_command}"),
-        ("rift_window_name", "@*", "#{window_name}"),
-    ] {
-        if let Err(e) = tmux_client.subscribe(name, scope, format) {
-            warn!(%e, name, "failed to register tmux subscription; continuing snapshot-only");
-        }
-    }
-
-    info!("tmux control mode connected");
-    let _ = ch.connection_status_tx.send(ConnectionStatus::Connected);
-    // See `run_daemon_terminal`: resets the reconnect engine's retry schedule.
-    connected.store(true, Ordering::Relaxed);
-
-    let pane_output_tx = ch.pane_output_tx;
-    let input_rx = ch.input_rx;
-    let size_changed_rx = ch.size_changed_rx;
-    let snapshot_tx = ch.snapshot_tx;
-    let tmux_command_rx = ch.tmux_command_rx;
-    let subscription_tx = ch.subscription_tx;
-    let capture_request_rx = ch.capture_request_rx;
-    let capture_result_tx = ch.capture_result_tx;
-
-    let initial_snapshot = tmux_client
-        .refresh_snapshot()
-        .context("failed to get initial tmux snapshot")?;
-    // Legacy tmux path: termy's snapshot has no daemon-evaluated `is_shell`
-    // flag, so the map is empty and every window renders the process glyph.
-    let _ = snapshot_tx.send(SessionSnapshot {
-        snapshot: initial_snapshot,
-        pane_is_shell: std::collections::HashMap::new(),
-    });
-
-    let tmux_for_input = std::sync::Arc::new(tmux_client);
-    let tmux_for_resize = tmux_for_input.clone();
-    let tmux_for_poll = tmux_for_input.clone();
-    let tmux_for_cmd = tmux_for_input.clone();
-    let tmux_for_capture = tmux_for_input.clone();
-
-    let input_handle = std::thread::spawn(move || {
-        while let Ok(input) = input_rx.recv() {
-            if tmux_for_input
-                .send_input(&input.pane_id, &input.bytes)
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-
-    let resize_handle = std::thread::spawn(move || {
-        while let Ok(new_size) = size_changed_rx.recv() {
-            if tmux_for_resize
-                .set_client_size(new_size.cols as u16, new_size.rows as u16)
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-
-    let cmd_handle = std::thread::spawn(move || {
-        while let Ok(cmd) = tmux_command_rx.recv() {
-            debug!(cmd = %cmd, "sending tmux command");
-            if tmux_for_cmd.send_command_async(&cmd).is_err() {
-                break;
-            }
-        }
-    });
-
-    // Pre-attach scrollback capture. `capture_pane_range` goes through termy's
-    // internal control-channel worker (10s timeout), so a blocking capture here
-    // is demultiplexed against the poll loop's `%output` stream. An empty payload
-    // on error lets the pane clear its in-flight flag and retry.
-    let capture_handle = std::thread::spawn(move || {
-        while let Ok(req) = capture_request_rx.recv() {
-            let bytes = tmux_for_capture
-                .capture_pane_range(&req.pane_id, &req.start_row, &req.end_row, req.join_wraps)
-                .unwrap_or_default();
-            if capture_result_tx
-                .send(CaptureResult {
-                    pane_id: req.pane_id,
-                    bytes,
-                })
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-
-    let poll_handle = std::thread::spawn(move || loop {
-        if wakeup_rx.recv().is_err() {
-            break;
-        }
-        let notifications = tmux_for_poll.poll_notifications();
-        let mut should_exit = false;
-        for notification in notifications {
-            match notification {
-                TmuxNotification::Output { pane_id, bytes } => {
-                    if pane_output_tx.send(PaneOutput { pane_id, bytes }).is_err() {
-                        should_exit = true;
-                        break;
-                    }
-                }
-                TmuxNotification::NeedsRefresh => {
-                    if let Ok(snapshot) = tmux_for_poll.refresh_snapshot() {
-                        let _ = snapshot_tx.send(SessionSnapshot {
-                            snapshot,
-                            pane_is_shell: std::collections::HashMap::new(),
-                        });
-                    }
-                }
-                TmuxNotification::SubscriptionChanged {
-                    name,
-                    session,
-                    window,
-                    pane,
-                    value,
-                } => {
-                    if subscription_tx
-                        .send(SubscriptionUpdate {
-                            name,
-                            session,
-                            window,
-                            pane,
-                            value,
-                        })
-                        .is_err()
-                    {
-                        should_exit = true;
-                        break;
-                    }
-                }
-                TmuxNotification::Exit(reason) => {
-                    info!(?reason, "tmux control mode exited");
-                    should_exit = true;
-                    break;
-                }
-                TmuxNotification::Warning(msg) => {
-                    tracing::warn!(%msg, "tmux control warning");
-                }
-            }
-        }
-        if should_exit {
-            break;
-        }
-    });
-
-    let _ = poll_handle.join();
-    let _ = input_handle.join();
-    let _ = resize_handle.join();
-    let _ = cmd_handle.join();
-    let _ = capture_handle.join();
-    Ok(())
-}
-
 /// Upper bound on the daemon's `Welcome` reply to our `Hello` (#441). A wedged
 /// daemon otherwise blocks [`provision_daemon`] forever, leaving the app stuck
 /// at "connecting" with no error.
@@ -2599,15 +2319,15 @@ struct DaemonEndpoint {
 ///
 /// Returns the live [`rift_ssh::DaemonClient`] on a clean handshake, paired
 /// with the [`DaemonEndpoint`] a mid-session reconnect reuses (#475); the
-/// caller decides how to drive it (the terminal byte stream in daemon mode, or
-/// just the worktree/git/diagnostics consumer in legacy mode). Provisioning
+/// caller drives the terminal byte stream and every daemon-backed IDE feature
+/// over it — the daemon is the only terminal source (#285). Provisioning
 /// steps are best-effort: an unconfigured binary or any step error logs and
-/// returns `Ok(None)`, so the legacy tmux flow keeps working without the
-/// daemon. The one hard failure is a version mismatch that persists after the
-/// replacement: that is real protocol skew the fallback would hide as silent
-/// feature death, so it returns `Err` and fails the session visibly. The
-/// socket and log sit beside the versioned binary (`<binary>.sock` /
-/// `<binary>.log`), inheriting its path.
+/// returns `Ok(None)`, which the caller turns into a clean session failure
+/// rather than degrading. The one hard failure is a version mismatch that
+/// persists after the replacement: that is real protocol skew a fallback
+/// would hide as silent feature death, so it returns `Err` and fails the
+/// session visibly. The socket and log sit beside the versioned binary
+/// (`<binary>.sock` / `<binary>.log`), inheriting its path.
 async fn provision_daemon(
     conn: &mut rift_ssh::SshConnection,
 ) -> Result<Option<(rift_ssh::DaemonClient, DaemonEndpoint)>> {
@@ -2616,8 +2336,9 @@ async fn provision_daemon(
     // RIFT_DAEMON_BINARY (runtime) wins over the `just promote` compile-time bake
     // RIFT_DEFAULT_DAEMON_BINARY (mirroring the RIFT_SSH_KEY / RIFT_DEFAULT_SSH_KEY
     // split), so a bare desktop-shortcut launch of the pinned stable exe resolves a
-    // working daemon without any user env. Both unset/empty skips the daemon: the
-    // terminal then needs the legacy path (the daemon is load-bearing under #205).
+    // working daemon without any user env. Both unset/empty skips the daemon:
+    // the daemon is the only terminal source (#285), so the caller fails the
+    // session cleanly.
     let binary_path = match env::var_os("RIFT_DAEMON_BINARY") {
         Some(p) if !p.is_empty() => PathBuf::from(p),
         _ => match option_env!("RIFT_DEFAULT_DAEMON_BINARY").filter(|s| !s.is_empty()) {
@@ -2732,7 +2453,7 @@ async fn provision_daemon(
         }
         Ok(Handshake::VersionMismatch { daemon }) => daemon,
         Err(e) => {
-            warn!(%e, "daemon handshake failed, continuing with tmux only");
+            warn!(%e, "daemon handshake failed, no daemon available for this session");
             return Ok(None);
         }
     };
@@ -2742,9 +2463,9 @@ async fn provision_daemon(
     // client-side (`docs/spec-connection-robustness.md`): stop it via its
     // pidfile (#281), re-run the fingerprinted deploy so the on-disk binary
     // matches this client, respawn detached, and re-handshake, bounded like
-    // the first attempt. One retry only — a second mismatch is real skew the
-    // legacy fallback would hide as silent feature death, so it fails the
-    // session as a visible connection error instead.
+    // the first attempt. One retry only — a second mismatch is real skew that
+    // degrading would hide as silent feature death, so it fails the session
+    // as a visible connection error instead.
     warn!(
         daemon = stale_version,
         client = rift_protocol::PROTOCOL_VERSION,
@@ -2799,7 +2520,7 @@ async fn provision_daemon(
             rift_protocol::PROTOCOL_VERSION
         )),
         Err(e) => {
-            warn!(%e, "daemon re-handshake failed, continuing with tmux only");
+            warn!(%e, "daemon re-handshake failed, no daemon available for this session");
             Ok(None)
         }
     }
@@ -2814,9 +2535,10 @@ async fn provision_daemon(
 /// (`FileContent` / `SaveResult` / `SaveConflict`) to the editor on
 /// `editor.buffer_tx`, and — when `terminal` is `Some` —
 /// the per-pane byte stream and layout snapshots into the terminal render
-/// channels (#205). With `terminal` `None` (legacy mode) the terminal arms are
-/// inert — the app never sent `Attach`, so the daemon streams no terminal events,
-/// but the worktree + buffer channel still flow. Returns how the stream ended
+/// channels (#205). With `terminal` `None` (the pre-attach picker phase) the
+/// terminal arms are inert — the app never sent `Attach`, so the daemon streams
+/// no terminal events, but the worktree + buffer channel still flow. Returns
+/// how the stream ended
 /// ([`StreamEnd`]): a closed channel is the recoverable stream death the
 /// recovery engine reacts to (#475), a `TerminalExit` the orderly end of the
 /// active attach; either way the detached daemon keeps running for the next
@@ -3573,7 +3295,7 @@ fn bytes_to_string(bytes: Vec<u8>) -> String {
 /// (#495) rather than the window's array position, so a closed window's gap in
 /// the numbering matches `tmux list-windows` instead of silently collapsing.
 /// Per-pane CWD/command ride the daemon layout query (#442) and refresh on its
-/// coalesced re-query cadence; on the legacy path they stay subscription-driven.
+/// coalesced re-query cadence.
 fn layout_to_snapshot(
     session: String,
     windows: Vec<rift_protocol::WindowLayout>,
@@ -3763,7 +3485,6 @@ mod tests {
         let (size_tx, size_changed_rx) = flume::unbounded();
         let (snapshot_tx, _) = flume::unbounded();
         let (command_tx, tmux_command_rx) = flume::unbounded();
-        let (subscription_tx, _) = flume::unbounded();
         let (capture_tx, capture_request_rx) = flume::unbounded();
         let (capture_result_tx, _) = flume::unbounded();
         let (connection_status_tx, _) = flume::unbounded();
@@ -3785,7 +3506,6 @@ mod tests {
         let (git_op_tx, git_op_rx) = flume::unbounded();
         let (file_op_tx, file_op_rx) = flume::unbounded();
         let (file_op_result_tx, _) = flume::unbounded();
-        let (daemon_unavailable_tx, _) = flume::unbounded();
         let (_, dir_browse_rx) = flume::unbounded();
         let (dir_browse_reply_tx, _) = flume::unbounded();
         BacklogHarness {
@@ -3795,7 +3515,6 @@ mod tests {
                 size_changed_rx,
                 snapshot_tx,
                 tmux_command_rx,
-                subscription_tx,
                 capture_request_rx,
                 capture_result_tx,
                 connection_status_tx,
@@ -3819,7 +3538,6 @@ mod tests {
                 git_op_rx,
                 file_op_rx,
                 file_op_result_tx,
-                daemon_unavailable_tx,
                 dir_browse_rx,
                 dir_browse_reply_tx,
             },
