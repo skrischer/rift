@@ -45,9 +45,12 @@ use gpui::{
     InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement as _, Pixels,
     Render, SharedString, Size, Styled as _, Subscription, Window,
 };
+use gpui_component::button::Button;
 use gpui_component::dock::{Panel, PanelControl, PanelEvent};
 use gpui_component::{v_virtual_list, ActiveTheme as _, VirtualListScrollHandle};
 use rift_protocol::{Diagnostic, DiagnosticSeverity, Range};
+
+use crate::workspace::{solo_button, SoloDiagnostics};
 
 use crate::file_tree::FileTree;
 
@@ -428,13 +431,24 @@ impl Panel for ProblemsPanel {
         SharedString::from("Problems")
     }
 
-    // Direct header button rather than the "..." overflow menu default
-    // (`docs/spec-dogfooding-fixes.md`, #716): `Panel::zoomable` defaults to
-    // `PanelControl::Menu`, which buries zoom in/out inside the Ellipsis
-    // menu. `Toolbar` renders it as a `Maximize`/`Minimize` button in the
-    // panel header instead, reusing gpui-component's own extension point.
+    // gpui-component's own native zoom disabled (issue #820, superseding
+    // #716): its `ToggleZoom` -> `PanelEvent` path would flip `TabPanel.
+    // zoomed` + `DockArea.zoom_view` independently of the rift-owned
+    // visible set (`docs/spec-workspace-visibility-rail.md`, "Single source
+    // of truth for solo"). `toolbar_buttons` below replaces it with a header
+    // button that solos this area through that set instead.
     fn zoomable(&self, _cx: &App) -> Option<PanelControl> {
-        Some(PanelControl::Toolbar)
+        None
+    }
+
+    fn toolbar_buttons(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Vec<Button>> {
+        Some(vec![solo_button(|_, window, cx| {
+            window.dispatch_action(Box::new(SoloDiagnostics), cx);
+        })])
     }
 }
 

@@ -253,3 +253,30 @@ grid-resize-on-reshow work is the accepted cost.
   demotes the terminal (the agent's star). The grid-resize-on-reshow work is
   accepted. The design artboard's Section-B mocks are corrected to the real
   side-by-side layout (Explorer | Editor | Terminal), not terminal-under-editor.
+- 2026-07-10 (issue #820 implementation): the "intercept or replace" built-in
+  `ToggleZoom` -> `PanelEvent` path resolved to **replace**. Investigation found
+  the native per-panel zoom button's `on_click` (gpui-component `tab_panel.rs`)
+  calls `TabPanel::on_action_toggle_zoom` as a direct method invocation, not
+  through `window.dispatch_action` — there is no capture-phase or event hook
+  available to intercept that specific call from outside the pinned dependency.
+  `DockArea.zoom_view` is also a single-`AnyView` render-one substrate, which
+  cannot represent the combined Explorer+Editor area (two separate `TabPanel`s)
+  or the Git area (right dock's source-control + diff split) as one solo
+  target. Resolution: each of the five zoomable panels (`FileTree`,
+  `EditorView`, `TerminalPanel`, `ProblemsPanel`, `SourceControlPanel`) now
+  returns `Panel::zoomable() -> None` (disabling gpui-component's native zoom
+  button and making its `ToggleZoom` handler an early-return no-op per its own
+  `zoomable().is_none()` guard) and supplies a `toolbar_buttons()` header
+  button dispatching a `Solo<Area>` action instead. Solo reuses the *same*
+  rift-owned "not rendered" hide/show mechanism as the plain rail toggle
+  (`apply_*_visibility`), reconciled across all four areas on every solo
+  transition, rather than gpui-component's zoom_view/zoomed fields — those stay
+  permanently at their default (`None`/`false`) and are no longer live state.
+  The header button carries no live "currently soloed" indicator (the rail,
+  already reactive via `Visibility::is_visible`, is the authoritative visual
+  state); a follow-up could push a `soloed` flag into each panel if the header
+  itself needs to reflect it. The Terminal's own render-level hide (needed so
+  soloing a non-Terminal area visibly hides it, not just at the `Visibility`
+  state-machine level) remains deferred to issue #821 alongside the Terminal's
+  plain rail toggle — `apply_area_visibility`'s `Area::Terminal` arm is still a
+  no-op, matching the existing #819 boundary.

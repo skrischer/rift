@@ -73,9 +73,9 @@ use std::time::Duration;
 
 use flume::{Receiver, Sender};
 use gpui::{
-    div, point, px, size, App, AppContext as _, Axis, Bounds, Context, Entity, FocusHandle,
-    Focusable, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
-    SharedString, Styled as _, Subscription, Window, WindowBounds,
+    div, point, px, size, App, AppContext as _, Axis, Bounds, ClickEvent, Context, Entity,
+    FocusHandle, Focusable, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
+    Render, SharedString, Styled as _, Subscription, Window, WindowBounds,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dialog::{AlertDialog, DialogButtonProps};
@@ -157,13 +157,67 @@ pub struct ToggleSourceControl;
 #[action(namespace = rift, no_json)]
 pub struct FocusTerminal;
 
-/// Toggle zoom on the currently focused panel. Forwards to `gpui_component`'s
-/// own `dock::ToggleZoom` — the action its built-in zoom button already
-/// dispatches — so there is exactly one zoom code path (no parallel
-/// execution mechanism).
+/// Solo whichever area currently holds focus (issue #820): the
+/// command-palette / keyboard path onto [`WorkspaceView::toggle_solo_area`].
+/// Superseded from forwarding `gpui_component`'s own `dock::ToggleZoom` —
+/// that built-in path flips `TabPanel.zoomed` + `DockArea.zoom_view`
+/// independently of the rift-owned visible set, the exact divergence
+/// `docs/spec-workspace-visibility-rail.md`'s "Single source of truth for
+/// solo" constraint rules out. The per-area header button (`Solo*` below) is
+/// the primary, always-correct trigger, since it names its own area
+/// explicitly rather than inferring it from focus.
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = rift, no_json)]
 pub struct ZoomActivePanel;
+
+/// Solo the Explorer+Editor area, dispatched by `FileTree`/`EditorView`'s
+/// `toolbar_buttons()` header button (issue #820) — see [`ZoomActivePanel`].
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct SoloExplorerEditor;
+
+/// Solo the Terminal area, dispatched by `TerminalPanel`'s `toolbar_buttons()`
+/// header button (issue #820) — see [`ZoomActivePanel`].
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct SoloTerminal;
+
+/// Solo the Diagnostics area, dispatched by `ProblemsPanel`'s
+/// `toolbar_buttons()` header button (issue #820) — see [`ZoomActivePanel`].
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct SoloDiagnostics;
+
+/// Solo the Git area, dispatched by `SourceControlPanel`'s `toolbar_buttons()`
+/// header button (issue #820) — see [`ZoomActivePanel`].
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct SoloGit;
+
+/// Builds the per-area solo header button (issue #820): `FileTree`,
+/// `EditorView`, `TerminalPanel`, `ProblemsPanel`, and `SourceControlPanel`
+/// each call this from their `Panel::toolbar_buttons()` with a closure
+/// dispatching their own `Solo*` action above, replacing gpui-component's
+/// native zoom button (disabled via each panel's `Panel::zoomable() ->
+/// None`) so the header control is unambiguously a rift-owned solo trigger
+/// rather than a second surface reaching into `TabPanel.zoomed` /
+/// `DockArea.zoom_view` (`docs/spec-workspace-visibility-rail.md`, "Single
+/// source of truth for solo"). Presentational only, mirroring
+/// `activity_rail::rail_button`: no live "currently soloed" indicator on the
+/// button itself — the activity rail (already solo-aware through
+/// `Visibility::is_visible`) is the authoritative visual state, so this is
+/// purely the action trigger.
+pub(crate) fn solo_button(
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Button {
+    Button::new("solo-area")
+        .icon(IconName::Maximize)
+        .xsmall()
+        .ghost()
+        .tab_stop(false)
+        .tooltip("Solo (show only this area)")
+        .on_click(on_click)
+}
 
 /// Request an on-demand session-list refresh (`docs/spec-session-management.md`).
 /// The always-visible title-bar session strip (#683) replaced the phase-19
@@ -321,9 +375,12 @@ impl Area {
 /// into the actual dock tree (`toggle_area`).
 ///
 /// Solo (routing the zoom control through `solo`, reconciling
-/// gpui-component's two zoom states) is issue #820: this carries the field
-/// and `is_visible`'s solo-aware read, but nothing here ever sets `solo` away
-/// from `None`. Persisting this across restart is issue #822.
+/// gpui-component's two zoom states) is issue #820: the per-area header
+/// button (`Solo*` actions, dispatched from each panel's `toolbar_buttons`)
+/// drives [`Visibility::toggle_solo`]; the rail's own [`Visibility::toggle`]
+/// clears solo when clicked while soloed, rather than blindly flipping a
+/// membership bit solo made irrelevant. Persisting this across restart is
+/// issue #822.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Visibility {
     visible: BTreeSet<Area>,
@@ -354,12 +411,39 @@ impl Visibility {
         }
     }
 
-    /// Flip `area`'s membership in the visible set — the rail's only
-    /// operation in this issue; solo's own toggle semantics land in #820.
+    /// Flip `area`'s membership in the visible set — the rail's click
+    /// handler. While solo is active, every area but the soloed one reads as
+    /// hidden (`is_visible`), regardless of its own membership bit; a rail
+    /// click in that state must not blindly XOR that bit (it could leave the
+    /// clicked area hidden after solo clears, if it happened to already be a
+    /// member). Instead it exits solo and re-adds (inserts, never removes)
+    /// the clicked area, restoring the pre-solo set with that area
+    /// guaranteed visible — "re-toggling any area from the rail exits solo
+    /// by re-adding that area" (`docs/spec-workspace-visibility-rail.md`,
+    /// issue #820). Outside solo this is the plain #819 toggle.
     fn toggle(&mut self, area: Area) {
+        if self.solo.take().is_some() {
+            self.visible.insert(area);
+            return;
+        }
         if !self.visible.remove(&area) {
             self.visible.insert(area);
         }
+    }
+
+    /// Toggle `area` as the solo target — the per-area header button's
+    /// solo/zoom trigger (issue #820). Soloing the already-soloed area exits
+    /// solo (mirroring a zoom-out); soloing any other area switches the
+    /// target directly, without an intermediate exit. Never touches
+    /// `visible` membership: solo is a pure rendering override over it (see
+    /// `is_visible`), so exiting solo — this way or via `toggle` — always
+    /// restores exactly the set from before solo engaged.
+    fn toggle_solo(&mut self, area: Area) {
+        self.solo = if self.solo == Some(area) {
+            None
+        } else {
+            Some(area)
+        };
     }
 }
 
@@ -424,8 +508,9 @@ pub struct WorkspaceView {
     /// The diff view (`docs/spec-source-control.md`, #338): renders the
     /// `FileDiff` streamed for the source-control panel's selection. Kept as
     /// its own field for the same reason as `problems_panel` above; the
-    /// open-diff subscription below reaches it through this field.
-    #[allow(dead_code)]
+    /// open-diff subscription below reaches it through this field, and
+    /// [`WorkspaceView::zoom_active_panel`] reads its focus state (issue
+    /// #820).
     diff_view: Entity<DiffView>,
     /// Read-request sender: a tree open turns into a path on this channel, which
     /// the tokio side emits as `ClientMessage::OpenFile`.
@@ -1406,11 +1491,55 @@ impl WorkspaceView {
     /// Toggle `area`'s membership in the rift-owned visible set and
     /// reconcile the dock tree to match — the rail's `on_action` handlers
     /// below call this per [`Area`], replacing the old direct
-    /// `dock_area.toggle_dock` forwarding. No reconciliation for the Terminal
-    /// (it stays always-rendered; becoming toggleable is issue #821).
+    /// `dock_area.toggle_dock` forwarding. `Visibility::toggle` exits solo
+    /// when called while soloed (issue #820), which changes every area's
+    /// effective visibility at once, not just `area`'s — so that case
+    /// reconciles all of them via [`Self::reconcile_visibility`] rather than
+    /// only the clicked one.
     fn toggle_area(&mut self, area: Area, window: &mut Window, cx: &mut Context<Self>) {
+        let was_soloed = self.visibility.solo.is_some();
         self.visibility.toggle(area);
-        let visible = self.visibility.is_visible(area);
+        if was_soloed {
+            self.reconcile_visibility(window, cx);
+            return;
+        }
+        self.apply_area_visibility(area, self.visibility.is_visible(area), window, cx);
+    }
+
+    /// Toggle `area` as the solo target — the per-area header button's
+    /// solo/zoom trigger (issue #820, dispatched as a `Solo*` action from
+    /// each panel's `toolbar_buttons()`) and [`Self::zoom_active_panel`]'s
+    /// focus-based command-palette path. Entering or exiting solo changes
+    /// every area's effective visibility at once, so this always
+    /// reconciles all of them rather than only the target.
+    fn toggle_solo_area(&mut self, area: Area, window: &mut Window, cx: &mut Context<Self>) {
+        self.visibility.toggle_solo(area);
+        self.reconcile_visibility(window, cx);
+    }
+
+    /// Reconcile every area's dock rendering with its current
+    /// [`Visibility::is_visible`] — unlike a plain rail toggle (which only
+    /// ever changes one area's own effective visibility and can call just
+    /// its matching `apply_*_visibility`), a solo transition changes what
+    /// every area's `is_visible` returns at once.
+    fn reconcile_visibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for area in Area::ALL {
+            let visible = self.visibility.is_visible(area);
+            self.apply_area_visibility(area, visible, window, cx);
+        }
+    }
+
+    /// Dispatch to the one `apply_*_visibility` matching `area`. No
+    /// reconciliation for the Terminal (it stays always-rendered; becoming
+    /// toggleable — including the render-level hide solo requires for full
+    /// symmetry — is issue #821).
+    fn apply_area_visibility(
+        &self,
+        area: Area,
+        visible: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match area {
             Area::ExplorerEditor => self.apply_explorer_editor_visibility(visible, window, cx),
             Area::Diagnostics => self.apply_diagnostics_visibility(visible, window, cx),
@@ -1462,9 +1591,12 @@ impl WorkspaceView {
     /// `render` is never invoked (`TabPanel::render_active_panel` falls back
     /// to `Empty` with zero tabs), unlike merely collapsing the dock, which
     /// gpui-component keeps a slim title strip always rendered for the
-    /// bottom placement — and open/close the dock. `add_panel`/`remove_panel`
-    /// are idempotent (no-op on an already-present/already-absent entity id),
-    /// so this is safe regardless of the panel's current attachment.
+    /// bottom placement — and open/close the dock. The actually-rendered set
+    /// (`TabPanel::panels`) is idempotent (no-op on an already-present/
+    /// already-absent entity id), so the add/remove itself is safe
+    /// regardless of the panel's current attachment; `reset_bottom_dock_tabs_
+    /// items` below additionally works around a separate gpui-component
+    /// bookkeeping leak on top of that.
     fn apply_diagnostics_visibility(
         &self,
         visible: bool,
@@ -1474,14 +1606,59 @@ impl WorkspaceView {
         let panel: Arc<dyn PanelView> = Arc::new(self.problems_panel.clone());
         self.dock_area.update(cx, |dock_area, cx| {
             if visible {
-                dock_area.add_panel(panel, DockPlacement::Bottom, None, window, cx);
+                dock_area.add_panel(panel.clone(), DockPlacement::Bottom, None, window, cx);
             } else {
-                dock_area.remove_panel(panel, DockPlacement::Bottom, window, cx);
+                dock_area.remove_panel(panel.clone(), DockPlacement::Bottom, window, cx);
             }
             if let Some(bottom_dock) = dock_area.bottom_dock().cloned() {
-                bottom_dock.update(cx, |dock, cx| dock.set_open(visible, window, cx));
+                bottom_dock.update(cx, |dock, cx| {
+                    dock.set_open(visible, window, cx);
+                    Self::reset_bottom_dock_tabs_items(dock, visible, &panel, window, cx);
+                });
             }
         });
+    }
+
+    /// Works around a gpui-component bookkeeping leak (review note carried
+    /// from #819/PR #826 into issue #820): `DockItem::add_panel`'s `Tabs`
+    /// branch (`gpui-component` `dock/mod.rs`) unconditionally pushes onto
+    /// `items: Vec<Arc<dyn PanelView>>` on every show, and `remove_panel`'s
+    /// `Tabs` branch never trims `items` on hide. The actually-rendered set
+    /// (`TabPanel::panels`, deduped/pruned internally by entity id) stays
+    /// correct — this shadow list is read only by `DockArea::dump`, which
+    /// rift never calls — but left alone it grows one stale `Arc` per
+    /// show/hide cycle forever. Rewrites `items` to exactly what the bottom
+    /// dock holds today (the problems panel alone, or nothing — the only
+    /// panel ever placed there); `Dock::set_panel` is a plain field
+    /// assignment with no re-subscription, so this is safe to call after
+    /// every visibility change.
+    fn reset_bottom_dock_tabs_items(
+        dock: &mut Dock,
+        visible: bool,
+        panel: &Arc<dyn PanelView>,
+        window: &mut Window,
+        cx: &mut Context<Dock>,
+    ) {
+        let DockItem::Tabs {
+            size,
+            active_ix,
+            view,
+            ..
+        } = dock.panel().clone()
+        else {
+            return;
+        };
+        let items = if visible { vec![panel.clone()] } else { vec![] };
+        dock.set_panel(
+            DockItem::Tabs {
+                size,
+                items,
+                active_ix,
+                view,
+            },
+            window,
+            cx,
+        );
     }
 
     /// Reconcile the dock tree with the Git (source-control + diff) area's
@@ -1592,12 +1769,43 @@ impl WorkspaceView {
         self.session_view.focus_handle(cx).focus(window, cx);
     }
 
-    /// Toggle zoom on the currently focused panel (issue #358): re-dispatches
-    /// `gpui_component`'s own `ToggleZoom`, which bubbles from the focused
-    /// element up to whichever `TabPanel` contains it — the same path its
-    /// built-in zoom button already drives.
+    /// Solo whichever area currently holds focus (issue #820), superseding
+    /// the old direct `gpui_component::dock::ToggleZoom` forward (issue
+    /// #358): that built-in path flips `TabPanel.zoomed` + `DockArea.
+    /// zoom_view` independently of the rift-owned visible set — exactly the
+    /// divergence `docs/spec-workspace-visibility-rail.md` rules out. A
+    /// best-effort command-palette/keyboard entry point, not the primary
+    /// trigger (the per-area header button names its area explicitly); a
+    /// no-op if focus is not inside a recognized surface. Source Control's
+    /// own tab (as opposed to the diff view) has no dedicated field to check
+    /// here — it stays reachable via its own header button.
     fn zoom_active_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        window.dispatch_action(Box::new(gpui_component::dock::ToggleZoom), cx);
+        // `Focusable::focus_handle` disambiguated: `FileTree`/`EditorView`/
+        // `ProblemsPanel`/`DiffView` all also implement gpui-component's
+        // `Panel`, which gives `Entity<T>` a second, differently-scoped
+        // `focus_handle` (via its blanket `PanelView` impl) — plain method
+        // syntax is ambiguous between the two.
+        let area = if Focusable::focus_handle(&self.file_tree, cx).contains_focused(window, cx)
+            || Focusable::focus_handle(&self.editor, cx).contains_focused(window, cx)
+        {
+            Some(Area::ExplorerEditor)
+        } else if self
+            .session_view
+            .focus_handle(cx)
+            .contains_focused(window, cx)
+        {
+            Some(Area::Terminal)
+        } else if Focusable::focus_handle(&self.problems_panel, cx).contains_focused(window, cx) {
+            Some(Area::Diagnostics)
+        } else if Focusable::focus_handle(&self.diff_view, cx).contains_focused(window, cx) {
+            Some(Area::Git)
+        } else {
+            None
+        };
+
+        if let Some(area) = area {
+            self.toggle_solo_area(area, window, cx);
+        }
     }
 
     /// Open the command palette (issue #359) as a `Root` dialog.
@@ -2058,6 +2266,18 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &ZoomActivePanel, window, cx| {
                 this.zoom_active_panel(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &SoloExplorerEditor, window, cx| {
+                this.toggle_solo_area(Area::ExplorerEditor, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SoloTerminal, window, cx| {
+                this.toggle_solo_area(Area::Terminal, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SoloDiagnostics, window, cx| {
+                this.toggle_solo_area(Area::Diagnostics, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SoloGit, window, cx| {
+                this.toggle_solo_area(Area::Git, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &SwitchSession, _window, cx| {
                 this.session_view.read(cx).open_session_switcher();
             }))
@@ -2116,7 +2336,7 @@ impl Render for WorkspaceView {
 mod tests {
     use super::*;
     use gpui::{Axis, TestAppContext};
-    use gpui_component::dock::{DockPlacement, Panel};
+    use gpui_component::dock::{DockPlacement, Panel, PanelControl};
 
     // --- window-state restore decision (#225) --------------------------------
     // Headless: `initial_window_bounds` and the types it returns
@@ -2184,6 +2404,122 @@ mod tests {
                  still in the visible set"
             );
         }
+    }
+
+    /// Issue #820: `toggle_solo` entering solo on a non-Terminal area hides
+    /// every other area, including the Terminal — the spec's "Terminal:
+    /// fully symmetric" decision, exercised here through the mutating
+    /// solo-toggle entry point rather than a hand-built `Visibility`.
+    #[test]
+    fn test_toggle_solo_on_a_non_terminal_area_hides_the_terminal_too() {
+        let mut visibility = Visibility::all_visible();
+
+        visibility.toggle_solo(Area::Diagnostics);
+
+        assert!(
+            visibility.is_visible(Area::Diagnostics),
+            "the target area renders"
+        );
+        for area in [Area::ExplorerEditor, Area::Terminal, Area::Git] {
+            assert!(
+                !visibility.is_visible(area),
+                "{area:?}, including the Terminal, is hidden while Diagnostics is soloed"
+            );
+        }
+    }
+
+    /// Issue #820: soloing the Terminal itself shows only the Terminal,
+    /// hiding every other area — the same full-symmetry rule applied to the
+    /// Terminal as the target rather than the odd one out.
+    #[test]
+    fn test_toggle_solo_on_the_terminal_shows_only_the_terminal() {
+        let mut visibility = Visibility::all_visible();
+
+        visibility.toggle_solo(Area::Terminal);
+
+        assert!(visibility.is_visible(Area::Terminal));
+        for area in [Area::ExplorerEditor, Area::Diagnostics, Area::Git] {
+            assert!(!visibility.is_visible(area), "{area:?} is hidden");
+        }
+    }
+
+    /// Issue #820: soloing the already-soloed area exits solo (a zoom-out),
+    /// restoring the pre-solo visible set exactly — solo never touches
+    /// `visible` membership, so nothing here needed re-adding.
+    #[test]
+    fn test_toggle_solo_on_the_soloed_area_again_exits_solo() {
+        let mut visibility = Visibility::all_visible();
+        visibility.toggle(Area::Git); // Git starts hidden, pre-solo.
+
+        visibility.toggle_solo(Area::Diagnostics);
+        assert!(visibility.is_visible(Area::Diagnostics));
+
+        visibility.toggle_solo(Area::Diagnostics);
+
+        assert!(
+            !visibility.is_visible(Area::Git),
+            "exiting solo restores the pre-solo set, where Git was still hidden"
+        );
+        for area in [Area::ExplorerEditor, Area::Terminal, Area::Diagnostics] {
+            assert!(visibility.is_visible(area), "{area:?} is visible again");
+        }
+    }
+
+    /// Issue #820: soloing a second area switches the target directly —
+    /// no intermediate "exit solo" step, and the previous target is hidden
+    /// exactly like every other non-target area.
+    #[test]
+    fn test_toggle_solo_on_a_different_area_switches_the_target() {
+        let mut visibility = Visibility::all_visible();
+        visibility.toggle_solo(Area::Diagnostics);
+
+        visibility.toggle_solo(Area::Git);
+
+        assert!(visibility.is_visible(Area::Git), "the new target renders");
+        assert!(
+            !visibility.is_visible(Area::Diagnostics),
+            "the previous target is hidden like any other non-soloed area"
+        );
+    }
+
+    /// Issue #820: "re-toggling any area from the rail exits solo by
+    /// re-adding that area" — clicking the rail's own (currently soloed)
+    /// area exits solo, keeping that area visible among the restored set.
+    #[test]
+    fn test_toggle_area_on_the_soloed_area_exits_solo_and_keeps_it_visible() {
+        let mut visibility = Visibility::all_visible();
+        visibility.toggle_solo(Area::Diagnostics);
+
+        visibility.toggle(Area::Diagnostics);
+
+        assert!(visibility.solo.is_none(), "solo is cleared");
+        for area in Area::ALL {
+            assert!(visibility.is_visible(area), "{area:?} is visible again");
+        }
+    }
+
+    /// Issue #820: a rail click on a DIFFERENT (non-soloed) area while
+    /// soloed also exits solo, and forces that area visible even if it had
+    /// been toggled off before solo engaged — the affordance read as
+    /// "hidden" (via `is_visible`) while soloed, so the click means "show
+    /// it", not a blind flip of a membership bit solo made irrelevant.
+    #[test]
+    fn test_toggle_area_on_a_different_area_while_soloed_exits_solo_and_shows_it() {
+        let mut visibility = Visibility::all_visible();
+        visibility.toggle(Area::Git); // Git hidden before solo engages.
+        visibility.toggle_solo(Area::Diagnostics);
+
+        visibility.toggle(Area::Git);
+
+        assert!(visibility.solo.is_none(), "solo is cleared");
+        assert!(
+            visibility.is_visible(Area::Git),
+            "the clicked area is shown, overriding its pre-solo hidden state"
+        );
+        assert!(
+            visibility.is_visible(Area::Diagnostics),
+            "the previously-soloed area stays visible too (never removed from the set)"
+        );
     }
 
     // --- unsaved-changes window-close guard message (spec-v1-hardening) -------
@@ -2456,17 +2792,23 @@ mod tests {
             .unwrap();
     }
 
-    /// Dock interaction (`docs/spec-ide-shell.md`, issue #325): every surface
-    /// stays zoomable to fill the shell and restore. `FileTree`, `EditorView`,
-    /// `TerminalPanel`, and `ProblemsPanel` all override `Panel::zoomable` to
-    /// `Some(PanelControl::Toolbar)` (`docs/spec-dogfooding-fixes.md`, #716)
-    /// so the zoom control renders as a direct header button instead of the
-    /// "..." overflow menu — this locks the "stays zoomable" invariant
-    /// against an accidental future override that drops it to `None`.
+    /// Dock interaction (`docs/spec-ide-shell.md`, issue #325), superseded by
+    /// `docs/spec-workspace-visibility-rail.md` (issue #820): every dock
+    /// surface used to expose gpui-component's own native zoom button
+    /// (`Panel::zoomable` -> `Some(PanelControl::Toolbar)`, #716); #820
+    /// disables that (`-> None`) on all five — `FileTree`, `EditorView`,
+    /// `TerminalPanel`, `ProblemsPanel`, `SourceControlPanel` — so the
+    /// built-in `ToggleZoom` -> `PanelEvent` path can never flip
+    /// `TabPanel.zoomed` + `DockArea.zoom_view` behind the rift-owned
+    /// visible set's back ("Single source of truth for solo"), and each
+    /// supplies exactly one `toolbar_buttons()` entry (the solo trigger) in
+    /// its place.
     #[gpui::test]
-    fn test_all_dock_surfaces_stay_zoomable(cx: &mut TestAppContext) {
+    fn test_all_dock_surfaces_disable_native_zoom_and_supply_one_solo_button(
+        cx: &mut TestAppContext,
+    ) {
         let mut workspace: Option<Entity<WorkspaceView>> = None;
-        cx.update(|cx| {
+        let window = cx.update(|cx| {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
@@ -2476,51 +2818,79 @@ mod tests {
                     }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
-            .unwrap();
+            .unwrap()
         });
         let workspace = workspace.expect("workspace constructed inside the window callback");
 
-        cx.update(|cx| {
-            let (file_tree, editor, session_view, problems_panel) = {
-                let view = workspace.read(cx);
-                (
-                    view.file_tree.clone(),
-                    view.editor.clone(),
-                    view.session_view.clone(),
-                    view.problems_panel.clone(),
-                )
-            };
+        window
+            .update(cx, |_, window, cx| {
+                let (file_tree, editor, session_view, problems_panel) = {
+                    let view = workspace.read(cx);
+                    (
+                        view.file_tree.clone(),
+                        view.editor.clone(),
+                        view.session_view.clone(),
+                        view.problems_panel.clone(),
+                    )
+                };
 
-            for (name, control) in [
-                ("the explorer", file_tree.read(cx).zoomable(cx)),
-                ("the editor", editor.read(cx).zoomable(cx)),
-                ("the problems panel", problems_panel.read(cx).zoomable(cx)),
-            ] {
-                let control = control.unwrap_or_else(|| panic!("{name} stays zoomable"));
-                assert!(
-                    control.toolbar_visible(),
-                    "{name}'s zoom renders as a direct header button, not the \"...\" menu"
-                );
-                assert!(
-                    !control.menu_visible(),
-                    "{name}'s zoom is pulled out of the \"...\" overflow menu"
-                );
-            }
+                fn assert_solo_only(
+                    name: &str,
+                    zoomable: Option<PanelControl>,
+                    buttons: Option<Vec<Button>>,
+                ) {
+                    assert!(zoomable.is_none(), "{name} disables native zoom");
+                    let buttons = buttons.unwrap_or_else(|| panic!("{name} supplies a header button"));
+                    assert_eq!(
+                        buttons.len(),
+                        1,
+                        "{name}'s toolbar carries exactly the solo button, not a native zoom button too"
+                    );
+                }
 
-            let terminal_panel = cx.new(|_| TerminalPanel::new(session_view));
-            let terminal_control = terminal_panel
-                .read(cx)
-                .zoomable(cx)
-                .expect("the terminal stays zoomable");
-            assert!(
-                terminal_control.toolbar_visible(),
-                "the terminal's zoom renders as a direct header button, not the \"...\" menu"
-            );
-            assert!(
-                !terminal_control.menu_visible(),
-                "the terminal's zoom is pulled out of the \"...\" overflow menu"
-            );
-        });
+                file_tree.update(cx, |view, cx| {
+                    assert_solo_only(
+                        "the explorer",
+                        view.zoomable(cx),
+                        view.toolbar_buttons(window, cx),
+                    );
+                });
+                editor.update(cx, |view, cx| {
+                    assert_solo_only(
+                        "the editor",
+                        view.zoomable(cx),
+                        view.toolbar_buttons(window, cx),
+                    );
+                });
+                problems_panel.update(cx, |view, cx| {
+                    assert_solo_only(
+                        "the problems panel",
+                        view.zoomable(cx),
+                        view.toolbar_buttons(window, cx),
+                    );
+                });
+
+                let (git_op_tx, _git_op_rx) = flume::unbounded();
+                let source_control =
+                    cx.new(|cx| SourceControlPanel::new(file_tree, git_op_tx, window, cx));
+                source_control.update(cx, |view, cx| {
+                    assert_solo_only(
+                        "the source control panel",
+                        view.zoomable(cx),
+                        view.toolbar_buttons(window, cx),
+                    );
+                });
+
+                let terminal_panel = cx.new(|_| TerminalPanel::new(session_view));
+                terminal_panel.update(cx, |view, cx| {
+                    assert_solo_only(
+                        "the terminal",
+                        view.zoomable(cx),
+                        view.toolbar_buttons(window, cx),
+                    );
+                });
+            })
+            .unwrap();
     }
 
     /// Problems panel (`docs/spec-problems-panel.md`, #342): the panel docks in
@@ -3030,6 +3400,79 @@ mod tests {
                     "ToggleSourceControl opens the right dock"
                 );
                 assert!(workspace.read(cx).visibility.is_visible(Area::Git));
+            })
+            .unwrap();
+    }
+
+    /// Solo (`docs/spec-workspace-visibility-rail.md`, issue #820): soloing
+    /// an area closes every OTHER area's dock — including one the user had
+    /// just explicitly opened — and re-toggling the soloed area from the
+    /// rail (the same click path #819 wired) exits solo, restoring each
+    /// dock to exactly its pre-solo open/closed state.
+    #[gpui::test]
+    fn test_toggle_solo_area_closes_every_other_dock_and_toggle_area_restores(
+        cx: &mut TestAppContext,
+    ) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let session_view = cx.new(|cx| SessionView::new(cx).0);
+                workspace =
+                    Some(cx.new(|cx| {
+                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
+                    }));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+
+        window
+            .update(cx, |_, window, cx| {
+                let dock_area = workspace.read(cx).dock_area.clone();
+
+                // Git on, Diagnostics still off (the default) — a mixed
+                // pre-solo state, so restoring it is a real assertion.
+                workspace.update(cx, |view, cx| {
+                    view.toggle_area(Area::Git, window, cx);
+                });
+                assert!(dock_area.read(cx).is_dock_open(DockPlacement::Left, cx));
+                assert!(dock_area.read(cx).is_dock_open(DockPlacement::Right, cx));
+                assert!(!dock_area.read(cx).is_dock_open(DockPlacement::Bottom, cx));
+
+                workspace.update(cx, |view, cx| {
+                    view.toggle_solo_area(Area::Diagnostics, window, cx);
+                });
+                assert!(
+                    !dock_area.read(cx).is_dock_open(DockPlacement::Left, cx),
+                    "soloing Diagnostics closes the left (Explorer) dock"
+                );
+                assert!(
+                    !dock_area.read(cx).is_dock_open(DockPlacement::Right, cx),
+                    "soloing Diagnostics closes the right (Git) dock, even though it was open"
+                );
+                assert!(
+                    dock_area.read(cx).is_dock_open(DockPlacement::Bottom, cx),
+                    "the soloed area's own dock opens"
+                );
+                assert!(workspace.read(cx).visibility.is_visible(Area::Diagnostics));
+
+                workspace.update(cx, |view, cx| {
+                    view.toggle_area(Area::Diagnostics, window, cx);
+                });
+                assert!(
+                    dock_area.read(cx).is_dock_open(DockPlacement::Left, cx),
+                    "exiting solo restores the left dock"
+                );
+                assert!(
+                    dock_area.read(cx).is_dock_open(DockPlacement::Right, cx),
+                    "exiting solo restores the right dock to its pre-solo (open) state"
+                );
+                assert!(
+                    dock_area.read(cx).is_dock_open(DockPlacement::Bottom, cx),
+                    "re-adding Diagnostics from the rail keeps it visible post-solo"
+                );
             })
             .unwrap();
     }

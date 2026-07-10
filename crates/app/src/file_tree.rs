@@ -84,6 +84,7 @@ use rift_protocol::{
 
 use crate::file_icons::{self, Glyph};
 use crate::fuzzy_match::fuzzy_match;
+use crate::workspace::{solo_button, SoloExplorerEditor};
 use crate::worktree::WorktreeModel;
 
 /// Stable, distinct dock-panel identity for the file tree (`Panel::panel_name`).
@@ -2854,13 +2855,25 @@ impl Panel for FileTree {
         SharedString::from("Explorer")
     }
 
-    // Direct header button rather than the "..." overflow menu default
-    // (`docs/spec-dogfooding-fixes.md`, #716): `Panel::zoomable` defaults to
-    // `PanelControl::Menu`, which buries zoom in/out inside the Ellipsis
-    // menu. `Toolbar` renders it as a `Maximize`/`Minimize` button in the
-    // panel header instead, reusing gpui-component's own extension point.
+    // gpui-component's own native zoom disabled (issue #820, superseding
+    // #716): its `ToggleZoom` -> `PanelEvent` path would flip `TabPanel.
+    // zoomed` + `DockArea.zoom_view` independently of the rift-owned
+    // visible set (`docs/spec-workspace-visibility-rail.md`, "Single source
+    // of truth for solo"). `toolbar_buttons` below replaces it with a header
+    // button that solos this area (Explorer+Editor) through that set
+    // instead.
     fn zoomable(&self, _cx: &App) -> Option<PanelControl> {
-        Some(PanelControl::Toolbar)
+        None
+    }
+
+    fn toolbar_buttons(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Vec<Button>> {
+        Some(vec![solo_button(|_, window, cx| {
+            window.dispatch_action(Box::new(SoloExplorerEditor), cx);
+        })])
     }
 }
 
