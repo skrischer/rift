@@ -2,14 +2,13 @@
 //! a pre-cockpit `Shell` state shown after the SSH connect + daemon handshake
 //! and before the cockpit attach, but only while the session is unresolved.
 //!
-//! Issue #707 wires the full entry-point routing: `RIFT_SESSION` (env)
-//! resolves to `SessionIntent::Fixed` and attaches directly, no picker (the
-//! dogfooding fast-path); a RECENT row's remembered session resolves to
-//! `SessionIntent::Preferred` and attaches directly if still present on the
-//! live host, else shows this picker; the plain "Connect \u{2192}" button
-//! resolves to `SessionIntent::Pick` and always shows it. Issue #705 removes
-//! the connect card's Session field entirely — `main.rs`'s entry point is the
-//! only session source now.
+//! Issue #707 wires the full entry-point routing: a RECENT row's remembered
+//! session resolves to `SessionIntent::Preferred` and attaches directly if
+//! still present on the live host, else shows this picker; the plain
+//! "Connect \u{2192}" button resolves to `SessionIntent::Pick` and always
+//! shows it (issue #808 retires the `RIFT_SESSION`-driven `Fixed` fast-path
+//! that used to bypass it). Issue #705 removes the connect card's Session
+//! field entirely — `main.rs`'s entry point is the only session source now.
 //!
 //! Deliberately GPUI-view-only, mirroring [`crate::connection_screen::ConnectionScreen`]:
 //! it emits [`SessionPickerEvent`] and never touches the daemon client or SSH

@@ -333,9 +333,6 @@ windows_stable_exe := windows_stable_dir / "rift-stable.exe"
 # Windows tools by absolute path: this WSL config does not append the Windows PATH
 # (no appendWindowsPath), so bare `taskkill.exe`/`cmd.exe` are not resolvable.
 windows_system32 := "/mnt/c/Windows/System32"
-# Tmux session the app attaches to. Default `rift` (the shared live session both
-# channels mirror); override to isolate dev, e.g. `RIFT_SESSION=rift-dev just dev-windows-watch`.
-rift_session := env("RIFT_SESSION", "rift")
 
 dev: release-daemon
     WAYLAND_DISPLAY="" \
@@ -360,14 +357,14 @@ dev-watch:
     RIFT_PROJECT_ROOT="{{RIFT_PROJECT_ROOT}}" \
     cargo watch -x 'clippy --workspace -- -D warnings' -x 'run -p rift-app'
 
-# Shared Windows launch: export the SSH + session env block (translated for the
-# native .exe via WSLENV) and run EXE on tmux session SESSION. A non-empty DETACH
-# starts the exe in its own session via `setsid` (WSL binfmt direct exec) so the
-# recipe returns while the GUI keeps running (stable/promote); empty runs foreground
-# for the dev watch loop. Private — keeps the env block in one place so the dev and
+# Shared Windows launch: export the SSH env block (translated for the native
+# .exe via WSLENV) and run EXE. A non-empty DETACH starts the exe in its own
+# session via `setsid` (WSL binfmt direct exec) so the recipe returns while
+# the GUI keeps running (stable/promote); empty runs foreground for the dev
+# watch loop. Private — keeps the env block in one place so the dev and
 # stable recipes never drift.
 [private]
-_launch-windows exe session detach="":
+_launch-windows exe detach="":
     #!/usr/bin/env bash
     set -euo pipefail
     # RIFT_PROJECT_ROOT carries no `/p`: it is a path on the SSH host (Linux), not
@@ -381,13 +378,12 @@ _launch-windows exe session detach="":
     # the live TTY check to decide. dev-windows[-watch] pins it (see below): the
     # WSL binfmt interop relay is a pipe, not a TTY, so without the override the
     # dev console would silently divert to the rotated file sink.
-    export WSLENV="RUST_LOG:RIFT_SSH_HOST:RIFT_SSH_USER:RIFT_SSH_PORT:RIFT_SSH_KEY:RIFT_SESSION:RIFT_PROJECT_ROOT:RIFT_TERMINAL_LEGACY:RIFT_LOG_CONSOLE:RIFT_DAEMON_BINARY/p"
+    export WSLENV="RUST_LOG:RIFT_SSH_HOST:RIFT_SSH_USER:RIFT_SSH_PORT:RIFT_SSH_KEY:RIFT_PROJECT_ROOT:RIFT_TERMINAL_LEGACY:RIFT_LOG_CONSOLE:RIFT_DAEMON_BINARY/p"
     export RUST_LOG=rift=debug,rift_ssh=debug
     export RIFT_SSH_HOST="{{RIFT_SSH_HOST}}"
     export RIFT_SSH_USER="{{RIFT_SSH_USER}}"
     export RIFT_SSH_PORT="{{RIFT_SSH_PORT}}"
     export RIFT_SSH_KEY="{{windows_ssh_key}}"
-    export RIFT_SESSION="{{session}}"
     export RIFT_PROJECT_ROOT="{{RIFT_PROJECT_ROOT}}"
     export RIFT_TERMINAL_LEGACY="${RIFT_TERMINAL_LEGACY:-}"
     export RIFT_LOG_CONSOLE="${RIFT_LOG_CONSOLE:-}"
@@ -409,7 +405,7 @@ _launch-windows exe session detach="":
 dev-windows: release-daemon
     cargo build -p rift-app --target x86_64-pc-windows-gnu
     -{{windows_system32}}/taskkill.exe /F /IM rift.exe 2>/dev/null
-    RIFT_LOG_CONSOLE=1 just _launch-windows {{windows_exe}} {{rift_session}}
+    RIFT_LOG_CONSOLE=1 just _launch-windows {{windows_exe}}
 
 # Watch for changes and rebuild+run Windows .exe (requires cargo-watch)
 dev-windows-watch:
@@ -478,8 +474,8 @@ promote:
       echo "promote: could not overwrite {{windows_stable_exe}} — still locked by a running rift-stable.exe?" >&2
       exit 1
     fi
-    just _launch-windows "{{windows_stable_exe}}" rift detach
-    echo "promote: rift-stable promoted from $(git rev-parse --short HEAD), relaunched on session rift"
+    just _launch-windows "{{windows_stable_exe}}" detach
+    echo "promote: rift-stable promoted from $(git rev-parse --short HEAD), relaunched"
 
 # Hints to run `promote` first if rift-stable.exe has not been built yet.
 # Relaunch the pinned rift-stable.exe without rebuilding (e.g. after a reboot).
@@ -491,8 +487,8 @@ stable:
       exit 1
     fi
     "{{windows_system32}}/taskkill.exe" /F /IM rift-stable.exe 2>/dev/null || true
-    just _launch-windows "{{windows_stable_exe}}" rift detach
-    echo "stable: relaunched rift-stable.exe on session rift"
+    just _launch-windows "{{windows_stable_exe}}" detach
+    echo "stable: relaunched rift-stable.exe"
 
 # Build Windows .exe without running
 build-windows:
