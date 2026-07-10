@@ -620,9 +620,9 @@ vs always starting empty. No root-switch hook is
 pre-baked into the in-flight phase-32/33 work — the `SessionSwitchRequest → Attach`
 seam is already the extension point.
 
-## Workspace visibility rail — prior-art index (Phase 37)
+## Workspace visibility rail — prior-art index (Phase 39)
 
-Per-concern prior art for the rail-driven visibility + solo model (Phase 37).
+Per-concern prior art for the rail-driven visibility + solo model (Phase 39).
 
 | Concern | Reference | Verdict |
 |---|---|---|
@@ -636,6 +636,18 @@ and "zoom = solo" compose cleanly. AVOID: VS Code / Zed drag-rearrange, multiple
 floating panels, and per-user free layout — out of scope (rift's area set is fixed and
 opinionated). Sources: VS Code Custom Layout / Activity Bar docs; JetBrains Tool Windows
 help; Zed "new panel system" blog.
+
+## Mid-session session lifecycle — prior-art index (Phase 40)
+
+Per-concern prior art for the connected-but-sessionless mid-session state (Phase 40).
+
+| Concern | Reference | Verdict |
+|---|---|---|
+| Kill the attached session → switch to another vs detach (never disconnect the transport) | **tmux `detach-on-destroy`** option: default `on` detaches the client to the shell when the attached session is killed; `off` switches the client to the most-recently-active remaining session instead ([tmux(1)](https://man7.org/linux/man-pages/man1/tmux.1.html)) | reference — rift's variant of `detach-on-destroy off`: on kill, show the session PICKER (user chooses, always — even for one) rather than auto-switch, and open the root picker when none remain; never drop the SSH/daemon connection |
+| Connection persists independent of the active session / workspace | VS Code Remote-SSH — the SSH host stays connected across closing folders/terminals; only a real transport loss shows "Disconnected, reconnecting" ([Remote SSH](https://code.visualstudio.com/docs/remote/ssh)); Zed / rift's own phase-20 daemon-as-proxy — the reattachable daemon survives drops (Category 8 #1) | reference — model the connection (SSH + daemon) as persistent and the session (tmux) as ephemeral; "session ended" is an in-app transition, not a disconnect |
+| Re-enter the picker states with a live connection | rift's own phase-33 post-connect picker + phase-20 recovery engine's re-Attach ([spec-post-connect-picker.md](spec-post-connect-picker.md), [spec-connection-robustness.md](spec-connection-robustness.md)); the existing `PickerOutcome::ShowPicker` empty-vs-non-empty routing | reuse own pattern — drive the pre-cockpit `ScreenState::Picker` / `RootPicker` machinery mid-session with the live daemon client, not only after a fresh connect |
+
+Notes — ADOPT: tmux's `detach-on-destroy off` semantics (switch, don't disconnect), rendered as rift's picker; the connection-vs-session separation from VS Code Remote / Zed / rift's own daemon-as-proxy. AVOID: auto-attach on kill (the user chose always-picker), tmux's default detach-to-shell (rift stays in-app), and any teardown of the SSH/daemon on a session end. Sources: tmux(1) man page (`detach-on-destroy`); VS Code Remote-SSH docs.
 
 ## Priority reference projects (top 10)
 
