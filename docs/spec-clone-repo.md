@@ -136,8 +136,9 @@ credential forwarding.
   `protocol` additions are a deliberate API change (`PROTOCOL_VERSION` bump +
   fingerprint re-pin), per `docs/constitution.md`.
 - **No clobber, no partial tree.** The daemon refuses a target that already
-  exists and must not leave a half-cloned directory on failure (clone into the
-  final path only on success, or clean up on error).
+  exists and must not leave a half-cloned directory on failure — via gix's own
+  Drop cleanup (the created dir is removed unless `persist()`d; see the
+  `crates/daemon` scope), not a hand-rolled temp-then-rename.
 - **Remote-native auth is a differentiator, not a gap.** Because the daemon runs
   on the target, it uses the target's own credentials — the homelab devenv
   already provisions `GIT_AUTH_TOKEN`. Whether that env var is wired into gix's
@@ -179,7 +180,7 @@ credential forwarding.
 |---|---|---|
 | Clone runs **daemon-side via `gix`**, pure-Rust, no system `git` | musl-static self-containment (constitution ruled out `git2`/`libgit2`); `gix` is already the daemon's git dependency and `prepare_clone` does fetch + checkout honoring auth config | 2026-07-10 |
 | HTTP transport is **rustls** (`reqwest` rustls family), not curl/OpenSSL | Only a pure-Rust TLS stack is musl-static-clean; curl/OpenSSL reintroduce the native-linking problem gix was chosen to avoid | 2026-07-10 |
-| gix clone features are a **named dependency addition** (network + rustls HTTP transport + worktree checkout); exact feature names pinned by the daemon spike | The current `default-features = false` gix set has no network; the spec names the dep so the implement loop may add it (workflow autonomy); must pass `cargo deny check licenses` | 2026-07-10 |
+| gix clone features are a **named dependency addition**, exact names given (`blocking-http-transport-reqwest-rust-tls` + `worktree-mutation`, pulling `reqwest`); the spike confirms the musl build, not the names | The current `default-features = false` gix set has no network; the spec names the dep so the implement loop may add it (workflow autonomy); must pass `cargo deny check licenses` | 2026-07-10 |
 | New **request/reply clone channel** (`CloneRepo` → `CloneResult`), query-reply data-or-error shape; `PROTOCOL_VERSION` bump (10 → 11, next free at merge) | Mirrors the browse channel's message shape (`QueryDirEntries` → `DirEntriesReply`); a `protocol` addition is a deliberate API change (fingerprint re-pin) | 2026-07-10 |
 | Clone dispatch is a **detached task**, NOT inline like browse; cancellation via gix's `should_interrupt` flag | A clone is unbounded; awaiting it inline in `serve_connection` (`lib.rs:1211`, as browse does) would stall the connection's terminal + inbound messages for the clone's duration and make a hung clone un-cancellable | 2026-07-10 |
 | No partial tree via gix's Drop cleanup (don't `persist()` on error), not temp-then-rename | gix's `PrepareFetch`/`PrepareCheckout` remove the dir they created on Drop unless persisted, so the mechanism is already there; a daemon-kill mid-clone leaving a partial dir is an accepted v1 edge | 2026-07-10 |
