@@ -32,6 +32,7 @@
 
 use std::path::{Path, PathBuf};
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -515,14 +516,12 @@ impl ConnectionScreen {
     /// blindly. Recents never carry a passphrase (never persisted — #478),
     /// so a click landing on an encrypted key stops short of connecting and
     /// prompts for it instead of spinning up a connect attempt that would
-    /// deterministically fail. `RecentConnection` does not carry a wrapper
-    /// yet either (recents persistence for it is issue #790, out of scope
-    /// here), so — unlike host/user/port/key — the wrapper field is left
-    /// untouched by a recent click and read as-is at connect, the same way
-    /// a plain Connect click reads it (no regression to the fresh-card
-    /// env/bake prefill when a recent is picked instead). Silently ignored
-    /// if `index` is stale (the list changed under a slow click), rather
-    /// than panicking.
+    /// deterministically fail. The wrapper field is prefilled from the
+    /// recent's stored `remote_exec_wrapper` (issue #790) — recent takes
+    /// precedence over the fresh-card env/bake prefill, mirroring the
+    /// host/user/port/key reset exactly (an empty stored wrapper clears the
+    /// field, a normal host connection). Silently ignored if `index` is
+    /// stale (the list changed under a slow click), rather than panicking.
     fn connect_from_recent(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(recent) = self.recents.get(index).cloned() else {
             return;
@@ -541,6 +540,9 @@ impl ConnectionScreen {
         });
         self.passphrase_input
             .update(cx, |input, cx| input.set_value(String::new(), window, cx));
+        self.remote_exec_wrapper_input.update(cx, |input, cx| {
+            input.set_value(recent.remote_exec_wrapper.clone(), window, cx)
+        });
         self.refresh_key_encrypted(cx);
 
         if self.key_encrypted {
@@ -704,8 +706,11 @@ fn render_logo(cx: &mut Context<ConnectionScreen>) -> impl IntoElement {
 }
 
 /// One RECENT row: a host icon tile, host (mono) + "user · session <name>"
-/// caption, and a trailing relative-time label. Clicking anywhere on the row
-/// prefills and connects ([`ConnectionScreen::connect_from_recent`]).
+/// caption, an optional muted wrapper indicator (issue #790 — only rendered
+/// when the entry's `remote_exec_wrapper` is non-empty, so a container
+/// connection is visually distinguishable from a plain one), and a trailing
+/// relative-time label. Clicking anywhere on the row prefills and connects
+/// ([`ConnectionScreen::connect_from_recent`]).
 fn render_recent_row(
     cx: &mut Context<ConnectionScreen>,
     index: usize,
@@ -720,6 +725,8 @@ fn render_recent_row(
 
     let host = SharedString::from(recent.host.clone());
     let caption = SharedString::from(format!("{} \u{b7} session {}", recent.user, recent.session));
+    let wrapper = SharedString::from(recent.remote_exec_wrapper.clone());
+    let has_wrapper = !recent.remote_exec_wrapper.is_empty();
     let when = SharedString::from(recents::relative_time(
         now_unix_secs,
         recent.last_connected_unix_secs,
@@ -773,6 +780,21 @@ fn render_recent_row(
                         .child(caption),
                 ),
         )
+        .when(has_wrapper, |el| {
+            el.child(
+                div()
+                    .flex_none()
+                    .max_w(px(120.0))
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded(px(4.0))
+                    .bg(tile_bg)
+                    .text_size(px(10.0))
+                    .text_color(muted)
+                    .truncate()
+                    .child(wrapper),
+            )
+        })
         .child(
             div()
                 .flex_none()
