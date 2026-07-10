@@ -620,6 +620,23 @@ vs always starting empty. No root-switch hook is
 pre-baked into the in-flight phase-32/33 work — the `SessionSwitchRequest → Attach`
 seam is already the extension point.
 
+## Workspace visibility rail — prior-art index (Phase 37)
+
+Per-concern prior art for the rail-driven visibility + solo model (Phase 37).
+
+| Concern | Reference | Verdict |
+|---|---|---|
+| Rail icon toggles an area's visibility (inactive hidden, not just collapsed) | VS Code Activity Bar — view containers as activity items; toggle sidebar / activity-bar visibility ([Custom Layout](https://code.visualstudio.com/docs/configure/custom-layout), [Activity Bar UX](https://code.visualstudio.com/api/ux-guidelines/activity-bar)); Zed dock-toggle actions — toggling focus onto a panel opens its dock ([Zed new panel system](https://zed.dev/blog/new-panel-system)) | reference — adopt icon-per-area + click-toggles-visibility; a click on the active area hides it |
+| Solo / maximize one area (zoom = deselect the rest) | Zed `workspace::ToggleZoom` (maximize a pane/panel, Shift+Esc; [Zed panel system](https://zed.dev/blog/new-panel-system)); VS Code "View: Toggle Maximized Panel"; JetBrains "Hide All Windows / Restore" (Ctrl+Shift+F12) + tool-window maximize ([Tool windows](https://www.jetbrains.com/help/idea/tool-windows.html)) | reference — rift's zoom = solo the area (hide the rest), restore on re-toggle; the visibility SET is rift-owned state driving the dock beneath |
+| The dock / panel substrate | longbridge/gpui-component Dock (vendored, #325); `zed` `crates/workspace/src/dock.rs` — Dock entities, panel open / zoom lifecycle | reuse (gpui-component) / reference (Zed dock model) |
+
+Notes — ADOPT: the canonical icon-rail + solo/maximize semantics; keep the visibility set
+as rift-owned state driving gpui-component Dock's show/hide, so "inactive = not rendered"
+and "zoom = solo" compose cleanly. AVOID: VS Code / Zed drag-rearrange, multiple docks,
+floating panels, and per-user free layout — out of scope (rift's area set is fixed and
+opinionated). Sources: VS Code Custom Layout / Activity Bar docs; JetBrains Tool Windows
+help; Zed "new panel system" blog.
+
 ## Priority reference projects (top 10)
 
 1. **penso/arbor** — Closest existing implementation of rift's exact concept (Rust + GPUI + daemon + SSH outposts + agent state). Read end-to-end before writing any architecture docs.
