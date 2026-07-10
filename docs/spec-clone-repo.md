@@ -30,9 +30,14 @@ credentials — no credential forwarding.
       it.
 - [ ] A failed clone (bad URL, auth failure, target already exists, network
       error) surfaces a clear error in the picker and creates **no** session and
-      **no** partial directory — never a half-clone left on disk.
-- [ ] `protocol` gains a clone request/reply channel; `PROTOCOL_VERSION` bumps
-      `10 → 11` and the fingerprint test is re-pinned.
+      **no** partial directory — never a half-clone left on disk. If the host has
+      no `git`, the picker shows a distinct actionable "git is not installed on the
+      host" message (a `CloneError::GitUnavailable` variant), not a generic
+      failure.
+- [ ] `protocol` gains a clone request/reply channel (shipped in #827,
+      `PROTOCOL_VERSION` 10 → 11); this revision adds one variant
+      (`CloneError::GitUnavailable`), bumping `PROTOCOL_VERSION` 11 → 12 (next free
+      at merge) and re-pinning the fingerprint test.
 - [ ] The daemon stays a self-contained static musl binary **and pure-Rust /
       C-free**: the clone shells out to the host's `git`, so the daemon embeds no
       HTTPS/TLS stack — no `reqwest`/`rustls`/`aws-lc-rs`, no `libgit2`/OpenSSL,
@@ -50,11 +55,13 @@ credentials — no credential forwarding.
   `ClientMessage::CloneRepo { url, parent, name }` →
   `DaemonMessage::CloneResult { path, error: Option<CloneError> }`, with a
   `CloneError` enum (invalid URL, auth failed, target exists, network/transport,
-  other) mirroring `DirBrowseError`. `PROTOCOL_VERSION` bumps to the next free
-  value (10 → 11 unless another protocol-touching phase merges first); re-pin the
-  fingerprint test. **Shipped in #827 — the wire contract is mechanism-agnostic
-  (it carries a URL and a resolved path, not a transport), so the shell-out
-  reimplementation leaves it unchanged.**
+  other) mirroring `DirBrowseError`. **Shipped in #827** (`PROTOCOL_VERSION`
+  10 → 11) — the wire contract is otherwise mechanism-agnostic (it carries a URL
+  and a resolved path, not a transport), so the shell-out reimplementation reuses
+  it. **This revision makes one additive change**: a `CloneError::GitUnavailable`
+  variant so the git-absent case surfaces as a distinct, actionable picker
+  message rather than a generic `Other`; `PROTOCOL_VERSION` bumps 11 → 12 (next
+  free at merge) and the fingerprint test is re-pinned.
 - **`crates/daemon`**: the `clone` module. It reuses the browse channel's
   **message** shape (one request → one data-or-error reply) but NOT its dispatch:
   the browse listing is awaited **inline** in the per-connection
@@ -78,12 +85,16 @@ credentials — no credential forwarding.
   option injection, is rejecting local-path-looking strings) — passes it after a
   `--` separator, and refuses when the target already exists (no clobber). The
   child is spawned with `LC_ALL=C` so `git`'s stderr is locale-stable for error
-  classification. **No partial tree on failure**: `git
+  classification. A spawn `NotFound` (no `git` on the host) maps to the new
+  `CloneError::GitUnavailable`; the child's exit status + stderr map onto the
+  other `CloneError` variants (auth / network / target-exists / other).
+  **No partial tree on failure**: `git
   clone` removes its own target on a failed clone, and the task additionally
   removes `<target>` on any non-success exit or on interrupt-kill, so a partial
-  tree never survives. Auth is left to the host's git configuration (credential
-  helpers / `GIT_AUTH_TOKEN` in the daemon's environment) — the same resolution a
-  terminal `git clone` on the host uses.
+  tree never survives. Auth is left to the host's git configuration (a configured
+  credential helper — a bare `GIT_AUTH_TOKEN` needs a helper to consume it, see
+  the Remote-native auth constraint) — the same resolution a terminal `git clone`
+  on the host uses.
 - **Daemon dependency posture (reverting the gix-transport addition)**: the
   daemon does **not** gain any git HTTP-transport dependency. The `gix` clone
   features added in the first implementation
@@ -103,8 +114,10 @@ credentials — no credential forwarding.
   path (`Attach { session, root: Some(<checkout>) }`, the same path the
   browse-and-pick Create uses); on error, show it inline. The visual contract is
   the Paper `rift` file, "Session management" **Frame C** (root-picker anatomy)
-  extended with the clone mode. **Shipped in #829/#835 — mechanism-agnostic, so
-  the shell-out reimplementation leaves it unchanged.**
+  extended with the clone mode. **Shipped in #829/#835** — the shell-out
+  reimplementation leaves it unchanged except one line: `describe_clone_error`
+  gains the `CloneError::GitUnavailable` case (an actionable "git is not installed
+  on the host" message).
 - **Docs**: `docs/protocol.md` documents the clone channel; `CLAUDE.md` /
   `AGENTS.md` container-workflow note mentions clone-to-start as the cold-start
   path (and that the target host must have `git`).
@@ -225,7 +238,8 @@ credentials — no credential forwarding.
 | Clone runs **daemon-side by shelling out to the host's `git`** (`git clone`), NOT gix-in-process | The embedded-HTTPS path (`gix` + `rustls`) pulls a C crypto backend (`aws-lc-rs`/`ring`), violating the constitution's pure-Rust/no-C rule and breaking the musl build without a C cross-compiler; there is no production-grade pure-Rust TLS. Shelling out keeps the daemon pure-Rust/C-free and matches the ecosystem (Zed deleted libgit2 and shells out; VS Code/JetBrains/orchestrators require system `git`). **Reverses the original gix-in-process decision.** | 2026-07-10 |
 | Accepted tradeoff: a **runtime dependency on `git` on the target host** | Low, industry-standard assumption; a dev/agent host running tmux agents always has `git`. The daemon detects its absence and reports a clear error. | 2026-07-10 |
 | The daemon embeds **no git HTTP transport**: revert `gix`'s clone features (`blocking-http-transport-reqwest-rust-tls` + `worktree-mutation`) and their `reqwest`/`rustls`/`aws-lc-rs`/`webpki-root-certs` tree, the `deny.toml` CDLA allowance, and the direct daemon `gix` dep | Those are the only source of the C dependency; `gix` stays for local reads (status/diff) which are pure-Rust and network-free | 2026-07-10 |
-| New **request/reply clone channel** (`CloneRepo` → `CloneResult`), query-reply data-or-error shape; `PROTOCOL_VERSION` bump (10 → 11); mechanism-agnostic wire | Mirrors the browse channel; the wire carries a URL + resolved path, not a transport, so the shell-out reimplementation reuses it unchanged (shipped in #827) | 2026-07-10 |
+| New **request/reply clone channel** (`CloneRepo` → `CloneResult`), query-reply data-or-error shape; `PROTOCOL_VERSION` bump (10 → 11); mechanism-agnostic wire | Mirrors the browse channel; the wire carries a URL + resolved path, not a transport, so the shell-out reimplementation reuses it (shipped in #827) — adding only one variant (below) | 2026-07-10 |
+| Add a **`CloneError::GitUnavailable`** variant for the git-absent case (`PROTOCOL_VERSION` 11 → 12, fingerprint re-pin; one `describe_clone_error` line in the app) | Shelling out to host `git` introduces a git-absent failure mode; a distinct actionable "git not installed on the host" message (Zed-style clarity) beats a generic `Other`. A single additive variant is the proportionate cost — no message payload, no new channel; decided at the re-plan spec-acceptance gate | 2026-07-10 |
 | Clone dispatch is a **detached task**, NOT inline like browse; cancellation kills the `git` child process on `should_interrupt` | A clone is unbounded; awaiting it inline in `serve_connection` (`lib.rs:1211`, as browse does) would stall the connection's terminal + inbound messages for the clone's duration and make a hung clone un-cancellable | 2026-07-10 |
 | No partial tree: `git clone`'s own target cleanup + a defensive `<target>` removal on any non-success exit or interrupt-kill (not gix Drop) | With no gix in the clone path, cleanup is explicit; `git clone` already removes its target on failure, and the belt-and-suspenders removal covers the interrupt-kill case | 2026-07-10 |
 | **No client-sent credentials / no forwarding**; the daemon's `git clone` uses the host's ambient git credentials | The remote-native differentiator — the daemon is already on the target with its own creds (devenv `GIT_AUTH_TOKEN` + credential helpers, inherited by the subprocess for free); avoids an auth UI and a security surface | 2026-07-10 |
@@ -253,16 +267,18 @@ under the milestone. This spec owns the design; the issues own progress.
 - [ ] `cargo deny check licenses` passes; the `reqwest`/`rustls`/`aws-lc-rs`/
       `webpki-root-certs` subtree and the `CDLA-Permissive-2.0` allowance are
       **removed** from the tree and `deny.toml`.
-- [ ] `protocol`: `PROTOCOL_VERSION == 11`; the fingerprint test passes re-pinned;
-      `CloneRepo`/`CloneResult`/`CloneError` round-trip serde (valid + error).
-      (Shipped in #827; unchanged by this revision.)
+- [ ] `protocol`: the additive `CloneError::GitUnavailable` variant lands;
+      `PROTOCOL_VERSION` bumps to 12 (next free at merge); the fingerprint test
+      passes re-pinned; `CloneRepo`/`CloneResult`/`CloneError` round-trip serde
+      (valid + each error variant, incl. `GitUnavailable`). (The channel itself
+      shipped in #827.)
 - [ ] Daemon clone tests (a local `file://` / bare-repo fixture to stay offline in
       CI, cloned via the host `git`): a `file://` URL clones into `<parent>/<name>`
       and the checkout is present; an existing target is refused with
       `CloneError::TargetExists`; a bogus URL yields `CloneError::InvalidUrl` and
       leaves no directory behind; an unreachable/failed clone leaves no directory
-      behind; a missing `git` binary surfaces as `CloneError::Other` with no panic
-      and no directory left behind.
+      behind; a missing `git` binary surfaces as `CloneError::GitUnavailable` with
+      no panic and no directory left behind.
 - [ ] The clone dispatch is **non-blocking**: a clone in progress does not stall
       the connection — a live terminal in the same session keeps producing output
       during the clone (dev-channel QA), and the daemon-side clone task is
@@ -282,7 +298,7 @@ under the milestone. This spec owns the design; the issues own progress.
 
 | Risk | Mitigation |
 |---|---|
-| `git` is absent on the target host/container | The daemon detects a missing `git` (spawn `NotFound`) and logs a clear "git not found" `warn!`. On the wire this can only be `CloneError::Other` — the frozen 5-variant enum carries no message payload, so a missing `git` reads in the picker as a generic failure (clear only in the daemon log); acceptable since `git`-present is a documented host prerequisite and adding a variant would break the "protocol unchanged" claim. A dev/agent host running tmux agents has `git`. |
+| `git` is absent on the target host/container | The daemon detects a missing `git` (spawn `NotFound`) and returns the new `CloneError::GitUnavailable`, which the picker renders as an actionable "git is not installed on the host" message (not a generic failure) — the one additive protocol change this revision makes. Also logged. A dev/agent host running tmux agents has `git`. |
 | `git clone` error classification onto the wire `CloneError` | Map the child's exit status + stderr onto `CloneError` by recognizable substrings (authentication vs. could-not-resolve-host/network vs. already-exists vs. other), with `LC_ALL=C` set on the child so the substrings are locale-stable; best-effort defaulting to `CloneError::Other` — the same "stable surface, no guessing" approach the first implementation used for gix's error `Display`. |
 | An interrupt (connection drop) leaves a `git` child running or a partial dir | The task holds the child handle and `start_kill`s + reaps it on `should_interrupt`; the target dir is removed on any non-success/interrupt exit. |
 | A slow clone with only a coarse in-progress state feels unresponsive | Acceptable for v1 (proportional); the channel is shaped so streamed progress (`git clone --progress`) can be added later without breaking the request/reply base. |
@@ -355,3 +371,15 @@ under the milestone. This spec owns the design; the issues own progress.
   the daemon log); the up-front URL validation is now gix-free (allow-list +
   scp-shorthand, no `gix::url::parse`); `should_interrupt` is watched via a
   `select!` on `child.wait()` since it is no longer a gix-internal polled flag.
+- 2026-07-10 (re-plan spec-acceptance gate): one decision resolved — the
+  git-absent case gets a **distinct `CloneError::GitUnavailable` variant** (over
+  the review's non-blocking "keep it `Other`" suggestion), so the picker shows an
+  actionable "git is not installed on the host" message (Zed-style clarity) rather
+  than a generic failure. This makes the protocol a small additive change
+  (`PROTOCOL_VERSION` 11 → 12, fingerprint re-pin) plus one `describe_clone_error`
+  line in the app — the reimplementation issue now spans protocol + app + daemon,
+  one coherent change. Auth/URL/network/target-exists failure modes were already
+  actionable via their existing variants. Human prerequisites (`git` on the host;
+  a credential helper for private-repo clone) confirmed as the delivery / QA
+  handover; the operator verifies the devenv's git + credential-helper config
+  before private-repo QA (public-repo cold-start unaffected). Spec accepted.
