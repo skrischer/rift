@@ -1,8 +1,8 @@
 # Spec: Session start-directory (spawn panes in the project root)
 
-> Status: READY
+> Status: COMPLETED
 > Created: 2026-07-09
-> Completed: —
+> Completed: 2026-07-10
 
 Give every tmux session rift creates a project-root default working directory, so
 its first pane and every new window and split land in the project — not the SSH

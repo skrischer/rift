@@ -1,8 +1,8 @@
 # Spec: Per-session project root (root follows the active session)
 
-> Status: READY
+> Status: COMPLETED
 > Created: 2026-07-09
-> Completed: —
+> Completed: 2026-07-10
 
 Make the daemon's watched root follow the active tmux session: each session's
 project root is coupled to the session via a session-scoped `@root` user option,
