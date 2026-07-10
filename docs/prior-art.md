@@ -620,9 +620,9 @@ vs always starting empty. No root-switch hook is
 pre-baked into the in-flight phase-32/33 work — the `SessionSwitchRequest → Attach`
 seam is already the extension point.
 
-## Workspace visibility rail — prior-art index (Phase 38)
+## Workspace visibility rail — prior-art index (Phase 39)
 
-Per-concern prior art for the rail-driven visibility + solo model (Phase 38).
+Per-concern prior art for the rail-driven visibility + solo model (Phase 39).
 
 | Concern | Reference | Verdict |
 |---|---|---|
@@ -637,9 +637,9 @@ floating panels, and per-user free layout — out of scope (rift's area set is f
 opinionated). Sources: VS Code Custom Layout / Activity Bar docs; JetBrains Tool Windows
 help; Zed "new panel system" blog.
 
-## Mid-session session lifecycle — prior-art index (Phase 39)
+## Mid-session session lifecycle — prior-art index (Phase 40)
 
-Per-concern prior art for the connected-but-sessionless mid-session state (Phase 39).
+Per-concern prior art for the connected-but-sessionless mid-session state (Phase 40).
 
 | Concern | Reference | Verdict |
 |---|---|---|

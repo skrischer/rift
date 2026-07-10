@@ -54,8 +54,9 @@
 | 35 | Per-session project root — the daemon watched root follows the active session; the root is coupled to the tmux session via a session-scoped `@root` user option, resolved daemon-side on attach, superseding the single baked `RIFT_PROJECT_ROOT`; a session switch re-roots the reactive layer (file tree / git / LSP). session = project | [spec-per-session-project-root.md](spec-per-session-project-root.md) | [Phase 350](https://github.com/skrischer/rift/milestone/53) |
 | 36 | New-session remote root picker — creating a session picks its project root by browsing the remote filesystem (a daemon-side directory listing), binding session = project at creation: the name defaults to the folder basename and the root is written to `@root` (phase 35). Supersedes the zero-sessions picker screen — with no sessions, connecting opens the root picker directly | [spec-session-root-picker.md](spec-session-root-picker.md) | [Phase 360](https://github.com/skrischer/rift/milestone/55) |
 | 37 | Remote exec wrapper UI — surface `RIFT_REMOTE_EXEC_WRAPPER` as an editable, env/bake-prefilled connect-card field and persist it per host in the connection recents store, so a container connection can be set up and re-run from the UI (the UI field the archived remote-exec-wrapper spec deferred) | [spec-remote-exec-wrapper-ui.md](spec-remote-exec-wrapper-ui.md) | [Phase 370](https://github.com/skrischer/rift/milestone/56) |
-| 38 | Workspace visibility rail — the left activity rail toggles each workspace area's visibility (inactive = not rendered, not merely collapsed); Explorer+Editor count as one area, plus Terminal / Diagnostics / Git; the per-area zoom becomes a solo mode (all other areas deselected), and re-toggling an area from the rail adds it back into the workspace | — | — |
-| 39 | Mid-session session lifecycle — killing or exiting the active session returns to the pre-cockpit picker (the session picker if ≥1 session remains — always, even for one; else the zero-sessions root picker) while keeping the SSH/daemon connection alive; the connection screen is entered only on a real transport loss, so "session ended" stops meaning "disconnected" | — | — |
+| 38 | Retire the fixed `RIFT_SESSION` default — connect-and-list becomes the default session model: the launch recipes stop pinning `RIFT_SESSION` and the `SessionIntent::Fixed` fast-path is removed, so every connect resolves to the live session list (Phase 33) or the remote root picker (Phase 36); the dogfooding mirror moves to recents-based same-session attach | [spec-retire-fixed-session.md](spec-retire-fixed-session.md) | [Phase 380](https://github.com/skrischer/rift/milestone/57) |
+| 39 | Workspace visibility rail — the left activity rail toggles each workspace area's visibility (inactive = not rendered, not merely collapsed); Explorer+Editor count as one area, plus Terminal / Diagnostics / Git; the per-area zoom becomes a solo mode (all other areas deselected), and re-toggling an area from the rail adds it back into the workspace | — | — |
+| 40 | Mid-session session lifecycle — killing or exiting the active session returns to the pre-cockpit picker (the session picker if ≥1 session remains — always, even for one; else the zero-sessions root picker) while keeping the SSH/daemon connection alive; the connection screen is entered only on a real transport loss, so "session ended" stops meaning "disconnected" | — | — |
 
 A phase gets a Spec link once `/loopkit:plan` drafts it, and a Milestone link once
 it is `READY`. The milestone (open/closed + issue progress) is where status lives.
@@ -289,7 +290,7 @@ wrapper stays a transport setting resolved at SSH-connect, orthogonal to the roo
 Backing prior art: "Session ↔ project root coupling — prior-art index
 (Phases 34–36)" in [prior-art.md](prior-art.md).
 
-## Workspace visibility rail (phase 38)
+## Workspace visibility rail (phase 39)
 
 Seeded 2026-07-10 from idea sparring (research mode: websearch). Evolves the shipped
 activity rail (#513), dock interaction (#325), and the direct zoom toggle (#716/#665)
@@ -313,10 +314,10 @@ UI evolution. It **supersedes the cockpit-chrome rail behaviour**
 that design-contract update is authored in the phase's spec PR (a design artifact
 reviewed at spec-acceptance), not a foundation-doc change.
 
-Backing prior art: "Workspace visibility rail — prior-art index (Phase 38)" in
+Backing prior art: "Workspace visibility rail — prior-art index (Phase 39)" in
 [prior-art.md](prior-art.md).
 
-## Mid-session session lifecycle (phase 39)
+## Mid-session session lifecycle (phase 40)
 
 Seeded 2026-07-10 from idea sparring (research mode: websearch). Killing/exiting the
 active session today ends the whole session pipeline and routes to
@@ -341,7 +342,7 @@ contract" gains the **mid-session sessionless state** and the **session-end vs.
 transport-loss distinction** (only a transport loss routes to the connection screen).
 Authored + ratified in the phase's `/loopkit:plan` spec PR, never here.
 
-Backing prior art: "Mid-session session lifecycle — prior-art index (Phase 39)" in
+Backing prior art: "Mid-session session lifecycle — prior-art index (Phase 40)" in
 [prior-art.md](prior-art.md).
 
 ## Tracks (tooling/DX, not product phases)
