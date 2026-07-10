@@ -44,7 +44,12 @@ pub(crate) async fn reply(msg: ClientMessage) -> DaemonMessage {
 /// is unset — a stripped daemon environment, best-effort rather than a hard
 /// failure); any other value is used as-is (the caller sends an absolute
 /// path).
-fn resolve_path(path: &str) -> PathBuf {
+///
+/// `pub(crate)`: the clone channel's `parent` resolution (`crate::clone`,
+/// `docs/spec-clone-repo.md`) reuses this exact convention rather than
+/// duplicating it — `parent` is the same key space as this browse channel's
+/// `path`.
+pub(crate) fn resolve_path(path: &str) -> PathBuf {
     if path.is_empty() || path == "~" {
         return home_dir();
     }
@@ -55,7 +60,7 @@ fn resolve_path(path: &str) -> PathBuf {
 }
 
 /// The daemon user's home directory, or `/` when `HOME` is unset.
-fn home_dir() -> PathBuf {
+pub(crate) fn home_dir() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/"))
