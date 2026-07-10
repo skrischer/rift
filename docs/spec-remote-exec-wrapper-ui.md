@@ -1,6 +1,6 @@
 # Spec: Remote exec wrapper — connect-card field + recents persistence
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-07-10
 > Completed: —
 
@@ -101,6 +101,7 @@ container connection can be set up and re-run from the UI without an env var.
 | **Recents persistence is additive** — a `remote_exec_wrapper` string on `RecentConnection`, `#[serde(default)]` "" | The store is already `#[serde(default)]` + tolerant-load (#477); an old file loads the field as "" → `None`. Persisting it is what makes a container recent re-runnable (the requesting need: a recent without its wrapper connects to the bare host). | 2026-07-10 |
 | **Client-only, no protocol/daemon change** | The wrapper mechanism (`SshConnection` builder, `exec::wrap_command`) and its rules are already merged (archived `spec-remote-exec-wrapper.md`); this is purely the deferred UI + recents surface over them. | 2026-07-10 |
 | Free-text field, no container picker / validation | Proportional (archived spec's "a UI field is a separate later issue if wanted"): the env var is free text today; the field matches. Validation/auto-detect is a later nicety. | 2026-07-10 |
+| **The wrapper joins the recents `same_target` dedupe** — dedupe key becomes `(host, user, port, key, remote_exec_wrapper)` | Resolved at the spec-acceptance gate. A container connection (host + wrapper) and a bare-host connection to the same host are distinct functional targets; including the wrapper keeps both re-runnable rather than a plain reconnect clobbering a container recent's wrapper. At most one extra entry per host used both ways, bounded by `MAX_RECENTS`. | 2026-07-10 |
 
 ## Prior art
 
@@ -118,12 +119,6 @@ container connection can be set up and re-run from the UI without an env var.
 
 - none — the field's values are entered by the user at runtime; no secret,
   provisioning, or account is required to build or test this.
-
-## Open decisions (resolved at the spec-acceptance gate)
-
-| Question | Options | Recommendation |
-|---|---|---|
-| Does the wrapper participate in the recents **`same_target`** dedupe (`crates/app/src/recents.rs`)? | (A) **Include it** → a container connection `(host,user,port,key,wrapper)` and a plain connection to the same host are **distinct** recents; neither clobbers the other. (B) **Exclude it** → keep dedupe on host/user/port/key only; the newest wrapper wins on move-to-front (a plain reconnect overwrites a container recent's wrapper). | **(A) include it** — a container vs a bare-host connection to the same host are different functional targets; including the wrapper keeps both re-runnable, matching the "a recent must stay functional" intent. Trade-off: at most one extra entry per host that is used both ways (bounded by `MAX_RECENTS`). |
 
 ## Verification
 
@@ -174,6 +169,11 @@ container connection can be set up and re-run from the UI without an env var.
   separate later issue if wanted"), adding per-host recents persistence of the
   wrapper (the requesting need: a container recent must stay functional). Field
   authoritative at connect, prefilled recent→env→bake, empty→None; additive
-  `RecentConnection.remote_exec_wrapper`; client-only, no protocol change. One
-  open decision carried to the acceptance gate: whether the wrapper joins the
-  recents `same_target` dedupe (recommended: yes).
+  `RecentConnection.remote_exec_wrapper`; client-only, no protocol change.
+- 2026-07-10: Spec-acceptance gate. Open decision resolved — **the wrapper joins
+  the recents `same_target` dedupe** (dedupe key `(host,user,port,key,wrapper)`),
+  so a container recent and a bare-host recent to the same host stay distinct and
+  re-runnable. Review hardening: the connect site stops calling
+  `resolve_remote_exec_wrapper()` directly (it becomes the prefill); the RECENT-row
+  wrapper indicator's exact form is settled at visual QA. Human prerequisites:
+  none. Status `DRAFT` → `READY`.
