@@ -1,6 +1,6 @@
 # Spec: Retire the fixed RIFT_SESSION default — connect-and-list session model
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-07-10
 > Completed: —
 
@@ -20,11 +20,11 @@ on the same host" via the recents reattach path, not a fixed env name.
       connect the app resolves `SessionIntent::Pick` — the live session list when
       the host has sessions (Phase 33), the remote root picker when it has none
       (Phase 36) — never a silent `Fixed("rift")` auto-attach at the baked root.
-- [ ] `RIFT_SESSION` [keep-as-override or remove — resolved at the acceptance
-      gate]: if kept, it stays an optional per-launch override
-      (`RIFT_SESSION=<name> just dev-windows-watch` still forces `Fixed`, the
-      documented dev-isolation use); if removed, `SessionIntent::Fixed` and its
-      env read are deleted and every connect is `Pick`.
+- [ ] `RIFT_SESSION` is **removed entirely**: `SessionIntent::Fixed`,
+      `session_intent_from_env`, and its three `main.rs` consumers
+      (~L916/942/1622-1626) are deleted; the env var is no longer read; every
+      connect resolves `Pick`. Dev-isolation (a throwaway `rift-dev` session) is
+      done by picking/creating that session in the picker, not via env.
 - [ ] The dogfooding-channels mirror is re-specified: stable + dev no longer
       auto-share session `rift` via a baked env; they mirror by attaching the same
       session on the same host — each channel picks it once, then later launches of
@@ -42,21 +42,18 @@ on the same host" via the recents reattach path, not a fixed env name.
 
 ### In scope
 
-- **Launch recipes (`justfile`)**: stop pinning `RIFT_SESSION=rift`. Change
-  `rift_session := env("RIFT_SESSION", "rift")` to default empty, and have the
-  private `_launch-windows` recipe omit the `RIFT_SESSION` export (and its
-  `WSLENV` entry) when the session argument is empty; `promote` / `stable` pass an
-  empty session. A user-set `RIFT_SESSION` is still honoured (override), so the
-  `RIFT_SESSION=rift-dev just dev-windows-watch` isolation invocation keeps
-  working.
-- **`RIFT_SESSION` env knob**: [keep as optional override | remove entirely] per
-  the acceptance-gate decision, with the app code and doc-comments updated to
-  match. The **keep** branch touches no app code (only demotes the knob in docs).
-  The **remove** branch is compiler-enforced and cascades beyond
-  `connection_screen.rs::session_intent_from_env` + `SessionIntent::Fixed` to the
-  three functional consumers in `crates/app/src/main.rs`: the eager-recents-record
-  branch (~L916), `is_fixed_intent` gating direct-attach vs picker (~L942), and
-  the `initial_session`/`preferred_session` seeding match (~L1622-1626).
+- **Launch recipes (`justfile`)**: stop setting `RIFT_SESSION` entirely — drop the
+  `rift_session := env("RIFT_SESSION", "rift")` variable, the `RIFT_SESSION` export
+  and its `WSLENV` entry in `_launch-windows`, and the literal `rift` passed by
+  `promote` / `stable`. With the knob removed there is no override to preserve; the
+  recipes never set the var.
+- **Remove the `RIFT_SESSION` env knob** (acceptance-gate decision): delete
+  `connection_screen.rs::session_intent_from_env` + `SessionIntent::Fixed` and its
+  three functional consumers in `crates/app/src/main.rs` — the eager-recents-record
+  branch (~L916), `is_fixed_intent` gating direct-attach vs picker (~L942), and the
+  `initial_session`/`preferred_session` seeding match (~L1622-1626) — plus the
+  `RIFT_SESSION` doc-comments; the env var is no longer read. Compiler-enforced, so
+  no consumer is silently missed.
 - **Docs**: `docs/spec-dogfooding-channels.md` (a live operational contract whose
   Outcome — "`RIFT_SESSION` (default `rift`)" — becomes factually wrong, so it is
   **edited**) + `CLAUDE.md` (a symlink to `AGENTS.md`; the dogfooding-channels
@@ -104,7 +101,7 @@ on the same host" via the recents reattach path, not a fixed env name.
 | The recipe change is **default `rift_session` → empty** + omit the export when empty; a user-set `RIFT_SESSION` is still honoured | One change that both flips the default and preserves the documented `RIFT_SESSION=rift-dev` dev-isolation override. | 2026-07-10 |
 | The **dogfooding mirror is re-expressed via recents `Preferred`** (same-session attach), not a baked env | The user accepts manually attaching the same session across channels; the recents reattach already makes a remembered still-live session attach directly, giving the mirror back without a fixed name. | 2026-07-10 |
 | **No protocol / daemon change**; client + justfile + docs only | The UI is shipped; this only removes the bypass and updates tooling/docs. | 2026-07-10 |
-| `RIFT_SESSION` knob: **keep as optional override vs remove entirely** | OPEN — resolved at the spec-acceptance gate. | 2026-07-10 |
+| `RIFT_SESSION` knob is **removed entirely** — `SessionIntent::Fixed`, `session_intent_from_env`, and its three `main.rs` consumers (~L916/942/1622-1626) are deleted; every connect resolves `Pick` | Resolved at the spec-acceptance gate. The knob is an obsolete early-project artifact; retiring it (not just demoting it) is the clean host-agnostic v1 end state and strands no capability — dev-isolation (`rift-dev`) is done by picking/creating that session in the picker, not via env. Compiler-enforced removal. | 2026-07-10 |
 
 ## Prior art
 
@@ -131,13 +128,10 @@ on the same host" via the recents reattach path, not a fixed env name.
 - [ ] `just ci` passes (fmt-check + clippy `-D warnings` + tests, workspace
       excluding `rift-app`); `app-check` compiles `rift-app`.
 - [ ] Recipe inspection: `just dev-windows`, `just promote`, `just stable` no
-      longer export a non-empty `RIFT_SESSION`; a `RIFT_SESSION=rift-dev just
-      dev-windows-watch` still forces that session (override preserved — if the
-      knob is kept).
-- [ ] Unit (`crates/app`): `session_intent_from_env(None)` and
-      `session_intent_from_env(Some(""))` both yield `Pick`; a non-empty value
-      yields `Fixed` — or, if the knob is removed, `session_intent_from_env` /
-      `SessionIntent::Fixed` no longer exist and every connect is `Pick`.
+      longer reference or export `RIFT_SESSION` at all.
+- [ ] Unit / build (`crates/app`): `session_intent_from_env` and
+      `SessionIntent::Fixed` no longer exist (compile-checked); the connect path
+      resolves `Pick` with no env read; the old `Fixed`-path tests are removed.
 - [ ] Behavioural (dev-channel QA): `just dev-windows-watch` with no
       `RIFT_SESSION` lands on the session list (host has sessions) or the root
       picker (none) — never a silent `rift` auto-attach at the baked root. A
@@ -152,9 +146,10 @@ on the same host" via the recents reattach path, not a fixed env name.
   Mitigation: the recents `Preferred` reattach makes a remembered still-live
   session attach directly, so after the first pick the channels re-mirror
   automatically; documented in the dogfooding-channels spec.
-- **A muscle-memory `RIFT_SESSION=rift` in a shell profile** would silently
-  re-enable the old fast-path. Mitigation: keeping the knob is by design an
-  override; the docs note it. If the knob is removed, the env is simply ignored.
+- **A muscle-memory `RIFT_SESSION=rift` in a shell profile** — with the knob
+  removed the env var is simply ignored, so it cannot re-enable the old fast-path.
+  No mitigation needed; noted so the disappearance of the doc-referenced knob is
+  expected.
 - **The stable channel launches detached** — with no session it lands on the
   connect screen. Today `promote` / `stable` pass a literal `rift` and auto-attach;
   after this change they land on the connect screen instead (the Phase-20 startup
@@ -175,3 +170,10 @@ on the same host" via the recents reattach path, not a fixed env name.
   attach. Supersedes the "`RIFT_SESSION` stays the picker-skipping fast-path"
   stance of Phases 33/36. One open decision (knob keep vs remove) carried to the
   acceptance gate.
+- 2026-07-10: Spec-acceptance gate. Open decision resolved — **`RIFT_SESSION` is
+  removed entirely** (not kept as an override): `SessionIntent::Fixed`,
+  `session_intent_from_env`, and its three `main.rs` consumers are deleted and the
+  env var is no longer read; every connect resolves `Pick`. Dev-isolation moves to
+  the picker. Spec-review refinements folded in pre-acceptance (doc-scope now
+  includes `docs/roadmap.md`; per-channel recents; risk wording). Human
+  prerequisites: none. Status `DRAFT` → `READY`.
