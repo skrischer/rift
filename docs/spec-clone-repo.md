@@ -1,6 +1,6 @@
 # Spec: Clone-a-repository into a new session
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-07-10
 > Completed: —
 
@@ -187,7 +187,7 @@ credential forwarding.
 | **No client-sent credentials / no forwarding**; the daemon uses the host's ambient git credentials | The remote-native differentiator — the daemon is already on the target with its own creds (devenv `GIT_AUTH_TOKEN`); avoids an auth UI and a security surface | 2026-07-10 |
 | v1 is **coarse progress** (in-progress → success/error), **URL-only** (default branch), **no mkdir** | Proportional first cut; streamed progress, ref selection, and empty-folder scaffolding are deferred enhancements that add surface without closing the cold-start gap | 2026-07-10 |
 | No clobber; **no partial tree** left on failure | A half-clone masquerading as a project would corrupt the reactive layer; clone materializes at the final path only on success | 2026-07-10 |
-| OPEN — clone surface: a **mode inside Frame C** (Browse ⇄ Clone toggle in the existing root picker) vs a **distinct "New from URL" entry point** | resolved at the spec-acceptance gate | — |
+| Clone surface is a **mode inside Frame C** — a `Browse ⇄ Clone` toggle in the existing root picker, NOT a distinct entry point | Resolved at the spec-acceptance gate via an exploratory Paper sketch: at cold-start the picker is already open so clone is one toggle away, it keeps a single surface with minimal new chrome, and it extends the existing Frame C artboard rather than adding a second surface to maintain | 2026-07-10 |
 
 ## Tracking
 
@@ -258,3 +258,10 @@ under the milestone. This spec owns the design; the issues own progress.
   private-repo auth reworded to spike-confirmed (a bare `GIT_AUTH_TOKEN` is not a
   standard gix credential source); URL→basename parse rule pinned; `10 → 11`
   hedged to next-free-at-merge.
+- 2026-07-10 (spec-acceptance gate): open decision resolved — the clone surface
+  is a **mode inside Frame C** (`Browse ⇄ Clone` toggle in the root picker), not a
+  distinct entry point. Decided with an exploratory Paper sketch (two variants
+  compared in the `rift` file's "Phase 42 — Clone surface options" artboard — a
+  sparring aid, NOT the durable design; the Frame C clone-mode is authored in
+  implementation / visual-QA). Human prerequisites: none to deliver. Status
+  DRAFT → READY.
