@@ -1,6 +1,6 @@
 # Spec: Workspace visibility rail — rail-driven area visibility + solo
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-07-10
 > Completed: —
 
