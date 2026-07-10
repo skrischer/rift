@@ -137,7 +137,7 @@ restart, driving the dock beneath.
 | **Persistence = additive `visible_areas` + `solo_area` on `WindowState`** | The Phase-9 store is the established layout-persistence pattern (`recent_roots`/`DiffViewMode`), `#[serde(default)]` + tolerant load — no schema break, old files default to all-visible. | 2026-07-10 |
 | **Not-rendered preserves bindings** (entity/subscription lifetime, not render lifetime) | Investigated: tmux + daemon bindings live on Entity models + detached tasks held by the workspace, not the panel view; a not-built panel keeps them, re-show re-attaches. | 2026-07-10 |
 | **Terminal grid resize is re-asserted on re-show** (extend the #596 observer to visible-set/solo transitions) | The tmux grid is render-coupled; without re-assertion a re-shown Terminal is stale. Mandatory regardless of the Terminal-visibility decision. | 2026-07-10 |
-| **Terminal area: always-visible floor vs fully symmetric** | OPEN — resolved at the spec-acceptance gate (couples to the render-coupled grid risk; see the Terminal decision below). | 2026-07-10 |
+| **Terminal is fully symmetric** — a peer area, hideable and soloable like the rest, keeping its prominent side-by-side placement (the Editor ∥ Terminal center `h_split`); the render-coupled tmux grid is re-asserted on Terminal re-show | Resolved at the spec-acceptance gate. The terminal is rift's primary surface (the agent's star) and stays first-class and side-by-side — the visibility rail never re-arranges or demotes it. Full symmetry is chosen over an always-visible floor; the grid-resize-on-reshow work (extending the #596 observer to a Terminal (re)build) is accepted as the cost. | 2026-07-10 |
 
 ## Prior art
 
@@ -172,8 +172,9 @@ restart, driving the dock beneath.
       round-trip; a state file with the fields absent loads to the default (all
       areas visible, no solo); the tolerant-load contract holds.
 - [ ] Unit (`crates/app`): the visible-set / solo state machine — toggling an
-      area flips its visibility; solo yields exactly one visible area (subject to
-      the Terminal decision); re-toggling an area exits solo by re-adding it.
+      area flips its visibility; solo yields exactly the target area (the Terminal
+      is a normal peer — soloing a non-Terminal area hides the Terminal too);
+      re-toggling an area exits solo by re-adding it.
 - [ ] Behavioural (dev-channel QA): clicking each rail icon shows/hides its area
       (hidden = not rendered); the soloed area fills the workspace and the rest are
       hidden; re-toggling restores; the set + solo persist across an app restart.
@@ -187,9 +188,10 @@ restart, driving the dock beneath.
 ## Risks and mitigations
 
 - **Render-coupled tmux grid (primary).** A not-rendered Terminal freezes the tmux
-  grid until re-show. Mitigation: the Terminal decision (always-visible avoids it)
-  plus a mandatory resize re-assertion on re-show extending the #596 observer to
-  visible-set/solo transitions. Verified by the QA item above.
+  grid until re-show. Mitigation: with the Terminal a fully symmetric peer, a
+  mandatory resize re-assertion on Terminal re-show — extending the #596 observer to
+  visible-set/solo transitions — re-emits `refresh-client -C` when the Terminal
+  element is (re)built. Verified by the QA item above.
 - **Two sources of truth for solo.** gpui-component holds its own `zoom_view`;
   driving it from rift's set without reconciling would diverge. Mitigation: the
   rift set is authoritative and the only trigger path; the panel zoom control
@@ -206,30 +208,20 @@ restart, driving the dock beneath.
   `Area` enum (or a field-level tolerant deserializer) so unknown entries are
   dropped, not fatal; covered by a dedicated test.
 
-## The Terminal decision (resolved at the acceptance gate)
+## Terminal: fully symmetric (resolved at the acceptance gate)
 
-Whether the **Terminal** area is an always-visible floor or a fully symmetric
-peer. The chosen option fully determines the Terminal rail icon's behaviour and
-the solo cardinality — both derived here so the gate answer leaves nothing open:
-
-- **Always-visible floor (recommended)** — the Terminal is always rendered; it
-  cannot be hidden. Derived behaviour: its rail icon **solos the Terminal** (show
-  only the Terminal, hide the other three — the safe direction, since the Terminal
-  stays rendered), and re-clicking it or toggling any other area from the rail
-  restores the previous visible set; soloing any *non-Terminal* area shows **that
-  area + the Terminal** (never the area alone). Because the Terminal is never
-  unrendered, the render-coupled grid hazard cannot arise. Aligns with
-  `docs/vision.md` (the terminal agent is the primary actor; every GUI feature
-  exists to keep agent work observable). Smallest, lowest-risk cut.
-- **Fully symmetric** — the Terminal is a peer: hideable and soloable like any
-  area. Derived behaviour: its rail icon toggles its visibility like the others;
-  solo shows only the target (soloing a non-Terminal area hides the Terminal too).
-  Requires the render-coupled grid mitigation to actually fire on Terminal re-show
-  — re-assert `refresh-client -C` when the Terminal element is (re)built — a real
-  chunk of render-path work beyond the #596 dock-toggle observer.
-
-The recommendation is **always-visible floor**; the choice sets the Terminal
-icon's behaviour, the solo cardinality, and the size of the grid-resize work.
+The **Terminal is a fully symmetric peer** — hideable and soloable like any area —
+that keeps its **prominent side-by-side placement** in the center `h_split([Editor,
+Terminal])`. The rail governs only visibility and solo; it never re-arranges or
+demotes the terminal (the terminal is rift's primary surface, the agent's star).
+Derived behaviour: the Terminal rail icon toggles its visibility like the others;
+solo shows only the target (soloing a non-Terminal area hides the Terminal too, and
+soloing the Terminal shows the Terminal alone). Because a hidden/soloed-away
+Terminal is unrendered, the render-coupled grid mitigation is **mandatory**:
+re-assert `refresh-client -C` when the Terminal element is (re)built — extending the
+#596 dock-toggle observer to visible-set/solo transitions. The always-visible-floor
+alternative was considered and rejected in favour of full symmetry; the
+grid-resize-on-reshow work is the accepted cost.
 
 ## Tracking
 
@@ -255,3 +247,9 @@ icon's behaviour, the solo cardinality, and the size of the grid-resize work.
   persistence requires an all-visible `Default` and `#[serde(other)]` on the `Area`
   enum so an unknown persisted variant is not fatal; and the Explorer+Editor
   center-fill behaviour is stated.
+- 2026-07-10: Terminal decision resolved at the acceptance gate — **fully
+  symmetric** (a peer, hideable/soloable), keeping its **prominent side-by-side
+  placement** (Editor ∥ Terminal center `h_split`); the rail never re-arranges or
+  demotes the terminal (the agent's star). The grid-resize-on-reshow work is
+  accepted. The design artboard's Section-B mocks are corrected to the real
+  side-by-side layout (Explorer | Editor | Terminal), not terminal-under-editor.
