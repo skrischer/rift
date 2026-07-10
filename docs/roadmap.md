@@ -53,6 +53,7 @@
 | 34 | Session start-directory — new panes / windows / sessions spawn in the session's project root (`-c` on new-session / new-window / split-window + `attach-session -c` to re-root a pre-existing session), replacing the `$HOME` landing; single-root (no per-session dynamize yet) | [spec-session-start-directory.md](spec-session-start-directory.md) | [Phase 340](https://github.com/skrischer/rift/milestone/52) |
 | 35 | Per-session project root — the daemon watched root follows the active session; the root is coupled to the tmux session via a session-scoped `@root` user option, resolved daemon-side on attach, superseding the single baked `RIFT_PROJECT_ROOT`; a session switch re-roots the reactive layer (file tree / git / LSP). session = project | [spec-per-session-project-root.md](spec-per-session-project-root.md) | [Phase 350](https://github.com/skrischer/rift/milestone/53) |
 | 36 | New-session remote root picker — creating a session picks its project root by browsing the remote filesystem (a daemon-side directory listing), binding session = project at creation: the name defaults to the folder basename and the root is written to `@root` (phase 35). Supersedes the zero-sessions picker screen — with no sessions, connecting opens the root picker directly | [spec-session-root-picker.md](spec-session-root-picker.md) | [Phase 360](https://github.com/skrischer/rift/milestone/55) |
+| 37 | Workspace visibility rail — the left activity rail toggles each workspace area's visibility (inactive = not rendered, not merely collapsed); Explorer+Editor count as one area, plus Terminal / Diagnostics / Git; the per-area zoom becomes a solo mode (all other areas deselected), and re-toggling an area from the rail adds it back into the workspace | — | — |
 | 37 | Remote exec wrapper UI — surface `RIFT_REMOTE_EXEC_WRAPPER` as an editable, env/bake-prefilled connect-card field and persist it per host in the connection recents store, so a container connection can be set up and re-run from the UI (the UI field the archived remote-exec-wrapper spec deferred) | [spec-remote-exec-wrapper-ui.md](spec-remote-exec-wrapper-ui.md) | [Phase 370](https://github.com/skrischer/rift/milestone/56) |
 
 A phase gets a Spec link once `/loopkit:plan` drafts it, and a Milestone link once
@@ -286,6 +287,33 @@ wrapper stays a transport setting resolved at SSH-connect, orthogonal to the roo
 
 Backing prior art: "Session ↔ project root coupling — prior-art index
 (Phases 34–36)" in [prior-art.md](prior-art.md).
+
+## Workspace visibility rail (phase 37)
+
+Seeded 2026-07-10 from idea sparring (research mode: websearch). Evolves the shipped
+activity rail (#513), dock interaction (#325), and the direct zoom toggle (#716/#665)
+from a focus/toggle model into a **visibility-set + solo** model driven by the rail:
+each workspace area — **Explorer+Editor as one**, plus Terminal, Diagnostics, Git — has
+a rail icon; toggling shows/hides it (**inactive = not rendered**, with tmux + the
+daemon reactive bindings preserved so re-toggling re-attaches the view); **zoom = solo**
+(all other areas deselected so only that one is open), and re-toggling another area from
+the rail adds it back.
+
+Open design decisions deferred to the phase's `/loopkit:plan` spec (never a roadmap
+guess): whether zoom **reuses gpui-component's `ToggleZoom`** or a **rift-owned
+visibility-set solo** replacing it; whether the Terminal is fully symmetric or
+**defaults always-visible** (agent observability); **persistence** of the visible set
+across restart (the phase-9 window-state store); and the exact **"not rendered"**
+mechanic (view detach/re-attach while tmux + the daemon bindings persist).
+
+Foundation impact: **none** to vision / constitution / architecture — an app-internal
+UI evolution. It **supersedes the cockpit-chrome rail behaviour**
+([spec-cockpit-chrome.md](spec-cockpit-chrome.md) / the Paper "Cockpit — IDE" artboard);
+that design-contract update is authored in the phase's spec PR (a design artifact
+reviewed at spec-acceptance), not a foundation-doc change.
+
+Backing prior art: "Workspace visibility rail — prior-art index (Phase 37)" in
+[prior-art.md](prior-art.md).
 
 ## Tracks (tooling/DX, not product phases)
 
