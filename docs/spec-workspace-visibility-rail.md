@@ -253,6 +253,35 @@ grid-resize-on-reshow work is the accepted cost.
   demotes the terminal (the agent's star). The grid-resize-on-reshow work is
   accepted. The design artboard's Section-B mocks are corrected to the real
   side-by-side layout (Explorer | Editor | Terminal), not terminal-under-editor.
+- 2026-07-10: Issue #821 implemented. `apply_area_visibility`'s `Area::Terminal`
+  no-op arm (#819/#820's deliberate deferral) is filled in: `Explorer+Editor`
+  and `Terminal` both now route through one `apply_center_visibility`, which
+  reads both areas' live visibility and rebuilds the center as the
+  editor|terminal `h_split`, either side alone, or — a state not previously
+  reachable, since the Terminal used to be an always-rendered floor — an empty
+  zero-panel tab strip when both are hidden at once (e.g. any non-Terminal
+  solo), mirroring `apply_diagnostics_visibility`'s existing "hidden = zero
+  tabs" contract rather than inventing a placeholder view. `reconcile_visibility`
+  (the solo path) now calls the three `apply_*_visibility` functions directly
+  instead of looping `Area::ALL` through the dispatcher, since Explorer+Editor
+  and Terminal would otherwise both trigger (and redundantly double-build) the
+  same center. The grid re-assertion is an explicit `session_view.update(cx,
+  |_, cx| cx.notify())` at the end of `apply_center_visibility`, added
+  alongside — not folded into — the existing #596 dock-observer: that observer
+  only watches the left/right/bottom `Dock` entities, which a pure Terminal/
+  Explorer+Editor visibility change never touches, so it could not have covered
+  this transition on its own. A code-level investigation of gpui-component's
+  own render caching (`session_view.rs`'s `grid_observer` comment: "this view
+  only re-renders when it is marked dirty") confirmed a freshly rebuilt
+  wrapping `TabPanel` does not, by itself, force the wrapped `SessionView`
+  entity to re-render — the explicit notify is required, not defensive
+  belt-and-suspenders. The `SessionView`/`TerminalPanel` entities themselves are
+  never dropped or recreated by any of this (only the surrounding dock chrome
+  is rebuilt), preserving the entity-lifetime binding contract with no
+  reconnect. The rail gained a fourth icon (`IconName::SquareTerminal`,
+  `ToggleTerminal`), placed directly after Explorer in the rail's `.child(...)`
+  order — the existing Diagnostics/Git relative order (a pre-#821 choice) is
+  left untouched, out of this issue's scope.
 - 2026-07-10 (issue #822): `Area` gained a **field-level tolerant
   deserializer** for `WindowState::visible_areas`/`solo_area` (deserializing
   each entry as `serde_json::Value` first, dropping one that fails to convert

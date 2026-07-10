@@ -6,15 +6,17 @@
 //! per-dock open/close toggle to the rift-owned area-visibility set: each
 //! icon's active state now reads [`RailState`]'s `*_visible` fields — sourced
 //! by the caller from `WorkspaceView`'s own visibility set, not
-//! `dock.is_open` — though the click still dispatches the same three
-//! shell-command `Action`s ([`crate::workspace::ToggleExplorer`] etc.) the
-//! command palette already binds, via `window.dispatch_action`; only their
-//! handlers changed, from forwarding to `DockArea::toggle_dock` to toggling
-//! the visibility set. Presentational only, mirroring [`crate::title_bar`]:
-//! the badge data is read off the existing client models
-//! (`WorktreeModel::git_statuses` for the changed-file count,
-//! `WorktreeModel::all_diagnostics` for [`worst_severity`]) — no new state
-//! lives here, the rail never reaches into a `WorkspaceView` entity directly.
+//! `dock.is_open` — though the click still dispatches the same shell-command
+//! `Action`s ([`crate::workspace::ToggleExplorer`] etc., plus
+//! [`crate::workspace::ToggleTerminal`] making the Terminal a fully
+//! symmetric peer, issue #821) the command palette already binds, via
+//! `window.dispatch_action`; only their handlers changed, from forwarding to
+//! `DockArea::toggle_dock` to toggling the visibility set. Presentational
+//! only, mirroring [`crate::title_bar`]: the badge data is read off the
+//! existing client models (`WorktreeModel::git_statuses` for the
+//! changed-file count, `WorktreeModel::all_diagnostics` for
+//! [`worst_severity`]) — no new state lives here, the rail never reaches
+//! into a `WorkspaceView` entity directly.
 
 use std::collections::BTreeMap;
 
@@ -28,7 +30,7 @@ use gpui_component::{v_flex, ActiveTheme as _, IconName, Selectable as _, Sizabl
 use rift_protocol::{Diagnostic, DiagnosticSeverity};
 
 use crate::settings::OpenSettings;
-use crate::workspace::{ToggleExplorer, ToggleProblems, ToggleSourceControl};
+use crate::workspace::{ToggleExplorer, ToggleProblems, ToggleSourceControl, ToggleTerminal};
 
 /// Fixed width of the activity rail, per the design contract.
 pub const WIDTH: Pixels = px(48.0);
@@ -43,6 +45,11 @@ pub struct RailState {
     /// Whether the Explorer+Editor area is visible (`Area::ExplorerEditor`,
     /// one rail icon for both the left-dock explorer and the center editor).
     pub explorer_editor_visible: bool,
+    /// Whether the Terminal area is visible (`Area::Terminal`, issue #821):
+    /// a fully symmetric peer like the other three — hiding it or soloing a
+    /// different area removes it from the center `h_split` entirely, never
+    /// re-arranging or demoting it while it does show.
+    pub terminal_visible: bool,
     /// Whether the Git area is visible (`Area::Git`: the right dock's source
     /// control + diff view).
     pub git_visible: bool,
@@ -113,12 +120,12 @@ fn rail_button(
         .on_click(on_click)
 }
 
-/// Render the 48px activity rail: files / source-control / diagnostics
-/// toggles, a flexible spacer, then settings at the bottom — no search icon,
-/// since no search panel exists yet (the spec's "no dead controls"
-/// constraint). Theme tokens only: rail background/border match the title
-/// bar's sidebar surface, the active state matches the design's selected
-/// surface.
+/// Render the 48px activity rail: files / terminal / source-control /
+/// diagnostics toggles, a flexible spacer, then settings at the bottom — no
+/// search icon, since no search panel exists yet (the spec's "no dead
+/// controls" constraint). Theme tokens only: rail background/border match
+/// the title bar's sidebar surface, the active state matches the design's
+/// selected surface.
 pub fn render(state: RailState, cx: &App) -> impl IntoElement {
     let explorer = rail_button(
         "activity-rail-explorer",
@@ -126,6 +133,14 @@ pub fn render(state: RailState, cx: &App) -> impl IntoElement {
         "Explorer",
         state.explorer_editor_visible,
         |_event, window, cx| window.dispatch_action(Box::new(ToggleExplorer), cx),
+    );
+
+    let terminal = rail_button(
+        "activity-rail-terminal",
+        IconName::SquareTerminal,
+        "Terminal",
+        state.terminal_visible,
+        |_event, window, cx| window.dispatch_action(Box::new(ToggleTerminal), cx),
     );
 
     let source_control = Badge::new().count(state.changed_count).child(rail_button(
@@ -171,6 +186,7 @@ pub fn render(state: RailState, cx: &App) -> impl IntoElement {
         .border_r_1()
         .border_color(cx.theme().sidebar_border)
         .child(explorer)
+        .child(terminal)
         .child(source_control)
         .child(problems)
         .child(div().flex_1())

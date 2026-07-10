@@ -146,6 +146,15 @@ pub struct ToggleProblems;
 #[action(namespace = rift, no_json)]
 pub struct ToggleSourceControl;
 
+/// Toggle the Terminal area hidden/shown — the rail's icon for `Area::
+/// Terminal` (issue #821, "Terminal: fully symmetric"). Mirrors
+/// `ToggleExplorer`/`ToggleProblems`/`ToggleSourceControl` exactly: the
+/// Terminal is a normal peer in the rift-owned visible set, never demoted or
+/// re-arranged by this toggle — only its render-level visibility changes.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct ToggleTerminal;
+
 /// Move focus to the terminal, so keystrokes reach the active tmux pane.
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = rift, no_json)]
@@ -327,10 +336,13 @@ pub struct WorkspaceChannels {
 /// (`docs/spec-workspace-visibility-rail.md`), replacing gpui-component's own
 /// per-dock open/close as the source of truth for what renders.
 /// Explorer+Editor are one area: the left-dock file tree and the center
-/// editor half toggle together, and the Terminal expands to fill the freed
-/// center `h_split` half. `Diagnostics`/`Git` are the existing bottom/right
-/// docks. The Terminal is always visible in this issue (becoming toggleable
-/// is issue #821).
+/// editor half toggle together. The Terminal is a fully symmetric peer
+/// (issue #821, "Terminal: fully symmetric"): hiding it removes it from the
+/// center `h_split` entirely (the Editor expands to fill the freed half, or
+/// the center goes empty if both are hidden), and it never re-arranges or
+/// takes the Explorer+Editor's place — the rail only ever governs visibility
+/// and solo, never layout order. `Diagnostics`/`Git` are the existing
+/// bottom/right docks.
 ///
 /// `Serialize`/`Deserialize` (issue #822, `window_state.rs`) use
 /// `rename_all = "snake_case"` tags (`"explorer_editor"`, `"terminal"`, ...)
@@ -467,9 +479,13 @@ pub struct WorkspaceView {
     session_view: Entity<SessionView>,
     /// The terminal's dock panel wrapper (`docs/spec-ide-shell.md`, #324):
     /// kept as its own field (mirroring `file_tree`/`editor`) so
-    /// `apply_explorer_editor_visibility` can rebuild the center `h_split`
-    /// around the same live entity on every Explorer+Editor toggle, instead
-    /// of only being reachable through the (rebuilt) `dock_area` tree.
+    /// [`Self::apply_center_visibility`] can rebuild the center `h_split`
+    /// around the same live entity on every Explorer+Editor or Terminal
+    /// toggle (issue #821), instead of only being reachable through the
+    /// (rebuilt) `dock_area` tree. Never dropped or recreated across a
+    /// hide/show — this is what keeps the wrapped `SessionView`'s tmux
+    /// control-mode subscription alive with no reconnect while the Terminal
+    /// is unrendered.
     terminal_panel: Entity<TerminalPanel>,
     /// The problems panel (`docs/spec-problems-panel.md`, #342): a read-only
     /// mirror of `file_tree`'s model, docked in the bottom zone. Kept as its
@@ -1046,6 +1062,7 @@ impl WorkspaceView {
         let visibility =
             Visibility::from_persisted(&persisted_state.visible_areas, persisted_state.solo_area);
         let explorer_editor_visible = visibility.is_visible(Area::ExplorerEditor);
+        let terminal_visible = visibility.is_visible(Area::Terminal);
         let diagnostics_visible = visibility.is_visible(Area::Diagnostics);
         let git_visible = visibility.is_visible(Area::Git);
 
@@ -1182,12 +1199,14 @@ impl WorkspaceView {
         .detach();
 
         let left_item = DockItem::tab(file_tree.clone(), &weak_dock_area, window, cx);
-        // The Explorer+Editor area (issue #822): the center starts as the
-        // editor|terminal split when visible, or the Terminal alone — filling
-        // the freed half — when the loaded state left it hidden, mirroring
-        // `apply_explorer_editor_visibility`'s own branch.
-        let center_item = if explorer_editor_visible {
-            DockItem::h_split(
+        // The Explorer+Editor and Terminal areas (issue #822 seeding, issue
+        // #821 making the Terminal a fully symmetric peer too): the center
+        // starts as the editor|terminal split only when both are visible,
+        // either side alone when just one is, or an empty tab strip when the
+        // loaded state left both hidden — mirroring
+        // `Self::apply_center_visibility`'s own branches exactly.
+        let center_item = match (explorer_editor_visible, terminal_visible) {
+            (true, true) => DockItem::h_split(
                 vec![
                     DockItem::tab(editor.clone(), &weak_dock_area, window, cx),
                     DockItem::tab(terminal_panel.clone(), &weak_dock_area, window, cx),
@@ -1195,9 +1214,10 @@ impl WorkspaceView {
                 &weak_dock_area,
                 window,
                 cx,
-            )
-        } else {
-            DockItem::tab(terminal_panel.clone(), &weak_dock_area, window, cx)
+            ),
+            (true, false) => DockItem::tab(editor.clone(), &weak_dock_area, window, cx),
+            (false, true) => DockItem::tab(terminal_panel.clone(), &weak_dock_area, window, cx),
+            (false, false) => DockItem::tabs(vec![], &weak_dock_area, window, cx),
         };
         // Both real docks (not placeholder views) — a single-tab `TabPanel`,
         // open/collapsed per the loaded visibility below rather than always
@@ -1253,7 +1273,11 @@ impl WorkspaceView {
         // old size and the content clipped behind the panels. Observing each
         // dock and notifying the session forces it to re-render against its new
         // bounds and re-emit the resize; the observer's own grid dedup keeps a
-        // no-op layout change from spamming the seam.
+        // no-op layout change from spamming the seam. Issue #821 extends this
+        // same re-assertion to the Terminal's own visible-set/solo
+        // transitions, which never touch these three docks directly — see
+        // `Self::apply_center_visibility`'s own explicit `session_view`
+        // notify at the end of its body.
         let docks: Vec<Entity<Dock>> = {
             let dock_area = dock_area.read(cx);
             [
@@ -1549,20 +1573,30 @@ impl WorkspaceView {
     /// [`Visibility::is_visible`] — unlike a plain rail toggle (which only
     /// ever changes one area's own effective visibility and can call just
     /// its matching `apply_*_visibility`), a solo transition changes what
-    /// every area's `is_visible` returns at once. Callers persist once
-    /// themselves afterward; looping `apply_area_visibility` per area here
-    /// must not also persist per area (redundant saves of the same result).
+    /// every area's `is_visible` returns at once. Calls each of the three
+    /// underlying `apply_*_visibility` functions directly (not through
+    /// [`Self::apply_area_visibility`]'s per-`Area` dispatch) since
+    /// `ExplorerEditor` and `Terminal` both map to the same
+    /// [`Self::apply_center_visibility`] (issue #821) — looping `Area::ALL`
+    /// through the dispatcher would rebuild the center twice per
+    /// reconciliation. Callers persist once themselves afterward.
     fn reconcile_visibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for area in Area::ALL {
-            let visible = self.visibility.is_visible(area);
-            self.apply_area_visibility(area, visible, window, cx);
-        }
+        self.apply_center_visibility(window, cx);
+        self.apply_diagnostics_visibility(
+            self.visibility.is_visible(Area::Diagnostics),
+            window,
+            cx,
+        );
+        self.apply_git_visibility(self.visibility.is_visible(Area::Git), window, cx);
     }
 
-    /// Dispatch to the one `apply_*_visibility` matching `area`. No
-    /// reconciliation for the Terminal (it stays always-rendered; becoming
-    /// toggleable — including the render-level hide solo requires for full
-    /// symmetry — is issue #821).
+    /// Dispatch to the one `apply_*_visibility` matching `area` — the plain
+    /// rail-click path (`Self::toggle_area`), which only ever changes one
+    /// area at a time. `ExplorerEditor` and `Terminal` (issue #821) both
+    /// route to [`Self::apply_center_visibility`], which reads both areas'
+    /// current visibility itself rather than trusting the single `visible`
+    /// passed in for whichever one of the pair triggered this — the center's
+    /// shape depends on both.
     fn apply_area_visibility(
         &self,
         area: Area,
@@ -1571,10 +1605,9 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         match area {
-            Area::ExplorerEditor => self.apply_explorer_editor_visibility(visible, window, cx),
+            Area::ExplorerEditor | Area::Terminal => self.apply_center_visibility(window, cx),
             Area::Diagnostics => self.apply_diagnostics_visibility(visible, window, cx),
             Area::Git => self.apply_git_visibility(visible, window, cx),
-            Area::Terminal => {}
         }
     }
 
@@ -1593,25 +1626,41 @@ impl WorkspaceView {
         }
     }
 
-    /// Reconcile the dock tree with the Explorer+Editor area's visibility:
-    /// rebuild the center as the editor|terminal `h_split` when visible, or
-    /// the Terminal alone — filling the freed half — when hidden, and
-    /// open/close the left dock (closed, a Left `Dock` skips its whole
-    /// subtree in gpui-component's own `Dock::render`, so this alone makes
-    /// the explorer "not rendered"). Rebuilding `center` from the same live
-    /// `editor`/`terminal_panel` entities (never dropping or recreating them)
-    /// keeps their reactive state and daemon-stream bindings alive across a
-    /// hide/show — only the surrounding `TabPanel`/`StackPanel` chrome is
-    /// rebuilt.
-    fn apply_explorer_editor_visibility(
-        &self,
-        visible: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// Reconcile the dock tree's center region with the Explorer+Editor
+    /// *and* Terminal areas' visibility together (issue #821 makes the
+    /// Terminal a fully symmetric peer, no longer an always-rendered floor —
+    /// see the spec's "Terminal: fully symmetric" decision): the
+    /// editor|terminal `h_split` when both are visible, either side alone —
+    /// filling the freed half — when exactly one is, or an empty tab strip
+    /// (a zero-panel `TabPanel`, mirroring `apply_diagnostics_visibility`'s
+    /// "hidden = zero tabs, not merely collapsed" contract) when both are
+    /// hidden, e.g. while a non-Terminal area is soloed. Also open/closes the
+    /// left dock with the Explorer+Editor flag (closed, a Left `Dock` skips
+    /// its whole subtree in gpui-component's own `Dock::render`, so this
+    /// alone makes the explorer "not rendered"). The rail never re-arranges
+    /// or demotes the terminal — it stays the prominent center peer
+    /// side-by-side with the Editor whenever both show, never merged into a
+    /// shared tab strip.
+    ///
+    /// Rebuilds `center` from the same live `editor`/`terminal_panel`
+    /// entities (never dropping or recreating them) so their reactive state
+    /// and daemon-stream/tmux bindings survive a hide/show — only the
+    /// surrounding `TabPanel`/`StackPanel` chrome is rebuilt.
+    ///
+    /// Explicitly notifies `session_view` afterward — issue #821 extending
+    /// the #596 dock-toggle reflow observer (below, in `Self::new`) to
+    /// visible-set/solo transitions. That observer only watches the
+    /// left/right/bottom `Dock` entities, which a pure Terminal/
+    /// Explorer+Editor visibility change never touches; without this, a
+    /// re-shown Terminal's render-coupled tmux grid resize
+    /// (`resize_client_to_area`, `rift-terminal`'s `grid_observer` prepaint)
+    /// might not re-fire, leaving tmux at the stale pre-hide grid.
+    fn apply_center_visibility(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let explorer_editor_visible = self.visibility.is_visible(Area::ExplorerEditor);
+        let terminal_visible = self.visibility.is_visible(Area::Terminal);
         let weak_dock_area = self.dock_area.downgrade();
-        let center = if visible {
-            DockItem::h_split(
+        let center = match (explorer_editor_visible, terminal_visible) {
+            (true, true) => DockItem::h_split(
                 vec![
                     DockItem::tab(self.editor.clone(), &weak_dock_area, window, cx),
                     DockItem::tab(self.terminal_panel.clone(), &weak_dock_area, window, cx),
@@ -1619,16 +1668,22 @@ impl WorkspaceView {
                 &weak_dock_area,
                 window,
                 cx,
-            )
-        } else {
-            DockItem::tab(self.terminal_panel.clone(), &weak_dock_area, window, cx)
+            ),
+            (true, false) => DockItem::tab(self.editor.clone(), &weak_dock_area, window, cx),
+            (false, true) => {
+                DockItem::tab(self.terminal_panel.clone(), &weak_dock_area, window, cx)
+            }
+            (false, false) => DockItem::tabs(vec![], &weak_dock_area, window, cx),
         };
         self.dock_area.update(cx, |dock_area, cx| {
             dock_area.set_center(center, window, cx);
             if let Some(left_dock) = dock_area.left_dock().cloned() {
-                left_dock.update(cx, |dock, cx| dock.set_open(visible, window, cx));
+                left_dock.update(cx, |dock, cx| {
+                    dock.set_open(explorer_editor_visible, window, cx)
+                });
             }
         });
+        self.session_view.update(cx, |_session, cx| cx.notify());
     }
 
     /// Reconcile the dock tree with the Diagnostics (bottom/problems) area's
@@ -2265,6 +2320,7 @@ impl Render for WorkspaceView {
             activity_rail::render(
                 activity_rail::RailState {
                     explorer_editor_visible: self.visibility.is_visible(Area::ExplorerEditor),
+                    terminal_visible: self.visibility.is_visible(Area::Terminal),
                     git_visible: self.visibility.is_visible(Area::Git),
                     diagnostics_visible: self.visibility.is_visible(Area::Diagnostics),
                     changed_count: model.git_statuses().len(),
@@ -2342,6 +2398,9 @@ impl Render for WorkspaceView {
             }))
             .on_action(cx.listener(|this, _: &ToggleSourceControl, window, cx| {
                 this.toggle_area(Area::Git, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
+                this.toggle_area(Area::Terminal, window, cx);
             }))
             .on_action(cx.listener(|this, _: &FocusTerminal, window, cx| {
                 this.focus_terminal(window, cx);
@@ -2465,6 +2524,32 @@ mod tests {
         visibility.toggle(Area::Git);
         assert!(
             visibility.is_visible(Area::Git),
+            "a second toggle restores it"
+        );
+    }
+
+    /// Issue #821: the Terminal toggles exactly like any other area — this
+    /// exercises it as the toggle TARGET (not a bystander, unlike the Git
+    /// case above), the rail's own `ToggleTerminal` click path.
+    #[test]
+    fn test_toggle_terminal_hides_it_and_a_second_toggle_restores_it() {
+        let mut visibility = Visibility::from_persisted(&Area::ALL, None);
+
+        visibility.toggle(Area::Terminal);
+        assert!(
+            !visibility.is_visible(Area::Terminal),
+            "Terminal is now hidden"
+        );
+        for area in [Area::ExplorerEditor, Area::Diagnostics, Area::Git] {
+            assert!(
+                visibility.is_visible(area),
+                "toggling Terminal leaves {area:?} visible"
+            );
+        }
+
+        visibility.toggle(Area::Terminal);
+        assert!(
+            visibility.is_visible(Area::Terminal),
             "a second toggle restores it"
         );
     }
@@ -3219,6 +3304,253 @@ mod tests {
                         panic!("expected the center to be a horizontal split again, got {other:?}")
                     }
                 }
+            })
+            .unwrap();
+    }
+
+    /// Shell command action (`docs/spec-workspace-visibility-rail.md`, issue
+    /// #821, "Terminal: fully symmetric"): `ToggleTerminal` flips
+    /// `Area::Terminal`'s membership in the rift-owned visibility set and
+    /// collapses the center split down to the Editor alone — the mirror
+    /// image of the Explorer+Editor toggle above, proving the Terminal is a
+    /// real render-level peer rather than the permanent floor #820 left it
+    /// as.
+    #[gpui::test]
+    fn test_toggle_area_terminal_collapses_center_to_editor_and_restores_the_split(
+        cx: &mut TestAppContext,
+    ) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let session_view = cx.new(|cx| SessionView::new(cx).0);
+                workspace =
+                    Some(cx.new(|cx| {
+                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
+                    }));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+
+        window
+            .update(cx, |_, window, cx| {
+                let dock_area = workspace.read(cx).dock_area.clone();
+                assert!(
+                    workspace.read(cx).visibility.is_visible(Area::Terminal),
+                    "the Terminal starts visible"
+                );
+
+                workspace.update(cx, |view, cx| {
+                    view.toggle_area(Area::Terminal, window, cx);
+                });
+                assert!(
+                    !workspace.read(cx).visibility.is_visible(Area::Terminal),
+                    "ToggleTerminal hides the Terminal in the rift-owned set"
+                );
+                match dock_area.read(cx).center() {
+                    DockItem::Tabs { items, .. } => assert_eq!(
+                        items[0].panel_name(cx),
+                        crate::editor::EDITOR_PANEL_NAME,
+                        "the editor expands to fill the center alone; the Terminal is gone, \
+                         not merely collapsed"
+                    ),
+                    other => {
+                        panic!("expected the center to collapse to a single tab, got {other:?}")
+                    }
+                }
+                // The rail never re-arranges the layout: the left (Explorer)
+                // dock is untouched by a Terminal-only toggle.
+                assert!(dock_area.read(cx).is_dock_open(DockPlacement::Left, cx));
+
+                workspace.update(cx, |view, cx| {
+                    view.toggle_area(Area::Terminal, window, cx);
+                });
+                assert!(workspace.read(cx).visibility.is_visible(Area::Terminal));
+                match dock_area.read(cx).center() {
+                    DockItem::Split { axis, items, .. } => {
+                        assert_eq!(*axis, Axis::Horizontal);
+                        assert_eq!(items.len(), 2, "center split holds editor + terminal again");
+                    }
+                    other => {
+                        panic!("expected the center to be a horizontal split again, got {other:?}")
+                    }
+                }
+            })
+            .unwrap();
+    }
+
+    /// Issue #821, "Terminal: fully symmetric": soloing the Terminal shows it
+    /// alone in the center and closes every other dock, exactly like soloing
+    /// any other area — exercised end to end through `SoloTerminal`'s
+    /// handler (`Self::toggle_solo_area`), not just the pure `Visibility`
+    /// state machine.
+    #[gpui::test]
+    fn test_toggle_solo_terminal_shows_it_alone_and_closes_every_other_dock(
+        cx: &mut TestAppContext,
+    ) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let session_view = cx.new(|cx| SessionView::new(cx).0);
+                workspace =
+                    Some(cx.new(|cx| {
+                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
+                    }));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+
+        window
+            .update(cx, |_, window, cx| {
+                let dock_area = workspace.read(cx).dock_area.clone();
+
+                workspace.update(cx, |view, cx| {
+                    view.toggle_solo_area(Area::Terminal, window, cx);
+                });
+
+                assert!(
+                    !dock_area.read(cx).is_dock_open(DockPlacement::Left, cx),
+                    "soloing the Terminal closes the Explorer dock too"
+                );
+                assert!(!dock_area.read(cx).is_dock_open(DockPlacement::Right, cx));
+                assert!(!dock_area.read(cx).is_dock_open(DockPlacement::Bottom, cx));
+                match dock_area.read(cx).center() {
+                    DockItem::Tabs { items, .. } => assert_eq!(
+                        items[0].panel_name(cx),
+                        crate::terminal_panel::TERMINAL_PANEL_NAME,
+                        "the Terminal alone fills the center"
+                    ),
+                    other => panic!("expected a single-tab center, got {other:?}"),
+                }
+
+                workspace.update(cx, |view, cx| {
+                    view.toggle_area(Area::Terminal, window, cx);
+                });
+                assert!(
+                    dock_area.read(cx).is_dock_open(DockPlacement::Left, cx),
+                    "re-toggling the Terminal from the rail exits solo"
+                );
+                match dock_area.read(cx).center() {
+                    DockItem::Split { items, .. } => {
+                        assert_eq!(items.len(), 2, "the editor|terminal split is restored")
+                    }
+                    other => panic!("expected the split to be restored, got {other:?}"),
+                }
+            })
+            .unwrap();
+    }
+
+    /// Issue #821: soloing a NON-Terminal area hides the Terminal too — the
+    /// spec's "Terminal: fully symmetric" decision — which drives the
+    /// center's `apply_center_visibility` all the way down to an empty tab
+    /// strip (zero panels) since both center-contributing areas
+    /// (Explorer+Editor and Terminal) are hidden at once. Zero panels, not a
+    /// leftover single tab, is what actually makes the Terminal "not
+    /// rendered" while soloed away.
+    #[gpui::test]
+    fn test_toggle_solo_a_non_terminal_area_empties_the_center(cx: &mut TestAppContext) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let session_view = cx.new(|cx| SessionView::new(cx).0);
+                workspace =
+                    Some(cx.new(|cx| {
+                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
+                    }));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+
+        window
+            .update(cx, |_, window, cx| {
+                let dock_area = workspace.read(cx).dock_area.clone();
+
+                workspace.update(cx, |view, cx| {
+                    view.toggle_solo_area(Area::Diagnostics, window, cx);
+                });
+
+                assert!(
+                    !workspace.read(cx).visibility.is_visible(Area::Terminal),
+                    "soloing Diagnostics hides the Terminal too"
+                );
+                match dock_area.read(cx).center() {
+                    DockItem::Tabs { items, .. } => assert!(
+                        items.is_empty(),
+                        "neither the editor nor the terminal render while Diagnostics is soloed"
+                    ),
+                    other => panic!("expected an empty tab strip, got {other:?}"),
+                }
+
+                workspace.update(cx, |view, cx| {
+                    view.toggle_solo_area(Area::Diagnostics, window, cx);
+                });
+                assert!(workspace.read(cx).visibility.is_visible(Area::Terminal));
+                match dock_area.read(cx).center() {
+                    DockItem::Split { items, .. } => assert_eq!(items.len(), 2),
+                    other => panic!("expected the split to be restored, got {other:?}"),
+                }
+            })
+            .unwrap();
+    }
+
+    /// Constraint ("Bindings are entity-lifetime, not render-lifetime",
+    /// `docs/spec-workspace-visibility-rail.md`): hiding the Terminal never
+    /// drops or recreates the `SessionView`/`TerminalPanel` entities — this
+    /// is what lets a re-show re-attach the live tmux control-mode
+    /// subscription with no reconnect. `Entity<T>`'s `PartialEq` compares by
+    /// entity id, so this fails if `apply_center_visibility` ever rebuilt
+    /// the underlying session instead of reusing `self.session_view`/
+    /// `self.terminal_panel`.
+    #[gpui::test]
+    fn test_hiding_and_reshowing_the_terminal_keeps_the_same_session_entity(
+        cx: &mut TestAppContext,
+    ) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let mut session_view: Option<Entity<SessionView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let view = cx.new(|cx| SessionView::new(cx).0);
+                session_view = Some(view.clone());
+                workspace =
+                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+        let session_view =
+            session_view.expect("session view constructed inside the window callback");
+
+        window
+            .update(cx, |_, window, cx| {
+                let terminal_panel_before = workspace.read(cx).terminal_panel.clone();
+
+                workspace.update(cx, |view, cx| {
+                    view.toggle_area(Area::Terminal, window, cx);
+                });
+                workspace.update(cx, |view, cx| {
+                    view.toggle_area(Area::Terminal, window, cx);
+                });
+
+                assert_eq!(
+                    workspace.read(cx).session_view,
+                    session_view,
+                    "hide/show never replaces the SessionView entity (no reconnect)"
+                );
+                assert_eq!(
+                    workspace.read(cx).terminal_panel,
+                    terminal_panel_before,
+                    "hide/show never replaces the TerminalPanel wrapper entity either"
+                );
             })
             .unwrap();
     }

@@ -253,6 +253,7 @@ mod tests {
                 "Toggle Outline",
                 "Toggle Problems",
                 "Toggle Source Control",
+                "Toggle Terminal",
                 "Toggle Light/Dark Theme"
             ]
         );
