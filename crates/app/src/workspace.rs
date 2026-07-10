@@ -66,7 +66,7 @@
 //! #351) — never the merely-active tab, so a stale response for a superseded
 //! request can never land on the wrong tab.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -286,11 +286,94 @@ pub struct WorkspaceChannels {
     pub dir_browse_tx: Sender<ClientMessage>,
 }
 
+/// The four fixed workspace areas the activity rail carries one icon each for
+/// (`docs/spec-workspace-visibility-rail.md`), replacing gpui-component's own
+/// per-dock open/close as the source of truth for what renders.
+/// Explorer+Editor are one area: the left-dock file tree and the center
+/// editor half toggle together, and the Terminal expands to fill the freed
+/// center `h_split` half. `Diagnostics`/`Git` are the existing bottom/right
+/// docks. The Terminal is always visible in this issue (becoming toggleable
+/// is issue #821).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Area {
+    ExplorerEditor,
+    Terminal,
+    Diagnostics,
+    Git,
+}
+
+impl Area {
+    /// Every area, in the rail's left-to-right order.
+    const ALL: [Area; 4] = [
+        Area::ExplorerEditor,
+        Area::Terminal,
+        Area::Diagnostics,
+        Area::Git,
+    ];
+}
+
+/// The rift-owned visible-area set + solo target
+/// (`docs/spec-workspace-visibility-rail.md`), authoritative over dock
+/// rendering: [`WorkspaceView`] reads this — not gpui-component's own
+/// `Dock::is_open` — for the rail's active-icon state and which panels get
+/// built. A pure state machine (no GPUI dependency), unit-testable directly;
+/// [`WorkspaceView`]'s `apply_*_visibility` methods translate a change here
+/// into the actual dock tree (`toggle_area`).
+///
+/// Solo (routing the zoom control through `solo`, reconciling
+/// gpui-component's two zoom states) is issue #820: this carries the field
+/// and `is_visible`'s solo-aware read, but nothing here ever sets `solo` away
+/// from `None`. Persisting this across restart is issue #822.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Visibility {
+    visible: BTreeSet<Area>,
+    solo: Option<Area>,
+}
+
+impl Visibility {
+    /// Every area visible, no solo target — the fallback default an absent
+    /// (or old-format) persisted state loads to (issue #822). `WorkspaceView::
+    /// new` mirrors the dock tree's own construction-time seeding instead of
+    /// using this directly, until #822 replaces that seeding with a loaded
+    /// `Visibility`.
+    fn all_visible() -> Self {
+        Self {
+            visible: Area::ALL.into_iter().collect(),
+            solo: None,
+        }
+    }
+
+    /// Whether `area` renders right now: the solo target alone when solo is
+    /// set (soloing any area hides every other area, including the Terminal —
+    /// the spec's "Terminal: fully symmetric" decision), otherwise plain
+    /// membership in the visible set.
+    fn is_visible(&self, area: Area) -> bool {
+        match self.solo {
+            Some(solo) => solo == area,
+            None => self.visible.contains(&area),
+        }
+    }
+
+    /// Flip `area`'s membership in the visible set — the rail's only
+    /// operation in this issue; solo's own toggle semantics land in #820.
+    fn toggle(&mut self, area: Area) {
+        if !self.visible.remove(&area) {
+            self.visible.insert(area);
+        }
+    }
+}
+
 /// The composed app root.
 pub struct WorkspaceView {
     file_tree: Entity<FileTree>,
     editor: Entity<EditorView>,
     session_view: Entity<SessionView>,
+    /// The terminal's dock panel wrapper (`docs/spec-ide-shell.md`, #324):
+    /// kept as its own field (mirroring `file_tree`/`editor`) so
+    /// `apply_explorer_editor_visibility` can rebuild the center `h_split`
+    /// around the same live entity on every Explorer+Editor toggle, instead
+    /// of only being reachable through the (rebuilt) `dock_area` tree.
+    terminal_panel: Entity<TerminalPanel>,
     /// The problems panel (`docs/spec-problems-panel.md`, #342): a read-only
     /// mirror of `file_tree`'s model, docked in the bottom zone. Kept as its
     /// own field (mirroring `file_tree`/`editor`) so tests can reach it
@@ -355,6 +438,15 @@ pub struct WorkspaceView {
     /// (`file_tree`, `editor`, `problems_panel`, `diff_view` above) so the
     /// daemon-stream bridges keep working unchanged after the layout refactor.
     dock_area: Entity<DockArea>,
+    /// The rift-owned area-visibility set + solo target
+    /// (`docs/spec-workspace-visibility-rail.md`), authoritative over dock
+    /// rendering: the rail's active-icon state and `toggle_area`'s dock-tree
+    /// reconciliation both read/mutate this rather than `dock_area`'s own
+    /// per-dock `open` bool. Initialized to mirror the dock tree's own
+    /// construction-time seeding just below (left dock open, right/bottom
+    /// collapsed) rather than [`Visibility::all_visible`] — replacing that
+    /// seeding with a loaded value is issue #822.
+    visibility: Visibility,
     /// The command palette (`docs/spec-command-palette.md`, issue #359): owns
     /// its `ListState` entity for the workspace's lifetime, so reopening it
     /// (`Ctrl+Shift+P` / `Cmd+Shift+P`) reuses the same list rather than
@@ -1000,7 +1092,7 @@ impl WorkspaceView {
         let center_item = DockItem::h_split(
             vec![
                 DockItem::tab(editor.clone(), &weak_dock_area, window, cx),
-                DockItem::tab(terminal_panel, &weak_dock_area, window, cx),
+                DockItem::tab(terminal_panel.clone(), &weak_dock_area, window, cx),
             ],
             &weak_dock_area,
             window,
@@ -1169,10 +1261,21 @@ impl WorkspaceView {
         })
         .detach();
 
+        // Mirrors the dock tree's own construction-time seeding above (left
+        // dock open, right/bottom collapsed) by toggling the two areas that
+        // start collapsed off the all-visible default — this issue only
+        // rewires the rail's *toggle* mechanic, not the initial layout it
+        // starts from (`docs/spec-workspace-visibility-rail.md`; replacing
+        // this seeding with a loaded value is issue #822).
+        let mut visibility = Visibility::all_visible();
+        visibility.toggle(Area::Diagnostics);
+        visibility.toggle(Area::Git);
+
         Self {
             file_tree,
             editor,
             session_view,
+            terminal_panel,
             problems_panel,
             outline_panel,
             outline_open: false,
@@ -1183,6 +1286,7 @@ impl WorkspaceView {
             diff_view,
             open_file_tx,
             dock_area,
+            visibility,
             command_palette,
             quick_open,
             window_state_path,
@@ -1299,18 +1403,111 @@ impl WorkspaceView {
         });
     }
 
-    /// Toggle the explorer (left) dock hidden/shown (issue #358).
-    fn toggle_explorer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Toggle `area`'s membership in the rift-owned visible set and
+    /// reconcile the dock tree to match — the rail's `on_action` handlers
+    /// below call this per [`Area`], replacing the old direct
+    /// `dock_area.toggle_dock` forwarding. No reconciliation for the Terminal
+    /// (it stays always-rendered; becoming toggleable is issue #821).
+    fn toggle_area(&mut self, area: Area, window: &mut Window, cx: &mut Context<Self>) {
+        self.visibility.toggle(area);
+        let visible = self.visibility.is_visible(area);
+        match area {
+            Area::ExplorerEditor => self.apply_explorer_editor_visibility(visible, window, cx),
+            Area::Diagnostics => self.apply_diagnostics_visibility(visible, window, cx),
+            Area::Git => self.apply_git_visibility(visible, window, cx),
+            Area::Terminal => {}
+        }
+    }
+
+    /// Reconcile the dock tree with the Explorer+Editor area's visibility:
+    /// rebuild the center as the editor|terminal `h_split` when visible, or
+    /// the Terminal alone — filling the freed half — when hidden, and
+    /// open/close the left dock (closed, a Left `Dock` skips its whole
+    /// subtree in gpui-component's own `Dock::render`, so this alone makes
+    /// the explorer "not rendered"). Rebuilding `center` from the same live
+    /// `editor`/`terminal_panel` entities (never dropping or recreating them)
+    /// keeps their reactive state and daemon-stream bindings alive across a
+    /// hide/show — only the surrounding `TabPanel`/`StackPanel` chrome is
+    /// rebuilt.
+    fn apply_explorer_editor_visibility(
+        &self,
+        visible: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let weak_dock_area = self.dock_area.downgrade();
+        let center = if visible {
+            DockItem::h_split(
+                vec![
+                    DockItem::tab(self.editor.clone(), &weak_dock_area, window, cx),
+                    DockItem::tab(self.terminal_panel.clone(), &weak_dock_area, window, cx),
+                ],
+                &weak_dock_area,
+                window,
+                cx,
+            )
+        } else {
+            DockItem::tab(self.terminal_panel.clone(), &weak_dock_area, window, cx)
+        };
         self.dock_area.update(cx, |dock_area, cx| {
-            dock_area.toggle_dock(DockPlacement::Left, window, cx);
+            dock_area.set_center(center, window, cx);
+            if let Some(left_dock) = dock_area.left_dock().cloned() {
+                left_dock.update(cx, |dock, cx| dock.set_open(visible, window, cx));
+            }
+        });
+    }
+
+    /// Reconcile the dock tree with the Diagnostics (bottom/problems) area's
+    /// visibility: add/remove the problems panel's tab — so a hidden panel's
+    /// `render` is never invoked (`TabPanel::render_active_panel` falls back
+    /// to `Empty` with zero tabs), unlike merely collapsing the dock, which
+    /// gpui-component keeps a slim title strip always rendered for the
+    /// bottom placement — and open/close the dock. `add_panel`/`remove_panel`
+    /// are idempotent (no-op on an already-present/already-absent entity id),
+    /// so this is safe regardless of the panel's current attachment.
+    fn apply_diagnostics_visibility(
+        &self,
+        visible: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel: Arc<dyn PanelView> = Arc::new(self.problems_panel.clone());
+        self.dock_area.update(cx, |dock_area, cx| {
+            if visible {
+                dock_area.add_panel(panel, DockPlacement::Bottom, None, window, cx);
+            } else {
+                dock_area.remove_panel(panel, DockPlacement::Bottom, window, cx);
+            }
+            if let Some(bottom_dock) = dock_area.bottom_dock().cloned() {
+                bottom_dock.update(cx, |dock, cx| dock.set_open(visible, window, cx));
+            }
+        });
+    }
+
+    /// Reconcile the dock tree with the Git (source-control + diff) area's
+    /// visibility: open/close the right dock only — unlike Diagnostics, never
+    /// add_panel/remove_panel the right dock's two tabs directly. The right
+    /// dock's panel is a vertical `Split` of two separate `Tabs` (source
+    /// control, diff view, #338), and `DockItem::add_panel`'s `Split` branch
+    /// always re-inserts into the *first* `Tabs` it finds regardless of which
+    /// one a panel came from — a remove/re-add round trip would merge both
+    /// tabs into one and lose the split. Closing the (non-bottom) right dock
+    /// already skips its whole subtree in `Dock::render`, reaching the same
+    /// "not rendered" outcome without that hazard.
+    fn apply_git_visibility(&self, visible: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.dock_area.update(cx, |dock_area, cx| {
+            if let Some(right_dock) = dock_area.right_dock().cloned() {
+                right_dock.update(cx, |dock, cx| dock.set_open(visible, window, cx));
+            }
         });
     }
 
     /// Toggle the outline panel shown/hidden in the left dock (#530): adds it
     /// as a tab alongside the explorer (opening the dock too, since
     /// `DockArea::add_panel` does not do that for an already-existing dock)
-    /// or removes it, per `outline_open`'s current state — the panel-level
-    /// counterpart to `toggle_explorer`'s whole-dock toggle.
+    /// or removes it, per `outline_open`'s current state — independent of the
+    /// Explorer+Editor area toggle above (the outline panel is not one of the
+    /// rail's four areas).
     fn toggle_outline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let opening = !self.outline_open;
         let panel: Arc<dyn PanelView> = Arc::new(self.outline_panel.clone());
@@ -1387,20 +1584,6 @@ impl WorkspaceView {
         self.results_panel.update(cx, |panel, cx| panel.clear(cx));
         self.editor
             .update(cx, |editor, _cx| editor.mark_results_closed());
-    }
-
-    /// Toggle the problems dock (bottom) hidden/shown (issue #358).
-    fn toggle_problems(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.dock_area.update(cx, |dock_area, cx| {
-            dock_area.toggle_dock(DockPlacement::Bottom, window, cx);
-        });
-    }
-
-    /// Toggle the source control dock (right) hidden/shown (issue #358).
-    fn toggle_source_control(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.dock_area.update(cx, |dock_area, cx| {
-            dock_area.toggle_dock(DockPlacement::Right, window, cx);
-        });
     }
 
     /// Move focus to the terminal (issue #358), so keystrokes reach the tmux
@@ -1780,18 +1963,19 @@ impl Render for WorkspaceView {
             .into_any_element();
         let title_bar = title_bar::render(connection, session_strip, Some(settings_button), cx);
 
-        // The activity rail (#513, `docs/spec-cockpit-chrome.md`): active
-        // state tracks live dock visibility and the badges read the same
-        // `WorktreeModel` the status bar reads below — both live views over
-        // one model, no separate rail-owned state.
+        // The activity rail (#513, `docs/spec-cockpit-chrome.md`; rewired to
+        // area visibility by `docs/spec-workspace-visibility-rail.md`): active
+        // state reads the rift-owned `visibility` set — not `dock.is_open` —
+        // and the badges read the same `WorktreeModel` the status bar reads
+        // below — both live views over one model, no separate rail-owned
+        // state.
         let rail = {
             let model = self.file_tree.read(cx).model();
-            let dock_area = self.dock_area.read(cx);
             activity_rail::render(
                 activity_rail::RailState {
-                    explorer_open: dock_area.is_dock_open(DockPlacement::Left, cx),
-                    source_control_open: dock_area.is_dock_open(DockPlacement::Right, cx),
-                    problems_open: dock_area.is_dock_open(DockPlacement::Bottom, cx),
+                    explorer_editor_visible: self.visibility.is_visible(Area::ExplorerEditor),
+                    git_visible: self.visibility.is_visible(Area::Git),
+                    diagnostics_visible: self.visibility.is_visible(Area::Diagnostics),
                     changed_count: model.git_statuses().len(),
                     worst_diagnostic: activity_rail::worst_severity(model.all_diagnostics()),
                 },
@@ -1857,16 +2041,16 @@ impl Render for WorkspaceView {
             .size_full()
             .bg(cx.theme().background)
             .on_action(cx.listener(|this, _: &ToggleExplorer, window, cx| {
-                this.toggle_explorer(window, cx);
+                this.toggle_area(Area::ExplorerEditor, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleOutline, window, cx| {
                 this.toggle_outline(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleProblems, window, cx| {
-                this.toggle_problems(window, cx);
+                this.toggle_area(Area::Diagnostics, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleSourceControl, window, cx| {
-                this.toggle_source_control(window, cx);
+                this.toggle_area(Area::Git, window, cx);
             }))
             .on_action(cx.listener(|this, _: &FocusTerminal, window, cx| {
                 this.focus_terminal(window, cx);
@@ -1945,6 +2129,60 @@ mod tests {
             y,
             width,
             height,
+        }
+    }
+
+    // --- workspace visibility set/solo state machine ---------------------
+    // (`docs/spec-workspace-visibility-rail.md`, issue #819): `Visibility` has
+    // no GPUI dependency, so these run as ordinary `#[test]`s exercising the
+    // pure state machine directly, independent of the dock-tree reconciliation
+    // the `#[gpui::test]`s further below cover.
+
+    #[test]
+    fn test_visibility_all_visible_marks_every_area_visible() {
+        let visibility = Visibility::all_visible();
+        for area in Area::ALL {
+            assert!(visibility.is_visible(area), "{area:?} should start visible");
+        }
+    }
+
+    #[test]
+    fn test_toggle_hides_one_area_and_a_second_toggle_restores_it() {
+        let mut visibility = Visibility::all_visible();
+
+        visibility.toggle(Area::Git);
+        assert!(!visibility.is_visible(Area::Git), "Git is now hidden");
+        for area in [Area::ExplorerEditor, Area::Terminal, Area::Diagnostics] {
+            assert!(
+                visibility.is_visible(area),
+                "toggling Git leaves {area:?} visible"
+            );
+        }
+
+        visibility.toggle(Area::Git);
+        assert!(
+            visibility.is_visible(Area::Git),
+            "a second toggle restores it"
+        );
+    }
+
+    #[test]
+    fn test_is_visible_solo_shows_only_the_target_area() {
+        let visibility = Visibility {
+            visible: Area::ALL.into_iter().collect(),
+            solo: Some(Area::Diagnostics),
+        };
+
+        assert!(
+            visibility.is_visible(Area::Diagnostics),
+            "the soloed area renders"
+        );
+        for area in [Area::ExplorerEditor, Area::Terminal, Area::Git] {
+            assert!(
+                !visibility.is_visible(area),
+                "{area:?} is hidden while another area is soloed, even though it is \
+                 still in the visible set"
+            );
         }
     }
 
@@ -2402,12 +2640,18 @@ mod tests {
         });
     }
 
-    /// Shell command action (`docs/spec-command-palette.md`, issue #358): the
-    /// `ToggleExplorer` handler reaches the same `DockArea::toggle_dock` call
-    /// `test_toggle_left_dock_flips_open_state` already exercises directly —
-    /// this proves the action is wired to the dock, not just defined.
+    /// Shell command action (`docs/spec-command-palette.md`, issue #358;
+    /// rewired by `docs/spec-workspace-visibility-rail.md`, issue #819): the
+    /// `ToggleExplorer` handler now flips `Area::ExplorerEditor`'s membership
+    /// in the rift-owned visibility set, closes the left dock (the same
+    /// `DockArea::toggle_dock` wiring `test_toggle_left_dock_flips_open_state`
+    /// exercises directly), and collapses the center split down to the
+    /// Terminal alone — restoring the editor|terminal split on the next
+    /// toggle.
     #[gpui::test]
-    fn test_toggle_explorer_flips_left_dock_open_state(cx: &mut TestAppContext) {
+    fn test_toggle_area_explorer_editor_hides_left_dock_and_collapses_center_to_terminal(
+        cx: &mut TestAppContext,
+    ) {
         let mut workspace: Option<Entity<WorkspaceView>> = None;
         let window = cx.update(|cx| {
             gpui_component::init(cx);
@@ -2430,14 +2674,62 @@ mod tests {
                     dock_area.read(cx).is_dock_open(DockPlacement::Left, cx),
                     "explorer dock starts open"
                 );
+                assert!(
+                    workspace
+                        .read(cx)
+                        .visibility
+                        .is_visible(Area::ExplorerEditor),
+                    "the area starts visible"
+                );
 
                 workspace.update(cx, |view, cx| {
-                    view.toggle_explorer(window, cx);
+                    view.toggle_area(Area::ExplorerEditor, window, cx);
                 });
                 assert!(
                     !dock_area.read(cx).is_dock_open(DockPlacement::Left, cx),
                     "ToggleExplorer hides the explorer dock"
                 );
+                assert!(
+                    !workspace
+                        .read(cx)
+                        .visibility
+                        .is_visible(Area::ExplorerEditor),
+                    "the area is now hidden in the rift-owned set"
+                );
+                match dock_area.read(cx).center() {
+                    DockItem::Tabs { items, .. } => assert_eq!(
+                        items[0].panel_name(cx),
+                        crate::terminal_panel::TERMINAL_PANEL_NAME,
+                        "the terminal expands to fill the center alone"
+                    ),
+                    other => {
+                        panic!("expected the center to collapse to a single tab, got {other:?}")
+                    }
+                }
+
+                workspace.update(cx, |view, cx| {
+                    view.toggle_area(Area::ExplorerEditor, window, cx);
+                });
+                assert!(
+                    dock_area.read(cx).is_dock_open(DockPlacement::Left, cx),
+                    "toggling again restores the explorer dock"
+                );
+                assert!(
+                    workspace
+                        .read(cx)
+                        .visibility
+                        .is_visible(Area::ExplorerEditor),
+                    "the area is visible again"
+                );
+                match dock_area.read(cx).center() {
+                    DockItem::Split { axis, items, .. } => {
+                        assert_eq!(*axis, Axis::Horizontal);
+                        assert_eq!(items.len(), 2, "center split holds editor + terminal again");
+                    }
+                    other => {
+                        panic!("expected the center to be a horizontal split again, got {other:?}")
+                    }
+                }
             })
             .unwrap();
     }
@@ -2507,7 +2799,7 @@ mod tests {
                 // Collapse the left dock first, to prove ToggleOutline opens
                 // it rather than merely adding an invisible tab.
                 workspace.update(cx, |view, cx| {
-                    view.toggle_explorer(window, cx);
+                    view.toggle_area(Area::ExplorerEditor, window, cx);
                 });
                 assert!(!dock_area.read(cx).is_dock_open(DockPlacement::Left, cx));
 
@@ -2615,10 +2907,32 @@ mod tests {
             .unwrap();
     }
 
-    /// Shell command action (issue #358): `ToggleProblems` reaches the bottom
-    /// dock (home to the problems panel, #342), which starts collapsed.
+    /// Shell command action (issue #358; rewired by `docs/spec-workspace-
+    /// visibility-rail.md`, issue #819): `ToggleProblems` now flips
+    /// `Area::Diagnostics`'s membership in the rift-owned visibility set,
+    /// opens/closes the bottom dock (home to the problems panel, #342 —
+    /// which starts collapsed), and attaches/detaches the panel's tab itself
+    /// so a hidden Diagnostics area is not rendered (`TabPanel` falls back to
+    /// `Empty` with zero tabs) rather than merely collapsed.
     #[gpui::test]
-    fn test_toggle_problems_flips_bottom_dock_open_state(cx: &mut TestAppContext) {
+    fn test_toggle_area_diagnostics_attaches_and_detaches_the_problems_panel(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::problems_panel::PROBLEMS_PANEL_NAME;
+
+        fn bottom_active_tab_name(dock_area: &Entity<DockArea>, cx: &App) -> Option<&'static str> {
+            let bottom = dock_area
+                .read(cx)
+                .bottom_dock()
+                .expect("bottom dock exists");
+            match bottom.read(cx).panel() {
+                DockItem::Tabs { view, .. } => {
+                    view.read(cx).active_panel(cx).map(|p| p.panel_name(cx))
+                }
+                other => panic!("expected the bottom dock to hold tabs, got {other:?}"),
+            }
+        }
+
         let mut workspace: Option<Entity<WorkspaceView>> = None;
         let window = cx.update(|cx| {
             gpui_component::init(cx);
@@ -2641,23 +2955,49 @@ mod tests {
                     !dock_area.read(cx).is_dock_open(DockPlacement::Bottom, cx),
                     "problems dock starts collapsed"
                 );
+                assert!(
+                    !workspace.read(cx).visibility.is_visible(Area::Diagnostics),
+                    "the area starts hidden, matching the collapsed dock"
+                );
 
                 workspace.update(cx, |view, cx| {
-                    view.toggle_problems(window, cx);
+                    view.toggle_area(Area::Diagnostics, window, cx);
                 });
                 assert!(
                     dock_area.read(cx).is_dock_open(DockPlacement::Bottom, cx),
                     "ToggleProblems opens the bottom dock"
                 );
+                assert!(workspace.read(cx).visibility.is_visible(Area::Diagnostics));
+                assert_eq!(
+                    bottom_active_tab_name(&dock_area, cx),
+                    Some(PROBLEMS_PANEL_NAME),
+                    "showing the area attaches the problems panel's tab"
+                );
+
+                workspace.update(cx, |view, cx| {
+                    view.toggle_area(Area::Diagnostics, window, cx);
+                });
+                assert!(
+                    !dock_area.read(cx).is_dock_open(DockPlacement::Bottom, cx),
+                    "toggling again re-collapses the bottom dock"
+                );
+                assert!(!workspace.read(cx).visibility.is_visible(Area::Diagnostics));
+                assert_eq!(
+                    bottom_active_tab_name(&dock_area, cx),
+                    None,
+                    "hiding the area detaches the problems panel's tab, so it is not rendered"
+                );
             })
             .unwrap();
     }
 
-    /// Shell command action (issue #358): `ToggleSourceControl` reaches the
-    /// right dock (reserved for the Phase 12 source control panel), which
-    /// starts collapsed.
+    /// Shell command action (issue #358; rewired by `docs/spec-workspace-
+    /// visibility-rail.md`, issue #819): `ToggleSourceControl` now flips
+    /// `Area::Git`'s membership in the rift-owned visibility set and
+    /// opens/closes the right dock (reserved for the source control + diff
+    /// panels, #338), which starts collapsed.
     #[gpui::test]
-    fn test_toggle_source_control_flips_right_dock_open_state(cx: &mut TestAppContext) {
+    fn test_toggle_area_git_flips_right_dock_open_state(cx: &mut TestAppContext) {
         let mut workspace: Option<Entity<WorkspaceView>> = None;
         let window = cx.update(|cx| {
             gpui_component::init(cx);
@@ -2680,14 +3020,16 @@ mod tests {
                     !dock_area.read(cx).is_dock_open(DockPlacement::Right, cx),
                     "source control dock starts collapsed"
                 );
+                assert!(!workspace.read(cx).visibility.is_visible(Area::Git));
 
                 workspace.update(cx, |view, cx| {
-                    view.toggle_source_control(window, cx);
+                    view.toggle_area(Area::Git, window, cx);
                 });
                 assert!(
                     dock_area.read(cx).is_dock_open(DockPlacement::Right, cx),
                     "ToggleSourceControl opens the right dock"
                 );
+                assert!(workspace.read(cx).visibility.is_visible(Area::Git));
             })
             .unwrap();
     }

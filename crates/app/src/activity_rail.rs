@@ -1,17 +1,20 @@
 //! The 48px activity rail (#513, `docs/spec-cockpit-chrome.md`): a fixed-width
-//! flex column left of the dock, toggling the explorer / source-control /
-//! problems docks and opening settings.
+//! flex column left of the dock, toggling area visibility and opening
+//! settings.
 //!
-//! Presentational only, mirroring [`crate::title_bar`]: it takes the live
-//! badge data ([`RailState`]) the caller already reads off the existing
-//! client models (`WorktreeModel::git_statuses` for the changed-file count,
-//! `WorktreeModel::all_diagnostics` for [`worst_severity`]) — this phase adds
-//! rendering only, no new state (the spec's prior-decisions row). Each
-//! button's click dispatches the same shell-command `Action`
-//! ([`crate::workspace::ToggleExplorer`] etc.) the command palette already
-//! binds, via `window.dispatch_action`, so the rail never reaches into a
-//! `WorkspaceView` entity directly and bubbles to the same `on_action`
-//! handlers at the workspace root.
+//! Rewired by `docs/spec-workspace-visibility-rail.md` (issue #819) from a
+//! per-dock open/close toggle to the rift-owned area-visibility set: each
+//! icon's active state now reads [`RailState`]'s `*_visible` fields — sourced
+//! by the caller from `WorkspaceView`'s own visibility set, not
+//! `dock.is_open` — though the click still dispatches the same three
+//! shell-command `Action`s ([`crate::workspace::ToggleExplorer`] etc.) the
+//! command palette already binds, via `window.dispatch_action`; only their
+//! handlers changed, from forwarding to `DockArea::toggle_dock` to toggling
+//! the visibility set. Presentational only, mirroring [`crate::title_bar`]:
+//! the badge data is read off the existing client models
+//! (`WorktreeModel::git_statuses` for the changed-file count,
+//! `WorktreeModel::all_diagnostics` for [`worst_severity`]) — no new state
+//! lives here, the rail never reaches into a `WorkspaceView` entity directly.
 
 use std::collections::BTreeMap;
 
@@ -34,11 +37,18 @@ pub const WIDTH: Pixels = px(48.0);
 const BUTTON_SIZE: Pixels = px(36.0);
 
 /// Live badge/active-state data the rail renders, read by the caller from the
-/// existing dock and worktree models — never derived or cached here.
+/// rift-owned visibility set (`docs/spec-workspace-visibility-rail.md`) and
+/// worktree models — never derived or cached here.
 pub struct RailState {
-    pub explorer_open: bool,
-    pub source_control_open: bool,
-    pub problems_open: bool,
+    /// Whether the Explorer+Editor area is visible (`Area::ExplorerEditor`,
+    /// one rail icon for both the left-dock explorer and the center editor).
+    pub explorer_editor_visible: bool,
+    /// Whether the Git area is visible (`Area::Git`: the right dock's source
+    /// control + diff view).
+    pub git_visible: bool,
+    /// Whether the Diagnostics area is visible (`Area::Diagnostics`: the
+    /// bottom dock's problems panel).
+    pub diagnostics_visible: bool,
     /// Changed-file count from `WorktreeModel::git_statuses` — the
     /// source-control badge (hidden by `Badge` itself when zero).
     pub changed_count: usize,
@@ -114,7 +124,7 @@ pub fn render(state: RailState, cx: &App) -> impl IntoElement {
         "activity-rail-explorer",
         IconName::Folder,
         "Explorer",
-        state.explorer_open,
+        state.explorer_editor_visible,
         |_event, window, cx| window.dispatch_action(Box::new(ToggleExplorer), cx),
     );
 
@@ -122,7 +132,7 @@ pub fn render(state: RailState, cx: &App) -> impl IntoElement {
         "activity-rail-source-control",
         IconName::Github,
         "Source Control",
-        state.source_control_open,
+        state.git_visible,
         |_event, window, cx| window.dispatch_action(Box::new(ToggleSourceControl), cx),
     ));
 
@@ -130,7 +140,7 @@ pub fn render(state: RailState, cx: &App) -> impl IntoElement {
         "activity-rail-problems",
         IconName::TriangleAlert,
         "Problems",
-        state.problems_open,
+        state.diagnostics_visible,
         |_event, window, cx| window.dispatch_action(Box::new(ToggleProblems), cx),
     );
     let problems: AnyElement = match state.worst_diagnostic {
