@@ -1,8 +1,8 @@
 # Spec: New-session remote root picker
 
-> Status: READY
+> Status: COMPLETED
 > Created: 2026-07-09
-> Completed: —
+> Completed: 2026-07-10
 
 Creating a tmux session picks its project root by browsing the remote filesystem
 first: a new daemon-side directory-listing capability backs a folder picker that
