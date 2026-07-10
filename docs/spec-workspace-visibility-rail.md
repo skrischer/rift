@@ -55,14 +55,24 @@ restart, driving the dock beneath.
   Dock tree; its Entity models + detached subscription tasks (held by
   `WorkspaceView`, not the view render) stay alive, so re-show re-attaches. Solo
   reuses gpui-component's render-one path (the dock renders only the soloed
-  subtree) but driven by the rift-owned set, not gpui-component's internal
-  `zoom_view` as a parallel source of truth.
+  subtree) but driven by the rift-owned set — reconciling **both** gpui-component
+  zoom states (`DockArea.zoom_view` + `TabPanel.zoomed`) by intercepting the
+  built-in `ToggleZoom` → `PanelEvent` path so neither is set behind the set's back
+  (see Constraints).
 - **Explorer+Editor as one area**: the left-dock Explorer and the center Editor
-  region toggle together; Terminal remains its own center region.
+  region toggle together; Terminal remains its own center region. The center is an
+  `h_split([Editor, Terminal])` (`workspace.rs:1000-1008`), so hiding the
+  Explorer+Editor area removes the left dock and the Editor half, and the Terminal
+  tab-panel expands to fill the center.
 - **Persistence**: additive `visible_areas` + `solo_area` on `WindowState`
   (`window_state.rs`), `#[serde(default)]` with tolerant load, mirroring
   `recent_roots` / `DiffViewMode` (a field + a read-modify-write `save_*` helper);
   re-applied on launch in place of the current unconditional `set_*_dock` seeding.
+  The hand-written `Default` must seed `visible_areas` to **all areas visible**
+  (not `Vec::default()`, which is empty = blank workspace) and `solo_area` to
+  `None`. The `Area` enum carries `#[serde(other)]` (or a field-level tolerant
+  deserializer) so a present `visible_areas` with an unknown variant degrades that
+  entry rather than failing the whole parse.
 - **Terminal grid re-assertion**: whatever the Terminal decision (below), the spec
   must guarantee the terminal is correctly sized after a visibility/solo change —
   extending the existing #596 dock-toggle resize-reassert observer
@@ -100,9 +110,16 @@ restart, driving the dock beneath.
   always rendered) — this is the primary technical risk and gates the Terminal
   decision below.
 - **Single source of truth for solo.** rift's visible set is authoritative;
-  gpui-component's own zoom must be driven by it, never invoked directly in
-  parallel (the #716 toolbar zoom control becomes the solo trigger routed through
-  the set), so the two never diverge.
+  gpui-component holds **two** internal zoom states — `DockArea.zoom_view`
+  (`gpui-component .../dock/mod.rs:1127`) and per-`TabPanel.zoomed: bool`
+  (`.../dock/tab_panel.rs:82`) — and the #716 header control forwards
+  `gpui_component::dock::ToggleZoom` (`workspace.rs:1416-1418`), whose
+  `PanelEvent::ZoomIn/Out` path mutates **both** in parallel inside gpui-component.
+  Making rift's set authoritative therefore requires **intercepting or replacing
+  that built-in `ToggleZoom` → `PanelEvent` path** (so it cannot set `zoom_view` +
+  `TabPanel.zoomed` independently and desync the header button's selected state
+  from the rift set), not merely driving `zoom_view`. The panel zoom control
+  becomes the solo trigger routed through the rift set.
 - **Additive persistence.** `WindowState` is `#[serde(default)]` + tolerant load
   (`window_state.rs:92,359-364`); the new fields follow that contract so old state
   files still load (default: all areas visible, no solo).
@@ -182,27 +199,37 @@ restart, driving the dock beneath.
   state. Mitigation: the area maps to both mounts as a unit; QA covers hide/show of
   the combined area.
 - **State drift on area set changes.** A persisted `visible_areas` referencing an
-  area that no longer exists must degrade gracefully (ignore unknown, default
-  missing to visible) — covered by the tolerant-load test.
+  area that no longer exists must degrade gracefully. Container `#[serde(default)]`
+  only fills *missing* fields — a *present* list with an unknown enum variant fails
+  the whole parse, and the tolerant `load` then resets the entire `WindowState` to
+  default (losing bounds / theme / recents). Mitigation: `#[serde(other)]` on the
+  `Area` enum (or a field-level tolerant deserializer) so unknown entries are
+  dropped, not fatal; covered by a dedicated test.
 
 ## The Terminal decision (resolved at the acceptance gate)
 
-Whether the **Terminal** area is:
+Whether the **Terminal** area is an always-visible floor or a fully symmetric
+peer. The chosen option fully determines the Terminal rail icon's behaviour and
+the solo cardinality — both derived here so the gate answer leaves nothing open:
 
-- **Always-visible floor (recommended)** — the Terminal cannot be hidden or soloed
-  away; solo of any other area keeps the Terminal alongside it. Aligns with
+- **Always-visible floor (recommended)** — the Terminal is always rendered; it
+  cannot be hidden. Derived behaviour: its rail icon **solos the Terminal** (show
+  only the Terminal, hide the other three — the safe direction, since the Terminal
+  stays rendered), and re-clicking it or toggling any other area from the rail
+  restores the previous visible set; soloing any *non-Terminal* area shows **that
+  area + the Terminal** (never the area alone). Because the Terminal is never
+  unrendered, the render-coupled grid hazard cannot arise. Aligns with
   `docs/vision.md` (the terminal agent is the primary actor; every GUI feature
-  exists to keep agent work observable) and sidesteps the render-coupled grid
-  hazard entirely (the Terminal is always rendered, so `refresh-client -C` always
-  fires). Smallest, lowest-risk cut.
-- **Fully symmetric** — the Terminal is a peer area, hideable and soloable like the
-  rest. Requires the render-coupled grid mitigation to actually fire on Terminal
-  re-show (re-assert `refresh-client -C` when the Terminal element is (re)built),
-  a real chunk of the render-path work, and defines solo of a non-Terminal area as
-  hiding the Terminal too.
+  exists to keep agent work observable). Smallest, lowest-risk cut.
+- **Fully symmetric** — the Terminal is a peer: hideable and soloable like any
+  area. Derived behaviour: its rail icon toggles its visibility like the others;
+  solo shows only the target (soloing a non-Terminal area hides the Terminal too).
+  Requires the render-coupled grid mitigation to actually fire on Terminal re-show
+  — re-assert `refresh-client -C` when the Terminal element is (re)built — a real
+  chunk of render-path work beyond the #596 dock-toggle observer.
 
-The recommendation is **always-visible floor**; the choice sets the solo
-semantics and the size of the grid-resize work.
+The recommendation is **always-visible floor**; the choice sets the Terminal
+icon's behaviour, the solo cardinality, and the size of the grid-resize work.
 
 ## Tracking
 
@@ -219,3 +246,12 @@ semantics and the size of the grid-resize work.
   ties the one open decision (Terminal always-visible vs fully symmetric) to the
   grid-resize work. Supersedes the cockpit-chrome rail design via this phase's
   Paper artifact. One open decision carried to the acceptance gate.
+- 2026-07-10: Spec-review refinements folded pre-acceptance (VERDICT was
+  REQUEST_CHANGES, both blockers surgical): the Terminal decision now derives the
+  Terminal rail-icon behaviour + solo cardinality per option (so resolving the one
+  open decision leaves nothing implicit); the solo single-source-of-truth names
+  both gpui-component zoom states (`DockArea.zoom_view` + `TabPanel.zoomed`) and the
+  built-in `ToggleZoom`→`PanelEvent` interception as the reconciliation point;
+  persistence requires an all-visible `Default` and `#[serde(other)]` on the `Area`
+  enum so an unknown persisted variant is not fatal; and the Explorer+Editor
+  center-fill behaviour is stated.
