@@ -171,3 +171,25 @@ Human milestone-QA gate (dev channel, `just dev-windows-watch`):
   `SessionIntent::Fixed` fast-path); Phase 40's issues carry a `Depends on: #808`
   edge and the milestone a `Depends on milestone: #57`. No standalone Fixed
   handling. Spec accepted.
+- 2026-07-10 (#813 impl): Routing seam realized as a pure `route_picker(&[SessionListItem])
+  -> PickerRoute { SessionPicker | RootPicker }` classifier extracted from the
+  Shell handler's inline `if sessions.is_empty()`. It is used for real (not
+  test-only) in the `PickerOutcome::ShowPicker` arm — the empty-guard match arm
+  became a nested `match route_picker(&sessions)` — and unit-tested directly
+  (empty → root, one/many → session). The `preferred = None` forces-picker path
+  keeps its existing `test_resolve_preferred_session_none_returns_none` coverage.
+- 2026-07-10 (#813 impl): First-attach vs re-entry is distinguished by a local
+  `first_attach: bool` in `run_daemon_terminal`'s outer loop (not a watch): the
+  first iteration passes `watches.preferred_session`, every later iteration passes
+  `None`. On a full `run_daemon_terminal` restart (an SSH-level reconnect after
+  the watch was unset), `first_attach` resets to `true`, so that fresh entry
+  honors `Preferred` again exactly like the post-connect first entry — matching
+  the phase-20 reconnect-re-shows-the-picker contract.
+- 2026-07-10 (#813 impl): The outer loop re-picks/re-`Attach`es over the local
+  `current` client handle, which the inner stream-recovery loop reassigns from
+  `reconnect_daemon` (and mirrors into `client_tx` for the bridges), so a
+  reconnect-then-`TerminalExit` within one session re-picks over the reconnected
+  client. The reverse-path bridges are spawned once above the first
+  `await_session_pick` (mirroring `spawn_dir_browse_bridge`); the inner recovery
+  loop's `TerminalExit` arm changed to unset the watch + break, its stream-death
+  arm is unchanged.
