@@ -568,12 +568,15 @@ impl WorkspaceView {
                     // matching on the message type — naturally fires exactly
                     // once per completed snapshot, multi-chunk-safe.
                     let previous_root = view.file_tree.read(cx).model().root().map(str::to_owned);
-                    view.file_tree.update(cx, |tree, cx| {
-                        apply_worktree_message(tree, msg);
+                    let snapshot_completed = view.file_tree.update(cx, |tree, cx| {
+                        let completed = apply_worktree_message(tree, msg);
                         cx.notify();
+                        completed
                     });
                     let new_root = view.file_tree.read(cx).model().root().map(str::to_owned);
-                    if worktree_root_switched(previous_root.as_deref(), new_root.as_deref()) {
+                    let switched =
+                        worktree_root_switched(previous_root.as_deref(), new_root.as_deref());
+                    if switched {
                         // The reactive layer just re-rooted to a different
                         // project: force-close every open tab so a buffer
                         // left open against the OLD root can never resolve a
@@ -583,6 +586,30 @@ impl WorkspaceView {
                         // in `crates/daemon/src/lib.rs`).
                         view.editor.update(cx, |editor, cx| {
                             editor.close_all_tabs_for_project_switch(window, cx);
+                        });
+                    }
+                    // Default the explorer to collapsed on the snapshot that
+                    // just completed (#795, `docs/spec-dogfooding-fixes.md`)
+                    // — the very first one ever, or the first one for a
+                    // newly switched-to project. `switched` implies
+                    // `snapshot_completed` (both derive from the same
+                    // FINAL-chunk root commit above), so resetting the
+                    // per-project seed here — BEFORE the seed call in the
+                    // same update — always leaves a fresh guard for it to
+                    // fire against; without the reset, the switched-to
+                    // project would inherit the OLD project's `collapsed`
+                    // set (same-named directories, e.g. both projects having
+                    // `src`, reading as collapsed by accident) and the
+                    // already-set guard would no-op the reseed. A no-op on
+                    // any later same-project snapshot: a directory the user
+                    // has since expanded stays expanded.
+                    if snapshot_completed {
+                        view.file_tree.update(cx, |tree, cx| {
+                            if switched {
+                                tree.reset_collapse_seed();
+                            }
+                            tree.seed_collapsed_on_first_snapshot();
+                            cx.notify();
                         });
                     }
                     // Status bar (#347, #348): a `RepoState` fold changes the
@@ -1648,7 +1675,15 @@ fn worktree_root_switched(previous: Option<&str>, new: Option<&str>) -> bool {
 /// actually turns into a select + reveal, once the push-only recompute has
 /// added the row to `model` — never before, and never mutating the model a
 /// second time to do it.
-fn apply_worktree_message(tree: &mut FileTree, msg: DaemonMessage) {
+///
+/// Returns whether this fold just completed a worktree snapshot (the final
+/// chunk of a `WorktreeSnapshot`) — the caller uses this to drive the
+/// default-collapsed seed (#795, `docs/spec-dogfooding-fixes.md`) AFTER it
+/// has had a chance to reset that seed on a project re-root, so the reset
+/// and the seed for the same switch-completing snapshot land in the right
+/// order (never both inside this one call, which would seed against a
+/// not-yet-reset guard).
+fn apply_worktree_message(tree: &mut FileTree, msg: DaemonMessage) -> bool {
     let model = tree.model_mut();
     let mut snapshot_completed = false;
     let added_paths = match msg {
@@ -1692,16 +1727,10 @@ fn apply_worktree_message(tree: &mut FileTree, msg: DaemonMessage) {
         }
         _ => None,
     };
-    // Default the explorer to collapsed on the very first completed
-    // snapshot (#795, `docs/spec-dogfooding-fixes.md`); a no-op on every
-    // later one, so a reattach or project switch never re-collapses a
-    // directory the user has since expanded.
-    if snapshot_completed {
-        tree.seed_collapsed_on_first_snapshot();
-    }
     if let Some(added_paths) = added_paths {
         tree.apply_pending_reveal(&added_paths);
     }
+    snapshot_completed
 }
 
 impl Focusable for WorkspaceView {
@@ -3258,6 +3287,105 @@ mod tests {
                 Some("a.rs"),
                 "switching to the already-open a.rs tab reveals it in the tree"
             );
+        });
+    }
+
+    /// Default-collapsed is per-project (#795 follow-up, #738 re-root): a
+    /// project switch's fresh snapshot must default the NEW project's tree
+    /// to collapsed too, never inherit the OLD project's per-path
+    /// `collapsed` state. Regression for the reviewer-flagged gap: without
+    /// resetting the seed guard at the re-root hook, a directory the user
+    /// had expanded in the old project (here `src`, deliberately same-named
+    /// across both projects) would carry over as expanded in the new one.
+    #[gpui::test]
+    fn test_worktree_snapshot_after_a_project_switch_defaults_the_new_tree_to_collapsed(
+        cx: &mut TestAppContext,
+    ) {
+        use rift_protocol::WorktreeEntry;
+        use std::time::SystemTime;
+
+        fn dir(path: &str) -> WorktreeEntry {
+            WorktreeEntry {
+                path: path.to_owned(),
+                kind: EntryKind::Dir,
+                ignored: false,
+                mtime: SystemTime::UNIX_EPOCH,
+            }
+        }
+
+        fn file(path: &str) -> WorktreeEntry {
+            WorktreeEntry {
+                path: path.to_owned(),
+                kind: EntryKind::File,
+                ignored: false,
+                mtime: SystemTime::UNIX_EPOCH,
+            }
+        }
+
+        let (worktree_tx, worktree_rx) = flume::unbounded();
+        let channels = WorkspaceChannels {
+            worktree_rx,
+            ..test_channels()
+        };
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let session_view = cx.new(|cx| SessionView::new(cx).0);
+                workspace =
+                    Some(cx.new(|cx| WorkspaceView::new(session_view, channels, None, window, cx)));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+        let file_tree = cx.update(|cx| workspace.read(cx).file_tree.clone());
+
+        // Project A's first (and only) snapshot defaults to collapsed.
+        let _ = worktree_tx.send(DaemonMessage::WorktreeSnapshot {
+            root: "/proj-a".into(),
+            entries: vec![dir("src"), file("src/main.rs"), dir("docs")],
+            final_chunk: true,
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let tree = file_tree.read(cx);
+            assert!(tree.is_collapsed("src"), "project A defaults to collapsed");
+            assert!(tree.is_collapsed("docs"));
+        });
+
+        // The user opens `src` in project A.
+        cx.update_window(window.into(), |_, _window, cx| {
+            file_tree.update(cx, |tree, cx| {
+                tree.reveal("src/main.rs");
+                cx.notify();
+            });
+        })
+        .unwrap();
+        cx.update(|cx| {
+            assert!(
+                !file_tree.read(cx).is_collapsed("src"),
+                "revealing src/main.rs expands its ancestor"
+            );
+        });
+
+        // Switching to project B -- a same-named `src` directory, plus one
+        // the user never touched -- must default BOTH to collapsed, not
+        // inherit project A's now-expanded `src`.
+        let _ = worktree_tx.send(DaemonMessage::WorktreeSnapshot {
+            root: "/proj-b".into(),
+            entries: vec![dir("src"), file("src/lib.rs"), dir("vendor")],
+            final_chunk: true,
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let tree = file_tree.read(cx);
+            assert_eq!(tree.model().root(), Some("/proj-b"));
+            assert!(
+                tree.is_collapsed("src"),
+                "the new project's same-named src defaults to collapsed, no stale carry-over"
+            );
+            assert!(tree.is_collapsed("vendor"));
         });
     }
 }

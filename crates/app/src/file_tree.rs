@@ -952,15 +952,19 @@ pub struct FileTree {
     model: WorktreeModel,
     /// Directories the user has collapsed (their subtrees are hidden). A
     /// directory absent from this set is expanded. Seeded with every
-    /// directory the first time a snapshot completes ([`FileTree::
-    /// seed_collapsed_on_first_snapshot`]), so the tree defaults to fully
-    /// collapsed; the user's own toggles own it from then on.
+    /// directory the first time a snapshot completes
+    /// ([`Self::seed_collapsed_on_first_snapshot`]), so the tree defaults to
+    /// fully collapsed; the user's own toggles own it from then on — until a
+    /// project re-root wipes it ([`Self::reset_collapse_seed`]) so the new
+    /// project defaults to collapsed too, instead of inheriting stale
+    /// per-path state from the old one.
     collapsed: HashSet<String>,
     /// First-load guard for the default-collapsed seeding (#795,
-    /// `docs/spec-dogfooding-fixes.md`): set the moment the first worktree
-    /// snapshot ever completes, so a later snapshot (reattach, project
-    /// switch, #738 re-root) never re-collapses directories the user has
-    /// since expanded. Never cleared once set.
+    /// `docs/spec-dogfooding-fixes.md`): set the moment a worktree snapshot
+    /// completes, so a later same-project snapshot (reconnect) never
+    /// re-collapses directories the user has since expanded. Cleared by
+    /// [`Self::reset_collapse_seed`] on a project re-root (#738), so the
+    /// next completed snapshot re-seeds for the new project.
     collapsed_seeded: bool,
     /// The currently selected entry's path, or `None` when nothing is selected.
     selected: Option<String>,
@@ -1316,18 +1320,37 @@ impl FileTree {
 
     /// Default the tree to fully collapsed the first time a worktree
     /// snapshot completes (#795, `docs/spec-dogfooding-fixes.md`) — a
-    /// first-load guard around [`FileTree::collapse_all`]. A no-op on every
-    /// later snapshot (reattach, project switch): `collapsed_seeded` is set
-    /// once here and never cleared, so a directory the user has since
-    /// expanded stays expanded across a re-snapshot. Called from
-    /// `workspace.rs`'s `apply_worktree_message` right after a
-    /// `WorktreeSnapshot` fold reports it completed the tree.
+    /// first-load guard around [`FileTree::collapse_all`]. A no-op on a
+    /// later same-project snapshot (reconnect): `collapsed_seeded` stays set
+    /// so a directory the user has since expanded stays expanded across a
+    /// re-snapshot. [`FileTree::reset_collapse_seed`] clears the guard on a
+    /// project re-root, so this fires again — fresh — for the new project.
+    /// Called from `workspace.rs`'s worktree-message handler right after a
+    /// `WorktreeSnapshot` fold reports it completed the tree (and, on a
+    /// re-root, right after the reset below).
     pub(crate) fn seed_collapsed_on_first_snapshot(&mut self) {
         if self.collapsed_seeded {
             return;
         }
         self.collapsed_seeded = true;
         self.collapse_all();
+    }
+
+    /// Un-set the default-collapsed guard and drop the whole `collapsed` set
+    /// on a project re-root (#795 follow-up, #738, `docs/spec-dogfooding-fixes.md`):
+    /// without this, a switched-to project would inherit the OLD project's
+    /// per-path collapse state — same-named directories (e.g. both projects
+    /// having `src`) would read as collapsed by accident, and every other
+    /// directory would render expanded, since [`FileTree::
+    /// seed_collapsed_on_first_snapshot`] no-ops once `collapsed_seeded` is
+    /// set. Called from `workspace.rs` at the re-root hook, BEFORE
+    /// `seed_collapsed_on_first_snapshot` runs for the switch-completing
+    /// snapshot, so that call re-seeds the new project from a clean slate
+    /// instead of no-opping against the stale guard.
+    pub(crate) fn reset_collapse_seed(&mut self) {
+        self.collapsed_seeded = false;
+        self.collapsed.clear();
+        self.cache_dirty = true;
     }
 
     /// Expand every directory (header "Expand all"): clears the `collapsed`
