@@ -1519,9 +1519,17 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let focus_handle = workspace.focus_handle(cx);
+        // Explicit terminal-focus call (issue #358), not
+        // `workspace.focus_handle(cx).focus(...)`: `WorkspaceView::focus_handle`
+        // is now the workspace's own stable root anchor rather than a
+        // delegation to the terminal (`docs/spec-visibility-rail-focus.md`,
+        // issue #847) — using it here would silently focus that anchor
+        // instead and regress #358's "terminal focused by default".
+        let workspace_for_focus = workspace.clone();
         window.defer(cx, move |window, cx| {
-            focus_handle.focus(window, cx);
+            workspace_for_focus.update(cx, |workspace, cx| {
+                workspace.focus_terminal(window, cx);
+            });
         });
         self.screen = ScreenState::Workspace(workspace);
         cx.notify();
