@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,8 +18,9 @@ use rift_explorer::{Change, Entry, GitStatus, Snapshot, Watcher};
 use rift_lsp::{DocumentChange, DocumentSelector};
 use rift_protocol::{
     encode_frame, BufferErrorReason, ClientMessage, DaemonMessage, Diagnostic, EntryKind,
-    FrameDecoder, LspServerState, NavRequestId, WorktreeEntry, PROTOCOL_VERSION,
+    FrameDecoder, LoadAverage, LspServerState, NavRequestId, WorktreeEntry, PROTOCOL_VERSION,
 };
+use sysinfo::System;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
@@ -252,6 +253,20 @@ const NAV_REPLY_CAPACITY: usize = 32;
 /// single `CloneResult` to. A clone is an operator-paced, rare action (unlike
 /// terminal or nav traffic), so a small buffer is ample.
 const CLONE_REPLY_CAPACITY: usize = 8;
+
+/// Sampling cadence for the daemon-global host-resource sampler
+/// (`docs/spec-host-telemetry.md`, [`HostMetricsBus`]): a compile-time
+/// constant (no settings surface yet). Frugal on the shared host and close to
+/// `htop`'s default. `sysinfo`'s CPU percentage needs only two samples spaced
+/// at least `sysinfo::MINIMUM_CPU_UPDATE_INTERVAL` apart (200 ms on Linux),
+/// well under this.
+const HOST_METRICS_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Broadcast backlog for the daemon-global host-metrics bus
+/// ([`HostMetricsBus::events`]). One sample per tick and a single message
+/// kind — unlike the per-context `events` bus this is never asked to carry a
+/// burst, so a handful of slots is ample.
+const HOST_METRICS_EVENT_CAPACITY: usize = 4;
 
 /// Queue depth for worktree events flowing from the blocking worker into the
 /// dispatch loop. Bounds how far the worker may run ahead while the loop is busy.
@@ -1010,6 +1025,21 @@ impl NavStaleGate {
 /// exactly as before #737; only a root a resolved `Attach` actually names is
 /// tracked and released by this connection itself.
 ///
+/// A connection's private handle onto the daemon-global host-metrics bus
+/// ([`HostMetricsBus`], `docs/spec-host-telemetry.md`) — threaded into
+/// [`serve_connection`] alongside its per-context `events`/`state` handles,
+/// but unlike those this one is the SAME daemon-wide signal for every
+/// connection, not a per-root one. `events` is this connection's own
+/// subscription, drained in an added `select!` branch exactly like the
+/// per-context `events` bus; `latest` is read once, synchronously, in the
+/// `Hello` arm to replay the cached sample right after `write_snapshot`, so a
+/// (re)attaching client sees current host state without waiting for the next
+/// tick.
+struct HostMetricsHandles {
+    events: broadcast::Receiver<DaemonMessage>,
+    latest: watch::Receiver<Option<DaemonMessage>>,
+}
+
 /// Returns once the reader reaches EOF, the dispatch loop is gone, or the
 /// event bus closes.
 #[allow(clippy::too_many_arguments)]
@@ -1023,6 +1053,7 @@ async fn serve_connection<R, W>(
     tmux_server: Option<String>,
     root: Option<PathBuf>,
     context_map: Option<Arc<ContextMap>>,
+    mut host_metrics: HostMetricsHandles,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -1181,6 +1212,20 @@ where
                             // `state` branch delivers it once it lands.
                             if !snapshot_sent {
                                 snapshot_sent = write_snapshot(&mut writer, &state).await?;
+                            }
+                            // Replay the daemon-global host-metrics sample the
+                            // same way (`docs/spec-host-telemetry.md`): unlike
+                            // the per-context snapshot above this is a single
+                            // message, not a scan result, so there is nothing
+                            // to gate on completion — just write it if the
+                            // sampler has produced one yet. The borrow is
+                            // released (cloned out) before any `await`, same
+                            // discipline as `write_snapshot`.
+                            let sample = host_metrics.latest.borrow().clone();
+                            if let Some(sample) = sample {
+                                let frame = encode_frame(&sample)?;
+                                writer.write_all(&frame).await?;
+                                writer.flush().await?;
                             }
                         }
                         // The source-control write ops (#544, hunk staging #545)
@@ -1347,6 +1392,39 @@ where
                             snapshot_sent = write_snapshot(&mut writer, &state).await?;
                         }
                     }
+                    Err(broadcast::error::RecvError::Closed) => break 'serve,
+                }
+            }
+            // The daemon-global host-metrics bus (`docs/spec-host-telemetry.md`,
+            // `HostMetricsBus`), drained alongside the per-context `events` bus
+            // above but from a SEPARATE subscription — a daemon-wide signal
+            // every connection sees, not a per-root one.
+            host_metrics_event = host_metrics.events.recv() => {
+                match host_metrics_event {
+                    Ok(msg) => {
+                        // Same discipline as the per-context `events` branch:
+                        // pre-handshake traffic is dropped, never written — a
+                        // fresh client sees the current sample via the
+                        // `Hello`-replay above instead.
+                        if !handshaken {
+                            continue;
+                        }
+                        let frame = encode_frame(&msg)?;
+                        writer.write_all(&frame).await?;
+                        writer.flush().await?;
+                    }
+                    // Unlike the per-context bus, this one only ever carries
+                    // one message kind (the latest `HostMetrics` sample), so a
+                    // lagged reader has nothing to resync via a snapshot
+                    // replay — the next tick (within `HOST_METRICS_INTERVAL`)
+                    // converges the client on its own.
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "host metrics bus lagged; next tick converges");
+                    }
+                    // The bus's sender is the sampler task, daemon-process
+                    // lifetime in production; it closing means the process is
+                    // going down, so end this connection like the per-context
+                    // bus closing.
                     Err(broadcast::error::RecvError::Closed) => break 'serve,
                 }
             }
@@ -1858,6 +1936,138 @@ async fn reroot_connection(
     true
 }
 
+/// Daemon-process-level host-telemetry bus (`docs/spec-host-telemetry.md`).
+///
+/// Unlike every per-context [`Handles`]/[`Core`] pair (one per project-root
+/// [`Context`]), host CPU/RAM/swap/load is a property of the MACHINE, not of
+/// any root — so this lives one level above: built once by [`serve`] /
+/// [`serve_uds`] and shared by every connection they hand off to
+/// [`serve_connection`], never duplicated per context (the central design
+/// decision, see the spec's Prior decisions table). `events` fans the
+/// sampler's ticks out to every connection; `latest` caches the most recent
+/// sample for the `Hello`-replay path (mirroring [`write_snapshot`]'s
+/// per-context replay, but for a daemon-global signal); `connections` is the
+/// sampler's explicit gate — an atomic counter [`serve_uds`]'s accept loop
+/// increments/decrements around each connection's task, INDEPENDENT of
+/// [`KeepWarmEvent`] (per-context, `mpsc`-consumed only by the rooted
+/// keep-warm supervisor, and absent entirely on the rootless `Standalone`
+/// path, so it cannot serve as a process-global gate here).
+#[derive(Clone)]
+struct HostMetricsBus {
+    events: broadcast::Sender<DaemonMessage>,
+    latest_tx: watch::Sender<Option<DaemonMessage>>,
+    latest_rx: watch::Receiver<Option<DaemonMessage>>,
+    connections: Arc<AtomicUsize>,
+}
+
+impl HostMetricsBus {
+    /// A fresh bus with no cached sample and zero connections (the sampler
+    /// polls nothing until a caller raises `connections` above zero).
+    fn new() -> Self {
+        let (events, _events_rx) = broadcast::channel(HOST_METRICS_EVENT_CAPACITY);
+        let (latest_tx, latest_rx) = watch::channel(None);
+        Self {
+            events,
+            latest_tx,
+            latest_rx,
+            connections: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// This connection's private handle: a fresh subscription onto `events`
+    /// plus a clone of the replay watch, threaded into [`serve_connection`].
+    fn handles(&self) -> HostMetricsHandles {
+        HostMetricsHandles {
+            events: self.events.subscribe(),
+            latest: self.latest_rx.clone(),
+        }
+    }
+}
+
+/// The daemon-global `/proc` sampler task (`docs/spec-host-telemetry.md`).
+///
+/// Holds one persistent [`sysinfo::System`], primed with an initial refresh,
+/// then refreshed every [`HOST_METRICS_INTERVAL`] under `spawn_blocking` (a
+/// `/proc` read) and pushed onto `bus.events` / `bus.latest_tx` — but only
+/// while `bus.connections` reads above zero; with zero connections the tick
+/// is a no-op, so an idle daemon polls `/proc` for nothing. Runs until its
+/// spawning task is dropped/aborted: [`serve_uds`] spawns it detached for the
+/// daemon process's whole lifetime (matching [`keep_warm_supervisor`]'s own
+/// spawn-and-forget); [`serve`] aborts its `JoinHandle` when the one
+/// connection it drives ends.
+///
+/// `sysinfo`'s CPU percentage needs two samples spaced at least
+/// `sysinfo::MINIMUM_CPU_UPDATE_INTERVAL` apart (200 ms on Linux, well under
+/// this interval) — priming with one refresh here before the loop starts
+/// means only the FIRST emitted sample may still carry `cpu = 0`; it settles
+/// on the following tick (`docs/spec-host-telemetry.md`, Risks table).
+async fn host_metrics_sampler(bus: HostMetricsBus) {
+    let mut system = match tokio::task::spawn_blocking(System::new_all).await {
+        Ok(system) => system,
+        Err(err) => {
+            error!(%err, "host metrics: priming refresh panicked; sampler not started");
+            return;
+        }
+    };
+
+    let mut interval = tokio::time::interval(HOST_METRICS_INTERVAL);
+    // The first `tick()` fires immediately; consume it here so the loop
+    // below's first refresh happens one full interval after priming.
+    interval.tick().await;
+
+    loop {
+        interval.tick().await;
+        if bus.connections.load(Ordering::Relaxed) == 0 {
+            continue;
+        }
+
+        let refreshed = tokio::task::spawn_blocking(move || {
+            system.refresh_cpu_usage();
+            system.refresh_memory();
+            let message = build_host_metrics_message(&system);
+            (system, message)
+        })
+        .await;
+
+        let (refreshed_system, message) = match refreshed {
+            Ok(pair) => pair,
+            Err(err) => {
+                error!(%err, "host metrics: refresh panicked; sampler stops");
+                return;
+            }
+        };
+        system = refreshed_system;
+
+        let _ = bus.latest_tx.send(Some(message.clone()));
+        let _ = bus.events.send(message);
+    }
+}
+
+/// Build one `DaemonMessage::HostMetrics` sample from `system`'s CURRENT
+/// state (`docs/spec-host-telemetry.md`). Callers refresh `system`
+/// (`refresh_cpu_usage` + `refresh_memory`) immediately before calling this —
+/// kept as a pure builder, separate from [`host_metrics_sampler`]'s own
+/// `/proc`-reading side effects, so it is testable without spawning a task or
+/// waiting on the sampling interval. `System::load_average()` is a Unix
+/// concept read fresh from `/proc/loadavg` on every call (an associated
+/// function, not tied to `system`'s own refresh cycle).
+fn build_host_metrics_message(system: &System) -> DaemonMessage {
+    let load = System::load_average();
+    DaemonMessage::HostMetrics {
+        cpu: system.global_cpu_usage(),
+        mem_total: system.total_memory(),
+        mem_available: system.available_memory(),
+        swap_total: system.total_swap(),
+        swap_used: system.used_swap(),
+        load: LoadAverage {
+            one: load.one,
+            five: load.five,
+            fifteen: load.fifteen,
+        },
+        cpu_count: system.cpus().len() as u32,
+    }
+}
+
 /// Run a daemon over a single byte-stream transport until either side closes.
 ///
 /// Spins up a dispatch loop, serves exactly one connection over `reader`/
@@ -1881,7 +2091,16 @@ where
     // resolve a DIFFERENT session root mid-connection (a reconnect that picks
     // another session) and re-root against this same registry.
     let context_map = Arc::new(ContextMap::new());
-    match worktree_root {
+
+    // Host telemetry (`docs/spec-host-telemetry.md`) is daemon-global, not
+    // per-context (`HostMetricsBus`); `serve` drives exactly one connection
+    // for its whole lifetime, so — unlike `serve_uds`'s accept-loop counter —
+    // the gate is simply seeded to 1 once and never touched again.
+    let host_metrics_bus = HostMetricsBus::new();
+    host_metrics_bus.connections.store(1, Ordering::Relaxed);
+    let host_metrics_task = tokio::spawn(host_metrics_sampler(host_metrics_bus.clone()));
+
+    let result = match worktree_root {
         Some(root) => {
             // Acquires the one root's context up front, exactly like the
             // pre-context-map code did, and releases it below once that
@@ -1919,6 +2138,7 @@ where
                 None,
                 Some(root),
                 Some(context_map.clone()),
+                host_metrics_bus.handles(),
             )
             .await;
             // `serve_connection` dropped its `inbound` clone on return, making
@@ -1951,6 +2171,7 @@ where
                 None,
                 None,
                 Some(context_map.clone()),
+                host_metrics_bus.handles(),
             )
             .await;
             // `serve_connection` dropped its `inbound` clone on return, so the
@@ -1958,7 +2179,13 @@ where
             dispatch.await?;
             result
         }
-    }
+    };
+    // The one connection this function drove has ended; nothing is left to
+    // read `host_metrics_bus`'s sampler, so stop it rather than leak an
+    // interval task per `serve` call (production runs `serve` once per
+    // process — stdio mode — but tests call it many times).
+    host_metrics_task.abort();
+    result
 }
 
 /// Derive the pidfile path for a daemon socket: the socket path with a `.pid`
@@ -2060,6 +2287,15 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
     // against the SAME registry, without disturbing the primary reference
     // below.
     let context_map = Arc::new(ContextMap::new());
+
+    // The daemon-global host-metrics sampler (`docs/spec-host-telemetry.md`):
+    // one `HostMetricsBus` for the whole process, spawned detached like
+    // `keep_warm_supervisor` below — it outlives every individual connection.
+    // `connections` starts at zero and is gated by the accept loop below,
+    // independent of `KeepWarmEvent` (see `HostMetricsBus`'s doc).
+    let host_metrics_bus = HostMetricsBus::new();
+    tokio::spawn(host_metrics_sampler(host_metrics_bus.clone()));
+
     let connection_root = worktree_root.clone();
     let primary = match worktree_root {
         // Canonicalized for the SAME reason as `serve`'s keep-warm acquire
@@ -2133,6 +2369,14 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
         let nav_requests = context.nav_requests.clone();
         let root = connection_root.clone();
         let context_map = Arc::clone(&context_map);
+        let host_metrics = host_metrics_bus.handles();
+        // The explicit process-global connection counter
+        // (`docs/spec-host-telemetry.md`): incremented before the connection
+        // task is spawned, decremented in that task's own cleanup below, so
+        // the sampler's gate (`HostMetricsBus::connections`) is exact —
+        // never zero while at least one `serve_connection` is running.
+        host_metrics_bus.connections.fetch_add(1, Ordering::Relaxed);
+        let host_metrics_connections = Arc::clone(&host_metrics_bus.connections);
         tokio::spawn(async move {
             if let Err(e) = serve_connection(
                 reader,
@@ -2144,6 +2388,7 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
                 None,
                 root,
                 Some(context_map),
+                host_metrics,
             )
             .await
             {
@@ -2160,6 +2405,7 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
             if let Some(keep_warm_tx) = keep_warm_tx {
                 let _ = keep_warm_tx.send(KeepWarmEvent::Disconnected).await;
             }
+            host_metrics_connections.fetch_sub(1, Ordering::Relaxed);
         });
     }
 }
@@ -2632,6 +2878,27 @@ mod tests {
         panic!("daemon socket {} never became connectable", path.display());
     }
 
+    /// A [`HostMetricsHandles`] for a test's direct `serve_connection` call,
+    /// paired with the `broadcast::Sender` that must stay alive for the
+    /// duration of the test: dropping it would close `events`, and this
+    /// connection's `select!` branch treats a closed host-metrics bus as
+    /// fatal (`break 'serve`, mirroring the per-context `events` bus) exactly
+    /// like production would if the daemon-global sampler ever went away —
+    /// so an unrelated test that never exercises host metrics must still keep
+    /// the sender bound (even to a `_`-prefixed name) rather than let it drop
+    /// immediately.
+    fn test_host_metrics_handles() -> (broadcast::Sender<DaemonMessage>, HostMetricsHandles) {
+        let (tx, rx) = broadcast::channel(HOST_METRICS_EVENT_CAPACITY);
+        let (_latest_tx, latest_rx) = watch::channel(None);
+        (
+            tx,
+            HostMetricsHandles {
+                events: rx,
+                latest: latest_rx,
+            },
+        )
+    }
+
     /// Read one framed `DaemonMessage` from `reader`, reassembling across reads.
     ///
     /// The decoder is caller-owned and must live for the whole connection: one
@@ -2713,6 +2980,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (mut client_reader, mut client_writer) = tokio::io::split(client);
         let (server_reader, server_writer) = tokio::io::split(server);
+        let (_host_metrics_tx, host_metrics) = test_host_metrics_handles();
         let conn = tokio::spawn(async move {
             serve_connection(
                 server_reader,
@@ -2724,6 +2992,7 @@ mod tests {
                 None,
                 None,
                 None,
+                host_metrics,
             )
             .await
         });
@@ -2772,6 +3041,7 @@ mod tests {
         let (healthy, healthy_srv) = tokio::io::duplex(64 * 1024);
         let (mut healthy_reader, mut healthy_writer) = tokio::io::split(healthy);
         let (healthy_srv_reader, healthy_srv_writer) = tokio::io::split(healthy_srv);
+        let (_healthy_host_metrics_tx, healthy_host_metrics) = test_host_metrics_handles();
         let healthy_conn = tokio::spawn({
             let inbound = handles.inbound.clone();
             let events = handles.subscribe();
@@ -2787,6 +3057,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    healthy_host_metrics,
                 )
                 .await
             }
@@ -2810,6 +3081,7 @@ mod tests {
         let (bad, bad_srv) = tokio::io::duplex(64 * 1024);
         let (mut bad_reader, mut bad_writer) = tokio::io::split(bad);
         let (bad_srv_reader, bad_srv_writer) = tokio::io::split(bad_srv);
+        let (_bad_host_metrics_tx, bad_host_metrics) = test_host_metrics_handles();
         let bad_conn = tokio::spawn({
             let inbound = handles.inbound.clone();
             let events = handles.subscribe();
@@ -2825,6 +3097,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    bad_host_metrics,
                 )
                 .await
             }
@@ -2941,6 +3214,125 @@ mod tests {
 
         server.abort();
         let _ = tokio::fs::remove_file(&sock).await;
+    }
+
+    /// `docs/spec-host-telemetry.md`: a real `sysinfo::System` refresh
+    /// produces a plausible host sample — `mem_total` positive, `cpu` a
+    /// percentage, `cpu_count` at least one core, and every load-average
+    /// field present. Pure and fast (no sampler task, no waiting on
+    /// `HOST_METRICS_INTERVAL`): exercises `build_host_metrics_message`
+    /// directly, the same builder `host_metrics_sampler` calls each tick.
+    #[test]
+    fn test_build_host_metrics_message_produces_plausible_sample() {
+        let mut system = System::new_all();
+        system.refresh_cpu_usage();
+        system.refresh_memory();
+
+        match build_host_metrics_message(&system) {
+            DaemonMessage::HostMetrics {
+                cpu,
+                mem_total,
+                mem_available,
+                swap_total: _,
+                swap_used: _,
+                load,
+                cpu_count,
+            } => {
+                assert!(mem_total > 0, "a real host always reports total memory");
+                assert!(
+                    mem_available <= mem_total,
+                    "available memory cannot exceed total: {mem_available} > {mem_total}"
+                );
+                assert!(
+                    (0.0..=100.0).contains(&cpu),
+                    "cpu must be a 0..=100 percentage, got {cpu}"
+                );
+                assert!(cpu_count >= 1, "a real host reports at least one core");
+                assert!(load.one >= 0.0 && load.five >= 0.0 && load.fifteen >= 0.0);
+            }
+            other => panic!("expected HostMetrics, got {other:?}"),
+        }
+    }
+
+    /// `docs/spec-host-telemetry.md`: on `Hello`, a connection replays the
+    /// daemon-global bus's CACHED latest sample right behind the handshake
+    /// (and the — here absent — worktree snapshot), so a (re)attaching client
+    /// sees current host state without waiting for the next sampler tick.
+    /// Seeds `HostMetricsHandles::latest` directly rather than running the
+    /// real 2-second-interval sampler, so the test is deterministic and fast.
+    #[tokio::test]
+    async fn test_serve_connection_hello_replays_cached_host_metrics_sample() {
+        let (daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
+        let dispatch = tokio::spawn(daemon.run());
+
+        let sample = DaemonMessage::HostMetrics {
+            cpu: 12.5,
+            mem_total: 16_000_000_000,
+            mem_available: 8_000_000_000,
+            swap_total: 2_000_000_000,
+            swap_used: 0,
+            load: LoadAverage {
+                one: 0.1,
+                five: 0.2,
+                fifteen: 0.3,
+            },
+            cpu_count: 8,
+        };
+        let (_host_metrics_tx, host_metrics_events) =
+            broadcast::channel(HOST_METRICS_EVENT_CAPACITY);
+        let (host_metrics_latest_tx, host_metrics_latest) = watch::channel(None);
+        host_metrics_latest_tx
+            .send(Some(sample.clone()))
+            .expect("watch has a receiver");
+        let host_metrics = HostMetricsHandles {
+            events: host_metrics_events,
+            latest: host_metrics_latest,
+        };
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+        let (server_reader, server_writer) = tokio::io::split(server);
+        let conn = tokio::spawn(async move {
+            serve_connection(
+                server_reader,
+                server_writer,
+                handles.inbound.clone(),
+                handles.subscribe(),
+                handles.state.clone(),
+                None,
+                None,
+                None,
+                None,
+                host_metrics,
+            )
+            .await
+        });
+
+        client_writer
+            .write_all(&hello_frame())
+            .await
+            .expect("send Hello");
+        client_writer.flush().await.expect("flush Hello");
+
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(
+            read_daemon_message(&mut client_reader, &mut decoder).await,
+            DaemonMessage::Welcome {
+                version: PROTOCOL_VERSION,
+            }
+        );
+        // No worktree root was given, so `write_snapshot` writes nothing; the
+        // very next frame is the replayed host-metrics sample.
+        assert_eq!(
+            read_daemon_message(&mut client_reader, &mut decoder).await,
+            sample,
+            "the cached host-metrics sample must replay right behind the handshake"
+        );
+
+        drop(client_writer);
+        drop(client_reader);
+        conn.abort();
+        dispatch.abort();
     }
 
     #[tokio::test]
@@ -3258,6 +3650,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(8 * 1024);
         let (mut client_reader, mut client_writer) = tokio::io::split(client);
         let (server_reader, server_writer) = tokio::io::split(server);
+        let (_host_metrics_tx, host_metrics) = test_host_metrics_handles();
         let conn = tokio::spawn(async move {
             let _ = serve_connection(
                 server_reader,
@@ -3269,6 +3662,7 @@ mod tests {
                 None,
                 None,
                 None,
+                host_metrics,
             )
             .await;
         });
@@ -3309,6 +3703,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (mut client_reader, mut client_writer) = tokio::io::split(client);
         let (server_reader, server_writer) = tokio::io::split(server);
+        let (_host_metrics_tx, host_metrics) = test_host_metrics_handles();
         let conn = tokio::spawn(async move {
             let _ = serve_connection(
                 server_reader,
@@ -3320,6 +3715,7 @@ mod tests {
                 None,
                 None,
                 None,
+                host_metrics,
             )
             .await;
         });
@@ -3401,6 +3797,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(256);
         let (mut client_reader, mut client_writer) = tokio::io::split(client);
         let (server_reader, server_writer) = tokio::io::split(server);
+        let (_host_metrics_tx, host_metrics) = test_host_metrics_handles();
         let conn = tokio::spawn(async move {
             let _ = serve_connection(
                 server_reader,
@@ -3412,6 +3809,7 @@ mod tests {
                 None,
                 None,
                 None,
+                host_metrics,
             )
             .await;
         });
@@ -3556,6 +3954,7 @@ mod tests {
         let (mut client_reader, mut client_writer) = tokio::io::split(client);
 
         let tmux_name = server.0.clone();
+        let (_host_metrics_tx, host_metrics) = test_host_metrics_handles();
         let conn = tokio::spawn(async move {
             serve_connection(
                 server_reader,
@@ -3567,6 +3966,7 @@ mod tests {
                 Some(tmux_name),
                 None,
                 None,
+                host_metrics,
             )
             .await
         });
@@ -3690,6 +4090,7 @@ mod tests {
         let (mut client_reader, mut client_writer) = tokio::io::split(client);
 
         let tmux_name = server.0.clone();
+        let (_host_metrics_tx, host_metrics) = test_host_metrics_handles();
         let conn = tokio::spawn(async move {
             serve_connection(
                 server_reader,
@@ -3701,6 +4102,7 @@ mod tests {
                 Some(tmux_name),
                 None,
                 Some(context_map),
+                host_metrics,
             )
             .await
         });
@@ -4238,17 +4640,31 @@ mod tests {
         assert!(lsp_status_snapshot_messages(&BTreeMap::new()).is_empty());
     }
 
-    /// Drain framed messages off a connection until no message arrives within
-    /// `settle`, returning all collected. Tolerates ordering/duplicates (the
-    /// per-connection replay and the bus broadcast can both deliver git state).
+    /// Drain framed messages off a connection until no WORKTREE/GIT message
+    /// arrives within `settle`, returning all collected (including any
+    /// interleaved `HostMetrics`). Tolerates ordering/duplicates (the
+    /// per-connection replay and the bus broadcast can both deliver git
+    /// state).
+    ///
+    /// A `HostMetrics` frame does NOT push the settle deadline back
+    /// (`docs/spec-host-telemetry.md`): it is a daemon-global heartbeat that
+    /// keeps arriving every `HOST_METRICS_INTERVAL` for as long as this
+    /// connection (`serve_uds`, real socket) stays open, independent of
+    /// worktree/git activity — resetting on it too would mean "quiet" never
+    /// arrives once the sampler starts ticking, hanging this helper forever.
     async fn drain_messages<R: AsyncRead + Unpin>(
         reader: &mut R,
         decoder: &mut FrameDecoder,
         settle: Duration,
     ) -> Vec<DaemonMessage> {
         let mut msgs = Vec::new();
-        while let Ok(msg) = tokio::time::timeout(settle, read_daemon_message(reader, decoder)).await
+        let mut deadline = tokio::time::Instant::now() + settle;
+        while let Ok(msg) =
+            tokio::time::timeout_at(deadline, read_daemon_message(reader, decoder)).await
         {
+            if !matches!(msg, DaemonMessage::HostMetrics { .. }) {
+                deadline = tokio::time::Instant::now() + settle;
+            }
             msgs.push(msg);
         }
         msgs
@@ -4552,6 +4968,12 @@ mod tests {
         let (client_a, server_a) = tokio::io::duplex(64 * 1024);
         let (mut ca_reader, mut ca_writer) = tokio::io::split(client_a);
         let (sa_reader, sa_writer) = tokio::io::split(server_a);
+        // Declared OUTSIDE the block below (not moved into the
+        // spawned future): the sender must outlive the whole test, not
+        // just the block's own evaluation, or it drops the instant
+        // `_conn_a` is bound and `host_metrics.events.recv()`
+        // observes `Closed` on the connection's very first `select!` poll.
+        let (_host_metrics_tx_a, host_metrics_a) = test_host_metrics_handles();
         let _conn_a = {
             let (inbound, events, state, nav) = (
                 handles.inbound.clone(),
@@ -4570,6 +4992,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    host_metrics_a,
                 )
                 .await
             })
@@ -4578,6 +5001,12 @@ mod tests {
         let (client_b, server_b) = tokio::io::duplex(64 * 1024);
         let (mut cb_reader, mut cb_writer) = tokio::io::split(client_b);
         let (sb_reader, sb_writer) = tokio::io::split(server_b);
+        // Declared OUTSIDE the block below (not moved into the
+        // spawned future): the sender must outlive the whole test, not
+        // just the block's own evaluation, or it drops the instant
+        // `_conn_b` is bound and `host_metrics.events.recv()`
+        // observes `Closed` on the connection's very first `select!` poll.
+        let (_host_metrics_tx_b, host_metrics_b) = test_host_metrics_handles();
         let _conn_b = {
             let (inbound, events, state, nav) = (
                 handles.inbound.clone(),
@@ -4596,6 +5025,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    host_metrics_b,
                 )
                 .await
             })
@@ -4685,6 +5115,12 @@ mod tests {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (mut c_reader, mut c_writer) = tokio::io::split(client);
         let (s_reader, s_writer) = tokio::io::split(server);
+        // Declared OUTSIDE the block below (not moved into the
+        // spawned future): the sender must outlive the whole test, not
+        // just the block's own evaluation, or it drops the instant
+        // `_conn` is bound and `host_metrics.events.recv()`
+        // observes `Closed` on the connection's very first `select!` poll.
+        let (_host_metrics_tx_a, host_metrics_a) = test_host_metrics_handles();
         let _conn = {
             let (inbound, events, state) = (
                 handles.inbound.clone(),
@@ -4702,6 +5138,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    host_metrics_a,
                 )
                 .await
             })
@@ -4765,6 +5202,12 @@ mod tests {
         let (client_a, server_a) = tokio::io::duplex(64 * 1024);
         let (mut ca_reader, mut ca_writer) = tokio::io::split(client_a);
         let (sa_reader, sa_writer) = tokio::io::split(server_a);
+        // Declared OUTSIDE the block below (not moved into the
+        // spawned future): the sender must outlive the whole test, not
+        // just the block's own evaluation, or it drops the instant
+        // `_conn_a` is bound and `host_metrics.events.recv()`
+        // observes `Closed` on the connection's very first `select!` poll.
+        let (_host_metrics_tx_a, host_metrics_a) = test_host_metrics_handles();
         let _conn_a = {
             let (inbound, events, state, nav) = (
                 handles.inbound.clone(),
@@ -4783,6 +5226,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    host_metrics_a,
                 )
                 .await
             })
@@ -4791,6 +5235,12 @@ mod tests {
         let (client_b, server_b) = tokio::io::duplex(64 * 1024);
         let (mut cb_reader, mut cb_writer) = tokio::io::split(client_b);
         let (sb_reader, sb_writer) = tokio::io::split(server_b);
+        // Declared OUTSIDE the block below (not moved into the
+        // spawned future): the sender must outlive the whole test, not
+        // just the block's own evaluation, or it drops the instant
+        // `_conn_b` is bound and `host_metrics.events.recv()`
+        // observes `Closed` on the connection's very first `select!` poll.
+        let (_host_metrics_tx_b, host_metrics_b) = test_host_metrics_handles();
         let _conn_b = {
             let (inbound, events, state, nav) = (
                 handles.inbound.clone(),
@@ -4809,6 +5259,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    host_metrics_b,
                 )
                 .await
             })
