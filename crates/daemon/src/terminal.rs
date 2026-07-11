@@ -293,6 +293,23 @@ async fn open_attach(
     }
 }
 
+/// Build a `tokio::process::Command` for `tmux`, forcing `LC_ALL=C.UTF-8`
+/// (`docs/spec-tmux-locale.md`): on a target whose default locale is
+/// non-UTF-8 (C/POSIX), tmux sanitizes the non-printable TAB in its
+/// format-string output (`LAYOUT_QUERY`, `SESSION_LIST_QUERY`, `ROOT_QUERY`) to
+/// `_`, corrupting the daemon's tab-separated parse. `LC_ALL` is the strongest
+/// locale override and `C.UTF-8` is portable (musl and glibc 2.35+), so this
+/// forces tmux to preserve the tab regardless of the host's own `LANG`/`LC_*`.
+/// The single seam every daemon tmux spawn goes through — mirrors
+/// `clone.rs::spawn_and_run`'s `LC_ALL=C` on the git clone (opposite locale,
+/// same mechanism: C there for git's stable English text, C.UTF-8 here for
+/// tmux's byte-preserving format output).
+fn tmux_command() -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("tmux");
+    command.env("LC_ALL", "C.UTF-8");
+    command
+}
+
 /// Answer a pre-attach [`ClientMessage::QuerySessionList`] (#757) with a one-off
 /// `tmux list-sessions`, independent of the control-mode attach path
 /// ([`Attach::send_command`]), which does not exist until a session is attached.
@@ -307,7 +324,7 @@ async fn query_session_list_detached(
     server_socket: Option<&str>,
     outbound: &mpsc::Sender<DaemonMessage>,
 ) {
-    let mut command = tokio::process::Command::new("tmux");
+    let mut command = tmux_command();
     if let Some(socket) = server_socket {
         command.args(["-L", socket]);
     }
@@ -537,7 +554,7 @@ impl Attach {
         server_socket: Option<&str>,
         root: Option<&Path>,
     ) -> anyhow::Result<Self> {
-        let mut command = tokio::process::Command::new("tmux");
+        let mut command = tmux_command();
         command
             .args(spawn_args(&session, server_socket, root))
             .stdin(Stdio::piped())
@@ -1264,6 +1281,17 @@ mod tests {
                 "/proj"
             ]
         );
+    }
+
+    #[test]
+    fn test_tmux_command_sets_utf8_locale_env() {
+        use std::ffi::OsStr;
+
+        let command = tmux_command();
+        let mut envs = command.as_std().get_envs();
+        assert!(envs.any(
+            |(key, value)| key == OsStr::new("LC_ALL") && value == Some(OsStr::new("C.UTF-8"))
+        ));
     }
 
     #[test]
