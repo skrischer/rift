@@ -86,8 +86,13 @@ natural home for the seed-fallback so both inherit it.
   `current_path` is still empty (the seed browse) **and** the errored `path`
   (echoed by the daemon) is non-empty, clear the error, set `loading`, and emit
   `RootPickerEvent::Browse(String::new())` to re-seed at `$HOME` instead of
-  rendering the dead-end. Bounded: an errored `""` retry (or an error while
-  `current_path` is still empty on the second pass) renders inline — no loop.
+  rendering the dead-end. Bounded by an **explicit once-flag on the view** (a
+  `seed_fallback_attempted` bool, cleared when a fresh picker/browse cycle
+  starts): the fallback fires at most once, so a re-error — **including the
+  `$HOME` retry itself, whose reply echoes the resolved non-empty `$HOME` path**
+  — renders inline rather than looping. The bound must NOT rest on the errored
+  path being empty (a `""` browse resolves to a non-empty `$HOME`, so that
+  condition never holds on the retry).
   `start_path` stays the pure "first recent root, else empty" over a slice (now
   fed the per-host slice). Both owners already forward `RootPickerEvent::Browse`
   to the daemon, so this single view change covers both pickers.
@@ -102,7 +107,9 @@ natural home for the seed-fallback so both inherit it.
   site (`:2115`) get the same host-scoped seed + record. `WorkspaceView::new`
   (`:637`, constructed at `main.rs:1094`) currently takes only
   `window_state_path`; thread in the `recents_path` + the connection identity so
-  the in-cockpit picker can seed and record per host.
+  the in-cockpit picker can seed and record per host. Add them as `Option` params
+  so the existing `WorkspaceView::new(..., None, ...)` test call sites stay valid
+  (identity absent → seed `""`, record no-op).
 
 ### Out of scope
 
@@ -189,7 +196,7 @@ natural home for the seed-fallback so both inherit it.
 | **Seed** from the current target's `recent_roots.first()`, else `""` (→ `$HOME`) | A per-host seed offers only roots valid on this host; `$HOME` is always valid there. Both owners have the identity available at launch. | 2026-07-11 |
 | **Remove** the flat `window_state.recent_roots`; drop old values (no migration) | A channel-global root list has no host to attribute its entries to; the field is the bug. Tolerant serde load ignores the now-absent field, so old state files load unchanged. | 2026-07-11 |
 | `record` **merges/preserves** roots (never clobbers) | Connection recording (session refresh) runs on every connect, before a root is picked; a fresh entry from the identity carries no roots, so `record` must carry over the existing entry's roots or reconnecting wipes them. | 2026-07-11 |
-| The fallback is bounded (once) and seed-scoped | A `""`/`$HOME` retry that itself errors renders inline (no re-fallback → no loop); a resolved-level (`current_path` non-empty) navigation error keeps today's inline-error-with-breadcrumb behavior. | 2026-07-11 |
+| The fallback is bounded by an explicit once-flag, and seed-scoped | An explicit `seed_fallback_attempted` flag on the view caps the fallback at a single re-browse; the `$HOME` retry's reply echoes the resolved non-empty path, so the bound must not rest on "errored path empty". A resolved-level (`current_path` non-empty) navigation error keeps today's inline-error-with-breadcrumb behavior. | 2026-07-11 |
 | Split into **two issues, one spec** | Acceptance-gate, human-chosen. Issue A = the seed-`NotFound` → `$HOME` fallback (shared-view change, `root_picker.rs` only, covers both owners, independent). Issue B = host-scope the roots + remove the flat store, across both owners. Disjoint code regions; both unblocked; A recommended first. | 2026-07-11 |
 
 ## Tracking
