@@ -15,7 +15,7 @@ pub use frame::{encode_frame, FrameDecoder, FrameError, MAX_FRAME_LEN};
 /// is wire-compatible in one direction. The message set is pinned by the
 /// fingerprint test beside `PROTOCOL_FINGERPRINT` below, so a message-set
 /// change without a bump cannot pass CI.
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// Pinned fingerprint of the protocol message set, checked by the
 /// `fingerprint_tests` module: an FNV-1a hash over the serde-visible surface
@@ -25,7 +25,7 @@ pub const PROTOCOL_VERSION: u32 = 12;
 /// [`PROTOCOL_VERSION`] above and re-pin this value (the failing test prints
 /// the new fingerprint).
 #[cfg(test)]
-const PROTOCOL_FINGERPRINT: u64 = 0x5d2e_d727_84eb_6f0a;
+const PROTOCOL_FINGERPRINT: u64 = 0x0548_0061_525c_804d;
 
 /// Messages the client sends to the daemon.
 ///
@@ -708,6 +708,28 @@ pub enum DaemonMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<FileOpError>,
     },
+    /// A host resource sample, sampled from `/proc` on a fixed daemon-process
+    /// timer via `sysinfo` (`docs/spec-host-telemetry.md`). Unlike every other
+    /// push in this enum, it is **daemon-global, not per-context**: the host's
+    /// CPU/RAM/swap/load are a property of the machine, not of any project
+    /// root, so the daemon samples once regardless of how many contexts are
+    /// attached and pushes the same sample to every connection. `cpu` is the
+    /// aggregate CPU load (0.0-100.0); `mem_total`/`mem_available`/
+    /// `swap_total`/`swap_used` are bytes; `mem_available` is `MemAvailable`
+    /// from `/proc/meminfo`, the basis for "how much RAM is really free".
+    /// Push-only, and replayed once behind [`Welcome`](DaemonMessage::Welcome)
+    /// from the daemon's cached latest sample, so a (re)attaching client sees
+    /// current host state without waiting for the next tick — the same
+    /// precedent as [`LspStatus`](DaemonMessage::LspStatus).
+    HostMetrics {
+        cpu: f32,
+        mem_total: u64,
+        mem_available: u64,
+        swap_total: u64,
+        swap_used: u64,
+        load: LoadAverage,
+        cpu_count: u32,
+    },
     Welcome {
         version: u32,
     },
@@ -933,6 +955,16 @@ pub struct GitStatusEntry {
 pub struct AheadBehind {
     pub ahead: u32,
     pub behind: u32,
+}
+
+/// Host load average over 1/5/15 minutes, carried by
+/// [`DaemonMessage::HostMetrics`] — a Unix concept read from
+/// `/proc/loadavg`. No `Eq`: the fields are `f64`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LoadAverage {
+    pub one: f64,
+    pub five: f64,
+    pub fifteen: f64,
 }
 
 /// One diagnostic a language server reports for a file: a source span plus the
@@ -2115,6 +2147,51 @@ mod tests {
             assert!(
                 serde_json::from_str::<DaemonMessage>(json).is_err(),
                 "malformed LspStatus must not deserialize: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_host_metrics_roundtrip_preserves_full_payload() {
+        let msg = DaemonMessage::HostMetrics {
+            cpu: 42.5,
+            mem_total: 16_000_000_000,
+            mem_available: 4_000_000_000,
+            swap_total: 2_000_000_000,
+            swap_used: 100_000_000,
+            load: LoadAverage {
+                one: 1.5,
+                five: 1.1,
+                fifteen: 0.9,
+            },
+            cpu_count: 8,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize HostMetrics");
+        assert!(json.contains(r#""type":"host_metrics""#));
+        assert!(json.contains(r#""cpu":42.5"#));
+        assert!(json.contains(r#""mem_total":16000000000"#));
+        assert!(json.contains(r#""mem_available":4000000000"#));
+        assert!(json.contains(r#""swap_total":2000000000"#));
+        assert!(json.contains(r#""swap_used":100000000"#));
+        assert!(json.contains(r#""one":1.5"#));
+        assert!(json.contains(r#""five":1.1"#));
+        assert!(json.contains(r#""fifteen":0.9"#));
+        assert!(json.contains(r#""cpu_count":8"#));
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize HostMetrics"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_host_metrics_missing_field_is_rejected() {
+        for json in [
+            r#"{"type":"host_metrics","mem_total":1,"mem_available":1,"swap_total":0,"swap_used":0,"load":{"one":0.0,"five":0.0,"fifteen":0.0},"cpu_count":1}"#,
+            r#"{"type":"host_metrics","cpu":1.0,"mem_total":1,"mem_available":1,"swap_total":0,"swap_used":0,"cpu_count":1}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<DaemonMessage>(json).is_err(),
+                "malformed HostMetrics must not deserialize: {json}"
             );
         }
     }
