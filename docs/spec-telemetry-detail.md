@@ -50,7 +50,13 @@ push, and only the memory breakdown + uptime + disk need new daemon reads.
   disk push keyed to the connection's `@root` mount (if it tracks the **session
   `@root`** filesystem — `@root` is per-connection, #737, so this cannot ride the
   daemon-global `HostMetrics`; it follows the per-connection transport pattern Phase 45
-  established). The gate resolves this **before** the protocol issue is cut.
+  **introduces**, a **sibling phase that is not yet merged**). The gate resolves this
+  **before** the protocol issue is cut. **Cross-phase coupling:** the `@root` branch
+  needs Phase 45's per-connection daemon transport, so if `@root` is chosen the
+  Phase-46 daemon issue either takes a hard `Depends on` edge to Phase 45's daemon
+  issue **or** scopes that per-connection push transport into itself; the daemon-fs
+  branch (two fields fanned on the existing daemon-global bus) needs **no** new
+  transport and no Phase-45 dependency — a point in its favour beyond simplicity.
 - **`crates/daemon` memory breakdown + uptime**: in the existing sampler tick, read
   `Cached` + `Buffers` from `/proc/meminfo` (a small dedicated parse — `sysinfo`
   exposes total / free / available / used but not cached / buffers) and `sysinfo`'s
@@ -60,10 +66,19 @@ push, and only the memory breakdown + uptime + disk need new daemon reads.
   `sysinfo` dep, `["system", "disk"]`); refresh `Disks` on the sampler tick (disk
   usage changes slowly, so the 2 s cadence is ample) and report free / total for the
   chosen filesystem — for `@root`, resolve the mount whose `mount_point` is the longest
-  prefix of the connection's `@root`. Per-connection or daemon-global per the gate.
+  prefix of the connection's **current** resolved root, recomputed each tick so a
+  reroot (`reroot_connection`, #737) is handled automatically, and **emit nothing while
+  the connection has no resolved root** (a rootless / `Standalone` connection has no
+  `@root`, hence no disk figure). Per-connection or daemon-global per the gate.
 - **`crates/app` detail view**: render the memory breakdown + swap + load 1/5/15 +
-  uptime + cores from the pushed sample. Surface (a hover card on the `MEM% · CPU%`
-  indicator vs a section added to the Phase-45 breakdown popover) resolved at the gate.
+  uptime + cores from the pushed sample. Note the app currently **narrows** the wire
+  sample to three fields — the fold loop destructures only `cpu, mem_total,
+  mem_available, ..` (`workspace.rs:1026`) and the app-local `status_bar::HostMetrics`
+  carries only those (`status_bar.rs:47`, whose doc already anticipates this widening);
+  the detail view must widen that struct + the fold to carry `swap_*` / `load` /
+  `cpu_count` and the new breakdown + uptime fields — real client work, not a free read.
+  Surface (a hover card on the `MEM% · CPU%` indicator vs a section added to the
+  Phase-45 breakdown popover) resolved at the gate.
 - **`crates/app` sparkline**: a fixed-length client ring buffer of recent samples
   (MEM% and CPU%), rendered as a small sparkline in the status area / detail view. Pure
   client state fed by the existing host-metrics fold loop; nothing on the wire.
@@ -152,7 +167,8 @@ push, and only the memory breakdown + uptime + disk need new daemon reads.
 | Cached / buffers come from a **small `/proc/meminfo` read**, not `sysinfo` | `sysinfo` exposes total / free / available / used but **not** cached / buffers; a tiny dedicated parse (the same daemon-side `/proc` read pattern as Phase 44's PSI) is warranted. Unlike PSI, `Cached` / `Buffers` are always present on Linux — no file-gating | 2026-07-11 |
 | Disk uses `sysinfo`'s **`disk` feature** (added to the existing dep); disk is sampled on the 2 s tick | `Disks` is behind the `disk` feature (not in today's `["system"]`); a named feature of an approved crate, musl-clean. Disk usage changes slowly, so the host cadence is ample and no separate gating is needed | 2026-07-11 |
 | The disk indicator is **neutral-coloured** (no threshold warning) this phase | Consistent with Phase 43's neutral indicator; a disk-full warning colour is a possible later add (Phase 44 owns memory pressure). Keeps scope bounded | 2026-07-11 |
-| OPEN — the **disk filesystem**: the session `@root` mount (per-connection, tracks the project fs where `target/` lives) vs the daemon's own filesystem (daemon-global, simpler) | resolved at the spec-acceptance gate — accuracy-vs-simplicity; this **sets the disk protocol shape** (per-connection push vs a daemon-global `HostMetrics` field), fixed before the protocol issue is cut. Recommended: `@root` | — |
+| **No foundation-doc change** — disk / uptime / memory-breakdown are all the same host-resource `/proc` signal Phase 43 already admitted | The constitution's third-signal parenthetical ("CPU / memory / swap / load") is illustrative; disk headroom (`/proc/mounts` + `statvfs`) adds no new signal source and is host-global + agent-agnostic, subsumed under "host resource state". Only a deliberate `protocol` extension is needed, no ratification (same reasoning as Phase 45) | 2026-07-11 |
+| OPEN — the **disk filesystem**: the session `@root` mount (per-connection, tracks the project fs where `target/` lives) vs the daemon's own filesystem (daemon-global, simpler) | resolved at the spec-acceptance gate — accuracy-vs-simplicity; this **sets the disk protocol shape** (per-connection push vs a daemon-global `HostMetrics` field), fixed before the protocol issue is cut. `@root` is the more accurate target but rides Phase-45's unmerged per-connection transport (a Phase-45 dependency or in-phase transport work); daemon-fs is daemon-global and Phase-45-independent | — |
 | OPEN — the **detail + sparkline surface**: a hover card on the `MEM% · CPU%` indicator (independent of Phase 45) vs a section added to the Phase-45 breakdown popover (couples to Phase 45) | resolved at the spec-acceptance gate — a UX surface call; the sparkline placement (inline in the status area vs inside the detail) rides this choice | — |
 | The sparkline retention window defaults to **~150 samples (~5 min at 2 s)** as a client constant | Enough to show a trend toward the limit without unbounded memory; tunable later. Not a gate decision — a bakeable default | 2026-07-11 |
 
@@ -166,7 +182,10 @@ under the milestone. This spec owns the design; the issues own progress.
   fields + version bump), `daemon` (meminfo breakdown + uptime + `sysinfo` disk
   feature + disk read), `app` (detail view + sparkline + disk indicator). Dependency
   edges in the issue bodies; the disk-filesystem + surface decisions shape the daemon +
-  app issues.
+  app issues (an `@root` disk choice adds a Phase-45 dependency — see the disk scope).
+  The `app` work **may split per surface** (detail / sparkline / disk) if the combined
+  PR exceeds the ~400-line guideline — each surface lands a complete ingest+render path,
+  so no split reintroduces the Phase-43 written-but-unread dead-code trap.
 
 ## Verification
 
@@ -213,3 +232,15 @@ under the milestone. This spec owns the design; the issues own progress.
   the sparkline is a pure client ring buffer over the existing push. Two open items — the
   disk filesystem (which sets the disk protocol shape) and the detail/sparkline surface
   (hover card vs Phase-45 popover section) — carried to the acceptance gate.
+- 2026-07-11 (spec review — APPROVE, non-blocking folded in): (1) made the `@root` disk
+  branch's dependency on Phase 45's **unmerged** per-connection transport explicit — an
+  `@root` choice adds a Phase-45 daemon edge or in-phase transport work, while daemon-fs
+  is Phase-45-independent (a real point in its favour); (2) noted the app currently
+  narrows the wire sample to three fields, so the detail view must widen
+  `status_bar::HostMetrics` + the fold loop (real client work, not a free read);
+  (3) allowed the app work to split per surface (detail / sparkline / disk) if it
+  exceeds ~400 lines — each lands a complete ingest+render, no dead-code trap; (4) the
+  `@root` disk mount is recomputed per tick from the connection's current resolved root
+  (reroot-safe) and emits nothing while rootless; (5) added an explicit no-foundation
+  decision row (disk is subsumed under the already-admitted host-resource `/proc` signal;
+  the constitution's parenthetical list is illustrative).
