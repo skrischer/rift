@@ -55,9 +55,9 @@ daemon-global CPU/memory/swap/load sample, push-only and `welcome`-replayed
 like `lsp_status` (`docs/spec-host-telemetry.md`); version 12 adds
 `CloneError::GitUnavailable` for a missing host `git` binary, surfaced as a
 distinct actionable clone failure rather than a generic `Other`
-(`docs/spec-clone-repo.md`); version 11 adds the clone channel — `clone_repo` answered by one
+(`docs/archive/spec-clone-repo.md`); version 11 adds the clone channel — `clone_repo` answered by one
 `clone_result` carrying the resolved checkout `path` and an optional typed
-`CloneError` (`docs/spec-clone-repo.md`); version 10 adds the directory-browse channel — `query_dir_entries`
+`CloneError` (`docs/archive/spec-clone-repo.md`); version 10 adds the directory-browse channel — `query_dir_entries`
 answered by one `dir_entries_reply` carrying `DirEntry` children and an
 optional typed `DirBrowseError` — plus a `root: Option<String>` field on
 `attach` (the create-with-root transport) and a `root: Option<String>` field
@@ -706,7 +706,7 @@ before a session is created. Specified by
 The clone channel is the **ninth request/response family in the protocol**,
 backing the root picker's clone-from-URL mode — the cold-start path that
 clones a repo on the daemon host and precedes creating a session rooted at
-the checkout. Specified by `docs/spec-clone-repo.md`.
+the checkout. Specified by `docs/archive/spec-clone-repo.md`.
 
 ```json
 // client → daemon
@@ -718,13 +718,15 @@ the checkout. Specified by `docs/spec-clone-repo.md`.
 
 - `clone_repo` requests a clone of `url` into `<parent>/<name>` — `parent` is
   an absolute host path (the same key space as `query_dir_entries`); `name`
-  is the target directory name under it. The clone runs daemon-side via
-  `gix`, using the host's own git credentials — the client never sends a
-  token.
+  is the target directory name under it. The clone runs daemon-side by
+  **shelling out to the host's `git`** (`git clone`), using the host's own git
+  credentials — the client never sends a token. (The daemon embeds no HTTPS/TLS
+  stack, keeping it pure-Rust/C-free; `docs/archive/spec-clone-repo.md`.)
 - `clone_result` is the **single reply shape**: `path` is the resolved
   `<parent>/<name>` clone target. On failure the checkout is never persisted
   at `path` and `error` is a typed `CloneError` (`invalid_url` /
-  `auth_failed` / `target_exists` / `network` / `other`), present only on
+  `auth_failed` / `target_exists` / `network` / `git_unavailable` / `other`),
+  present only on
   failure (omitted, never `null`, on success) — a **query-reply** shape
   (success = `error` absent), deliberately not the `ok: bool` op-result shape
   of `file_op_result`: a clone returns a path or an error, not an ack.

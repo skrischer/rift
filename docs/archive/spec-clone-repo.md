@@ -1,6 +1,6 @@
 # Spec: Clone-a-repository into a new session
 
-> Status: READY
+> Status: COMPLETED (2026-07-11)
 > Created: 2026-07-10
 
 A "Clone from URL" path in the new-session / root-picker flow: the operator
