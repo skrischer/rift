@@ -272,6 +272,16 @@ pub struct RootPicker {
     /// successful reply. The picker keeps the last good level visible
     /// underneath rather than tearing down.
     error: Option<DirBrowseError>,
+    /// Whether the seed-browse-failed fallback (issue #872,
+    /// `docs/spec-host-scoped-root-recents.md`) has already fired this
+    /// picker's lifetime. `current_path` alone cannot bound the fallback: a
+    /// `""` retry resolves to a non-empty `$HOME`, so the retry's error reply
+    /// still lands with `current_path` empty — without this explicit flag
+    /// the fallback would re-fire on every subsequent seed failure. Cleared
+    /// on the next successful reply (a fresh browse cycle); starts `false`
+    /// per picker instance, since both owners construct a fresh `RootPicker`
+    /// per pick.
+    seed_fallback_attempted: bool,
     /// The session-name field: seeded with the current level's basename on
     /// every successful browse, freely editable from there.
     name_input: Entity<InputState>,
@@ -373,6 +383,7 @@ impl RootPicker {
             entries: Vec::new(),
             loading: false,
             error: None,
+            seed_fallback_attempted: false,
             name_input,
             _name_subscription: subscription,
             focus_handle: cx.focus_handle(),
@@ -417,6 +428,17 @@ impl RootPicker {
     /// last good level and renders `error` inline
     /// (`docs/spec-session-root-picker.md`'s browse-error mitigation — never
     /// tears down).
+    ///
+    /// A failed *seed* browse (`current_path` still empty — no level has
+    /// ever resolved) is a special case (issue #872,
+    /// `docs/spec-host-scoped-root-recents.md`): rather than rendering the
+    /// dead-end empty card (no breadcrumb, Create disabled), it falls back
+    /// once to a `""` ($HOME) re-browse via [`RootPickerEvent::Browse`] — the
+    /// daemon resolves `""` to the host's `$HOME`, which always exists.
+    /// [`Self::seed_fallback_attempted`] bounds this to a single retry (the
+    /// `$HOME` retry itself echoes a non-empty resolved path, so the bound
+    /// cannot rest on the errored path being empty); once it has fired, a
+    /// further seed error renders inline like any other failure.
     pub fn apply_dir_entries_reply(
         &mut self,
         path: String,
@@ -428,11 +450,18 @@ impl RootPicker {
     ) {
         self.loading = false;
         if let Some(error) = error {
+            if self.current_path.is_empty() && !self.seed_fallback_attempted {
+                self.seed_fallback_attempted = true;
+                self.error = None;
+                self.browse(String::new(), cx);
+                return;
+            }
             self.error = Some(error);
             cx.notify();
             return;
         }
         self.error = None;
+        self.seed_fallback_attempted = false;
         self.current_path = path;
         self.parent = parent;
         self.entries = entries;
@@ -1316,6 +1345,142 @@ mod tests {
             );
             assert_eq!(picker.entries.len(), 1);
         });
+    }
+
+    #[gpui::test]
+    fn test_seed_error_reply_falls_back_to_a_home_rebrowse(cx: &mut TestAppContext) {
+        let (picker, window) = build_picker(cx);
+        let events = subscribe_events(&picker, cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                picker.update(cx, |picker, cx| {
+                    picker.browse(String::new(), cx);
+                    picker.apply_dir_entries_reply(
+                        "/home/dev".to_string(),
+                        None,
+                        Vec::new(),
+                        Some(DirBrowseError::NotFound),
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .expect("apply seed error reply");
+
+        cx.update(|cx| {
+            let picker = picker.read(cx);
+            assert!(
+                picker.loading,
+                "the fallback re-enters loading for the $HOME retry"
+            );
+            assert!(
+                picker.error.is_none(),
+                "the fallback clears the error instead of rendering the dead-end"
+            );
+            assert!(picker.current_path.is_empty(), "no level has resolved yet");
+            assert!(picker.seed_fallback_attempted);
+        });
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["browse:", "browse:"],
+            "the seed browse and the $HOME fallback re-browse both request an empty path"
+        );
+    }
+
+    #[gpui::test]
+    fn test_seed_error_reply_second_failure_renders_inline_and_emits_no_further_browse(
+        cx: &mut TestAppContext,
+    ) {
+        let (picker, window) = build_picker(cx);
+        let events = subscribe_events(&picker, cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                picker.update(cx, |picker, cx| {
+                    picker.browse(String::new(), cx);
+                    picker.apply_dir_entries_reply(
+                        "/home/dev".to_string(),
+                        None,
+                        Vec::new(),
+                        Some(DirBrowseError::NotFound),
+                        window,
+                        cx,
+                    );
+                    // The $HOME retry itself fails too, echoing the resolved
+                    // non-empty $HOME path (never the empty request path) —
+                    // the once-flag, not the errored path, must bound this.
+                    picker.apply_dir_entries_reply(
+                        "/home/dev".to_string(),
+                        None,
+                        Vec::new(),
+                        Some(DirBrowseError::NotFound),
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .expect("apply seed and retry error replies");
+
+        cx.update(|cx| {
+            let picker = picker.read(cx);
+            assert!(!picker.loading);
+            assert_eq!(picker.error, Some(DirBrowseError::NotFound));
+            assert!(
+                picker.current_path.is_empty(),
+                "still no level has ever resolved"
+            );
+        });
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["browse:", "browse:"],
+            "the once-flag suppresses a second fallback re-browse"
+        );
+    }
+
+    #[gpui::test]
+    fn test_resolved_level_error_reply_sets_the_error_and_emits_no_browse(cx: &mut TestAppContext) {
+        let (picker, window) = build_picker(cx);
+        load(
+            &picker,
+            &window,
+            cx,
+            "",
+            "/home/dev",
+            Some("/home"),
+            vec![dir("project")],
+        );
+        let events = subscribe_events(&picker, cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                picker.update(cx, |picker, cx| {
+                    picker.browse("/home/dev/locked".to_string(), cx);
+                    picker.apply_dir_entries_reply(
+                        "/home/dev/locked".to_string(),
+                        None,
+                        Vec::new(),
+                        Some(DirBrowseError::PermissionDenied),
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .expect("apply resolved-level error reply");
+
+        cx.update(|cx| {
+            let picker = picker.read(cx);
+            assert_eq!(picker.error, Some(DirBrowseError::PermissionDenied));
+            assert_eq!(
+                picker.current_path, "/home/dev",
+                "a resolved-level error keeps the last good level, no seed fallback applies"
+            );
+        });
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["browse:/home/dev/locked"],
+            "a resolved-level error renders inline and issues no further Browse"
+        );
     }
 
     #[gpui::test]
