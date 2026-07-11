@@ -322,3 +322,31 @@ grid-resize-on-reshow work is the accepted cost.
   state-machine level) remains deferred to issue #821 alongside the Terminal's
   plain rail toggle — `apply_area_visibility`'s `Area::Terminal` arm is still a
   no-op, matching the existing #819 boundary.
+- 2026-07-11 (issue #856): The rail's per-area hues resolve to theme tokens,
+  not the artboard hexes, wherever a token's live value already matches (or
+  the codebase already substitutes it for the same artboard reference):
+  Explorer+Editor -> `theme().blue` (`#89b4fa`, exact), Diagnostics ->
+  `theme().red` (`#f38ba8`, exact), Git -> `theme().green` (`#a6e3a1`, exact),
+  solo -> `theme().magenta` (`#cba6f7`, exact) — all base `ThemeColor` tokens
+  under the shipped Catppuccin Mocha theme, confirmed against
+  `assets/themes/catppuccin-mocha.json`'s `base.*` values. Terminal has no
+  dedicated peach/amber base token (`ThemeColor` only carries red/green/blue/
+  yellow/magenta/cyan), so it resolves to `theme().warning` instead of the
+  artboard's `#FAB387` — the exact substitution `file_icons::TintRole::Warning`
+  already made for the identical artboard peach reference on the `.rs`
+  file-type glyph, reused here for consistency rather than reintroducing the
+  hex. No area hue is hardcoded. `RailState` gained `solo: Option<Area>`
+  (`workspace.rs`'s `Visibility::solo` fed in at the `activity_rail::render`
+  call site), and `activity_rail.rs` now imports `crate::workspace::Area` to
+  type it and to pick each hue — the one deliberate exception to the module's
+  prior "never names `Area`" boundary, mirroring `file_tree.rs`'s existing
+  `workspace::{solo_button, SoloExplorerEditor}` import for the same reason.
+  The Explorer+Editor icon swapped `IconName::Folder` -> `IconName::PanelLeft`
+  and the Git icon swapped `IconName::Github` -> a vendored Lucide
+  `git-branch.svg` (`assets/file_icons/git-branch.svg`, `currentColor` stroke),
+  rendered through the same `Icon::empty().path(..).text_color(..)` custom-SVG
+  path `file_tree.rs` already uses for file-type glyphs. The 2px active-icon
+  accent bar is a literal `border_l_2()` + `border_color(tint)` on the
+  `Button`, drawn only while the icon renders with a hue (visible or soloed;
+  never while muted) — additive to the existing `Button::selected` surface-bg
+  treatment, not a replacement for it.

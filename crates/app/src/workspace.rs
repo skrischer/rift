@@ -2473,6 +2473,7 @@ impl Render for WorkspaceView {
                     terminal_visible: self.visibility.is_visible(Area::Terminal),
                     git_visible: self.visibility.is_visible(Area::Git),
                     diagnostics_visible: self.visibility.is_visible(Area::Diagnostics),
+                    solo: self.visibility.solo,
                     changed_count: model.git_statuses().len(),
                     worst_diagnostic: activity_rail::worst_severity(model.all_diagnostics()),
                 },

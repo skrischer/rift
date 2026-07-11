@@ -23,8 +23,20 @@
 //! badge data is read off the existing client models
 //! (`WorktreeModel::git_statuses` for the changed-file count,
 //! `WorktreeModel::all_diagnostics` for [`worst_severity`]) — no new state
-//! lives here, and this module never names `WorkspaceView` or `Area`, only
-//! the click callbacks the caller hands it.
+//! lives here.
+//!
+//! Full visual fidelity with the Paper "Workspace visibility rail" artboard
+//! (issue #856) needs [`crate::workspace::Area`] itself, to pick each icon's
+//! design hue and to compare against the solo target — the one exception to
+//! this module otherwise never naming `WorkspaceView` types, mirroring how
+//! `file_tree.rs` already imports `workspace::{solo_button, SoloExplorerEditor}`
+//! for the same reason. [`RailState::solo`] carries the rift-owned solo
+//! target (`Option<Area>`) alongside the existing `*_visible` flags: an
+//! area's icon renders in its own hue while visible, the shared solo hue
+//! while it is the solo target, or `muted_foreground` while hidden — with a
+//! matching 2px accent bar on the icon's left edge whenever it renders with a
+//! hue (the artboard's "tint + 2px bar" active state; never drawn while
+//! muted). Settings is not an area and stays unhued, unchanged.
 
 use std::collections::BTreeMap;
 
@@ -34,10 +46,11 @@ use gpui::{
 };
 use gpui_component::badge::Badge;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{v_flex, ActiveTheme as _, IconName, Selectable as _, Sizable as _};
+use gpui_component::{v_flex, ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _};
 use rift_protocol::{Diagnostic, DiagnosticSeverity};
 
 use crate::settings::OpenSettings;
+use crate::workspace::Area;
 
 /// Fixed width of the activity rail, per the design contract.
 pub const WIDTH: Pixels = px(48.0);
@@ -63,6 +76,15 @@ pub struct RailState {
     /// Whether the Diagnostics area is visible (`Area::Diagnostics`: the
     /// bottom dock's problems panel).
     pub diagnostics_visible: bool,
+    /// The current solo target, if any (issue #856): fed by the caller from
+    /// the rift-owned visibility set's own solo field. `None` outside solo —
+    /// every visible area then renders in its own design hue. `Some(area)`
+    /// renders `area`'s icon in the shared solo hue instead of its own;
+    /// since solo already forces every other area's `*_visible` flag to
+    /// `false` (`Visibility::is_visible`), this only ever changes *which*
+    /// hue the one still-visible icon uses, never which icons render as
+    /// visible.
+    pub solo: Option<Area>,
     /// Changed-file count from `WorktreeModel::git_statuses` — the
     /// source-control badge (hidden by `Badge` itself when zero).
     pub changed_count: usize,
@@ -111,7 +133,9 @@ fn severity_color(severity: DiagnosticSeverity, cx: &App) -> Hsla {
 /// Build one rail icon button: `active` maps to the design's "surface bg + fg
 /// icon" selected state; `on_click` is whatever the caller hands in — an
 /// entity-bound listener for the area toggles, a bubbling `Action` dispatch
-/// for Settings — this helper stays presentational either way.
+/// for Settings — this helper stays presentational either way. Used directly
+/// only by Settings, which is not an area and carries no design hue; the four
+/// area icons go through [`area_button`] instead.
 fn rail_button(
     id: &'static str,
     icon: IconName,
@@ -126,6 +150,96 @@ fn rail_button(
         .selected(active)
         .tooltip(tooltip)
         .on_click(on_click)
+}
+
+/// `area`'s design hue while it renders plainly visible (not soloed) — the
+/// artboard's per-area color system (`docs/spec-workspace-visibility-rail.md`,
+/// issue #856): Explorer+Editor blue, Terminal amber, Diagnostics red, Git
+/// green. Explorer+Editor/Diagnostics/Git resolve to the base `blue`/`red`/
+/// `green` theme tokens, exact matches for the artboard's `#89B4FA`/
+/// `#F38BA8`/`#A6E3A1` under the shipped Catppuccin Mocha theme (`cx.theme()`
+/// is live, so a theme switch re-tints automatically — no hardcoded hex).
+/// Terminal has no dedicated "peach"/amber base token, so it resolves to
+/// `warning` instead: the same substitution `file_icons::TintRole::Warning`
+/// already uses for the identical artboard peach `#FAB387` reference on the
+/// `.rs` file-type glyph, kept consistent here rather than hardcoding the hex.
+fn area_hue(area: Area, cx: &App) -> Hsla {
+    match area {
+        Area::ExplorerEditor => cx.theme().blue,
+        Area::Terminal => cx.theme().warning,
+        Area::Diagnostics => cx.theme().red,
+        Area::Git => cx.theme().green,
+    }
+}
+
+/// Which color role an area's rail icon uses — pure and unit-testable
+/// independent of a live theme, mirroring how `file_icons::TintRole` itself
+/// stays resolve-free (the Hsla lookup against `cx.theme()` happens
+/// separately, in [`area_button`]). Solo takes precedence over plain
+/// visibility: [`RailState::solo`] already forces every non-target area's
+/// `*_visible` flag to `false` (`Visibility::is_visible`), so in practice a
+/// `Some(area)` match against `solo` implies `visible` is also true for that
+/// same area — this only decides *which* hue the one still-visible icon
+/// uses, never whether it renders as visible at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TintState {
+    /// `area` is the current solo target — the shared solo hue.
+    Solo,
+    /// `area` is visible and not soloed — its own design hue ([`area_hue`]).
+    Own,
+    /// `area` is hidden — `muted_foreground`.
+    Muted,
+}
+
+/// Resolve the [`TintState`] for `area` given its own visibility and the
+/// current solo target.
+fn tint_state(area: Area, visible: bool, solo: Option<Area>) -> TintState {
+    if solo == Some(area) {
+        TintState::Solo
+    } else if visible {
+        TintState::Own
+    } else {
+        TintState::Muted
+    }
+}
+
+/// Build one rail icon button for a workspace **area**: the icon tints per
+/// [`tint_state`] — [`area_hue`] while visible, the shared solo hue
+/// (`theme().magenta`, matching the artboard's mauve `#CBA6F7`) while soloed,
+/// or `muted_foreground` while hidden — with a matching 2px accent bar on the
+/// icon's left edge whenever it renders with a hue (the artboard's "tint +
+/// 2px bar" active state; never drawn while muted). The existing `selected`
+/// surface-bg treatment (`Button::selected`) is kept alongside the new hue +
+/// bar, not replaced by them — the design adds to today's selected state
+/// rather than superseding it.
+#[allow(clippy::too_many_arguments)]
+fn area_button(
+    id: &'static str,
+    icon: impl Into<Icon>,
+    tooltip: &'static str,
+    area: Area,
+    visible: bool,
+    solo: Option<Area>,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> Button {
+    let tint = match tint_state(area, visible, solo) {
+        TintState::Solo => cx.theme().magenta,
+        TintState::Own => area_hue(area, cx),
+        TintState::Muted => cx.theme().muted_foreground,
+    };
+    let button = Button::new(id)
+        .ghost()
+        .with_size(BUTTON_SIZE)
+        .icon(icon.into().text_color(tint))
+        .selected(visible)
+        .tooltip(tooltip)
+        .on_click(on_click);
+    if visible {
+        button.border_l_2().border_color(tint)
+    } else {
+        button
+    }
 }
 
 /// Render the 48px activity rail: files / terminal / source-control /
@@ -146,36 +260,48 @@ pub fn render(
     on_toggle_problems: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> impl IntoElement {
-    let explorer = rail_button(
+    let explorer = area_button(
         "activity-rail-explorer",
-        IconName::Folder,
+        IconName::PanelLeft,
         "Explorer",
+        Area::ExplorerEditor,
         state.explorer_editor_visible,
+        state.solo,
         on_toggle_explorer_editor,
+        cx,
     );
 
-    let terminal = rail_button(
+    let terminal = area_button(
         "activity-rail-terminal",
         IconName::SquareTerminal,
         "Terminal",
+        Area::Terminal,
         state.terminal_visible,
+        state.solo,
         on_toggle_terminal,
+        cx,
     );
 
-    let source_control = Badge::new().count(state.changed_count).child(rail_button(
+    let source_control = Badge::new().count(state.changed_count).child(area_button(
         "activity-rail-source-control",
-        IconName::Github,
+        Icon::empty().path("file_icons/git-branch.svg"),
         "Source Control",
+        Area::Git,
         state.git_visible,
+        state.solo,
         on_toggle_source_control,
+        cx,
     ));
 
-    let problems_button = rail_button(
+    let problems_button = area_button(
         "activity-rail-problems",
         IconName::TriangleAlert,
         "Problems",
+        Area::Diagnostics,
         state.diagnostics_visible,
+        state.solo,
         on_toggle_problems,
+        cx,
     );
     let problems: AnyElement = match state.worst_diagnostic {
         Some(severity) => Badge::new()
@@ -292,5 +418,31 @@ mod tests {
             vec![diag(DiagnosticSeverity::Hint)],
         )]);
         assert_eq!(worst_severity(&map), Some(DiagnosticSeverity::Hint));
+    }
+
+    #[test]
+    fn test_tint_state_visible_and_not_soloed_is_own() {
+        assert_eq!(tint_state(Area::Git, true, None), TintState::Own);
+    }
+
+    #[test]
+    fn test_tint_state_hidden_and_not_soloed_is_muted() {
+        assert_eq!(tint_state(Area::Git, false, None), TintState::Muted);
+    }
+
+    #[test]
+    fn test_tint_state_soloed_area_is_solo() {
+        assert_eq!(
+            tint_state(Area::Git, true, Some(Area::Git)),
+            TintState::Solo
+        );
+    }
+
+    #[test]
+    fn test_tint_state_other_area_soloed_is_muted() {
+        assert_eq!(
+            tint_state(Area::Git, false, Some(Area::Terminal)),
+            TintState::Muted
+        );
     }
 }
