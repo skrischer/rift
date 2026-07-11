@@ -1,8 +1,8 @@
 # Spec: Visibility rail focus & dispatch — toggles survive hide/solo
 
-> Status: READY
+> Status: COMPLETED
 > Created: 2026-07-11
-> Completed: —
+> Completed: 2026-07-11
 
 A focus/dispatch hardening follow-up to the Phase-39 visibility rail
 (`docs/spec-workspace-visibility-rail.md`). Making every workspace area —

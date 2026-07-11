@@ -1,8 +1,8 @@
 # Spec: Workspace visibility rail — rail-driven area visibility + solo
 
-> Status: READY
+> Status: COMPLETED
 > Created: 2026-07-10
-> Completed: —
+> Completed: 2026-07-11
 
 Evolve the shipped left activity rail (#513), the gpui-component Dock (#325), and
 the panel zoom (#716/#665) from a per-dock open/close model into a **rift-owned
