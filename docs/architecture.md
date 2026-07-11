@@ -15,10 +15,11 @@ Target architecture (Phase 3+): split into two processes connected by an SSH tun
 
 The system has no concept of "which coding agent is running." It sees tmux panes producing byte streams and a filesystem receiving changes. Whether Claude Code, Codex, OpenCode, Gemini CLI, or plain bash is running in a pane makes zero difference.
 
-All IDE features derive from two universal signals:
+All IDE features derive from three universal, agent-agnostic signals:
 
 - **PTY byte streams** — terminal output, parsed by the VTE layer into cell grids. Any process that writes to a terminal works.
 - **Filesystem events** — file creation, modification, deletion. Any process that writes files triggers the file watcher, the explorer update, and LSP diagnostics.
+- **Host resource state** — the host's own CPU / memory / swap / load, read from `/proc` by the daemon (Phase 43). A host-global observable of the machine the agents run on, not of any agent: `/proc` knows nothing about which process is Claude Code vs `cargo`. Attributing usage to a tmux pane (Phase 45) keys on the pane's process subtree (`pane_pid`), never on agent identity.
 
 This is a deliberate architectural constraint. There is no agent detection, no agent-specific event parsing, no protocol integration with any agent's internals. The agents are black boxes.
 
@@ -103,6 +104,20 @@ sessions attached to it — the Zed `HeadlessProject` / `WorktreeStore` shape (o
 server, N per-root contexts). The watched root follows the active tmux session
 (see the Connection robustness contract below), so it is no longer a single
 process-global root bound at daemon start (`spec-per-session-project-root.md`).
+
+### Host resource telemetry (a daemon-global signal)
+
+The worktree / git / diagnostics / LSP-health pushes are **per-context** state —
+they belong to a project root. Host resource state (CPU / memory / swap / load) is
+different: it is a property of the **machine**, not of any root, so it is a
+**daemon-global** signal (Phase 43, `spec-host-telemetry.md`). One sampler per
+daemon process reads `/proc` via `sysinfo` on a fixed interval (`spawn_blocking`,
+connection-gated so an idle daemon polls nothing), caches the latest sample in a
+process-global `watch`, and pushes a push-only `HostMetrics` on a daemon-global bus
+that every connection drains **alongside** its per-context bus — replayed once
+behind `welcome` like `lsp_status`. So two app instances attached to different
+roots on the one shared daemon see the same host figure from a single sample, never
+one `/proc` read per context.
 
 ### Why LSP runs on the remote
 
@@ -225,6 +240,7 @@ Editing uses a deliberate request/response buffer channel over the daemon transp
 | VTE parsing | `vte` (via alacritty_terminal) |
 | SSH connection | `russh` |
 | LSP client | `async-lsp` (MIT OR Apache-2.0) over `lsp-types` 0.95 (MIT) — daemon-side, `gpui`-free, musl-clean |
+| Host metrics | `sysinfo` (MIT) — daemon-side `/proc` sampler (CPU / memory / swap / load), `["system"]` feature only, musl-clean |
 | Async runtime | `tokio` |
 | Channel bridge | `flume` |
 | Serialization | `serde` + `serde_json` |
