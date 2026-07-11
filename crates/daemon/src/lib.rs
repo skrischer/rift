@@ -1287,8 +1287,8 @@ where
                         // connection's terminal output and every other
                         // inbound message for the clone's duration. Spawn a
                         // DETACHED task instead: dispatch returns immediately,
-                        // the task runs the clone (`clone::run`, itself
-                        // `spawn_blocking` internally) and posts the single
+                        // the task runs the clone (`clone::run`, an async
+                        // `git clone` child process) and posts the single
                         // `CloneResult` on `clone_reply_tx` — this
                         // connection's own private inbox, drained by the
                         // `clone_reply_rx` branch below, mirroring the nav
