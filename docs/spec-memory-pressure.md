@@ -211,7 +211,7 @@ adds "know when it's bad." Builds on the Phase-43 host-telemetry core (daemon-gl
 | The PSI file-existence check is resolved **once** at sampler start and cached | PSI availability is a boot-time kernel-config property (`CONFIG_PSI`), not a runtime-varying condition; checking every tick is wasteful | 2026-07-11 |
 | The first / welcome-replayed sample **seeds** the tracked level without firing a toast | `HostMetrics` is welcome-replayed, so a client (re)connecting under sustained pressure receives a Warning/Critical sample first; seeding the previous level from it (silent) means a reconnect or new window shows the right colour at once but does not re-toast — only a genuine *rise* during the session fires | 2026-07-11 |
 | PSI escalation **shape** is fixed (only the numeric cutoffs are gate-open): a nonzero `some_avg10` stall raises one band; any `full_avg10 > 0` → `Critical`; PSI never lowers the baseline | Keeps the daemon/client contract unambiguous for the implementer while leaving the taste-level numbers to the gate; a full memory stall is unambiguous evidence of critical pressure | 2026-07-11 |
-| OPEN — the concrete **warning / critical thresholds and hysteresis bands** (available-memory % enter/exit, swap-used % enter/exit, and the PSI `some_avg10` stall cutoff that escalates to Warning) | resolved at the spec-acceptance gate — a UX taste call on the developer's own dogfooding host; recommended defaults presented there. The escalation *shape* (PSI raises by one band, `full_avg10 > 0` → Critical) is fixed in Prior decisions; only the numeric cutoffs are open | — |
+| **Thresholds (resolved at the spec-acceptance gate — the "Standard" band):** Warning enters at mem-available < 20% (mem-used > 80%), exits at > 25%, or swap-used > 50%; Critical enters at mem-available < 10% (mem-used > 90%), exits at > 15%, or swap-used > 80%; PSI `some_avg10` > 5% escalates to Warning and `full_avg10 > 0` to Critical | Accepted 2026-07-11 — the balanced band for the dogfooding WSL2 host (today's ~37% used sits well in the green); the enter/exit gap provides the hysteresis; all are compile-time constants, tunable later without a spec change | 2026-07-11 |
 
 ## Tracking
 
@@ -278,3 +278,13 @@ under the milestone. This spec owns the design; the issues own progress.
   optional file-gated escalation over the portable baseline, memory-only trigger.
   One open item — the concrete threshold / hysteresis numbers — carried to the
   acceptance gate as a UX taste call on the dogfooding host.
+- 2026-07-11 (spec-acceptance gate — ACCEPTED): the one open item resolved — the
+  "Standard" threshold band (Warning at mem-available <20% enter / >25% exit or
+  swap-used >50%; Critical at <10% enter / >15% exit or swap-used >80%; PSI
+  `some_avg10` >5% → Warning, `full_avg10` >0 → Critical), baked into Prior decisions
+  as compile-time constants. Human prerequisites: none. Review (top-tier, fresh
+  context): APPROVE with six non-blocking refinements, all folded in pre-merge — the
+  fixture-injectable `read_memory_pressure(path)` helper + pure-builder PSI parameter,
+  the `MemoryPressure: Copy` derive and `total=` tolerance, the silent seed-on-
+  (re)connect toast rule, the explicit no-foundation-change note, and the PSI
+  escalation shape pinned in Prior decisions.
