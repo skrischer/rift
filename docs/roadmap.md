@@ -215,14 +215,17 @@ long-standing "tmux session = project" decision and picks up the three items the
 Phase-3.5 daemon-project-root spec deliberately parked as out of scope
 ([archive/spec-daemon-project-root.md](archive/spec-daemon-project-root.md)): the
 tmux session's working directory (agent cwd), multi-root / per-worktree contexts,
-and a runtime project-switch affordance. Today the project root is a single value
-baked into the app (`RIFT_PROJECT_ROOT` / the `RIFT_DEFAULT_PROJECT_ROOT`
-compile-time default, `justfile:293`), the daemon watches exactly one global root
-bound at first spawn (`crates/daemon/src/lib.rs` — the single-root chokepoint), new
-panes / windows inherit tmux's `$HOME` cwd (no `-c` except the explorer's
-reveal-in-terminal path), and a session is only a tmux name with no root binding —
-so switching sessions (built in phases 32–33) re-attaches the terminal but leaves
-the reactive layer on the old root.
+and a runtime project-switch affordance. At the time this block was seeded, the
+project root was a single value baked into the app (`RIFT_PROJECT_ROOT` / the
+`RIFT_DEFAULT_PROJECT_ROOT` compile-time default), the daemon watched exactly one
+global root bound at first spawn (`crates/daemon/src/lib.rs` — the single-root
+chokepoint), new panes / windows inherited tmux's `$HOME` cwd (no `-c` except the
+explorer's reveal-in-terminal path), and a session was only a tmux name with no
+root binding — so switching sessions (built in phases 32–33) re-attached the
+terminal but left the reactive layer on the old root. Phase 41 has since retired
+the baked default entirely: the daemon starts root-less and follows the active
+session's `@root` (or `session_path` for externally-created sessions) — see
+[spec-retire-project-root-env.md](spec-retire-project-root-env.md).
 
 Ordering is a chain: **34 (start-directory)** is the single-root quick win that
 stops panes landing in `$HOME`; **35 (per-session root)** dynamizes the root and
