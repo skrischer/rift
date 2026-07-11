@@ -122,17 +122,9 @@ pub struct WindowState {
     /// the raw terminal PTY grid, which stays pinned to a Nerd Font variant
     /// for its icon glyphs (`rift_terminal`'s `session_view`/`pane_view`).
     pub mono_font_family: String,
-    /// Recently-picked project roots for the remote root picker
-    /// (`docs/spec-session-root-picker.md`, issue #768), most-recent-first,
-    /// capped at [`MAX_RECENT_ROOTS`]. The picker's start level seeds from
-    /// `recent_roots.first()`, falling back to `$HOME` (an empty
-    /// `QueryDirEntries` path) when this is empty. A successful session
-    /// create records the picked root here via [`record_recent_root`] (the
-    /// call site is issue #769 — this store only owns the persistence).
-    pub recent_roots: Vec<String>,
     /// Which workspace areas are visible right now
-    /// (`docs/spec-workspace-visibility-rail.md`, issue #822), mirroring
-    /// `recent_roots`'s additive shape: a field missing from the on-disk
+    /// (`docs/spec-workspace-visibility-rail.md`, issue #822), mirroring the
+    /// other additive fields' shape: a field missing from the on-disk
     /// JSON falls back to [`default_visible_areas`] — every area visible —
     /// never the empty `Vec::default()`, which would restore to a blank
     /// workspace. A present entry naming an area this build does not
@@ -193,11 +185,6 @@ where
     Ok(raw.and_then(|value| serde_json::from_value::<Area>(value).ok()))
 }
 
-/// Recent roots beyond this count are dropped (oldest first) on every
-/// [`record_recent_root`] — mirrors [`crate::recents::MAX_RECENTS`]'s cap on
-/// the sibling recent-connections store.
-pub const MAX_RECENT_ROOTS: usize = 8;
-
 impl Default for WindowState {
     fn default() -> Self {
         Self {
@@ -213,7 +200,6 @@ impl Default for WindowState {
             diff_view_mode: DiffViewMode::default(),
             ui_font_family: String::new(),
             mono_font_family: String::new(),
-            recent_roots: Vec::new(),
             visible_areas: default_visible_areas(),
             solo_area: None,
         }
@@ -287,22 +273,6 @@ pub fn save_visibility(
     let mut state = load(path);
     state.visible_areas = visible_areas;
     state.solo_area = solo_area;
-    save(path, &state)
-}
-
-/// Record a freshly-picked root into the store at `path` (issue #768's
-/// recents-of-roots requirement): move it to the front if already present, or
-/// insert it as the newest, then cap at [`MAX_RECENT_ROOTS`], dropping the
-/// oldest — the same move-to-front/cap shape as `crate::recents::record`. A
-/// read-modify-write over whatever bounds/theme/fonts are already on disk,
-/// mirroring [`save_diff_view_mode`]'s shape. The call site (recording a
-/// successful create-with-root) is issue #769; this store only owns the
-/// persistence.
-pub fn record_recent_root(path: &Path, root: &str) -> Result<(), StoreError> {
-    let mut state = load(path);
-    state.recent_roots.retain(|existing| existing != root);
-    state.recent_roots.insert(0, root.to_string());
-    state.recent_roots.truncate(MAX_RECENT_ROOTS);
     save(path, &state)
 }
 
@@ -566,7 +536,6 @@ mod tests {
             diff_view_mode: DiffViewMode::Split,
             ui_font_family: "Inter".to_string(),
             mono_font_family: "JetBrains Mono".to_string(),
-            recent_roots: vec!["/home/dev/rift".to_string()],
             visible_areas: vec![Area::ExplorerEditor, Area::Git],
             solo_area: Some(Area::Git),
         }
@@ -601,7 +570,6 @@ mod tests {
         assert_eq!(parsed.diff_view_mode, DiffViewMode::Unified);
         assert_eq!(parsed.ui_font_family, "");
         assert_eq!(parsed.mono_font_family, "");
-        assert!(parsed.recent_roots.is_empty());
         assert_eq!(
             parsed.visible_areas,
             default_visible_areas(),
@@ -909,7 +877,10 @@ mod tests {
     /// The spec's "State drift on area set changes" risk: a persisted
     /// `visible_areas` naming an area this build does not recognize must
     /// drop only that entry, not fail the whole parse and reset
-    /// bounds/theme/recents to default along with it.
+    /// bounds/theme/etc. to default along with it. The now-removed
+    /// `recent_roots` field (issue #873, `docs/spec-host-scoped-root-recents.md`)
+    /// rides along as an unrecognized-but-present key, doubling as a check
+    /// that dropping it did not add `deny_unknown_fields`.
     #[test]
     fn test_unknown_area_variant_in_visible_areas_is_dropped_not_fatal() {
         let json = r#"{
@@ -934,7 +905,30 @@ mod tests {
             parsed.theme_name, "Catppuccin Mocha",
             "unrelated fields are unaffected by the tolerant array"
         );
-        assert_eq!(parsed.recent_roots, vec!["/home/dev/rift".to_string()]);
+    }
+
+    /// Issue #873 (`docs/spec-host-scoped-root-recents.md`): an old state
+    /// file written before recent roots moved to the host-keyed
+    /// `recents::RecentConnection` still loads — the removed
+    /// `recent_roots` array is simply an unrecognized field now, ignored by
+    /// serde exactly like any other, not a parse failure that would reset
+    /// the rest of the file to default.
+    #[test]
+    fn test_load_old_file_with_recent_roots_array_still_loads() {
+        let scratch = Scratch::new("legacy_recent_roots");
+        let path = scratch.path("state.json");
+        let json = r#"{
+            "theme_name": "Catppuccin Mocha",
+            "maximized": true,
+            "recent_roots": ["/home/dev/rift", "/home/dev/other"]
+        }"#;
+        fs::write(&path, json).expect("write legacy json with recent_roots");
+
+        let loaded = load(&path);
+
+        assert_eq!(loaded.theme_name, "Catppuccin Mocha");
+        assert!(loaded.maximized);
+        assert_eq!(loaded.bounds, Rect::default());
     }
 
     #[test]
@@ -1030,72 +1024,6 @@ mod tests {
         assert_eq!(loaded.mono_font_family, "JetBrains Mono");
         assert_eq!(loaded.theme_name, crate::DEFAULT_THEME_NAME);
         assert_eq!(loaded.bounds, Rect::default());
-    }
-
-    // --- recent-roots persistence (#768) ------------------------------------
-
-    #[test]
-    fn test_record_recent_root_on_missing_file_starts_from_defaults() {
-        let scratch = Scratch::new("record_recent_root_missing");
-        let path = scratch.path("does-not-exist.json");
-
-        record_recent_root(&path, "/home/dev/rift").expect("record_recent_root");
-
-        let loaded = load(&path);
-        assert_eq!(loaded.recent_roots, vec!["/home/dev/rift".to_string()]);
-        assert_eq!(loaded.theme_name, crate::DEFAULT_THEME_NAME);
-    }
-
-    #[test]
-    fn test_record_recent_root_inserts_newest_first_and_preserves_the_rest() {
-        let scratch = Scratch::new("record_recent_root_order");
-        let path = scratch.path("state.json");
-        let initial = sample_state();
-        save(&path, &initial).expect("initial save");
-
-        record_recent_root(&path, "/home/dev/other").expect("record_recent_root");
-
-        let loaded = load(&path);
-        assert_eq!(
-            loaded.recent_roots,
-            vec!["/home/dev/other".to_string(), "/home/dev/rift".to_string()]
-        );
-        assert_eq!(loaded.theme_name, initial.theme_name);
-        assert_eq!(loaded.bounds, initial.bounds);
-    }
-
-    #[test]
-    fn test_record_recent_root_existing_entry_moves_to_front_without_duplicating() {
-        let scratch = Scratch::new("record_recent_root_dedupe");
-        let path = scratch.path("state.json");
-        record_recent_root(&path, "/home/dev/a").expect("record a");
-        record_recent_root(&path, "/home/dev/b").expect("record b");
-
-        record_recent_root(&path, "/home/dev/a").expect("re-record a");
-
-        let loaded = load(&path);
-        assert_eq!(
-            loaded.recent_roots,
-            vec!["/home/dev/a".to_string(), "/home/dev/b".to_string()]
-        );
-    }
-
-    #[test]
-    fn test_record_recent_root_caps_at_max_dropping_the_oldest() {
-        let scratch = Scratch::new("record_recent_root_cap");
-        let path = scratch.path("state.json");
-
-        for i in 0..(MAX_RECENT_ROOTS + 3) {
-            record_recent_root(&path, &format!("/root-{i}")).expect("record");
-        }
-
-        let loaded = load(&path);
-        assert_eq!(loaded.recent_roots.len(), MAX_RECENT_ROOTS);
-        assert_eq!(
-            loaded.recent_roots[0],
-            format!("/root-{}", MAX_RECENT_ROOTS + 2)
-        );
-        assert_eq!(loaded.recent_roots[MAX_RECENT_ROOTS - 1], "/root-3");
     }
 
     // --- platform path resolution -------------------------------------------

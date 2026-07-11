@@ -18,7 +18,7 @@ use gpui_component_assets::Assets;
 use rift_app::connection_screen::{
     ConnectError, ConnectRequest, ConnectionScreen, ConnectionScreenEvent, SessionIntent,
 };
-use rift_app::recents::RecentConnection;
+use rift_app::recents::RecentTarget;
 use rift_app::root_picker::{RootPicker, RootPickerEvent};
 use rift_app::session_picker::{SessionPicker, SessionPickerEvent};
 use rift_app::{
@@ -738,9 +738,10 @@ struct RootPickerScreen {
 /// argument-count threshold: the picker's initial data (`ssh_label`,
 /// `sessions`, the pre-loaded client-side `order`) plus what a pick does next
 /// (`choice_tx` back to the daemon thread, the eagerly built `workspace` to
-/// swap to, and `recents` — the target to record a pick into, issue #707).
-/// `dir_browse_tx` and `state_path` ride along so a "+ New session..." pick
-/// can hand off straight into [`RootPickerLaunch`] (issue #769).
+/// swap to, and `recents` — the target to seed/record a root and connection
+/// into, issues #707/#873). `dir_browse_tx` rides along so a "+ New
+/// session..." pick can hand off straight into [`RootPickerLaunch`] (issue
+/// #769).
 struct PickerLaunch {
     ssh_label: SharedString,
     sessions: Vec<SessionListItem>,
@@ -749,16 +750,17 @@ struct PickerLaunch {
     workspace: Entity<workspace::WorkspaceView>,
     recents: Option<(PathBuf, RecentTarget)>,
     dir_browse_tx: flume::Sender<rift_protocol::ClientMessage>,
-    state_path: Option<PathBuf>,
 }
 
 /// [`Shell::show_root_picker`]'s arguments (issue #769,
 /// `docs/spec-session-root-picker.md`), mirroring [`PickerLaunch`]: `sessions`
 /// is the live list known when the picker opened, used to disambiguate the
 /// picked basename before Create; `dir_browse_tx` sends `QueryDirEntries` for
-/// every `RootPickerEvent::Browse`; `state_path` seeds the picker's start
-/// level from the phase-9 recents-of-roots store and records a successful
-/// pick back into it.
+/// every `RootPickerEvent::Browse`; `recents` — the current connection
+/// target's recents-file path + identity (issue #873,
+/// `docs/spec-host-scoped-root-recents.md`) — seeds the picker's start level
+/// from that target's own recorded roots and records a successful pick back
+/// onto it, never a different host's.
 struct RootPickerLaunch {
     ssh_label: SharedString,
     sessions: Vec<SessionListItem>,
@@ -766,43 +768,6 @@ struct RootPickerLaunch {
     workspace: Entity<workspace::WorkspaceView>,
     recents: Option<(PathBuf, RecentTarget)>,
     dir_browse_tx: flume::Sender<rift_protocol::ClientMessage>,
-    state_path: Option<PathBuf>,
-}
-
-/// The host/user/port/key/wrapper identity for a recents entry (issue #707,
-/// wrapper added by #790), captured once in [`Shell::connect`] before
-/// `request`'s fields move into the `SshConfig`. `Preferred`/`Pick` defer the
-/// actual [`recents::record`] call until the session resolves (a
-/// [`PickerOutcome::Attached`] or a picker pick), so the store never carries
-/// a pre-pick placeholder.
-#[derive(Clone)]
-struct RecentTarget {
-    host: String,
-    user: String,
-    port: u16,
-    key: String,
-    /// The connect-time Remote exec wrapper field value (issue #790), empty
-    /// for a normal host connection — persisted onto the recorded
-    /// [`RecentConnection`] so a container recent stays re-runnable.
-    remote_exec_wrapper: String,
-}
-
-impl RecentTarget {
-    fn record(&self, path: &Path, session: &str) {
-        let now = recents::now_unix_secs();
-        let entry = RecentConnection {
-            host: self.host.clone(),
-            user: self.user.clone(),
-            port: self.port,
-            key: self.key.clone(),
-            session: session.to_string(),
-            remote_exec_wrapper: self.remote_exec_wrapper.clone(),
-            last_connected_unix_secs: now,
-        };
-        if let Err(e) = recents::record(path, entry, now) {
-            warn!(%e, "failed to record recent connection");
-        }
-    }
 }
 
 struct Shell {
@@ -1090,6 +1055,15 @@ impl Shell {
         // cannot reach `rift-app`'s explorer/editor, so the composition lives
         // here. Focus still delegates to the terminal so keystrokes reach the
         // active pane.
+        //
+        // `recents_path`/`recent_target` (issue #873, `docs/spec-host-scoped-
+        // root-recents.md`) give the in-cockpit "+ New session..." picker the
+        // same host-scoped recents file + connection identity the pre-cockpit
+        // one already carries via `RootPickerLaunch.recents`, cloned here
+        // since `recent_target` is moved into the picker-outcome loop further
+        // below.
+        let recents_path_for_workspace = self.recents_path.clone();
+        let recent_target_for_workspace = recent_target.clone();
         let workspace = cx.new(|cx| {
             workspace::WorkspaceView::new(
                 session_view,
@@ -1111,6 +1085,8 @@ impl Shell {
                     dir_browse_tx: dir_browse_tx.clone(),
                 },
                 state_path,
+                recents_path_for_workspace,
+                Some(recent_target_for_workspace),
                 window,
                 cx,
             )
@@ -1182,7 +1158,6 @@ impl Shell {
             .map(session_order::load)
             .unwrap_or_default();
         let recents_path = self.recents_path.clone();
-        let state_path_for_picker = self.state_path.clone();
         cx.spawn_in(window, async move |this, cx| loop {
             let Ok(outcome) = picker_outcome_rx.recv_async().await else {
                 return;
@@ -1200,7 +1175,6 @@ impl Shell {
             let dir_browse_tx = dir_browse_tx.clone();
             let ssh_label = ssh_label.clone();
             let order = order.clone();
-            let state_path_for_picker = state_path_for_picker.clone();
             match outcome {
                 PickerOutcome::Attached(name) => {
                     // A `Preferred` name is still present on the host: attached
@@ -1234,7 +1208,6 @@ impl Shell {
                                         workspace,
                                         recents,
                                         dir_browse_tx,
-                                        state_path: state_path_for_picker,
                                     },
                                     window,
                                     cx,
@@ -1252,7 +1225,6 @@ impl Shell {
                                         workspace,
                                         recents,
                                         dir_browse_tx,
-                                        state_path: state_path_for_picker,
                                     },
                                     window,
                                     cx,
@@ -1289,7 +1261,6 @@ impl Shell {
             workspace,
             recents,
             dir_browse_tx,
-            state_path,
         } = launch;
         // Cloned before `SessionPicker::new` consumes the originals below —
         // the "+ New session..." branch hands its own copy into
@@ -1320,7 +1291,6 @@ impl Shell {
                             workspace: workspace.clone(),
                             recents: recents.clone(),
                             dir_browse_tx: dir_browse_tx.clone(),
-                            state_path: state_path.clone(),
                         },
                         window,
                         cx,
@@ -1340,14 +1310,17 @@ impl Shell {
     /// Open the root picker (issue #769, `docs/spec-session-root-picker.md`):
     /// the entry point for every create — reached directly from the
     /// zero-sessions edge or from the session picker's "+ New session..."
-    /// footer. Seeds the first browse from the phase-9 recents-of-roots store
-    /// (`launch.state_path`), falling back to `""` ($HOME). A
+    /// footer. Seeds the first browse from the current connection target's
+    /// own recorded roots (`launch.recents`, issue #873,
+    /// `docs/spec-host-scoped-root-recents.md`), falling back to `""`
+    /// ($HOME) — never a root picked on a different host. A
     /// [`RootPickerEvent::Browse`] sends `QueryDirEntries` and records the
     /// requested path as the outstanding one
     /// ([`root_picker::browse_reply_matches`] guards the reply); a
     /// [`RootPickerEvent::Picked`] disambiguates the name against the
-    /// picker-open-time live list, records the picked root in recents, sends
-    /// the choice to the daemon thread, and swaps to the cockpit.
+    /// picker-open-time live list, records the picked root and the
+    /// connection in recents, sends the choice to the daemon thread, and
+    /// swaps to the cockpit.
     fn show_root_picker(
         &mut self,
         launch: RootPickerLaunch,
@@ -1361,11 +1334,10 @@ impl Shell {
             workspace,
             recents,
             dir_browse_tx,
-            state_path,
         } = launch;
-        let recent_roots = state_path
-            .as_deref()
-            .map(|path| window_state::load(path).recent_roots)
+        let recent_roots = recents
+            .as_ref()
+            .map(|(path, target)| recents::target_recent_roots(path, target))
             .unwrap_or_default();
         let start = root_picker::start_path(&recent_roots);
         let picker = cx.new(|cx| RootPicker::new(window, cx));
@@ -1405,12 +1377,10 @@ impl Shell {
                         .map(|session| session.name.clone())
                         .collect();
                     let session = root_picker::disambiguate_session_name(name, &existing);
-                    if let Some(path) = &state_path {
-                        if let Err(e) = window_state::record_recent_root(path, root) {
+                    if let Some((path, target)) = &recents {
+                        if let Err(e) = recents::merge_recent_root(path, target, root) {
                             warn!(%e, "failed to record recent root");
                         }
-                    }
-                    if let Some((path, target)) = &recents {
                         target.record(path, &session);
                     }
                     let _ = choice_tx.send(PickedSession {
