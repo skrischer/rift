@@ -6,17 +6,25 @@
 //! per-dock open/close toggle to the rift-owned area-visibility set: each
 //! icon's active state now reads [`RailState`]'s `*_visible` fields — sourced
 //! by the caller from `WorkspaceView`'s own visibility set, not
-//! `dock.is_open` — though the click still dispatches the same shell-command
-//! `Action`s ([`crate::workspace::ToggleExplorer`] etc., plus
-//! [`crate::workspace::ToggleTerminal`] making the Terminal a fully
-//! symmetric peer, issue #821) the command palette already binds, via
-//! `window.dispatch_action`; only their handlers changed, from forwarding to
-//! `DockArea::toggle_dock` to toggling the visibility set. Presentational
-//! only, mirroring [`crate::title_bar`]: the badge data is read off the
-//! existing client models (`WorktreeModel::git_statuses` for the
-//! changed-file count, `WorktreeModel::all_diagnostics` for
-//! [`worst_severity`]) — no new state lives here, the rail never reaches
-//! into a `WorkspaceView` entity directly.
+//! `dock.is_open`. The four area icons' `on_click` handlers
+//! (`on_toggle_explorer_editor`/`on_toggle_terminal`/`on_toggle_source_control`/
+//! `on_toggle_problems`) are built by the caller and passed into [`render`]
+//! (`docs/spec-visibility-rail-focus.md`, issue #848): `WorkspaceView` binds
+//! them to itself via `cx.listener` (a weak reference into
+//! `Entity<WorkspaceView>`, no retain cycle) so a click invokes
+//! `WorkspaceView::toggle_area` directly, immune to where keyboard focus
+//! currently sits — replacing the earlier focus-coupled
+//! `window.dispatch_action` of the `Toggle*` `Action`s, which stayed dropped
+//! once a hide/solo transition unrendered the focused panel. Those `Action`s
+//! and their root `on_action` handlers remain for the keyboard, command
+//! palette, and any agent-driven dispatch; only the rail's own mouse-click
+//! path is decoupled. Settings keeps dispatching `OpenSettings` — it is not
+//! an area toggle. Presentational only, mirroring [`crate::title_bar`]: the
+//! badge data is read off the existing client models
+//! (`WorktreeModel::git_statuses` for the changed-file count,
+//! `WorktreeModel::all_diagnostics` for [`worst_severity`]) — no new state
+//! lives here, and this module never names `WorkspaceView` or `Area`, only
+//! the click callbacks the caller hands it.
 
 use std::collections::BTreeMap;
 
@@ -30,7 +38,6 @@ use gpui_component::{v_flex, ActiveTheme as _, IconName, Selectable as _, Sizabl
 use rift_protocol::{Diagnostic, DiagnosticSeverity};
 
 use crate::settings::OpenSettings;
-use crate::workspace::{ToggleExplorer, ToggleProblems, ToggleSourceControl, ToggleTerminal};
 
 /// Fixed width of the activity rail, per the design contract.
 pub const WIDTH: Pixels = px(48.0);
@@ -102,8 +109,9 @@ fn severity_color(severity: DiagnosticSeverity, cx: &App) -> Hsla {
 }
 
 /// Build one rail icon button: `active` maps to the design's "surface bg + fg
-/// icon" selected state; `on_click` dispatches the bubbling `Action` rather
-/// than reaching into an entity, keeping this module presentational.
+/// icon" selected state; `on_click` is whatever the caller hands in — an
+/// entity-bound listener for the area toggles, a bubbling `Action` dispatch
+/// for Settings — this helper stays presentational either way.
 fn rail_button(
     id: &'static str,
     icon: IconName,
@@ -126,13 +134,24 @@ fn rail_button(
 /// controls" constraint). Theme tokens only: rail background/border match
 /// the title bar's sidebar surface, the active state matches the design's
 /// selected surface.
-pub fn render(state: RailState, cx: &App) -> impl IntoElement {
+///
+/// The four `on_toggle_*` callbacks are the caller's entity-bound listeners
+/// (issue #848) — this function only wires them to the matching button's
+/// `on_click`, it never builds a click handler itself for an area toggle.
+pub fn render(
+    state: RailState,
+    on_toggle_explorer_editor: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_toggle_terminal: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_toggle_source_control: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_toggle_problems: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> impl IntoElement {
     let explorer = rail_button(
         "activity-rail-explorer",
         IconName::Folder,
         "Explorer",
         state.explorer_editor_visible,
-        |_event, window, cx| window.dispatch_action(Box::new(ToggleExplorer), cx),
+        on_toggle_explorer_editor,
     );
 
     let terminal = rail_button(
@@ -140,7 +159,7 @@ pub fn render(state: RailState, cx: &App) -> impl IntoElement {
         IconName::SquareTerminal,
         "Terminal",
         state.terminal_visible,
-        |_event, window, cx| window.dispatch_action(Box::new(ToggleTerminal), cx),
+        on_toggle_terminal,
     );
 
     let source_control = Badge::new().count(state.changed_count).child(rail_button(
@@ -148,7 +167,7 @@ pub fn render(state: RailState, cx: &App) -> impl IntoElement {
         IconName::Github,
         "Source Control",
         state.git_visible,
-        |_event, window, cx| window.dispatch_action(Box::new(ToggleSourceControl), cx),
+        on_toggle_source_control,
     ));
 
     let problems_button = rail_button(
@@ -156,7 +175,7 @@ pub fn render(state: RailState, cx: &App) -> impl IntoElement {
         IconName::TriangleAlert,
         "Problems",
         state.diagnostics_visible,
-        |_event, window, cx| window.dispatch_action(Box::new(ToggleProblems), cx),
+        on_toggle_problems,
     );
     let problems: AnyElement = match state.worst_diagnostic {
         Some(severity) => Badge::new()

@@ -36,6 +36,24 @@ const TEXT_SIZE: f32 = 12.0;
 /// claiming this (#490).
 const NO_BRANCH_LABEL: &str = "detached HEAD";
 
+/// The workspace's latest host resource sample, folded from the daemon's
+/// `DaemonMessage::HostMetrics` push (`docs/spec-host-telemetry.md`). `protocol`
+/// carries the full sample inline on the enum variant rather than as a separate
+/// reusable type (unlike `LspServerState`), so this narrows it to the fields the
+/// composite status line's MEM/CPU segment actually reads; a later phase widens
+/// it as the pressure warning (Phase 44) and per-pane attribution (Phase 45)
+/// need more of the daemon's coherent sample (`swap_*`, `load`, `cpu_count`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HostMetrics {
+    /// Aggregate CPU load, 0.0-100.0.
+    pub cpu: f32,
+    /// Total host RAM, in bytes.
+    pub mem_total: u64,
+    /// `MemAvailable` from `/proc/meminfo`, in bytes — the basis for "how much
+    /// RAM is really free" (`docs/spec-host-telemetry.md`).
+    pub mem_available: u64,
+}
+
 /// The full set of values the composite status line renders, borrowed from the
 /// workspace's existing models plus the two new streams. Kept as one struct so
 /// [`render`]'s signature stays legible and the workspace assembles the read in
@@ -59,6 +77,10 @@ pub struct StatusLineModel<'a> {
     pub diagnostics: &'a BTreeMap<String, BTreeMap<String, Vec<Diagnostic>>>,
     /// Language-server health, keyed by stable server name (`LspStatus`).
     pub lsp: &'a BTreeMap<String, LspServerState>,
+    /// The host's latest resource sample (`HostMetrics`), or `None` before the
+    /// first sample arrives — hides the MEM/CPU segment entirely, mirroring
+    /// the LSP dot before a server is known (`docs/spec-host-telemetry.md`).
+    pub host_metrics: Option<&'a HostMetrics>,
     /// The active editor tab's zero-based cursor `(line, column)`, or `None`
     /// when no tab is open.
     pub cursor: Option<(u32, u32)>,
@@ -128,6 +150,26 @@ fn cursor_text(cursor: Option<(u32, u32)>) -> Option<String> {
 /// clock.
 pub fn format_clock(hour: u32, minute: u32) -> String {
     format!("{hour:02}:{minute:02}")
+}
+
+/// The `MEM <n>% \u{b7} CPU <n>%` host-resource segment text
+/// (`docs/spec-host-telemetry.md`): both percentages integer-rounded, a
+/// middot separator, literal `MEM`/`CPU` labels. RAM% is
+/// `(mem_total - mem_available) / mem_total`; `mem_total == 0` (a degenerate
+/// sample) is guarded to `0%` rather than dividing by zero. Whether to render
+/// at all (hidden before the first sample) is the caller's concern via
+/// `StatusLineModel.host_metrics: Option<...>`, mirroring `cursor_text`.
+fn metrics_text(cpu: f32, mem_total: u64, mem_available: u64) -> String {
+    let mem_pct = if mem_total == 0 {
+        0.0
+    } else {
+        (mem_total.saturating_sub(mem_available)) as f64 / mem_total as f64 * 100.0
+    };
+    format!(
+        "MEM {}% \u{b7} CPU {}%",
+        mem_pct.round() as i64,
+        (cpu as f64).round() as i64
+    )
 }
 
 /// Build the composite status line element. Theme tokens only: the bar sits on
@@ -232,6 +274,19 @@ pub fn render(
             .child(SharedString::from(t))
     });
 
+    // Host resource segment (`docs/spec-host-telemetry.md`): hidden until the
+    // first `HostMetrics` sample arrives, neutral-colored — threshold/pressure
+    // coloring is Phase 44.
+    let metrics = model.host_metrics.map(|m| {
+        div()
+            .text_color(theme.muted_foreground)
+            .child(SharedString::from(metrics_text(
+                m.cpu,
+                m.mem_total,
+                m.mem_available,
+            )))
+    });
+
     let clock = div()
         .text_color(theme.muted_foreground)
         .child(SharedString::from(model.clock.to_owned()));
@@ -244,6 +299,7 @@ pub fn render(
         .children(counts)
         .children((!model.lsp.is_empty()).then_some(lsp))
         .children(cursor)
+        .children(metrics)
         .child(clock);
 
     h_flex()
@@ -495,5 +551,27 @@ mod tests {
         assert_eq!(format_clock(9, 5), "09:05");
         assert_eq!(format_clock(23, 59), "23:59");
         assert_eq!(format_clock(0, 0), "00:00");
+    }
+
+    #[test]
+    fn test_metrics_text_formats_mem_and_cpu_rounded() {
+        assert_eq!(
+            metrics_text(42.4, 16_000_000_000, 8_000_000_000),
+            "MEM 50% \u{b7} CPU 42%"
+        );
+    }
+
+    #[test]
+    fn test_metrics_text_rounds_half_away_from_zero() {
+        // 2/3 of mem_total used -> 66.67%; cpu 42.5 -> 43.
+        assert_eq!(
+            metrics_text(42.5, 3_000_000_000, 1_000_000_000),
+            "MEM 67% \u{b7} CPU 43%"
+        );
+    }
+
+    #[test]
+    fn test_metrics_text_guards_against_zero_mem_total() {
+        assert_eq!(metrics_text(10.0, 0, 0), "MEM 0% \u{b7} CPU 10%");
     }
 }

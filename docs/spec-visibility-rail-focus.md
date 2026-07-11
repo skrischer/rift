@@ -209,3 +209,29 @@ focus-dependent action dispatch.
   named the `key_context` (`"Workspace"`), softened the Zed focus-model prior-art
   attribution to the spec's own elaboration, and marked the rail decoupling as
   architectural hardening (not required for the freeze fix).
+- 2026-07-11: Implementation (issue #847, this phase's core fix; rail
+  decoupling split out to issue #848 and left for a follow-up PR). The three
+  named `focus_handle`-delegation tests turned out to be two more than named:
+  the same `workspace.focus_handle(cx) == session_view.focus_handle(cx)`
+  assertion also appeared in the quick-open and root-picker dialog tests
+  (added after the spec's test inventory was written) — all five were updated
+  to the anchor semantics (`assert_ne!`) to keep `cargo test --workspace`
+  green, not just the three named ones. `preferred_focus_area`'s Terminal ->
+  Explorer+Editor -> Diagnostics -> Git re-home target for the ExplorerEditor
+  case moves focus to the editor (`EditorView::focus_active_input`, the
+  existing "hand focus back to the editor" helper `hide_results_panel`
+  already used), not the file tree — the more likely destination for
+  keyboard input, and `Area::ExplorerEditor`'s focused-area detection already
+  treats file tree and editor as one unit.
+- 2026-07-11: Implementation (issue #848, rail dispatch decoupling). The spec
+  names two candidate wirings for the entity-bound listener
+  (`activity_rail::render` taking `cx: &mut Context<WorkspaceView>` directly,
+  vs. accepting pre-built listener callbacks from the workspace render site).
+  Chose the callback-parameter form: `WorkspaceView::render` builds the four
+  `cx.listener` closures (still bound to `Entity<WorkspaceView>`, weak
+  reference, satisfying the spec's retain-cycle mitigation) and passes them
+  into `activity_rail::render`, which stays ignorant of `WorkspaceView`/`Area`
+  and only wires a caller-supplied `on_click` to each button — preserving the
+  module's existing "presentational, never reaches into a `WorkspaceView`
+  entity directly" invariant (`activity_rail.rs`'s own module doc) rather than
+  having the rail import and call a `WorkspaceView` method by name.
