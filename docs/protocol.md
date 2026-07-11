@@ -50,7 +50,12 @@ binary, never by tolerating it (`docs/spec-connection-robustness.md`).
   a healthy concurrent connection's stream (relevant for the shared stable+dev
   daemon).
 
-History: version 11 adds the clone channel — `clone_repo` answered by one
+History: version 13 adds the host-metrics push (`host_metrics`) — a
+daemon-global CPU/memory/swap/load sample, push-only and `welcome`-replayed
+like `lsp_status` (`docs/spec-host-telemetry.md`); version 12 adds
+`CloneError::GitUnavailable` for a missing host `git` binary, surfaced as a
+distinct actionable clone failure rather than a generic `Other`
+(`docs/spec-clone-repo.md`); version 11 adds the clone channel — `clone_repo` answered by one
 `clone_result` carrying the resolved checkout `path` and an optional typed
 `CloneError` (`docs/spec-clone-repo.md`); version 10 adds the directory-browse channel — `query_dir_entries`
 answered by one `dir_entries_reply` carrying `DirEntry` children and an
@@ -279,6 +284,28 @@ the daemon's LSP registry around its observe cycle: `starting` when a
 the server exits) or a (re)start attempt fails. Push-only, and replayed once
 per known server behind `welcome` so a (re)attaching client sees current
 health immediately.
+
+## Host metrics (`docs/spec-host-telemetry.md`)
+
+```json
+{ "type": "host_metrics", "cpu": 42.5, "mem_total": 16000000000, "mem_available": 4000000000, "swap_total": 2000000000, "swap_used": 100000000, "load": { "one": 1.5, "five": 1.1, "fifteen": 0.9 }, "cpu_count": 8 }
+```
+
+`host_metrics` is a **host-global** signal, not per-context: unlike every
+other push in this document (`worktree` / `git` / `diagnostics` /
+`lsp_status`, all scoped to one attached project-root context), CPU/RAM/swap/
+load are a property of the machine, not of any root, so the daemon samples
+`/proc` once per process on a fixed timer (`HOST_METRICS_INTERVAL`, 2 s) and
+pushes the same sample to every connection, regardless of how many contexts
+are attached. Sampling is connection-gated — an idle daemon with zero
+connections polls nothing. `cpu` is the aggregate CPU load (`0.0`-`100.0`);
+`mem_total`/`mem_available`/`swap_total`/`swap_used` are bytes;
+`mem_available` is `/proc/meminfo`'s `MemAvailable`, the basis for "how much
+RAM is really free"; `load` is the 1/5/15-minute load average
+(`/proc/loadavg`); `cpu_count` is the host's logical core count. Push-only,
+and replayed once behind `welcome` from the daemon's cached latest sample —
+the same precedent as `lsp_status` — so a (re)attaching client sees current
+host state without waiting for the next tick.
 
 ### Live-buffer feed (`spec-editor.md`, cut C)
 
