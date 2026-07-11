@@ -90,6 +90,7 @@ use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::outline_panel::{OutlinePanel, OutlinePanelEvent};
 use crate::problems_panel::{ProblemsPanel, ProblemsPanelEvent};
 use crate::quick_open::{OpenQuickOpen, QuickOpen};
+use crate::recents::{self, RecentTarget};
 use crate::results_panel::{ResultsPanel, ResultsPanelEvent};
 use crate::root_picker::{self, RootPicker, RootPickerEvent};
 use crate::settings::{OpenSettings, SettingsView};
@@ -586,6 +587,15 @@ pub struct WorkspaceView {
     /// (`window_state::state_path`'s failure mode) — capture then silently
     /// no-ops rather than crashing, matching the store's own contract.
     window_state_path: Option<PathBuf>,
+    /// The recents file + current connection identity (issue #873,
+    /// `docs/spec-host-scoped-root-recents.md`), for the in-cockpit "+ New
+    /// session..." root picker's host-scoped seed/record — the same pair
+    /// `main.rs`'s `Shell` threads through `RootPickerLaunch.recents`. `None`
+    /// when either half is unavailable (no recents-file path resolved, or no
+    /// connection identity given — every non-test `WorkspaceView::new` call
+    /// site supplies both): the picker then seeds `""` and a pick simply
+    /// records nothing, exactly like a `main.rs` launch with no recents path.
+    recents: Option<(PathBuf, RecentTarget)>,
     /// Monotonic generation fencing the debounced window-state save timer
     /// (mirrors `EditorView::arm_buffer_feed`'s `buffer_generation`): each
     /// arm bumps it, so an in-flight timer from an earlier move/resize sees
@@ -634,10 +644,19 @@ impl WorkspaceView {
     /// terminal, created in `main.rs` so it keeps owning the SSH/daemon session
     /// thread). Creates the explorer and editor, mounts all three, and starts the
     /// daemon-stream bridges.
+    ///
+    /// `recents_path`/`recent_target` (issue #873, `docs/spec-host-scoped-
+    /// root-recents.md`) give the in-cockpit "+ New session..." root picker
+    /// the same host-scoped recents store `main.rs`'s pre-cockpit picker
+    /// uses; both are `None` in the existing test call sites, which seeds
+    /// `""` and makes a pick's root-record a no-op, exactly like a `main.rs`
+    /// launch with no recents path.
     pub fn new(
         session_view: Entity<SessionView>,
         channels: WorkspaceChannels,
         window_state_path: Option<PathBuf>,
+        recents_path: Option<PathBuf>,
+        recent_target: Option<RecentTarget>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1477,6 +1496,7 @@ impl WorkspaceView {
             command_palette,
             quick_open,
             window_state_path,
+            recents: recents_path.zip(recent_target),
             window_state_save_generation: 0,
             settings_view,
             dir_browse_tx,
@@ -2064,22 +2084,24 @@ impl WorkspaceView {
     /// [`SessionViewEvent::NewSessionRequested`]. A fresh [`RootPicker`]
     /// entity is built on every open (never reused, mirroring `main.rs`'s
     /// `Shell`), so its correlation guard always starts clean; its start
-    /// level seeds from the phase-9 recents-of-roots store. On `Picked`, the
-    /// name is disambiguated against `session_view`'s live list before
+    /// level seeds from the current connection target's own recorded roots
+    /// (`self.recents`, issue #873, `docs/spec-host-scoped-root-recents.md`),
+    /// never a different host's. On `Picked`, the name is disambiguated
+    /// against `session_view`'s live list before
     /// [`SessionView::create_session_at_root`] sends the create — the
     /// single create-with-root transport this and the pre-cockpit picker
     /// both use.
     fn open_root_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let recent_roots = self
-            .window_state_path
-            .as_deref()
-            .map(|path| window_state::load(path).recent_roots)
+            .recents
+            .as_ref()
+            .map(|(path, target)| recents::target_recent_roots(path, target))
             .unwrap_or_default();
         let start = root_picker::start_path(&recent_roots);
         let picker = cx.new(|cx| RootPicker::new(window, cx));
 
         let dir_browse_tx = self.dir_browse_tx.clone();
-        let window_state_path = self.window_state_path.clone();
+        let recents = self.recents.clone();
         let session_view = self.session_view.clone();
         let subscription = cx.subscribe_in(
             &picker,
@@ -2111,8 +2133,8 @@ impl WorkspaceView {
                         .map(|session| session.name.clone())
                         .collect();
                     let session_name = root_picker::disambiguate_session_name(name, &existing);
-                    if let Some(path) = &window_state_path {
-                        if let Err(e) = window_state::record_recent_root(path, root) {
+                    if let Some((path, target)) = &recents {
+                        if let Err(e) = recents::merge_recent_root(path, target, root) {
                             warn!(%e, "failed to record recent root");
                         }
                     }
@@ -3109,10 +3131,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap();
@@ -3198,10 +3219,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -3256,10 +3276,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -3354,10 +3373,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap();
@@ -3440,8 +3458,9 @@ mod tests {
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
                 session_view = Some(view.clone());
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -3485,10 +3504,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -3578,10 +3596,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -3649,10 +3666,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -3713,10 +3729,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -3774,8 +3789,9 @@ mod tests {
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
                 session_view = Some(view.clone());
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -3830,8 +3846,9 @@ mod tests {
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
                 session_view = Some(view.clone());
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -3924,10 +3941,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4013,10 +4029,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4098,10 +4113,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4169,10 +4183,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4223,10 +4236,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4294,8 +4306,9 @@ mod tests {
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
                 session_view = Some(view.clone());
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4332,8 +4345,9 @@ mod tests {
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
                 session_view = Some(view.clone());
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4394,8 +4408,9 @@ mod tests {
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
                 session_view = Some(view.clone());
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4451,8 +4466,9 @@ mod tests {
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
                 session_view = Some(view.clone());
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4509,8 +4525,9 @@ mod tests {
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
                 session_view = Some(view.clone());
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4567,8 +4584,9 @@ mod tests {
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
                 session_view = Some(view.clone());
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4609,8 +4627,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4750,8 +4769,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4844,10 +4864,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4950,8 +4969,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(session_view, channels, None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, channels, None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
