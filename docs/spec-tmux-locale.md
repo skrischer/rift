@@ -12,8 +12,9 @@ fields into a garbage value (e.g. `@root` `/workspace/rift` + `session_path`
 `/workspace/rift` resolve to `/workspace/rift_/workspace/rift`), so the daemon's
 worktree scan fails ("path not found") and the reactive layer (file tree / git /
 diagnostics) stays dead. Fix: the daemon spawns tmux with `LC_ALL=C.UTF-8` so
-tmux treats the tab as printable and preserves the field separators, regardless
-of the target's default locale.
+tmux preserves the tab in its format output — in a C/POSIX locale tmux sanitizes
+the non-printable tab to `_`; a UTF-8 ctype stops that — regardless of the
+target's default locale.
 
 ## Outcome
 
@@ -60,6 +61,11 @@ of the target's default locale.
   printable separator exists (tmux mangles all non-printables in the C locale,
   and printables appear in paths/names), so forcing UTF-8 is the fix, not a
   separator change.
+- The `#[cfg(test)]` tmux test helpers (`TmuxServer` / `IsolatedTmux`,
+  `terminal.rs` / `lib.rs`) spawn tmux via `std::process::Command` with no locale
+  env; their tab-parse tests would regress only if CI ever ran under a C locale
+  (it does not today). Pre-existing and orthogonal to this bug — noted, not fixed
+  here.
 - Any protocol / daemon-message change; any client (`crates/app`) change.
 
 ## Constraints
@@ -70,6 +76,13 @@ of the target's default locale.
   normal daemon-owns-tmux model (`docs/architecture.md`: the daemon is the sole
   terminal source). A server the daemon attaches to (already running) keeps its
   own locale (Out of scope).
+- **Each tmux invocation sanitizes format output per its OWN locale**, not only
+  the server's. A one-off `tmux list-sessions` client run in a C locale mangles
+  the tab in its own `-F` output even against a UTF-8 server (tmux `list-sessions`
+  cannot create a server, so its role is a short-lived client). So `LC_ALL=C.UTF-8`
+  is required on EVERY tmux `Command` the daemon spawns that reads tab-separated
+  format output — the control-mode attach (server-wide + its own decode) AND the
+  one-off `list-sessions` — for two distinct reasons, not merely for consistency.
 - **`LC_ALL` is the strongest locale override** (wins over every `LC_*` and
   `LANG`), so it forces UTF-8 ctype regardless of the target's `LANG`/`LC_*` —
   the robust choice, matching `clone.rs`'s use of `LC_ALL`.
@@ -103,7 +116,7 @@ of the target's default locale.
 |---|---|---|
 | The daemon spawns tmux with `LC_ALL=C.UTF-8` (not a format/separator change) | tmux in a non-UTF-8 locale replaces the non-printable TAB separator with `_`; forcing a UTF-8 ctype makes tmux preserve it. No printable separator is safe (paths/names contain them), so the locale is the fix. | 2026-07-11 |
 | `LC_ALL` (strongest override) + `C.UTF-8` (portable UTF-8) | `LC_ALL` beats the target's `LANG`/`LC_*`; `C.UTF-8` is always available (musl + glibc 2.35+), unlike `en_US.UTF-8`. Mirrors `clone.rs`'s `LC_ALL`. | 2026-07-11 |
-| Set it on ALL daemon tmux spawns (attach + list-sessions) | The attach spawn is the server-creator (locale-decisive); setting it on every tmux spawn is consistent and cheap, and covers whichever spawn creates the server first. | 2026-07-11 |
+| Set `LC_ALL=C.UTF-8` on EVERY daemon tmux spawn — the control-mode attach AND the one-off `list-sessions` | Two distinct reasons, not consistency: the attach spawn creates the server (server-wide locale) and is the control client that decodes format replies; the one-off `list-sessions` is a separate short-lived tmux CLIENT whose OWN locale governs how IT sanitizes format output — a C-locale one-off mangles the tab even against a UTF-8 server (`list-sessions` never creates a server). Neither env is redundant. | 2026-07-11 |
 | A pre-existing operator-started C-locale tmux server is out of scope (documented limitation) | The server's locale is immutable after creation; the daemon cannot change an attached server's locale. The fix covers the daemon-owns-the-server case (the reported failure); a foreign pre-C server is the operator's to fix (UTF-8 shell) — no rift mechanism forces a foreign server's locale. | 2026-07-11 |
 
 ## Tracking
