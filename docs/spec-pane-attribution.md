@@ -7,7 +7,7 @@ cause*: the daemon rolls up the `/proc` process subtree rooted at each tmux pane
 process (`pane_pid` → descendants' RSS + CPU via `sysinfo`) and pushes a per-pane
 metrics list keyed by `pane_id`; the app surfaces it as a breakdown of the session's
 panes ranked by resource use, each labelled by its `pane_current_command` — **never** by which agent runs there. Extends the Phase-43
-host-telemetry channel from a host aggregate to a per-pane attribution.
+host-telemetry model from a host aggregate to a per-pane attribution.
 
 ## Outcome
 
@@ -17,8 +17,10 @@ host-telemetry channel from a host aggregate to a per-pane attribution.
       `cargo build` or an agent chewing RAM in a pane is attributable to *that pane*.
 - [ ] The daemon pushes a per-pane metrics list keyed by `pane_id` (the id the client
       already has from the layout), each entry carrying the pane's rolled-up RSS + CPU
-      and its agnostic label (`pane_current_command`); push-only on the existing
-      telemetry channel, the same shape as `HostMetrics`.
+      and its agnostic label (`pane_current_command`); a **new per-connection**
+      push-only message (each `serve_connection` sends its own session's list — **not**
+      on the Phase-43 daemon-global broadcast bus), the same message *shape* as
+      `HostMetrics`.
 - [ ] The app surfaces a **per-pane breakdown** of the attached session's panes ranked
       by resource use (the "which pane is the cause" view), each row labelled by its
       `pane_current_command` and showing its RSS (and CPU). The exact surface (anchor +
