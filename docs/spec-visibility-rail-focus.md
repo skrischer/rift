@@ -223,3 +223,15 @@ focus-dependent action dispatch.
   already used), not the file tree — the more likely destination for
   keyboard input, and `Area::ExplorerEditor`'s focused-area detection already
   treats file tree and editor as one unit.
+- 2026-07-11: Implementation (issue #848, rail dispatch decoupling). The spec
+  names two candidate wirings for the entity-bound listener
+  (`activity_rail::render` taking `cx: &mut Context<WorkspaceView>` directly,
+  vs. accepting pre-built listener callbacks from the workspace render site).
+  Chose the callback-parameter form: `WorkspaceView::render` builds the four
+  `cx.listener` closures (still bound to `Entity<WorkspaceView>`, weak
+  reference, satisfying the spec's retain-cycle mitigation) and passes them
+  into `activity_rail::render`, which stays ignorant of `WorkspaceView`/`Area`
+  and only wires a caller-supplied `on_click` to each button — preserving the
+  module's existing "presentational, never reaches into a `WorkspaceView`
+  entity directly" invariant (`activity_rail.rs`'s own module doc) rather than
+  having the rail import and call a `WorkspaceView` method by name.

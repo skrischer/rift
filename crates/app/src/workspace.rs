@@ -2409,7 +2409,14 @@ impl Render for WorkspaceView {
         // state reads the rift-owned `visibility` set — not `dock.is_open` —
         // and the badges read the same `WorktreeModel` the status bar reads
         // below — both live views over one model, no separate rail-owned
-        // state.
+        // state. The four `on_toggle_*` callbacks are `cx.listener`s bound to
+        // this `Entity<WorkspaceView>` (a weak reference, no retain cycle),
+        // calling `Self::toggle_area` directly rather than round-tripping
+        // through `window.dispatch_action`'s focused-node routing
+        // (`docs/spec-visibility-rail-focus.md`, issue #848) — the rail click
+        // path is now focus-immune by construction. The `Toggle*` actions +
+        // their `on_action` handlers below stay in place for the keyboard,
+        // command palette, and agent-driven dispatch.
         let rail = {
             let model = self.file_tree.read(cx).model();
             activity_rail::render(
@@ -2421,6 +2428,18 @@ impl Render for WorkspaceView {
                     changed_count: model.git_statuses().len(),
                     worst_diagnostic: activity_rail::worst_severity(model.all_diagnostics()),
                 },
+                cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    this.toggle_area(Area::ExplorerEditor, window, cx);
+                }),
+                cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    this.toggle_area(Area::Terminal, window, cx);
+                }),
+                cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    this.toggle_area(Area::Git, window, cx);
+                }),
+                cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    this.toggle_area(Area::Diagnostics, window, cx);
+                }),
                 cx,
             )
         };
