@@ -6338,6 +6338,7 @@ dependencies = [
  "rift-lsp",
  "rift-protocol",
  "rift-tmux-core",
+ "sysinfo",
  "tokio",
  "tracing",
  "tracing-subscriber",
