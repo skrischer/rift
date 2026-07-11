@@ -54,12 +54,13 @@ host-telemetry model from a host aggregate to a per-pane attribution.
   wire tag `pane_metrics`). `PROTOCOL_VERSION` bumped to the next free value at merge,
   fingerprint re-pinned; serde round-trip test for the message and a `PaneMetric`, and
   a malformed-input test.
-  **Conditional on the sampling-model gate decision:** the *on-demand* branch also adds
-  a client to daemon opt-in `ClientMessage` (there is no client request path today —
-  the telemetry channel is push-only), so per-connection sampling activates only while
-  a breakdown is open; the *always-on* branch adds no second message. The gate resolves
-  this **before** the protocol issue is cut (issues are created post-merge), so the
-  protocol issue ships the right surface.
+  **Plus a client→daemon opt-in message (sampling model = on-demand, resolved at the
+  gate):** a new `ClientMessage` (e.g. `SetPaneMetricsEnabled { enabled: bool }`) by
+  which a connection turns per-pane sampling **on** while its breakdown popover is open
+  and **off** when it closes — the telemetry channel has no client request path today,
+  so this is the opt-in that makes on-demand possible. The protocol issue ships **both**
+  the `PaneMetrics` push and this opt-in message under the one version bump; serde tests
+  cover both.
 - **`crates/daemon` pane pid**: extend the internal pane query (`LAYOUT_QUERY`,
   `terminal.rs:65`) with `#{pane_pid}`, inserted **before** the tab-tolerant trailing
   `window_name` field and bumping the `splitn(13, '\t')` parse in `parse_layout_line`
@@ -69,14 +70,18 @@ host-telemetry model from a host aggregate to a per-pane attribution.
   `pane_id` and never needs the host pid, so the wire type is unchanged (no
   layout-format version concern). The `terminal_task` surfaces a
   `pane_id → pane_pid` map for its connection's session to `serve_connection`.
-- **`crates/daemon` shared process snapshot (daemon-global)**: the one place that is
-  genuinely daemon-global. Once per tick, the shared sampler refreshes the process
-  table (`sysinfo`, `["system"]` feature — already present; the current sampler
-  refreshes only cpu+memory, so a per-tick **process** refresh is added — see the
-  priming risk) and publishes a shared, immutable snapshot — a `parent_pid → children`
-  index plus per-PID `{ rss, cpu }` — on a daemon-global `watch`, built **once** per
-  tick. This is the only reused daemon-global piece besides the connection-gating
-  counter; a single process refresh serves all connections.
+- **`crates/daemon` shared process snapshot (daemon-global, opt-in-gated)**: the one
+  place that is genuinely daemon-global. **Only while ≥1 connection has opted in** (a
+  process-global pane-metrics-enabled counter, mirroring the Phase-43 connection-gating
+  counter — incremented on `SetPaneMetricsEnabled { true }`, decremented on `false` /
+  disconnect), the shared sampler refreshes the process table (`sysinfo`, `["system"]`
+  feature — already present; the current sampler refreshes only cpu+memory, so a
+  per-tick **process** refresh is added — see the priming risk) and publishes a shared,
+  immutable snapshot — a `parent_pid → children` index plus per-PID `{ rss, cpu }` — on
+  a daemon-global `watch`, built **once** per tick. With the counter at zero the daemon
+  does **no** process refresh (an idle daemon, or one whose clients have no breakdown
+  open, does zero per-pane work). A single process refresh serves all opted-in
+  connections; primed on activation for the per-process CPU two-sample rule.
 - **`crates/daemon` per-connection roll-up + push**: **not** the Phase-43 broadcast
   bus and **not** its single global replay cache — those fan one identical value to
   every connection and would hand each connection another session's pane data (the
@@ -86,20 +91,23 @@ host-telemetry model from a host aggregate to a per-pane attribution.
   from the snapshot's child index, builds **its own** `PaneMetrics`, and writes it to
   **its own** socket — a per-connection computation with a per-connection latest-value
   cache (compute-and-send as soon as it has both a layout and a snapshot; no
-  cross-connection replay needed). Runs under the existing `spawn_blocking`. The
-  *activation* of per-connection sampling (always-on vs on-demand while the breakdown
-  is open) is resolved at the gate; see the sampling-model decision and its protocol
-  consequence (the conditional client→daemon opt-in message).
+  cross-connection replay needed). Runs under the existing `spawn_blocking`. A
+  connection rolls up + pushes **only while it has opted in** (its breakdown popover is
+  open, per `SetPaneMetricsEnabled`); on opt-out (popover closed / disconnect) it stops
+  and decrements the shared-snapshot gate.
 - **`crates/app` ingest**: a `PaneMetrics` router arm in `consume_daemon_messages`
   (mirroring the `HostMetrics` arm) routing to a new channel; a
   `pane_metrics: Vec<PaneMetric>` (or `HashMap<pane_id, PaneMetric>`) field on
   `WorkspaceView`, fed by a fold spawn loop mirroring the host-metrics loop; `notify`
   on update.
-- **`crates/app` breakdown surface**: a per-pane breakdown listing the attached
-  session's panes ranked by RSS (then CPU), each row = label (`command`) + RSS + CPU. Rendered via the vendored `gpui-component` popover primitives. The
-  anchor/trigger (the Phase-43/44 `MEM% · CPU%` status indicator made clickable, vs a
-  per-pane-header badge, vs both) is resolved at the gate; the status segments are
-  already click-dispatch capable (`status_bar.rs`).
+- **`crates/app` breakdown surface (resolved: popover on the MEM/CPU indicator)**:
+  clicking the Phase-43/44 `MEM% · CPU%` status segment toggles a popover listing the
+  attached session's panes ranked by RSS (then CPU), each row = label (`command`) + RSS
+  + CPU. Rendered via the vendored `gpui-component` popover primitives; the status
+  segment is made clickable (segments already dispatch clicks, `status_bar.rs`). On open
+  the app sends `SetPaneMetricsEnabled { true }` (starting daemon sampling); on close it
+  sends `{ false }`. Rows render from the `PaneMetrics` pushes folded into
+  `WorkspaceView`; the popover shows a brief "sampling…" state until the first push.
 - **`docs/protocol.md`**: a "Pane metrics" push section and a next-version History line.
 
 ### Out of scope
@@ -193,8 +201,8 @@ host-telemetry model from a host aggregate to a per-pane attribution.
 | Subtree roll-up = **one process snapshot + a `parent_pid→children` index per tick**, then a per-pane DFS sum | `sysinfo` exposes each process's parent pid; building the child index once and summing each pane's subtree is O(processes)+O(subtree), far cheaper than re-walking `/proc` per pane. The prior-art (`tmux-task-monitor`) uses the same recursive-children method | 2026-07-11 |
 | A short-lived child racing a sample is **tolerated** — it is simply in or out of that tick's snapshot | Attribution is an ambient sample, not accounting; a process that appears/vanishes between ticks shows up on the next sample or not at all. No attempt to catch sub-tick churn (which would need per-process accounting the feature does not warrant) | 2026-07-11 |
 | v1 attributes the **attached session's** panes (per-connection), not host-wide | The breakdown answers "which of *my* panes is the cause"; the connection already tracks its session's layout, so per-connection keys naturally to what the user sees and avoids leaking other sessions' process data. The host aggregate (Phase 43) still shows total load; cross-session attribution is deferred | 2026-07-11 |
-| OPEN — the **breakdown surface** (anchor + trigger): the `MEM% · CPU%` status indicator made clickable → a ranked pane list, vs per-pane-header badges, vs both | resolved at the spec-acceptance gate — a UX surface call; recommended option presented there | — |
-| OPEN — the **sampling activation model**: always-on (process refresh + per-connection roll-up every tick) vs on-demand (only while a breakdown is open, via a new client→daemon opt-in `ClientMessage`) | resolved at the spec-acceptance gate. Cost driver is the per-tick process-table refresh (a few ms at 2 s — modest even continuously, cf. htop). **Always-on is the simpler default** (no new wire message, processes stay CPU-primed); on-demand saves the refresh when nobody is looking but adds the opt-in message and a ~1-tick stale first CPU frame. This choice sets the protocol surface (see the protocol scope) — resolved before the protocol issue is cut | — |
+| **Breakdown surface (resolved at the gate): a popover on the `MEM% · CPU%` status indicator** — clicking it toggles a ranked pane list (RSS/CPU per pane, `command` label) | Directly connects "host under pressure" (the indicator) to "which pane is the cause"; reuses the existing click-capable status segment as the anchor — no new always-on chrome. Per-pane-header badges were declined (they would force always-on sampling) | 2026-07-11 |
+| **Sampling model (resolved at the gate): on-demand** — per-connection sampling runs only while the breakdown popover is open, via a new client→daemon opt-in `ClientMessage` (`SetPaneMetricsEnabled { enabled }`); the shared process refresh is gated on a process-global opt-in counter (zero → no process work) | The feature's whole motivation is the shared-host resource budget, so an idle daemon must do zero process refreshes; the accepted costs are the second wire message and a ~1-tick stale first CPU frame (RSS is immediate, so the primary RSS ranking is correct at once). Composes with the popover surface (opt-in on open, opt-out on close) | 2026-07-11 |
 
 ## Tracking
 
@@ -202,10 +210,12 @@ The decomposition into steps lives as GitHub issues, one per implementable step,
 under the milestone. This spec owns the design; the issues own progress.
 
 - Milestone: [Phase 450 — Per-pane resource attribution](#) (created at the acceptance gate)
-- Issues: created from this spec once merged — `protocol` (PaneMetrics + version bump),
-  `daemon` (pane_pid query + subtree roll-up + push), `app` (ingest + breakdown
-  surface). Dependency edges in the issue bodies; the surface + sampling-model
-  decisions shape the daemon + app issues.
+- Issues: created from this spec once merged — `protocol` (`PaneMetrics` push +
+  `SetPaneMetricsEnabled` opt-in `ClientMessage` + version bump), `daemon` (`#{pane_pid}`
+  query + opt-in-gated shared process snapshot + per-connection subtree roll-up + push),
+  `app` (ingest + the MEM/CPU-indicator popover with opt-in/opt-out wiring). Dependency
+  edges in the issue bodies (daemon + app both depend on protocol; the app ingest +
+  popover stay one issue to avoid the dead-code trap).
 
 ## Verification
 
@@ -276,3 +286,11 @@ under the milestone. This spec owns the design; the issues own progress.
   note; `pane_title` dropped as a hard label (needs an added query field — future
   refinement), label is `pane_current_command`; `command` re-ship justified as a
   sample-coherent snapshot.
+- 2026-07-11 (spec-acceptance gate — ACCEPTED): both open items resolved. **Surface:** a
+  popover on the `MEM% · CPU%` status indicator (click to toggle a ranked pane list),
+  reusing the click-capable status segment — per-pane-header badges declined.
+  **Sampling: on-demand** — per-connection sampling runs only while the popover is open,
+  via a new `ClientMessage::SetPaneMetricsEnabled { enabled }`; the shared process
+  refresh is gated on a process-global opt-in counter so an idle daemon does zero
+  process work. The protocol issue therefore ships both the `PaneMetrics` push and the
+  opt-in `ClientMessage` under one version bump. Human prerequisites: none.
