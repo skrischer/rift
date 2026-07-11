@@ -1,6 +1,6 @@
 # Spec: Host resource telemetry core
 
-> Status: DRAFT
+> Status: READY
 > Created: 2026-07-11
 
 The daemon samples the host's own CPU / memory / swap / load from `/proc` (via the
@@ -206,7 +206,7 @@ per-pane attribution, 46 detail + disk) build on.
 | Indicator **hidden until the first sample**, right group, before the clock | Mirrors the LSP dot (absent until a server is known); `Option<HostMetrics>` renders nothing until populated. Placement follows the sketch (right-side ambient info) | 2026-07-11 |
 | `sysinfo` with `default-features = false, features = ["system"]`, workspace-declared, version reused from `Cargo.lock` (0.31.x) | Minimal surface (CPU/mem/load only — disk is Phase 46), musl-clean, and reusing the resolved version avoids a second `sysinfo` build | 2026-07-11 |
 | **Foundation ratification**: extend the "exactly two signals" principle to three (add host resource state / `/proc`) in `docs/constitution.md` + `docs/architecture.md`, authored on this spec branch | The roadmap seed flagged this Phase-43 foundation impact; `/proc` is a genuinely new signal source (neither a PTY byte stream nor a filesystem-change event), still fully agent-agnostic (host-global, `/proc` knows nothing about agents). Ratified at the spec-acceptance gate, never edited from the roadmap | 2026-07-11 |
-| OPEN — ratify the exact constitution/architecture wording of the third-signal amendment | resolved at the spec-acceptance gate | — |
+| **Ratified**: extend the "exactly two signals" principle to **three** — host resource state (`/proc`) is the third agent-agnostic host signal — with the wording authored in this PR's `constitution.md` + `architecture.md` | Accepted at the spec-acceptance gate; `/proc` is a genuinely new signal source, still host-global and agent-agnostic | 2026-07-11 |
 
 ## Tracking
 
