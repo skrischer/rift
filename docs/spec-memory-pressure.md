@@ -50,19 +50,27 @@ adds "know when it's bad." Builds on the Phase-43 host-telemetry core (daemon-gl
 - **`crates/protocol`**: a new `MemoryPressure` payload type carrying the
   `/proc/pressure/memory` averages — `some_avg10`, `some_avg60`, `some_avg300`,
   `full_avg10`, `full_avg60`, `full_avg300` (all `f64`, the kernel's percent-stalled
-  figures) — added to `DaemonMessage::HostMetrics` as a single field
-  `psi: Option<MemoryPressure>` with `#[serde(default, skip_serializing_if =
-  "Option::is_none")]` (wire-additive; a PSI-less host emits nothing). `LoadAverage`
+  figures) — deriving `Copy` (six `f64`) so the app-local `status_bar::HostMetrics`
+  that embeds it stays `Copy` — added to `DaemonMessage::HostMetrics` as a single
+  field `psi: Option<MemoryPressure>` with `#[serde(default, skip_serializing_if =
+  "Option::is_none")]` (intra-version optionality: a same-version PSI-less WSL2 host
+  emits no `psi` key; the required `cpu` / `load` fields stay required, so the
+  existing missing-required-field rejection test still holds). `LoadAverage`
   and the existing fields are unchanged. `PROTOCOL_VERSION` 13 → 14 (next free at
   merge), fingerprint re-pinned. serde round-trip tests for the message **with** and
   **without** `psi`, plus a `MemoryPressure` round-trip and a malformed-input test
   (mirroring the Phase-43 `HostMetrics` tests).
-- **`crates/daemon`**: in the existing sampler tick (`build_host_metrics_message` /
-  `host_metrics_sampler`, `lib.rs`), populate `psi` by reading
-  `/proc/pressure/memory` when it exists and parsing its two `some` / `full` lines;
-  `None` when the file is absent or unparseable. The file-existence check is resolved
-  **once** at sampler start (PSI availability is a boot-time kernel property, not a
-  per-tick change) and cached; the per-tick read runs inside the sampler's existing
+- **`crates/daemon`**: a `read_memory_pressure(path: &Path) -> Option<MemoryPressure>`
+  helper — path-injectable so it is fixture-testable — reading the file and parsing
+  its two `some` / `full` lines, returning `None` when the file is absent or
+  unparseable. It parses the `avgN` tokens and **ignores the trailing `total=<µs>`
+  counter** each line also carries (the `avgN` are the ready-to-use percentages). The
+  PSI value is threaded into the pure builder as a parameter —
+  `build_host_metrics_message(&System, Option<MemoryPressure>)` — keeping the builder
+  pure/testable (its existing `test_build_host_metrics_message_produces_plausible_sample`
+  is updated to pass the new arg). The file-existence check is resolved **once** at
+  sampler start (PSI availability is a boot-time kernel property, not a per-tick
+  change) and cached; the per-tick read runs inside the sampler's existing
   `spawn_blocking` alongside the `sysinfo` refresh. A small dedicated parser (sysinfo
   does **not** expose PSI) with unit tests over a real `/proc/pressure/memory`-shaped
   fixture and a malformed string. No new dependency.
@@ -74,7 +82,12 @@ adds "know when it's bad." Builds on the Phase-43 host-telemetry core (daemon-gl
   `PressureLevel { Normal, Warning, Critical }`, computed from the portable baseline
   (mem-available ratio + swap-used ratio) with enter/exit hysteresis, taking the
   previous level so the hysteresis band applies, and escalated by PSI when present.
-  Unit-tested across the bands, the hysteresis boundaries, and PSI-present vs absent.
+  PSI escalation shape (default, tunable with the thresholds at the gate): a nonzero
+  memory stall raises the level by one band — `some_avg10` above a small stall cutoff
+  escalates a baseline `Normal` to `Warning`, and any `full_avg10 > 0` (the host is
+  fully stalled on memory) escalates to `Critical`; PSI only ever raises, never
+  lowers, the baseline verdict. Unit-tested across the bands, the hysteresis
+  boundaries, and PSI-present vs absent.
 - **`crates/app` recolour**: the `MEM% · CPU%` segment (`status_bar.rs`) takes its
   text colour from the level — `Normal → theme.muted_foreground`, `Warning →
   theme.warning`, `Critical → theme.danger` — replacing the unconditional
@@ -87,7 +100,12 @@ adds "know when it's bad." Builds on the Phase-43 host-telemetry core (daemon-gl
   nav loops right below it already use — so it has the `Window` handle
   `push_notification` needs. `WorkspaceView` tracks the previous level to detect the
   edge; the toast fires only on the rising edge and re-arms after a return to
-  `Normal`.
+  `Normal`. **Initial / replayed sample seeds silently:** because `HostMetrics` is
+  welcome-replayed, a client (re)connecting while the host is already under pressure
+  receives a `Warning` / `Critical` sample first; that first sample **establishes**
+  the tracked level **without** firing a toast (the previous level is seeded from it),
+  so a reconnect or a new window under sustained pressure does not spam — only a
+  *subsequent* rise fires.
 - **`docs/protocol.md`**: extend the "Host metrics" push section with the optional
   PSI payload and add a `version 14` History line.
 
@@ -116,6 +134,11 @@ adds "know when it's bad." Builds on the Phase-43 host-telemetry core (daemon-gl
   ([archive/spec-host-telemetry.md](archive/spec-host-telemetry.md)) are reused as-is;
   Phase 44 only adds a field to the sample and adds client-side interpretation. No
   change to the sampling cadence (2 s), the daemon-global model, or the replay hook.
+- **No foundation-doc change.** Phase 43 already amended `docs/constitution.md` /
+  `docs/architecture.md` to admit host resource state (`/proc`: CPU / memory / swap /
+  load) as the third agent-agnostic signal; `/proc/pressure/memory` is a further read
+  under that same admission, so this phase ratifies nothing new — the acceptance PR
+  carries only the spec + the roadmap link, no foundation-doc edit.
 - **Portable baseline is the guaranteed path; PSI is optional and file-gated.** The
   stock `microsoft-standard-WSL2` kernel ships without `CONFIG_PSI` (confirmed live
   in Phase-43 planning), so `/proc/pressure/memory` is absent on the developer's own
@@ -186,7 +209,9 @@ adds "know when it's bad." Builds on the Phase-43 host-telemetry core (daemon-gl
 | **Hysteresis** via separate enter/exit thresholds; the toast fires only on a **rising** level edge and re-arms after a return to `Normal` | An ambient indicator that flaps colour or spams toasts around a boundary is worse than none; separate enter/exit bands and edge-triggered, re-arming toasts are the standard notification-fatigue guard (systemd-oomd / monitoring precedent) | 2026-07-11 |
 | Recolour reuses `theme.warning` / `theme.danger`; `Normal` stays `muted_foreground` | The semantic tokens the diagnostic-count and LSP-dot segments already use — no new colour system, no hardcoded hex (aligns with the Phase-26 hardcoded-palette cleanup direction) | 2026-07-11 |
 | The PSI file-existence check is resolved **once** at sampler start and cached | PSI availability is a boot-time kernel-config property (`CONFIG_PSI`), not a runtime-varying condition; checking every tick is wasteful | 2026-07-11 |
-| OPEN — the concrete **warning / critical thresholds and hysteresis bands** (available-memory % enter/exit, swap-used % enter/exit) | resolved at the spec-acceptance gate — a UX taste call on the developer's own dogfooding host; recommended defaults presented there | — |
+| The first / welcome-replayed sample **seeds** the tracked level without firing a toast | `HostMetrics` is welcome-replayed, so a client (re)connecting under sustained pressure receives a Warning/Critical sample first; seeding the previous level from it (silent) means a reconnect or new window shows the right colour at once but does not re-toast — only a genuine *rise* during the session fires | 2026-07-11 |
+| PSI escalation **shape** is fixed (only the numeric cutoffs are gate-open): a nonzero `some_avg10` stall raises one band; any `full_avg10 > 0` → `Critical`; PSI never lowers the baseline | Keeps the daemon/client contract unambiguous for the implementer while leaving the taste-level numbers to the gate; a full memory stall is unambiguous evidence of critical pressure | 2026-07-11 |
+| OPEN — the concrete **warning / critical thresholds and hysteresis bands** (available-memory % enter/exit, swap-used % enter/exit, and the PSI `some_avg10` stall cutoff that escalates to Warning) | resolved at the spec-acceptance gate — a UX taste call on the developer's own dogfooding host; recommended defaults presented there. The escalation *shape* (PSI raises by one band, `full_avg10 > 0` → Critical) is fixed in Prior decisions; only the numeric cutoffs are open | — |
 
 ## Tracking
 
@@ -222,6 +247,10 @@ under the milestone. This spec owns the design; the issues own progress.
       the WSL2 host (no PSI) the portable baseline alone drives this; cross-check the
       trigger point against `free -m`. Confirm no flapping when memory hovers at a
       boundary.
+- [ ] Behavioural (dev-channel QA): (re)connecting a client — or opening a second
+      channel / window — while the host is already under pressure shows the correct
+      warning colour immediately but fires **no** toast on connect (the replayed
+      sample seeds the level silently); only a subsequent rise toasts.
 - [ ] The daemon binary embeds **no new dependency** for PSI (the read is `std::fs` +
       a local parser); `cargo deny check licenses` is unchanged.
 
