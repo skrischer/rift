@@ -286,6 +286,9 @@ pub struct WorkspaceChannels {
     /// `LspStatus` pushes to fold into the composite status line's
     /// language-server health map (`docs/spec-status-line.md`).
     pub lsp_status_rx: Receiver<DaemonMessage>,
+    /// `HostMetrics` pushes to fold into the composite status line's MEM/CPU
+    /// segment (`docs/spec-host-telemetry.md`).
+    pub host_metrics_rx: Receiver<DaemonMessage>,
     /// `FileDiff` replies to route to the diff view (#338).
     pub diff_rx: Receiver<DaemonMessage>,
     /// Read requests: the root-relative path of a file to open. The tokio side
@@ -534,6 +537,13 @@ pub struct WorkspaceView {
     /// from the daemon's `LspStatus` push (replayed behind Welcome). Read
     /// inline in [`WorkspaceView::render`].
     lsp: BTreeMap<String, LspServerState>,
+    /// The host's latest resource sample for the composite status line's
+    /// MEM/CPU segment (`docs/spec-host-telemetry.md`), folded from the
+    /// daemon's `HostMetrics` push (replayed behind Welcome). `None` until
+    /// the first sample arrives, which hides the segment entirely (mirroring
+    /// the LSP dot before a server is known). Read inline in
+    /// [`WorkspaceView::render`].
+    host_metrics: Option<status_bar::HostMetrics>,
     /// The diff view (`docs/spec-source-control.md`, #338): renders the
     /// `FileDiff` streamed for the source-control panel's selection. Kept as
     /// its own field for the same reason as `problems_panel` above; the
@@ -632,6 +642,7 @@ impl WorkspaceView {
             buffer_rx,
             nav_rx,
             lsp_status_rx,
+            host_metrics_rx,
             diff_rx,
             open_file_tx,
             save_file_tx,
@@ -986,6 +997,42 @@ impl WorkspaceView {
                         return;
                     };
                     view.lsp.insert(server, state);
+                    cx.notify();
+                });
+                if result.is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
+
+        // Host resource stream -> composite status line
+        // (`docs/spec-host-telemetry.md`): each daemon-global `HostMetrics`
+        // push replaces the latest sample wholesale (replayed behind Welcome
+        // so a reattach sees current state), then a notify repaints the
+        // status bar. `None` before the first sample, which hides the
+        // segment (mirroring the LSP fold above). Routed through this view's
+        // weak handle so a closed window ends the loop gracefully.
+        {
+            cx.spawn(async move |this, cx| loop {
+                let Ok(msg) = host_metrics_rx.recv_async().await else {
+                    break;
+                };
+                let result = this.update(cx, |view, cx| {
+                    let DaemonMessage::HostMetrics {
+                        cpu,
+                        mem_total,
+                        mem_available,
+                        ..
+                    } = msg
+                    else {
+                        return;
+                    };
+                    view.host_metrics = Some(status_bar::HostMetrics {
+                        cpu,
+                        mem_total,
+                        mem_available,
+                    });
                     cx.notify();
                 });
                 if result.is_err() {
@@ -1418,6 +1465,7 @@ impl WorkspaceView {
             results_open: false,
             results_opened_dock: false,
             lsp: BTreeMap::new(),
+            host_metrics: None,
             diff_view,
             open_file_tx,
             dock_area,
@@ -2367,6 +2415,7 @@ impl Render for WorkspaceView {
                     lines_removed,
                     diagnostics: model.all_diagnostics(),
                     lsp: &self.lsp,
+                    host_metrics: self.host_metrics.as_ref(),
                     cursor,
                     clock: &clock,
                 },
@@ -2829,6 +2878,7 @@ mod tests {
         let (_buffer_tx, buffer_rx) = flume::unbounded();
         let (_nav_reply_tx, nav_rx) = flume::unbounded();
         let (_lsp_status_tx, lsp_status_rx) = flume::unbounded();
+        let (_host_metrics_tx, host_metrics_rx) = flume::unbounded();
         let (_diff_reply_tx, diff_rx) = flume::unbounded();
         let (open_file_tx, _open_file_rx) = flume::unbounded();
         let (save_file_tx, _save_file_rx) = flume::unbounded();
@@ -2844,6 +2894,7 @@ mod tests {
             buffer_rx,
             nav_rx,
             lsp_status_rx,
+            host_metrics_rx,
             diff_rx,
             open_file_tx,
             save_file_tx,

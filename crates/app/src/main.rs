@@ -108,6 +108,9 @@ struct EditorChannels {
     /// `LspStatus` pushes routed to the workspace's composite status line
     /// language-server health segment (`docs/spec-status-line.md`).
     lsp_status_tx: flume::Sender<rift_protocol::DaemonMessage>,
+    /// `HostMetrics` pushes routed to the workspace's composite status line
+    /// MEM/CPU segment (`docs/spec-host-telemetry.md`).
+    host_metrics_tx: flume::Sender<rift_protocol::DaemonMessage>,
     /// Root-relative paths to open, emitted by the tree (or the editor's
     /// auto-reload); each becomes an `OpenFile` request.
     open_file_rx: flume::Receiver<String>,
@@ -928,6 +931,7 @@ impl Shell {
         let (buffer_tx, buffer_rx) = flume::unbounded();
         let (nav_daemon_tx, nav_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
         let (lsp_status_tx, lsp_status_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
+        let (host_metrics_tx, host_metrics_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
         let (open_file_tx, open_file_rx) = flume::unbounded::<String>();
         let (save_file_tx, save_file_rx) = flume::unbounded::<rift_protocol::ClientMessage>();
         let (buffer_change_tx, buffer_change_rx) =
@@ -1035,6 +1039,7 @@ impl Shell {
                 buffer_tx,
                 nav_tx: nav_daemon_tx,
                 lsp_status_tx,
+                host_metrics_tx,
                 open_file_rx,
                 save_file_rx,
                 buffer_change_rx,
@@ -1093,6 +1098,7 @@ impl Shell {
                     buffer_rx,
                     nav_rx,
                     lsp_status_rx,
+                    host_metrics_rx,
                     diff_rx,
                     open_file_tx,
                     save_file_tx,
@@ -2840,6 +2846,14 @@ async fn consume_daemon_messages(
             msg @ DaemonMessage::LspStatus { .. } => {
                 let _ = editor.lsp_status_tx.send(msg);
             }
+            // --- host resource sample -> composite status line (every mode) ---
+            // Daemon-global `HostMetrics` pushes (`docs/spec-host-telemetry.md`),
+            // replayed once behind Welcome so a (re)attaching client sees the
+            // latest sample without waiting for the next tick — the same
+            // precedent as `LspStatus` above.
+            msg @ DaemonMessage::HostMetrics { .. } => {
+                let _ = editor.host_metrics_tx.send(msg);
+            }
             // --- diff reply -> diff view (every mode) ---
             // The reply to a `RequestDiff`: forward to the diff view, which
             // routes it by path against the currently open selection (#338).
@@ -3654,6 +3668,7 @@ mod tests {
         let (buffer_tx, _) = flume::unbounded();
         let (nav_reply_tx, _) = flume::unbounded();
         let (lsp_status_tx, _) = flume::unbounded();
+        let (host_metrics_tx, _) = flume::unbounded();
         let (open_file_tx, open_file_rx) = flume::unbounded();
         let (save_file_tx, save_file_rx) = flume::unbounded();
         let (buffer_change_tx, buffer_change_rx) = flume::unbounded();
@@ -3686,6 +3701,7 @@ mod tests {
                 buffer_tx,
                 nav_tx: nav_reply_tx,
                 lsp_status_tx,
+                host_metrics_tx,
                 open_file_rx,
                 save_file_rx,
                 buffer_change_rx,
