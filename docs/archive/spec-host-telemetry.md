@@ -1,6 +1,6 @@
 # Spec: Host resource telemetry core
 
-> Status: READY
+> Status: COMPLETED (2026-07-11)
 > Created: 2026-07-11
 
 The daemon samples the host's own CPU / memory / swap / load from `/proc` (via the
@@ -270,3 +270,28 @@ under the milestone. This spec owns the design; the issues own progress.
   host telemetry is a **daemon-global** signal (one sampler, all connections), not
   per-context. One open item — the exact constitution/architecture wording of the
   third-signal amendment — carried to the acceptance gate for ratification.
+- 2026-07-11 (spec-acceptance gate): foundation amendment ratified — constitution +
+  architecture extended from "two signals" to "three agent-agnostic host signals"
+  (`/proc` the third). Status READY; milestone #62 created; issues #852 (protocol),
+  #853 (daemon), #854 (app ingest), #855 (app status-line) seeded.
+- 2026-07-11 (implementation): #852 shipped `DaemonMessage::HostMetrics` +
+  `LoadAverage`, `PROTOCOL_VERSION` 12→13, fingerprint re-pinned. #853 shipped the
+  daemon-global `HostMetricsBus` (broadcast + `watch` replay cache + `AtomicUsize`
+  gate) built once at the process level in `serve`/`serve_uds`, a 2 s `sysinfo`
+  sampler under `spawn_blocking`, connection-gating via the explicit counter
+  (increment before spawn / decrement in cleanup — **independent of
+  `KeepWarmEvent`**), welcome-replay after `write_snapshot`, and lagged-bus =
+  non-fatal; it also fixed a pre-existing `drain_messages` test-helper livelock the
+  2 s heartbeat exposed (HostMetrics frames no longer reset the settle deadline).
+  **#854 + #855 shipped as ONE app PR (#859)**: split, #854's written-but-unread
+  `host_metrics` field would fail dead-code `clippy -D warnings`, so ingest + render
+  are one unit. Since `protocol` inlines the fields on the enum variant (no reusable
+  payload struct), the app defined a minimal app-local
+  `status_bar::HostMetrics { cpu, mem_total, mem_available }` — the three fields
+  Phase 43 reads (44/46 widen it). `sysinfo` 0.31.4 reused from `Cargo.lock`,
+  `["system"]` feature, `cargo deny` clean.
+- 2026-07-11 (milestone QA gate — ACCEPTED): dev-channel QA confirmed the status
+  line shows a live `MEM% · CPU%` matching the host — displayed ~37 % MEM
+  cross-checked against `/proc/meminfo` (MemAvailable-based 37.2 %). Design richness
+  (threshold coloring, detail popover, sparkline, per-pane, disk) is deliberately
+  the Phase 44–46 scope, not a Phase-43 regression. Spec COMPLETED, archived.
