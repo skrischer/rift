@@ -2382,7 +2382,6 @@ async fn try_daemon_reconnect(
         &endpoint.remote_path,
         &endpoint.socket_path,
         &endpoint.log_path,
-        endpoint.project_root.as_deref(),
     )
     .await
     .map_err(ReconnectFailure::Transient)?;
@@ -2442,9 +2441,6 @@ struct DaemonEndpoint {
     socket_path: String,
     /// Detached-spawn log beside the binary (`<binary>.log`).
     log_path: String,
-    /// Project root a fresh spawn watches; a reattach keeps the running
-    /// daemon's root.
-    project_root: Option<String>,
 }
 
 /// Best-effort daemon provisioning, run before the terminal is opened.
@@ -2551,22 +2547,11 @@ async fn provision_daemon(
         }
     }
 
-    // Project root the daemon should watch: RIFT_PROJECT_ROOT (runtime) wins over
-    // a `just promote` compile-time bake (RIFT_DEFAULT_PROJECT_ROOT), mirroring the
-    // RIFT_SSH_KEY / RIFT_DEFAULT_SSH_KEY split. None makes a freshly spawned daemon
-    // refuse to start and this call fall back to tmux-only (see the `Err` arm
-    // below); the root is only honored on a fresh spawn, so a reattach keeps the
-    // already-running daemon's root regardless of this value.
-    let project_root = env::var("RIFT_PROJECT_ROOT")
-        .ok()
-        .or_else(|| option_env!("RIFT_DEFAULT_PROJECT_ROOT").map(String::from));
-
     let channel = match rift_ssh::connect_or_spawn_daemon(
         conn,
         &remote_path,
         &socket_path,
         &log_path,
-        project_root.as_deref(),
     )
     .await
     {
@@ -2597,7 +2582,6 @@ async fn provision_daemon(
                     remote_path,
                     socket_path,
                     log_path,
-                    project_root,
                 },
             )));
         }
@@ -2637,7 +2621,6 @@ async fn provision_daemon(
         &remote_path,
         &socket_path,
         &log_path,
-        project_root.as_deref(),
     )
     .await
     {
@@ -2660,7 +2643,6 @@ async fn provision_daemon(
                     remote_path,
                     socket_path,
                     log_path,
-                    project_root,
                 },
             )))
         }
