@@ -28,6 +28,13 @@ anyhow = "1"
 thiserror = "2"
 ignore = "0.4"
 notify = "7"
+# Host resource telemetry (`docs/spec-host-telemetry.md`): the daemon-global
+# `/proc` sampler. `default-features = false` + `["system"]` keeps the daemon
+# to CPU/memory/load only (no disk/network/component) and, on the musl target,
+# pure-Rust (`/proc` + `libc` bindings, no C compilation). Version pinned to
+# the one already resolved in Cargo.lock (0.31.x, pulled in transitively by
+# the app's `zed-scap` dep) so the daemon build adds no second `sysinfo`.
+sysinfo = { version = "0.31", default-features = false, features = ["system"] }
 # Pure-Rust git for the read-only status path (musl-clean; git2/libgit2 is a C
 # dep ruled out by the static-musl daemon build). `max-performance` (zlib-ng, C)
 # is deliberately NOT enabled — `status` + `dirwalk` over the default pure-Rust
