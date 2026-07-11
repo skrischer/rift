@@ -32,10 +32,21 @@ async fn main() -> anyhow::Result<()> {
         // it survives connection drops (issue #62).
         Some("--serve-uds") => {
             let (path, root_flag, log_file_flag) = parse_serve_uds_args(args)?;
-            let root = watched_root(root_flag)?;
             init_logging(default_log_path(&path), log_file_flag)?;
-            tracing::info!(socket = %path, worktree = %root.display(), "rift-daemon listening");
-            serve_uds(Path::new(&path), Some(root)).await
+            match &root_flag {
+                Some(root) => {
+                    tracing::info!(socket = %path, worktree = %root.display(), "rift-daemon listening");
+                }
+                None => {
+                    tracing::info!(socket = %path, "no initial root — awaiting first attach");
+                }
+            }
+            // No `watched_root` here (unlike the bare stdio arm below): the
+            // per-session `@root` substrate re-roots every connection on its
+            // first attach (`reroot_connection`, `lib.rs`), so `--serve-uds`
+            // must accept an absent `--root` and let `serve_uds` start with
+            // `None` rather than refusing to launch.
+            serve_uds(Path::new(&path), root_flag).await
         }
         // Relay mode: connect the process's stdio to a running daemon's socket.
         // The SSH host wires its channel to this so the channel reaches the
@@ -148,13 +159,15 @@ fn parse_serve_uds_args(
     Ok((path, root, log_file))
 }
 
-/// The directory the daemon watches: the `--root` flag, required. There is no
-/// launch-directory fallback (issue #502): over SSH the launch directory is
-/// `$HOME`, so falling back to it silently pointed the file watcher and git
-/// status at the whole home directory instead of the intended project. Every
-/// sanctioned launch path (`crates/ssh/src/launch.rs`, `justfile`) already
-/// resolves and passes an explicit root; a missing one is refused loudly
-/// instead of scanning the wrong tree quietly.
+/// The directory the bare stdio `serve` mode watches: the `--root` flag,
+/// required. Unlike `--serve-uds` (which now accepts an absent `--root` and
+/// serves `None` — the per-session `@root` substrate re-roots on first
+/// attach), this mode has no reattach path to recover a root later, so it
+/// keeps the #502 guard: there is no launch-directory fallback. Over SSH the
+/// launch directory is `$HOME`, so falling back to it silently pointed the
+/// file watcher and git status at the whole home directory instead of the
+/// intended project. No production path launches this mode bare; a missing
+/// root is refused loudly instead of scanning the wrong tree quietly.
 fn watched_root(flag: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     flag.context(
         "no watch root given: pass --root <path> (the daemon refuses to fall back to its \
@@ -234,6 +247,49 @@ mod tests {
             default_log_path("/h/rift-daemon-0.1.0.sock"),
             PathBuf::from("/h/rift-daemon-0.1.0.sock.log")
         );
+    }
+
+    /// Unique per-test Unix-socket path under the system temp dir, mirroring
+    /// `lib.rs`'s test helper of the same purpose (not shared across the
+    /// crate/binary-target boundary).
+    fn unique_socket_path() -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "rift-serve-uds-rootless-{}-{}.sock",
+            std::process::id(),
+            n
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_serve_uds_starts_rootless_when_root_flag_absent() {
+        // The `--serve-uds` launch path: parse args without `--root`, then feed
+        // the resulting `Option` straight to `serve_uds` (no `watched_root`
+        // call, unlike the bare stdio arm) — an absent `--root` must not
+        // prevent the daemon from starting.
+        let sock = unique_socket_path();
+        let (path, root, _log_file) =
+            parse_serve_uds_args(args(&[sock.to_str().expect("utf8 socket path")])).expect("parse");
+        assert_eq!(root, None, "absent --root must parse to None");
+
+        let sock_for_task = PathBuf::from(&path);
+        let handle = tokio::spawn(async move { serve_uds(&sock_for_task, root).await });
+
+        for _ in 0..100 {
+            if ping(&sock).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            ping(&sock).await,
+            "serve_uds never came up with a root-less start"
+        );
+
+        handle.abort();
+        let _ = tokio::fs::remove_file(&sock).await;
     }
 
     #[test]
