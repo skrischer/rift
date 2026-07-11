@@ -597,6 +597,10 @@ pub struct WorkspaceView {
     /// [`root_picker::browse_reply_matches`] checks against every incoming
     /// `DirEntriesReply` — always starts clean.
     root_picker_session: Option<RootPickerSession>,
+    /// The workspace's own, always-rendered focus anchor
+    /// (`docs/spec-visibility-rail-focus.md`, issue #847) — see the
+    /// `Focusable` impl below for why this exists.
+    focus_handle: FocusHandle,
 }
 
 /// [`WorkspaceView::root_picker_session`]'s payload, mirroring `main.rs`'s
@@ -1429,6 +1433,7 @@ impl WorkspaceView {
             settings_view,
             dir_browse_tx,
             root_picker_session: None,
+            focus_handle: cx.focus_handle(),
         }
     }
 
@@ -1552,7 +1557,13 @@ impl WorkspaceView {
         if was_soloed {
             self.reconcile_visibility(window, cx);
         } else {
+            // Captured before `apply_area_visibility` unrenders `area` (gpui
+            // does not clear focus on unmount, so the window's focus handle
+            // still names whatever held it going in) — re-homed below only
+            // if that is `area` itself and it just became hidden (issue #847).
+            let focused_area = self.focused_area(window, cx);
             self.apply_area_visibility(area, self.visibility.is_visible(area), window, cx);
+            self.rehome_focus_if_hidden(focused_area, window, cx);
         }
         self.persist_visibility();
     }
@@ -1582,6 +1593,10 @@ impl WorkspaceView {
     /// through the dispatcher would rebuild the center twice per
     /// reconciliation. Callers persist once themselves afterward.
     fn reconcile_visibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Captured before the `apply_*_visibility` calls below unrender
+        // whichever area just lost visibility — re-homed afterward only if
+        // that area held focus and is now hidden (issue #847).
+        let focused_area = self.focused_area(window, cx);
         self.apply_center_visibility(window, cx);
         self.apply_diagnostics_visibility(
             self.visibility.is_visible(Area::Diagnostics),
@@ -1589,6 +1604,7 @@ impl WorkspaceView {
             cx,
         );
         self.apply_git_visibility(self.visibility.is_visible(Area::Git), window, cx);
+        self.rehome_focus_if_hidden(focused_area, window, cx);
     }
 
     /// Dispatch to the one `apply_*_visibility` matching `area` — the plain
@@ -1865,28 +1881,30 @@ impl WorkspaceView {
     }
 
     /// Move focus to the terminal (issue #358), so keystrokes reach the tmux
-    /// pane exactly as they do when the terminal is clicked directly.
-    fn focus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// pane exactly as they do when the terminal is clicked directly. `pub`
+    /// (not `pub(crate)`) so `main.rs::enter_workspace` — a separate binary
+    /// crate depending on this one — can call it directly as the explicit
+    /// startup-focus call `WorkspaceView::focus_handle` no longer provides by
+    /// delegation (`docs/spec-visibility-rail-focus.md`, issue #847).
+    pub fn focus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.session_view.focus_handle(cx).focus(window, cx);
     }
 
-    /// Solo whichever area currently holds focus (issue #820), superseding
-    /// the old direct `gpui_component::dock::ToggleZoom` forward (issue
-    /// #358): that built-in path flips `TabPanel.zoomed` + `DockArea.
-    /// zoom_view` independently of the rift-owned visible set — exactly the
-    /// divergence `docs/spec-workspace-visibility-rail.md` rules out. A
-    /// best-effort command-palette/keyboard entry point, not the primary
-    /// trigger (the per-area header button names its area explicitly); a
-    /// no-op if focus is not inside a recognized surface. Source Control's
-    /// own tab (as opposed to the diff view) has no dedicated field to check
-    /// here — it stays reachable via its own header button.
-    fn zoom_active_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Which [`Area`] currently holds keyboard focus, if any — shared by
+    /// [`Self::zoom_active_panel`] (the focused-panel solo command) and the
+    /// hide/solo focus re-home helpers below
+    /// (`docs/spec-visibility-rail-focus.md`, issue #847), so the two
+    /// focus-detection paths can never diverge. Source Control's own tab (as
+    /// opposed to the diff view) has no dedicated field to check here — it
+    /// stays reachable via its own header button, unrelated to this
+    /// detection.
+    fn focused_area(&self, window: &Window, cx: &App) -> Option<Area> {
         // `Focusable::focus_handle` disambiguated: `FileTree`/`EditorView`/
         // `ProblemsPanel`/`DiffView` all also implement gpui-component's
         // `Panel`, which gives `Entity<T>` a second, differently-scoped
         // `focus_handle` (via its blanket `PanelView` impl) — plain method
         // syntax is ambiguous between the two.
-        let area = if Focusable::focus_handle(&self.file_tree, cx).contains_focused(window, cx)
+        if Focusable::focus_handle(&self.file_tree, cx).contains_focused(window, cx)
             || Focusable::focus_handle(&self.editor, cx).contains_focused(window, cx)
         {
             Some(Area::ExplorerEditor)
@@ -1902,11 +1920,77 @@ impl WorkspaceView {
             Some(Area::Git)
         } else {
             None
-        };
+        }
+    }
 
-        if let Some(area) = area {
+    /// Solo whichever area currently holds focus (issue #820), superseding
+    /// the old direct `gpui_component::dock::ToggleZoom` forward (issue
+    /// #358): that built-in path flips `TabPanel.zoomed` + `DockArea.
+    /// zoom_view` independently of the rift-owned visible set — exactly the
+    /// divergence `docs/spec-workspace-visibility-rail.md` rules out. A
+    /// best-effort command-palette/keyboard entry point, not the primary
+    /// trigger (the per-area header button names its area explicitly); a
+    /// no-op if focus is not inside a recognized surface.
+    fn zoom_active_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(area) = self.focused_area(window, cx) {
             self.toggle_solo_area(area, window, cx);
         }
+    }
+
+    /// Re-home focus after a visibility/solo transition, when
+    /// `previously_focused` names the area that held focus *before* the
+    /// transition and that area is now hidden (`docs/spec-visibility-rail-
+    /// focus.md`, issue #847) — a no-op when nothing was focused there, or
+    /// when it is still visible, so an unaffected focus is never disturbed.
+    /// gpui does not clear focus on unmount, so leaving this unhandled would
+    /// strand the window's focus on a now-unrendered panel, dropping every
+    /// subsequent `window.dispatch_action` (the Phase-390 QA freeze). Moves
+    /// focus to [`Self::preferred_focus_area`]'s pick, or to the workspace's
+    /// own root anchor when nothing is visible.
+    fn rehome_focus_if_hidden(
+        &mut self,
+        previously_focused: Option<Area>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(area) = previously_focused else {
+            return;
+        };
+        if self.visibility.is_visible(area) {
+            return;
+        }
+        match Self::preferred_focus_area(&self.visibility) {
+            Some(Area::Terminal) => self.focus_terminal(window, cx),
+            Some(Area::ExplorerEditor) => self.editor.update(cx, |editor, cx| {
+                editor.focus_active_input(window, cx);
+            }),
+            Some(Area::Diagnostics) => {
+                Focusable::focus_handle(&self.problems_panel, cx).focus(window, cx);
+            }
+            Some(Area::Git) => {
+                Focusable::focus_handle(&self.diff_view, cx).focus(window, cx);
+            }
+            None => self.focus_handle.focus(window, cx),
+        }
+    }
+
+    /// Pick the area focus should re-home to, preferring **Terminal ->
+    /// Explorer+Editor -> Diagnostics -> Git** (`docs/vision.md`: the
+    /// terminal is rift's primary surface, restore focus there first when
+    /// visible) — pure state-machine logic over [`Visibility`], no GPUI
+    /// dependency, directly unit-testable. `None` means no area is visible
+    /// (the degenerate all-hidden state); callers fall back to the
+    /// workspace's own root focus anchor.
+    fn preferred_focus_area(visibility: &Visibility) -> Option<Area> {
+        const PREFERENCE: [Area; 4] = [
+            Area::Terminal,
+            Area::ExplorerEditor,
+            Area::Diagnostics,
+            Area::Git,
+        ];
+        PREFERENCE
+            .into_iter()
+            .find(|&area| visibility.is_visible(area))
     }
 
     /// Open the command palette (issue #359) as a `Root` dialog.
@@ -2266,10 +2350,18 @@ fn apply_worktree_message(tree: &mut FileTree, msg: DaemonMessage) -> bool {
 }
 
 impl Focusable for WorkspaceView {
-    fn focus_handle(&self, cx: &gpui::App) -> FocusHandle {
-        // Delegate focus to the terminal so keystrokes reach the active pane, as
-        // they did before the editor surface mounted.
-        self.session_view.focus_handle(cx)
+    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
+        // The workspace's own always-rendered anchor (`docs/spec-visibility-
+        // rail-focus.md`, issue #847) — no longer delegated to the terminal.
+        // Delegating meant a hidden (unrendered) focused terminal stranded the
+        // window's focus off the dispatch tree entirely, since the root `div`
+        // registering the `on_action` handlers below was itself non-focusable;
+        // `window.dispatch_action` then silently dropped every rail/keyboard
+        // toggle. Startup still hands focus to the terminal explicitly (#358,
+        // `main.rs::enter_workspace`'s `focus_terminal` call), and hide/solo
+        // re-homes focus to a still-visible surface (`Self::rehome_focus_if_hidden`)
+        // rather than relying on this delegation.
+        self.focus_handle.clone()
     }
 }
 
@@ -2390,6 +2482,13 @@ impl Render for WorkspaceView {
             .flex_col()
             .size_full()
             .bg(cx.theme().background)
+            // Stable focus anchor (`docs/spec-visibility-rail-focus.md`, issue
+            // #847): keeps this node — the one registering the `on_action`
+            // handlers below — in `window`'s dispatch tree every frame, even
+            // when no panel is focused/rendered, so rail/keyboard/command-
+            // palette actions always reach a live handler.
+            .key_context("Workspace")
+            .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &ToggleExplorer, window, cx| {
                 this.toggle_area(Area::ExplorerEditor, window, cx);
             }))
@@ -2727,6 +2826,73 @@ mod tests {
         let rebuilt = Visibility::from_persisted(&visible_areas, solo_area);
 
         assert_eq!(rebuilt, visibility);
+    }
+
+    // --- focus re-home target selection (`docs/spec-visibility-rail-focus.md`,
+    // issue #847): `WorkspaceView::preferred_focus_area` has no GPUI
+    // dependency (pure logic over `Visibility`), so these run as ordinary
+    // `#[test]`s directly, independent of the `#[gpui::test]`s that exercise
+    // the actual focus movement further below.
+
+    #[test]
+    fn test_preferred_focus_area_all_visible_picks_the_terminal_first() {
+        let visibility = Visibility::from_persisted(&Area::ALL, None);
+
+        assert_eq!(
+            WorkspaceView::preferred_focus_area(&visibility),
+            Some(Area::Terminal),
+            "Terminal is the primary surface (docs/vision.md) and wins when everything is visible"
+        );
+    }
+
+    #[test]
+    fn test_preferred_focus_area_falls_back_down_the_preference_order() {
+        let mut visibility = Visibility::from_persisted(&Area::ALL, None);
+        visibility.toggle(Area::Terminal);
+        assert_eq!(
+            WorkspaceView::preferred_focus_area(&visibility),
+            Some(Area::ExplorerEditor),
+            "Terminal hidden: Explorer+Editor is next"
+        );
+
+        visibility.toggle(Area::ExplorerEditor);
+        assert_eq!(
+            WorkspaceView::preferred_focus_area(&visibility),
+            Some(Area::Diagnostics),
+            "Terminal and Explorer+Editor hidden: Diagnostics is next"
+        );
+
+        visibility.toggle(Area::Diagnostics);
+        assert_eq!(
+            WorkspaceView::preferred_focus_area(&visibility),
+            Some(Area::Git),
+            "only Git is left visible"
+        );
+    }
+
+    #[test]
+    fn test_preferred_focus_area_nothing_visible_yields_the_root_anchor_fallback() {
+        let visibility = Visibility::from_persisted(&[], None);
+
+        assert_eq!(
+            WorkspaceView::preferred_focus_area(&visibility),
+            None,
+            "the degenerate all-hidden state has no area to re-home to: callers fall back to the \
+             workspace's own root focus anchor"
+        );
+    }
+
+    #[test]
+    fn test_preferred_focus_area_solo_picks_only_the_soloed_area() {
+        let mut visibility = Visibility::from_persisted(&Area::ALL, None);
+        visibility.toggle_solo(Area::Git);
+
+        assert_eq!(
+            WorkspaceView::preferred_focus_area(&visibility),
+            Some(Area::Git),
+            "solo hides every other area (including the Terminal), so the soloed area is the \
+             only one `is_visible` reports"
+        );
     }
 
     // --- unsaved-changes window-close guard message (spec-v1-hardening) -------
@@ -3184,16 +3350,21 @@ mod tests {
         });
     }
 
-    /// Dock interaction (`docs/spec-ide-shell.md`, issue #325): focus keeps
-    /// delegating to the terminal so agent keystrokes reach the tmux pane
-    /// byte-identically to pre-refactor — the dock's own focus-follows-active-
-    /// panel handling (native `TabPanel`) must not change where the workspace's
-    /// own handed-off focus lands.
+    /// Stable workspace focus anchor (`docs/spec-visibility-rail-focus.md`,
+    /// issue #847): `WorkspaceView::focus_handle` is the workspace's own,
+    /// always-rendered root anchor — no longer delegated to the terminal
+    /// (superseding this test's pre-#847 name/assertion) — so the node
+    /// carrying the root `on_action` handlers (`.track_focus`'d on the same
+    /// `div` in `render`) stays in `window`'s dispatch path even while no
+    /// panel is focused. Startup focus still lands on the terminal via an
+    /// explicit `focus_terminal` call from `main.rs::enter_workspace` (issue
+    /// #358), exercised directly by `test_focus_terminal_moves_focus_to_the_terminal`
+    /// below.
     #[gpui::test]
-    fn test_workspace_focus_delegates_to_the_terminal(cx: &mut TestAppContext) {
+    fn test_workspace_focus_handle_is_its_own_focusable_anchor(cx: &mut TestAppContext) {
         let mut workspace: Option<Entity<WorkspaceView>> = None;
         let mut session_view: Option<Entity<SessionView>> = None;
-        cx.update(|cx| {
+        let window = cx.update(|cx| {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
@@ -3202,19 +3373,28 @@ mod tests {
                     Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
-            .unwrap();
+            .unwrap()
         });
         let workspace = workspace.expect("workspace constructed inside the window callback");
         let session_view =
             session_view.expect("session view constructed inside the window callback");
 
-        cx.update(|cx| {
-            assert_eq!(
-                workspace.read(cx).focus_handle(cx),
-                session_view.read(cx).focus_handle(cx),
-                "workspace focus delegates to the terminal so keystrokes keep reaching the tmux pane"
-            );
-        });
+        window
+            .update(cx, |_, window, cx| {
+                let anchor = workspace.read(cx).focus_handle(cx);
+                assert_ne!(
+                    anchor,
+                    session_view.read(cx).focus_handle(cx),
+                    "the workspace's focus handle is its own root anchor, not delegated to the terminal"
+                );
+
+                anchor.focus(window, cx);
+                assert!(
+                    anchor.is_focused(window),
+                    "the root anchor is focusable, so it stays reachable even with no panel focused"
+                );
+            })
+            .unwrap();
     }
 
     /// Shell command action (`docs/spec-command-palette.md`, issue #358;
@@ -3553,6 +3733,79 @@ mod tests {
                     workspace.read(cx).terminal_panel,
                     terminal_panel_before,
                     "hide/show never replaces the TerminalPanel wrapper entity either"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Focus re-home on hide (`docs/spec-visibility-rail-focus.md`, issue
+    /// #847). Two cases in one window, both starting from the Terminal
+    /// focused: (1) hiding an unrelated area (Git) never fires the re-home —
+    /// the Terminal still holds focus, since it never lost visibility; (2)
+    /// hiding the focused Terminal itself — the Phase-390 QA freeze's actual
+    /// trigger (clicking the Terminal rail toggle broke every other toggle,
+    /// since focus is on the Terminal at click time far more often than on
+    /// any other area) — moves focus to the next-preferred still-visible
+    /// area (Explorer+Editor) instead of stranding it on the now-unrendered
+    /// Terminal.
+    #[gpui::test]
+    fn test_toggle_area_rehomes_focus_only_when_the_focused_area_is_hidden(
+        cx: &mut TestAppContext,
+    ) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let mut session_view: Option<Entity<SessionView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let view = cx.new(|cx| SessionView::new(cx).0);
+                session_view = Some(view.clone());
+                workspace =
+                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+        let session_view =
+            session_view.expect("session view constructed inside the window callback");
+
+        window
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |view, cx| {
+                    view.focus_terminal(window, cx);
+                });
+
+                // Case 1: hiding Git, an area unrelated to focus, is a no-op
+                // for focus.
+                workspace.update(cx, |view, cx| {
+                    view.toggle_area(Area::Git, window, cx);
+                });
+                assert!(
+                    !workspace.read(cx).visibility.is_visible(Area::Git),
+                    "Git is now hidden"
+                );
+                assert!(
+                    session_view.focus_handle(cx).is_focused(window),
+                    "the Terminal still holds focus: it never lost visibility, so re-home never fires"
+                );
+
+                // Case 2: hiding the focused Terminal re-homes focus to the
+                // next-preferred still-visible area.
+                workspace.update(cx, |view, cx| {
+                    view.toggle_area(Area::Terminal, window, cx);
+                });
+                assert!(
+                    !workspace.read(cx).visibility.is_visible(Area::Terminal),
+                    "the Terminal is now hidden"
+                );
+                assert!(
+                    !session_view.focus_handle(cx).contains_focused(window, cx),
+                    "focus moved off the now-hidden Terminal"
+                );
+                assert!(
+                    Focusable::focus_handle(&workspace.read(cx).editor, cx)
+                        .contains_focused(window, cx),
+                    "focus re-homed to Explorer+Editor, the next-preferred still-visible area"
                 );
             })
             .unwrap();
@@ -3996,8 +4249,9 @@ mod tests {
     /// Command palette (`docs/spec-command-palette.md`, issue #359): opening
     /// sets an active `Root` dialog (the modal wired via `render_dialog_layer`
     /// actually appears) and closing it clears that state, without disturbing
-    /// the workspace's own focus delegation to the terminal — "dismissing the
-    /// palette leaves terminal/editor state untouched" from the spec.
+    /// the workspace's own root focus anchor (`docs/spec-visibility-rail-
+    /// focus.md`, issue #847) — "dismissing the palette leaves terminal/editor
+    /// state untouched" from the spec.
     #[gpui::test]
     fn test_open_command_palette_opens_a_dialog_and_close_clears_it(cx: &mut TestAppContext) {
         let mut workspace: Option<Entity<WorkspaceView>> = None;
@@ -4036,10 +4290,10 @@ mod tests {
                 window.has_active_dialog(cx),
                 "OpenCommandPalette opens a Root dialog"
             );
-            assert_eq!(
+            assert_ne!(
                 workspace.read(cx).focus_handle(cx),
                 session_view.read(cx).focus_handle(cx),
-                "opening the palette does not move the workspace's terminal focus delegation"
+                "opening the palette does not touch the workspace's own root focus anchor"
             );
 
             window.close_dialog(cx);
@@ -4047,10 +4301,10 @@ mod tests {
                 !window.has_active_dialog(cx),
                 "closing the dialog clears the active-dialog state"
             );
-            assert_eq!(
+            assert_ne!(
                 workspace.read(cx).focus_handle(cx),
                 session_view.read(cx).focus_handle(cx),
-                "dismissing the palette leaves the terminal focus delegation untouched"
+                "dismissing the palette leaves the workspace's root focus anchor untouched"
             );
         })
         .unwrap();
@@ -4059,7 +4313,7 @@ mod tests {
     /// Settings surface (`docs/spec-theme-settings.md`, issue #366): opening
     /// sets an active `Root` dialog, mirroring the command palette above, and
     /// closing it clears that state without disturbing the workspace's own
-    /// focus delegation to the terminal.
+    /// root focus anchor (`docs/spec-visibility-rail-focus.md`, issue #847).
     #[gpui::test]
     fn test_open_settings_opens_a_dialog_and_close_clears_it(cx: &mut TestAppContext) {
         let mut workspace: Option<Entity<WorkspaceView>> = None;
@@ -4092,10 +4346,10 @@ mod tests {
                 window.has_active_dialog(cx),
                 "OpenSettings opens a Root dialog"
             );
-            assert_eq!(
+            assert_ne!(
                 workspace.read(cx).focus_handle(cx),
                 session_view.read(cx).focus_handle(cx),
-                "opening settings does not move the workspace's terminal focus delegation"
+                "opening settings does not touch the workspace's own root focus anchor"
             );
 
             window.close_dialog(cx);
@@ -4103,10 +4357,10 @@ mod tests {
                 !window.has_active_dialog(cx),
                 "closing the dialog clears the active-dialog state"
             );
-            assert_eq!(
+            assert_ne!(
                 workspace.read(cx).focus_handle(cx),
                 session_view.read(cx).focus_handle(cx),
-                "dismissing settings leaves the terminal focus delegation untouched"
+                "dismissing settings leaves the workspace's root focus anchor untouched"
             );
         })
         .unwrap();
@@ -4115,8 +4369,8 @@ mod tests {
     /// Jump-to-file quick-open (`docs/spec-explorer-search.md`, Phase 31,
     /// issue #681): opening sets an active `Root` dialog, mirroring the
     /// command palette and settings surface above, and closing it clears
-    /// that state without disturbing the workspace's own focus delegation to
-    /// the terminal.
+    /// that state without disturbing the workspace's own root focus anchor
+    /// (`docs/spec-visibility-rail-focus.md`, issue #847).
     #[gpui::test]
     fn test_open_quick_open_opens_a_dialog_and_close_clears_it(cx: &mut TestAppContext) {
         let mut workspace: Option<Entity<WorkspaceView>> = None;
@@ -4149,10 +4403,10 @@ mod tests {
                 window.has_active_dialog(cx),
                 "OpenQuickOpen opens a Root dialog"
             );
-            assert_eq!(
+            assert_ne!(
                 workspace.read(cx).focus_handle(cx),
                 session_view.read(cx).focus_handle(cx),
-                "opening quick-open does not move the workspace's terminal focus delegation"
+                "opening quick-open does not touch the workspace's own root focus anchor"
             );
 
             window.close_dialog(cx);
@@ -4160,10 +4414,10 @@ mod tests {
                 !window.has_active_dialog(cx),
                 "closing the dialog clears the active-dialog state"
             );
-            assert_eq!(
+            assert_ne!(
                 workspace.read(cx).focus_handle(cx),
                 session_view.read(cx).focus_handle(cx),
-                "dismissing quick-open leaves the terminal focus delegation untouched"
+                "dismissing quick-open leaves the workspace's root focus anchor untouched"
             );
         })
         .unwrap();
@@ -4173,7 +4427,8 @@ mod tests {
     /// `docs/spec-session-root-picker.md`): opening sets an active `Root`
     /// dialog and an in-flight browse of the seeded start path, mirroring
     /// the command palette / settings / quick-open dialogs above; closing it
-    /// leaves the workspace's focus delegation untouched.
+    /// leaves the workspace's own root focus anchor
+    /// (`docs/spec-visibility-rail-focus.md`, issue #847) untouched.
     #[gpui::test]
     fn test_open_root_picker_opens_a_dialog_with_a_pending_seed_browse(cx: &mut TestAppContext) {
         let mut workspace: Option<Entity<WorkspaceView>> = None;
@@ -4214,10 +4469,10 @@ mod tests {
                 Some(String::new()),
                 "no recent roots yet: the seed browse targets \"\" ($HOME)"
             );
-            assert_eq!(
+            assert_ne!(
                 workspace.read(cx).focus_handle(cx),
                 session_view.read(cx).focus_handle(cx),
-                "opening the root picker does not move the terminal focus delegation"
+                "opening the root picker does not touch the workspace's own root focus anchor"
             );
 
             window.close_dialog(cx);
