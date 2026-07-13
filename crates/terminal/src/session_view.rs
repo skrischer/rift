@@ -959,6 +959,18 @@ impl SessionView {
         &self.sessions
     }
 
+    /// Whether the currently attached session ([`Self::session_name`])
+    /// carries no `@root` — present in the live session list with
+    /// `root: None` (issue #891). `false` while the session's own row has
+    /// not landed in [`Self::sessions`] yet: the caller (`WorkspaceView`,
+    /// feeding the explorer's root-less empty-state) treats that transient
+    /// window as "unknown", never flashing "No project root" early.
+    pub fn active_session_is_root_less(&self) -> bool {
+        self.sessions.iter().any(|session| {
+            session.name.as_str() == self.session_name.as_ref() && session.root.is_none()
+        })
+    }
+
     /// Create a session at `root`, named `name` (already disambiguated by the
     /// owner against [`Self::sessions`]) — the root-picker's single transport
     /// for both entry points (`docs/spec-session-root-picker.md`): a
@@ -3906,6 +3918,53 @@ mod tests {
                 session.read(cx).ssh_label,
                 SharedString::from("developer@100.64.0.1")
             );
+        });
+    }
+
+    /// Issue #891 (`docs/spec-project-optional-session.md`, phase 47), the
+    /// explorer root-less empty-state condition: `true` only once the
+    /// attached session's own list row confirms `root: None`; a `root:
+    /// Some(..)` row is never root-less; and before any `SessionListReply`
+    /// lands (or during a churn window the row has not caught up yet) the
+    /// status is "unknown", not "root-less" — an empty list must never read
+    /// as root-less.
+    #[gpui::test]
+    fn test_active_session_is_root_less(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let session = cx.new(|cx| SessionView::new(cx).0);
+            session.update(cx, |session, _cx| session.session_name = "rift".into());
+            assert!(
+                !session.read(cx).active_session_is_root_less(),
+                "unknown before the session list arrives"
+            );
+
+            session.update(cx, |session, cx| {
+                session.apply_session_list(
+                    vec![SessionListItem {
+                        id: 1,
+                        name: "rift".to_owned(),
+                        windows: 1,
+                        attached: true,
+                        root: Some("/home/dev/rift".to_owned()),
+                    }],
+                    cx,
+                );
+            });
+            assert!(!session.read(cx).active_session_is_root_less());
+
+            session.update(cx, |session, cx| {
+                session.apply_session_list(
+                    vec![SessionListItem {
+                        id: 1,
+                        name: "rift".to_owned(),
+                        windows: 1,
+                        attached: true,
+                        root: None,
+                    }],
+                    cx,
+                );
+            });
+            assert!(session.read(cx).active_session_is_root_less());
         });
     }
 }

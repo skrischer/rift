@@ -75,8 +75,8 @@ use gpui_component::input::{
 };
 use gpui_component::menu::{ContextMenuExt as _, PopupMenu};
 use gpui_component::{
-    h_flex, v_virtual_list, ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _,
-    VirtualListScrollHandle, WindowExt as _,
+    h_flex, v_flex, v_virtual_list, ActiveTheme as _, Icon, IconName, Selectable as _,
+    Sizable as _, VirtualListScrollHandle, WindowExt as _,
 };
 use rift_protocol::{
     DiagnosticSeverity, EntryKind, FileOp, FileOpError, GitEntryStatus, GitStatusCode,
@@ -340,6 +340,12 @@ pub enum FileTreeEvent {
     /// into a `ClientMessage::DeletePath` on `file_op_tx`. Never batched —
     /// one event per confirmed delete.
     DeleteRequested { path: String },
+    /// The root-less empty-state's "Set project root" action fired (issue
+    /// #891). `workspace.rs`'s existing `file_tree` subscription opens the
+    /// in-cockpit root picker and, on a pick, re-`Attach`es the current
+    /// session with the picked root — the phase-35 re-root path, no new
+    /// protocol message. The tree itself never sends the request.
+    SetRootRequested,
 }
 
 /// Which placeholder the panel shows instead of the tree
@@ -352,6 +358,12 @@ enum EmptyState {
     /// A snapshot arrived and the root has no entries (`model.root()` is
     /// `Some`, `model.is_empty()` is `true`).
     EmptyRoot,
+    /// The attached session carries no `@root` at all (issue #891) —
+    /// `model.root()` is `None`, same as [`Loading`](Self::Loading), but
+    /// `WorkspaceView` has confirmed via the live session list that no
+    /// snapshot is ever coming, so this shows "Set project root" instead of
+    /// a spinner-style wait.
+    NoRoot,
 }
 
 /// One rendered row: an entry's path, kind, nesting depth, and decoration
@@ -1057,6 +1069,12 @@ pub struct FileTree {
     /// prior tree, mirroring the filter bar's non-mutating discipline
     /// (`filter_query` above).
     root_collapsed: bool,
+    /// Whether the attached session is known to carry no `@root` (issue
+    /// #891) — pushed in by `WorkspaceView::render`, every frame, from the
+    /// live session list. The tree's own model has no notion of "session",
+    /// so this is what [`FileTree::empty_state`] uses to tell "no snapshot
+    /// yet" apart from "no root, ever". Defaults `false` (assume loading).
+    session_root_less: bool,
 }
 
 impl FileTree {
@@ -1083,6 +1101,18 @@ impl FileTree {
             filter_input: None,
             _filter_input_sub: None,
             root_collapsed: false,
+            session_root_less: false,
+        }
+    }
+
+    /// Update the root-less flag (see the field doc) — called every
+    /// `WorkspaceView::render` pass with the freshly re-derived value.
+    /// Guarded on an equality check, so a repeated push once the value has
+    /// converged is a cheap no-op: no notify, no repaint.
+    pub fn set_session_root_less(&mut self, root_less: bool, cx: &mut Context<Self>) {
+        if self.session_root_less != root_less {
+            self.session_root_less = root_less;
+            cx.notify();
         }
     }
 
@@ -1274,7 +1304,11 @@ impl FileTree {
     /// two, which read as an error during ordinary startup.
     fn empty_state(&self) -> Option<EmptyState> {
         if self.model.root().is_none() {
-            Some(EmptyState::Loading)
+            if self.session_root_less {
+                Some(EmptyState::NoRoot)
+            } else {
+                Some(EmptyState::Loading)
+            }
         } else if self.model.is_empty() {
             Some(EmptyState::EmptyRoot)
         } else {
@@ -2274,6 +2308,35 @@ impl FileTree {
             .into_any_element()
     }
 
+    /// The [`EmptyState::NoRoot`] placeholder (issue #891): the same quiet,
+    /// centered chrome as [`Self::render_placeholder`], plus a primary "Set
+    /// project root" action. Emits [`FileTreeEvent::SetRootRequested`]; the
+    /// tree never opens the picker itself.
+    fn render_no_root_placeholder(&self, cx: &mut Context<Self>) -> AnyElement {
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap(px(12.0))
+            .p(px(16.0))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("No project root"),
+            )
+            .child(
+                Button::new("file-tree-set-root")
+                    .primary()
+                    .small()
+                    .label("Set project root")
+                    .on_click(cx.listener(|_this, _event, _window, cx| {
+                        cx.emit(FileTreeEvent::SetRootRequested);
+                    })),
+            )
+            .into_any_element()
+    }
+
     /// The in-panel filter bar (artboard **State B**,
     /// `docs/spec-explorer-search.md`, #679): a `gpui-component` `Input` in
     /// the header→tree seam Phase 27 reserved, reusing the shipped
@@ -2899,11 +2962,11 @@ impl Render for FileTree {
         // the same quiet placeholder rather than an empty tree body that
         // could read as an error.
         let content = if let Some(state) = self.empty_state() {
-            let message = match state {
-                EmptyState::Loading => "Loading\u{2026}",
-                EmptyState::EmptyRoot => "Empty folder",
-            };
-            Self::render_placeholder(message, cx)
+            match state {
+                EmptyState::Loading => Self::render_placeholder("Loading\u{2026}", cx),
+                EmptyState::EmptyRoot => Self::render_placeholder("Empty folder", cx),
+                EmptyState::NoRoot => self.render_no_root_placeholder(cx),
+            }
         } else if self.filter_active && !self.filter_query.is_empty() && self.row_cache.is_empty() {
             Self::render_placeholder("No matches", cx)
         } else {
@@ -3323,12 +3386,33 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_state_with_no_snapshot_and_root_less_flag_is_no_root() {
+        // Same "no snapshot yet" condition as `Loading` above, but
+        // `WorkspaceView` has confirmed (via the live session list) that no
+        // snapshot is ever coming — the root-less empty-state, issue #891.
+        let mut tree = FileTree::new();
+        tree.session_root_less = true;
+        assert_eq!(tree.empty_state(), Some(EmptyState::NoRoot));
+    }
+
+    #[test]
     fn test_empty_state_with_an_empty_root_snapshot_is_empty_root() {
         // A complete snapshot arrived (`root()` is `Some`) but it carried no
         // entries — a genuinely empty root, distinct from still loading.
         let tree = seed(vec![]);
         assert!(tree.model().root().is_some());
         assert!(tree.model().is_empty());
+        assert_eq!(tree.empty_state(), Some(EmptyState::EmptyRoot));
+    }
+
+    #[test]
+    fn test_empty_state_root_less_flag_is_ignored_once_a_snapshot_arrives() {
+        // A snapshot resolving `model.root()` to `Some` always wins over the
+        // root-less flag — a stale `true` left over from before the picker's
+        // re-`Attach` completed must never mask the real `EmptyRoot`/`None`
+        // state once the reactive layer has re-rooted.
+        let mut tree = seed(vec![]);
+        tree.session_root_less = true;
         assert_eq!(tree.empty_state(), Some(EmptyState::EmptyRoot));
     }
 
@@ -3910,6 +3994,25 @@ mod tests {
                 });
             })
             .expect("toggle filter");
+    }
+
+    /// `WorkspaceView::render` pushes the root-less flag in every frame
+    /// (issue #891) — `set_session_root_less` is what flips `empty_state`
+    /// from `Loading` to `NoRoot`.
+    #[gpui::test]
+    fn test_set_session_root_less_flips_empty_state_to_no_root(cx: &mut gpui::TestAppContext) {
+        let (tree, window) = open_tree(cx);
+        window
+            .update(cx, |_, _window, cx| {
+                tree.update(cx, |tree, cx| {
+                    assert_eq!(tree.empty_state(), Some(EmptyState::Loading));
+                    tree.set_session_root_less(true, cx);
+                    assert_eq!(tree.empty_state(), Some(EmptyState::NoRoot));
+                    tree.set_session_root_less(false, cx);
+                    assert_eq!(tree.empty_state(), Some(EmptyState::Loading));
+                });
+            })
+            .expect("set root-less flag");
     }
 
     // --- git + diagnostic decoration / ancestor roll-up (#329) ---
