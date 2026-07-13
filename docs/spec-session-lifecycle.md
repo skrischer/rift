@@ -10,6 +10,16 @@ even for exactly one, no auto-attach), the zero-sessions root picker when none
 remain. The connection screen is entered only on a real SSH/transport loss.
 "Session ended" stops meaning "disconnected".
 
+> **Superseded in part by Phase 47** (`spec-project-optional-session.md`,
+> 2026-07-13). The connected-sessionless **substrate** below — keep the connection
+> alive on session end and re-enter over the live client, shipped via #813 —
+> stands. Its **routing policy** (always show the picker, even for one session, no
+> auto-attach; force the root-mandatory create flow at zero sessions) is reversed
+> there: the mid-session route follows the accepted Phase-47 policy (auto-switch /
+> escapable root-optional create), not the always-picker rule. Read the Outcome
+> and Prior-decision rows below that assert "always shown — no auto-attach" and
+> "zero-sessions root picker (create flow)" through that reversal.
+
 ## Outcome
 
 - [ ] Killing the attached session with ≥1 other session on the host lands on the
