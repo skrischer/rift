@@ -2126,6 +2126,15 @@ impl WorkspaceView {
                     }
                 }
                 RootPickerEvent::Picked { root, name } => {
+                    // This dialog never sets `allow_rootless` (issue #887,
+                    // `docs/spec-project-optional-session.md`) —
+                    // `SessionView::create_session_at_root` (`crates/terminal`)
+                    // has no root-less create transport of its own yet, so
+                    // `root` is always `Some` here in practice; handled
+                    // defensively rather than assumed.
+                    let Some(root) = root else {
+                        return;
+                    };
                     let existing: Vec<String> = session_view
                         .read(cx)
                         .sessions()
