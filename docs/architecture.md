@@ -180,7 +180,9 @@ Editing uses a deliberate request/response buffer channel over the daemon transp
 > 2026-07-09) — the current-session watch also driving the daemon's watched root
 > (marked below) —, and by `spec-session-lifecycle.md` (phase 40, 2026-07-10) — the
 > mid-session sessionless state and the session-end-vs-transport-loss distinction
-> (marked below).
+> (marked below) —, and by `spec-project-optional-session.md` (phase 47,
+> 2026-07-13) — root-optional post-connect routing, the never-dead-end picker, and
+> the mid-session set-root affordance (marked below).
 
 - **Protocol versioning:** `PROTOCOL_VERSION` (crates/protocol) reflects the
   message set — every message-set change bumps it, enforced by a pinned
@@ -220,6 +222,21 @@ Editing uses a deliberate request/response buffer channel over the daemon transp
   exactly like a switch. **Only a real SSH/transport loss routes to the reconnect
   loop and then the Connection screen** — a session end never does
   (`spec-session-lifecycle.md`).
+- _(Phase 47)_ **A project root is optional and the connect→usable path never
+  dead-ends.** Connecting with ≥1 session **auto-attaches** a live session (the
+  recents `preferred`, else the most-recently-active) straight into the cockpit —
+  the post-connect picker becomes on-demand, revising the phase-33 "a fresh
+  Connect always shows the picker". A session may be **created with no project
+  root** (name-only → `Attach { root: None }`, watched at `session_path`), and a
+  root-less session's **root is set later** from the cockpit's explorer
+  empty-state by re-`Attach`ing the same session with a root (the phase-35
+  re-root). The root picker is **always escapable** (a persistent Back /
+  Disconnect and "Start without a project root"), and a **stale or absent seeded
+  root is a non-event** — the picker opens at the home default like a fresh pick,
+  with no notice and no error state. The phase-40 mid-session routing policy
+  (always-picker, root-mandatory-on-zero) is superseded per the accepted
+  mid-session policy, retaining its connected-sessionless substrate
+  (`spec-project-optional-session.md`).
 - _(Phase 35)_ **The current-session watch also drives the daemon's watched root.**
   A session's project root is coupled to the tmux session via a session-scoped
   `@root` user option (stamped by the daemon at `new-session`, resolved daemon-side
