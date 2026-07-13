@@ -13,7 +13,8 @@ use std::thread;
 
 use anyhow::{Context as _, Result};
 use gpui::*;
-use gpui_component::{ActiveTheme as _, Root, TitleBar};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::{h_flex, ActiveTheme as _, Root, TitleBar};
 use gpui_component_assets::Assets;
 use rift_app::connection_screen::{
     ConnectError, ConnectRequest, ConnectionScreen, ConnectionScreenEvent, SessionIntent,
@@ -210,12 +211,14 @@ struct PickerChannels {
     /// the host) or the live list needs a human pick — the Shell swaps to
     /// `ScreenState::Picker` only for the latter.
     outcome_tx: flume::Sender<PickerOutcome>,
-    /// The user's pick, sent by the Shell once
+    /// The user's pick — or a Disconnect request — sent by the Shell once
     /// [`rift_app::session_picker::SessionPickerEvent::Pick`] (an existing
-    /// row, `root: None`) or [`rift_app::root_picker::RootPickerEvent::Picked`]
-    /// (a create-with-root, issue #769) fires. `run_daemon_terminal` blocks
-    /// on this before the first `Attach`.
-    choice_rx: flume::Receiver<PickedSession>,
+    /// row, `root: None`), [`rift_app::root_picker::RootPickerEvent::Picked`]
+    /// (a create-with-root, issue #769), or the root-picker chrome's
+    /// persistent Disconnect control (issue #888,
+    /// `docs/spec-project-optional-session.md`) fires. `run_daemon_terminal`
+    /// blocks on this before the first `Attach`.
+    choice_rx: flume::Receiver<PickerChoice>,
 }
 
 /// A resolved post-connect pick (issue #769,
@@ -230,6 +233,23 @@ struct PickerChannels {
 struct PickedSession {
     session: String,
     root: Option<String>,
+}
+
+/// What [`PickerChannels::choice_rx`] carries (issue #888,
+/// `docs/spec-project-optional-session.md`): either a real pick, or a
+/// Disconnect request from the root-picker chrome's persistent Disconnect
+/// control (also sent by its persistent Back control when there is no live
+/// prior screen to return to — [`RootPickerOrigin::Fresh`]). `Disconnect`
+/// asks [`await_session_pick`] to give up cleanly instead of attaching
+/// anything; `run_daemon_terminal` turns that into an ordinary `Ok(())`
+/// return, ending the session pipeline exactly like an orderly session end
+/// (`session_ended_tx.send(None)` — no reconnect, no error banner), which the
+/// existing watcher (`Shell::connect`) already routes back to a fresh
+/// Connection screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PickerChoice {
+    Picked(PickedSession),
+    Disconnect,
 }
 
 /// What [`await_session_pick`]'s live-list query resolved to (issue #707):
@@ -712,8 +732,11 @@ enum ScreenState {
     /// `docs/spec-session-root-picker.md`): the entry point for every
     /// create — the zero-sessions edge (superseding the session picker's
     /// empty-list state) and the session picker's "+ New session..." footer
-    /// both land here.
-    RootPicker(RootPickerScreen),
+    /// both land here. Boxed: `RootPickerScreen` carries the full launch
+    /// bundle (issue #888, `docs/spec-project-optional-session.md`) and would
+    /// otherwise make this the dominant variant by far
+    /// (`clippy::large_enum_variant`).
+    RootPicker(Box<RootPickerScreen>),
     Workspace(Entity<workspace::WorkspaceView>),
 }
 
@@ -733,6 +756,21 @@ struct RootPickerScreen {
     /// [`root_picker::browse_reply_matches`] (issue #839) before routing it
     /// into `picker` — the clone-channel counterpart of `pending_browse`.
     pending_clone: Option<String>,
+    /// Where this screen was reached from (issue #888) — what the persistent
+    /// Back control does.
+    origin: RootPickerOrigin,
+    /// The daemon thread's pick channel — a clone of the same sender
+    /// [`RootPicker::Picked`] itself sends on, so the persistent Back
+    /// (with no prior screen, [`RootPickerOrigin::Fresh`]) and Disconnect
+    /// controls can send [`PickerChoice::Disconnect`] independently of the
+    /// picker's own subscription (issue #888).
+    choice_tx: flume::Sender<PickerChoice>,
+    /// Carried only so [`RootPickerOrigin::SessionPicker`]'s Back can rebuild
+    /// that screen via [`Shell::show_session_picker`] exactly like the
+    /// original launch did.
+    workspace: Entity<workspace::WorkspaceView>,
+    recents: Option<(PathBuf, RecentTarget)>,
+    dir_browse_tx: flume::Sender<rift_protocol::ClientMessage>,
 }
 
 /// [`Shell::show_session_picker`]'s arguments, bundled to stay under clippy's
@@ -747,7 +785,7 @@ struct PickerLaunch {
     ssh_label: SharedString,
     sessions: Vec<SessionListItem>,
     order: Vec<String>,
-    choice_tx: flume::Sender<PickedSession>,
+    choice_tx: flume::Sender<PickerChoice>,
     workspace: Entity<workspace::WorkspaceView>,
     recents: Option<(PathBuf, RecentTarget)>,
     dir_browse_tx: flume::Sender<rift_protocol::ClientMessage>,
@@ -761,14 +799,41 @@ struct PickerLaunch {
 /// target's recents-file path + identity (issue #873,
 /// `docs/spec-host-scoped-root-recents.md`) — seeds the picker's start level
 /// from that target's own recorded roots and records a successful pick back
-/// onto it, never a different host's.
+/// onto it, never a different host's. `origin` (issue #888,
+/// `docs/spec-project-optional-session.md`) exists only to make the
+/// root-picker chrome's persistent Back control possible — it says whether a
+/// live [`SessionPicker`] is the "prior screen" Back rebuilds, carrying what
+/// [`Shell::show_session_picker`] needs to do so.
 struct RootPickerLaunch {
     ssh_label: SharedString,
     sessions: Vec<SessionListItem>,
-    choice_tx: flume::Sender<PickedSession>,
+    choice_tx: flume::Sender<PickerChoice>,
     workspace: Entity<workspace::WorkspaceView>,
     recents: Option<(PathBuf, RecentTarget)>,
     dir_browse_tx: flume::Sender<rift_protocol::ClientMessage>,
+    origin: RootPickerOrigin,
+}
+
+/// Where a [`ScreenState::RootPicker`] screen was reached from (issue #888,
+/// `docs/spec-project-optional-session.md`) — decides what its persistent
+/// Back control does. The picker entity it replaced is gone the moment
+/// [`Shell::show_root_picker`] swaps `self.screen`, so `SessionPicker` carries
+/// everything [`Shell::show_session_picker`] needs to rebuild that screen
+/// fresh over the SAME live connection, rather than restoring a dead entity.
+#[derive(Clone)]
+enum RootPickerOrigin {
+    /// No live prior screen to return to — the zero-sessions entry, or a
+    /// mid-session re-entry after the last session ended
+    /// (`docs/spec-session-lifecycle.md`'s connected-sessionless substrate).
+    /// Back behaves exactly like Disconnect: there is nowhere to "return" to
+    /// but the connect flow, so it gives up this connect attempt the same way.
+    Fresh,
+    /// Reached from the pre-cockpit session picker's "+ New session..."
+    /// footer (`docs/spec-post-connect-picker.md`).
+    SessionPicker {
+        sessions: Vec<SessionListItem>,
+        order: Vec<String>,
+    },
 }
 
 struct Shell {
@@ -931,7 +996,7 @@ impl Shell {
         // `SessionIntent::Preferred`/`Pick` (`run_daemon_terminal`'s own
         // check against the session watch).
         let (picker_outcome_tx, picker_outcome_rx) = flume::unbounded::<PickerOutcome>();
-        let (picker_choice_tx, picker_choice_rx) = flume::unbounded::<PickedSession>();
+        let (picker_choice_tx, picker_choice_rx) = flume::unbounded::<PickerChoice>();
         // Fires once when the session pipeline this attempt spawned ends —
         // orderly exit, a canceled reconnect, or a non-retryable failure
         // (`run_session_with_reconnect`'s `end_reason`) — so the Shell can
@@ -1209,6 +1274,12 @@ impl Shell {
                                         workspace,
                                         recents,
                                         dir_browse_tx,
+                                        // No live session picker exists at
+                                        // this entry (zero sessions on the
+                                        // host, or none left mid-session) —
+                                        // Back has nothing to return to
+                                        // (issue #888).
+                                        origin: RootPickerOrigin::Fresh,
                                     },
                                     window,
                                     cx,
@@ -1265,9 +1336,11 @@ impl Shell {
         } = launch;
         // Cloned before `SessionPicker::new` consumes the originals below —
         // the "+ New session..." branch hands its own copy into
-        // `RootPickerLaunch` (issue #769).
+        // `RootPickerLaunch` (issue #769), also carried in `origin` (issue
+        // #888) so a later Back click can rebuild this exact screen.
         let root_picker_ssh_label = ssh_label.clone();
         let root_picker_sessions = sessions.clone();
+        let root_picker_order = order.clone();
         let picker = cx.new(|cx| SessionPicker::new(ssh_label, sessions, &order, window, cx));
         cx.subscribe_in(
             &picker,
@@ -1277,10 +1350,10 @@ impl Shell {
                     if let Some((path, target)) = &recents {
                         target.record(path, name);
                     }
-                    let _ = choice_tx.send(PickedSession {
+                    let _ = choice_tx.send(PickerChoice::Picked(PickedSession {
                         session: name.clone(),
                         root: None,
-                    });
+                    }));
                     this.enter_workspace(workspace.clone(), window, cx);
                 }
                 SessionPickerEvent::NewSession => {
@@ -1292,6 +1365,10 @@ impl Shell {
                             workspace: workspace.clone(),
                             recents: recents.clone(),
                             dir_browse_tx: dir_browse_tx.clone(),
+                            origin: RootPickerOrigin::SessionPicker {
+                                sessions: root_picker_sessions.clone(),
+                                order: root_picker_order.clone(),
+                            },
                         },
                         window,
                         cx,
@@ -1340,6 +1417,7 @@ impl Shell {
             workspace,
             recents,
             dir_browse_tx,
+            origin,
         } = launch;
         let recent_roots = recents
             .as_ref()
@@ -1351,12 +1429,22 @@ impl Shell {
         // root-less `Attach` — the in-cockpit "+ New session" dialog
         // (`workspace.rs`) leaves the default `false`.
         let picker = cx.new(|cx| RootPicker::new(window, cx).allow_rootless(true));
-        self.screen = ScreenState::RootPicker(RootPickerScreen {
-            ssh_label,
+        // Cloned before the subscription below moves the originals — the
+        // screen keeps its own copies so the persistent Back/Disconnect
+        // controls (issue #888) can act without waiting on the subscription
+        // (`Shell::back_from_root_picker`/`Shell::disconnect_root_picker`
+        // read `self.screen` directly, at click time).
+        self.screen = ScreenState::RootPicker(Box::new(RootPickerScreen {
+            ssh_label: ssh_label.clone(),
             picker: picker.clone(),
             pending_browse: Some(start.clone()),
             pending_clone: None,
-        });
+            origin,
+            choice_tx: choice_tx.clone(),
+            workspace: workspace.clone(),
+            recents: recents.clone(),
+            dir_browse_tx: dir_browse_tx.clone(),
+        }));
 
         cx.subscribe_in(
             &picker,
@@ -1399,10 +1487,10 @@ impl Shell {
                         }
                         target.record(path, &session);
                     }
-                    let _ = choice_tx.send(PickedSession {
+                    let _ = choice_tx.send(PickerChoice::Picked(PickedSession {
                         session,
                         root: root.clone(),
-                    });
+                    }));
                     this.enter_workspace(workspace.clone(), window, cx);
                 }
             },
@@ -1419,6 +1507,53 @@ impl Shell {
             focus_handle.focus(window, cx);
         });
         cx.notify();
+    }
+
+    /// The root-picker chrome's persistent Disconnect control (issue #888,
+    /// `docs/spec-project-optional-session.md`): sends [`PickerChoice::Disconnect`]
+    /// on the current screen's `choice_tx`, then does nothing else — no
+    /// optimistic local screen swap, mirroring `SessionView::cancel_reconnect`'s
+    /// own "the engine answers, the UI reacts to that" contract. The daemon
+    /// thread is already blocked on this exact channel (`await_session_pick`)
+    /// regardless of which pre-cockpit screen is currently shown, so it wakes
+    /// immediately, ends the session pipeline cleanly (no reconnect, no error),
+    /// and the existing `session_ended_rx` watcher in [`Self::connect`] routes
+    /// back to a fresh Connection screen. A no-op when the screen already
+    /// moved on (e.g. a stale click racing a pick).
+    fn disconnect_root_picker(&mut self) {
+        if let ScreenState::RootPicker(screen) = &self.screen {
+            let _ = screen.choice_tx.send(PickerChoice::Disconnect);
+        }
+    }
+
+    /// The root-picker chrome's persistent Back control (issue #888,
+    /// `docs/spec-project-optional-session.md`): returns to the prior screen —
+    /// rebuilds the pre-cockpit session picker via [`Self::show_session_picker`]
+    /// when [`RootPickerOrigin::SessionPicker`] carries one (the "+ New
+    /// session..." entry), or behaves exactly like
+    /// [`Self::disconnect_root_picker`] when [`RootPickerOrigin::Fresh`] says
+    /// there is nothing to return to but the connect flow (the zero-sessions
+    /// entry, or a mid-session re-entry with no sessions left). A no-op when
+    /// the screen already moved on.
+    fn back_from_root_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ScreenState::RootPicker(screen) = &self.screen else {
+            return;
+        };
+        match &screen.origin {
+            RootPickerOrigin::Fresh => self.disconnect_root_picker(),
+            RootPickerOrigin::SessionPicker { sessions, order } => {
+                let launch = PickerLaunch {
+                    ssh_label: screen.ssh_label.clone(),
+                    sessions: sessions.clone(),
+                    order: order.clone(),
+                    choice_tx: screen.choice_tx.clone(),
+                    workspace: screen.workspace.clone(),
+                    recents: screen.recents.clone(),
+                    dir_browse_tx: screen.dir_browse_tx.clone(),
+                };
+                self.show_session_picker(launch, window, cx);
+            }
+        }
     }
 
     /// Route a `DirEntriesReply` (issue #769) to whichever picker is
@@ -1545,16 +1680,49 @@ impl Shell {
 /// or from that picker's own footer) around [`RootPicker`]'s own card, which
 /// renders only its content, not a full screen of its own
 /// (`root_picker.rs`'s "presented as a modal/panel by the caller" contract).
-fn render_root_picker_screen(screen: &RootPickerScreen, cx: &mut App) -> AnyElement {
+///
+/// A persistent Back / Disconnect control row (issue #888,
+/// `docs/spec-project-optional-session.md`) sits between the title bar and
+/// the card, present in every state the picker can be in (loading, browsing,
+/// clone mode, an inline browse/clone error) — the picker is never the only
+/// path to a usable state. `cx: &mut Context<Shell>` (not the bare `App` this
+/// used to take) so the two controls can dispatch straight to
+/// [`Shell::back_from_root_picker`]/[`Shell::disconnect_root_picker`] via
+/// `cx.listener`.
+fn render_root_picker_screen(screen: &RootPickerScreen, cx: &mut Context<Shell>) -> AnyElement {
     let connection =
         title_bar::ConnectionGroup::connected(cx.theme().success, screen.ssh_label.clone());
     let title_bar = title_bar::render(connection, None, None, cx);
+    let controls = h_flex()
+        .id("root-picker-chrome-controls")
+        .w_full()
+        .items_center()
+        .gap(px(8.0))
+        .px(px(16.0))
+        .py(px(10.0))
+        .child(
+            Button::new("root-picker-back")
+                .ghost()
+                .label("Back")
+                .on_click(cx.listener(|shell, _event, window, cx| {
+                    shell.back_from_root_picker(window, cx);
+                })),
+        )
+        .child(
+            Button::new("root-picker-disconnect")
+                .ghost()
+                .label("Disconnect")
+                .on_click(cx.listener(|shell, _event, _window, _cx| {
+                    shell.disconnect_root_picker();
+                })),
+        );
     div()
         .size_full()
         .flex()
         .flex_col()
         .bg(cx.theme().background)
         .child(title_bar)
+        .child(controls)
         .child(
             div()
                 .flex_1()
@@ -1695,8 +1863,14 @@ fn run_session_with_reconnect(ssh: &SshConfig, params: SessionRunParams) {
             while cancel_rx.try_recv().is_ok() {}
         }
         let error = match result {
+            // Issue #888, `docs/spec-project-optional-session.md`: the root-
+            // picker chrome's Disconnect (or an origin-`Fresh` Back) is
+            // currently the only path here — `run_daemon_terminal` never
+            // returns `Ok` on its own otherwise (an orderly tmux exit
+            // re-enters the pre-cockpit picker instead of returning,
+            // `docs/spec-session-lifecycle.md`).
             Ok(()) => {
-                info!("SSH session ended (orderly tmux exit)");
+                info!("session pipeline ended without error (user disconnect)");
                 break;
             }
             Err(e) => e,
@@ -1884,12 +2058,17 @@ async fn run_ssh_session(
 /// session watch and re-enters the pre-cockpit picker over the SAME live client
 /// (`preferred = None`, so the picker always shows, never a silent auto-attach
 /// even for exactly one remaining session), then re-`Attach`es the pick. The
-/// connection screen is reached only on a genuine transport loss: the function
-/// never returns `Ok` (the outer loop diverges) and returns `Err` only on a
-/// transport-shaped failure, which the SSH-level engine (#476) surfaces as the
-/// visible reconnect / `Disconnected` path. The SSH connection (`conn`) stays
-/// alive for the session; the recovery engine below reuses it to reopen daemon
-/// channels.
+/// connection screen is normally reached only on a genuine transport loss —
+/// the function returns `Err` only on a transport-shaped failure, which the
+/// SSH-level engine (#476) surfaces as the visible reconnect / `Disconnected`
+/// path — or on the root-picker chrome's persistent Disconnect / origin-
+/// `Fresh` Back control (issue #888, `docs/spec-project-optional-session.md`):
+/// [`await_session_pick`] resolving to [`PickerChoice::Disconnect`] returns
+/// `Ok(())` here directly (the one deliberate early return; every other path
+/// through this outer loop diverges), which the caller's `Ok` arm treats
+/// exactly like an orderly session end — no retry, no error banner. The SSH
+/// connection (`conn`) stays alive for the session; the recovery engine below
+/// reuses it to reopen daemon channels.
 ///
 /// A daemon-channel death (EOF, malformed frame, channel error) while SSH is
 /// up does NOT end the session (#475, `docs/spec-connection-robustness.md`):
@@ -2077,7 +2256,16 @@ async fn run_daemon_terminal(
             } else {
                 None
             };
-            let picked = await_session_pick(&current, &editor, &watches.picker, preferred).await?;
+            let picked =
+                match await_session_pick(&current, &editor, &watches.picker, preferred).await? {
+                    PickerChoice::Picked(picked) => picked,
+                    // The root-picker chrome's persistent Disconnect (or an
+                    // origin-`Fresh` Back, issue #888) — give up this connect
+                    // attempt cleanly instead of attaching anything. See this
+                    // function's own doc comment for why `Ok(())` here is the
+                    // correct, deliberate outer-loop exit.
+                    PickerChoice::Disconnect => return Ok(()),
+                };
             watches.session.send_replace(picked.session.clone());
             Some(picked)
         } else {
@@ -2237,12 +2425,18 @@ fn resolve_attach_session(
 /// the Connection screen. Pre-Attach there is no in-flight terminal state to
 /// preserve, so restarting the whole attempt is simpler than replicating the
 /// main loop's narrower daemon-only [`reconnect_daemon`] and just as correct.
+///
+/// Returns [`PickerChoice::Disconnect`] instead of a real pick (issue #888,
+/// `docs/spec-project-optional-session.md`) when the root-picker chrome's
+/// persistent Disconnect (or an origin-`Fresh` Back) fires — the caller
+/// (`run_daemon_terminal`) turns that into a clean `Ok(())` return, never an
+/// error.
 async fn await_session_pick(
     client: &rift_ssh::DaemonClient,
     editor: &EditorChannels,
     picker: &PickerChannels,
     preferred: Option<&str>,
-) -> Result<PickedSession> {
+) -> Result<PickerChoice> {
     use rift_protocol::ClientMessage;
 
     client
@@ -2263,16 +2457,17 @@ async fn await_session_pick(
         let _ = picker
             .outcome_tx
             .send(PickerOutcome::Attached(name.clone()));
-        return Ok(PickedSession {
+        return Ok(PickerChoice::Picked(PickedSession {
             session: name,
             root: None,
-        });
+        }));
     }
 
     let _ = picker.outcome_tx.send(PickerOutcome::ShowPicker(sessions));
 
     match consume_daemon_messages(client, None, editor, false, Some(&picker.choice_rx)).await {
-        StreamEnd::Picked(picked) => Ok(picked),
+        StreamEnd::Picked(picked) => Ok(PickerChoice::Picked(picked)),
+        StreamEnd::Disconnected => Ok(PickerChoice::Disconnect),
         _ => Err(anyhow::Error::new(rift_ssh::SshError::Channel(
             "daemon stream closed while awaiting the session pick".to_string(),
         ))),
@@ -2684,16 +2879,18 @@ async fn provision_daemon(
 /// [`StreamEnd::SessionListSent`] (carrying the mapped list) instead of
 /// reaching `terminal`'s sink; when `pick_rx` is `Some`, every iteration also
 /// races a receive on it, ending the call with [`StreamEnd::Picked`] the
-/// moment a pick lands. Every other message arm is unaffected either way, so
-/// the picker's two calls still route worktree/buffer/nav/diagnostics/LSP
-/// traffic exactly like a normal call — nothing arriving during the
-/// pre-Attach window is dropped.
+/// moment a pick lands, or [`StreamEnd::Disconnected`] (issue #888,
+/// `docs/spec-project-optional-session.md`) the moment a
+/// [`PickerChoice::Disconnect`] lands. Every other message arm is unaffected
+/// either way, so the picker's two calls still route
+/// worktree/buffer/nav/diagnostics/LSP traffic exactly like a normal call —
+/// nothing arriving during the pre-Attach window is dropped.
 async fn consume_daemon_messages(
     client: &rift_ssh::DaemonClient,
     terminal: Option<&TerminalSinks>,
     editor: &EditorChannels,
     capture_session_list: bool,
-    pick_rx: Option<&flume::Receiver<PickedSession>>,
+    pick_rx: Option<&flume::Receiver<PickerChoice>>,
 ) -> StreamEnd {
     use rift_protocol::DaemonMessage;
 
@@ -2702,9 +2899,10 @@ async fn consume_daemon_messages(
             Some(rx) => {
                 tokio::select! {
                     msg = client.recv() => msg,
-                    picked = rx.recv_async() => {
-                        return match picked {
-                            Ok(picked) => StreamEnd::Picked(picked),
+                    choice = rx.recv_async() => {
+                        return match choice {
+                            Ok(PickerChoice::Picked(picked)) => StreamEnd::Picked(picked),
+                            Ok(PickerChoice::Disconnect) => StreamEnd::Disconnected,
                             Err(_) => StreamEnd::Closed,
                         };
                     }
@@ -2906,6 +3104,12 @@ enum StreamEnd {
     /// seed the engine's session watch and thread the root into the first
     /// `Attach`.
     Picked(PickedSession),
+    /// The root-picker chrome's persistent Disconnect (or an origin-`Fresh`
+    /// Back) fired while `pick_rx` was armed (issue #888,
+    /// `docs/spec-project-optional-session.md`) — [`await_session_pick`]
+    /// turns this into [`PickerChoice::Disconnect`], its caller's signal to
+    /// end the session pipeline cleanly instead of attaching anything.
+    Disconnected,
 }
 
 /// The bridges' handle to the current daemon client: a `watch` receiver the
