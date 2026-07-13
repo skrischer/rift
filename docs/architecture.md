@@ -235,9 +235,10 @@ Editing uses a deliberate request/response buffer channel over the daemon transp
   Disconnect and "Start without a project root"), and a **stale or absent seeded
   root is a non-event** — the picker opens at the home default like a fresh pick,
   with no notice and no error state. The phase-40 mid-session routing policy
-  (always-picker, root-mandatory-on-zero) is superseded per the accepted
-  mid-session policy, retaining its connected-sessionless substrate
-  (`spec-project-optional-session.md`).
+  (always-picker, root-mandatory-on-zero) is superseded: killing the active
+  session **auto-switches** to the display-order head of the remaining sessions
+  (0 remaining → the escapable create picker), retaining its connected-sessionless
+  substrate (`spec-project-optional-session.md`).
 - _(Phase 35)_ **The current-session watch also drives the daemon's watched root.**
   A session's project root is coupled to the tmux session via a session-scoped
   `@root` user option (stamped by the daemon at `new-session`, resolved daemon-side

@@ -31,10 +31,10 @@ connected-sessionless substrate (#813).
       action browses the host and re-roots the reactive layer (file tree / git /
       LSP) by re-`Attach`ing the same session with the picked root (stamps
       `@root`, phase-35 re-root).
-- [ ] Killing/exiting the active session with the connection alive **routes per
-      the accepted mid-session policy** (auto-switch vs. picker — resolved at the
-      gate), never to the connection screen; a real transport loss still routes to
-      the reconnect loop (unchanged from phase 20/40).
+- [ ] Killing/exiting the active session with the connection alive **auto-switches**
+      to the display-order head of the remaining sessions (0 remaining &#8594; the
+      escapable create picker), never to the connection screen; a real transport
+      loss still routes to the reconnect loop (unchanged from phase 20/40).
 - [ ] `docs/architecture.md`'s Connection robustness contract documents the
       root-optional post-connect routing and the mid-session set-root affordance
       (this spec PR's amendment); `docs/spec-session-lifecycle.md` carries a
@@ -167,7 +167,7 @@ connected-sessionless substrate (#813).
 | **Post-connect auto-attach:** connecting with &#8805;1 session auto-attaches `preferred` (recents) else the **first session in the app display order** (`session_order`, phase 32; daemon list order when unset), via the existing `PickerOutcome::Attached`; the picker is on-demand | Design review (Path A): "the picker is unnecessary — the switcher is always up." Reuses the phase-33 `Preferred` direct-attach; the Connect button stops forcing `ShowPicker`. The target is app-side data only (no `#{session_activity}` / protocol change) — so "most-recently-active" is deliberately not used; display order is deterministic and already what the switcher renders. | 2026-07-13 (design review) |
 | The connected-no-session state stays the **escapable picker** (phase-40 substrate), not an empty cockpit render | A cockpit render with no attached session is a large, separate change (the WorkspaceView assumes an attached session/layout); a session — possibly root-less — is always attached before the cockpit shows. Keeps scope minimal. | 2026-07-13 |
 | App-only; **`PROTOCOL_VERSION` unchanged** | Every reused message (`Attach` with/without root, `QuerySessionList`, the browse channel, `PickerOutcome`) already exists; this is a `crates/app` state-machine change (plus an optional daemon browse-seed tweak). | 2026-07-13 |
-| **OPEN — resolved at the spec-acceptance gate:** the mid-session kill policy — auto-switch to the **display-order head** of the remaining sessions (the same target rule as post-connect auto-attach) vs. keep the phase-40 always-picker; and the 0-remaining landing (escapable create picker vs. auto-create a default root-less session) | This reverses phase-40's explicit "always-picker mid-session, no auto-attach" decision, so it is confirmed by the human, not guessed. Recommendation: auto-switch to the display-order head, connected-no-session &#8594; escapable create picker at 0 — fully symmetric with the post-connect model (same app-side target rule, no protocol data). | 2026-07-13 |
+| **Mid-session kill policy (accepted):** killing/exiting the active session with the connection alive **auto-switches** to the display-order head of the remaining sessions (the same app-side target rule as post-connect); with **0 remaining** it lands on the escapable create picker (connected, no session). No mid-session picker is forced. | Fully symmetric with the post-connect auto-attach model — the switcher shows the rest. Reverses phase-40's "always-picker mid-session, no auto-attach". Same app-side target rule, no protocol data. | 2026-07-13 (accepted) |
 
 ## Design surface
 
@@ -214,9 +214,10 @@ Human milestone-QA gate (dev channel, `just dev-windows-watch`):
 - [ ] In a root-less cockpit, the explorer shows `No project root &#8594; Set
       project root`; using it browses the host and lights up the file tree / git /
       diagnostics on the chosen root.
-- [ ] Kill the active session &#8594; routes per the accepted mid-session policy
-      (auto-switch / picker), connection alive, no connection screen; a real
-      transport loss still shows the reconnect banner.
+- [ ] Kill the active session &#8594; auto-switches to another session (the
+      display-order head); with none remaining, the escapable create picker;
+      connection alive, no connection screen; a real transport loss still shows the
+      reconnect banner.
 
 ## Risks and mitigations
 
@@ -243,6 +244,11 @@ Human milestone-QA gate (dev channel, `just dev-windows-watch`):
 - 2026-07-13: One open decision (the mid-session kill policy + 0-remaining
   landing) carried to the spec-acceptance gate; recommendation recorded
   (auto-switch, symmetric with post-connect).
+- 2026-07-13 (spec-acceptance gate): mid-session kill policy **accepted** —
+  auto-switch to the display-order head on kill (the same target rule as
+  post-connect), 0-remaining &#8594; the escapable create picker; no forced
+  mid-session picker. Reverses phase-40's always-picker. Human prerequisites:
+  none. Spec accepted; milestone + issues follow.
 - 2026-07-13 (spec review): two blocking findings fixed. (1) The auto-attach
   fallback "most-recently-active" is not derivable app-side — the wire
   `SessionEntry` carries no activity and `SESSION_LIST_QUERY` fetches none, so it
