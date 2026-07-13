@@ -56,13 +56,14 @@
 | 37 | Remote exec wrapper UI — surface `RIFT_REMOTE_EXEC_WRAPPER` as an editable, env/bake-prefilled connect-card field and persist it per host in the connection recents store, so a container connection can be set up and re-run from the UI (the UI field the archived remote-exec-wrapper spec deferred) | [spec-remote-exec-wrapper-ui.md](spec-remote-exec-wrapper-ui.md) | [Phase 370](https://github.com/skrischer/rift/milestone/56) |
 | 38 | Retire the fixed `RIFT_SESSION` default — connect-and-list becomes the default session model: the launch recipes stop pinning `RIFT_SESSION` and the `SessionIntent::Fixed` fast-path is removed, so every connect resolves to the live session list (Phase 33) or the remote root picker (Phase 36); the dogfooding mirror moves to recents-based same-session attach | [spec-retire-fixed-session.md](spec-retire-fixed-session.md) | [Phase 380](https://github.com/skrischer/rift/milestone/57) |
 | 39 | Workspace visibility rail — the left activity rail toggles each workspace area's visibility (inactive = not rendered, not merely collapsed); Explorer+Editor count as one area, plus Terminal / Diagnostics / Git; the per-area zoom becomes a solo mode (all other areas deselected), and re-toggling an area from the rail adds it back into the workspace | [spec-workspace-visibility-rail.md](archive/spec-workspace-visibility-rail.md) | [Phase 390](https://github.com/skrischer/rift/milestone/59) |
-| 40 | Mid-session session lifecycle — killing or exiting the active session returns to the pre-cockpit picker (the session picker if ≥1 session remains — always, even for one; else the zero-sessions root picker) while keeping the SSH/daemon connection alive; the connection screen is entered only on a real transport loss, so "session ended" stops meaning "disconnected" | [spec-session-lifecycle.md](spec-session-lifecycle.md) | [Phase 400](https://github.com/skrischer/rift/milestone/58) |
+| 40 | Mid-session session lifecycle — killing or exiting the active session returns to the pre-cockpit picker (the session picker if ≥1 session remains — always, even for one; else the zero-sessions root picker) while keeping the SSH/daemon connection alive; the connection screen is entered only on a real transport loss, so "session ended" stops meaning "disconnected". Its routing policy (always-picker, root-mandatory-on-zero) is superseded by Phase 47; the connected-sessionless substrate (#813) is retained | [spec-session-lifecycle.md](spec-session-lifecycle.md) | [Phase 400](https://github.com/skrischer/rift/milestone/58) |
 | 41 | Retire the `RIFT_PROJECT_ROOT` env root — the daemon's watched root is no longer a baked launch default (`RIFT_PROJECT_ROOT` / `RIFT_DEFAULT_PROJECT_ROOT`); it starts root-less and follows the active session's `@root` (or `session_path` for externally-created sessions), superseding the single global seed that leaked a host path into a remote session. Mirrors Phase 38 for the project root; completes the Phase 34–36 session↔root coupling | [spec-retire-project-root-env.md](spec-retire-project-root-env.md) | [Phase 410](https://github.com/skrischer/rift/milestone/60) |
 | 42 | Clone-a-repository into a new session — a "Clone from URL" path in the new-session / root-picker flow: enter a git URL, the daemon clones it (host `git` shell-out) into the browsed parent as `<parent>/<name>`, then a session is created rooted at the checkout (`@root` stamped), binding clone → session=project in one step. Closes the cold-start gap (connecting to a parent like `/workspace` with nothing cloned yet); extends the root picker (Frame C). Foundation impact: a new `crates/protocol` clone channel (`PROTOCOL_VERSION` bump) + daemon git-clone (host `git` shell-out), authored + ratified at this phase's /loopkit:plan spec-acceptance | [spec-clone-repo.md](archive/spec-clone-repo.md) | [Phase 420](https://github.com/skrischer/rift/milestone/61) |
 | 43 | Host resource telemetry core — the daemon samples host CPU / RAM / swap / load average via `sysinfo` (/proc) on a timer, pushes a new host-metrics message (`PROTOCOL_VERSION` bump), and surfaces an always-visible compact status-line indicator (RAM% / CPU%). The dogfooding root: intensive sessions hit the host RAM limit and today only the Windows Task Manager shows it (the WSL VM from outside); the daemon runs inside the host and reads /proc directly. Foundation impact: constitution — the "exactly two signals (PTY bytes + filesystem events)" principle is extended to admit host resource state (/proc) as a third agent-agnostic observable; architecture — the daemon gains a periodic resource sampler + host-metrics channel. New dependency `sysinfo` (MIT), named in the spec. Authored + ratified at this phase's /loopkit:plan spec-acceptance | [spec-host-telemetry.md](archive/spec-host-telemetry.md) | [Phase 430](https://github.com/skrischer/rift/milestone/62) |
 | 44 | Memory-pressure warning — a proactive warning before the host wedges, on a portable baseline (`MemAvailable` ratio + swap-in-use + load trend) that works on every host incl. WSL2, with Linux PSI (`/proc/pressure/memory`) as an optional enhancement gated on file existence (the stock `microsoft-standard-WSL2` kernel ships no `CONFIG_PSI` — confirmed live, so PSI is absent on the dogfooding host); warning UX = indicator recolour + toast. Depends on 43 | [spec-memory-pressure.md](spec-memory-pressure.md) | [Phase 440](https://github.com/skrischer/rift/milestone/65) |
 | 45 | Per-pane resource attribution — `pane_pid` → /proc process-subtree RSS / CPU roll-up per tmux pane, surfaced as a per-pane breakdown popover ("which pane is the cause"); strictly agent-agnostic — the pane label is `pane_current_command` / `pane_title`, never agent detection. Extends the phase-43 host-metrics channel with per-pane metrics. Depends on 43 | [spec-pane-attribution.md](spec-pane-attribution.md) | [Phase 450](https://github.com/skrischer/rift/milestone/66) |
 | 46 | Telemetry detail + disk headroom — a detail popover (memory breakdown used / cached / buffers / available, load 1·5·15, uptime, cores), a client-side sparkline history (trend toward the limit), and a project-filesystem disk-headroom indicator (worktree `target/` dirs are heavy). Depends on 43 | — | — |
+| 47 | Project-optional session model — rift is usable the moment SSH connects, with no project root required. Connecting lands directly in a usable cockpit (auto-attach the last/first live session, or a connected-sessionless state when the host has none) instead of a forced picker; creating a session no longer requires a root (name-only create, attached root-less exactly like an externally-created session already is); the project root becomes an OPTIONAL, per-session, mid-session action (set / change / clear via the existing `@root` stamp + `reroot_connection`), not a creation gate; and the connect→usable path never dead-ends (the broken-seed root picker of the "This folder no longer exists" screenshot always offers navigate-up / name-only create / back / disconnect). Supersedes Phase 40's routing policy (always-picker, root-mandatory-on-zero) while retaining its shipped connected-sessionless substrate (#813); reverses Phase 36's "session = project at creation" mandatory coupling. Foundation impact: `architecture.md` connection-robustness contract (root-optional post-connect routing + the mid-session set-root affordance) and a `vision.md` reinforcement (a tmux session is usable without a project root; the root is an optional per-session enhancement), authored + ratified at this phase's /loopkit:plan spec-acceptance | — | — |
 
 A phase gets a Spec link once `/loopkit:plan` drafts it, and a Milestone link once
 it is `READY`. The milestone (open/closed + issue progress) is where status lives.
@@ -356,6 +357,15 @@ Authored + ratified in the phase's `/loopkit:plan` spec PR, never here.
 Backing prior art: "Mid-session session lifecycle — prior-art index (Phase 40)" in
 [prior-art.md](prior-art.md).
 
+Update (2026-07-13, superseding policy): the "connected, no active session"
+substrate shipped via #813 (milestone 58). Phase 40's *routing policy* — always
+show the picker (even for one session, no auto-attach) and force the
+root-mandatory create flow when zero sessions remain — is superseded by **Phase 47
+(project-optional session model)**, which builds on this substrate and reverses the
+mandatory-root / always-picker choices so the host is usable without a project
+root. The spec reconciliation (retiring the superseded Outcome items from
+spec-session-lifecycle.md) happens at Phase 47's `/loopkit:plan`.
+
 ## Host resource telemetry (phases 43–46)
 
 Seeded 2026-07-11 from idea sparring (research mode: websearch) — a dogfooding
@@ -406,6 +416,81 @@ never edited from here):
 
 Backing prior art: "Host resource telemetry — prior-art index (Phases 43–46)" in
 [prior-art.md](prior-art.md).
+
+## Project-optional session model (phase 47)
+
+Seeded 2026-07-13 from idea sparring (research mode: websearch) — a dogfooding
+result: connecting the stable channel to a host whose seeded root no longer exists
+dead-ends the root picker ("This folder no longer exists" / "No folders here",
+empty breadcrumb, disabled Create, no back / skip / disconnect), forcing a repo
+clone just to proceed. The north star correction: **rift is a GUI for tmux +
+agentic IDE features, usable the moment SSH connects — a project root is an
+optional per-session enhancement, never a precondition.**
+
+Most of the connect flow this phase wants already ships and is NOT rebuilt:
+connect is pure-SSH (no session / root field — phases 33/38); attaching an existing
+session is already root-less (the daemon follows `@root` → `session_path` —
+phase 41); the always-visible in-cockpit session switcher exists (phases 19/32);
+and the connected-but-sessionless mid-session substrate shipped via #813
+(phase 40). The actual gaps are three surgical items plus one policy reversal:
+
+1. **Root is mandatory to *create* a session.** The root picker can only complete
+   with `RootPickerEvent::Picked{root, name}` (Create disabled while `current_path`
+   is empty) — there is no name-only create. This is the phase-36 "session =
+   project at creation" decision, reversed here: a session may be created with no
+   root and attached root-less (the same path an externally created session
+   already takes).
+2. **The connect→usable path dead-ends.** Zero sessions routes *directly* to the
+   root picker (`route_picker`), which offers no navigate-up when the seed never
+   resolves, no skip, and no cancel / back / disconnect; when the seeded recent
+   root and the `""`→`$HOME` fallback both fail (a container / exec-wrapper host
+   with no readable `$HOME`), the only escape is Clone or killing the app. The
+   picker must always be escapable and must never be the *only* way to a usable
+   state.
+3. **Root is settable only at creation.** The daemon re-root machinery (`@root`
+   stamp + `reroot_connection`) already exists but is exposed only through the
+   create-time picker; this phase surfaces it as a mid-session, per-session
+   "set / change / clear project root" action on the active session.
+
+Policy reversal (supersedes phase 40): after connect, land in a usable cockpit —
+auto-attach the last/first live session, or a connected-sessionless state when the
+host has none — rather than a forced picker; the picker becomes an explicit
+affordance, not a gate. This reverses phase 40's "always-picker, no auto-attach"
+and "zero-sessions → root-mandatory create" while retaining its shipped
+connected-sessionless substrate (#813).
+
+The logical cases the spec must cover lock-tight (verified against the current
+code): connect with 0 vs N sessions; attach an existing session with vs without
+`@root` (both already work); create a session with a root (keep as a fast path) vs
+without one (new, name-only); set / change / clear a root on a running root-less
+session (new); the broken-seed / non-existent browse dir (must degrade to a
+usable, escapable state, never trap); killing the active session (the phase-40
+#813 substrate — stay connected, sessionless); and reconnect / stale-daemon while
+sessionless.
+
+Foundation impact (authored + ratified at this phase's `/loopkit:plan`
+spec-acceptance, never edited from here): `docs/architecture.md` — the phase-20
+"Connection robustness contract" gains root-optional post-connect routing and the
+mid-session set-root affordance (amending the phase-40 additions, not duplicating
+them); `docs/vision.md` — a reinforcement that a tmux session is usable without a
+project root, the root being an optional per-session enhancement (no constitution
+change: "session = project" lives in the roadmap, not the constitution). No
+protocol change is expected — root-less attach and `@root` re-root are already in
+the wire format; a "clear `@root`" that needs a new tmux-command shape rides the
+existing generic `TmuxCommand` seam.
+
+Open design decisions deferred to the `/loopkit:plan` spec (never a roadmap
+guess): the post-connect entry model (auto-attach last/first + switcher, vs a
+connected-sessionless landing surface, vs keep the picker opt-in — recommendation:
+auto-attach the most-recent live session, land sessionless-usable when none exist,
+picker on demand); whether "clear the root" returns the session to `session_path`
+or to a truly root-less watch; the exact escapable-picker mechanics (a persistent
+Back / Disconnect plus a "start here without a root" action); and how the
+mid-session set-root surface is reached (command palette, session/pane header, or
+an explorer empty-state affordance).
+
+Backing prior art: "Project-optional session model — prior-art index (Phase 47)"
+in [prior-art.md](prior-art.md).
 
 ## Tracks (tooling/DX, not product phases)
 
