@@ -2264,7 +2264,13 @@ async fn run_daemon_terminal(
     // reconnect engine. `current` carries the live client across iterations —
     // the recovery below swaps a reconnected client in, so a
     // reconnect-then-`TerminalExit` re-picks over the reconnected client, not the
-    // original.
+    // original. The re-entry below (issue #890, `docs/spec-project-optional-session.md`)
+    // is what turns this orderly re-pick into the mid-session auto-switch: it
+    // passes `preferred = None` into the same `resolve_auto_attach_target` the
+    // first attach uses, so a `TerminalExit` with sessions remaining resolves
+    // straight to the display-order head (no picker shown) and a `TerminalExit`
+    // with none left falls through to the escapable create picker — the exact
+    // routing `route_picker` already applies to every re-entry.
     let mut current = client;
     let mut first_attach = true;
     loop {
@@ -3985,6 +3991,33 @@ mod tests {
             None
         );
     }
+
+    // --- mid-session auto-switch on session end (issue #890,
+    // docs/spec-project-optional-session.md) -----------------------------
+    //
+    // Every mid-session re-entry calls `resolve_auto_attach_target` with
+    // `preferred = None` (`run_daemon_terminal`'s outer loop passes `None` on
+    // every iteration after the first) — exactly the shape the tests above
+    // already exercise. The one case not yet pinned above is the exact
+    // reversal this issue delivers: the superseded phase-40 policy forced the
+    // mid-session picker even for exactly one remaining session; phase 47
+    // auto-switches to it instead, with no picker shown at all.
+
+    #[test]
+    fn test_resolve_auto_attach_target_single_remaining_session_auto_switches() {
+        let sessions = vec![session_item("work")];
+
+        assert_eq!(
+            resolve_auto_attach_target(None, &sessions, &[]),
+            Some("work".to_string()),
+            "the sole remaining session auto-switches — reverses phase-40's \
+             always-picker-even-for-one policy"
+        );
+    }
+
+    // `route_picker`'s empty-list branch is the "0 remaining -> escapable
+    // create picker" routing decision for both the post-connect first entry
+    // and every mid-session re-entry (issue #890) — one rule, reused as-is.
 
     #[test]
     fn test_route_picker_empty_list_routes_to_root_picker() {
