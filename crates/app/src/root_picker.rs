@@ -227,6 +227,19 @@ enum PickerMode {
     Clone,
 }
 
+/// Which action the Browse-mode footer confirms (issue #891): the default
+/// [`Create`](RootPickerPurpose::Create) attaches-or-creates a NEW session
+/// at the picked root, so its footer asks for a session name; the
+/// mid-session [`SetRoot`](RootPickerPurpose::SetRoot) picks a root for the
+/// ALREADY-attached session, so no name is asked for. Both still emit
+/// [`RootPickerEvent::Picked`]; the owner decides what `name` means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RootPickerPurpose {
+    #[default]
+    Create,
+    SetRoot,
+}
+
 /// Emitted by [`RootPicker`]; the owner never touches this view's internals
 /// directly, mirroring [`crate::session_picker::SessionPickerEvent`].
 pub enum RootPickerEvent {
@@ -332,6 +345,10 @@ pub struct RootPicker {
     /// [`Self::clone_error`] (a daemon-reported [`CloneError`]) since this
     /// never reaches the wire.
     clone_name_error: Option<&'static str>,
+    /// Which action the Browse-mode footer confirms (issue #891) — defaults
+    /// to [`RootPickerPurpose::Create`]; [`Self::set_purpose`] switches it
+    /// right after construction for the mid-session "Set project root" flow.
+    purpose: RootPickerPurpose,
     /// Whether [`Self::start_without_root`]'s "Start without a project root"
     /// action is offered (issue #887, `docs/spec-project-optional-session.md`).
     /// Set via [`Self::allow_rootless`] — the pre-cockpit entry point (the
@@ -414,8 +431,17 @@ impl RootPicker {
             cloning: false,
             clone_error: None,
             clone_name_error: None,
+            purpose: RootPickerPurpose::default(),
             rootless_enabled: false,
         }
+    }
+
+    /// Switch the Browse-mode footer's purpose (see [`RootPickerPurpose`]) —
+    /// called once, right after construction, by the mid-session "Set
+    /// project root" owner; every other caller leaves the default
+    /// [`RootPickerPurpose::Create`].
+    pub fn set_purpose(&mut self, purpose: RootPickerPurpose) {
+        self.purpose = purpose;
     }
 
     /// Enable the "Start without a project root" action (issue #887,
@@ -520,14 +546,16 @@ impl RootPicker {
 
     /// The Create button / name-field Enter: emit the picked root and
     /// trimmed session name. A no-op until a level has resolved
-    /// (`current_path` non-empty) and the name field holds non-whitespace
-    /// text — a tmux session needs a name.
+    /// (`current_path` non-empty); in the default [`RootPickerPurpose::Create`]
+    /// the name field must also hold non-whitespace text — a NEW tmux session
+    /// needs a name. [`RootPickerPurpose::SetRoot`] skips that check: nothing
+    /// is being created, so the (hidden) name field is never a gate.
     fn create(&mut self, cx: &mut Context<Self>) {
         if self.current_path.is_empty() {
             return;
         }
         let name = self.name_input.read(cx).value().trim().to_string();
-        if name.is_empty() {
+        if self.purpose == RootPickerPurpose::Create && name.is_empty() {
             return;
         }
         cx.emit(RootPickerEvent::Picked {
@@ -828,20 +856,27 @@ fn render_error_banner(cx: &mut Context<RootPicker>, message: &'static str) -> i
         )
 }
 
-/// The footer: the session-name field plus the Create button, disabled until
-/// a level has resolved and the name field holds non-whitespace text; when
+/// The footer: the Create button (disabled until a level has resolved and,
+/// in [`RootPickerPurpose::Create`], the name field holds non-whitespace
+/// text), preceded by the session-name field — only in `Create` purpose;
+/// [`RootPickerPurpose::SetRoot`] (issue #891) hides it entirely, since
+/// nothing is being named, and relabels the button "Set project root". When
 /// `can_start_rootless` is `Some` (issue #887,
 /// `docs/spec-project-optional-session.md` — [`RootPicker::allow_rootless`]
-/// enabled this picker), a second row offers "Start without a project root",
-/// a plain ghost button matching the rest of the picker's chrome, disabled
-/// until the name field holds a valid name — independent of whether any
-/// directory level has resolved.
+/// enabled this picker; never set alongside `SetRoot`), a second row offers
+/// "Start without a project root", disabled until the name field holds a
+/// valid name.
 fn render_footer(
     cx: &mut Context<RootPicker>,
     name_input: &Entity<InputState>,
     can_create: bool,
     can_start_rootless: Option<bool>,
+    purpose: RootPickerPurpose,
 ) -> impl IntoElement {
+    let label = match purpose {
+        RootPickerPurpose::Create => "Create",
+        RootPickerPurpose::SetRoot => "Set project root",
+    };
     let rootless_action = can_start_rootless.map(|can_start_rootless| {
         h_flex().w_full().justify_end().child(
             Button::new("root-picker-start-rootless")
@@ -853,25 +888,23 @@ fn render_footer(
                 })),
         )
     });
+    let mut row = h_flex().w_full().items_center().justify_end().gap(px(8.0));
+    if purpose == RootPickerPurpose::Create {
+        row = row.child(Input::new(name_input).flex_1());
+    }
+    row = row.child(
+        Button::new("root-picker-create")
+            .primary()
+            .label(label)
+            .disabled(!can_create)
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.create(cx);
+            })),
+    );
     v_flex()
         .w_full()
         .gap(px(8.0))
-        .child(
-            h_flex()
-                .w_full()
-                .items_center()
-                .gap(px(8.0))
-                .child(Input::new(name_input).flex_1())
-                .child(
-                    Button::new("root-picker-create")
-                        .primary()
-                        .label("Create")
-                        .disabled(!can_create)
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.create(cx);
-                        })),
-                ),
-        )
+        .child(row)
         .children(rootless_action)
 }
 
@@ -998,7 +1031,8 @@ impl Render for RootPicker {
                     let loading = self.loading;
                     let error = self.error;
                     let name = self.name_input.read(cx).value().trim().to_string();
-                    let can_create = !self.current_path.is_empty() && !name.is_empty();
+                    let can_create = !self.current_path.is_empty()
+                        && (self.purpose == RootPickerPurpose::SetRoot || !name.is_empty());
                     let can_start_rootless = self
                         .rootless_enabled
                         .then(|| !name.is_empty() && !invalid_target_name(&name));
@@ -1046,7 +1080,13 @@ impl Render for RootPicker {
                     let error_banner = error
                         .map(|error| render_error_banner(cx, describe_dir_browse_error(error)));
                     let name_input = self.name_input.clone();
-                    let footer = render_footer(cx, &name_input, can_create, can_start_rootless);
+                    let footer = render_footer(
+                        cx,
+                        &name_input,
+                        can_create,
+                        can_start_rootless,
+                        self.purpose,
+                    );
 
                     v_flex()
                         .gap(px(16.0))
@@ -1700,6 +1740,50 @@ mod tests {
         let events = subscribe_events(&picker, cx);
         cx.update(|cx| picker.update(cx, |picker, cx| picker.create(cx)));
         assert!(events.borrow().is_empty(), "a blank name never creates");
+    }
+
+    #[test]
+    fn test_root_picker_purpose_defaults_to_create() {
+        assert_eq!(RootPickerPurpose::default(), RootPickerPurpose::Create);
+    }
+
+    /// Issue #891 (`docs/spec-project-optional-session.md`, phase 47): the
+    /// mid-session "Set project root" owner switches the picker to
+    /// [`RootPickerPurpose::SetRoot`] right after construction — `create()`
+    /// must then emit even with a blank name field, since the footer that
+    /// would otherwise gate on it is never shown for this purpose.
+    #[gpui::test]
+    fn test_create_in_set_root_purpose_emits_even_with_a_blank_name(cx: &mut TestAppContext) {
+        let (picker, window) = build_picker(cx);
+        picker.update(cx, |picker, _cx| {
+            picker.set_purpose(RootPickerPurpose::SetRoot);
+        });
+        load(
+            &picker,
+            &window,
+            cx,
+            "",
+            "/home/dev",
+            Some("/home"),
+            Vec::new(),
+        );
+        window
+            .update(cx, |_, window, cx| {
+                picker.update(cx, |picker, cx| {
+                    let input = picker.name_input.clone();
+                    input.update(cx, |input, cx| input.set_value("", window, cx));
+                });
+            })
+            .expect("blank the auto-seeded name field");
+
+        let events = subscribe_events(&picker, cx);
+        cx.update(|cx| picker.update(cx, |picker, cx| picker.create(cx)));
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["picked:/home/dev:"],
+            "SetRoot never gates on the (hidden) name field"
+        );
     }
 
     #[gpui::test]
