@@ -222,8 +222,9 @@ struct PickerChannels {
 /// `docs/spec-session-root-picker.md`): the session name to attach and,
 /// for a root-picker create, the picked root — carried across
 /// [`PickerChannels::choice_rx`] into `run_daemon_terminal`'s first `Attach`.
-/// `root` is `None` for an existing-row pick (a plain attach); `Some(picked)`
-/// only for a fresh create-with-root, threaded verbatim into
+/// `root` is `None` for an existing-row pick (a plain attach) or a name-only
+/// create (issue #887, `docs/spec-project-optional-session.md`); `Some(picked)`
+/// only for a create with a picked root — either way threaded verbatim into
 /// `ClientMessage::Attach.root`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PickedSession {
@@ -1318,9 +1319,14 @@ impl Shell {
     /// requested path as the outstanding one
     /// ([`root_picker::browse_reply_matches`] guards the reply); a
     /// [`RootPickerEvent::Picked`] disambiguates the name against the
-    /// picker-open-time live list, records the picked root and the
-    /// connection in recents, sends the choice to the daemon thread, and
-    /// swaps to the cockpit.
+    /// picker-open-time live list, records the picked root (if any — a
+    /// name-only create carries `root: None`, issue #887,
+    /// `docs/spec-project-optional-session.md`) and the connection in
+    /// recents, sends the choice to the daemon thread, and swaps to the
+    /// cockpit. `allow_rootless(true)` on the constructed [`RootPicker`]
+    /// offers the "Start without a project root" action — this is the
+    /// pre-cockpit entry point, the only reachable target of a root-less
+    /// `Attach`.
     fn show_root_picker(
         &mut self,
         launch: RootPickerLaunch,
@@ -1340,7 +1346,11 @@ impl Shell {
             .map(|(path, target)| recents::target_recent_roots(path, target))
             .unwrap_or_default();
         let start = root_picker::start_path(&recent_roots);
-        let picker = cx.new(|cx| RootPicker::new(window, cx));
+        // `allow_rootless(true)` (issue #887, `docs/spec-project-optional-session.md`):
+        // this is the pre-cockpit entry point, the only reachable target of a
+        // root-less `Attach` — the in-cockpit "+ New session" dialog
+        // (`workspace.rs`) leaves the default `false`.
+        let picker = cx.new(|cx| RootPicker::new(window, cx).allow_rootless(true));
         self.screen = ScreenState::RootPicker(RootPickerScreen {
             ssh_label,
             picker: picker.clone(),
@@ -1378,14 +1388,20 @@ impl Shell {
                         .collect();
                     let session = root_picker::disambiguate_session_name(name, &existing);
                     if let Some((path, target)) = &recents {
-                        if let Err(e) = recents::merge_recent_root(path, target, root) {
-                            warn!(%e, "failed to record recent root");
+                        // `root: None` (issue #887, name-only create) has no
+                        // root to record — only the session name goes into
+                        // recents, `target.record` leaves the existing
+                        // `recent_roots` list untouched either way.
+                        if let Some(root) = root {
+                            if let Err(e) = recents::merge_recent_root(path, target, root) {
+                                warn!(%e, "failed to record recent root");
+                            }
                         }
                         target.record(path, &session);
                     }
                     let _ = choice_tx.send(PickedSession {
                         session,
-                        root: Some(root.clone()),
+                        root: root.clone(),
                     });
                     this.enter_workspace(workspace.clone(), window, cx);
                 }
@@ -3532,6 +3548,25 @@ mod tests {
         assert_eq!(
             resolve_attach_session(String::new(), Some(picked)),
             ("rift".to_string(), None)
+        );
+    }
+
+    /// Issue #887, `docs/spec-project-optional-session.md`: a root picker
+    /// "Start without a project root" pick
+    /// (`rift_app::root_picker::RootPickerEvent::Picked` with `root: None`)
+    /// resolves to a root-less `Attach`, exactly like [`PickedSession`]'s
+    /// existing `root: None` cases — this test names the name-only-create
+    /// scenario explicitly rather than relying on the preferred-attach test
+    /// above to stand in for it.
+    #[test]
+    fn test_resolve_attach_session_name_only_create_carries_no_root() {
+        let picked = PickedSession {
+            session: "scratch".to_string(),
+            root: None,
+        };
+        assert_eq!(
+            resolve_attach_session(String::new(), Some(picked)),
+            ("scratch".to_string(), None)
         );
     }
 

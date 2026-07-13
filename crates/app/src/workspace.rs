@@ -2129,6 +2129,15 @@ impl WorkspaceView {
                     }
                 }
                 RootPickerEvent::Picked { root, name } => {
+                    // This dialog never sets `allow_rootless` (issue #887,
+                    // `docs/spec-project-optional-session.md`) —
+                    // `SessionView::create_session_at_root` (`crates/terminal`)
+                    // has no root-less create transport of its own yet, so
+                    // `root` is always `Some` here in practice; handled
+                    // defensively rather than assumed.
+                    let Some(root) = root else {
+                        return;
+                    };
                     let existing: Vec<String> = session_view
                         .read(cx)
                         .sessions()
@@ -2222,9 +2231,15 @@ impl WorkspaceView {
                     }
                 }
                 RootPickerEvent::Picked { root, .. } => {
-                    // The picked name is never used here — the whole point of
-                    // this flow is re-rooting the ALREADY-attached session,
-                    // never renaming or creating one.
+                    // This dialog never sets `allow_rootless` (issue #887) —
+                    // `root` is always `Some` here in practice; handled
+                    // defensively rather than assumed, mirroring
+                    // `open_root_picker`. The picked NAME is never used here
+                    // either way — the whole point of this flow is re-rooting
+                    // the ALREADY-attached session, never renaming/creating.
+                    let Some(root) = root else {
+                        return;
+                    };
                     let session_name = session_view.read(cx).session_name().to_owned();
                     if let Some((path, target)) = &recents {
                         if let Err(e) = recents::merge_recent_root(path, target, root) {
@@ -4778,7 +4793,7 @@ mod tests {
         cx.update_window(window.into(), |_, _window, cx| {
             picker.update(cx, |_picker, cx| {
                 cx.emit(RootPickerEvent::Picked {
-                    root: "/home/dev/rift".to_string(),
+                    root: Some("/home/dev/rift".to_string()),
                     name: "some-typed-name".to_string(),
                 });
             });
