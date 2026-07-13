@@ -190,10 +190,18 @@ struct EngineWatches {
     /// when `session` above is the unset sentinel (empty).
     picker: PickerChannels,
     /// The `SessionIntent::Preferred` name to try against the live host list
-    /// before falling back to the picker (issue #707) — `None` for `Pick`
-    /// (always the picker). Engine-scoped like the rest of this struct:
-    /// constant across every reconnect attempt while `session` stays unset.
+    /// before falling back to the display-order head (issue #707) — `None`
+    /// for `Pick`. Engine-scoped like the rest of this struct: constant across
+    /// every reconnect attempt while `session` stays unset.
     preferred_session: Option<String>,
+    /// The persisted session display order (phase 32, `session_order.rs`),
+    /// loaded once for this connect attempt — the same store the in-cockpit
+    /// switcher sorts by. Feeds [`resolve_auto_attach_target`]'s
+    /// display-order-head fallback (issue #889,
+    /// `docs/spec-project-optional-session.md`) so the post-connect (and
+    /// mid-session re-entry) auto-attach picks the same session the switcher
+    /// would show first, never a silent re-sort surprise.
+    session_order: Vec<String>,
 }
 
 /// Cross-thread coordination for the post-connect session picker (#706/#707,
@@ -256,12 +264,15 @@ enum PickerChoice {
 /// sent once on [`PickerChannels::outcome_tx`], read by the Shell's
 /// `connect()` continuation.
 enum PickerOutcome {
-    /// A `SessionIntent::Preferred` name is still present on the host: the
-    /// daemon thread attaches it directly without ever showing the picker.
-    /// Carries the name so the Shell can record it in recents.
+    /// [`resolve_auto_attach_target`] resolved a session (issue #889) — the
+    /// recents `preferred` name if still live, else the display-order head —
+    /// against the live host list: the daemon thread attaches it directly
+    /// without ever showing the picker. Carries the name so the Shell can
+    /// record it as the new `preferred` in recents.
     Attached(String),
-    /// No direct attach: either `SessionIntent::Pick`, or a `Preferred` name
-    /// that vanished from the host. Carries the live list to render.
+    /// No target resolved: the live host session list is empty. Carries the
+    /// (empty) list to render, which [`route_picker`] sends to the
+    /// escapable create picker.
     ShowPicker(Vec<SessionListItem>),
 }
 
@@ -1104,6 +1115,7 @@ impl Shell {
                         cancel_rx: reconnect_cancel_rx,
                         key_exists,
                         session_intent,
+                        session_order_path: session_order_path.clone(),
                         session_ended_tx,
                         picker: PickerChannels {
                             outcome_tx: picker_outcome_tx,
@@ -1791,8 +1803,15 @@ struct SessionRunParams {
     key_exists: bool,
     /// The entry point's resolved session intent (issue #707): decides
     /// whether this run tries a remembered name before falling back to the
-    /// picker (`Preferred`), or always shows the picker (`Pick`).
+    /// display-order head (`Preferred`), or always resolves via the
+    /// display-order head (`Pick`) — see [`resolve_auto_attach_target`].
     session_intent: SessionIntent,
+    /// The session-order store's path (phase 32), loaded once into
+    /// [`EngineWatches::session_order`] below (issue #889,
+    /// `docs/spec-project-optional-session.md`) — `None` when the platform
+    /// state directory is unavailable, degrading to an empty order exactly
+    /// like every other reader of this store.
+    session_order_path: Option<PathBuf>,
     /// Fires exactly once when this run's loop ends, so the Shell can route
     /// back to a fresh Connection screen (#477). Carries [`ConnectError::Passphrase`]
     /// instead of [`ConnectError::General`] when the failure was the SSH key
@@ -1812,6 +1831,7 @@ fn run_session_with_reconnect(ssh: &SshConfig, params: SessionRunParams) {
         cancel_rx,
         key_exists,
         session_intent,
+        session_order_path,
         session_ended_tx,
         picker,
     } = params;
@@ -1825,17 +1845,27 @@ fn run_session_with_reconnect(ssh: &SshConfig, params: SessionRunParams) {
     let mut end_reason: Option<ConnectError> = None;
     // `Preferred`/`Pick` seed the session watch with the unset sentinel
     // (empty); `Preferred` additionally stashes its remembered name in
-    // `preferred_session` for `await_session_pick` to try against the live
-    // host list before falling back to the picker (issue #707).
+    // `preferred_session` for `resolve_auto_attach_target` to try against the
+    // live host list before falling back to the display-order head
+    // (issue #707).
     let (initial_session, preferred_session) = match session_intent {
         SessionIntent::Preferred(name) => (String::new(), Some(name)),
         SessionIntent::Pick => (String::new(), None),
     };
+    // Loaded once for the whole connect attempt (issue #889,
+    // `docs/spec-project-optional-session.md`) — mirrors `preferred_session`'s
+    // engine-wide scope, so a mid-attempt reconnect reuses the same order
+    // rather than re-reading the file per attempt.
+    let session_order = session_order_path
+        .as_deref()
+        .map(session_order::load)
+        .unwrap_or_default();
     let watches = EngineWatches {
         session: tokio::sync::watch::channel(initial_session).0,
         viewport: tokio::sync::watch::channel(None::<TermSize>).0,
         picker,
         preferred_session,
+        session_order,
     };
     loop {
         connected.store(false, Ordering::Relaxed);
@@ -2236,36 +2266,47 @@ async fn run_daemon_terminal(
         // engine, not an orderly end.
         let session = watches.session.borrow().clone();
         let picked = if session_is_unset(&session) {
-            // Pre-cockpit session picker (#706/#707,
-            // `docs/spec-post-connect-picker.md`; mid-session re-entry,
-            // `docs/spec-session-lifecycle.md`). The FIRST attach honors a
-            // `Preferred`/recent name (`watches.preferred_session`) and may attach
-            // it directly without ever showing the picker; every later re-entry
-            // (after a session end unset the watch below) passes `preferred =
-            // None`, so `await_session_pick` ALWAYS shows the picker — never a
-            // silent auto-attach, even for exactly one remaining session.
-            // Re-entered on every reconnect attempt while the watch stays unset
-            // (SSH dropping before resolution re-shows the picker instead of a
-            // blind attach); the watch is seeded below so a later reconnect (after
-            // resolution) skips straight past this branch. `picked.root` (the
-            // create-with-root transport, `docs/spec-session-root-picker.md`,
-            // issue #769) is `Some` only for a fresh root-picker create; `Attached`
-            // and every later reconnect never carry one.
+            // Pre-cockpit session resolution (#706/#707, issue #889,
+            // `docs/spec-project-optional-session.md`; mid-session re-entry,
+            // `docs/spec-session-lifecycle.md`). A live session list
+            // auto-attaches via [`resolve_auto_attach_target`] — the FIRST
+            // attach's `Preferred`/recent name (`watches.preferred_session`)
+            // if still live, else the display-order head
+            // (`watches.session_order`) — with no forced picker; only a
+            // genuinely empty host session list falls to the escapable
+            // create picker. Every later re-entry (after a session end unset
+            // the watch below) passes `preferred = None`, so it always
+            // resolves via the display-order head instead. Re-entered on
+            // every reconnect attempt while the watch stays unset (SSH
+            // dropping before resolution re-tries the same resolution
+            // instead of a blind attach); the watch is seeded below so a
+            // later reconnect (after resolution) skips straight past this
+            // branch. `picked.root` (the create-with-root transport,
+            // `docs/spec-session-root-picker.md`, issue #769) is `Some` only
+            // for a fresh root-picker create; `Attached` and every later
+            // reconnect never carry one.
             let preferred = if first_attach {
                 watches.preferred_session.as_deref()
             } else {
                 None
             };
-            let picked =
-                match await_session_pick(&current, &editor, &watches.picker, preferred).await? {
-                    PickerChoice::Picked(picked) => picked,
-                    // The root-picker chrome's persistent Disconnect (or an
-                    // origin-`Fresh` Back, issue #888) — give up this connect
-                    // attempt cleanly instead of attaching anything. See this
-                    // function's own doc comment for why `Ok(())` here is the
-                    // correct, deliberate outer-loop exit.
-                    PickerChoice::Disconnect => return Ok(()),
-                };
+            let picked = match await_session_pick(
+                &current,
+                &editor,
+                &watches.picker,
+                preferred,
+                &watches.session_order,
+            )
+            .await?
+            {
+                PickerChoice::Picked(picked) => picked,
+                // The root-picker chrome's persistent Disconnect (or an
+                // origin-`Fresh` Back, issue #888) — give up this connect
+                // attempt cleanly instead of attaching anything. See this
+                // function's own doc comment for why `Ok(())` here is the
+                // correct, deliberate outer-loop exit.
+                PickerChoice::Disconnect => return Ok(()),
+            };
             watches.session.send_replace(picked.session.clone());
             Some(picked)
         } else {
@@ -2348,7 +2389,8 @@ fn session_is_unset(session: &str) -> bool {
 /// is unit-testable without a daemon round-trip: whether `preferred` is
 /// present in the live host `sessions` list. `Some(name)` attaches directly;
 /// `None` (either `preferred` itself is `None` — `SessionIntent::Pick` — or
-/// the name is no longer on the host) falls back to the picker.
+/// the name is no longer on the host) falls back to [`resolve_auto_attach_target`]'s
+/// display-order-head fallback.
 fn resolve_preferred_session(
     preferred: Option<&str>,
     sessions: &[SessionListItem],
@@ -2360,13 +2402,47 @@ fn resolve_preferred_session(
         .then(|| name.to_string())
 }
 
+/// The post-connect (and mid-session re-entry) auto-attach target (issue
+/// #889, `docs/spec-project-optional-session.md`), a pure function over
+/// exactly the three app-side inputs the design settles on — deliberately
+/// NOT the wire `SessionEntry`'s activity, which does not exist (a protocol
+/// change is out of scope, see the spec's Prior decisions): the recents
+/// `preferred` name if it is still [`resolve_preferred_session`]-live, else
+/// the head of `sessions` after applying the persisted display `order`
+/// (phase 32, `session_order::sort_sessions` — the same sort the in-cockpit
+/// switcher renders), else — when `order` is empty/unset — the head of
+/// `sessions` exactly as the daemon's session-list query returned it (NOT
+/// `sort_sessions`'s own empty-order fallback, which re-sorts by name; an
+/// unset order here means "no opinion yet", so the daemon's own order wins
+/// instead of an incidental alphabetical one). `None` only when `sessions`
+/// is empty — the caller falls back to the escapable create picker.
+fn resolve_auto_attach_target(
+    preferred: Option<&str>,
+    sessions: &[SessionListItem],
+    order: &[String],
+) -> Option<String> {
+    if let Some(name) = resolve_preferred_session(preferred, sessions) {
+        return Some(name);
+    }
+    if order.is_empty() {
+        return sessions.first().map(|session| session.name.clone());
+    }
+    session_order::sort_sessions(sessions.to_vec(), order)
+        .into_iter()
+        .next()
+        .map(|session| session.name)
+}
+
 /// Which pre-cockpit picker a `PickerOutcome::ShowPicker` routes to
 /// (`docs/spec-session-lifecycle.md`, `docs/spec-session-root-picker.md`). Pure
 /// so the empty-vs-non-empty split is unit-testable without a GPUI Shell: an
 /// empty live list has nothing to pick, so it opens the zero-sessions root
-/// picker (the create flow) directly; any non-empty list opens the session
-/// picker. One routing rule for both the post-connect first entry and every
-/// mid-session re-entry.
+/// picker (the create flow) directly; a non-empty list opens the session
+/// picker — reachable today only if a future caller sends `ShowPicker` with a
+/// non-empty list, since [`resolve_auto_attach_target`] (issue #889) now
+/// resolves every non-empty list itself before `await_session_pick` ever
+/// emits `ShowPicker`. One routing rule for both the post-connect first entry
+/// and every mid-session re-entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PickerRoute {
     SessionPicker,
@@ -2403,25 +2479,28 @@ fn resolve_attach_session(
     }
 }
 
-/// Pre-cockpit session pick (#706/#707): entered only when `watches.session`
-/// is unset. Issues `QuerySessionList` on the handshaken client and reuses
-/// [`consume_daemon_messages`]'s own routing table for everything else that
-/// arrives along the way — the daemon's post-Welcome state replay (worktree,
-/// git, diagnostics, LSP health) can interleave with the reply, and this way
-/// none of it is dropped even though no `Attach` has happened yet. The first
-/// call captures the session list; if `preferred` ([`resolve_preferred_session`])
-/// is still present there, this returns immediately without ever showing the
-/// picker. Otherwise the list is handed to the Shell's picker and the second
-/// call blocks for the pick, racing it against the same stream so a stream
-/// death while the picker is showing unblocks this await instead of hanging
-/// forever.
+/// Pre-cockpit session resolution (#706/#707, issue #889): entered only when
+/// `watches.session` is unset. Issues `QuerySessionList` on the handshaken
+/// client and reuses [`consume_daemon_messages`]'s own routing table for
+/// everything else that arrives along the way — the daemon's post-Welcome
+/// state replay (worktree, git, diagnostics, LSP health) can interleave with
+/// the reply, and this way none of it is dropped even though no `Attach` has
+/// happened yet. The first call captures the session list; if
+/// [`resolve_auto_attach_target`] resolves a target against it (`preferred`,
+/// else the `order`-applied display-order head — true for every non-empty
+/// list), this returns immediately without ever showing the picker. Only a
+/// genuinely empty list is handed to the Shell as `ShowPicker`, which routes
+/// it to the escapable create picker (`route_picker`, zero-sessions branch);
+/// the second call then blocks for that pick, racing it against the same
+/// stream so a stream death while the picker is showing unblocks this await
+/// instead of hanging forever.
 ///
 /// Either failure case returns a [`rift_ssh::SshError::Channel`] rather than
 /// a plain `anyhow!` string: [`is_retryable_session_error`] only recognizes
 /// an [`rift_ssh::SshError`] in the chain, so this is what makes the SSH-level
 /// reconnect engine (#476) retry the whole attempt — fresh SSH connect, fresh
 /// daemon handshake, and (since `watches.session` is still unset) this same
-/// branch again, re-showing the picker — instead of surfacing a dead end on
+/// branch again, re-resolving a target — instead of surfacing a dead end on
 /// the Connection screen. Pre-Attach there is no in-flight terminal state to
 /// preserve, so restarting the whole attempt is simpler than replicating the
 /// main loop's narrower daemon-only [`reconnect_daemon`] and just as correct.
@@ -2436,6 +2515,7 @@ async fn await_session_pick(
     editor: &EditorChannels,
     picker: &PickerChannels,
     preferred: Option<&str>,
+    order: &[String],
 ) -> Result<PickerChoice> {
     use rift_protocol::ClientMessage;
 
@@ -2453,7 +2533,7 @@ async fn await_session_pick(
         }
     };
 
-    if let Some(name) = resolve_preferred_session(preferred, &sessions) {
+    if let Some(name) = resolve_auto_attach_target(preferred, &sessions, order) {
         let _ = picker
             .outcome_tx
             .send(PickerOutcome::Attached(name.clone()));
@@ -3719,9 +3799,10 @@ fn layout_to_snapshot(
 mod tests {
     use super::{
         drain_render_backlog, is_retryable_session_error, layout_to_snapshot,
-        resolve_attach_session, resolve_preferred_session, route_picker, session_is_unset,
-        CaptureRequest, EditorChannels, EngineWatches, PaneInput, PickedSession, PickerChannels,
-        PickerRoute, PtyChannels, SessionListItem, SessionSwitchRequest, TermSize,
+        resolve_attach_session, resolve_auto_attach_target, resolve_preferred_session,
+        route_picker, session_is_unset, CaptureRequest, EditorChannels, EngineWatches, PaneInput,
+        PickedSession, PickerChannels, PickerRoute, PtyChannels, SessionListItem,
+        SessionSwitchRequest, TermSize,
     };
 
     #[test]
@@ -3823,6 +3904,64 @@ mod tests {
     #[test]
     fn test_resolve_preferred_session_empty_list_returns_none() {
         assert_eq!(resolve_preferred_session(Some("work"), &[]), None);
+    }
+
+    // --- resolve_auto_attach_target (issue #889) ----------------------------
+
+    #[test]
+    fn test_resolve_auto_attach_target_preferred_live_wins_over_order() {
+        let sessions = vec![session_item("work"), session_item("scratch")];
+        let order = vec!["scratch".to_string(), "work".to_string()];
+
+        assert_eq!(
+            resolve_auto_attach_target(Some("work"), &sessions, &order),
+            Some("work".to_string()),
+            "a live preferred name attaches directly, regardless of display order"
+        );
+    }
+
+    #[test]
+    fn test_resolve_auto_attach_target_preferred_absent_falls_to_ordered_head() {
+        let sessions = vec![session_item("work"), session_item("scratch")];
+        let order = vec!["scratch".to_string(), "work".to_string()];
+
+        assert_eq!(
+            resolve_auto_attach_target(None, &sessions, &order),
+            Some("scratch".to_string()),
+            "no live preferred name falls to the display-order-applied head"
+        );
+    }
+
+    #[test]
+    fn test_resolve_auto_attach_target_stale_preferred_falls_to_ordered_head() {
+        let sessions = vec![session_item("work"), session_item("scratch")];
+        let order = vec!["scratch".to_string(), "work".to_string()];
+
+        assert_eq!(
+            resolve_auto_attach_target(Some("gone"), &sessions, &order),
+            Some("scratch".to_string()),
+            "a preferred name no longer on the host falls to the ordered head too"
+        );
+    }
+
+    #[test]
+    fn test_resolve_auto_attach_target_order_unset_falls_to_daemon_head() {
+        let sessions = vec![session_item("zeta"), session_item("alpha")];
+
+        assert_eq!(
+            resolve_auto_attach_target(None, &sessions, &[]),
+            Some("zeta".to_string()),
+            "an unset display order falls to the daemon list's own head, not a name re-sort"
+        );
+    }
+
+    #[test]
+    fn test_resolve_auto_attach_target_empty_list_returns_none() {
+        assert_eq!(resolve_auto_attach_target(Some("work"), &[], &[]), None);
+        assert_eq!(
+            resolve_auto_attach_target(None, &[], &["work".to_string()]),
+            None
+        );
     }
 
     #[test]
@@ -3939,6 +4078,7 @@ mod tests {
                     choice_rx: flume::unbounded().1,
                 },
                 preferred_session: None,
+                session_order: Vec::new(),
             },
             input_tx,
             size_tx,
