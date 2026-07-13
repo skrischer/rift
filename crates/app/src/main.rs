@@ -195,13 +195,20 @@ struct EngineWatches {
     /// every reconnect attempt while `session` stays unset.
     preferred_session: Option<String>,
     /// The persisted session display order (phase 32, `session_order.rs`),
-    /// loaded once for this connect attempt — the same store the in-cockpit
-    /// switcher sorts by. Feeds [`resolve_auto_attach_target`]'s
-    /// display-order-head fallback (issue #889,
-    /// `docs/spec-project-optional-session.md`) so the post-connect (and
-    /// mid-session re-entry) auto-attach picks the same session the switcher
-    /// would show first, never a silent re-sort surprise.
+    /// loaded once at the start of this connect attempt — the same store the
+    /// in-cockpit switcher sorts by. Feeds [`resolve_auto_attach_target`]'s
+    /// display-order-head fallback for the FIRST attach only (issue #889,
+    /// `docs/spec-project-optional-session.md`): a mid-session re-entry
+    /// reloads fresh from [`Self::session_order_path`] instead, since
+    /// `spawn_session_order_actor`'s drag-reorder/rename actor persists every
+    /// change straight to that file — this snapshot would otherwise go stale
+    /// the moment the switcher's order changes mid-connection.
     session_order: Vec<String>,
+    /// The session-order store's path, kept alongside the snapshot above so
+    /// a mid-session re-entry can reload it fresh (issue #889 review fix) —
+    /// `None` mirrors [`Self::session_order`]'s own degrade-to-empty when the
+    /// platform state directory is unavailable.
+    session_order_path: Option<PathBuf>,
 }
 
 /// Cross-thread coordination for the post-connect session picker (#706/#707,
@@ -1854,8 +1861,11 @@ fn run_session_with_reconnect(ssh: &SshConfig, params: SessionRunParams) {
     };
     // Loaded once for the whole connect attempt (issue #889,
     // `docs/spec-project-optional-session.md`) — mirrors `preferred_session`'s
-    // engine-wide scope, so a mid-attempt reconnect reuses the same order
-    // rather than re-reading the file per attempt.
+    // engine-wide scope, used only for the FIRST attach; `session_order_path`
+    // (moved in below) lets a mid-session re-entry reload a fresh copy
+    // instead of reusing this snapshot (review fix: the in-cockpit switcher's
+    // reorder actor persists straight to that file, independent of this
+    // engine-scoped struct).
     let session_order = session_order_path
         .as_deref()
         .map(session_order::load)
@@ -1866,6 +1876,7 @@ fn run_session_with_reconnect(ssh: &SshConfig, params: SessionRunParams) {
         picker,
         preferred_session,
         session_order,
+        session_order_path,
     };
     loop {
         connected.store(false, Ordering::Relaxed);
@@ -2290,23 +2301,34 @@ async fn run_daemon_terminal(
             } else {
                 None
             };
-            let picked = match await_session_pick(
-                &current,
-                &editor,
-                &watches.picker,
-                preferred,
-                &watches.session_order,
-            )
-            .await?
-            {
-                PickerChoice::Picked(picked) => picked,
-                // The root-picker chrome's persistent Disconnect (or an
-                // origin-`Fresh` Back, issue #888) — give up this connect
-                // attempt cleanly instead of attaching anything. See this
-                // function's own doc comment for why `Ok(())` here is the
-                // correct, deliberate outer-loop exit.
-                PickerChoice::Disconnect => return Ok(()),
+            // The FIRST attach reuses the connect-attempt-start snapshot
+            // (`watches.session_order`, loaded once); a mid-session
+            // re-entry reloads it fresh from disk instead — the in-cockpit
+            // switcher's reorder/rename actor (`spawn_session_order_actor`)
+            // persists every change straight to that file, so the stale
+            // engine-scoped snapshot would otherwise auto-switch to a
+            // pre-reorder head (issue #889 review fix).
+            let order = if first_attach {
+                watches.session_order.clone()
+            } else {
+                watches
+                    .session_order_path
+                    .as_deref()
+                    .map(session_order::load)
+                    .unwrap_or_default()
             };
+            let picked =
+                match await_session_pick(&current, &editor, &watches.picker, preferred, &order)
+                    .await?
+                {
+                    PickerChoice::Picked(picked) => picked,
+                    // The root-picker chrome's persistent Disconnect (or an
+                    // origin-`Fresh` Back, issue #888) — give up this connect
+                    // attempt cleanly instead of attaching anything. See this
+                    // function's own doc comment for why `Ok(())` here is the
+                    // correct, deliberate outer-loop exit.
+                    PickerChoice::Disconnect => return Ok(()),
+                };
             watches.session.send_replace(picked.session.clone());
             Some(picked)
         } else {
@@ -4079,6 +4101,7 @@ mod tests {
                 },
                 preferred_session: None,
                 session_order: Vec::new(),
+                session_order_path: None,
             },
             input_tx,
             size_tx,
