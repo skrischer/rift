@@ -728,6 +728,34 @@ how a short-lived child racing a sample is handled; phase 46 — which filesyste
 disk indicator tracks (the session `@root` mount vs the daemon's own) and the
 sparkline retention window.
 
+## Project-optional session model — prior-art index (Phase 47)
+
+Seeded 2026-07-13 from idea sparring (research mode: websearch). Per-concern prior
+art for making rift usable without a project root (Phase 47) — the connect→usable
+flow, root-optional / decoupled from the session, and set-root-after-open. Builds
+on and reverses parts of the Phase-40 index above; the connect-vs-project
+separation resolves largely against catalogued Category 8 references (Zed / VS Code
+remote), topped up with focused lookups.
+
+| Concern | Reference | Verdict |
+|---|---|---|
+| Connect = pure transport; a project is opened *after*, optionally (usable with none) | **VS Code Remote-SSH** — "after you are connected, you'll be in an **empty window**. This is the **expected behavior** … the empty window is **by design** — it lets you choose a folder *after* connecting rather than forcing one at connection time"; open a folder later via File > Open / the Remote Explorer ([Remote Development using SSH](https://code.visualstudio.com/docs/remote/ssh)); the long-standing opt-in "prompt to open a folder after connecting" ([vscode-remote-release #511](https://github.com/microsoft/vscode-remote-release/issues/511)) | **reference — adopt** the empty/usable-window-by-design model: connecting is complete on its own; the root is chosen after, optionally. rift already has the pure-SSH connect (phases 33/38); the gap is the *usable-with-no-root* landing state |
+| Set / add / change the project root after opening (mid-session) | **Zed** — right-click the project panel → "**Add Folders to Project**" adds a root to the open window; the title-bar worktree picker switches / creates worktrees without reconnecting ([Windows & Projects](https://zed.dev/docs/windows-and-projects); [Add Workspace Support #39292](https://github.com/zed-industries/zed/discussions/39292)) | **reference (pattern)** — the root is a post-open, changeable property of the window, not a launch precondition; rift's equivalent is a mid-session set/change of the session `@root` via the existing `reroot_connection` (single root, not multi-root — Zed's multi-root/worktree UI stays deferred, vision Scenario 2) |
+| Session ≠ project; killing / switching a session never drops the transport | **tmux `detach-on-destroy off`** — switch the client to another session on kill instead of detaching ([tmux(1)](https://man7.org/linux/man-pages/man1/tmux.1.html)); rift's own #813 connected-sessionless substrate (phase 40, index above) | **reuse own / reference** — the substrate already ships (#813); this phase changes the *policy* on top (auto-attach + usable-sessionless landing), not always-picker |
+| A tmux session is meaningful with no "project" at all | **tmux / Zellij** — a session is a set of windows/panes with a working dir, never a "project"; project-ness is a convention layered by sessionizers (`sesh`, `tmux-sessionizer`, catalogued for phases 34/35) | **reference — differentiation** — reinforces reversing phase-36's mandatory session=project: rift stays a tmux GUI first; the project root is an optional enhancement the daemon uses to light up the reactive layer, absent = plain terminal cockpit |
+
+Notes — ADOPT: the VS Code "empty window by design" connect model (usable with no
+project) and Zed's after-open add/change-root affordance, both mapped onto rift's
+single per-session `@root`; the tmux session-vs-project separation. AVOID: Zed-style
+multi-root / multi-worktree-in-one-window UI (vision Scenario 2, deferred), a
+mandatory folder prompt on connect (the whole point is that it is optional), and
+any teardown of the SSH/daemon on a session end (the phase-40 substrate already
+holds the connection). This index reverses the Phase-40 index's "AVOID auto-attach
+on kill / always-picker" record — that was the phase-40 policy this phase
+supersedes; the underlying #813 substrate is retained. Sources: VS Code Remote-SSH
+docs + remote-release #511; Zed Windows & Projects / multi-root discussion;
+tmux(1).
+
 ## Priority reference projects (top 10)
 
 1. **penso/arbor** — Closest existing implementation of rift's exact concept (Rust + GPUI + daemon + SSH outposts + agent state). Read end-to-end before writing any architecture docs.
