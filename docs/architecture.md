@@ -224,7 +224,8 @@ Editing uses a deliberate request/response buffer channel over the daemon transp
   (`spec-session-lifecycle.md`).
 - _(Phase 47)_ **A project root is optional and the connect→usable path never
   dead-ends.** Connecting with ≥1 session **auto-attaches** a live session (the
-  recents `preferred`, else the most-recently-active) straight into the cockpit —
+  recents `preferred`, else the app display-order head — `session_order`, no
+  session-activity/protocol data) straight into the cockpit —
   the post-connect picker becomes on-demand, revising the phase-33 "a fresh
   Connect always shows the picker". A session may be **created with no project
   root** (name-only → `Attach { root: None }`, watched at `session_path`), and a

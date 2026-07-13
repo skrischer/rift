@@ -12,9 +12,10 @@ connected-sessionless substrate (#813).
 ## Outcome
 
 - [ ] Connecting to a host with **&#8805;1 session** auto-attaches a live session
-      (the recents `preferred`, else the most-recently-active) and lands in the
-      cockpit with no forced picker; the other sessions are reachable in the
-      in-cockpit switcher (phases 19/32).
+      (the recents `preferred`, else the first session in the app's display order —
+      the `session_order`-applied order the switcher renders, phase 32) and lands
+      in the cockpit with no forced picker; the other sessions are reachable in the
+      in-cockpit switcher (phases 19/32), and the picker stays available on demand.
 - [ ] A session can be created with **no project root** (name-only): the root
       picker completes without a selected root, and the daemon attaches the new
       session root-less (no `-c`, no `@root`), exactly as it already does for a
@@ -53,20 +54,27 @@ connected-sessionless substrate (#813).
   None) == None`, `crates/daemon/src/terminal.rs`). Surfaced as the
   `Start without a project root` action; `Create`/`Open` no longer requires a
   non-empty `current_path`.
-- **Never-dead-end the picker** (`crates/app` root picker + the daemon browse
-  seed): a stale/absent seeded recent root resolves to the home listing like a
-  fresh pick — extend the existing one-shot seed fallback (`apply_dir_entries_reply`
-  `seed_fallback_attempted`, issue #872; `browse.rs resolve_path` `""`&#8594;`$HOME`)
-  so an invalid recent root never leaves the picker in an error state; add a
-  persistent `Back` / `Disconnect` control to the root-picker chrome
-  (`crates/app/src/main.rs` `render_root_picker_screen`, `root_picker.rs`).
+- **Never-dead-end the picker** (`crates/app` root picker). The seed&#8594;home
+  fallback **already shipped** (PR #882, in develop): a failed seed browse falls
+  back to `$HOME`, and a stale recent root resolves silently via
+  `apply_dir_entries_reply` / `seed_fallback_attempted` (`crates/app/src/root_picker.rs`;
+  `browse.rs resolve_path` `""`&#8594;`$HOME`). The residual deliverable here is
+  the **persistent `Back` / `Disconnect` control** on the root-picker chrome
+  (`crates/app/src/main.rs` `render_root_picker_screen`, `root_picker.rs`) — the
+  picker today has no cancel/back/disconnect — plus a QA confirmation that the
+  stale-recent-root case resolves silently (no notice, no error UI) as designed.
 - **Auto-attach entry model** (`crates/app/src/main.rs` post-connect routing): the
-  `SessionIntent::Pick` post-connect resolution auto-attaches a live session
-  (`preferred` then most-recently-active) via the existing
-  `PickerOutcome::Attached` path instead of unconditionally emitting
-  `ShowPicker`; the picker becomes an on-demand affordance. Includes the
-  mid-session routing per the accepted gate policy (the phase-40 `run_daemon_terminal`
-  re-pick, #813).
+  `SessionIntent::Pick` post-connect resolution auto-attaches a live session — the
+  recents `preferred` if still live, else the first session in the app display
+  order (`session_order`, phase 32; falls back to the daemon's `SESSION_LIST_QUERY`
+  order when unset) — via the existing `PickerOutcome::Attached` path instead of
+  unconditionally emitting `ShowPicker` (`await_session_pick`, `main.rs`). The
+  target selection is a pure function over (`preferred`, the session list,
+  `session_order`) — **no session-activity data is added** (the wire `SessionEntry`
+  carries none, so "most-recently-active" is deliberately NOT used — it would need
+  a protocol change). The auto-attached session is recorded as the new `preferred`;
+  the picker becomes an on-demand affordance. Includes the mid-session routing per
+  the accepted gate policy (the phase-40 `run_daemon_terminal` re-pick, #813).
 - **Set project root mid-session** (`crates/app` explorer/cockpit): a root-less
   session's explorer empty-state exposes `Set project root`, which reuses the
   remote browse (phase 36) and re-`Attach`es the current session with
@@ -84,10 +92,12 @@ connected-sessionless substrate (#813).
 
 ### Out of scope
 
-- **Clearing / unsetting a root** on a session that has one (`@root` &#8594; unset):
-  deferred — set/change is the need; an explicit un-set is a rare edge with a
-  messier `set -u @root` + reroot-to-`session_path` semantics. Recorded as a
-  follow-up, not built here.
+- **Changing or clearing an existing root** (a session that already has `@root`):
+  deferred. The delivered need is **setting** a root on a **root-less** session
+  (surfaced on the explorer empty-state, which is gone once a root exists);
+  changing root A&#8594;B (recreate / switch the session instead) and an explicit
+  un-set (`set -u @root` + reroot to `session_path`) are rare edges with **no
+  surfaced entry point in this phase**. Recorded as a follow-up.
 - **Multi-root / add-folder-to-project** (Zed-style multiple roots in one window):
   out — rift stays single-root-per-session (vision Scenario 2 deferred).
 - **An empty cockpit with no attached session:** the connected-no-session state
@@ -153,8 +163,8 @@ connected-sessionless substrate (#813).
 | **Name-only create** emits `Attach { root: None }`; the daemon attaches root-less (no `-c` / `@root`), watched at `session_path` | The root-less attach path already exists end-to-end (phase 41); a name-only create reuses it with no daemon change. | 2026-07-13 |
 | A **stale/absent seeded root is invisible**: the picker opens at the home default like a fresh pick — no notice, no error banner, no recovery buttons, no distinct broken-seed state | Design review: two recovery buttons (and even a fallback notice) were rejected as over-engineered. The daemon already falls `""`&#8594;`$HOME` (#872); make an invalid recent root resolve there silently. Removes the screenshot dead-end at its root. | 2026-07-13 (design review) |
 | The picker's only escapes are a persistent **Back / Disconnect** and **Start without a project root** — no per-error recovery UI | Minimal, always-present exits make the picker unconditionally escapable; the silent home fallback removes the need for error-specific recovery affordances. | 2026-07-13 (design review) |
-| **Set project root mid-session** is surfaced on the root-less session's **explorer empty-state** ("No project root &#8594; Set project root"), reusing the remote browse + re-`Attach`-with-root | Design review picked the explorer empty-state (where the absence is felt) over a command-palette-only entry; the mechanism is the existing phase-35 re-root, no new message. | 2026-07-13 (design review) |
-| **Post-connect auto-attach:** connecting with &#8805;1 session auto-attaches `preferred` (recents) else the most-recently-active, via the existing `PickerOutcome::Attached`; the picker is on-demand | Design review (Path A): "the picker is unnecessary — the switcher is always up." Reuses the phase-33 `Preferred` direct-attach; the Connect button stops forcing `ShowPicker`. | 2026-07-13 (design review) |
+| **Set project root** (root-less &#8594; root) is surfaced on the root-less session's **explorer empty-state** ("No project root &#8594; Set project root"), reusing the remote browse + re-`Attach`-with-root; when the explorer area is hidden, its activity-rail toggle (phase 39) is the reveal path | Design review picked the explorer empty-state (where the absence is felt) over a command-palette-only entry; the mechanism is the existing phase-35 re-root, no new message. Scoped to setting a root on a root-less session — changing/clearing an existing root is out of scope. | 2026-07-13 (design review) |
+| **Post-connect auto-attach:** connecting with &#8805;1 session auto-attaches `preferred` (recents) else the **first session in the app display order** (`session_order`, phase 32; daemon list order when unset), via the existing `PickerOutcome::Attached`; the picker is on-demand | Design review (Path A): "the picker is unnecessary — the switcher is always up." Reuses the phase-33 `Preferred` direct-attach; the Connect button stops forcing `ShowPicker`. The target is app-side data only (no `#{session_activity}` / protocol change) — so "most-recently-active" is deliberately not used; display order is deterministic and already what the switcher renders. | 2026-07-13 (design review) |
 | The connected-no-session state stays the **escapable picker** (phase-40 substrate), not an empty cockpit render | A cockpit render with no attached session is a large, separate change (the WorkspaceView assumes an attached session/layout); a session — possibly root-less — is always attached before the cockpit shows. Keeps scope minimal. | 2026-07-13 |
 | **Clearing** an existing `@root` is out of scope (deferred follow-up) | set/change is the actual need; an explicit un-set is a rare edge with messier semantics (`set -u @root` + reroot to `session_path`). | 2026-07-13 |
 | App-only; **`PROTOCOL_VERSION` unchanged** | Every reused message (`Attach` with/without root, `QuerySessionList`, the browse channel, `PickerOutcome`) already exists; this is a `crates/app` state-machine change (plus an optional daemon browse-seed tweak). | 2026-07-13 |
@@ -186,9 +196,11 @@ Machine gates (`docs/workflow.md`):
       `rift-app`); CI `app-check` compiles `rift-app`.
 - [ ] `PROTOCOL_VERSION` unchanged (pinned fingerprint test green).
 - [ ] Pure-seam unit tests: name-only create resolves to `Attach { root: None }`;
-      the post-connect auto-attach target selection (`preferred` &#8594;
-      most-recently-active) is testable as a pure function; an invalid recent-root
-      seed resolves to the home default (no terminal error state).
+      the post-connect auto-attach target selection — a pure function over
+      (`preferred`, the session list, `session_order`) returning `preferred`-if-live
+      else the display-order head — is unit-tested. (The stale-recent-root &#8594;
+      home resolution already ships and is covered by #882's tests; this phase adds
+      the escapable-chrome + QA, not a new fallback.)
 
 Human milestone-QA gate (dev channel, `just dev-windows-watch`):
 
@@ -211,7 +223,7 @@ Human milestone-QA gate (dev channel, `just dev-windows-watch`):
 
 | Risk | Mitigation |
 |---|---|
-| Auto-attach on connect surprises the user by attaching an unexpected session | Attach the recents `preferred` (the last session used on this host) first, only falling back to most-recently-active; the switcher makes the rest one click away, and a fresh host (no sessions) never auto-attaches. |
+| Auto-attach on connect surprises the user by attaching an unexpected session | Attach the recents `preferred` (the last session used on this host) first, only falling back to the display-order head; the auto-attached session becomes the new `preferred` so it resumes the same next time; the switcher makes the rest one click away, and a fresh host (no sessions) never auto-attaches. |
 | A name-only (root-less) session lands at an unhelpful cwd (daemon home) | Correct and expected — root-less means "no watched project"; the `Set project root` empty-state is the one-click path to bind one. `#502`'s no-`$HOME`-watch guard keeps the reactive layer empty (not wrongly watching home) until a root is set. |
 | Reversing the phase-40 always-picker mid-session leaves `spec-session-lifecycle.md` internally inconsistent | This PR adds a superseding note to that spec and amends the architecture contract; the mid-session policy is the one gate decision, so the reversal is explicitly ratified. |
 | Making `Create`/`Open` root-optional weakens the "session = project" intent for users who want it | Picking a root is still the default first-class path (folder &#8594; `@root`), unchanged; root-optional only removes the *hard requirement*. |
@@ -232,3 +244,15 @@ Human milestone-QA gate (dev channel, `just dev-windows-watch`):
 - 2026-07-13: One open decision (the mid-session kill policy + 0-remaining
   landing) carried to the spec-acceptance gate; recommendation recorded
   (auto-switch, symmetric with post-connect).
+- 2026-07-13 (spec review): two blocking findings fixed. (1) The auto-attach
+  fallback "most-recently-active" is not derivable app-side — the wire
+  `SessionEntry` carries no activity and `SESSION_LIST_QUERY` fetches none, so it
+  would force a `PROTOCOL_VERSION` bump; replaced with the **display-order head**
+  (`session_order`, phase 32; daemon list order when unset), a pure app-side
+  function, preserving the no-protocol-change invariant. (2) "Change an existing
+  root" had no entry point — explicitly scoped **out** alongside clear; the
+  delivered need is setting a root on a root-less session. Non-blocking folded in:
+  the seed&#8594;home fallback already ships (#882) so the residual "never
+  dead-end" work is the persistent Back/Disconnect chrome; the explorer
+  empty-state's activity-rail reveal path noted. All other code-fact claims
+  verified true against source.
