@@ -183,13 +183,21 @@ secrets, accounts, or external provisioning.
   default size, no `-x/-y` — `crates/daemon/src/terminal.rs` `spawn_args`) and
   re-asserts the client grid unconditionally as a `ResizePane` after the
   `Attach` (`crates/app/src/main.rs:3614`), which the daemon maps to
-  `refresh-client -C <cols>x<rows>` (`terminal.rs:666`). But `refresh-client -C`
-  to the size tmux already holds is a **no-op** (the resize-feedback pitfall,
-  `docs/tmux-reference.md` §"Known pitfalls" 2), so a switch between two sessions
-  at the SAME grid forces no reflow/redraw; content then depends solely on the
-  fresh attach's own `%output` redraw, which is intermittently missed (racy
-  against fresh, empty pane materialization — `apply_snapshot` creates panes with
-  an empty `Term`/paint-cache before `%output` lands). A real resize *changes*
+  `refresh-client -C <cols>x<rows>` (`terminal.rs:666`). The leading hypothesis:
+  `refresh-client -C` to the size tmux already holds is a **no-op** (tmux reflows
+  only on an actual size change — plausible but UNVERIFIED against live tmux; the
+  spike below confirms it, and it is not what `docs/tmux-reference.md` §"Known
+  pitfalls" 2 documents — that pitfall is the converse resize-feedback loop). If
+  so, a switch between two sessions at the SAME grid forces no reflow/redraw, and
+  content then depends solely on the fresh attach's own `%output` redraw, which is
+  intermittently missed (racy against fresh, empty pane materialization —
+  `apply_snapshot` creates panes with an empty `Term`/paint-cache before `%output`
+  lands, `session_view.rs:1119`). Note `apply_snapshot` already replays `%output`
+  that arrived before the pane existed via `early_output_buffer`
+  (`session_view.rs:1152`), so if tmux DOES resend content on the fresh attach the
+  race is largely covered — which tilts the prior toward the same-size no-op
+  candidate (if tmux resends nothing, there is nothing to buffer or replay). A
+  real resize *changes*
   the size, so `-C` actually reflows and tmux resends `%output` — which is why a
   window resize "fixes" it, and why typing only repairs the cells it echoes. NB
   the earlier decision "close the `switch-client` gap with `request_layout()`" is
