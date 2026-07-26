@@ -64,6 +64,15 @@
 | 45 | Per-pane resource attribution — `pane_pid` → /proc process-subtree RSS / CPU roll-up per tmux pane, surfaced as a per-pane breakdown popover ("which pane is the cause"); strictly agent-agnostic — the pane label is `pane_current_command` / `pane_title`, never agent detection. Extends the phase-43 host-metrics channel with per-pane metrics. Depends on 43 | [spec-pane-attribution.md](spec-pane-attribution.md) | [Phase 450](https://github.com/skrischer/rift/milestone/66) |
 | 46 | Telemetry detail + disk headroom — a detail popover (memory breakdown used / cached / buffers / available, load 1·5·15, uptime, cores), a client-side sparkline history (trend toward the limit), and a project-filesystem disk-headroom indicator (worktree `target/` dirs are heavy). Depends on 43 | — | — |
 | 47 | Project-optional session model — rift is usable the moment SSH connects, with no project root required. Connecting lands directly in a usable cockpit (auto-attach the last/first live session, or a connected-sessionless state when the host has none) instead of a forced picker; creating a session no longer requires a root (name-only create, attached root-less exactly like an externally-created session already is); the project root becomes an OPTIONAL, per-session, mid-session action (set / change / clear via the existing `@root` stamp + `reroot_connection`), not a creation gate; and the connect→usable path never dead-ends (the broken-seed root picker of the "This folder no longer exists" screenshot always offers navigate-up / name-only create / back / disconnect). Supersedes Phase 40's routing policy (always-picker, root-mandatory-on-zero) while retaining its shipped connected-sessionless substrate (#813); reverses Phase 36's "session = project at creation" mandatory coupling. Foundation impact: `architecture.md` connection-robustness contract (root-optional post-connect routing + the mid-session set-root affordance) and a `vision.md` reinforcement (a tmux session is usable without a project root; the root is an optional per-session enhancement), authored + ratified at this phase's /loopkit:plan spec-acceptance | [spec-project-optional-session.md](spec-project-optional-session.md) | [Phase 470](https://github.com/skrischer/rift/milestone/67) |
+| 48 | Multi-language LSP — populate the daemon's `ServerSpec` registry beyond the single rust-analyzer row (pyright, typescript-language-server, gopls, clangd), selected by the existing extension-based `DocumentSelector`; servers are consumed from the remote `$PATH`, never installed. The registry + filetype routing already exist (Phase 3.4); this fills the table | — | — |
+| 49 | Terminal scrollback scrollbar — a visible, auto-hiding vertical scrollbar over the terminal history tied to scrollback position, using gpui-component's `Scrollbar` (the widget the pickers adopted in #804) | — | — |
+| 50 | Terminal output timestamps (on-demand) — stamp PTY-byte arrival time per scrollback line and surface it on demand (hover-gutter / idle-marker / toggle), agent-agnostic (no output parsing). Closes the gap iTerm2 has under tmux (one timestamp per window) by stamping per pane at the control-mode `%output` boundary | — | — |
+| 51 | Markdown preview — a source/preview toggle for `.md` files rendering via gpui-component's `Markdown` element (read-only first; no live split-edit) | — | — |
+| 52 | WSL transport — a first-class WSL connection type alongside SSH (Zed's SSH/WSL/Docker `RemoteConnection` split), with a connection-kind chooser on the connect card; distinct from the `RIFT_REMOTE_EXEC_WRAPPER` one-hop-deeper wrapper | — | — |
+| 53 | Agent activity: working vs idle signal — discriminate an agent pane actively working from one idle-awaiting-input, which today's `is_shell` foreground-command signal cannot (an agent pane reads permanently Busy). Adds a per-pane `/proc` `pane_pid` CPU roll-up (the Phase-45 method) and/or PTY output-idle timing; strictly agent-agnostic. Depends on 45 | — | — |
+| 54 | Global UI font size — a real UI font-size / zoom control applied to editor, explorer, and chrome (not only the terminal PTY grid, which is all today's mislabelled "Font size" slider touches); folds the explorer-font-too-large papercut | — | — |
+| 55 | Real editor minimap — replace the 32px marks-strip (line-length bars, click-to-jump only) with a scaled code miniature plus a viewport indicator and drag-to-scroll | — | — |
+| 56 | Independent Explorer/Editor visibility — split the combined `Area::ExplorerEditor` rail item into two independently-toggleable areas (two nav items, filled-region icon indicating the target); reverses Phase 39's deliberate Explorer+Editor unification | — | — |
 
 A phase gets a Spec link once `/loopkit:plan` drafts it, and a Milestone link once
 it is `READY`. The milestone (open/closed + issue progress) is where status lives.
@@ -491,6 +500,46 @@ an explorer empty-state affordance).
 
 Backing prior art: "Project-optional session model — prior-art index (Phase 47)"
 in [prior-art.md](prior-art.md).
+
+## QA-seeded phases (48–56)
+
+Seeded 2026-07-26 from an interactive QA/dogfooding session on the **stable** channel
+(which lags `develop`). Most findings reconciled against the shipped roadmap: the bulk
+were already merged on `develop` (re-test after `just promote`) or are papercuts (the
+`papercut` label under [spec-dogfooding-fixes.md](spec-dogfooding-fixes.md)); this block
+seeds only the genuinely-new features and the two verified enhancements of
+already-shipped work. Constitution guardrail across all rows: agent-agnostic only —
+signals from PTY bytes, filesystem events, and host `/proc` state, never agent-output
+parsing or agent detection.
+
+Two rows are **enhancements of shipped phases**, verified inadequate by a live
+develop-code read, not fresh scope:
+- Phase 53 sharpens Phase 18's pane-activity status: the shipped signal derives from the
+  tmux foreground-command flag, so an agent (a non-shell foreground process) reads
+  permanently `Busy` and the working→idle-awaiting-input transition — the one an agent
+  indicator most needs — is never surfaced. Phase 53 adds the missing signal.
+- Phase 55 replaces Phase 23's minimap, which shipped as a 32px marks-strip (no glyphs,
+  no drag-scroll), with a real scaled miniature.
+
+Ordering: 48 / 49 / 51 / 54 are independent client/daemon wins; 50 and 55 are P3 polish;
+52 (WSL transport) is the largest; 53 depends on Phase 45's `pane_pid`→/proc method
+(milestone 66, in flight); 56 reverses a Phase-39 choice and is P3.
+
+Foundation impact (authored + ratified at each phase's `/loopkit:plan` spec-acceptance,
+never edited from here):
+
+- Phase 48 — vision none; constitution none; architecture none. The `ServerSpec` registry and extension routing already exist (Phase 3.4); this populates data rows. Servers come from the remote `$PATH`, never installed (no new dependency).
+- Phase 49 — vision none; constitution none; architecture none. gpui-component `Scrollbar`, already vendored.
+- Phase 50 — vision none; constitution none (PTY-byte arrival timing is already an admitted agent-agnostic signal); architecture none. Per-line timestamp state in the scrollback is client-side; memory cost at long history is a plan-time call.
+- Phase 51 — vision none; constitution none; architecture none. gpui-component `Markdown` element, already vendored.
+- Phase 52 — vision none; constitution none; **architecture — the transport layer gains a second transport behind a connection-kind seam (SSH | WSL) and the connect card a transport chooser**; the `crates/ssh` SSH-only assumption is generalised (Zed's `RemoteConnection` shape). Authored + ratified at Phase 52's spec-acceptance.
+- Phase 53 — vision none; constitution none (Phase 43 already admitted `/proc`; Phase 45 supplies the `pane_pid` method); architecture none beyond consuming the Phase-45 per-pane metric. Guardrail: the pane label is `pane_current_command`/`pane_title`, never agent detection.
+- Phase 54 — vision none; constitution none; architecture none. A settings/theme concern (Zed `SettingsStore` shape); persisted via the phase-9 window-state store.
+- Phase 55 — vision none; constitution none; architecture none. Client-side editor rendering.
+- Phase 56 — vision none; constitution none; architecture none. App-internal UI; **supersedes the Phase-39 rail's Explorer+Editor unification** — a design-contract update authored in Phase 56's spec PR, not a foundation-doc change.
+
+Backing prior art: "QA-seeded phases — prior-art index (Phases 48–56)" in
+[prior-art.md](prior-art.md).
 
 ## Tracks (tooling/DX, not product phases)
 
