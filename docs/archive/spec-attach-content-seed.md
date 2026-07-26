@@ -1,8 +1,8 @@
 # Spec: seed visible pane content on attach
 
-> Status: READY
+> Status: COMPLETED
 > Created: 2026-07-26
-> Completed: —
+> Completed: 2026-07-26
 
 When the daemon attaches a control-mode child to a tmux session, seed each pane's
 CURRENT visible screen from the server (`capture-pane`) so the pane shows its real

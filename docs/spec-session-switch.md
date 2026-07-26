@@ -221,6 +221,6 @@ secrets, accounts, or external provisioning.
   redraws only the current line. Content is retrievable solely via `capture-pane`.
   The fix is therefore a daemon-side `capture-pane` seed on attach, which also fixes
   first-connect to a running session — a self-contained daemon capability that
-  outgrew this spec's switch scope. Moved to **`docs/spec-attach-content-seed.md`**;
-  #897 is repointed there. The switch-content Outcome/Verification items here remain
+  outgrew this spec's switch scope. Moved to **`docs/archive/spec-attach-content-seed.md`**
+  (COMPLETED 2026-07-26, delivered by #897/#900); #897 is repointed there. The switch-content Outcome/Verification items here remain
   valid as the user-visible acceptance; that spec delivers them.
