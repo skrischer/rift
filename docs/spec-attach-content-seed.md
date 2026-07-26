@@ -167,3 +167,18 @@ or external provisioning.
   visible (alternate) cells; wrapping switches the client buffer so they render in
   the right plane. Spike-confirmed `#{alternate_on}` is queryable and `-e` preserves
   the styling.
+- 2026-07-26 (implementation, #897): the seed fires once, off the attach-time
+  **layout snapshot** reply (`!snapshot_sent`), reusing the panes the layout query
+  already returned — no extra pane enumeration. Panes split AFTER attach arrive as
+  `LayoutUpdate`s and are NOT seeded: a freshly split pane draws its own prompt as
+  post-attach `%output`, so only pre-existing content needs the seed. Each pane
+  pairs two correlated commands — `display-message -p -t %<pane>
+  '#{alternate_on}\t#{cursor_x}\t#{cursor_y}'` and `capture-pane -p -e -t %<pane>`
+  — tracked in a per-pane `SeedCapture` (mirroring `KeyTableQuery`'s two-leg
+  pairing) whose reply arm is checked BEFORE `captures`, so a seed capture is never
+  emitted as a scrollback `PaneCapture`. Framing (`frame_seed`, pure + unit-tested):
+  optional `ESC[?1049h`, then `ESC[2J ESC[H`, rows CRLF-joined with the LAST row
+  left unterminated (the no-scroll invariant for a full-width bottom row), then a
+  1-based cursor restore from the 0-based tmux coordinates. A malformed/errored
+  format reply degrades to `SeedFrame::default` (normal screen, home) rather than
+  dropping the pane.
