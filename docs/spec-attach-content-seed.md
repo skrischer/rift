@@ -46,11 +46,14 @@ that predates the attach.
 
 - `daemon`: after the attach's `LAYOUT_QUERY` resolves, issue one
   `capture-pane -p -e -t %<pane>` per pane in the attached session (visible screen
-  only, no `-S`/scrollback), correlated under the existing `%begin/%end` command
-  mechanism (the same path the scrollback `capture-pane` already uses,
-  `terminal.rs:686`). Deliver each as the pane's initial content on the existing
-  `PaneOutput` channel (the same channel `%output` uses), so the client's `Term`
-  renders it with zero new protocol surface.
+  only, no `-S`/scrollback). Reuse the existing command-emission + `%begin/%end`
+  correlation, but route the reply through a **distinct in-flight set** (e.g.
+  `seed_captures`) whose replies emit `DaemonMessage::PaneOutput` — **not**
+  `self.captures`, whose replies emit `PaneCapture` and land in the client's
+  SCROLLBACK, not the live screen (`terminal.rs`: `captures` insert ~:688, reply
+  ~:874, `PaneCapture`). Delivering the seed on `PaneOutput` (the same channel
+  `%output` uses) makes the client's `Term` render it with zero new protocol
+  surface and no client change.
 - `daemon`: make the seed render correctly by querying the pane's screen state in
   the same round-trip and framing the captured rows accordingly —
   `#{alternate_on}`, `#{cursor_x}`, `#{cursor_y}` (one `display-message`/format read
@@ -98,10 +101,12 @@ that predates the attach.
   via `capture-pane` on attach for exactly this reason — control mode does not replay
   the screen. Reference only; the mechanism here is derived and spike-hardened, no
   code is copied.
-- `docs/prior-art.md` → **WezTerm `termwiz::tmux_cc`** and **smtg-ai/claude-squad
-  `session/tmux/`** for `capture-pane` usage patterns. NB claude-squad's *content
-  hashing* of `capture-pane` is on the AVOID list (agent-specific) — only the capture
-  mechanism is borrowed, never output interpretation.
+- `docs/prior-art.md` → **WezTerm `termwiz::tmux_cc`** (control-mode parser
+  reference — `%output`/`%begin`/`%end` framing, `unvis` octal decode) and
+  **smtg-ai/claude-squad `session/tmux/`** for `capture-pane` usage. NB
+  claude-squad's *content hashing* of `capture-pane` is on the AVOID list
+  (agent-specific) — only the capture mechanism is borrowed, never output
+  interpretation.
 
 ## Human prerequisites
 
@@ -124,7 +129,9 @@ or external provisioning.
       (the regression that today's tests miss because they only cover the
       post-attach prompt draw)
 - [ ] Framing helper unit tests: normal-screen and alternate-screen captures frame
-      to the expected byte sequence (valid + malformed capture input)
+      to the expected byte sequence (valid + malformed capture input), including a
+      full-width last row / bottom-row case that locks the no-scroll invariant (a
+      naive replay of a full bottom row must not push the grid up a line)
 - [ ] Behavioural (dev channel, #897): switch A→B→A between two same-size sessions,
       each running content (one an alt-screen agent TUI) — the target pane always
       shows its current content immediately; the TUI renders as its alt-screen, not
