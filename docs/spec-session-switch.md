@@ -213,3 +213,14 @@ secrets, accounts, or external provisioning.
   delivers a full content repaint independent of any grid-size change. Tracked as
   the reframed `fix:` #897 (moved off the `papercut`/`spec-dogfooding-fixes`
   bucket onto this spec).
+- 2026-07-26: **Spike done — hypothesis refuted; #897 graduates to its own spec.**
+  The `/loopkit:implement 897` spike (live tmux 3.4) showed the same-size
+  `refresh-client -C` no-op above is NOT the fix path: tmux control mode never
+  replays a pane's pre-existing screen to a freshly-attached control client — no
+  `refresh-client` variant (same-size `-C`, bare, `-S`) resends it, and a resize
+  redraws only the current line. Content is retrievable solely via `capture-pane`.
+  The fix is therefore a daemon-side `capture-pane` seed on attach, which also fixes
+  first-connect to a running session — a self-contained daemon capability that
+  outgrew this spec's switch scope. Moved to **`docs/spec-attach-content-seed.md`**;
+  #897 is repointed there. The switch-content Outcome/Verification items here remain
+  valid as the user-visible acceptance; that spec delivers them.
