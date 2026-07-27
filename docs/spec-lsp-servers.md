@@ -11,7 +11,7 @@ remote host's `$PATH` and degrading gracefully when one is absent. Roadmap Phase
 
 - [ ] Opening a file of each shipped language on a remote host where that language's server is installed streams its diagnostics into rift's editor/problems surfaces, exactly as rust does today.
 - [ ] Each shipped `ServerSpec` row's `extensions` are all covered by `language_id_for` (`crates/lsp/src/document.rs`), so a matched file both spawns the server and opens the document.
-- [ ] Opening a file whose server is NOT installed on the remote `$PATH` never crashes the daemon and is surfaced as a distinct "not installed" state (see the OPEN decision), not an alarming crash.
+- [ ] Opening a file whose server is NOT installed on the remote `$PATH` never crashes the daemon and is surfaced with a correct status — a distinct not-installed state if OPEN decision #2 is accepted, else a non-fatal crashed state — never an unhandled error.
 - [ ] The selector's unit tests assert every shipped row matches its extensions (and the multi-server-per-language case still holds).
 
 ## Scope
@@ -42,7 +42,7 @@ remote host's `$PATH` and degrading gracefully when one is absent. Roadmap Phase
 
 - [QA-seeded phases — prior-art index (Phases 48–56)](prior-art.md#qa-seeded-phases--prior-art-index-phases-4856) — the Phase 48 row: reuse the existing registry, servers from the remote `$PATH`, candidates pyright / typescript-language-server / gopls / clangd; the multi-server-per-doc (linter + type-checker) shape is the Helix `Registry` pattern.
 - [Category 7: LSP Client Implementations](prior-art.md#category-7-lsp-client-implementations) — helix `Registry` (`HashMap<LanguageServerName, Vec<LanguageServerId>>`) and lapce `DocumentSelector` per-language routing: the multi-server-per-document design rift already implements.
-- Architecture pattern #8 "Multi-server-per-document via Registry" — validates that linter + type-checker on one buffer is the intended shape, already realised in `crates/lsp/src/registry.rs`.
+- [Architecture patterns to adopt](prior-art.md#architecture-patterns-to-adopt) #8 "Multi-server-per-document via Registry" — validates that linter + type-checker on one buffer is the intended shape, already realised in `crates/lsp/src/registry.rs`.
 
 ## Human prerequisites
 
