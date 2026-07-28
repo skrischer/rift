@@ -11,7 +11,7 @@ remote host's `$PATH` and degrading gracefully when one is absent. Roadmap Phase
 
 - [ ] Opening a file of each shipped language on a remote host where that language's server is installed streams its diagnostics into rift's editor/problems surfaces, exactly as rust does today.
 - [ ] Each shipped `ServerSpec` row's `extensions` are all covered by `language_id_for` (`crates/lsp/src/document.rs`), so a matched file both spawns the server and opens the document.
-- [ ] Opening a file whose server is NOT installed on the remote `$PATH` never crashes the daemon and is surfaced with a correct status — a distinct not-installed state if OPEN decision #2 is accepted, else a non-fatal crashed state — never an unhandled error.
+- [ ] Opening a file whose server is NOT installed on the remote `$PATH` never crashes the daemon and is surfaced as a distinct `NotInstalled` status (informational, not an alarming crash), leaving other languages' servers unaffected.
 - [ ] The selector's unit tests assert every shipped row matches its extensions (and the multi-server-per-language case still holds).
 
 ## Scope
@@ -21,7 +21,7 @@ remote host's `$PATH` and degrading gracefully when one is absent. Roadmap Phase
 - Adding `ServerSpec` rows to `BUILTIN_SERVERS` (`crates/lsp/src/selector.rs`) for the shipped language set (final set resolved at the gate; recommended: Python, TypeScript/JavaScript, Go, C/C++), each with the correct `binary`, `args`, and `extensions`.
 - Confirming (and, only if a chosen extension is missing, extending) `language_id_for` coverage for every shipped row's extensions.
 - Unit tests in `selector.rs` for the new rows.
-- Distinguishing "server binary not found on `$PATH`" from "server started then crashed" in the status surfaced to the client (the OPEN `NotInstalled` decision), IF accepted at the gate.
+- Adding a distinct `NotInstalled` server state: mapping the missing-binary spawn error to `NotInstalled` (daemon), a new `protocol` `LspServerState` variant (`PROTOCOL_VERSION` bump — a deliberate, reviewed API change), and distinct informational app rendering (not the alarming crash colour).
 
 ### Out of scope
 
@@ -58,13 +58,13 @@ For the milestone-QA gate, the developer must have the relevant language servers
 
 | Decision | Rationale | Date |
 |---|---|---|
-| No new lifecycle/robustness code — the phase adds data rows to `BUILTIN_SERVERS` only | Spawn, multi-server registry, missing-binary non-fatality, generic `initialize`, encoding negotiation, and capability-gated nav are already generic (verified against develop) | 2026-07-27 |
+| The spawn/lifecycle machinery needs no new code (spawn, multi-server registry, missing-binary non-fatality, generic `initialize`, encoding negotiation, capability-gated nav are already generic, verified against develop); the phase adds data rows PLUS the `NotInstalled` status below | Keeps the bulk of the phase pure-data; the one code change is the accepted `NotInstalled` state | 2026-07-27 |
 | One `ServerSpec` row per server binary with an `extensions` list; NOT one row per `languageId` | The selector matches by extension; the wire `languageId` is differentiated separately by `language_id_for` | 2026-07-27 |
 | Every shipped row's `extensions` must be present in `language_id_for`; extend it only if a chosen extension is missing | The two tables must not drift, or the server spawns but the document never opens (`document.rs:270`) | 2026-07-27 |
 | Keep the built-in table hardcoded; no user/per-project server config this phase | Constitution: no premature abstraction; the `DocumentSelector` type is already the seam a richer config would slot into | 2026-07-27 |
 | Recommended binaries/args: `pyright-langserver --stdio`, `typescript-language-server --stdio`, `gopls` (no args), `clangd` (no args) | Each server's documented stdio launch; confirmed at the gate | 2026-07-27 |
-| OPEN — which language set ships this phase (and exact binaries/args, incl. alternatives: pylsp/ruff/basedpyright for Python, deno for TS) | resolved at the spec-acceptance gate | — |
-| OPEN — surface a distinct `NotInstalled` server state (missing `$PATH` binary → `LspError::Spawn`) vs. keep collapsing it into `Crashed` for v1 (adds a `protocol` `LspServerState` variant + `PROTOCOL_VERSION` bump + app rendering) | resolved at the spec-acceptance gate | — |
+| Ship all four servers: `pyright-langserver --stdio` (python: py, pyi), `typescript-language-server --stdio` (ts, tsx, js, jsx, mjs, cjs), `gopls` (go), `clangd` (c, h, cc, cpp, cxx, hpp, hh) | Accepted at the gate; covers the common project languages; all extensions already in `language_id_for` | 2026-07-28 |
+| Add a distinct `NotInstalled` `LspServerState`: the daemon maps the missing-binary `LspError::Spawn` to `NotInstalled` (not `Crashed`); `protocol` gains the variant (`PROTOCOL_VERSION` bump); the app renders it distinctly (informational, not alarming red) | Accepted at the gate; with several languages 'not installed' is the common case, and collapsing it into `Crashed` misleads | 2026-07-28 |
 
 ## Tracking
 
@@ -76,7 +76,7 @@ For the milestone-QA gate, the developer must have the relevant language servers
 - [ ] `just ci` equivalent green (fmt + clippy `-D warnings` + tests, workspace excl. `rift-app`); locally the `lsp`/`daemon` crates compile warm-target clean.
 - [ ] Unit: `selector.rs` tests assert each shipped row matches its declared extensions and unknown extensions still match nothing.
 - [ ] QA (remote, servers installed): opening a `.py` / `.ts` / `.tsx` / `.go` / `.c` / `.cpp` file with real errors streams diagnostics into rift within the same latency as rust today; fixing the error clears them.
-- [ ] QA (graceful degradation): opening a file whose server is NOT installed on the remote produces no daemon crash, no stuck state, and the correct status (not-installed if the `NotInstalled` decision is accepted, else a non-fatal crashed state) — other languages' servers keep working.
+- [ ] QA (graceful degradation): opening a file whose server is NOT installed on the remote produces no daemon crash, no stuck state, and the distinct `NotInstalled` status (not the crash colour) — other languages' servers keep working.
 - [ ] QA: two languages open simultaneously each get their own diagnostics independently (multi-server concurrency holds).
 
 ## Risks and mitigations
@@ -85,9 +85,10 @@ For the milestone-QA gate, the developer must have the relevant language servers
 |---|---|
 | A shipped row's extension is missing from `language_id_for` → server spawns but no diagnostics | Outcome + Prior-decision require confirming coverage; the recommended four are already covered — verify in the implementing PR |
 | A server needs `initializationOptions` to behave (e.g. some Python setups) | Out of scope for v1 (default `initialize` is generic and works for the recommended servers); revisit per-server options behind a real need |
-| Every uninstalled server shows as "Crashed" red, reading as broken | The `NotInstalled` OPEN decision; if deferred, document the known limitation and file a follow-up |
+| Every uninstalled server shows as "Crashed" red, reading as broken | Resolved: the accepted `NotInstalled` state renders missing servers distinctly (informational), separate from a real crash |
 | clangd without `compile_commands.json` gives limited diagnostics | Acceptable — still non-fatal; full C/C++ index config is the user's project concern, not rift's |
 
 ## Decision log
 
 - 2026-07-27: Scoped from a verified develop-code read — the LSP lifecycle is fully generic, so this phase is data rows plus the `language_id_for` coupling discipline, with two genuinely-open decisions (language set, `NotInstalled` state) carried to the gate.
+- 2026-07-28: Spec-acceptance gate — accepted. Ship all four servers (pyright / typescript-language-server / gopls / clangd). Introduce a distinct `NotInstalled` `LspServerState` (protocol variant + `PROTOCOL_VERSION` bump + informational app rendering), rather than collapsing a missing binary into `Crashed`. Spec review (PR #909) returned APPROVE with only non-blocking nits, addressed.
