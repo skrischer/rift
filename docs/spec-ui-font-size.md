@@ -8,7 +8,7 @@ terminal-only "Font size" setting. Roadmap Phase 54.
 
 ## Outcome
 
-- [ ] A "UI font size" setting resizes the interface surfaces that read the theme — the editor and dock panels (`mono_font_size`) and the explorer / chrome (`text_sm`/`text_xs`, derived from the theme base `font_size`) — live, without restart.
+- [ ] A "UI font size" setting resizes the theme-driven interface surfaces — the editor and dock panels (`mono_font_size`) and the explorer rows (`text_sm`/`text_xs`, which resolve against the theme base `font_size` via gpui-component's `set_rem_size`) — live, without restart.
 - [ ] The UI font size is persisted and restored across app restarts.
 - [ ] The terminal PTY grid keeps its own separate size control (today's "Font size"), and that control is relabelled to name the terminal (no longer the misleading "Base size for editor and terminal").
 - [ ] Changing the UI font size does not change the terminal grid size, and vice versa.
@@ -27,6 +27,7 @@ terminal-only "Font size" setting. Roadmap Phase 54.
 - Wiring the terminal PTY grid to the UI font-size setting — the grid is pinned to a Nerd Font and its size ties to cell-size measurement; it stays a separate control (settings.rs comment).
 - Per-surface font sizes (explorer vs editor vs chrome independently) — one global UI size cascades via the theme; per-surface is deferred behind a real need (constitution: no premature abstraction).
 - New font families or a font picker (families already exist as separate settings).
+- Fixed-`px` chrome that does not read the theme rem size — the title bar (`title_bar.rs`), status bar (`status_bar.rs`), and pre-connection screens (connection card, session/root pickers) use hardcoded `px(...)` and will NOT scale with the UI font size; making them scale is a known follow-up, out of scope here (QA must not fail on an unchanged title/status bar).
 
 ## Constraints
 
@@ -53,6 +54,7 @@ terminal-only "Font size" setting. Roadmap Phase 54.
 | The terminal PTY grid stays a SEPARATE size control, not folded into the UI size | The grid is Nerd-Font-pinned and cell-size-measured; the settings code already scopes this out | 2026-07-29 |
 | Relabel the existing "Font size" to name the terminal; the misleading "editor and terminal" copy is corrected | It only mutates the terminal grid today; the label is factually wrong | 2026-07-29 |
 | Persist the UI font size in `WindowState` as a new field, restored on launch | Mirrors the existing terminal `font_size_px` / font-family persistence | 2026-07-29 |
+| The UI font-size setter defines its own min/max bounds; it does not borrow the terminal-scoped `MIN/MAX_FONT_SIZE` | Those bounds are for the terminal grid; the UI needs its own sensible range | 2026-07-29 |
 | OPEN — Ctrl+= / Ctrl+- scope: keep them zooming the TERMINAL font only (status quo) vs make them context-aware (zoom the UI when a non-terminal surface is focused, the terminal when a terminal pane is focused) | resolved at the spec-acceptance gate | — |
 
 ## Tracking
