@@ -2,7 +2,9 @@
 
 ## Overview
 
-The system is a native GPU-accelerated terminal application that connects via SSH to a remote host, attaches to tmux, and renders terminal output through GPUI — no WebView, no browser-based terminal emulation, no Node.js runtime.
+The system is a native GPU-accelerated terminal application that connects to a host over a transport, attaches to tmux, and renders terminal output through GPUI — no WebView, no browser-based terminal emulation, no Node.js runtime.
+
+The transport is a seam with two variants selected by connection kind (Phase 52): **SSH** (`russh` to a remote host, the default and only cross-platform variant) and, on Windows, **WSL** (`wsl.exe -d <distro>` to a local Linux distro). Both satisfy one operation contract the daemon lifecycle needs — `exec_capture`, `upload_executable`, `open_daemon_channel`, `is_closed` — so everything above the seam (daemon provisioning, the reconnect engine, the terminal/explorer/git/LSP layers) is transport-agnostic. This is distinct from `RIFT_REMOTE_EXEC_WRAPPER`, which nests one hop deeper *over* an SSH transport rather than being a transport of its own. Elsewhere in this document "SSH" names the default transport; a WSL connection substitutes for it at the same seam.
 
 Current state (Phase 2): single-window terminal connected via SSH using tmux control mode (`-CC`). Event-driven notification processing, flow control, active pane tracking. The daemon architecture is designed but deferred to Phase 3+.
 
