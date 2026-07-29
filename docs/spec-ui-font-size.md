@@ -55,7 +55,7 @@ terminal-only "Font size" setting. Roadmap Phase 54.
 | Relabel the existing "Font size" to name the terminal; the misleading "editor and terminal" copy is corrected | It only mutates the terminal grid today; the label is factually wrong | 2026-07-29 |
 | Persist the UI font size in `WindowState` as a new field, restored on launch | Mirrors the existing terminal `font_size_px` / font-family persistence | 2026-07-29 |
 | The UI font-size setter defines its own min/max bounds; it does not borrow the terminal-scoped `MIN/MAX_FONT_SIZE` | Those bounds are for the terminal grid; the UI needs its own sensible range | 2026-07-29 |
-| OPEN — Ctrl+= / Ctrl+- scope: keep them zooming the TERMINAL font only (status quo) vs make them context-aware (zoom the UI when a non-terminal surface is focused, the terminal when a terminal pane is focused) | resolved at the spec-acceptance gate | — |
+| Ctrl+= / Ctrl+- keep zooming the TERMINAL font only (status quo); the UI font size is set via Settings | Accepted at the gate; no focus-dependent logic, avoids a new zoom-key collision (keeps the AltGr fix #903 clean), smallest | 2026-07-29 |
 
 ## Tracking
 
@@ -69,7 +69,7 @@ terminal-only "Font size" setting. Roadmap Phase 54.
 - [ ] QA: changing the (relabelled) terminal font size resizes only the terminal grid; the UI is unchanged.
 - [ ] QA: both sizes survive an app restart.
 - [ ] QA: the relabelled terminal control no longer claims to affect the editor.
-- [ ] QA (per the Ctrl+= decision): the zoom keys adjust the surface agreed at the gate.
+- [ ] QA: Ctrl+= / Ctrl+- still zoom only the terminal font; the UI font size changes only via Settings.
 
 ## Risks and mitigations
 
@@ -82,3 +82,4 @@ terminal-only "Font size" setting. Roadmap Phase 54.
 ## Decision log
 
 - 2026-07-29: Scoped from a develop-code read — the current "Font size" mutates only the terminal grid; a UI font size must drive the theme base `font_size` + `mono_font_size` (new setter, no existing size plumbing) and persist in `WindowState`, kept separate from the terminal grid size. The only open point is the Ctrl+= / Ctrl+- zoom scope.
+- 2026-07-29: Spec-acceptance gate — accepted. Ctrl+= / Ctrl+- stay terminal-only; the UI font size is a Settings control. Spec review (PR #919) returned APPROVE with only non-blocking nits (the "chrome" overreach softened to editor/panels/explorer, fixed-px chrome scoped out), addressed.
