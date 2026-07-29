@@ -49,7 +49,7 @@ on the connect card. Roadmap Phase 52.
 
 ## Human prerequisites
 
-- The dev/QA station (Windows GPU station) must have WSL2 installed with at least one Linux distro registered (`wsl.exe -l -q` lists it), so the WSL transport can be exercised at the milestone QA gate. No secrets or accounts are needed — WSL is local.
+- [x] The dev/QA station (Windows GPU station) has WSL2 installed with at least one Linux distro registered (`wsl.exe -l -q` lists it), so the WSL transport can be exercised at the milestone QA gate — confirmed in place at the spec-acceptance gate. No secrets or accounts are needed — WSL is local.
 
 ## Prior decisions
 
@@ -62,8 +62,8 @@ on the connect card. Roadmap Phase 52.
 | The connection kind is an additive `#[serde(default)]` discriminator on `SshConfig`/`ConnectRequest`/`RecentConnection`; `identity()` keys a WSL target by distro | Tolerant-load precedent (`remote_exec_wrapper`, `recent_roots`); one chokepoint (`identity()`) to change; an older recents file still loads | 2026-07-29 |
 | The WSL variant is Windows-gated; Linux/X11 builds offer SSH only | `wsl.exe` is Windows-only; matches the app's Windows-primary target | 2026-07-29 |
 | Phase 52 adds only a transport chooser to the existing connect card — NOT the full Zed-style "Add Project" redesign | The roadmap row scopes Phase 52 to the transport + kind chooser; the redesign (#13 UI) is a separate concern | 2026-07-29 |
-| **OPEN — resolved at the spec-acceptance gate:** the transport seam shape — `enum Connection { Ssh, Wsl }` vs. a `Transport` trait | Architecture-impacting (the foundation-impact line mandates ratification here). Enum sidesteps `async_trait`/`&mut self` object-safety friction for two known variants; a trait reads cleaner if Docker (a third) is coming. Constitution "extract a trait at 2+ implementations" cuts toward a trait; the async friction cuts toward an enum | 2026-07-29 |
-| **OPEN — resolved at the spec-acceptance gate:** the connect-card UI shape — one card with an SSH/WSL kind toggle that swaps the fields, vs. a separate WSL card reached from the kind choice | UX decision neither precedent nor constraint settles; both fit the existing `ConnectionScreen` | 2026-07-29 |
+| The transport seam is an `enum Connection { Ssh(SshConnection), Wsl(WslConnection) }`, matched at the four verbs — NOT a `Transport` trait | Accepted at the gate. Sidesteps `async_trait`/`&mut self` object-safety friction for two known variants; a future Docker transport is a third arm. The four-verb contract is the stable surface either way | 2026-07-29 |
+| The connect card is a SINGLE card with an SSH/WSL kind toggle at the top; choosing WSL swaps the host/user/port/key/passphrase fields for a distro dropdown — NOT a separate WSL card | Accepted at the gate. Least churn to the existing `ConnectionScreen`; one recents flow; SSH stays the default selection | 2026-07-29 |
 
 ## Tracking
 
@@ -94,3 +94,4 @@ on the connect card. Roadmap Phase 52.
 
 - 2026-07-29: The `docs/architecture.md` Overview is generalised in this spec PR (per the roadmap Phase-52 foundation-impact line: the transport layer gains an SSH|WSL seam) — the SSH-only framing becomes a transport seam with SSH default + WSL Windows variant, ratified at this spec-acceptance gate. The implementation PRs need not re-edit the architecture doc.
 - 2026-07-29: Scoped from a `crates/ssh` + connect-flow read (background scoping agent). Central finding: the SSH PTY path is dead code, so the transport contract is exactly the four daemon-lifecycle verbs; the daemon `sh` commands are already transport-neutral and run unchanged inside WSL; the musl daemon is already the WSL target. Two genuinely-open points carried to the gate: the seam shape (enum vs trait) and the connect-card UI shape.
+- 2026-07-29: Spec-acceptance gate (PR #921) — accepted. Spec review returned APPROVE (verified the dead-code claim by grep: zero app consumers of `open_pty`/`PtyStream`; no foundation-doc contradictions; both open items genuinely open) with only non-blocking nits, the architecture.md-edit nit addressed by generalising the Overview here. Gate decisions: (1) transport seam = `enum Connection { Ssh, Wsl }`, not a trait; (2) connect card = one card with an SSH/WSL kind toggle, not a separate WSL card. QA prerequisite (WSL2 + distro on the Windows station) confirmed in place.
