@@ -13,7 +13,7 @@ Roadmap Phase 49.
 - [ ] The scrollbar reflects the pane's *composite* scroll position — the live `Term`'s own scrollback (`display_offset`) plus the pre-attach history block (`history_scroll` / `history_size` / `block_rows`) — not just one of them.
 - [ ] The scrollbar autohides when the pane is idle at the bottom (live view) and reappears on scroll/hover.
 - [ ] In alt-screen mode (a full-screen TUI, e.g. a coding agent) where there is no scrollback to traverse, no scrollbar is shown.
-- [ ] Dragging the thumb scrolls the pane to the corresponding position — IF the drag-to-scroll decision is accepted (else the scrollbar is a position indicator only).
+- [ ] Dragging the thumb scrolls the pane to the corresponding position across the whole composite range (live scrollback + pre-attach history block).
 
 ## Scope
 
@@ -53,8 +53,8 @@ Roadmap Phase 49.
 | The scrollbar is a read-only view over the existing composite scroll state; it does not introduce a new scroll owner | The terminal already owns scroll via `display_offset` + `history_scroll`; the bar renders position, the pane keeps authority | 2026-07-28 |
 | Implementation: bespoke overlay from the composite offset OR a synthetic `ScrollHandle` mirroring it to drive the vendored `Scrollbar` — implementer's call, whichever reuses gpui-component more cleanly without distorting the composite model | The vendored `Scrollbar` assumes a `ScrollHandle`; the terminal's scroll is composite/custom, so a straight reuse is not guaranteed | 2026-07-28 |
 | No scrollbar in alt-screen | No scrollback to traverse; `alt_screen` is already known at the composite-scroll read | 2026-07-28 |
-| OPEN — drag-to-scroll on the thumb, or a position indicator only, for v1 | resolved at the spec-acceptance gate | — |
-| OPEN — visibility policy: autohide (show on scroll/hover, fade when idle) vs always-visible-when-scrollback-exists | resolved at the spec-acceptance gate | — |
+| Drag-to-scroll on the thumb (v1) — dragging maps to the composite offset across the whole range | Accepted at the gate; real scrollbar behaviour, not just an indicator | 2026-07-29 |
+| Autohide visibility — the bar shows on scroll/hover and fades when idle at the bottom (live view) | Accepted at the gate; terminal-conventional, least chrome | 2026-07-29 |
 
 ## Tracking
 
@@ -80,3 +80,4 @@ Roadmap Phase 49.
 ## Decision log
 
 - 2026-07-28: Scoped from a develop-code read — the terminal scroll is composite/custom (alacritty `display_offset` + pre-attach `history_scroll`), so the #804 `Scrollbar`-over-`ScrollHandle` reuse is not guaranteed; the bar renders the composite position, with drag-to-scroll and visibility policy carried to the gate.
+- 2026-07-29: Spec-acceptance gate — accepted. Drag-to-scroll (v1) and autohide visibility. Spec review (PR #914) returned APPROVE with only non-blocking nits, addressed.
