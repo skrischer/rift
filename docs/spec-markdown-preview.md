@@ -11,7 +11,7 @@ cards. Roadmap Phase 51.
 
 - [ ] A Markdown (`.md` / `.markdown`) tab can be toggled between source (the text editor) and preview (rendered Markdown), and back, with the toggle affordance shown only for Markdown tabs.
 - [ ] Preview renders the tab's current buffer content via `gpui_component::text::markdown` (the same renderer used for hover cards, `crates/app/src/editor.rs:204,2718`), read-only.
-- [ ] Preview reflects buffer changes per the live-update decision (see OPEN): if accepted, an agent editing the `.md` updates the open preview via the existing per-tab `observe_input` signal — matching rift's reactive premise; otherwise the preview is a snapshot until re-toggled.
+- [ ] Preview updates live as the buffer changes — an agent editing the `.md` updates the open preview via the existing per-tab `observe_input` signal, matching rift's reactive premise.
 - [ ] The mode is per tab: toggling one Markdown tab does not change another tab's mode, and a non-Markdown tab shows no toggle.
 
 ## Scope
@@ -54,7 +54,7 @@ cards. Roadmap Phase 51.
 | Reuse `gpui_component::text::markdown` (the hover-card renderer); no new markdown dependency | Already vendored and in use; constitution reuse / no premature abstraction | 2026-07-29 |
 | Preview is read-only; editing stays in source mode | A rendered view is not an editing surface; keeps the buffer authority in the text editor | 2026-07-29 |
 | Toggle affordance: a button in the editor tab/breadcrumb chrome for Markdown tabs, plus a command-palette action | Discoverable on the tab, keyboard-reachable via the palette; both are cheap and consistent with existing chrome | 2026-07-29 |
-| OPEN — live-updating preview (re-render on every buffer change) vs render-on-toggle only (snapshot until re-toggled) | resolved at the spec-acceptance gate | — |
+| Live-updating preview — the open preview re-renders on buffer changes via the existing per-tab `observe_input` signal | Accepted at the gate; matches rift's reactive premise, and the per-tab feed already exists (low cost) | 2026-07-29 |
 
 ## Tracking
 
@@ -67,7 +67,7 @@ cards. Roadmap Phase 51.
 - [ ] QA: opening a `.md` file shows a preview toggle; toggling renders formatted Markdown (headings, lists, code blocks, links) read-only; toggling back restores the editable source with the buffer intact.
 - [ ] QA: a non-Markdown tab shows no preview toggle.
 - [ ] QA: two tabs, one in preview and one in source, keep independent modes.
-- [ ] QA (if live-update accepted): editing the `.md` (or an agent editing it) updates the open preview without a manual re-toggle.
+- [ ] QA: editing the `.md` (or an agent editing it) updates the open preview without a manual re-toggle.
 
 ## Risks and mitigations
 
@@ -80,3 +80,4 @@ cards. Roadmap Phase 51.
 ## Decision log
 
 - 2026-07-29: Scoped from a develop-code read — the gpui-component Markdown renderer is already used for hover cards and the editor is tab-based with a per-tab live-buffer feed, so preview is a per-tab client-only mode reusing both; the only open point is whether the preview live-updates or renders on toggle.
+- 2026-07-29: Spec-acceptance gate — accepted. Live-updating preview (via the existing per-tab `observe_input` signal). Spec review (PR #917) returned APPROVE with only non-blocking nits, addressed.
