@@ -11,7 +11,7 @@ cards. Roadmap Phase 51.
 
 - [ ] A Markdown (`.md` / `.markdown`) tab can be toggled between source (the text editor) and preview (rendered Markdown), and back, with the toggle affordance shown only for Markdown tabs.
 - [ ] Preview renders the tab's current buffer content via `gpui_component::text::markdown` (the same renderer used for hover cards, `crates/app/src/editor.rs:204,2718`), read-only.
-- [ ] Preview updates as the buffer changes (the per-tab live-buffer feed already reloads on external edits), so an agent editing the `.md` is reflected in the open preview — matching rift's reactive premise.
+- [ ] Preview reflects buffer changes per the live-update decision (see OPEN): if accepted, an agent editing the `.md` updates the open preview via the existing per-tab `observe_input` signal — matching rift's reactive premise; otherwise the preview is a snapshot until re-toggled.
 - [ ] The mode is per tab: toggling one Markdown tab does not change another tab's mode, and a non-Markdown tab shows no toggle.
 
 ## Scope
@@ -74,7 +74,7 @@ cards. Roadmap Phase 51.
 | Risk | Mitigation |
 |---|---|
 | The vendored renderer lacks a needed feature (tables, task lists, images) | Out of scope to extend it; unsupported syntax degrades to plain text; note the limitation, file a follow-up if a gap bites |
-| Live re-render on every keystroke in a large file janks | Reuse the existing per-tab dirty/live-buffer signal (already debounced for the breadcrumb); render on that cadence, not per keystroke |
+| Live re-render on every keystroke in a large file janks | Ride the existing `observe_input` change signal (GPUI coalesces to frame cadence); throttle the re-render if a large file still janks, rather than rendering per keystroke |
 | Preview and source diverge on scroll/focus | v1 is a full-tab toggle (not a split), so there is no simultaneous divergence to reconcile |
 
 ## Decision log
