@@ -92,4 +92,5 @@ on the connect card. Roadmap Phase 52.
 
 ## Decision log
 
+- 2026-07-29: The `docs/architecture.md` Overview is generalised in this spec PR (per the roadmap Phase-52 foundation-impact line: the transport layer gains an SSH|WSL seam) — the SSH-only framing becomes a transport seam with SSH default + WSL Windows variant, ratified at this spec-acceptance gate. The implementation PRs need not re-edit the architecture doc.
 - 2026-07-29: Scoped from a `crates/ssh` + connect-flow read (background scoping agent). Central finding: the SSH PTY path is dead code, so the transport contract is exactly the four daemon-lifecycle verbs; the daemon `sh` commands are already transport-neutral and run unchanged inside WSL; the musl daemon is already the WSL target. Two genuinely-open points carried to the gate: the seam shape (enum vs trait) and the connect-card UI shape.
