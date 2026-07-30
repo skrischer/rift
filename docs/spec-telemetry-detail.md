@@ -21,10 +21,9 @@ push, and only the memory breakdown + uptime + disk need new daemon reads.
       trend toward the limit — as a **pure client-side ring buffer** over the existing
       2 s `HostMetrics` pushes; **no protocol or daemon change** for the history. The
       retention window is a client constant (see Prior decisions).
-- [ ] A **disk-headroom indicator** shows free / total for the relevant filesystem
-      (which filesystem — the session `@root` mount vs the daemon's own — is resolved at
-      the spec-acceptance gate), so a filling project disk (heavy worktree `target/`
-      dirs) is visible before a write fails.
+- [ ] A **disk-headroom indicator** shows free / total for the **daemon's own filesystem**
+      (daemon-global, resolved at the gate), so a filling disk (heavy worktree `target/`
+      dirs on the shared mount) is visible before a write fails.
 - [ ] `protocol` gains the daemon-global memory-breakdown + uptime fields on
       `HostMetrics`, and the disk field(s) whose shape depends on the disk-filesystem
       decision; `PROTOCOL_VERSION` bumps to the next free value at merge and the
@@ -44,19 +43,10 @@ push, and only the memory breakdown + uptime + disk need new daemon reads.
   `uptime_secs: u64`. `load` (`LoadAverage`) and `cpu_count` are **already present**
   (Phase 43) and are reused unchanged. `PROTOCOL_VERSION` bumped to the next free value
   at merge, fingerprint re-pinned; serde round-trip + malformed tests extended.
-- **`crates/protocol`** (disk — shape conditional on the gate decision): either
-  daemon-global fields `disk_total: u64` / `disk_available: u64` on `HostMetrics` (if
-  the indicator tracks the **daemon's own** filesystem), **or** a **per-connection**
-  disk push keyed to the connection's `@root` mount (if it tracks the **session
-  `@root`** filesystem — `@root` is per-connection, #737, so this cannot ride the
-  daemon-global `HostMetrics`; it follows the per-connection transport pattern Phase 45
-  **introduces**, a **sibling phase that is not yet merged**). The gate resolves this
-  **before** the protocol issue is cut. **Cross-phase coupling:** the `@root` branch
-  needs Phase 45's per-connection daemon transport, so if `@root` is chosen the
-  Phase-46 daemon issue either takes a hard `Depends on` edge to Phase 45's daemon
-  issue **or** scopes that per-connection push transport into itself; the daemon-fs
-  branch (two fields fanned on the existing daemon-global bus) needs **no** new
-  transport and no Phase-45 dependency — a point in its favour beyond simplicity.
+- **`crates/protocol`** (disk — gate-resolved: **daemon's own filesystem**): additive
+  daemon-global fields `disk_total: u64` / `disk_available: u64` on `HostMetrics`. This
+  rides the existing daemon-global bus — **no** per-connection transport and **no**
+  Phase-45 dependency. (The per-connection `@root` alternative was declined at the gate.)
 - **`crates/daemon` memory breakdown + uptime**: in the existing sampler tick, read
   `Cached` + `Buffers` from `/proc/meminfo` (a small dedicated parse — `sysinfo`
   exposes total / free / available / used but not cached / buffers) and `sysinfo`'s
@@ -65,11 +55,9 @@ push, and only the memory breakdown + uptime + disk need new daemon reads.
 - **`crates/daemon` disk**: add `"disk"` to the `sysinfo` features (workspace
   `sysinfo` dep, `["system", "disk"]`); refresh `Disks` on the sampler tick (disk
   usage changes slowly, so the 2 s cadence is ample) and report free / total for the
-  chosen filesystem — for `@root`, resolve the mount whose `mount_point` is the longest
-  prefix of the connection's **current** resolved root, recomputed each tick so a
-  reroot (`reroot_connection`, #737) is handled automatically, and **emit nothing while
-  the connection has no resolved root** (a rootless / `Standalone` connection has no
-  `@root`, hence no disk figure). Per-connection or daemon-global per the gate.
+  **daemon's own filesystem** — the mount whose `mount_point` is the longest prefix of
+  the daemon's own working directory (or an equivalent daemon-side path). Daemon-global,
+  fanned on the existing `HostMetrics` bus; no per-connection push, no `@root` resolution.
 - **`crates/app` detail view**: render the memory breakdown + swap + load 1/5/15 +
   uptime + cores from the pushed sample. Note the app currently **narrows** the wire
   sample to three fields — the fold loop destructures only `cpu, mem_total,
@@ -77,8 +65,8 @@ push, and only the memory breakdown + uptime + disk need new daemon reads.
   carries only those (`status_bar.rs:47`, whose doc already anticipates this widening);
   the detail view must widen that struct + the fold to carry `swap_*` / `load` /
   `cpu_count` and the new breakdown + uptime fields — real client work, not a free read.
-  Surface (a hover card on the `MEM% · CPU%` indicator vs a section added to the
-  Phase-45 breakdown popover) resolved at the gate.
+  The surface is an **independent hover card** on the `MEM% · CPU%` indicator
+  (gate-resolved), with the sparkline inline — not a section in the Phase-45 popover.
 - **`crates/app` sparkline**: a fixed-length client ring buffer of recent samples
   (MEM% and CPU%), rendered as a small sparkline in the status area / detail view. Pure
   client state fed by the existing host-metrics fold loop; nothing on the wire.
@@ -111,12 +99,11 @@ push, and only the memory breakdown + uptime + disk need new daemon reads.
 - **Sparkline is pure client-side.** History is a client ring buffer over the existing
   push — the reactive-signal model keeps derived history in the client, not the daemon
   (`docs/constitution.md`); nothing new on the wire for it.
-- **Disk-of-`@root` is per-connection.** `@root` is a per-connection resolved value
-  (#737, the Attach seam); the daemon-global `HostMetrics` cannot carry a per-session
-  disk figure. If the gate picks `@root`, the disk field is a per-connection push (the
-  Phase-45 per-connection transport pattern — each `serve_connection` computes and
-  sends its own); if it picks the daemon's own fs, it rides `HostMetrics`
-  daemon-globally. This is the reason the disk protocol shape is gate-conditional.
+- **Disk is daemon-global (gate-resolved).** The indicator tracks the daemon's own
+  filesystem, so the disk figure rides the daemon-global `HostMetrics` bus like every
+  other host reading — no per-connection push, no `@root` resolution, no Phase-45
+  dependency. (The per-connection `@root` alternative — accurate to the project mount but
+  requiring Phase-45's unmerged per-connection transport — was declined at the gate.)
 - **Pure-Rust / no-C daemon.** The breakdown is a `/proc/meminfo` read + a small
   parser (Cached / Buffers are always present on Linux — no file-gating, unlike PSI);
   uptime + disk come from `sysinfo` (the `disk` feature is pure-Rust `/proc` /
@@ -168,8 +155,8 @@ push, and only the memory breakdown + uptime + disk need new daemon reads.
 | Disk uses `sysinfo`'s **`disk` feature** (added to the existing dep); disk is sampled on the 2 s tick | `Disks` is behind the `disk` feature (not in today's `["system"]`); a named feature of an approved crate, musl-clean. Disk usage changes slowly, so the host cadence is ample and no separate gating is needed | 2026-07-11 |
 | The disk indicator is **neutral-coloured** (no threshold warning) this phase | Consistent with Phase 43's neutral indicator; a disk-full warning colour is a possible later add (Phase 44 owns memory pressure). Keeps scope bounded | 2026-07-11 |
 | **No foundation-doc change** — disk / uptime / memory-breakdown are all the same host-resource `/proc` signal Phase 43 already admitted | The constitution's third-signal parenthetical ("CPU / memory / swap / load") is illustrative; disk headroom (`/proc/mounts` + `statvfs`) adds no new signal source and is host-global + agent-agnostic, subsumed under "host resource state". Only a deliberate `protocol` extension is needed, no ratification (same reasoning as Phase 45) | 2026-07-11 |
-| OPEN — the **disk filesystem**: the session `@root` mount (per-connection, tracks the project fs where `target/` lives) vs the daemon's own filesystem (daemon-global, simpler) | resolved at the spec-acceptance gate — accuracy-vs-simplicity; this **sets the disk protocol shape** (per-connection push vs a daemon-global `HostMetrics` field), fixed before the protocol issue is cut. `@root` is the more accurate target but rides Phase-45's unmerged per-connection transport (a Phase-45 dependency or in-phase transport work); daemon-fs is daemon-global and Phase-45-independent | — |
-| OPEN — the **detail + sparkline surface**: a hover card on the `MEM% · CPU%` indicator (independent of Phase 45) vs a section added to the Phase-45 breakdown popover (couples to Phase 45) | resolved at the spec-acceptance gate — a UX surface call; the sparkline placement (inline in the status area vs inside the detail) rides this choice | — |
+| The **disk filesystem** is the **daemon's own filesystem** — daemon-global `disk_total` / `disk_available` fields on `HostMetrics`, NOT the per-connection `@root` mount | Accepted at the gate. Phase-45-independent (rides the existing daemon-global bus, no per-connection transport, no Phase-45 dependency), simplest; on the dogfooding host the daemon and project share one WSL mount so this ~equals the project fs. This **fixes the disk protocol shape** as two additive daemon-global fields on `HostMetrics` | 2026-07-30 |
+| The **detail + sparkline surface** is an **independent hover card** on the `MEM% · CPU%` status indicator, sparkline inline — NOT a section in the Phase-45 breakdown popover | Accepted at the gate. Self-contained and Phase-45-independent (Phase 46 ships without waiting on the unbuilt per-pane popover); host-global detail stays cleanly separate from per-pane attribution | 2026-07-30 |
 | The sparkline retention window defaults to **~150 samples (~5 min at 2 s)** as a client constant | Enough to show a trend toward the limit without unbounded memory; tunable later. Not a gate decision — a bakeable default | 2026-07-11 |
 
 ## Tracking
@@ -177,7 +164,7 @@ push, and only the memory breakdown + uptime + disk need new daemon reads.
 The decomposition into steps lives as GitHub issues, one per implementable step,
 under the milestone. This spec owns the design; the issues own progress.
 
-- Milestone: [Phase 460 — Telemetry detail + disk headroom](#) (created at the acceptance gate)
+- Milestone: [Phase 460 — Telemetry detail + disk headroom](https://github.com/skrischer/rift/milestone/74)
 - Issues: created from this spec once merged — `protocol` (breakdown + uptime + disk
   fields + version bump), `daemon` (meminfo breakdown + uptime + `sysinfo` disk
   feature + disk read), `app` (detail view + sparkline + disk indicator). Dependency
@@ -214,11 +201,11 @@ under the milestone. This spec owns the design; the issues own progress.
 
 | Risk | Mitigation |
 |---|---|
-| Disk-of-`@root` is per-connection and cannot ride the daemon-global `HostMetrics` | Made explicit: the disk protocol shape is gate-conditional; the `@root` branch reuses the Phase-45 per-connection push pattern (each `serve_connection` computes + sends its own), the daemon-fs branch rides `HostMetrics`. Resolved before the protocol issue is cut. |
+| Disk scope ambiguity (project mount vs daemon fs) blocks the protocol issue | Resolved at the gate: daemon's own filesystem, two daemon-global fields on `HostMetrics`. No per-connection push, no Phase-45 dependency; the protocol issue can be cut immediately. |
 | `/proc/meminfo` field names differ / a field is absent | The parser matches `Cached:` / `Buffers:` by key and tolerates absence (yields 0 for a missing field), never panics; unit-tested with a fixture missing a line. |
 | The `sysinfo` `disk` feature drags in a C dep on musl | The Linux disk backend is `/proc` / `statvfs` via `libc` bindings (no C build), same as the `system` feature; verified by the `daemon-musl` job and `cargo deny`. If a C dep appears, park `blocked:human` — do not add a C toolchain. |
 | The sparkline ring buffer grows unbounded over a long session | A fixed-length ring buffer (default ~150 samples); a QA item checks bounded memory. |
-| Phase 46 duplicates or collides with the Phase-45 popover on the same indicator | The surface decision at the gate settles this: either a distinct hover card (independent) or an added section in the Phase-45 popover (the implementer merges), never two competing click-popovers. |
+| Phase 46 duplicates or collides with the Phase-45 popover on the same indicator | Settled at the gate: an independent hover card on the `MEM% · CPU%` indicator (host-global detail), distinct from Phase 45's per-pane breakdown popover — no coupling, no competing click-popovers. |
 | Concurrent `PROTOCOL_VERSION` bumps across Phases 44/45/46 | "Next free at merge" + fingerprint re-pin: whichever lands takes the next integer, the others re-pin against the then-current value (standard strict-equality flow). |
 
 ## Decision log
@@ -244,3 +231,15 @@ under the milestone. This spec owns the design; the issues own progress.
   (reroot-safe) and emits nothing while rootless; (5) added an explicit no-foundation
   decision row (disk is subsumed under the already-admitted host-resource `/proc` signal;
   the constitution's parenthetical list is illustrative).
+- 2026-07-30: Spec-acceptance gate (PR #883) — accepted. Re-verified against current
+  `develop` by an independent scoping pass: `HostMetrics` still carries `load` +
+  `cpu_count`, the app still narrows the sample to three fields (widening confirmed
+  needed), `sysinfo` still needs the `disk` feature, and no disk/`statvfs` signal exists
+  yet — every load-bearing claim holds (line refs may have drifted a few lines since the
+  2026-07-11 draft; substance unchanged). Both open items resolved to the
+  **Phase-45-independent** path: (1) disk = the **daemon's own filesystem**, two
+  daemon-global `disk_total`/`disk_available` fields on `HostMetrics` (not the
+  per-connection `@root` mount) — so Phase 46 needs no Phase-45 transport; (2) surface =
+  an **independent hover card** on the `MEM% · CPU%` indicator with the sparkline inline
+  (not a section in the Phase-45 popover). This PR sat open at its gate since 2026-07-11
+  while siblings #871 (Phase 44) and #878 (Phase 45) merged; closing it now.
