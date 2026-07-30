@@ -728,6 +728,55 @@ how a short-lived child racing a sample is handled; phase 46 — which filesyste
 disk indicator tracks (the session `@root` mount vs the daemon's own) and the
 sparkline retention window.
 
+## Project-optional session model — prior-art index (Phase 47)
+
+Seeded 2026-07-13 from idea sparring (research mode: websearch). Per-concern prior
+art for making rift usable without a project root (Phase 47) — the connect→usable
+flow, root-optional / decoupled from the session, and set-root-after-open. Builds
+on and reverses parts of the Phase-40 index above; the connect-vs-project
+separation resolves largely against catalogued Category 8 references (Zed / VS Code
+remote), topped up with focused lookups.
+
+| Concern | Reference | Verdict |
+|---|---|---|
+| Connect = pure transport; a project is opened *after*, optionally (usable with none) | **VS Code Remote-SSH** — "after you are connected, you'll be in an **empty window**. This is the **expected behavior** … the empty window is **by design** — it lets you choose a folder *after* connecting rather than forcing one at connection time"; open a folder later via File > Open / the Remote Explorer ([Remote Development using SSH](https://code.visualstudio.com/docs/remote/ssh)); the long-standing opt-in "prompt to open a folder after connecting" ([vscode-remote-release #511](https://github.com/microsoft/vscode-remote-release/issues/511)) | **reference — adopt** the empty/usable-window-by-design model: connecting is complete on its own; the root is chosen after, optionally. rift already has the pure-SSH connect (phases 33/38); the gap is the *usable-with-no-root* landing state |
+| Set / add / change the project root after opening (mid-session) | **Zed** — right-click the project panel → "**Add Folders to Project**" adds a root to the open window; the title-bar worktree picker switches / creates worktrees without reconnecting ([Windows & Projects](https://zed.dev/docs/windows-and-projects); [Add Workspace Support #39292](https://github.com/zed-industries/zed/discussions/39292)) | **reference (pattern)** — the root is a post-open, changeable property of the window, not a launch precondition; rift's equivalent is a mid-session set/change of the session `@root` via the existing `reroot_connection` (single root, not multi-root — Zed's multi-root/worktree UI stays deferred, vision Scenario 2) |
+| Session ≠ project; killing / switching a session never drops the transport | **tmux `detach-on-destroy off`** — switch the client to another session on kill instead of detaching ([tmux(1)](https://man7.org/linux/man-pages/man1/tmux.1.html)); rift's own #813 connected-sessionless substrate (phase 40, index above) | **reuse own / reference** — the substrate already ships (#813); this phase changes the *policy* on top (auto-attach + usable-sessionless landing), not always-picker |
+| A tmux session is meaningful with no "project" at all | **tmux / Zellij** — a session is a set of windows/panes with a working dir, never a "project"; project-ness is a convention layered by sessionizers (`sesh`, `tmux-sessionizer`, catalogued for phases 34/35) | **reference — differentiation** — reinforces reversing phase-36's mandatory session=project: rift stays a tmux GUI first; the project root is an optional enhancement the daemon uses to light up the reactive layer, absent = plain terminal cockpit |
+
+Notes — ADOPT: the VS Code "empty window by design" connect model (usable with no
+project) and Zed's after-open add/change-root affordance, both mapped onto rift's
+single per-session `@root`; the tmux session-vs-project separation. AVOID: Zed-style
+multi-root / multi-worktree-in-one-window UI (vision Scenario 2, deferred), a
+mandatory folder prompt on connect (the whole point is that it is optional), and
+any teardown of the SSH/daemon on a session end (the phase-40 substrate already
+holds the connection). This index reverses the Phase-40 index's "AVOID auto-attach
+on kill / always-picker" record — that was the phase-40 policy this phase
+supersedes; the underlying #813 substrate is retained. Sources: VS Code Remote-SSH
+docs + remote-release #511; Zed Windows & Projects / multi-root discussion;
+tmux(1).
+
+## QA-seeded phases — prior-art index (Phases 48–56)
+
+Seeded 2026-07-26 from the QA-session sparring. Research mode: **none** for 8 of 9 — every
+concern resolves against entries already catalogued (Category 1 gpui-component, Category 7
+LSP registry + pattern #8, Category 8 Zed remote transports, the Phase-18 pane-activity
+index, the Phase-23 editor-chrome and Phase-39 rail indexes, Category 11 per-pane /proc).
+Only Phase 50 (terminal output timestamps) had **no** prior art and got a focused websearch
+(2026-07-26). All licenses GPL-3.0-compatible.
+
+| Phase | Concern | Reference (repo + path) | License | Verdict |
+|---|---|---|---|---|
+| 48 | Multi-server-per-language LSP registry populated beyond one row | `helix-lsp` `Registry` + pattern #8 (Category 7 #1); `lapce-proxy` `DocumentSelector` routing (Category 7 #3); rift's own Phase-3.4 `ServerSpec`/`DocumentSelector` (`crates/lsp/src/selector.rs`) | MPL-2.0 / Apache-2.0 | **reuse own** — add data rows to the existing registry; servers taken from the remote `$PATH` (never installed). Candidates pyright / typescript-language-server / gopls / clangd; the multi-server-per-doc shape (linter + type-checker on one buffer) is already the Helix pattern |
+| 49 | Auto-hiding scrollbar over terminal scrollback | `longbridge/gpui-component` `crates/ui/src/scroll/` `Scrollbar` (Category 1 #1); rift's own picker-scrollbar precedent (issue #804: `Scrollbar::vertical(&handle)` + `.track_scroll`) | Apache-2.0 | **reuse** — the vendored `Scrollbar` tied to the terminal's scrollback `ScrollHandle`; `ScrollbarShow` for overflow-only visibility |
+| 50 | On-demand per-line output timestamps (agent-agnostic) | **iTerm2** View > Show Timestamps (⌘⇧E — stamps when each *line* was emitted, right-edge overlay) ([iTerm2 docs](https://iterm2.com/documentation-highlights.html)); demand-confirming feature requests — Warp [#4675](https://github.com/warpdotdev/Warp/issues/4675), Waveterm [#1869](https://github.com/wavetermdev/waveterm/issues/1869), Windows Terminal [#9331](https://github.com/microsoft/terminal/issues/9331), Ghostty [#10506](https://github.com/ghostty-org/ghostty/discussions/10506), Tabby [#11065](https://github.com/Eugeny/tabby/issues/11065) | (refs) | **reference + differentiation** — adopt iTerm2's toggle + per-line-stamp semantics. Differentiation: iTerm2 and peers can only stamp **one time per window under tmux** (they see the multiplexer as a single command, [confirmed](https://groups.google.com/g/iterm2-discuss/c/knvPK8Xi114)); rift is the control-mode client receiving `%output` per pane, so it stamps PTY-byte arrival **per scrollback line at the pane** — exactly the gap the multiplexer hides. Variants (hover-gutter / idle-marker / toggle) are a plan-time call |
+| 51 | Markdown render/preview surface | `longbridge/gpui-component` `Markdown` element (Category 1 #1; already used for LSP hover cards, `crates/app/src/editor.rs`) | Apache-2.0 | **reuse** — the vendored `Markdown` renderer behind a source/preview toggle; read-only first (no live split-edit) |
+| 52 | WSL as a first-class transport alongside SSH | `zed` `crates/remote/src/transport/{ssh,wsl,docker}.rs` — the `RemoteConnection` trait abstracting SSH / WSL / Docker (Category 8 #1) | GPL-3.0 | **reference** — generalise rift's SSH-only `crates/ssh` into a transport seam with a WSL variant (`wsl.exe -d <distro> …` exec) and a connect-card kind chooser. Distinct from `RIFT_REMOTE_EXEC_WRAPPER` (a one-hop-deeper wrapper *over* SSH, not a transport) |
+| 53 | Agent working-vs-idle discrimination (agnostic) | rift's own Phase-18 pane-activity index (this file) + pattern #9; `penso/arbor` working/waiting indicators (Category 4 #1); per-pane `/proc` subtree via `pane_pid` — `YlanAllouche/tmux-task-monitor` + `sysinfo` (Category 11 #5 / #1) | MIT | **reference / reuse own** — the shipped `is_shell` signal cannot see an agent's working→idle edge (an agent is always a non-shell foreground process → permanently Busy); add the Phase-45 `pane_pid`→/proc CPU roll-up and/or a PTY output-idle timer as the missing edge signal. AVOID Arbor's agent detection + capture-pane content hashing (constitution) |
+| 54 | Global UI font size / zoom (not terminal-only) | `zed` `crates/settings` `SettingsStore` hierarchical merge + buffer/UI font-size settings (Category 1 #2); `longbridge/gpui-component` Theme `font_size` token (Category 1 #1) | GPL-3.0 / Apache-2.0 | **reference** — a UI font-size setting driving editor/explorer/chrome (today's slider only mutates the terminal PTY grid); persisted via the phase-9 window-state store. Separate UI size from the terminal grid size |
+| 55 | Real scaled editor minimap | `zed` `crates/editor` minimap; `longbridge/gpui-component` code-editor story (Phase-23 editor-chrome index, this file) | GPL-3.0 / Apache-2.0 | **reference** — a scaled code miniature + viewport slab + drag-to-scroll, replacing the shipped 32px marks-strip (line-length bars, click-to-jump only); virtualize / cache the miniature (`spawn_blocking`) for large files |
+| 56 | Independent area visibility toggles | VS Code Activity Bar view-containers (Phase-39 rail index, this file); rift's own `Area` enum + activity rail (`crates/app/src/workspace.rs`, `activity_rail.rs`) | MIT | **reference / reuse own** — split the combined `Area::ExplorerEditor` into two independently-toggled areas with a filled-region icon per target; reverses the Phase-39 unification (a design-contract update in the spec PR, not a foundation change) |
+
 ## Priority reference projects (top 10)
 
 1. **penso/arbor** — Closest existing implementation of rift's exact concept (Rust + GPUI + daemon + SSH outposts + agent state). Read end-to-end before writing any architecture docs.

@@ -204,13 +204,17 @@ fn describe_clone_error(error: CloneError) -> &'static str {
     }
 }
 
-/// True when `name` cannot be a clone target directory name — mirrors the
-/// daemon's own `clone::validate_name` (`docs/spec-clone-repo.md`, issue
-/// #841): empty, `.`, `..`, or containing a path separator. Checked
-/// client-side before sending `CloneRepo` (issue #839) so a doomed request
-/// never round-trips to the daemon and leaves the spinner with no resolved
-/// path to correlate against.
-fn invalid_clone_name(name: &str) -> bool {
+/// True when `name` cannot be a clone target directory name, nor a name-only
+/// session name — mirrors the daemon's own `clone::validate_name`
+/// (`docs/spec-clone-repo.md`, issue #841): empty, `.`, `..`, or containing a
+/// path separator. Checked client-side before sending `CloneRepo` (issue
+/// #839) so a doomed request never round-trips to the daemon and leaves the
+/// spinner with no resolved path to correlate against; reused by
+/// [`RootPicker::start_without_root`] (issue #887,
+/// `docs/spec-project-optional-session.md`) for the same reason — a
+/// root-less create's `name` is the only field naming the tmux session, with
+/// no directory basename to have already sanitized it.
+fn invalid_target_name(name: &str) -> bool {
     name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\'])
 }
 
@@ -221,6 +225,19 @@ fn invalid_clone_name(name: &str) -> bool {
 enum PickerMode {
     Browse,
     Clone,
+}
+
+/// Which action the Browse-mode footer confirms (issue #891): the default
+/// [`Create`](RootPickerPurpose::Create) attaches-or-creates a NEW session
+/// at the picked root, so its footer asks for a session name; the
+/// mid-session [`SetRoot`](RootPickerPurpose::SetRoot) picks a root for the
+/// ALREADY-attached session, so no name is asked for. Both still emit
+/// [`RootPickerEvent::Picked`]; the owner decides what `name` means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RootPickerPurpose {
+    #[default]
+    Create,
+    SetRoot,
 }
 
 /// Emitted by [`RootPicker`]; the owner never touches this view's internals
@@ -243,12 +260,15 @@ pub enum RootPickerEvent {
         parent: String,
         name: String,
     },
-    /// The user confirmed Create (browse mode) or a clone finished
-    /// successfully (clone mode, `path` as the root): the picked root and
-    /// the session name. Both paths drive the same create-with-root
-    /// `Attach { root: Some(...) }` flow — the owner does not distinguish
-    /// where the root came from.
-    Picked { root: String, name: String },
+    /// The user confirmed Create (browse mode), a clone finished
+    /// successfully (clone mode, `path` as the root), or — when
+    /// [`RootPicker::allow_rootless`] is set — confirmed
+    /// [`RootPicker::start_without_root`] (issue #887,
+    /// `docs/spec-project-optional-session.md`): the picked root, or `None`
+    /// for a name-only create, and the session name. Every path drives the
+    /// same `Attach { root }` flow — the owner does not distinguish where
+    /// the root (or its absence) came from.
+    Picked { root: Option<String>, name: String },
 }
 
 /// The root picker view (issue #768): a card with a breadcrumb, a
@@ -272,6 +292,16 @@ pub struct RootPicker {
     /// successful reply. The picker keeps the last good level visible
     /// underneath rather than tearing down.
     error: Option<DirBrowseError>,
+    /// Whether the seed-browse-failed fallback (issue #872,
+    /// `docs/spec-host-scoped-root-recents.md`) has already fired this
+    /// picker's lifetime. `current_path` alone cannot bound the fallback: a
+    /// `""` retry resolves to a non-empty `$HOME`, so the retry's error reply
+    /// still lands with `current_path` empty — without this explicit flag
+    /// the fallback would re-fire on every subsequent seed failure. Cleared
+    /// on the next successful reply (a fresh browse cycle); starts `false`
+    /// per picker instance, since both owners construct a fresh `RootPicker`
+    /// per pick.
+    seed_fallback_attempted: bool,
     /// The session-name field: seeded with the current level's basename on
     /// every successful browse, freely editable from there.
     name_input: Entity<InputState>,
@@ -315,6 +345,19 @@ pub struct RootPicker {
     /// [`Self::clone_error`] (a daemon-reported [`CloneError`]) since this
     /// never reaches the wire.
     clone_name_error: Option<&'static str>,
+    /// Which action the Browse-mode footer confirms (issue #891) — defaults
+    /// to [`RootPickerPurpose::Create`]; [`Self::set_purpose`] switches it
+    /// right after construction for the mid-session "Set project root" flow.
+    purpose: RootPickerPurpose,
+    /// Whether [`Self::start_without_root`]'s "Start without a project root"
+    /// action is offered (issue #887, `docs/spec-project-optional-session.md`).
+    /// Set via [`Self::allow_rootless`] — the pre-cockpit entry point (the
+    /// only reachable target of a root-less `Attach`) enables it; the
+    /// in-cockpit "+ New session" dialog leaves it unset, since
+    /// `SessionView::create_session_at_root` (`crates/terminal`) has no
+    /// root-less create transport of its own yet — showing the affordance
+    /// there would be a dead click.
+    rootless_enabled: bool,
 }
 
 impl RootPicker {
@@ -373,6 +416,7 @@ impl RootPicker {
             entries: Vec::new(),
             loading: false,
             error: None,
+            seed_fallback_attempted: false,
             name_input,
             _name_subscription: subscription,
             focus_handle: cx.focus_handle(),
@@ -387,7 +431,30 @@ impl RootPicker {
             cloning: false,
             clone_error: None,
             clone_name_error: None,
+            purpose: RootPickerPurpose::default(),
+            rootless_enabled: false,
         }
+    }
+
+    /// Switch the Browse-mode footer's purpose (see [`RootPickerPurpose`]) —
+    /// called once, right after construction, by the mid-session "Set
+    /// project root" owner; every other caller leaves the default
+    /// [`RootPickerPurpose::Create`].
+    pub fn set_purpose(&mut self, purpose: RootPickerPurpose) {
+        self.purpose = purpose;
+    }
+
+    /// Enable the "Start without a project root" action (issue #887,
+    /// `docs/spec-project-optional-session.md`) — a builder call the caller
+    /// chains right after [`Self::new`], mirroring `gpui_component`'s own
+    /// fluent-config idiom. Only the pre-cockpit entry point
+    /// (`main.rs::Shell::show_root_picker`) sets this; the in-cockpit
+    /// "+ New session" dialog (`workspace.rs::WorkspaceView::open_root_picker`)
+    /// leaves it at the `false` default (see the `rootless_enabled` field
+    /// doc for why).
+    pub fn allow_rootless(mut self, allow: bool) -> Self {
+        self.rootless_enabled = allow;
+        self
     }
 
     /// Request `path` (an absolute host path, or `""` for `$HOME`): sets the
@@ -417,6 +484,17 @@ impl RootPicker {
     /// last good level and renders `error` inline
     /// (`docs/spec-session-root-picker.md`'s browse-error mitigation — never
     /// tears down).
+    ///
+    /// A failed *seed* browse (`current_path` still empty — no level has
+    /// ever resolved) is a special case (issue #872,
+    /// `docs/spec-host-scoped-root-recents.md`): rather than rendering the
+    /// dead-end empty card (no breadcrumb, Create disabled), it falls back
+    /// once to a `""` ($HOME) re-browse via [`RootPickerEvent::Browse`] — the
+    /// daemon resolves `""` to the host's `$HOME`, which always exists.
+    /// [`Self::seed_fallback_attempted`] bounds this to a single retry (the
+    /// `$HOME` retry itself echoes a non-empty resolved path, so the bound
+    /// cannot rest on the errored path being empty); once it has fired, a
+    /// further seed error renders inline like any other failure.
     pub fn apply_dir_entries_reply(
         &mut self,
         path: String,
@@ -428,11 +506,18 @@ impl RootPicker {
     ) {
         self.loading = false;
         if let Some(error) = error {
+            if self.current_path.is_empty() && !self.seed_fallback_attempted {
+                self.seed_fallback_attempted = true;
+                self.error = None;
+                self.browse(String::new(), cx);
+                return;
+            }
             self.error = Some(error);
             cx.notify();
             return;
         }
         self.error = None;
+        self.seed_fallback_attempted = false;
         self.current_path = path;
         self.parent = parent;
         self.entries = entries;
@@ -461,20 +546,44 @@ impl RootPicker {
 
     /// The Create button / name-field Enter: emit the picked root and
     /// trimmed session name. A no-op until a level has resolved
-    /// (`current_path` non-empty) and the name field holds non-whitespace
-    /// text — a tmux session needs a name.
+    /// (`current_path` non-empty); in the default [`RootPickerPurpose::Create`]
+    /// the name field must also hold non-whitespace text — a NEW tmux session
+    /// needs a name. [`RootPickerPurpose::SetRoot`] skips that check: nothing
+    /// is being created, so the (hidden) name field is never a gate.
     fn create(&mut self, cx: &mut Context<Self>) {
         if self.current_path.is_empty() {
             return;
         }
         let name = self.name_input.read(cx).value().trim().to_string();
-        if name.is_empty() {
+        if self.purpose == RootPickerPurpose::Create && name.is_empty() {
             return;
         }
         cx.emit(RootPickerEvent::Picked {
-            root: self.current_path.clone(),
+            root: Some(self.current_path.clone()),
             name,
         });
+    }
+
+    /// The "Start without a project root" action (issue #887,
+    /// `docs/spec-project-optional-session.md`): emit
+    /// [`RootPickerEvent::Picked`] with `root: None` — the name-only
+    /// counterpart of [`Self::create`], reachable even before any directory
+    /// level has resolved (`current_path` is not checked, unlike `create`).
+    /// A no-op when [`Self::allow_rootless`] was never called, the name
+    /// field is blank, or the trimmed name fails [`invalid_target_name`] (a
+    /// path separator, `.`, or `..` — the same shape guard
+    /// [`Self::start_clone`] applies to a clone target name, since this name
+    /// is the tmux session name with no directory basename to have already
+    /// sanitized it).
+    fn start_without_root(&mut self, cx: &mut Context<Self>) {
+        if !self.rootless_enabled {
+            return;
+        }
+        let name = self.name_input.read(cx).value().trim().to_string();
+        if name.is_empty() || invalid_target_name(&name) {
+            return;
+        }
+        cx.emit(RootPickerEvent::Picked { root: None, name });
     }
 
     /// The Browse ⇄ Clone toggle: switches which body the card renders. A
@@ -492,7 +601,7 @@ impl RootPicker {
     /// trimmed URL/parent/name via [`RootPickerEvent::Clone`]. A no-op while
     /// a clone is already in flight, or until all three fields hold
     /// non-whitespace text — mirroring [`Self::browse`]'s in-flight guard and
-    /// [`Self::create`]'s blank-field guard. A `name` [`invalid_clone_name`]
+    /// [`Self::create`]'s blank-field guard. A `name` [`invalid_target_name`]
     /// rejects (a path separator, `.`, or `..`) is caught here rather than
     /// sent (issue #839): the daemon would reject it too, but only after
     /// echoing an unresolved path nothing downstream can correlate — this
@@ -508,7 +617,7 @@ impl RootPicker {
         if url.is_empty() || parent.is_empty() || name.is_empty() {
             return;
         }
-        if invalid_clone_name(&name) {
+        if invalid_target_name(&name) {
             self.clone_name_error = Some("Name must not be '.', '..', or contain a path separator");
             cx.notify();
             return;
@@ -545,7 +654,10 @@ impl RootPicker {
         }
         self.clone_error = None;
         let name = self.clone_name_input.read(cx).value().trim().to_string();
-        cx.emit(RootPickerEvent::Picked { root: path, name });
+        cx.emit(RootPickerEvent::Picked {
+            root: Some(path),
+            name,
+        });
         cx.notify();
     }
 }
@@ -744,27 +856,56 @@ fn render_error_banner(cx: &mut Context<RootPicker>, message: &'static str) -> i
         )
 }
 
-/// The footer: the session-name field plus the Create button, disabled until
-/// a level has resolved and the name field holds non-whitespace text.
+/// The footer: the Create button (disabled until a level has resolved and,
+/// in [`RootPickerPurpose::Create`], the name field holds non-whitespace
+/// text), preceded by the session-name field — only in `Create` purpose;
+/// [`RootPickerPurpose::SetRoot`] (issue #891) hides it entirely, since
+/// nothing is being named, and relabels the button "Set project root". When
+/// `can_start_rootless` is `Some` (issue #887,
+/// `docs/spec-project-optional-session.md` — [`RootPicker::allow_rootless`]
+/// enabled this picker; never set alongside `SetRoot`), a second row offers
+/// "Start without a project root", disabled until the name field holds a
+/// valid name.
 fn render_footer(
     cx: &mut Context<RootPicker>,
     name_input: &Entity<InputState>,
     can_create: bool,
+    can_start_rootless: Option<bool>,
+    purpose: RootPickerPurpose,
 ) -> impl IntoElement {
-    h_flex()
-        .w_full()
-        .items_center()
-        .gap(px(8.0))
-        .child(Input::new(name_input).flex_1())
-        .child(
-            Button::new("root-picker-create")
-                .primary()
-                .label("Create")
-                .disabled(!can_create)
+    let label = match purpose {
+        RootPickerPurpose::Create => "Create",
+        RootPickerPurpose::SetRoot => "Set project root",
+    };
+    let rootless_action = can_start_rootless.map(|can_start_rootless| {
+        h_flex().w_full().justify_end().child(
+            Button::new("root-picker-start-rootless")
+                .ghost()
+                .label("Start without a project root")
+                .disabled(!can_start_rootless)
                 .on_click(cx.listener(|this, _event, _window, cx| {
-                    this.create(cx);
+                    this.start_without_root(cx);
                 })),
         )
+    });
+    let mut row = h_flex().w_full().items_center().justify_end().gap(px(8.0));
+    if purpose == RootPickerPurpose::Create {
+        row = row.child(Input::new(name_input).flex_1());
+    }
+    row = row.child(
+        Button::new("root-picker-create")
+            .primary()
+            .label(label)
+            .disabled(!can_create)
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.create(cx);
+            })),
+    );
+    v_flex()
+        .w_full()
+        .gap(px(8.0))
+        .child(row)
+        .children(rootless_action)
 }
 
 /// The Browse ⇄ Clone toggle (issue #829): a compact, outlined
@@ -889,8 +1030,12 @@ impl Render for RootPicker {
                     let has_parent = self.parent.is_some();
                     let loading = self.loading;
                     let error = self.error;
+                    let name = self.name_input.read(cx).value().trim().to_string();
                     let can_create = !self.current_path.is_empty()
-                        && !self.name_input.read(cx).value().trim().is_empty();
+                        && (self.purpose == RootPickerPurpose::SetRoot || !name.is_empty());
+                    let can_start_rootless = self
+                        .rootless_enabled
+                        .then(|| !name.is_empty() && !invalid_target_name(&name));
 
                     let breadcrumb_el = render_breadcrumb(cx, &breadcrumb, loading);
 
@@ -935,7 +1080,13 @@ impl Render for RootPicker {
                     let error_banner = error
                         .map(|error| render_error_banner(cx, describe_dir_browse_error(error)));
                     let name_input = self.name_input.clone();
-                    let footer = render_footer(cx, &name_input, can_create);
+                    let footer = render_footer(
+                        cx,
+                        &name_input,
+                        can_create,
+                        can_start_rootless,
+                        self.purpose,
+                    );
 
                     v_flex()
                         .gap(px(16.0))
@@ -1102,15 +1253,15 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_clone_name_rejects_empty_dot_dotdot_and_separators() {
+    fn test_invalid_target_name_rejects_empty_dot_dotdot_and_separators() {
         for name in ["", ".", "..", "a/b", "a\\b"] {
-            assert!(invalid_clone_name(name), "name {name:?} must be rejected");
+            assert!(invalid_target_name(name), "name {name:?} must be rejected");
         }
     }
 
     #[test]
-    fn test_invalid_clone_name_accepts_a_plain_component() {
-        assert!(!invalid_clone_name("repo"));
+    fn test_invalid_target_name_accepts_a_plain_component() {
+        assert!(!invalid_target_name("repo"));
     }
 
     #[test]
@@ -1172,6 +1323,26 @@ mod tests {
         (picker.expect("picker constructed in window"), window)
     }
 
+    /// Mirrors [`build_picker`], with [`RootPicker::allow_rootless`] enabled
+    /// (issue #887) — the pre-cockpit entry point's construction, exercised
+    /// separately since [`build_picker`]'s default leaves the "Start without
+    /// a project root" action disabled (the in-cockpit dialog's shape).
+    fn build_rootless_picker(
+        cx: &mut TestAppContext,
+    ) -> (Entity<RootPicker>, gpui::WindowHandle<gpui_component::Root>) {
+        let mut picker = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let rp = cx.new(|cx| RootPicker::new(window, cx).allow_rootless(true));
+                picker = Some(rp.clone());
+                cx.new(|cx| gpui_component::Root::new(rp, window, cx))
+            })
+            .expect("open window")
+        });
+        (picker.expect("picker constructed in window"), window)
+    }
+
     fn subscribe_events(
         picker: &Entity<RootPicker>,
         cx: &mut TestAppContext,
@@ -1185,7 +1356,10 @@ mod tests {
                     RootPickerEvent::Clone { url, parent, name } => {
                         format!("clone:{url}:{parent}:{name}")
                     }
-                    RootPickerEvent::Picked { root, name } => format!("picked:{root}:{name}"),
+                    RootPickerEvent::Picked { root, name } => match root {
+                        Some(root) => format!("picked:{root}:{name}"),
+                        None => format!("picked:none:{name}"),
+                    },
                 });
             })
             .detach();
@@ -1319,6 +1493,142 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_seed_error_reply_falls_back_to_a_home_rebrowse(cx: &mut TestAppContext) {
+        let (picker, window) = build_picker(cx);
+        let events = subscribe_events(&picker, cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                picker.update(cx, |picker, cx| {
+                    picker.browse(String::new(), cx);
+                    picker.apply_dir_entries_reply(
+                        "/home/dev".to_string(),
+                        None,
+                        Vec::new(),
+                        Some(DirBrowseError::NotFound),
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .expect("apply seed error reply");
+
+        cx.update(|cx| {
+            let picker = picker.read(cx);
+            assert!(
+                picker.loading,
+                "the fallback re-enters loading for the $HOME retry"
+            );
+            assert!(
+                picker.error.is_none(),
+                "the fallback clears the error instead of rendering the dead-end"
+            );
+            assert!(picker.current_path.is_empty(), "no level has resolved yet");
+            assert!(picker.seed_fallback_attempted);
+        });
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["browse:", "browse:"],
+            "the seed browse and the $HOME fallback re-browse both request an empty path"
+        );
+    }
+
+    #[gpui::test]
+    fn test_seed_error_reply_second_failure_renders_inline_and_emits_no_further_browse(
+        cx: &mut TestAppContext,
+    ) {
+        let (picker, window) = build_picker(cx);
+        let events = subscribe_events(&picker, cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                picker.update(cx, |picker, cx| {
+                    picker.browse(String::new(), cx);
+                    picker.apply_dir_entries_reply(
+                        "/home/dev".to_string(),
+                        None,
+                        Vec::new(),
+                        Some(DirBrowseError::NotFound),
+                        window,
+                        cx,
+                    );
+                    // The $HOME retry itself fails too, echoing the resolved
+                    // non-empty $HOME path (never the empty request path) —
+                    // the once-flag, not the errored path, must bound this.
+                    picker.apply_dir_entries_reply(
+                        "/home/dev".to_string(),
+                        None,
+                        Vec::new(),
+                        Some(DirBrowseError::NotFound),
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .expect("apply seed and retry error replies");
+
+        cx.update(|cx| {
+            let picker = picker.read(cx);
+            assert!(!picker.loading);
+            assert_eq!(picker.error, Some(DirBrowseError::NotFound));
+            assert!(
+                picker.current_path.is_empty(),
+                "still no level has ever resolved"
+            );
+        });
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["browse:", "browse:"],
+            "the once-flag suppresses a second fallback re-browse"
+        );
+    }
+
+    #[gpui::test]
+    fn test_resolved_level_error_reply_sets_the_error_and_emits_no_browse(cx: &mut TestAppContext) {
+        let (picker, window) = build_picker(cx);
+        load(
+            &picker,
+            &window,
+            cx,
+            "",
+            "/home/dev",
+            Some("/home"),
+            vec![dir("project")],
+        );
+        let events = subscribe_events(&picker, cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                picker.update(cx, |picker, cx| {
+                    picker.browse("/home/dev/locked".to_string(), cx);
+                    picker.apply_dir_entries_reply(
+                        "/home/dev/locked".to_string(),
+                        None,
+                        Vec::new(),
+                        Some(DirBrowseError::PermissionDenied),
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .expect("apply resolved-level error reply");
+
+        cx.update(|cx| {
+            let picker = picker.read(cx);
+            assert_eq!(picker.error, Some(DirBrowseError::PermissionDenied));
+            assert_eq!(
+                picker.current_path, "/home/dev",
+                "a resolved-level error keeps the last good level, no seed fallback applies"
+            );
+        });
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["browse:/home/dev/locked"],
+            "a resolved-level error renders inline and issues no further Browse"
+        );
+    }
+
+    #[gpui::test]
     fn test_select_entry_browses_into_the_child_path(cx: &mut TestAppContext) {
         let (picker, window) = build_picker(cx);
         load(
@@ -1430,6 +1740,117 @@ mod tests {
         let events = subscribe_events(&picker, cx);
         cx.update(|cx| picker.update(cx, |picker, cx| picker.create(cx)));
         assert!(events.borrow().is_empty(), "a blank name never creates");
+    }
+
+    #[test]
+    fn test_root_picker_purpose_defaults_to_create() {
+        assert_eq!(RootPickerPurpose::default(), RootPickerPurpose::Create);
+    }
+
+    /// Issue #891 (`docs/spec-project-optional-session.md`, phase 47): the
+    /// mid-session "Set project root" owner switches the picker to
+    /// [`RootPickerPurpose::SetRoot`] right after construction — `create()`
+    /// must then emit even with a blank name field, since the footer that
+    /// would otherwise gate on it is never shown for this purpose.
+    #[gpui::test]
+    fn test_create_in_set_root_purpose_emits_even_with_a_blank_name(cx: &mut TestAppContext) {
+        let (picker, window) = build_picker(cx);
+        picker.update(cx, |picker, _cx| {
+            picker.set_purpose(RootPickerPurpose::SetRoot);
+        });
+        load(
+            &picker,
+            &window,
+            cx,
+            "",
+            "/home/dev",
+            Some("/home"),
+            Vec::new(),
+        );
+        window
+            .update(cx, |_, window, cx| {
+                picker.update(cx, |picker, cx| {
+                    let input = picker.name_input.clone();
+                    input.update(cx, |input, cx| input.set_value("", window, cx));
+                });
+            })
+            .expect("blank the auto-seeded name field");
+
+        let events = subscribe_events(&picker, cx);
+        cx.update(|cx| picker.update(cx, |picker, cx| picker.create(cx)));
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["picked:/home/dev:"],
+            "SetRoot never gates on the (hidden) name field"
+        );
+    }
+
+    #[gpui::test]
+    fn test_start_without_root_emits_picked_with_no_root_when_enabled(cx: &mut TestAppContext) {
+        let (picker, window) = build_rootless_picker(cx);
+        // No `load` call: the whole point of "Start without a project root"
+        // is reachability before (or without) any directory level resolving.
+        window
+            .update(cx, |_, window, cx| {
+                picker.update(cx, |picker, cx| {
+                    let input = picker.name_input.clone();
+                    input.update(cx, |input, cx| input.set_value("  scratch  ", window, cx));
+                });
+            })
+            .expect("edit name");
+        let events = subscribe_events(&picker, cx);
+
+        cx.update(|cx| picker.update(cx, |picker, cx| picker.start_without_root(cx)));
+
+        assert_eq!(events.borrow().as_slice(), ["picked:none:scratch"]);
+    }
+
+    #[gpui::test]
+    fn test_start_without_root_is_noop_when_not_enabled(cx: &mut TestAppContext) {
+        let (picker, window) = build_picker(cx);
+        window
+            .update(cx, |_, window, cx| {
+                picker.update(cx, |picker, cx| {
+                    let input = picker.name_input.clone();
+                    input.update(cx, |input, cx| input.set_value("scratch", window, cx));
+                });
+            })
+            .expect("edit name");
+        let events = subscribe_events(&picker, cx);
+
+        cx.update(|cx| picker.update(cx, |picker, cx| picker.start_without_root(cx)));
+
+        assert!(
+            events.borrow().is_empty(),
+            "the in-cockpit dialog's default construction never allows a root-less create"
+        );
+    }
+
+    #[gpui::test]
+    fn test_start_without_root_is_noop_with_a_blank_or_invalid_name(cx: &mut TestAppContext) {
+        let (picker, window) = build_rootless_picker(cx);
+        let events = subscribe_events(&picker, cx);
+
+        // Blank — the field's initial, unedited value.
+        cx.update(|cx| picker.update(cx, |picker, cx| picker.start_without_root(cx)));
+        assert!(events.borrow().is_empty(), "a blank name never creates");
+
+        for invalid in [".", "..", "a/b", "a\\b"] {
+            window
+                .update(cx, |_, window, cx| {
+                    picker.update(cx, |picker, cx| {
+                        let input = picker.name_input.clone();
+                        input.update(cx, |input, cx| input.set_value(invalid, window, cx));
+                    });
+                })
+                .expect("edit name");
+            cx.update(|cx| picker.update(cx, |picker, cx| picker.start_without_root(cx)));
+        }
+        assert!(
+            events.borrow().is_empty(),
+            "a dot-only or path-separator name never creates"
+        );
     }
 
     #[gpui::test]

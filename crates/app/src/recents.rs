@@ -16,12 +16,19 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::window_state::{self, StoreError};
 
 /// Recents beyond this count are dropped (oldest first) on every
 /// [`record`] — a handful of convenience prefills, not a growing history.
 pub const MAX_RECENTS: usize = 8;
+
+/// Recent project roots beyond this count are dropped (oldest first) on
+/// every [`merge_recent_root`] — the same handful-of-prefills shape as
+/// [`MAX_RECENTS`], scoped to one connection's `recent_roots` instead of the
+/// whole list (issue #873, `docs/spec-host-scoped-root-recents.md`).
+pub const MAX_RECENT_ROOTS: usize = 8;
 
 /// One entry in the RECENT list: everything the Connection screen's connect
 /// card needs to prefill and reconnect with one click.
@@ -46,6 +53,16 @@ pub struct RecentConnection {
     /// Unix seconds this entry was last connected (or reconnected) with —
     /// the RECENT row's relative-time caption is computed from this.
     pub last_connected_unix_secs: u64,
+    /// Recently-picked project roots on this host, most-recent-first, capped
+    /// at [`MAX_RECENT_ROOTS`] (issue #873, `docs/spec-host-scoped-root-
+    /// recents.md`). Co-located here rather than in a channel-global list
+    /// (the pre-#873 `window_state::recent_roots`) because a project root
+    /// only exists on the host it was picked on — the same host identity
+    /// [`same_target`] already keys this entry on. Additive over the
+    /// pre-#873 schema — `#[serde(default)]` on the struct plus this
+    /// hand-written `Default` keep a field-absent entry loading as `[]`
+    /// (the tolerant-load contract, #477).
+    pub recent_roots: Vec<String>,
 }
 
 impl Default for RecentConnection {
@@ -58,8 +75,23 @@ impl Default for RecentConnection {
             session: String::new(),
             remote_exec_wrapper: String::new(),
             last_connected_unix_secs: 0,
+            recent_roots: Vec::new(),
         }
     }
+}
+
+/// The host/user/port/key/wrapper identity a recents entry is keyed on, as a
+/// comparable tuple — the shared shape [`same_target`] (two entries) and
+/// [`matches_target`] (an entry vs. a live [`RecentTarget`]) both compare, so
+/// the five fields are named in exactly one place.
+fn identity(entry: &RecentConnection) -> (&str, &str, u16, &str, &str) {
+    (
+        entry.host.as_str(),
+        entry.user.as_str(),
+        entry.port,
+        entry.key.as_str(),
+        entry.remote_exec_wrapper.as_str(),
+    )
 }
 
 /// Whether two entries are the same connection target for the recents list's
@@ -71,11 +103,115 @@ impl Default for RecentConnection {
 /// bare-host recent to the same host are distinct functional targets, so both
 /// stay re-runnable rather than one clobbering the other's wrapper.
 fn same_target(a: &RecentConnection, b: &RecentConnection) -> bool {
-    a.host == b.host
-        && a.user == b.user
-        && a.port == b.port
-        && a.key == b.key
-        && a.remote_exec_wrapper == b.remote_exec_wrapper
+    identity(a) == identity(b)
+}
+
+/// Whether `entry` is the connection `target` identifies — the same five
+/// fields [`same_target`] compares, against a live [`RecentTarget`] instead
+/// of a second stored entry (issue #873, `docs/spec-host-scoped-root-
+/// recents.md`).
+fn matches_target(entry: &RecentConnection, target: &RecentTarget) -> bool {
+    identity(entry)
+        == (
+            target.host.as_str(),
+            target.user.as_str(),
+            target.port,
+            target.key.as_str(),
+            target.remote_exec_wrapper.as_str(),
+        )
+}
+
+/// The host/user/port/key/wrapper identity for a recents entry (issue #707,
+/// wrapper added by #790). Made lib-visible (moved here from `main.rs`) by
+/// issue #873 (`docs/spec-host-scoped-root-recents.md`) so `workspace.rs`'s
+/// `WorkspaceView` — a library type, not the binary — can key its own
+/// in-cockpit root picker's seed/record on the same identity `main.rs`'s
+/// `Shell` uses for its pre-cockpit one. `Shell::connect` captures one per
+/// connect attempt (before `ConnectRequest`'s fields move into `SshConfig`)
+/// and threads it through the post-connect pickers and into
+/// `workspace::WorkspaceView::new`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecentTarget {
+    pub host: String,
+    pub user: String,
+    pub port: u16,
+    pub key: String,
+    /// The connect-time Remote exec wrapper field value (issue #790), empty
+    /// for a normal host connection — persisted onto the recorded
+    /// [`RecentConnection`] so a container recent stays re-runnable.
+    pub remote_exec_wrapper: String,
+}
+
+impl RecentTarget {
+    /// Record a connection attempt under this identity: builds a fresh
+    /// [`RecentConnection`] (only the session name is newly known) and calls
+    /// [`record`], which carries over whatever `recent_roots` the matching
+    /// entry already had rather than wiping them on a session-only reconnect.
+    pub fn record(&self, path: &Path, session: &str) {
+        let now = now_unix_secs();
+        let entry = RecentConnection {
+            host: self.host.clone(),
+            user: self.user.clone(),
+            port: self.port,
+            key: self.key.clone(),
+            session: session.to_string(),
+            remote_exec_wrapper: self.remote_exec_wrapper.clone(),
+            last_connected_unix_secs: now,
+            recent_roots: Vec::new(),
+        };
+        if let Err(e) = record(path, entry, now) {
+            warn!(%e, "failed to record recent connection");
+        }
+    }
+}
+
+/// The recent project roots recorded for `target` (issue #873,
+/// `docs/spec-host-scoped-root-recents.md`), most-recent-first — empty if no
+/// recent connection matches `target` yet. Keys on [`matches_target`], the
+/// same identity [`RecentTarget::record`] stores the connection under, so a
+/// root picked on a different host is never offered as a seed here.
+pub fn target_recent_roots(path: &Path, target: &RecentTarget) -> Vec<String> {
+    load(path)
+        .into_iter()
+        .find(|entry| matches_target(entry, target))
+        .map(|entry| entry.recent_roots)
+        .unwrap_or_default()
+}
+
+/// Merge a freshly-picked root into `target`'s matching entry: move-to-front
+/// if already present, insert as newest otherwise, capped at
+/// [`MAX_RECENT_ROOTS`] — the same move-to-front/cap shape as [`record`]'s
+/// own list, scoped to one entry's `recent_roots` rather than the whole file.
+/// If no entry matches `target` yet — a root picked before any connection was
+/// recorded, which should not happen since [`RecentTarget::record`] runs on
+/// every connect before a root is ever picked — a fresh entry is inserted for
+/// it rather than silently dropping the root.
+pub fn merge_recent_root(path: &Path, target: &RecentTarget, root: &str) -> Result<(), StoreError> {
+    let mut recents = load(path);
+    match recents
+        .iter_mut()
+        .find(|entry| matches_target(entry, target))
+    {
+        Some(entry) => {
+            entry.recent_roots.retain(|existing| existing != root);
+            entry.recent_roots.insert(0, root.to_string());
+            entry.recent_roots.truncate(MAX_RECENT_ROOTS);
+        }
+        None => {
+            let entry = RecentConnection {
+                host: target.host.clone(),
+                user: target.user.clone(),
+                port: target.port,
+                key: target.key.clone(),
+                remote_exec_wrapper: target.remote_exec_wrapper.clone(),
+                recent_roots: vec![root.to_string()],
+                ..RecentConnection::default()
+            };
+            recents.insert(0, entry);
+            recents.truncate(MAX_RECENTS);
+        }
+    }
+    save(path, &recents)
 }
 
 /// Load the recents list at `path`, tolerating everything exactly like
@@ -122,6 +258,13 @@ pub fn save(path: &Path, recents: &[RecentConnection]) -> Result<(), StoreError>
 /// the oldest. A read-modify-write over the store at `path`, mirroring
 /// `window_state::save_theme`'s shape; returns the updated list so the caller
 /// can render it immediately without a second [`load`].
+///
+/// Carries over the matching existing entry's `recent_roots` onto `entry`
+/// first (issue #873, `docs/spec-host-scoped-root-recents.md`): this runs on
+/// every connect, before any root is ever picked on that connection, and
+/// `entry` itself carries no roots — without the carry-over, every reconnect
+/// to an already-known host would silently wipe the roots picked on it
+/// earlier.
 pub fn record(
     path: &Path,
     mut entry: RecentConnection,
@@ -129,6 +272,12 @@ pub fn record(
 ) -> Result<Vec<RecentConnection>, StoreError> {
     entry.last_connected_unix_secs = now_unix_secs;
     let mut recents = load(path);
+    if let Some(existing) = recents
+        .iter()
+        .find(|existing| same_target(existing, &entry))
+    {
+        entry.recent_roots = existing.recent_roots.clone();
+    }
     recents.retain(|existing| !same_target(existing, &entry));
     recents.insert(0, entry);
     recents.truncate(MAX_RECENTS);
@@ -233,6 +382,17 @@ mod tests {
             session: "rift".to_string(),
             remote_exec_wrapper: String::new(),
             last_connected_unix_secs: 0,
+            recent_roots: Vec::new(),
+        }
+    }
+
+    fn sample_target(host: &str) -> RecentTarget {
+        RecentTarget {
+            host: host.to_string(),
+            user: "developer".to_string(),
+            port: 22,
+            key: "/home/developer/.ssh/id_ed25519".to_string(),
+            remote_exec_wrapper: String::new(),
         }
     }
 
@@ -316,6 +476,31 @@ mod tests {
         assert_eq!(recents[0].remote_exec_wrapper, "");
     }
 
+    /// Issue #873 (`docs/spec-host-scoped-root-recents.md`): an entry written
+    /// before `recent_roots` existed still loads, defaulting to `[]` rather
+    /// than failing the parse — the same tolerant-load contract #790's
+    /// `remote_exec_wrapper` field above already relies on.
+    #[test]
+    fn test_load_field_absent_recent_roots_defaults_to_empty() {
+        let scratch = Scratch::new("roots_absent");
+        let path = scratch.path("recents.json");
+        let json = r#"[{
+            "host": "100.64.0.1",
+            "user": "developer",
+            "port": 22,
+            "key": "/home/developer/.ssh/id_ed25519",
+            "session": "rift",
+            "remote_exec_wrapper": "",
+            "last_connected_unix_secs": 1000
+        }]"#;
+        fs::write(&path, json).expect("write field-absent json");
+
+        let recents = load(&path);
+
+        assert_eq!(recents.len(), 1);
+        assert_eq!(recents[0].recent_roots, Vec::<String>::new());
+    }
+
     #[test]
     fn test_save_creates_parent_directories() {
         let scratch = Scratch::new("mkdirp");
@@ -379,6 +564,31 @@ mod tests {
         assert_eq!(recents[0].session, "other-session", "session refreshed");
         assert_eq!(recents[0].last_connected_unix_secs, 3_000);
         assert_eq!(recents[1].host, "100.64.0.2");
+    }
+
+    /// The spec's main foot-gun (issue #873, `docs/spec-host-scoped-root-
+    /// recents.md`): `record` runs on every connect, before any root is ever
+    /// picked, so a session-only reconnect to an already-known host must not
+    /// wipe the roots recorded on it earlier.
+    #[test]
+    fn test_record_preserves_existing_recent_roots_on_session_only_reconnect() {
+        let scratch = Scratch::new("record_preserves_roots");
+        let path = scratch.path("recents.json");
+        let target = sample_target("100.64.0.1");
+        record(&path, sample("100.64.0.1"), 1_000).expect("first record");
+        merge_recent_root(&path, &target, "/home/dev/proj").expect("merge root");
+
+        let mut reconnect = sample("100.64.0.1");
+        reconnect.session = "other-session".to_string();
+        let recents = record(&path, reconnect, 2_000).expect("session-only reconnect");
+
+        assert_eq!(recents.len(), 1);
+        assert_eq!(
+            recents[0].recent_roots,
+            vec!["/home/dev/proj".to_string()],
+            "reconnecting must not wipe the roots already recorded for this host"
+        );
+        assert_eq!(recents[0].session, "other-session");
     }
 
     #[test]
@@ -454,6 +664,98 @@ mod tests {
             format!("host-{}", 3),
             "oldest entries beyond the cap are dropped"
         );
+    }
+
+    // --- host-scoped recent roots (#873) ------------------------------------
+
+    #[test]
+    fn test_target_recent_roots_no_matching_entry_returns_empty() {
+        let scratch = Scratch::new("roots_lookup_missing");
+        let path = scratch.path("recents.json");
+        record(&path, sample("100.64.0.1"), 1_000).expect("record");
+
+        let roots = target_recent_roots(&path, &sample_target("100.64.0.2"));
+
+        assert_eq!(
+            roots,
+            Vec::<String>::new(),
+            "a different host has no recorded roots"
+        );
+    }
+
+    #[test]
+    fn test_target_recent_roots_keys_on_same_target_not_a_different_host() {
+        let scratch = Scratch::new("roots_lookup_scoped");
+        let path = scratch.path("recents.json");
+        record(&path, sample("100.64.0.1"), 1_000).expect("record host A");
+        record(&path, sample("100.64.0.2"), 2_000).expect("record host B");
+        merge_recent_root(&path, &sample_target("100.64.0.1"), "/a/proj").expect("merge for A");
+
+        let roots_a = target_recent_roots(&path, &sample_target("100.64.0.1"));
+        let roots_b = target_recent_roots(&path, &sample_target("100.64.0.2"));
+
+        assert_eq!(roots_a, vec!["/a/proj".to_string()]);
+        assert_eq!(
+            roots_b,
+            Vec::<String>::new(),
+            "a root picked on host A must never seed host B"
+        );
+    }
+
+    #[test]
+    fn test_merge_recent_root_move_to_fronts_existing_entry() {
+        let scratch = Scratch::new("merge_root_order");
+        let path = scratch.path("recents.json");
+        let target = sample_target("100.64.0.1");
+        record(&path, sample("100.64.0.1"), 1_000).expect("record");
+        merge_recent_root(&path, &target, "/a/one").expect("merge one");
+        merge_recent_root(&path, &target, "/a/two").expect("merge two");
+
+        merge_recent_root(&path, &target, "/a/one").expect("re-merge one");
+
+        let roots = target_recent_roots(&path, &target);
+        assert_eq!(
+            roots,
+            vec!["/a/one".to_string(), "/a/two".to_string()],
+            "re-picking an existing root moves it to front without duplicating"
+        );
+    }
+
+    #[test]
+    fn test_merge_recent_root_caps_at_max_recent_roots_dropping_the_oldest() {
+        let scratch = Scratch::new("merge_root_cap");
+        let path = scratch.path("recents.json");
+        let target = sample_target("100.64.0.1");
+        record(&path, sample("100.64.0.1"), 1_000).expect("record");
+
+        for i in 0..(MAX_RECENT_ROOTS + 3) {
+            merge_recent_root(&path, &target, &format!("/root-{i}")).expect("merge");
+        }
+
+        let roots = target_recent_roots(&path, &target);
+        assert_eq!(roots.len(), MAX_RECENT_ROOTS);
+        assert_eq!(
+            roots[0],
+            format!("/root-{}", MAX_RECENT_ROOTS + 2),
+            "newest first"
+        );
+        assert_eq!(
+            roots[MAX_RECENT_ROOTS - 1],
+            "/root-3",
+            "oldest roots beyond the cap are dropped"
+        );
+    }
+
+    #[test]
+    fn test_merge_recent_root_with_no_matching_entry_creates_one() {
+        let scratch = Scratch::new("merge_root_no_entry");
+        let path = scratch.path("recents.json");
+        let target = sample_target("100.64.0.1");
+
+        merge_recent_root(&path, &target, "/a/proj").expect("merge without a prior connect");
+
+        let roots = target_recent_roots(&path, &target);
+        assert_eq!(roots, vec!["/a/proj".to_string()]);
     }
 
     // --- channel keying --------------------------------------------------------

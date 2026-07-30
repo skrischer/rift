@@ -529,12 +529,51 @@ struct Attach {
     /// [`DaemonMessage::PaneCapture`] for that pane. Several may be in flight at
     /// once (one per pane); each is removed when its reply arrives.
     captures: HashMap<CommandId, u32>,
+    /// In-flight attach-time content seeds (`docs/spec-attach-content-seed.md`),
+    /// one per pane. DISTINCT from `captures`: a seed pairs a `display-message`
+    /// format read (alt-screen + cursor) with a `capture-pane` of the visible
+    /// screen and, once both legs land, emits the framed bytes on
+    /// [`DaemonMessage::PaneOutput`] — the same channel `%output` uses — so the
+    /// client `Term` renders the pre-existing screen with no new protocol
+    /// surface. `captures` instead emits [`DaemonMessage::PaneCapture`] into the
+    /// client's SCROLLBACK, which would not repaint the live screen. Small (one
+    /// per pane, once per attach), so a linear scan by [`CommandId`] is fine.
+    seed_captures: Vec<SeedCapture>,
     /// The in-flight `list-keys` + `show-options` query pair (at most one),
     /// for the tmux key-table mirror (`docs/spec-tmux-keytable-mirroring.md`).
     /// A newer request simply replaces this — a reply whose id no longer
     /// matches is dropped, which is fine since a fresher query is already
     /// in flight.
     key_table_query: Option<KeyTableQuery>,
+}
+
+/// One in-flight attach-time content seed for a single pane
+/// (`docs/spec-attach-content-seed.md`). Two correlated commands are queued on
+/// attach — a `display-message` format read and a `capture-pane` of the visible
+/// screen — and each reply is stashed here until both have arrived, so the
+/// framed [`DaemonMessage::PaneOutput`] carries a coherent screen snapshot
+/// rather than racing the two legs.
+struct SeedCapture {
+    pane_id: u32,
+    format_id: CommandId,
+    capture_id: CommandId,
+    /// The pane's alt-screen / cursor state, once the format reply lands.
+    format: Option<SeedFrame>,
+    /// The captured visible rows (already tmux-decoded by the [`Client`]), once
+    /// the capture reply lands.
+    rows: Option<Vec<String>>,
+}
+
+/// The pane screen-state a content seed needs to frame its rows correctly
+/// (`docs/spec-attach-content-seed.md`): whether the pane is on the alternate
+/// screen (`#{alternate_on}`) and where its cursor sits (`#{cursor_x}`/
+/// `#{cursor_y}`, 0-based). [`Default`] is the safe fallback for a malformed or
+/// errored format reply: normal screen, cursor home.
+#[derive(Default, Clone, Copy)]
+struct SeedFrame {
+    alternate: bool,
+    cursor_x: u16,
+    cursor_y: u16,
 }
 
 /// One in-flight `list-keys` + `show-options` round trip: both commands are
@@ -584,6 +623,7 @@ impl Attach {
             root_query: None,
             paused: HashSet::new(),
             captures: HashMap::new(),
+            seed_captures: Vec::new(),
             key_table_query: None,
         };
         // Enable tmux's per-pane flow control for this attach (tmux→daemon leg).
@@ -819,19 +859,38 @@ impl Attach {
                         self.layout_query = None;
                         if !error {
                             let windows = parse_layout(&output);
-                            let message = if self.snapshot_sent {
-                                DaemonMessage::LayoutUpdate {
-                                    session: self.session.clone(),
-                                    windows,
-                                }
+                            let is_snapshot = !self.snapshot_sent;
+                            // Seed each pane's current visible screen right after
+                            // the attach-time snapshot
+                            // (`docs/spec-attach-content-seed.md`): tmux never
+                            // replays a pane's pre-existing content to a fresh
+                            // control client, so without this the panes stay
+                            // blank until they next produce output. Collect the
+                            // pane ids before `windows` moves into the message.
+                            let seed_panes: Vec<u32> = if is_snapshot {
+                                windows
+                                    .iter()
+                                    .flat_map(|w| w.panes.iter().map(|p| p.pane_id))
+                                    .collect()
                             } else {
+                                Vec::new()
+                            };
+                            let message = if is_snapshot {
                                 self.snapshot_sent = true;
                                 DaemonMessage::LayoutSnapshot {
                                     session: self.session.clone(),
                                     windows,
                                 }
+                            } else {
+                                DaemonMessage::LayoutUpdate {
+                                    session: self.session.clone(),
+                                    windows,
+                                }
                             };
                             outbound.send(message).await.map_err(|_| Closed)?;
+                            if is_snapshot {
+                                self.request_seed(&seed_panes).await;
+                            }
                         }
                         if self.layout_dirty {
                             self.layout_dirty = false;
@@ -870,6 +929,15 @@ impl Attach {
                                 // blocking the tmux read loop over.
                                 let _ = root_resolved.try_send(resolved);
                             }
+                        }
+                    } else if self.seed_reply_id_matches(id) {
+                        // A content-seed reply (`docs/spec-attach-content-seed.md`):
+                        // stash this leg and, once both the format read and the
+                        // capture have arrived, emit the framed visible screen on
+                        // PaneOutput. Checked BEFORE `captures` so a seed capture
+                        // is never mistaken for a scrollback capture.
+                        if let Some(message) = self.apply_seed_reply(id, error, output) {
+                            outbound.send(message).await.map_err(|_| Closed)?;
                         }
                     } else if let Some(pane) = id.and_then(|id| self.captures.remove(&id)) {
                         // A `capture-pane` reply: forward the captured bytes (empty
@@ -986,6 +1054,94 @@ impl Attach {
             .is_some_and(|query| query.list_keys_id == id || query.show_options_id == id)
     }
 
+    /// Issue the attach-time content seed for each pane
+    /// (`docs/spec-attach-content-seed.md`): per pane, a `display-message` format
+    /// read of the alt-screen + cursor state and a `capture-pane` of the visible
+    /// screen, tracked together in `seed_captures` until both replies arrive.
+    /// `#{...}` formats are single-quoted (tmux-reference pitfall 9);
+    /// `capture-pane -p -e` (no `-S`/`-E`) captures the visible screen only, with
+    /// styling, reusing the [`Client`]'s existing decode. A send failure for one
+    /// pane skips only that pane's seed.
+    async fn request_seed(&mut self, panes: &[u32]) {
+        for &pane in panes {
+            let format_cmd = format!(
+                "display-message -p -t %{pane} '#{{alternate_on}}\t#{{cursor_x}}\t#{{cursor_y}}'"
+            );
+            let format_id = match self.send_command(&format_cmd).await {
+                Ok(id) => id,
+                Err(err) => {
+                    warn!(pane, %err, "seed format query failed");
+                    continue;
+                }
+            };
+            let capture_cmd = format!("capture-pane -p -e -t %{pane}");
+            let capture_id = match self.send_command(&capture_cmd).await {
+                Ok(id) => id,
+                Err(err) => {
+                    warn!(pane, %err, "seed capture query failed");
+                    continue;
+                }
+            };
+            self.seed_captures.push(SeedCapture {
+                pane_id: pane,
+                format_id,
+                capture_id,
+                format: None,
+                rows: None,
+            });
+        }
+    }
+
+    /// Whether `id` correlates to a leg of any in-flight content seed. Checked
+    /// before consuming a `CommandReply`'s owned `output`, mirroring
+    /// [`Attach::key_table_reply_id_matches`].
+    fn seed_reply_id_matches(&self, id: Option<CommandId>) -> bool {
+        let Some(id) = id else { return false };
+        self.seed_captures
+            .iter()
+            .any(|seed| seed.format_id == id || seed.capture_id == id)
+    }
+
+    /// Feed one `CommandReply` into the matching in-flight seed. Stashes the leg
+    /// (a malformed/errored format falls back to [`SeedFrame::default`], an
+    /// errored capture to no rows) and, once BOTH legs have arrived, removes the
+    /// seed and returns the framed [`DaemonMessage::PaneOutput`]; `None` while the
+    /// pair is still incomplete or `id` matches no seed.
+    fn apply_seed_reply(
+        &mut self,
+        id: Option<CommandId>,
+        error: bool,
+        output: Vec<String>,
+    ) -> Option<DaemonMessage> {
+        let id = id?;
+        let idx = self
+            .seed_captures
+            .iter()
+            .position(|seed| seed.format_id == id || seed.capture_id == id)?;
+        {
+            let seed = &mut self.seed_captures[idx];
+            if id == seed.format_id {
+                seed.format = Some(if error {
+                    SeedFrame::default()
+                } else {
+                    parse_seed_format(output.first().map(String::as_str).unwrap_or(""))
+                });
+            } else {
+                seed.rows = Some(if error { Vec::new() } else { output });
+            }
+            if seed.format.is_none() || seed.rows.is_none() {
+                return None;
+            }
+        }
+        let seed = self.seed_captures.remove(idx);
+        let frame = seed.format.unwrap_or_default();
+        let rows = seed.rows.unwrap_or_default();
+        Some(DaemonMessage::PaneOutput {
+            pane_id: seed.pane_id,
+            bytes: frame_seed(frame, &rows),
+        })
+    }
+
     /// Issue a layout query, coalescing so at most one is in flight.
     async fn request_layout(&mut self) {
         if self.layout_query.is_some() {
@@ -1066,6 +1222,52 @@ fn hex_bytes(data: &[u8]) -> String {
 /// tmux-decoded by the [`Client`]'s command-block decode.
 fn join_capture(output: &[String]) -> Vec<u8> {
     output.join("\n").into_bytes()
+}
+
+/// Parse a content-seed format reply — the single tab-separated line
+/// `#{alternate_on}\t#{cursor_x}\t#{cursor_y}` (`docs/spec-attach-content-seed.md`)
+/// — into the pane screen-state used to frame the seed. Tolerant of malformed
+/// input: a missing or non-numeric field falls back to its [`SeedFrame::default`]
+/// component, so a garbled reply degrades to a normal-screen, cursor-home seed
+/// rather than dropping the pane.
+fn parse_seed_format(line: &str) -> SeedFrame {
+    let mut fields = line.splitn(3, '\t');
+    let alternate = fields.next() == Some("1");
+    let cursor_x = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
+    let cursor_y = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
+    SeedFrame {
+        alternate,
+        cursor_x,
+        cursor_y,
+    }
+}
+
+/// Frame a pane's captured visible screen into the byte stream the client `Term`
+/// renders as that screen (`docs/spec-attach-content-seed.md`). An
+/// alternate-screen pane is wrapped with the alt-screen enter (`ESC[?1049h`)
+/// first, so the `Term` switches buffers before the rows land and a full-screen
+/// TUI renders in the right plane; then the buffer is cleared and homed
+/// (`ESC[2J ESC[H`) and the rows are laid down from the top-left. Rows are joined
+/// with CRLF but the LAST row is NOT terminated, so a full-width bottom row does
+/// not trigger autowrap into a scroll (the no-scroll invariant). The cursor is
+/// restored last, translating the 0-based tmux coordinates to a 1-based CSI
+/// position, so post-seed input and the pane's own next redraw resume where tmux
+/// says the cursor is.
+fn frame_seed(frame: SeedFrame, rows: &[String]) -> Vec<u8> {
+    use std::fmt::Write;
+    let mut out = String::new();
+    if frame.alternate {
+        out.push_str("\x1b[?1049h");
+    }
+    out.push_str("\x1b[2J\x1b[H");
+    out.push_str(&rows.join("\r\n"));
+    let _ = write!(
+        out,
+        "\x1b[{};{}H",
+        frame.cursor_y.saturating_add(1),
+        frame.cursor_x.saturating_add(1)
+    );
+    out.into_bytes()
 }
 
 /// Pull the `%<pane>` id out of a `%pause`/`%continue` notification argument.
@@ -2041,6 +2243,138 @@ mod tests {
 
         drop(in_tx);
         let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_attach_seeds_preexisting_visible_content() {
+        // The #897 regression (`docs/spec-attach-content-seed.md`): draw content
+        // into a session and let it go idle BEFORE the daemon attaches, so the
+        // content predates the control child. tmux never replays a fresh control
+        // client the pre-existing screen (spike-confirmed), so only the on-attach
+        // `capture-pane` seed recovers it. The other `test_attach_*` cases miss
+        // this because they observe the shell's FIRST prompt, drawn AFTER attach.
+        let server = TmuxServer::new("seed");
+        let marker = "SEEDMARKER897";
+        let create = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &server.name,
+                "new-session",
+                "-d",
+                "-s",
+                "rift",
+                "-x",
+                "80",
+                "-y",
+                "24",
+            ])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run tmux new-session");
+        assert!(create.success(), "tmux new-session -d failed");
+        let draw = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &server.name,
+                "send-keys",
+                "-t",
+                "rift",
+                &format!("printf '{marker}\\n'"),
+                "Enter",
+            ])
+            .status()
+            .expect("run tmux send-keys");
+        assert!(draw.success(), "tmux send-keys failed");
+        // Let the shell render the marker and settle back to an idle prompt, so
+        // the marker is on-screen and predates the attach below.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        let (in_tx, mut out_rx, task) = spawn_task(&server, 256);
+        in_tx
+            .send(ClientMessage::Attach {
+                session: "rift".to_owned(),
+                root: None,
+            })
+            .await
+            .expect("attach");
+
+        // The session is idle, so there is no live `%output`, and no resize or
+        // keystroke is sent — the ONLY path that carries the pre-existing marker
+        // to the client is the attach-time seed on `PaneOutput`.
+        let mut seen: Vec<u8> = Vec::new();
+        let found = recv_until(&mut out_rx, 10, |m| match m {
+            DaemonMessage::PaneOutput { bytes, .. } => {
+                seen.extend_from_slice(bytes);
+                seen.windows(marker.len())
+                    .any(|w| w == marker.as_bytes())
+                    .then_some(())
+            }
+            _ => None,
+        })
+        .await;
+        assert!(
+            found.is_some(),
+            "attach did not seed the pane's pre-existing visible content"
+        );
+
+        drop(in_tx);
+        let _ = task.await;
+    }
+
+    #[test]
+    fn test_parse_seed_format_valid_and_malformed() {
+        let alt = parse_seed_format("1\t5\t3");
+        assert!(alt.alternate);
+        assert_eq!((alt.cursor_x, alt.cursor_y), (5, 3));
+
+        let normal = parse_seed_format("0\t0\t0");
+        assert!(!normal.alternate);
+        assert_eq!((normal.cursor_x, normal.cursor_y), (0, 0));
+
+        // Malformed input degrades to the safe default (normal screen, home),
+        // never a panic: empty, missing fields, and non-numeric coordinates.
+        for garbled in ["", "x\tnope", "1", "1\t"] {
+            let f = parse_seed_format(garbled);
+            assert_eq!((f.cursor_x, f.cursor_y), (0, 0), "input {garbled:?}");
+        }
+    }
+
+    #[test]
+    fn test_frame_seed_normal_screen_clears_homes_and_restores_cursor() {
+        let rows = vec!["hello".to_owned(), "world".to_owned()];
+        let frame = SeedFrame {
+            alternate: false,
+            cursor_x: 2,
+            cursor_y: 1,
+        };
+        let s = String::from_utf8(frame_seed(frame, &rows)).expect("utf8");
+        // No alt-screen enter for a normal pane; clear + home, CRLF-joined rows,
+        // then a 1-based cursor restore of the 0-based (x=2, y=1).
+        assert!(!s.contains("\x1b[?1049h"));
+        assert_eq!(s, "\x1b[2J\x1b[Hhello\r\nworld\x1b[2;3H");
+    }
+
+    #[test]
+    fn test_frame_seed_alternate_screen_wraps_with_alt_enter() {
+        let rows = vec!["tui".to_owned()];
+        let frame = SeedFrame {
+            alternate: true,
+            cursor_x: 0,
+            cursor_y: 0,
+        };
+        let s = String::from_utf8(frame_seed(frame, &rows)).expect("utf8");
+        assert_eq!(s, "\x1b[?1049h\x1b[2J\x1b[Htui\x1b[1;1H");
+    }
+
+    #[test]
+    fn test_frame_seed_full_width_bottom_row_is_not_newline_terminated() {
+        // No-scroll invariant: a full-width last row must not be followed by a
+        // trailing CRLF, which would push the grid up a line on replay.
+        let full = "x".repeat(80);
+        let rows = vec!["top".to_owned(), full.clone()];
+        let s = String::from_utf8(frame_seed(SeedFrame::default(), &rows)).expect("utf8");
+        assert!(s.ends_with(&format!("{full}\x1b[1;1H")));
+        assert!(!s.contains(&format!("{full}\r\n")));
     }
 
     #[tokio::test]

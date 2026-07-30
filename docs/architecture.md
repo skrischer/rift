@@ -2,7 +2,9 @@
 
 ## Overview
 
-The system is a native GPU-accelerated terminal application that connects via SSH to a remote host, attaches to tmux, and renders terminal output through GPUI — no WebView, no browser-based terminal emulation, no Node.js runtime.
+The system is a native GPU-accelerated terminal application that connects to a host over a transport, attaches to tmux, and renders terminal output through GPUI — no WebView, no browser-based terminal emulation, no Node.js runtime.
+
+The transport is a seam with two variants selected by connection kind (Phase 52): **SSH** (`russh` to a remote host, the default and only cross-platform variant) and, on Windows, **WSL** (`wsl.exe -d <distro>` to a local Linux distro). Both satisfy one operation contract the daemon lifecycle needs — `exec_capture`, `upload_executable`, `open_daemon_channel`, `is_closed` — so everything above the seam (daemon provisioning, the reconnect engine, the terminal/explorer/git/LSP layers) is transport-agnostic. This is distinct from `RIFT_REMOTE_EXEC_WRAPPER`, which nests one hop deeper *over* an SSH transport rather than being a transport of its own. Elsewhere in this document "SSH" names the default transport; a WSL connection substitutes for it at the same seam.
 
 Current state (Phase 2): single-window terminal connected via SSH using tmux control mode (`-CC`). Event-driven notification processing, flow control, active pane tracking. The daemon architecture is designed but deferred to Phase 3+.
 
@@ -180,7 +182,9 @@ Editing uses a deliberate request/response buffer channel over the daemon transp
 > 2026-07-09) — the current-session watch also driving the daemon's watched root
 > (marked below) —, and by `spec-session-lifecycle.md` (phase 40, 2026-07-10) — the
 > mid-session sessionless state and the session-end-vs-transport-loss distinction
-> (marked below).
+> (marked below) —, and by `spec-project-optional-session.md` (phase 47,
+> 2026-07-13) — root-optional post-connect routing, the never-dead-end picker, and
+> the mid-session set-root affordance (marked below).
 
 - **Protocol versioning:** `PROTOCOL_VERSION` (crates/protocol) reflects the
   message set — every message-set change bumps it, enforced by a pinned
@@ -220,6 +224,23 @@ Editing uses a deliberate request/response buffer channel over the daemon transp
   exactly like a switch. **Only a real SSH/transport loss routes to the reconnect
   loop and then the Connection screen** — a session end never does
   (`spec-session-lifecycle.md`).
+- _(Phase 47)_ **A project root is optional and the connect→usable path never
+  dead-ends.** Connecting with ≥1 session **auto-attaches** a live session (the
+  recents `preferred`, else the app display-order head — `session_order`, no
+  session-activity/protocol data) straight into the cockpit —
+  the post-connect picker becomes on-demand, revising the phase-33 "a fresh
+  Connect always shows the picker". A session may be **created with no project
+  root** (name-only → `Attach { root: None }`, watched at `session_path`), and a
+  root-less session's **root is set later** from the cockpit's explorer
+  empty-state by re-`Attach`ing the same session with a root (the phase-35
+  re-root). The root picker is **always escapable** (a persistent Back /
+  Disconnect and "Start without a project root"), and a **stale or absent seeded
+  root is a non-event** — the picker opens at the home default like a fresh pick,
+  with no notice and no error state. The phase-40 mid-session routing policy
+  (always-picker, root-mandatory-on-zero) is superseded: killing the active
+  session **auto-switches** to the display-order head of the remaining sessions
+  (0 remaining → the escapable create picker), retaining its connected-sessionless
+  substrate (`spec-project-optional-session.md`).
 - _(Phase 35)_ **The current-session watch also drives the daemon's watched root.**
   A session's project root is coupled to the tmux session via a session-scoped
   `@root` user option (stamped by the daemon at `new-session`, resolved daemon-side

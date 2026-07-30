@@ -272,3 +272,12 @@ natural home for the seed-fallback so both inherit it.
   host retention; the fallback's reachability depends on the daemon echoing the
   concrete errored path; the lookup helper keys on the lib-visible identity, not
   the binary's `RecentTarget`.
+- 2026-07-11: Implementation of Issue A (#872, PR #882). The seed-fallback guard
+  ships as `current_path.is_empty() && !seed_fallback_attempted` — the spec's
+  additional "errored path non-empty" clause was dropped as **redundant**: the
+  daemon resolves `""` → `home_dir()` (with a `/` fallback), so a browse-error
+  reply never echoes an empty path, and `current_path.is_empty()` plus the
+  once-flag already bound the fallback to a single retry. Confirmed by
+  adversarial review against `crates/daemon/src/browse.rs`. No behavioral
+  difference from the spec; recorded so a spec-vs-code diff is not mistaken for a
+  gap.

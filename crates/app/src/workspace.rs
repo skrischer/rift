@@ -90,8 +90,9 @@ use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::outline_panel::{OutlinePanel, OutlinePanelEvent};
 use crate::problems_panel::{ProblemsPanel, ProblemsPanelEvent};
 use crate::quick_open::{OpenQuickOpen, QuickOpen};
+use crate::recents::{self, RecentTarget};
 use crate::results_panel::{ResultsPanel, ResultsPanelEvent};
-use crate::root_picker::{self, RootPicker, RootPickerEvent};
+use crate::root_picker::{self, RootPicker, RootPickerEvent, RootPickerPurpose};
 use crate::settings::{OpenSettings, SettingsView};
 use crate::source_control::{SourceControlEvent, SourceControlPanel};
 use crate::status_bar;
@@ -586,6 +587,15 @@ pub struct WorkspaceView {
     /// (`window_state::state_path`'s failure mode) — capture then silently
     /// no-ops rather than crashing, matching the store's own contract.
     window_state_path: Option<PathBuf>,
+    /// The recents file + current connection identity (issue #873,
+    /// `docs/spec-host-scoped-root-recents.md`), for the in-cockpit "+ New
+    /// session..." root picker's host-scoped seed/record — the same pair
+    /// `main.rs`'s `Shell` threads through `RootPickerLaunch.recents`. `None`
+    /// when either half is unavailable (no recents-file path resolved, or no
+    /// connection identity given — every non-test `WorkspaceView::new` call
+    /// site supplies both): the picker then seeds `""` and a pick simply
+    /// records nothing, exactly like a `main.rs` launch with no recents path.
+    recents: Option<(PathBuf, RecentTarget)>,
     /// Monotonic generation fencing the debounced window-state save timer
     /// (mirrors `EditorView::arm_buffer_feed`'s `buffer_generation`): each
     /// arm bumps it, so an in-flight timer from an earlier move/resize sees
@@ -634,10 +644,19 @@ impl WorkspaceView {
     /// terminal, created in `main.rs` so it keeps owning the SSH/daemon session
     /// thread). Creates the explorer and editor, mounts all three, and starts the
     /// daemon-stream bridges.
+    ///
+    /// `recents_path`/`recent_target` (issue #873, `docs/spec-host-scoped-
+    /// root-recents.md`) give the in-cockpit "+ New session..." root picker
+    /// the same host-scoped recents store `main.rs`'s pre-cockpit picker
+    /// uses; both are `None` in the existing test call sites, which seeds
+    /// `""` and makes a pick's root-record a no-op, exactly like a `main.rs`
+    /// launch with no recents path.
     pub fn new(
         session_view: Entity<SessionView>,
         channels: WorkspaceChannels,
         window_state_path: Option<PathBuf>,
+        recents_path: Option<PathBuf>,
+        recent_target: Option<RecentTarget>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -735,6 +754,9 @@ impl WorkspaceView {
                         {
                             debug!(error = %e, %path, "failed to enqueue delete");
                         }
+                    }
+                    FileTreeEvent::SetRootRequested => {
+                        this.open_set_root_picker(window, cx);
                     }
                 },
             )
@@ -1477,6 +1499,7 @@ impl WorkspaceView {
             command_palette,
             quick_open,
             window_state_path,
+            recents: recents_path.zip(recent_target),
             window_state_save_generation: 0,
             settings_view,
             dir_browse_tx,
@@ -2064,22 +2087,24 @@ impl WorkspaceView {
     /// [`SessionViewEvent::NewSessionRequested`]. A fresh [`RootPicker`]
     /// entity is built on every open (never reused, mirroring `main.rs`'s
     /// `Shell`), so its correlation guard always starts clean; its start
-    /// level seeds from the phase-9 recents-of-roots store. On `Picked`, the
-    /// name is disambiguated against `session_view`'s live list before
+    /// level seeds from the current connection target's own recorded roots
+    /// (`self.recents`, issue #873, `docs/spec-host-scoped-root-recents.md`),
+    /// never a different host's. On `Picked`, the name is disambiguated
+    /// against `session_view`'s live list before
     /// [`SessionView::create_session_at_root`] sends the create — the
     /// single create-with-root transport this and the pre-cockpit picker
     /// both use.
     fn open_root_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let recent_roots = self
-            .window_state_path
-            .as_deref()
-            .map(|path| window_state::load(path).recent_roots)
+            .recents
+            .as_ref()
+            .map(|(path, target)| recents::target_recent_roots(path, target))
             .unwrap_or_default();
         let start = root_picker::start_path(&recent_roots);
         let picker = cx.new(|cx| RootPicker::new(window, cx));
 
         let dir_browse_tx = self.dir_browse_tx.clone();
-        let window_state_path = self.window_state_path.clone();
+        let recents = self.recents.clone();
         let session_view = self.session_view.clone();
         let subscription = cx.subscribe_in(
             &picker,
@@ -2104,6 +2129,15 @@ impl WorkspaceView {
                     }
                 }
                 RootPickerEvent::Picked { root, name } => {
+                    // This dialog never sets `allow_rootless` (issue #887,
+                    // `docs/spec-project-optional-session.md`) —
+                    // `SessionView::create_session_at_root` (`crates/terminal`)
+                    // has no root-less create transport of its own yet, so
+                    // `root` is always `Some` here in practice; handled
+                    // defensively rather than assumed.
+                    let Some(root) = root else {
+                        return;
+                    };
                     let existing: Vec<String> = session_view
                         .read(cx)
                         .sessions()
@@ -2111,8 +2145,8 @@ impl WorkspaceView {
                         .map(|session| session.name.clone())
                         .collect();
                     let session_name = root_picker::disambiguate_session_name(name, &existing);
-                    if let Some(path) = &window_state_path {
-                        if let Err(e) = window_state::record_recent_root(path, root) {
+                    if let Some((path, target)) = &recents {
+                        if let Err(e) = recents::merge_recent_root(path, target, root) {
                             warn!(%e, "failed to record recent root");
                         }
                     }
@@ -2139,6 +2173,102 @@ impl WorkspaceView {
         window.open_dialog(cx, move |dialog, _window, _cx| {
             dialog
                 .title("New session")
+                .w(px(ROOT_PICKER_DIALOG_WIDTH))
+                .child(picker.clone())
+        });
+    }
+
+    /// The root-less explorer empty-state's "Set project root" action
+    /// (`docs/spec-project-optional-session.md`, issue #891), routed here
+    /// from [`FileTreeEvent::SetRootRequested`]. Mirrors
+    /// [`Self::open_root_picker`] — same fresh [`RootPicker`], same
+    /// recents-seeded start level, same `dir_browse_tx`/reply-routing wiring
+    /// (`self.root_picker_session` is the one field either flow uses; only
+    /// one is ever open at a time) — except the picker opens in
+    /// [`RootPickerPurpose::SetRoot`] (no name field, nothing is created)
+    /// and, on [`RootPickerEvent::Picked`], re-`Attach`es the CURRENTLY
+    /// attached session ([`SessionView::session_name`]) with the picked
+    /// root instead of disambiguating and creating a new one:
+    /// [`SessionView::create_session_at_root`] sends the same
+    /// `SessionSwitchRequest { root: Some(root), .. }` transport, and
+    /// naming it after the CURRENT session turns the resulting `Attach`
+    /// into the phase-35 re-root of THIS session, not a create.
+    fn open_set_root_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let recent_roots = self
+            .recents
+            .as_ref()
+            .map(|(path, target)| recents::target_recent_roots(path, target))
+            .unwrap_or_default();
+        let start = root_picker::start_path(&recent_roots);
+        let picker = cx.new(|cx| RootPicker::new(window, cx));
+        picker.update(cx, |picker, _cx| {
+            picker.set_purpose(RootPickerPurpose::SetRoot);
+        });
+
+        let dir_browse_tx = self.dir_browse_tx.clone();
+        let recents = self.recents.clone();
+        let session_view = self.session_view.clone();
+        let subscription = cx.subscribe_in(
+            &picker,
+            window,
+            move |this, _picker, event: &RootPickerEvent, window, cx| match event {
+                RootPickerEvent::Browse(path) => {
+                    let _ = dir_browse_tx
+                        .try_send(ClientMessage::QueryDirEntries { path: path.clone() });
+                    if let Some(session) = this.root_picker_session.as_mut() {
+                        session.pending_browse = Some(path.clone());
+                    }
+                }
+                RootPickerEvent::Clone { url, parent, name } => {
+                    let target = root_picker::join_child(parent, name);
+                    let _ = dir_browse_tx.try_send(ClientMessage::CloneRepo {
+                        url: url.clone(),
+                        parent: parent.clone(),
+                        name: name.clone(),
+                    });
+                    if let Some(session) = this.root_picker_session.as_mut() {
+                        session.pending_clone = Some(target);
+                    }
+                }
+                RootPickerEvent::Picked { root, .. } => {
+                    // This dialog never sets `allow_rootless` (issue #887) —
+                    // `root` is always `Some` here in practice; handled
+                    // defensively rather than assumed, mirroring
+                    // `open_root_picker`. The picked NAME is never used here
+                    // either way — the whole point of this flow is re-rooting
+                    // the ALREADY-attached session, never renaming/creating.
+                    let Some(root) = root else {
+                        return;
+                    };
+                    let session_name = session_view.read(cx).session_name().to_owned();
+                    if let Some((path, target)) = &recents {
+                        if let Err(e) = recents::merge_recent_root(path, target, root) {
+                            warn!(%e, "failed to record recent root");
+                        }
+                    }
+                    session_view.update(cx, |session, cx| {
+                        session.create_session_at_root(session_name, root.clone(), cx);
+                    });
+                    this.root_picker_session = None;
+                    window.close_dialog(cx);
+                }
+            },
+        );
+
+        // Set BEFORE the first browse below, mirroring `open_root_picker`:
+        // the `Browse` handler above needs `root_picker_session` to already
+        // exist by the time that emit is observed.
+        self.root_picker_session = Some(RootPickerSession {
+            picker: picker.clone(),
+            pending_browse: Some(start.clone()),
+            pending_clone: None,
+            _subscription: subscription,
+        });
+        picker.update(cx, |picker, cx| picker.browse(start, cx));
+
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            dialog
+                .title("Set project root")
                 .w(px(ROOT_PICKER_DIALOG_WIDTH))
                 .child(picker.clone())
         });
@@ -2442,6 +2572,18 @@ impl Render for WorkspaceView {
                 session_strip,
             )
         };
+
+        // Explorer root-less empty-state (issue #891): re-derived every
+        // render from the live session list and pushed into `FileTree`,
+        // whose own model has no notion of "session" — a root-less session
+        // never gets a `WorktreeSnapshot`, so `model.root().is_none()` alone
+        // cannot tell it apart from a rooted session still loading its
+        // first one. The setter's equality guard keeps repeated pushes free.
+        let session_root_less = self.session_view.read(cx).active_session_is_root_less();
+        self.file_tree.update(cx, |tree, cx| {
+            tree.set_session_root_less(session_root_less, cx);
+        });
+
         let settings_button = Button::new("title-bar-settings")
             .ghost()
             .xsmall()
@@ -2650,6 +2792,7 @@ mod tests {
     use super::*;
     use gpui::{Axis, TestAppContext};
     use gpui_component::dock::{DockPlacement, Panel, PanelControl};
+    use rift_terminal::TerminalHandle;
 
     // --- window-state restore decision (#225) --------------------------------
     // Headless: `initial_window_bounds` and the types it returns
@@ -3109,10 +3252,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap();
@@ -3198,10 +3340,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -3256,10 +3397,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -3354,10 +3494,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap();
@@ -3440,8 +3579,9 @@ mod tests {
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
                 session_view = Some(view.clone());
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -3485,10 +3625,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -3578,10 +3717,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -3649,10 +3787,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -3713,10 +3850,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -3774,8 +3910,9 @@ mod tests {
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
                 session_view = Some(view.clone());
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -3830,8 +3967,9 @@ mod tests {
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
                 session_view = Some(view.clone());
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -3924,10 +4062,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4013,10 +4150,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4098,10 +4234,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4169,10 +4304,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4223,10 +4357,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4294,8 +4427,9 @@ mod tests {
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
                 session_view = Some(view.clone());
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4332,8 +4466,9 @@ mod tests {
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
                 session_view = Some(view.clone());
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4394,8 +4529,9 @@ mod tests {
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
                 session_view = Some(view.clone());
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4451,8 +4587,9 @@ mod tests {
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
                 session_view = Some(view.clone());
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4509,8 +4646,9 @@ mod tests {
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
                 session_view = Some(view.clone());
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4567,8 +4705,9 @@ mod tests {
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
                 session_view = Some(view.clone());
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4594,6 +4733,90 @@ mod tests {
         .unwrap();
     }
 
+    /// Issue #891, `docs/spec-project-optional-session.md`: the explorer
+    /// root-less empty-state's `FileTreeEvent::SetRootRequested` (mirroring
+    /// `NewSessionRequested` above) opens the picker as a `Root` dialog; and
+    /// unlike `open_root_picker`'s create flow (a disambiguated NEW name),
+    /// `Picked` re-`Attach`es the CURRENTLY attached session, never the
+    /// picker's own typed name — a fresh `SessionView` starts at an empty
+    /// session name, so the switch request's `session` coming back empty
+    /// proves the typed name was ignored.
+    #[gpui::test]
+    fn test_set_root_requested_opens_the_picker_and_picked_re_attaches_the_current_session(
+        cx: &mut TestAppContext,
+    ) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let mut handle: Option<TerminalHandle> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let view = cx.new(|cx| {
+                    let (view, h) = SessionView::new(cx);
+                    handle = Some(h);
+                    view
+                });
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+        let handle = handle.expect("terminal handle constructed inside the window callback");
+
+        cx.update_window(window.into(), |_, _window, cx| {
+            assert!(workspace.read(cx).root_picker_session.is_none());
+            let file_tree = workspace.read(cx).file_tree.clone();
+            file_tree.update(cx, |_tree, cx| {
+                cx.emit(FileTreeEvent::SetRootRequested);
+            });
+        })
+        .unwrap();
+
+        let picker = cx
+            .update_window(window.into(), |_, window, cx| {
+                assert!(
+                    window.has_active_dialog(cx),
+                    "SetRootRequested opens a Root dialog"
+                );
+                workspace
+                    .read(cx)
+                    .root_picker_session
+                    .as_ref()
+                    .unwrap()
+                    .picker
+                    .clone()
+            })
+            .unwrap();
+
+        cx.update_window(window.into(), |_, _window, cx| {
+            picker.update(cx, |_picker, cx| {
+                cx.emit(RootPickerEvent::Picked {
+                    root: Some("/home/dev/rift".to_string()),
+                    name: "some-typed-name".to_string(),
+                });
+            });
+        })
+        .unwrap();
+
+        let request = handle
+            .session_switch_rx
+            .try_recv()
+            .expect("Picked sends a session switch request");
+        assert_eq!(
+            request.session, "",
+            "re-roots the CURRENT session (empty here, no attach yet), not the picker's typed name"
+        );
+        assert_eq!(request.root, Some("/home/dev/rift".to_string()));
+        cx.update(|cx| {
+            assert!(
+                workspace.read(cx).root_picker_session.is_none(),
+                "Picked closes the picker"
+            );
+        });
+    }
+
     /// [`WorkspaceView::apply_dir_entries_reply`]'s correlation guard (issue
     /// #769, `docs/spec-session-root-picker.md`): a reply whose path does
     /// not match the outstanding browse is dropped without clearing
@@ -4609,8 +4832,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4750,8 +4974,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(view, test_channels(), None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4844,10 +5069,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| {
-                        WorkspaceView::new(session_view, test_channels(), None, window, cx)
-                    }));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
@@ -4950,8 +5174,9 @@ mod tests {
             gpui_component::init(cx);
             cx.open_window(Default::default(), |window, cx| {
                 let session_view = cx.new(|cx| SessionView::new(cx).0);
-                workspace =
-                    Some(cx.new(|cx| WorkspaceView::new(session_view, channels, None, window, cx)));
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, channels, None, None, None, window, cx)
+                }));
                 cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
             })
             .unwrap()
