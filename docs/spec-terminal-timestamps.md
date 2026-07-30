@@ -22,7 +22,7 @@ on demand, agent-agnostic (no output parsing). Roadmap Phase 50.
 - Lockstep eviction: drop timestamp entries for lines alacritty silently evicted, inferred from the same counter / `history_size` diff, bounded to the alacritty history limit.
 - The chosen on-demand surface (gate decision) — one of: a per-line hover reveal (reusing `pixel_to_grid` `:887` + `on_mouse_move` `:1817` hover hit-testing), a toggleable timestamp gutter column (iTerm2-style, always-on when enabled), or idle-markers at output-pause boundaries — plus the row→line lookup helper it needs.
 - Alt-screen gating (`term.mode().contains(TermMode::ALT_SCREEN)`, `pane_view.rs:715`) so timestamps never show over a full-screen TUI; the primary-scrollback map persists across alt-screen toggles.
-- Share the composite-scroll row→line mapping with the Phase-49 scrollback scrollbar (both read the same composite offset); factor a small shared helper rather than duplicating the mapping.
+- Build the composite-scroll row→line inversion inline for v1. The Phase-49 scrollback scrollbar reads the same composite offset, so a shared helper is the eventual home — but factor it out only when that second consumer actually lands (Phase 49's issues are unmerged), not speculatively now (constitution: no premature abstraction, extract at 2+ implementations).
 
 ### Out of scope
 
@@ -37,7 +37,7 @@ on demand, agent-agnostic (no output parsing). Roadmap Phase 50.
 
 - **The stamping boundary is the client PTY read loop, per pane** (`pane_view.rs:329`/`:347`) — this is rift's differentiator: it sits at the `%output`-per-pane seam, where iTerm2-under-tmux cannot. Stamp at batch receive.
 - **No per-line metadata channel exists.** `CellRenderInfo` (the render unit, `pane_view.rs:1374`) has no timestamp field and is owned by the external `termy_terminal_ui` crate — timestamps must live in a parallel rift-owned per-pane structure keyed by the synthetic line id, never attached to a cell. Do NOT reuse the OSC-133 `CommandLifecycle` channel (`:251`) — that is shell-integration-driven and would couple to output semantics.
-- **alacritty gives no line-produced or eviction event.** The `EventListener` surfaces only `ClipboardStore` / `Bell` (`handle_term_event`, `:975-986`). Line identity and eviction must be inferred from `history_size()` / cursor-line diffs across each `advance` — the single hardest problem, proven by a spike before the surface is built.
+- **alacritty gives no line-produced or eviction event.** The `EventListener` surfaces only `ClipboardStore` / `Bell` (`handle_term_event`, `:975-986`). (`Term::damage()` / `TermDamage` is viewport render-diffing — it resets per frame and carries no stable scrollback identity or eviction signal, so it is not a usable anchor either.) Line identity and eviction must be inferred from `history_size()` / cursor-line diffs across each `advance` — the single hardest problem, proven by a spike before the surface is built.
 - **Line addressing is viewport-relative** (`Line(row - display_offset)`); a given text's address shifts as new lines scroll in. The synthetic monotonic id is the only stable anchor; it is inverted to a viewport row at render time via the composite mapping.
 - **Stamp policy:** a line is stamped with the arrival time of the batch during whose `advance` the line was completed (a line straddling two batches takes the completing batch's time). Bounded, deterministic; documented so hover/gutter reads are consistent.
 - Agent-agnostic, client-only: no daemon, protocol, or `crates/protocol` change — the byte-arrival signal is already client-side. No new dependency (wall-clock via the existing time facility).
@@ -60,7 +60,7 @@ on demand, agent-agnostic (no output parsing). Roadmap Phase 50.
 | v1 stamps pure client-arrival time; the tmux `%extended-output <age>` lag-correction is deferred | Simplicity; age-correction is an accuracy refinement, not core; the token is already parsed so a later phase can add it | 2026-07-30 |
 | Stamp a line with the arrival time of the batch that completed it (straddle → completing batch) | Deterministic, bounded, one clear policy for consistent hover/gutter reads | 2026-07-30 |
 | Client-only; no protocol / daemon change | Byte-arrival is already a client signal; the constitution admits PTY-byte timing as agent-agnostic | 2026-07-30 |
-| Share the composite row→line mapping with the Phase-49 scrollbar via a small helper | Both features invert the same composite-scroll offset; avoid duplicating the mapping | 2026-07-30 |
+| Build the composite row→line inversion inline for v1; factor a shared helper only when the Phase-49 scrollbar lands as the second consumer | Phase 49's issues are unmerged; a shared helper now would be single-use (constitution: extract at 2+ implementations) | 2026-07-30 |
 | **OPEN — resolved at the spec-acceptance gate:** the on-demand surface — per-line hover reveal vs. a toggleable iTerm2-style gutter column vs. idle-markers at output-pause boundaries (the QA session leaned "idle-marker + hover") | A UX call the constitution/prior-art does not settle; the backend (line-id + stamping) is shared across all three, so the surface is the only open variable | 2026-07-30 |
 
 ## Tracking
