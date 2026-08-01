@@ -206,3 +206,12 @@ includes:
   highlight to invisibility, caught by a CI test failure
   (`test_editor_surface_background_is_a_subtle_step_lighter_than_base`) before merge.
   `secondary` differs from `accent`, so the highlight stays visible.
+- 2026-08-01: **Explorer row font too large / not adjustable** resolved (#908). Category 2
+  (defect in an existing path — no explorer-specific font-size setting exists yet; the
+  terminal "Font size" slider does not reach the tree, and that global control is the
+  seeded roadmap Phase 54, out of scope here). `ROW_HEIGHT` 28px -> 24px and the ambient
+  `text_sm` (14px) row label replaced by a new named `ROW_TEXT_SIZE` constant at 12px, a
+  denser default matching typical IDE explorers. Root row (`ROOT_ROW_TEXT_SIZE`) and
+  header (`HEADER_TEXT_SIZE`) nudged down in step, 12px -> 11px and 11px -> 10px, keeping
+  the same ascending header < root < row order the shipped 11/12/14 triple had. Both
+  density-lock tests in `crates/app/src/file_tree.rs` updated to the new values.
