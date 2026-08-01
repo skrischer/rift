@@ -102,9 +102,7 @@ pub struct SessionListItem {
 /// re-asserted by the bridge task strictly after the `Attach` so the fresh
 /// control child reflows to the live viewport instead of the tmux default —
 /// the render side cannot re-send it itself, its resize channel only fires on
-/// a size *change*. Inert on the legacy tmux path (`RIFT_TERMINAL_LEGACY`):
-/// the receiver drops there, so a switch request goes nowhere (the legacy
-/// path is slated for removal, #285).
+/// a size *change*.
 /// `root` carries the create-with-root transport
 /// (`docs/spec-session-root-picker.md`, issue #769): `Some(picked)` when this
 /// switch is really a root-picker create (`SessionView::create_session_at_root`),
@@ -137,17 +135,6 @@ pub enum SessionOrderUpdate {
     /// Rename the order-store's key for a session (`old` -> `new`) so its
     /// slot survives an in-UI rename.
     Rename { old: String, new: String },
-}
-
-/// A tmux format-subscription update (`%subscription-changed`). `name` is the
-/// subscription registered via [`termy_terminal_ui::TmuxClient::subscribe`];
-/// `pane` is `-` for window- or session-scoped subscriptions.
-pub struct SubscriptionUpdate {
-    pub name: String,
-    pub session: String,
-    pub window: String,
-    pub pane: String,
-    pub value: String,
 }
 
 /// The SSH/tmux session lifecycle state, surfaced by the statusbar connection
