@@ -336,3 +336,11 @@ under the milestone. This spec owns the design; the issues own progress.
   polish (popover anchor/positioning, hover-state text color while the segment
   recolors for pressure) is left to the milestone visual-QA gate per the spec's
   "Design phase not enabled" constraint.
+- 2026-08-01 (#881 review finding, addressed): the vendored `Popover` fires
+  `on_open_change(false)` twice for a trigger-button close (content
+  capture-phase dismiss, then the trigger's own bubble-phase toggle), so
+  `status_bar.rs` emits an unbalanced `{true}, {false}, {false}` per toggle
+  cycle against the daemon's counted opt-in. Fixed app-locally in
+  `spawn_pane_metrics_bridge`: a pure `should_forward(last, next)` helper
+  dedups consecutive same-`enabled` sends before they reach the protocol,
+  restoring a balanced stream without touching the popover/status_bar code.

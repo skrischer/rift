@@ -3364,6 +3364,20 @@ fn spawn_file_op_bridge(
     });
 }
 
+/// Decides whether the next `enabled` value should be forwarded to the
+/// daemon, given the last value actually forwarded (`None` before the first
+/// send). Consecutive duplicates are suppressed and `*last` is updated only
+/// when the value is forwarded, so a caller folding a stream through this
+/// always sees a balanced `true`/`false` sequence out the other end — see
+/// [`spawn_pane_metrics_bridge`].
+fn should_forward(last: &mut Option<bool>, next: bool) -> bool {
+    if *last == Some(next) {
+        return false;
+    }
+    *last = Some(next);
+    true
+}
+
 /// Forward the breakdown popover's open/close toggle onto the protocol as
 /// [`rift_protocol::ClientMessage::SetPaneMetricsEnabled`]
 /// (`docs/spec-pane-attribution.md`, #881) — the same shape as
@@ -3371,12 +3385,28 @@ fn spawn_file_op_bridge(
 /// returns via [`consume_daemon_messages`] on `editor.pane_metrics_tx`, not
 /// as a routed reply to this message. Ends when the render-side channel
 /// closes.
+///
+/// The vendored `Popover` fires `on_open_change(false)` twice for a single
+/// trigger-button close (content capture-phase dismiss, then the trigger's
+/// own bubble-phase toggle), so `status_bar.rs` sends an unbalanced
+/// `{true}, {false}, {false}` per toggle cycle. The daemon's opt-in is a
+/// counter (inc on `true` / dec on `false`), so this bridge dedups
+/// consecutive same-value sends ([`should_forward`]) before they reach the
+/// protocol, collapsing the pair into a single `{false}` and restoring a
+/// balanced stream.
 fn spawn_pane_metrics_bridge(
     client_rx: DaemonClientWatch,
     pane_metrics_enabled_rx: flume::Receiver<rift_protocol::ClientMessage>,
 ) {
     tokio::spawn(async move {
+        let mut last_forwarded: Option<bool> = None;
         while let Ok(msg) = pane_metrics_enabled_rx.recv_async().await {
+            let rift_protocol::ClientMessage::SetPaneMetricsEnabled { enabled } = &msg else {
+                continue;
+            };
+            if !should_forward(&mut last_forwarded, *enabled) {
+                continue;
+            }
             debug!(?msg, "sending pane-metrics enabled toggle");
             let client = client_rx.borrow().clone();
             let _ = client.send(msg).await;
@@ -3877,10 +3907,28 @@ mod tests {
     use super::{
         drain_render_backlog, is_retryable_session_error, layout_to_snapshot,
         resolve_attach_session, resolve_auto_attach_target, resolve_preferred_session,
-        route_picker, session_is_unset, CaptureRequest, EditorChannels, EngineWatches, PaneInput,
-        PickedSession, PickerChannels, PickerRoute, PtyChannels, SessionListItem,
-        SessionSwitchRequest, TermSize,
+        route_picker, session_is_unset, should_forward, CaptureRequest, EditorChannels,
+        EngineWatches, PaneInput, PickedSession, PickerChannels, PickerRoute, PtyChannels,
+        SessionListItem, SessionSwitchRequest, TermSize,
     };
+
+    // The vendored `Popover`'s double `on_open_change(false)` per
+    // trigger-button close (see `spawn_pane_metrics_bridge`'s doc comment)
+    // makes a single toggle cycle emit `[true, false, false]` instead of
+    // `[true, false]`. `should_forward` must collapse the duplicate close
+    // and also guard an accidental repeat open, so the daemon always sees a
+    // balanced enable/disable stream.
+    #[test]
+    fn test_should_forward_consecutive_duplicates_are_suppressed() {
+        let mut last = None;
+        let input = [true, false, false, true, true, false];
+        let forwarded: Vec<bool> = input
+            .into_iter()
+            .filter(|&next| should_forward(&mut last, next))
+            .collect();
+
+        assert_eq!(forwarded, vec![true, false, true, false]);
+    }
 
     #[test]
     fn test_session_is_unset_empty_string_is_unset() {
