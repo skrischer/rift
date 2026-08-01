@@ -21,11 +21,13 @@ pub const PROTOCOL_VERSION: u32 = 15;
 /// `fingerprint_tests` module: an FNV-1a hash over the serde-visible surface
 /// of [`ClientMessage`] and [`DaemonMessage`] — container serde attributes,
 /// variant names, field names, and field types, with comments and whitespace
-/// ignored. When the message set changes deliberately, bump
-/// [`PROTOCOL_VERSION`] above and re-pin this value (the failing test prints
-/// the new fingerprint).
+/// ignored — plus the surface of every wire-reachable leaf enum referenced
+/// only as a field type (e.g. `Option<CloneError>`), so a variant added to
+/// one of those trips this too, not just the two top-level enums. When the
+/// message set changes deliberately, bump [`PROTOCOL_VERSION`] above and
+/// re-pin this value (the failing test prints the new fingerprint).
 #[cfg(test)]
-const PROTOCOL_FINGERPRINT: u64 = 0xaa93_6d0f_44a0_c16a;
+const PROTOCOL_FINGERPRINT: u64 = 0x6591_c829_77d9_5ee8;
 
 /// Messages the client sends to the daemon.
 ///
@@ -4420,8 +4422,13 @@ mod tests {
 /// Pins the protocol message set: a stable FNV-1a hash over the serde-visible
 /// surface of `ClientMessage` and `DaemonMessage` (container serde attributes,
 /// variant names, field names, field TYPES — so a wire-breaking type change
-/// also trips it), extracted from this crate's own source with comments and
-/// whitespace stripped. Changing either enum without re-pinning fails
+/// also trips it), plus the surface of every enum in [`REACHABLE_LEAF_ENUMS`]
+/// — enums such as `CloneError`/`DirBrowseError`/`FileOpError` that are
+/// referenced only as a field type (e.g. `Option<CloneError>`), so their own
+/// variant names never appear in `ClientMessage`/`DaemonMessage`'s own text
+/// and a variant added to one would otherwise be invisible to this
+/// fingerprint. All extracted from this crate's own source with comments and
+/// whitespace stripped. Changing any covered enum without re-pinning fails
 /// `cargo test -p rift-protocol`; the failure message instructs to bump
 /// `PROTOCOL_VERSION` and re-pin (`docs/protocol.md` — Versioning policy).
 #[cfg(test)]
@@ -4453,7 +4460,24 @@ mod fingerprint_tests {
     fn enum_surface(source: &str, name: &str) -> Option<String> {
         let stripped = strip_line_comments(source);
         let decl = format!("pub enum {name}");
-        let start = stripped.find(&decl)?;
+
+        // A plain substring search would match `pub enum FileOp` inside the
+        // unrelated, longer declaration `pub enum FileOpError` (`FileOp` is a
+        // prefix of `FileOpError`). Require the character right after `decl`
+        // to not continue an identifier, skipping past any such false match.
+        let mut search_from = 0usize;
+        let start = loop {
+            let found = search_from + stripped[search_from..].find(&decl)?;
+            let after = found + decl.len();
+            let is_boundary = stripped[after..]
+                .chars()
+                .next()
+                .is_none_or(|ch| ch != '_' && !ch.is_alphanumeric());
+            if is_boundary {
+                break found;
+            }
+            search_from = found + decl.len();
+        };
 
         let body_open = start + stripped[start..].find('{')?;
         let mut depth = 0usize;
@@ -4512,12 +4536,45 @@ mod fingerprint_tests {
         hash
     }
 
-    /// The message-set fingerprint: FNV-1a over both message enums' surfaces,
+    /// Every enum reachable from a [`ClientMessage`]/[`DaemonMessage`] field —
+    /// directly (e.g. `DirEntriesReply::error: Option<DirBrowseError>`) or
+    /// transitively through a struct field (e.g. `WorktreeEntry::kind:
+    /// EntryKind`) — that is NOT itself one of the two top-level message
+    /// enums. Each is a closed, `#[serde(rename_all = "snake_case")]`-style
+    /// (or `kind`-tagged) leaf enum whose variant names never appear in
+    /// `ClientMessage`'s or `DaemonMessage`'s own text, so adding a variant
+    /// to one is invisible unless its surface is extracted separately here.
+    ///
+    /// [`ClientMessage`]: super::ClientMessage
+    /// [`DaemonMessage`]: super::DaemonMessage
+    const REACHABLE_LEAF_ENUMS: &[&str] = &[
+        "DirBrowseError",
+        "CloneError",
+        "EntryKind",
+        "GitStatusCode",
+        "DiagnosticSeverity",
+        "LspServerState",
+        "BufferErrorReason",
+        "FileOpError",
+        "SymbolKind",
+        "FileDiffPayload",
+        "DiffLineKind",
+        "GitWriteOp",
+        "FileOp",
+    ];
+
+    /// The message-set fingerprint: FNV-1a over `ClientMessage`,
+    /// `DaemonMessage`, and every [`REACHABLE_LEAF_ENUMS`] surface, each
     /// separated so content cannot shift between them without a hash change.
     fn message_set_fingerprint(source: &str) -> Option<u64> {
-        let client = enum_surface(source, "ClientMessage")?;
-        let daemon = enum_surface(source, "DaemonMessage")?;
-        Some(fnv1a_64(format!("{client}|{daemon}").as_bytes()))
+        let mut combined = enum_surface(source, "ClientMessage")?;
+        combined.push('|');
+        combined.push_str(&enum_surface(source, "DaemonMessage")?);
+        for name in REACHABLE_LEAF_ENUMS {
+            combined.push('|');
+            combined.push_str(&enum_surface(source, name)?);
+        }
+        Some(fnv1a_64(combined.as_bytes()))
     }
 
     /// A sample enum shaped like the real message enums, for the trip-wire
@@ -4661,5 +4718,65 @@ pub enum Sample {
         );
         // A declaration with no body brace at all.
         assert_eq!(enum_surface("pub enum Broken", "Broken"), None);
+    }
+
+    #[test]
+    fn test_enum_surface_prefix_name_does_not_match_longer_enum() {
+        // `FileOp` is a textual prefix of `FileOpError` (`crates/protocol`
+        // has both, real precedent for this collision): a naive substring
+        // search for `pub enum FileOp` would match inside `pub enum
+        // FileOpError`'s declaration instead. Reproduced with a small
+        // synthetic source so the assertion does not depend on the real
+        // enums' current field lists.
+        let source = r#"
+pub enum FooError {
+    Bar,
+}
+
+pub enum Foo {
+    Baz,
+}
+"#;
+        let foo = enum_surface(source, "Foo").expect("extract Foo");
+        assert!(foo.contains("Baz"), "surface was {foo:?}");
+        assert!(!foo.contains("Bar"), "surface was {foo:?}");
+
+        let foo_error = enum_surface(source, "FooError").expect("extract FooError");
+        assert!(foo_error.contains("Bar"), "surface was {foo_error:?}");
+    }
+
+    #[test]
+    fn test_message_set_fingerprint_leaf_enum_variant_addition_changes_fingerprint() {
+        // CloneError is referenced in DaemonMessage only as a field type
+        // (`Option<CloneError>`) -- its own variant names never appear in
+        // DaemonMessage's text. Before widening `message_set_fingerprint` to
+        // cover REACHABLE_LEAF_ENUMS, adding a variant here left the
+        // fingerprint unchanged (the exact latent hole issue #844 reports).
+        // `Other,` (with this exact indentation) appears exactly once in the
+        // crate source, as CloneError's last variant.
+        assert_eq!(
+            PROTOCOL_SOURCE.matches("    Other,\n}").count(),
+            1,
+            "test anchor must be unique in the crate source"
+        );
+        let grown =
+            PROTOCOL_SOURCE.replacen("    Other,\n}", "    Other,\n    Hypothetical,\n}", 1);
+        assert_ne!(
+            message_set_fingerprint(PROTOCOL_SOURCE),
+            message_set_fingerprint(&grown),
+            "a variant added to a wire-reachable leaf enum must change the fingerprint"
+        );
+    }
+
+    #[test]
+    fn test_message_set_fingerprint_unreachable_enum_addition_keeps_fingerprint() {
+        // Adding a whole new enum that is not reachable from ClientMessage's
+        // or DaemonMessage's fields (and not in REACHABLE_LEAF_ENUMS) is
+        // wire-invisible by construction and must not move the fingerprint.
+        let with_new_enum = format!("{PROTOCOL_SOURCE}\npub enum TotallyUnrelated {{ A, B }}\n");
+        assert_eq!(
+            message_set_fingerprint(PROTOCOL_SOURCE),
+            message_set_fingerprint(&with_new_enum)
+        );
     }
 }
