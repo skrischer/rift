@@ -112,6 +112,13 @@ struct EditorChannels {
     /// `HostMetrics` pushes routed to the workspace's composite status line
     /// MEM/CPU segment (`docs/spec-host-telemetry.md`).
     host_metrics_tx: flume::Sender<rift_protocol::DaemonMessage>,
+    /// `PaneMetrics` pushes routed to the workspace's composite status line
+    /// per-pane breakdown popover (`docs/spec-pane-attribution.md`, #881).
+    pane_metrics_tx: flume::Sender<rift_protocol::DaemonMessage>,
+    /// The breakdown popover's open/close toggle, forwarded onto the
+    /// protocol as `ClientMessage::SetPaneMetricsEnabled`
+    /// (`docs/spec-pane-attribution.md`, #881) by `spawn_pane_metrics_bridge`.
+    pane_metrics_enabled_rx: flume::Receiver<rift_protocol::ClientMessage>,
     /// Root-relative paths to open, emitted by the tree (or the editor's
     /// auto-reload); each becomes an `OpenFile` request.
     open_file_rx: flume::Receiver<String>,
@@ -981,6 +988,9 @@ impl Shell {
         let (nav_daemon_tx, nav_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
         let (lsp_status_tx, lsp_status_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
         let (host_metrics_tx, host_metrics_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
+        let (pane_metrics_tx, pane_metrics_rx) = flume::unbounded::<rift_protocol::DaemonMessage>();
+        let (pane_metrics_enabled_tx, pane_metrics_enabled_rx) =
+            flume::unbounded::<rift_protocol::ClientMessage>();
         let (open_file_tx, open_file_rx) = flume::unbounded::<String>();
         let (save_file_tx, save_file_rx) = flume::unbounded::<rift_protocol::ClientMessage>();
         let (buffer_change_tx, buffer_change_rx) =
@@ -1089,6 +1099,8 @@ impl Shell {
                 nav_tx: nav_daemon_tx,
                 lsp_status_tx,
                 host_metrics_tx,
+                pane_metrics_tx,
+                pane_metrics_enabled_rx,
                 open_file_rx,
                 save_file_rx,
                 buffer_change_rx,
@@ -1158,6 +1170,7 @@ impl Shell {
                     nav_rx,
                     lsp_status_rx,
                     host_metrics_rx,
+                    pane_metrics_rx,
                     diff_rx,
                     open_file_tx,
                     save_file_tx,
@@ -1168,6 +1181,7 @@ impl Shell {
                     file_op_tx,
                     file_op_result_rx,
                     dir_browse_tx: dir_browse_tx.clone(),
+                    pane_metrics_enabled_tx,
                 },
                 state_path,
                 recents_path_for_workspace,
@@ -2030,7 +2044,8 @@ fn drain_render_backlog(ch: &PtyChannels, editor: &EditorChannels, watches: &Eng
         + editor.nav_request_rx.drain().count()
         + editor.request_diff_rx.drain().count()
         + editor.git_op_rx.drain().count()
-        + editor.file_op_rx.drain().count();
+        + editor.file_op_rx.drain().count()
+        + editor.pane_metrics_enabled_rx.drain().count();
     if dropped > 0 {
         debug!(
             dropped,
@@ -2241,7 +2256,13 @@ async fn run_daemon_terminal(
     // `FileOpResult` reply returns via `consume_daemon_messages` on
     // `editor.file_op_result_tx` — routed back for UX only, never the tree
     // mutation, which stays push-only via `UpdateWorktree`.
-    spawn_file_op_bridge(client_rx, editor.file_op_rx.clone());
+    spawn_file_op_bridge(client_rx.clone(), editor.file_op_rx.clone());
+    // Pane-metrics opt-in reverse path (`docs/spec-pane-attribution.md`,
+    // #881): the breakdown popover's open/close forwards verbatim as
+    // `SetPaneMetricsEnabled { enabled }`. Push-only from here — the
+    // resulting breakdown returns via `consume_daemon_messages` on
+    // `editor.pane_metrics_tx`.
+    spawn_pane_metrics_bridge(client_rx, editor.pane_metrics_enabled_rx.clone());
 
     // Forward-path sinks: fold the daemon stream into the render channels (pane
     // output, layout snapshots, capture replies), the file tree, and the editor.
@@ -3154,14 +3175,14 @@ async fn consume_daemon_messages(
             msg @ DaemonMessage::HostMetrics { .. } => {
                 let _ = editor.host_metrics_tx.send(msg);
             }
-            // --- per-pane metrics -> breakdown popover (wire foundation only) ---
-            // `PaneMetrics` (`docs/spec-pane-attribution.md`, #879) is
-            // per-connection, push-only, and sent only while this connection
-            // has opted in via `SetPaneMetricsEnabled`. Wiring it into
-            // `WorkspaceView` and the MEM/CPU-indicator popover lands in a
-            // follow-on issue.
-            // real handling: #881
-            DaemonMessage::PaneMetrics { .. } => {}
+            // --- per-pane metrics -> breakdown popover (`docs/spec-pane-
+            // attribution.md`, #881) ---
+            // `PaneMetrics` is per-connection, push-only, and sent only
+            // while this connection has opted in via
+            // `SetPaneMetricsEnabled` (`spawn_pane_metrics_bridge`).
+            msg @ DaemonMessage::PaneMetrics { .. } => {
+                let _ = editor.pane_metrics_tx.send(msg);
+            }
             // --- diff reply -> diff view (every mode) ---
             // The reply to a `RequestDiff`: forward to the diff view, which
             // routes it by path against the currently open selection (#338).
@@ -3337,6 +3358,26 @@ fn spawn_file_op_bridge(
     tokio::spawn(async move {
         while let Ok(msg) = file_op_rx.recv_async().await {
             debug!(op = ?msg, "sending file op");
+            let client = client_rx.borrow().clone();
+            let _ = client.send(msg).await;
+        }
+    });
+}
+
+/// Forward the breakdown popover's open/close toggle onto the protocol as
+/// [`rift_protocol::ClientMessage::SetPaneMetricsEnabled`]
+/// (`docs/spec-pane-attribution.md`, #881) — the same shape as
+/// [`spawn_git_op_bridge`]. Push-only from here: the resulting breakdown
+/// returns via [`consume_daemon_messages`] on `editor.pane_metrics_tx`, not
+/// as a routed reply to this message. Ends when the render-side channel
+/// closes.
+fn spawn_pane_metrics_bridge(
+    client_rx: DaemonClientWatch,
+    pane_metrics_enabled_rx: flume::Receiver<rift_protocol::ClientMessage>,
+) {
+    tokio::spawn(async move {
+        while let Ok(msg) = pane_metrics_enabled_rx.recv_async().await {
+            debug!(?msg, "sending pane-metrics enabled toggle");
             let client = client_rx.borrow().clone();
             let _ = client.send(msg).await;
         }
@@ -4067,6 +4108,7 @@ mod tests {
         request_diff_tx: flume::Sender<String>,
         git_op_tx: flume::Sender<rift_protocol::ClientMessage>,
         file_op_tx: flume::Sender<rift_protocol::ClientMessage>,
+        pane_metrics_enabled_tx: flume::Sender<rift_protocol::ClientMessage>,
     }
 
     fn backlog_harness() -> BacklogHarness {
@@ -4088,6 +4130,8 @@ mod tests {
         let (nav_reply_tx, _) = flume::unbounded();
         let (lsp_status_tx, _) = flume::unbounded();
         let (host_metrics_tx, _) = flume::unbounded();
+        let (pane_metrics_tx, _) = flume::unbounded();
+        let (pane_metrics_enabled_tx, pane_metrics_enabled_rx) = flume::unbounded();
         let (open_file_tx, open_file_rx) = flume::unbounded();
         let (save_file_tx, save_file_rx) = flume::unbounded();
         let (buffer_change_tx, buffer_change_rx) = flume::unbounded();
@@ -4121,6 +4165,8 @@ mod tests {
                 nav_tx: nav_reply_tx,
                 lsp_status_tx,
                 host_metrics_tx,
+                pane_metrics_tx,
+                pane_metrics_enabled_rx,
                 open_file_rx,
                 save_file_rx,
                 buffer_change_rx,
@@ -4158,6 +4204,7 @@ mod tests {
             request_diff_tx,
             git_op_tx,
             file_op_tx,
+            pane_metrics_enabled_tx,
         }
     }
 
@@ -4231,6 +4278,9 @@ mod tests {
                 to: "src/lib.rs".into(),
             })
             .expect("send file op");
+        h.pane_metrics_enabled_tx
+            .send(rift_protocol::ClientMessage::SetPaneMetricsEnabled { enabled: true })
+            .expect("send pane-metrics enabled toggle");
 
         drain_render_backlog(&h.ch, &h.editor, &h.watches);
 
@@ -4249,6 +4299,7 @@ mod tests {
         assert!(h.editor.request_diff_rx.is_empty());
         assert!(h.editor.git_op_rx.is_empty());
         assert!(h.editor.file_op_rx.is_empty());
+        assert!(h.editor.pane_metrics_enabled_rx.is_empty());
     }
 
     #[test]

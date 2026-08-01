@@ -16,13 +16,23 @@
 
 use std::collections::BTreeMap;
 
+use flume::Sender;
 use gpui::{
-    div, px, App, Entity, FontWeight, InteractiveElement as _, IntoElement, MouseButton,
+    div, px, Anchor, App, Entity, FontWeight, InteractiveElement as _, IntoElement, MouseButton,
     ParentElement as _, SharedString, Styled as _,
 };
-use gpui_component::{h_flex, ActiveTheme as _};
-use rift_protocol::{AheadBehind, Diagnostic, DiagnosticSeverity, LspServerState, MemoryPressure};
+use gpui_component::{
+    button::{Button, ButtonVariants as _},
+    h_flex,
+    popover::Popover,
+    v_flex, ActiveTheme as _, Sizable as _,
+};
+use rift_protocol::{
+    AheadBehind, ClientMessage, Diagnostic, DiagnosticSeverity, LspServerState, MemoryPressure,
+    PaneMetric,
+};
 use rift_terminal::{PaneActivity, SessionView, StatusWindow};
+use tracing::debug;
 
 /// Fixed height of the composite status line, in pixels (the design's 28px).
 const HEIGHT: f32 = 28.0;
@@ -239,6 +249,18 @@ pub struct StatusLineModel<'a> {
     /// text — `Normal` -> `theme.muted_foreground`, `Warning` -> `theme.warning`,
     /// `Critical` -> `theme.danger`. Unused while `host_metrics` is `None`.
     pub pressure_level: PressureLevel,
+    /// The attached session's latest per-pane breakdown, folded from the
+    /// daemon's per-connection `PaneMetrics` push
+    /// (`docs/spec-pane-attribution.md`, #881) — empty before the first push
+    /// arrives (the popover renders a brief "sampling" placeholder for that
+    /// case, [`pane_metrics_popover_content`]).
+    pub pane_metrics: &'a [PaneMetric],
+    /// The breakdown popover's open/close toggle sender: a clone is captured
+    /// by the popover's `on_open_change` callback in [`render`], which
+    /// forwards it onto the protocol as `ClientMessage::SetPaneMetricsEnabled`
+    /// — `true` on open (starts this connection's per-pane sampling on the
+    /// daemon), `false` on close (stops it).
+    pub pane_metrics_enabled_tx: Sender<ClientMessage>,
     /// The active editor tab's zero-based cursor `(line, column)`, or `None`
     /// when no tab is open.
     pub cursor: Option<(u32, u32)>,
@@ -328,6 +350,89 @@ fn metrics_text(cpu: f32, mem_total: u64, mem_available: u64) -> String {
         mem_pct.round() as i64,
         (cpu as f64).round() as i64
     )
+}
+
+/// One ranked row in the pane-metrics breakdown popover
+/// (`docs/spec-pane-attribution.md`, #881): the pane's agnostic `command`
+/// label plus its RSS/CPU, pre-formatted for display.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PaneMetricRow {
+    pub pane_id: u32,
+    pub command: String,
+    pub rss_text: String,
+    pub cpu_text: String,
+}
+
+/// Rank a `PaneMetrics` push into the breakdown popover's display rows
+/// (`docs/spec-pane-attribution.md`): sorted by RSS descending, ties broken
+/// by CPU descending, so the pane most likely "the cause" of host pressure
+/// reads first. Pure/unit-tested; [`render`] calls this each time the
+/// popover's content is built (the pane-metrics fold loop keeps the input
+/// current).
+pub fn pane_metric_rows(entries: &[PaneMetric]) -> Vec<PaneMetricRow> {
+    let mut ranked: Vec<&PaneMetric> = entries.iter().collect();
+    ranked.sort_by(|a, b| b.rss.cmp(&a.rss).then(b.cpu.total_cmp(&a.cpu)));
+    ranked
+        .into_iter()
+        .map(|m| PaneMetricRow {
+            pane_id: m.pane_id,
+            command: m.command.clone(),
+            rss_text: format_rss_mb(m.rss),
+            cpu_text: format!("{}%", (m.cpu as f64).round() as i64),
+        })
+        .collect()
+}
+
+/// The breakdown popover's RSS label: whole megabytes, rounded — coarser
+/// than the MEM/CPU segment's percentage ([`metrics_text`]) since an
+/// absolute per-pane byte count is more useful here than a host-relative
+/// percent.
+fn format_rss_mb(rss: u64) -> String {
+    format!("{} MB", (rss as f64 / (1024.0 * 1024.0)).round() as u64)
+}
+
+/// The breakdown popover's content (`docs/spec-pane-attribution.md`, #881):
+/// a brief "sampling..." placeholder while `rows` is still empty (no push
+/// has arrived since the popover opened), otherwise one row per pane —
+/// the agnostic `command` label left, RSS + CPU right. Theme tokens only.
+fn pane_metrics_popover_content(rows: &[PaneMetricRow], cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let mut list = v_flex().gap(px(4.0)).min_w(px(180.0));
+    if rows.is_empty() {
+        list = list.child(
+            div()
+                .text_color(theme.muted_foreground)
+                .child("sampling..."),
+        );
+    } else {
+        for row in rows {
+            list = list.child(
+                h_flex()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .text_color(theme.foreground)
+                            .child(SharedString::from(row.command.clone())),
+                    )
+                    .child(
+                        h_flex()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_color(theme.muted_foreground)
+                                    .child(SharedString::from(row.rss_text.clone())),
+                            )
+                            .child(
+                                div()
+                                    .text_color(theme.muted_foreground)
+                                    .child(SharedString::from(row.cpu_text.clone())),
+                            ),
+                    ),
+            );
+        }
+    }
+    list
 }
 
 /// Build the composite status line element. Theme tokens only: the bar sits on
@@ -441,14 +546,35 @@ pub fn render(
         PressureLevel::Warning => theme.warning,
         PressureLevel::Critical => theme.danger,
     };
+    // Per-pane breakdown popover (`docs/spec-pane-attribution.md`, #881):
+    // clicking the segment toggles a `Popover` listing the attached
+    // session's panes ranked by RSS/CPU. `on_open_change` forwards the new
+    // open state onto the protocol as `ClientMessage::SetPaneMetricsEnabled`
+    // so the daemon samples only while this popover is open; `pane_metrics`
+    // (folded from the daemon's per-connection pushes) drives the content,
+    // rebuilt fresh on every render per `Popover::content`'s own contract.
     let metrics = model.host_metrics.map(|m| {
-        div()
-            .text_color(pressure_color)
-            .child(SharedString::from(metrics_text(
-                m.cpu,
-                m.mem_total,
-                m.mem_available,
-            )))
+        let text = metrics_text(m.cpu, m.mem_total, m.mem_available);
+        let rows = pane_metric_rows(model.pane_metrics);
+        let enabled_tx = model.pane_metrics_enabled_tx.clone();
+        Popover::new("status-pane-metrics")
+            .anchor(Anchor::BottomRight)
+            .trigger(
+                Button::new("status-pane-metrics-trigger")
+                    .text()
+                    .xsmall()
+                    .label(text)
+                    .text_color(pressure_color),
+            )
+            .on_open_change(move |open, _window, _cx| {
+                let enabled = *open;
+                if let Err(e) =
+                    enabled_tx.try_send(ClientMessage::SetPaneMetricsEnabled { enabled })
+                {
+                    debug!(error = %e, enabled, "failed to send pane-metrics enabled toggle");
+                }
+            })
+            .content(move |_state, _window, cx| pane_metrics_popover_content(&rows, cx))
     });
 
     let clock = div()
@@ -920,5 +1046,65 @@ mod tests {
             ),
             PressureLevel::Critical
         );
+    }
+
+    // --- pane_metric_rows (docs/spec-pane-attribution.md, #881) --------------
+
+    fn pane(pane_id: u32, rss: u64, cpu: f32, command: &str) -> PaneMetric {
+        PaneMetric {
+            pane_id,
+            rss,
+            cpu,
+            command: command.to_owned(),
+        }
+    }
+
+    #[test]
+    fn test_pane_metric_rows_ranks_by_rss_descending() {
+        let entries = vec![
+            pane(1, 1_048_576, 5.0, "vim"),
+            pane(2, 209_715_200, 42.0, "cargo"),
+            pane(3, 10_485_760, 1.0, "zsh"),
+        ];
+        let rows = pane_metric_rows(&entries);
+        assert_eq!(
+            rows.iter().map(|r| r.pane_id).collect::<Vec<_>>(),
+            vec![2, 3, 1],
+            "heaviest RSS pane ranks first"
+        );
+    }
+
+    #[test]
+    fn test_pane_metric_rows_ties_broken_by_cpu_descending() {
+        let entries = vec![
+            pane(1, 1_048_576, 5.0, "vim"),
+            pane(2, 1_048_576, 42.0, "cargo"),
+        ];
+        let rows = pane_metric_rows(&entries);
+        assert_eq!(
+            rows.iter().map(|r| r.pane_id).collect::<Vec<_>>(),
+            vec![2, 1],
+            "equal RSS breaks the tie on CPU descending"
+        );
+    }
+
+    #[test]
+    fn test_pane_metric_rows_formats_command_rss_and_cpu() {
+        let entries = vec![pane(7, 209_715_200, 42.4, "cargo")];
+        let rows = pane_metric_rows(&entries);
+        assert_eq!(
+            rows,
+            vec![PaneMetricRow {
+                pane_id: 7,
+                command: "cargo".to_owned(),
+                rss_text: "200 MB".to_owned(),
+                cpu_text: "42%".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_pane_metric_rows_empty_input_yields_no_rows() {
+        assert!(pane_metric_rows(&[]).is_empty());
     }
 }

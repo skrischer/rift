@@ -309,3 +309,30 @@ under the milestone. This spec owns the design; the issues own progress.
   to make the deferral to #881 discoverable at the call site. Both placeholders are wire
   foundation only, superseded when #880 (daemon: pane pid, shared snapshot, roll-up,
   push) and #881 (app: ingest + popover) land.
+- 2026-08-01 (#881, app ingest + popover landed): the #879 placeholder arm in
+  `consume_daemon_messages` now routes `PaneMetrics` onto a new
+  `EditorChannels::pane_metrics_tx` / `WorkspaceChannels::pane_metrics_rx` pair,
+  mirroring the `HostMetrics` router arm and fold loop exactly (`cx.spawn`, no
+  Welcome-replay seeding — this stream is per-connection and on-demand, unlike
+  `host_metrics`/`lsp`). `WorkspaceView` gained a `pane_metrics: Vec<PaneMetric>`
+  field, replaced wholesale on every push. The `MEM% · CPU%` segment is now a
+  `gpui_component::popover::Popover` (trigger: a `Button::new(...).text().xsmall()`
+  styled to match the existing segment text, since `Popover::trigger` requires
+  `Selectable + IntoElement` and a plain `div` does not implement `Selectable`) —
+  its `on_open_change` callback sends `ClientMessage::SetPaneMetricsEnabled` over a
+  new `pane_metrics_enabled_tx`/`_rx` pair (GPUI side to a new
+  `spawn_pane_metrics_bridge`, the same shape as `spawn_git_op_bridge`); the popover
+  content is rebuilt each render from `status_bar::pane_metric_rows`, a pure
+  ranking/formatting function (RSS descending, ties broken by CPU descending —
+  `f32::total_cmp`) unit-tested directly, with rows rendered as
+  `command` label + whole-MB RSS + rounded CPU%; an empty list (no push since the
+  popover opened) renders a "sampling..." placeholder. `pane_metrics_enabled_rx` was
+  added to `drain_render_backlog`'s drained set (a stale open/close toggle queued
+  during a reconnect outage must not replay into the fresh attach, matching every
+  other request-shaped channel already drained there). The daemon push side (#880)
+  is a separate, independently-landing PR — until it merges the popover always
+  shows the "sampling..." placeholder, since no `PaneMetrics` push ever arrives;
+  wiring compiles and is tested against the #879 protocol types alone. Visual
+  polish (popover anchor/positioning, hover-state text color while the segment
+  recolors for pressure) is left to the milestone visual-QA gate per the spec's
+  "Design phase not enabled" constraint.
