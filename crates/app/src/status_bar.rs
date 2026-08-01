@@ -188,6 +188,25 @@ fn escalate_with_psi(baseline: PressureLevel, psi: Option<MemoryPressure>) -> Pr
     level
 }
 
+/// The upward-transition memory-pressure toast message
+/// (`docs/spec-memory-pressure.md`), e.g. `"Host memory low - 8% available"`:
+/// the `MemAvailable` ratio as an integer percentage, guarded against
+/// `mem_total == 0` the same way [`metrics_text`] is. The caller
+/// (`workspace.rs`'s host-metrics fold loop) picks the `NotificationType`
+/// (`Warning`/`Error`) from the new [`PressureLevel`]; this only names the
+/// condition.
+pub fn pressure_toast_message(mem_total: u64, mem_available: u64) -> String {
+    let available_pct = if mem_total == 0 {
+        0.0
+    } else {
+        mem_available as f64 / mem_total as f64 * 100.0
+    };
+    format!(
+        "Host memory low - {}% available",
+        available_pct.round() as i64
+    )
+}
+
 /// The full set of values the composite status line renders, borrowed from the
 /// workspace's existing models plus the two new streams. Kept as one struct so
 /// [`render`]'s signature stays legible and the workspace assembles the read in
@@ -718,6 +737,24 @@ mod tests {
     #[test]
     fn test_metrics_text_guards_against_zero_mem_total() {
         assert_eq!(metrics_text(10.0, 0, 0), "MEM 0% \u{b7} CPU 10%");
+    }
+
+    // --- pressure_toast_message (docs/spec-memory-pressure.md) ---------------
+
+    #[test]
+    fn test_pressure_toast_message_names_available_percentage() {
+        assert_eq!(
+            pressure_toast_message(16_000_000_000, 1_280_000_000),
+            "Host memory low - 8% available"
+        );
+    }
+
+    #[test]
+    fn test_pressure_toast_message_guards_against_zero_mem_total() {
+        assert_eq!(
+            pressure_toast_message(0, 0),
+            "Host memory low - 0% available"
+        );
     }
 
     // --- pressure_level (docs/spec-memory-pressure.md) -----------------------
