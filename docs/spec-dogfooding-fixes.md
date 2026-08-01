@@ -239,6 +239,25 @@ includes:
   `!ks.modifiers.alt`, so it is unit-testable without a GPUI window. The downstream
   sink (`SessionView::apply_font_zoom`) was already correct and untouched; Ctrl+`+`/
   Ctrl+`=`/Ctrl+`-` (no Alt) still zoom.
+- 2026-08-01: **Pane resize seam cursor + corner (2-axis) resize** resolved (#906).
+  Category 1 (completing the existing border-drag affordance — `resize_handle`
+  already dragged the seam, the cursor never changed to say so). `resize_handle`
+  now sets `CursorStyle::ResizeLeftRight`/`ResizeUpDown` matching its axis. For the
+  corner: `render_layout`'s per-seam loop now calls a new `render_seam`, which checks
+  whether the leading or trailing neighbor at that seam is itself a `LayoutNode::Split`
+  on the opposite axis (a new `layout::opposite_axis_children` helper) — i.e. whether
+  the seam also crosses that neighbor's own internal boundary/boundaries (leading
+  preferred, matching the seam's existing "leading child" resize-target convention;
+  trailing as fallback so a plain-pane/split-neighbor split, e.g. split right then
+  split the new right pane down, is covered too). When it does, the seam renders as a
+  mirror of the neighbor's own row/column proportions (same `flex_basis(relative(p))`
+  math as the neighbor's real row/column wrappers, so segment boundaries land at the
+  same pixels) with a small `nwse`-cursor corner hitzone between segments. `BorderDrag`
+  gained a `start: Point<Pixels>` (previously single-axis `Pixels`) and an optional
+  `corner: Option<CornerDrag>` so a corner drag emits two independent incremental
+  `resize-pane` commands (one per axis) from the same mouse-down origin, reusing the
+  existing per-axis delta/`resize_direction` plumbing rather than a new absolute-size
+  mechanism.
 - 2026-08-01: **Session strip overflow pushing window controls off-screen** resolved
   (#905). Category 2 (defect in an existing path). `render_session_strip` built a plain
   `h_flex()` with no width constraint, and the title bar's left group
@@ -254,3 +273,19 @@ includes:
   "+ New session" sits outside the scrollable region as a `flex_none` sibling so it
   stays reachable regardless of session count, never shrinking and never scrolled
   past.
+- 2026-08-01: **Explorer has no context menu / create action on empty background**
+  resolved (#904). Category 2 (defect in an existing path). `.context_menu(...)` was
+  attached only inside `render_row`, so right-clicking empty background space showed
+  nothing, and on an empty root — no rows at all — `NewFile`/`NewFolder` (pointer-only,
+  no keybinding) were unreachable. Fix scoped to the `EmptyState::EmptyRoot` render
+  path (`FileTree::render_empty_root_placeholder`), not the whole `Render::render`
+  container the issue's investigation pointed at: `gpui-component`'s `ContextMenuExt`
+  registers its right-click listener via `window.on_mouse_event` gated only on
+  `hitbox.is_hovered(window)` (a pure spatial check, no propagation-stopping) — a
+  `.context_menu()` on any ancestor that also contains rows would still fire (its
+  hitbox spans the whole area, including every row) on *every* row right-click,
+  alongside the row's own menu, opening both at once. The empty-root placeholder has
+  zero rows to collide with, so it is the only container safe to wrap directly.
+  `FileTree::create_target_dir` already resolves to the worktree root whenever
+  `self.selected` is `None` or the model can no longer find it (guaranteed on an empty
+  model), so no extra selection-clearing was needed to target the root.

@@ -18,7 +18,8 @@ use rift_explorer::{Change, Entry, GitStatus, Snapshot, Watcher};
 use rift_lsp::{DocumentChange, DocumentSelector};
 use rift_protocol::{
     encode_frame, BufferErrorReason, ClientMessage, DaemonMessage, Diagnostic, EntryKind,
-    FrameDecoder, LoadAverage, LspServerState, NavRequestId, PaneMetric, WorktreeEntry,
+    FrameDecoder, LoadAverage, LspServerState, MemoryPressure, NavRequestId, PaneMetric,
+    WorktreeEntry,
     PROTOCOL_VERSION,
 };
 use sysinfo::{ProcessesToUpdate, System};
@@ -275,6 +276,12 @@ const HOST_METRICS_INTERVAL: Duration = Duration::from_secs(2);
 /// kind — unlike the per-context `events` bus this is never asked to carry a
 /// burst, so a handful of slots is ample.
 const HOST_METRICS_EVENT_CAPACITY: usize = 4;
+
+/// Default Linux PSI memory-pressure file (`docs/spec-memory-pressure.md`).
+/// Present only where the kernel is built with `CONFIG_PSI` (absent on the
+/// stock `microsoft-standard-WSL2` kernel); [`host_metrics_sampler`] gates on
+/// its existence once at startup rather than on every tick.
+const DEFAULT_PSI_PATH: &str = "/proc/pressure/memory";
 
 /// Queue depth for worktree events flowing from the blocking worker into the
 /// dispatch loop. Bounds how far the worker may run ahead while the loop is busy.
@@ -2231,6 +2238,13 @@ async fn host_metrics_sampler(bus: HostMetricsBus) {
         }
     };
 
+    // PSI availability (`CONFIG_PSI`) is a boot-time kernel property, not a
+    // per-tick condition (`docs/spec-memory-pressure.md`), so the file's
+    // existence is resolved once here and cached for the sampler's lifetime;
+    // only its CONTENTS are re-read each tick.
+    let psi_path = Path::new(DEFAULT_PSI_PATH);
+    let psi_available = psi_path.exists();
+
     let mut interval = tokio::time::interval(HOST_METRICS_INTERVAL);
     // The first `tick()` fires immediately; consume it here so the loop
     // below's first refresh happens one full interval after priming.
@@ -2245,7 +2259,12 @@ async fn host_metrics_sampler(bus: HostMetricsBus) {
         let refreshed = tokio::task::spawn_blocking(move || {
             system.refresh_cpu_usage();
             system.refresh_memory();
-            let message = build_host_metrics_message(&system);
+            let psi = if psi_available {
+                read_memory_pressure(psi_path)
+            } else {
+                None
+            };
+            let message = build_host_metrics_message(&system, psi);
             (system, message)
         })
         .await;
@@ -2271,8 +2290,11 @@ async fn host_metrics_sampler(bus: HostMetricsBus) {
 /// `/proc`-reading side effects, so it is testable without spawning a task or
 /// waiting on the sampling interval. `System::load_average()` is a Unix
 /// concept read fresh from `/proc/loadavg` on every call (an associated
-/// function, not tied to `system`'s own refresh cycle).
-fn build_host_metrics_message(system: &System) -> DaemonMessage {
+/// function, not tied to `system`'s own refresh cycle). `psi` is the caller's
+/// already-read Linux PSI sample (`docs/spec-memory-pressure.md`) — `None`
+/// where the kernel exposes no `/proc/pressure/memory` — passed straight
+/// through onto the wire so this stays a pure builder.
+fn build_host_metrics_message(system: &System, psi: Option<MemoryPressure>) -> DaemonMessage {
     let load = System::load_average();
     DaemonMessage::HostMetrics {
         cpu: system.global_cpu_usage(),
@@ -2286,10 +2308,7 @@ fn build_host_metrics_message(system: &System) -> DaemonMessage {
             fifteen: load.fifteen,
         },
         cpu_count: system.cpus().len() as u32,
-        // PSI is read and wired in by a later step (`docs/spec-memory-pressure.md`);
-        // this protocol-only bump keeps every existing builder call site
-        // compiling with the portable baseline unaffected.
-        psi: None,
+        psi,
     }
 }
 
@@ -2505,6 +2524,71 @@ async fn pane_metrics_sampler(bus: PaneMetricsBus) {
 /// own pure function rather than inlined.
 fn pane_metrics_gate_open(enabled: &AtomicUsize) -> bool {
     enabled.load(Ordering::Relaxed) > 0
+}
+
+/// Read and parse Linux PSI memory-stall averages from `path`
+/// (`docs/spec-memory-pressure.md`), normally `/proc/pressure/memory`.
+/// Path-injectable so it is fixture-testable without a real `/proc`. Returns
+/// `None` where `path` does not exist or its contents do not parse — PSI is
+/// always an optional enhancement over the portable baseline, never a hard
+/// requirement, so any read/parse failure degrades silently rather than
+/// erroring.
+fn read_memory_pressure(path: &Path) -> Option<MemoryPressure> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    parse_memory_pressure(&contents)
+}
+
+/// Parse the two-line `/proc/pressure/memory` format:
+///
+/// ```text
+/// some avg10=0.00 avg60=0.00 avg300=0.00 total=0
+/// full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+/// ```
+///
+/// Only the `avgN` tokens are kept; the trailing `total=<microseconds>`
+/// counter each line also carries is deliberately ignored (the `avgN` are the
+/// ready-to-use percentages). `None` if either line is missing or any `avgN`
+/// token is missing/unparseable.
+fn parse_memory_pressure(contents: &str) -> Option<MemoryPressure> {
+    let mut some = None;
+    let mut full = None;
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("some ") {
+            some = parse_psi_averages(rest);
+        } else if let Some(rest) = line.strip_prefix("full ") {
+            full = parse_psi_averages(rest);
+        }
+    }
+    let (some_avg10, some_avg60, some_avg300) = some?;
+    let (full_avg10, full_avg60, full_avg300) = full?;
+    Some(MemoryPressure {
+        some_avg10,
+        some_avg60,
+        some_avg300,
+        full_avg10,
+        full_avg60,
+        full_avg300,
+    })
+}
+
+/// Parse the `avg10=`/`avg60=`/`avg300=` tokens out of one PSI line's
+/// remainder (everything after the leading `some `/`full ` keyword), ignoring
+/// the trailing `total=` token. `None` if any of the three is absent or fails
+/// to parse as `f64`.
+fn parse_psi_averages(rest: &str) -> Option<(f64, f64, f64)> {
+    let mut avg10 = None;
+    let mut avg60 = None;
+    let mut avg300 = None;
+    for token in rest.split_whitespace() {
+        let (key, value) = token.split_once('=')?;
+        match key {
+            "avg10" => avg10 = value.parse::<f64>().ok(),
+            "avg60" => avg60 = value.parse::<f64>().ok(),
+            "avg300" => avg300 = value.parse::<f64>().ok(),
+            _ => {}
+        }
+    }
+    Some((avg10?, avg60?, avg300?))
 }
 
 /// Run a daemon over a single byte-stream transport until either side closes.
@@ -3722,13 +3806,15 @@ mod tests {
     /// field present. Pure and fast (no sampler task, no waiting on
     /// `HOST_METRICS_INTERVAL`): exercises `build_host_metrics_message`
     /// directly, the same builder `host_metrics_sampler` calls each tick.
+    /// Passes `None` for the PSI argument (`docs/spec-memory-pressure.md`):
+    /// the builder must pass it straight through onto the wire unmodified.
     #[test]
     fn test_build_host_metrics_message_produces_plausible_sample() {
         let mut system = System::new_all();
         system.refresh_cpu_usage();
         system.refresh_memory();
 
-        match build_host_metrics_message(&system) {
+        match build_host_metrics_message(&system, None) {
             DaemonMessage::HostMetrics {
                 cpu,
                 mem_total,
@@ -3737,7 +3823,7 @@ mod tests {
                 swap_used: _,
                 load,
                 cpu_count,
-                psi: _,
+                psi,
             } => {
                 assert!(mem_total > 0, "a real host always reports total memory");
                 assert!(
@@ -3750,6 +3836,10 @@ mod tests {
                 );
                 assert!(cpu_count >= 1, "a real host reports at least one core");
                 assert!(load.one >= 0.0 && load.five >= 0.0 && load.fifteen >= 0.0);
+                assert!(
+                    psi.is_none(),
+                    "None in must mean None out of a pure builder"
+                );
             }
             other => panic!("expected HostMetrics, got {other:?}"),
         }
@@ -4115,6 +4205,87 @@ mod tests {
         );
 
         dispatch.abort();
+    }
+
+    /// `docs/spec-memory-pressure.md`: passing a PSI sample through the
+    /// builder carries it straight onto the wire, unmodified.
+    #[test]
+    fn test_build_host_metrics_message_with_psi_carries_it_through() {
+        let mut system = System::new_all();
+        system.refresh_cpu_usage();
+        system.refresh_memory();
+        let psi = MemoryPressure {
+            some_avg10: 1.0,
+            some_avg60: 2.0,
+            some_avg300: 3.0,
+            full_avg10: 4.0,
+            full_avg60: 5.0,
+            full_avg300: 6.0,
+        };
+
+        match build_host_metrics_message(&system, Some(psi)) {
+            DaemonMessage::HostMetrics { psi: Some(got), .. } => {
+                assert_eq!(got, psi);
+            }
+            other => panic!("expected HostMetrics with psi, got {other:?}"),
+        }
+    }
+
+    /// `docs/spec-memory-pressure.md`: a `/proc/pressure/memory`-shaped
+    /// fixture parses into all six averages, with the trailing `total=`
+    /// counter ignored.
+    #[test]
+    fn test_read_memory_pressure_valid_fixture_yields_all_six_averages() {
+        let tmp = TempDir::new("psi-valid");
+        let path = tmp.path.join("memory");
+        write_file(
+            &path,
+            "some avg10=1.23 avg60=4.56 avg300=7.89 total=123456\n\
+             full avg10=0.01 avg60=0.02 avg300=0.03 total=789\n",
+        );
+
+        let psi = read_memory_pressure(&path).expect("valid fixture must parse");
+
+        assert_eq!(psi.some_avg10, 1.23);
+        assert_eq!(psi.some_avg60, 4.56);
+        assert_eq!(psi.some_avg300, 7.89);
+        assert_eq!(psi.full_avg10, 0.01);
+        assert_eq!(psi.full_avg60, 0.02);
+        assert_eq!(psi.full_avg300, 0.03);
+    }
+
+    /// `docs/spec-memory-pressure.md`: malformed or empty file contents parse
+    /// to `None` rather than panicking, so a read/parse failure degrades
+    /// silently to the portable baseline.
+    #[test]
+    fn test_read_memory_pressure_malformed_contents_returns_none() {
+        let tmp = TempDir::new("psi-malformed");
+
+        let empty_path = tmp.path.join("empty");
+        write_file(&empty_path, "");
+        assert!(read_memory_pressure(&empty_path).is_none());
+
+        let garbage_path = tmp.path.join("garbage");
+        write_file(&garbage_path, "not the psi format at all\n");
+        assert!(read_memory_pressure(&garbage_path).is_none());
+
+        let partial_path = tmp.path.join("partial");
+        write_file(&partial_path, "some avg10=1.0 avg60=2.0 total=1\n");
+        assert!(
+            read_memory_pressure(&partial_path).is_none(),
+            "a missing avg300 or full line must not parse"
+        );
+    }
+
+    /// `docs/spec-memory-pressure.md`: an absent path (the expected case on
+    /// the stock `microsoft-standard-WSL2` kernel, which ships no
+    /// `CONFIG_PSI`) yields `None`, never an error.
+    #[test]
+    fn test_read_memory_pressure_absent_path_returns_none() {
+        let tmp = TempDir::new("psi-absent");
+        let path = tmp.path.join("does-not-exist");
+
+        assert!(read_memory_pressure(&path).is_none());
     }
 
     /// `docs/spec-host-telemetry.md`: on `Hello`, a connection replays the
