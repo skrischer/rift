@@ -206,3 +206,16 @@ includes:
   highlight to invisibility, caught by a CI test failure
   (`test_editor_surface_background_is_a_subtle_step_lighter_than_base`) before merge.
   `secondary` differs from `accent`, so the highlight stays visible.
+- 2026-08-01: **Pane header close (X) button** resolved (#907). Category 1 (completing
+  the existing pane-header action row — split-right/split-down/zoom already emit tmux
+  commands over the shared seam, close had not caught up). The lightweight confirm did
+  not need a new dialog component: it reuses the session strip's existing inline
+  kill-confirm pattern (`SessionKillConfirm` / `render_session_strip`, #685) rather than
+  building a dialog subsystem — a new `PaneKillConfirm` state (keyed by tmux pane id
+  instead of session id) swaps the header's action row for an inline "Kill?" +
+  confirm/cancel row, armed by `start_pane_kill_confirm` and committed/aborted by
+  `confirm_pane_kill`/`cancel_pane_kill`, mirroring the session methods exactly. The
+  shell/non-shell branch reuses `is_shell` (#510, already read for the header's type
+  glyph): a shell foreground sends `kill-pane` immediately (nothing in-flight to lose,
+  matching split/zoom's no-confirm precedent); any other foreground process arms the
+  confirm instead, so a stray click can never kill a running process outright.
