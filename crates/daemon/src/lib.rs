@@ -1065,6 +1065,62 @@ struct PaneMetricsHandles {
     enabled: Arc<AtomicUsize>,
 }
 
+/// This connection's own membership in the process-global pane-metrics
+/// opt-in counter (`docs/spec-pane-attribution.md`, #880), owned as an RAII
+/// guard rather than a bare bool so the decrement fires on EVERY exit path —
+/// not just the fall-through after `serve_connection`'s `'serve` loop. That
+/// loop's body is full of `?` early-returns (`read?`, `decoder.next_frame()?`,
+/// every `write_all`/`flush().await?`, `write_pane_metrics(...).await?`) that
+/// can fire while this connection is opted in, e.g. on an abrupt disconnect
+/// (broken pipe on a write, or a read error rather than a clean EOF); without
+/// `Drop` those returns skip the manual cleanup and leak the shared counter,
+/// which keeps [`pane_metrics_sampler`] refreshing forever for a client that
+/// is no longer there (review finding on #958). `set` is idempotent exactly
+/// like the bool it replaces: a redundant `{ enabled: true }` while already
+/// counted, or `{ enabled: false }` without ever having opted in, is a no-op.
+struct PaneMetricsOptIn {
+    enabled: Arc<AtomicUsize>,
+    counted: bool,
+}
+
+impl PaneMetricsOptIn {
+    fn new(enabled: Arc<AtomicUsize>) -> Self {
+        Self {
+            enabled,
+            counted: false,
+        }
+    }
+
+    /// This connection's current opt-in state.
+    fn is_enabled(&self) -> bool {
+        self.counted
+    }
+
+    /// Applies a false->true or true->false transition, incrementing or
+    /// decrementing the shared counter exactly once per actual transition.
+    fn set(&mut self, enabled: bool) {
+        if enabled && !self.counted {
+            self.counted = true;
+            self.enabled.fetch_add(1, Ordering::Relaxed);
+        } else if !enabled && self.counted {
+            self.counted = false;
+            self.enabled.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for PaneMetricsOptIn {
+    fn drop(&mut self) {
+        // Mirrors the false branch of `set` above: only decrement if this
+        // connection actually incremented the counter and never explicitly
+        // opted back out, so a normal `{ enabled: false }` followed by
+        // disconnect never double-decrements.
+        if self.counted {
+            self.enabled.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Returns once the reader reaches EOF, the dispatch loop is gone, or the
 /// event bus closes.
 #[allow(clippy::too_many_arguments)]
@@ -1152,12 +1208,14 @@ where
     // label per pane, #880's "strictly agent-agnostic" constraint) peeled off
     // this connection's own `LayoutSnapshot`/`LayoutUpdate` stream — no
     // separate query, the data already flows through `terminal_out_rx`.
-    // `pane_metrics_enabled` mirrors this connection's own opt-in state so
+    // `pane_metrics_opt_in` mirrors this connection's own opt-in state so
     // `SetPaneMetricsEnabled` toggles the shared gate exactly once per actual
-    // transition and disconnect cleanup decrements it only if still opted in.
+    // transition; being an RAII guard ([`PaneMetricsOptIn`]), its `Drop`
+    // decrements the counter on every exit from this function, including the
+    // `'serve` loop's `?` early-returns, not only the clean fall-through.
     let mut session_pane_pids: HashMap<u32, u32> = HashMap::new();
     let mut session_commands: HashMap<u32, String> = HashMap::new();
-    let mut pane_metrics_enabled = false;
+    let mut pane_metrics_opt_in = PaneMetricsOptIn::new(Arc::clone(&pane_metrics.enabled));
     // The root this connection has itself acquired via a resolved `Attach`
     // (as opposed to `root`/its context above, which the CALLER acquired and
     // releases). `None` until the first `Attach` resolves a root.
@@ -1405,13 +1463,15 @@ where
                         // The per-pane metrics opt-in
                         // (`docs/spec-pane-attribution.md`, #880): this
                         // connection's on/off toggle for per-pane sampling.
-                        // `pane_metrics.enabled` is the SAME process-global
-                        // counter every connection shares (`PaneMetricsBus`):
-                        // incremented exactly once per actual false->true
-                        // transition and decremented once per true->false
-                        // (including this connection's own disconnect
-                        // cleanup below), so it stays exact even if a client
-                        // sends a redundant repeat. On turning on, push once
+                        // `pane_metrics_opt_in` (a [`PaneMetricsOptIn`] guard)
+                        // owns the SAME process-global counter every
+                        // connection shares (`PaneMetricsBus`): incremented
+                        // exactly once per actual false->true transition and
+                        // decremented once per true->false (including this
+                        // connection's own disconnect cleanup, via `Drop` —
+                        // see the guard's doc comment), so it stays exact
+                        // even if a client sends a redundant repeat. On
+                        // turning on, push once
                         // immediately from whatever is already cached (this
                         // connection's own session layout plus the shared
                         // snapshot) instead of waiting for the next shared
@@ -1424,9 +1484,9 @@ where
                         // below would immediately re-fire on the SAME
                         // already-pushed value on its very next poll.
                         ClientMessage::SetPaneMetricsEnabled { enabled } => {
-                            if enabled && !pane_metrics_enabled {
-                                pane_metrics_enabled = true;
-                                pane_metrics.enabled.fetch_add(1, Ordering::Relaxed);
+                            let was_enabled = pane_metrics_opt_in.is_enabled();
+                            pane_metrics_opt_in.set(enabled);
+                            if enabled && !was_enabled {
                                 let cached = pane_metrics.snapshot.borrow_and_update().clone();
                                 if let Some(snapshot) = cached {
                                     write_pane_metrics(
@@ -1437,9 +1497,6 @@ where
                                     )
                                     .await?;
                                 }
-                            } else if !enabled && pane_metrics_enabled {
-                                pane_metrics_enabled = false;
-                                pane_metrics.enabled.fetch_sub(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -1568,11 +1625,11 @@ where
             // (`docs/spec-pane-attribution.md`, [`PaneMetricsBus`]) ticked:
             // roll up THIS connection's own session panes from it and push
             // its own `PaneMetrics` — never the Phase-43 broadcast bus, never
-            // a cross-connection replay. Guarded on `pane_metrics_enabled` so
+            // a cross-connection replay. Guarded on `pane_metrics_opt_in` so
             // a connection that has not opted in never even polls this
             // watch (and a connection with nothing else opted in daemon-wide
             // never wakes at all, since the shared sampler itself is gated).
-            changed = pane_metrics.snapshot.changed(), if pane_metrics_enabled => {
+            changed = pane_metrics.snapshot.changed(), if pane_metrics_opt_in.is_enabled() => {
                 if changed.is_err() {
                     // The sampler task is gone (process shutting down);
                     // nothing more will ever arrive on this watch.
@@ -1672,13 +1729,13 @@ where
     }
 
     // This connection's own opt-in cleanup (`docs/spec-pane-attribution.md`,
-    // #880): a disconnect while still opted in must decrement the SAME
-    // process-global counter `SetPaneMetricsEnabled { false }` would have,
-    // or the shared sampler would keep refreshing forever for a client that
-    // is no longer there to receive the pushes.
-    if pane_metrics_enabled {
-        pane_metrics.enabled.fetch_sub(1, Ordering::Relaxed);
-    }
+    // #880) needs no explicit statement here: `pane_metrics_opt_in`'s `Drop`
+    // decrements the SAME process-global counter `SetPaneMetricsEnabled
+    // { false }` would have, whether this point is reached by falling
+    // through the loop or `pane_metrics_opt_in` is instead dropped earlier by
+    // a `?` return out of the `'serve` loop above — otherwise the shared
+    // sampler would keep refreshing forever for a client that is no longer
+    // there to receive the pushes.
 
     // End this connection's tmux attach. The task then detaches the control
     // child (the tmux session persists) and exits.
@@ -3319,9 +3376,9 @@ mod tests {
     /// of the test — dropping it closes `snapshot`. Unlike
     /// [`test_host_metrics_handles`] this is safe for an unrelated test to
     /// drop immediately: the `snapshot.changed()` branch is only ever polled
-    /// while `pane_metrics_enabled` is true, and a test that never sends
-    /// `SetPaneMetricsEnabled { enabled: true }` never sets that flag, so a
-    /// closed watch is simply never observed.
+    /// while `pane_metrics_opt_in` reads enabled, and a test that never
+    /// sends `SetPaneMetricsEnabled { enabled: true }` never opts it in, so
+    /// a closed watch is simply never observed.
     fn test_pane_metrics_handles() -> (
         watch::Sender<Option<Arc<ProcessSnapshot>>>,
         PaneMetricsHandles,
@@ -3931,6 +3988,132 @@ mod tests {
         );
 
         let _ = latest_tx.send(None);
+        dispatch.abort();
+    }
+
+    /// Review finding on #958 (`docs/spec-pane-attribution.md`, #880): the
+    /// `'serve` loop in `serve_connection` is full of `?` early-returns (a
+    /// malformed frame from `decoder.next_frame()?`, a broken-pipe write,
+    /// etc.) that can fire while a connection is opted in, well before the
+    /// clean fall-through after the loop. `PaneMetricsOptIn` must still
+    /// decrement on that path via `Drop` alone, with no cleanup code
+    /// reachable after an early return — this is a direct unit test of the
+    /// guard type, isolated from the async connection machinery entirely.
+    #[test]
+    fn test_pane_metrics_opt_in_drop_after_error_path_return_decrements_counter() {
+        let enabled = Arc::new(AtomicUsize::new(0));
+
+        // Mirrors a connection opting in, then hitting a `?` early-return
+        // out of `serve_connection` (rather than reaching the clean
+        // fall-through): the guard goes out of scope without ever calling
+        // `set(false)` or running any explicit cleanup statement.
+        fn opt_in_then_fail(enabled: &Arc<AtomicUsize>) -> Result<(), ()> {
+            let mut opt_in = PaneMetricsOptIn::new(Arc::clone(enabled));
+            opt_in.set(true);
+            assert_eq!(enabled.load(Ordering::Relaxed), 1);
+            Err(())?;
+            unreachable!("the `?` above always returns early");
+        }
+
+        let _ = opt_in_then_fail(&enabled);
+        assert_eq!(
+            enabled.load(Ordering::Relaxed),
+            0,
+            "Drop must decrement the counter on an early-return path, not just the clean one"
+        );
+    }
+
+    /// Companion to
+    /// `test_serve_connection_pane_metrics_opt_in_increments_counter_and_pushes_cached_snapshot`
+    /// above (which covers the clean-EOF decrement): this covers the review
+    /// finding on #958 end to end through the real connection loop — a
+    /// malformed frame makes `decoder.next_frame::<ClientMessage>()?` (the
+    /// `'serve` loop, `docs/spec-pane-attribution.md`, #880) return an error
+    /// WHILE this connection is opted in, well before the loop's clean
+    /// fall-through. `serve_connection` must still return with the shared
+    /// counter back at zero — proving the decrement is not only reachable
+    /// from the bottom of the function.
+    #[tokio::test]
+    async fn test_serve_connection_pane_metrics_opt_in_decrements_counter_on_malformed_frame_error()
+    {
+        let (daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
+        let dispatch = tokio::spawn(daemon.run());
+        let (_host_metrics_tx, host_metrics) = test_host_metrics_handles();
+        let (_pane_metrics_tx, pane_metrics) = test_pane_metrics_handles();
+        let enabled = Arc::clone(&pane_metrics.enabled);
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+        let (server_reader, server_writer) = tokio::io::split(server);
+        let conn = tokio::spawn(async move {
+            serve_connection(
+                server_reader,
+                server_writer,
+                handles.inbound.clone(),
+                handles.subscribe(),
+                handles.state.clone(),
+                None,
+                None,
+                None,
+                None,
+                host_metrics,
+                pane_metrics,
+            )
+            .await
+        });
+
+        client_writer
+            .write_all(&hello_frame())
+            .await
+            .expect("send Hello");
+        client_writer
+            .write_all(
+                &encode_frame(&ClientMessage::SetPaneMetricsEnabled { enabled: true })
+                    .expect("encode opt-in"),
+            )
+            .await
+            .expect("send opt-in");
+        // A hand-built frame whose payload is not valid JSON at all (as
+        // opposed to a version mismatch or a well-formed-but-wrong message),
+        // so `decoder.next_frame::<ClientMessage>()?` fails exactly the way
+        // a corrupted stream would, deterministically and without touching
+        // the socket at the transport level.
+        let malformed_payload = b"not json";
+        let malformed_len = u32::try_from(malformed_payload.len())
+            .expect("payload length fits u32")
+            .to_be_bytes();
+        client_writer
+            .write_all(&malformed_len)
+            .await
+            .expect("send malformed frame length prefix");
+        client_writer
+            .write_all(malformed_payload)
+            .await
+            .expect("send malformed frame payload");
+        client_writer.flush().await.expect("flush");
+
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(
+            read_daemon_message(&mut client_reader, &mut decoder).await,
+            DaemonMessage::Welcome {
+                version: PROTOCOL_VERSION,
+            }
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(5), conn)
+            .await
+            .expect("serve_connection returns after the malformed frame")
+            .expect("connection task joins");
+        assert!(
+            result.is_err(),
+            "a malformed frame must surface as an error return, not a clean close"
+        );
+        assert_eq!(
+            enabled.load(Ordering::Relaxed),
+            0,
+            "an error return while opted in must still decrement the shared counter back to zero"
+        );
+
         dispatch.abort();
     }
 

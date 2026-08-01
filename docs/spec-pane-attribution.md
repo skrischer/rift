@@ -340,3 +340,16 @@ under the milestone. This spec owns the design; the issues own progress.
   `SetPaneMetricsEnabled` no-op arms (both never receive it in production, matching the
   `CloneRepo` convention) had their comments updated to drop the now-stale forward
   reference to this issue. No new dependency.
+- 2026-08-01 (#880 review fix): review on the #880 PR caught that the opt-in counter's
+  decrement ran only in the fall-through after `serve_connection`'s `'serve` loop — every
+  `?` early-return inside that loop (a read/write error, a malformed frame via
+  `decoder.next_frame()?`, etc.) skipped it, leaking a `+1` on an abrupt disconnect and
+  making `pane_metrics_sampler` refresh forever for a client no longer there. Replaced
+  the bare `pane_metrics_enabled: bool` with a `PaneMetricsOptIn` RAII guard (owns the
+  shared `Arc<AtomicUsize>` plus its own `counted: bool`): `set(enabled)` keeps the exact
+  same idempotent inc/dec-on-actual-transition semantics, and `Drop` decrements
+  unconditionally whenever still counted — covering the loop's `?` returns and a panic,
+  not only the clean fall-through. Added a direct unit test of the guard (construct,
+  opt in, return early via `?`, assert the counter is back at zero) plus an integration
+  test that drives a malformed frame through the real `serve_connection` loop while
+  opted in and asserts the same.
