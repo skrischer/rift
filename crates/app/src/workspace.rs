@@ -78,6 +78,7 @@ use gpui_component::notification::NotificationType;
 use gpui_component::{ActiveTheme as _, IconName, Root, Sizable as _, WindowExt as _};
 use rift_protocol::{
     ClientMessage, CloneError, DaemonMessage, DirBrowseError, DirEntry, EntryKind, LspServerState,
+    PaneMetric,
 };
 use rift_terminal::{SessionView, SessionViewEvent};
 use serde::{Deserialize, Serialize};
@@ -291,6 +292,11 @@ pub struct WorkspaceChannels {
     /// `HostMetrics` pushes to fold into the composite status line's MEM/CPU
     /// segment (`docs/spec-host-telemetry.md`).
     pub host_metrics_rx: Receiver<DaemonMessage>,
+    /// `PaneMetrics` pushes to fold into the composite status line's
+    /// per-pane breakdown popover (`docs/spec-pane-attribution.md`, #881):
+    /// per-connection and sent only while the popover is open (see
+    /// `pane_metrics_enabled_tx` below).
+    pub pane_metrics_rx: Receiver<DaemonMessage>,
     /// `FileDiff` replies to route to the diff view (#338).
     pub diff_rx: Receiver<DaemonMessage>,
     /// Read requests: the root-relative path of a file to open. The tokio side
@@ -335,6 +341,14 @@ pub struct WorkspaceChannels {
     /// [`WorkspaceView::apply_dir_entries_reply`] directly, since only one of
     /// the pre-/in-cockpit pickers is ever showing at a time.
     pub dir_browse_tx: Sender<ClientMessage>,
+    /// The per-pane breakdown popover's open/close toggle
+    /// (`docs/spec-pane-attribution.md`, #881): sent as a
+    /// `ClientMessage::SetPaneMetricsEnabled` directly from the popover's
+    /// `on_open_change` callback (`status_bar.rs`) — `true` while it is
+    /// open, `false` on close — so the daemon samples this connection's
+    /// panes only on demand. Push-only from here, mirroring `git_op_tx`: the
+    /// resulting breakdown arrives separately on `pane_metrics_rx` above.
+    pub pane_metrics_enabled_tx: Sender<ClientMessage>,
 }
 
 /// The four fixed workspace areas the activity rail carries one icon each for
@@ -553,6 +567,18 @@ pub struct WorkspaceView {
     /// host-metrics fold loop below, and a *subsequent* rising edge fires a
     /// single toast (`should_fire_pressure_toast`, #877).
     pressure_level: status_bar::PressureLevel,
+    /// The attached session's latest per-pane breakdown for the composite
+    /// status line's popover (`docs/spec-pane-attribution.md`, #881), folded
+    /// from the daemon's per-connection `PaneMetrics` push. Empty before the
+    /// first push arrives (sent only while the popover is open — there is no
+    /// Welcome replay for this per-connection, on-demand stream, unlike
+    /// `host_metrics`/`lsp` above). Read inline in [`WorkspaceView::render`].
+    pane_metrics: Vec<PaneMetric>,
+    /// The per-pane breakdown popover's open/close toggle sender
+    /// (`docs/spec-pane-attribution.md`, #881) — cloned into the popover's
+    /// `on_open_change` callback each render (`status_bar::render`), which
+    /// forwards it onto the protocol as `ClientMessage::SetPaneMetricsEnabled`.
+    pane_metrics_enabled_tx: Sender<ClientMessage>,
     /// The diff view (`docs/spec-source-control.md`, #338): renders the
     /// `FileDiff` streamed for the source-control panel's selection. Kept as
     /// its own field for the same reason as `problems_panel` above; the
@@ -674,6 +700,7 @@ impl WorkspaceView {
             nav_rx,
             lsp_status_rx,
             host_metrics_rx,
+            pane_metrics_rx,
             diff_rx,
             open_file_tx,
             save_file_tx,
@@ -684,6 +711,7 @@ impl WorkspaceView {
             file_op_tx,
             file_op_result_rx,
             dir_browse_tx,
+            pane_metrics_enabled_tx,
         } = channels;
 
         let file_tree = cx.new(|_| FileTree::new());
@@ -1098,6 +1126,34 @@ impl WorkspaceView {
                             status_bar::pressure_toast_message(mem_total, mem_available).into();
                         window.push_notification((notification_type, message), cx);
                     }
+                    cx.notify();
+                });
+                if result.is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
+
+        // Per-pane metrics stream -> composite status line breakdown popover
+        // (`docs/spec-pane-attribution.md`, #881): each `PaneMetrics` push
+        // replaces the latest breakdown wholesale, then a notify repaints
+        // the status bar — mirroring the host-metrics fold above. Unlike
+        // `host_metrics`/`lsp`, this stream is per-connection and sent only
+        // while the popover is open (no Welcome replay to seed a "current"
+        // value), so there is no seeding/pressure-toast logic here. Routed
+        // through this view's weak handle so a closed window ends the loop
+        // gracefully.
+        {
+            cx.spawn(async move |this, cx| loop {
+                let Ok(msg) = pane_metrics_rx.recv_async().await else {
+                    break;
+                };
+                let result = this.update(cx, |view, cx| {
+                    let DaemonMessage::PaneMetrics { entries } = msg else {
+                        return;
+                    };
+                    view.pane_metrics = entries;
                     cx.notify();
                 });
                 if result.is_err() {
@@ -1532,6 +1588,8 @@ impl WorkspaceView {
             lsp: BTreeMap::new(),
             host_metrics: None,
             pressure_level: status_bar::PressureLevel::Normal,
+            pane_metrics: Vec::new(),
+            pane_metrics_enabled_tx,
             diff_view,
             open_file_tx,
             dock_area,
@@ -2729,6 +2787,8 @@ impl Render for WorkspaceView {
                     lsp: &self.lsp,
                     host_metrics: self.host_metrics.as_ref(),
                     pressure_level: self.pressure_level,
+                    pane_metrics: &self.pane_metrics,
+                    pane_metrics_enabled_tx: self.pane_metrics_enabled_tx.clone(),
                     cursor,
                     clock: &clock,
                 },
@@ -3307,6 +3367,7 @@ mod tests {
         let (_nav_reply_tx, nav_rx) = flume::unbounded();
         let (_lsp_status_tx, lsp_status_rx) = flume::unbounded();
         let (_host_metrics_tx, host_metrics_rx) = flume::unbounded();
+        let (_pane_metrics_tx, pane_metrics_rx) = flume::unbounded();
         let (_diff_reply_tx, diff_rx) = flume::unbounded();
         let (open_file_tx, _open_file_rx) = flume::unbounded();
         let (save_file_tx, _save_file_rx) = flume::unbounded();
@@ -3317,12 +3378,14 @@ mod tests {
         let (file_op_tx, _file_op_rx) = flume::unbounded();
         let (_file_op_result_tx, file_op_result_rx) = flume::unbounded();
         let (dir_browse_tx, _dir_browse_rx) = flume::unbounded();
+        let (pane_metrics_enabled_tx, _pane_metrics_enabled_rx) = flume::unbounded();
         WorkspaceChannels {
             worktree_rx,
             buffer_rx,
             nav_rx,
             lsp_status_rx,
             host_metrics_rx,
+            pane_metrics_rx,
             diff_rx,
             open_file_tx,
             save_file_tx,
@@ -3333,6 +3396,7 @@ mod tests {
             file_op_tx,
             file_op_result_rx,
             dir_browse_tx,
+            pane_metrics_enabled_tx,
         }
     }
 
