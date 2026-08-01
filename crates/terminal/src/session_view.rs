@@ -7,6 +7,7 @@ use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::{h_flex, v_flex, ActiveTheme, Icon, IconName, Sizable};
 use termy_terminal_ui::TmuxSnapshot;
@@ -522,6 +523,13 @@ pub struct SessionView {
     /// stream) owns that. Rendered as the always-visible title-bar chip strip
     /// (#683), which replaced the phase-19 click-to-open popover.
     sessions: Vec<SessionListItem>,
+    /// Tracks the session strip's horizontal scroll offset (#905): shared
+    /// between the scrolling chip row (`.track_scroll`) and the overlay
+    /// [`gpui_component::scroll::Scrollbar`] in
+    /// [`Self::render_session_strip`] so the thumb reflects and drives the
+    /// same scroll position, mirroring `SessionPicker`'s vertical
+    /// `scroll_handle` (issue #804).
+    session_strip_scroll: ScrollHandle,
     /// The strip's in-progress inline session rename (#684), dispatched from
     /// a chip's right-click menu; when active, that chip renders the edit
     /// input in place of its name.
@@ -772,6 +780,7 @@ impl SessionView {
             prefix_options: PrefixOptions::default(),
             key_table_request_tx,
             sessions: Vec::new(),
+            session_strip_scroll: ScrollHandle::default(),
             renaming_session: None,
             confirming_kill: None,
             confirming_pane_kill: None,
@@ -1819,6 +1828,7 @@ impl SessionView {
         let danger = cx.theme().danger;
 
         let mut strip = h_flex()
+            .id("session-strip-chips")
             .items_center()
             .gap(px(4.0))
             .text_size(px(13.0))
@@ -2074,9 +2084,46 @@ impl SessionView {
                     view.open_new_session_prompt(cx);
                 });
             })
-            .child("+ New session...");
+            .child("+ New session...")
+            // Sits outside the scrollable chip region below so it stays
+            // reachable regardless of session count (#905) — it never
+            // shrinks and is never scrolled past.
+            .flex_none();
 
-        strip.child(new_session)
+        // Constrain the strip (#905): `flex_1` + `min_w_0` let this region
+        // shrink to whatever space the title bar's left group has left after
+        // the brand (`title_bar::render`'s left `h_flex` carries the matching
+        // `flex_1`/`min_w_0`), instead of forcing its own unbounded content
+        // width onto the row and pushing "+ New session" and the title bar's
+        // right-side connection/settings/window controls off-screen. Once
+        // shrunk below the chips' combined width, the chip row itself
+        // (`strip`, already `.id`'d above) becomes the horizontally
+        // scrollable region — overflowed chips are reachable via scroll/drag,
+        // with an overlay `Scrollbar` (`ScrollbarShow::Hover`, mirroring
+        // `SessionPicker`'s vertical one, #804) as the discoverable affordance
+        // rather than a silent wheel-only scroll.
+        h_flex()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        strip
+                            .min_w_0()
+                            .overflow_x_scroll()
+                            .track_scroll(&self.session_strip_scroll),
+                    )
+                    .child(
+                        Scrollbar::horizontal(&self.session_strip_scroll)
+                            .scrollbar_show(ScrollbarShow::Hover),
+                    ),
+            )
+            .child(new_session)
     }
 
     /// The reconnect banner's Cancel action: ask the SSH-level reconnect

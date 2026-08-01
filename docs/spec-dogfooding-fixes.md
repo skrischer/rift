@@ -230,3 +230,18 @@ includes:
   `!ks.modifiers.alt`, so it is unit-testable without a GPUI window. The downstream
   sink (`SessionView::apply_font_zoom`) was already correct and untouched; Ctrl+`+`/
   Ctrl+`=`/Ctrl+`-` (no Alt) still zoom.
+- 2026-08-01: **Session strip overflow pushing window controls off-screen** resolved
+  (#905). Category 2 (defect in an existing path). `render_session_strip` built a plain
+  `h_flex()` with no width constraint, and the title bar's left group
+  (`title_bar::render`) hosted it with no `min_w_0`/`max_w` either, so with enough
+  sessions the strip's unbounded content width pushed "+ New session" and the title
+  bar's right-side connection/settings/window controls off-screen. Fix: `flex_1` +
+  `min_w_0` on the left group (`title_bar.rs`) and again on the strip's own top-level
+  container let it shrink to whatever space remains after the brand, instead of
+  forcing its content width onto the row; the chip row itself becomes the
+  horizontally scrollable region past that point (`overflow_x_scroll` +
+  `track_scroll`, with an overlay `Scrollbar::horizontal` at `ScrollbarShow::Hover` as
+  the discoverable affordance, mirroring `SessionPicker`'s vertical scrollbar, #804).
+  "+ New session" sits outside the scrollable region as a `flex_none` sibling so it
+  stays reachable regardless of session count, never shrinking and never scrolled
+  past.
