@@ -206,3 +206,14 @@ includes:
   highlight to invisibility, caught by a CI test failure
   (`test_editor_surface_background_is_a_subtle_step_lighter_than_base`) before merge.
   `secondary` differs from `accent`, so the highlight stays visible.
+- 2026-08-01: **AltGr+Plus/Minus triggering font zoom** resolved (#903). Category 2
+  (defect in an existing path). The font-zoom guard in
+  `crates/terminal/src/pane_view.rs`'s `on_key_down` checked only
+  `ks.modifiers.control`, so AltGr — reported as Ctrl+Alt on Windows/Linux
+  (`keyboard.rs`'s `encode_keystroke_impl`) — matched the `"+"`/`"="`/`"-"` zoom arm
+  and `return`ed before the terminal's AltGr passthrough could send the composed
+  character (e.g. German AltGr+` -> `~`, physically the `+`/`~` key). Fix: extracted
+  the guard into a pure `font_zoom_delta(&Keystroke) -> i32` that also requires
+  `!ks.modifiers.alt`, so it is unit-testable without a GPUI window. The downstream
+  sink (`SessionView::apply_font_zoom`) was already correct and untouched; Ctrl+`+`/
+  Ctrl+`=`/Ctrl+`-` (no Alt) still zoom.
