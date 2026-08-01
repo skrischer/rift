@@ -88,7 +88,17 @@ pub fn render(
     TitleBar::new()
         .h(HEIGHT)
         .child(
+            // `flex_1` + `min_w_0` (#905): lets this group actually shrink
+            // when the session strip has many chips, instead of forcing its
+            // unbounded content width onto the bar and pushing the
+            // connection/settings group and the vendored window controls off
+            // to the right past the visible area. The brand keeps its full
+            // size (no flex properties -> its own min-content floor still
+            // protects it); `session_strip` (`SessionView::render_session_strip`)
+            // is the child that actually shrinks and becomes scrollable.
             h_flex()
+                .flex_1()
+                .min_w_0()
                 .items_center()
                 .gap(px(12.0))
                 .child(render_brand(cx))
@@ -96,6 +106,7 @@ pub fn render(
         )
         .child(
             h_flex()
+                .flex_none()
                 .items_center()
                 .gap(px(12.0))
                 .pr(px(4.0))

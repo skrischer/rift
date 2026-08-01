@@ -1364,6 +1364,15 @@ where
                                 }
                             }
                         }
+                        // The per-pane metrics opt-in
+                        // (`docs/spec-pane-attribution.md`, #879) is this
+                        // connection's on/off toggle for per-pane sampling.
+                        // Wire foundation only: the shared process-snapshot
+                        // gating, the per-connection subtree roll-up, and the
+                        // resulting `PaneMetrics` push all land in a
+                        // follow-on issue.
+                        // real handling: #880
+                        ClientMessage::SetPaneMetricsEnabled { .. } => {}
                     }
                 }
             }
@@ -2805,6 +2814,11 @@ impl Core {
             // connection, as a detached task (`docs/spec-clone-repo.md`); the
             // daemon-side execution lands in a follow-on issue (#828) — its
             // arm below is a defensive no-op until then.
+            //
+            // The per-pane metrics opt-in (`docs/spec-pane-attribution.md`,
+            // #879) is likewise answered per connection by
+            // `serve_connection` (real handling: #880); its arm below is a
+            // defensive no-op should it ever reach this loop.
             ClientMessage::Hello { .. }
             | ClientMessage::Attach { .. }
             | ClientMessage::Input { .. }
@@ -2830,7 +2844,8 @@ impl Core {
             | ClientMessage::RenamePath { .. }
             | ClientMessage::DeletePath { .. }
             | ClientMessage::QueryDirEntries { .. }
-            | ClientMessage::CloneRepo { .. } => {}
+            | ClientMessage::CloneRepo { .. }
+            | ClientMessage::SetPaneMetricsEnabled { .. } => {}
         }
     }
 

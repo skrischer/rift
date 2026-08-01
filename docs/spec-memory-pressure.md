@@ -308,3 +308,34 @@ under the milestone. This spec owns the design; the issues own progress.
   inside the existing `spawn_blocking`, exactly as the spec's daemon scope
   describes. `build_host_metrics_message` takes the PSI sample as a plain
   parameter and passes it straight through, staying a pure builder.
+- 2026-08-01 (#876, app pressure-model + recolour step): the accepted
+  threshold band gives separate enter/exit values for the mem-available axis
+  but only a single boundary for swap-used ("swap-used > 50%" / "> 80%", no
+  paired exit). Implemented the swap-used axis as a plain (non-hysteretic)
+  threshold check and reserved the enter/exit hysteresis state machine for
+  the mem-available axis only; the two axes combine via `PressureLevel::max`
+  (worse of the two), then PSI escalates the combined baseline. `pressure_level`
+  takes one overall previous `PressureLevel` (not a per-axis previous, matching
+  the spec's singular "taking the previous level"), so a level held by the
+  swap axis also anchors the mem-available axis's hysteresis on the next tick;
+  a descent out of `Critical` lands on `Warning` unless the sample also clears
+  the `Warning` exit threshold, rather than jumping straight to `Normal`. Toast
+  wiring, the `cx.spawn` -> `cx.spawn_in` conversion, and the seeded-vs-rising
+  edge distinction stay out of scope here (#877).
+- 2026-08-01 (#877, app toast step): converted the host-metrics fold loop
+  (`workspace.rs`) from `cx.spawn` to `cx.spawn_in(window, ...)` +
+  `update_in`, matching the diff/nav loops. Reused the existing
+  `view.host_metrics.is_none()` check (true only before the first sample) as
+  the seed marker, rather than adding a new field, so the seeding sample is
+  distinguished from a genuine rise without extra state. Extracted the
+  edge/re-arm decision into a small pure `should_fire_pressure_toast(seeding,
+  previous, new) -> bool` (`!seeding && new > previous`, using
+  `PressureLevel`'s derived `Ord`) so the trigger logic is unit-tested
+  headless, independent of the GPUI wiring; and a pure
+  `status_bar::pressure_toast_message(mem_total, mem_available) -> String`
+  for the "Host memory low - N% available" text (plain hyphen, matching the
+  issue's literal wording — the spec's prose em dash is not load-bearing).
+  `Warning` maps to `NotificationType::Warning`, `Critical` to
+  `NotificationType::Error`; the message text does not otherwise vary by
+  level, since the acceptance criteria only requires "naming the condition",
+  not distinct copy per level.

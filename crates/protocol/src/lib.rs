@@ -15,17 +15,19 @@ pub use frame::{encode_frame, FrameDecoder, FrameError, MAX_FRAME_LEN};
 /// is wire-compatible in one direction. The message set is pinned by the
 /// fingerprint test beside `PROTOCOL_FINGERPRINT` below, so a message-set
 /// change without a bump cannot pass CI.
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Pinned fingerprint of the protocol message set, checked by the
 /// `fingerprint_tests` module: an FNV-1a hash over the serde-visible surface
 /// of [`ClientMessage`] and [`DaemonMessage`] — container serde attributes,
 /// variant names, field names, and field types, with comments and whitespace
-/// ignored. When the message set changes deliberately, bump
-/// [`PROTOCOL_VERSION`] above and re-pin this value (the failing test prints
-/// the new fingerprint).
+/// ignored — plus the surface of every wire-reachable leaf enum referenced
+/// only as a field type (e.g. `Option<CloneError>`), so a variant added to
+/// one of those trips this too, not just the two top-level enums. When the
+/// message set changes deliberately, bump [`PROTOCOL_VERSION`] above and
+/// re-pin this value (the failing test prints the new fingerprint).
 #[cfg(test)]
-const PROTOCOL_FINGERPRINT: u64 = 0xb0fc_723e_ca5b_7294;
+const PROTOCOL_FINGERPRINT: u64 = 0x6591_c829_77d9_5ee8;
 
 /// Messages the client sends to the daemon.
 ///
@@ -338,6 +340,20 @@ pub enum ClientMessage {
     /// same as [`ClientMessage::CreateFile`].
     DeletePath {
         path: String,
+    },
+    /// Turn per-pane resource sampling on/off for this connection
+    /// (`docs/spec-pane-attribution.md`). The telemetry channel has no other
+    /// client→daemon request path (`HostMetrics` is unconditional and
+    /// daemon-global), so this is the opt-in a connection uses to drive
+    /// on-demand per-pane sampling: `true` while its breakdown popover is
+    /// open, `false` on close or disconnect. The daemon gates a
+    /// process-global shared snapshot refresh on the count of connections
+    /// currently opted in (zero -> no process work) and, per opted-in
+    /// connection, rolls up and pushes its own session's
+    /// [`DaemonMessage::PaneMetrics`] — never a daemon-global broadcast, so
+    /// one connection's toggle cannot affect another's stream.
+    SetPaneMetricsEnabled {
+        enabled: bool,
     },
     Hello {
         version: u32,
@@ -739,6 +755,21 @@ pub enum DaemonMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         psi: Option<MemoryPressure>,
     },
+    /// A per-pane resource attribution breakdown for the attached session
+    /// (`docs/spec-pane-attribution.md`): for each pane the daemon rolls up
+    /// the `/proc` process subtree rooted at the pane's process and reports
+    /// its resident memory and CPU. Unlike [`HostMetrics`](DaemonMessage::HostMetrics)
+    /// this is **per-connection, not daemon-global** — each `serve_connection`
+    /// computes and pushes its own session's list, never the shared broadcast
+    /// bus, so one connection's panes are never leaked onto another's stream
+    /// (relevant when two connections attach different tmux sessions on the
+    /// same host). Push-only, and sent only while this connection has opted
+    /// in via [`ClientMessage::SetPaneMetricsEnabled`] (the on-demand sampling
+    /// model — an idle daemon with no breakdown open does zero process
+    /// refresh work).
+    PaneMetrics {
+        entries: Vec<PaneMetric>,
+    },
     Welcome {
         version: u32,
     },
@@ -996,6 +1027,27 @@ pub struct MemoryPressure {
     pub full_avg10: f64,
     pub full_avg60: f64,
     pub full_avg300: f64,
+}
+
+/// One pane's resource attribution row, carried by
+/// [`DaemonMessage::PaneMetrics`] (`docs/spec-pane-attribution.md`). `pane_id`
+/// matches the layout's pane id ([`PaneLayout::pane_id`]) — the client keys on
+/// it exactly as it does for output/resize; the daemon never ships the
+/// underlying host pid. `rss` is the pane's `/proc` process-subtree resident
+/// memory in bytes (the pane's process and every descendant, summed); `cpu`
+/// is the subtree's CPU usage (0.0-100.0 times the core count, `sysinfo`'s
+/// convention, matching [`DaemonMessage::HostMetrics::cpu`]'s scale). `command`
+/// is the pane's agnostic `pane_current_command` label, re-shipped on every
+/// push (not looked up from a separately cached layout) so a
+/// [`DaemonMessage::PaneMetrics`] push is a **self-contained, sample-coherent**
+/// snapshot that still renders correctly if a pane has since vanished from
+/// the layout. No `Eq`: `cpu` is `f32`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PaneMetric {
+    pub pane_id: u32,
+    pub rss: u64,
+    pub cpu: f32,
+    pub command: String,
 }
 
 /// One diagnostic a language server reports for a file: a source span plus the
@@ -2269,6 +2321,80 @@ mod tests {
                 "malformed HostMetrics must not deserialize: {json}"
             );
         }
+    }
+
+    #[test]
+    fn test_pane_metrics_roundtrip_preserves_entries() {
+        let msg = DaemonMessage::PaneMetrics {
+            entries: vec![
+                PaneMetric {
+                    pane_id: 1,
+                    rss: 123_456_789,
+                    cpu: 12.5,
+                    command: "cargo".to_owned(),
+                },
+                PaneMetric {
+                    pane_id: 2,
+                    rss: 0,
+                    cpu: 0.0,
+                    command: String::new(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&msg).expect("serialize PaneMetrics");
+        assert!(json.contains(r#""type":"pane_metrics""#));
+        assert!(json.contains(r#""pane_id":1"#));
+        assert!(json.contains(r#""rss":123456789"#));
+        assert!(json.contains(r#""cpu":12.5"#));
+        assert!(json.contains(r#""command":"cargo""#));
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize PaneMetrics"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_pane_metrics_empty_entries_roundtrips() {
+        let msg = DaemonMessage::PaneMetrics { entries: vec![] };
+        let json = serde_json::to_string(&msg).expect("serialize empty PaneMetrics");
+        assert_eq!(json, r#"{"type":"pane_metrics","entries":[]}"#);
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize empty PaneMetrics"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_pane_metrics_malformed_entry_is_rejected() {
+        for json in [
+            // Missing `command` on the entry.
+            r#"{"type":"pane_metrics","entries":[{"pane_id":1,"rss":1,"cpu":1.0}]}"#,
+            // Missing the top-level `entries` field entirely.
+            r#"{"type":"pane_metrics"}"#,
+            // `pane_id` as a string instead of a u32.
+            r#"{"type":"pane_metrics","entries":[{"pane_id":"1","rss":1,"cpu":1.0,"command":""}]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<DaemonMessage>(json).is_err(),
+                "malformed PaneMetrics must not deserialize: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pane_metric_roundtrip_preserves_all_fields() {
+        let metric = PaneMetric {
+            pane_id: 7,
+            rss: 42,
+            cpu: 3.5,
+            command: "bash".to_owned(),
+        };
+        let json = serde_json::to_string(&metric).expect("serialize PaneMetric");
+        assert_eq!(json, r#"{"pane_id":7,"rss":42,"cpu":3.5,"command":"bash"}"#);
+        assert_eq!(
+            serde_json::from_str::<PaneMetric>(&json).expect("deserialize PaneMetric"),
+            metric
+        );
     }
 
     #[test]
@@ -3735,6 +3861,30 @@ mod tests {
     }
 
     #[test]
+    fn test_set_pane_metrics_enabled_roundtrip_true_and_false() {
+        for enabled in [true, false] {
+            let msg = ClientMessage::SetPaneMetricsEnabled { enabled };
+            let json = serde_json::to_string(&msg).expect("serialize SetPaneMetricsEnabled");
+            assert_eq!(
+                json,
+                format!(r#"{{"type":"set_pane_metrics_enabled","enabled":{enabled}}}"#)
+            );
+            let parsed: ClientMessage =
+                serde_json::from_str(&json).expect("deserialize SetPaneMetricsEnabled");
+            assert_eq!(parsed, msg);
+        }
+    }
+
+    #[test]
+    fn test_set_pane_metrics_enabled_missing_field_is_rejected() {
+        let err = serde_json::from_str::<ClientMessage>(r#"{"type":"set_pane_metrics_enabled"}"#);
+        assert!(
+            err.is_err(),
+            "set_pane_metrics_enabled without enabled must not deserialize"
+        );
+    }
+
+    #[test]
     fn test_file_op_result_ok_roundtrip_for_each_op() {
         // One representative op per FileOp variant, success case: `error`
         // must be omitted on the wire, never serialized as `null`.
@@ -4272,8 +4422,13 @@ mod tests {
 /// Pins the protocol message set: a stable FNV-1a hash over the serde-visible
 /// surface of `ClientMessage` and `DaemonMessage` (container serde attributes,
 /// variant names, field names, field TYPES — so a wire-breaking type change
-/// also trips it), extracted from this crate's own source with comments and
-/// whitespace stripped. Changing either enum without re-pinning fails
+/// also trips it), plus the surface of every enum in [`REACHABLE_LEAF_ENUMS`]
+/// — enums such as `CloneError`/`DirBrowseError`/`FileOpError` that are
+/// referenced only as a field type (e.g. `Option<CloneError>`), so their own
+/// variant names never appear in `ClientMessage`/`DaemonMessage`'s own text
+/// and a variant added to one would otherwise be invisible to this
+/// fingerprint. All extracted from this crate's own source with comments and
+/// whitespace stripped. Changing any covered enum without re-pinning fails
 /// `cargo test -p rift-protocol`; the failure message instructs to bump
 /// `PROTOCOL_VERSION` and re-pin (`docs/protocol.md` — Versioning policy).
 #[cfg(test)]
@@ -4305,7 +4460,24 @@ mod fingerprint_tests {
     fn enum_surface(source: &str, name: &str) -> Option<String> {
         let stripped = strip_line_comments(source);
         let decl = format!("pub enum {name}");
-        let start = stripped.find(&decl)?;
+
+        // A plain substring search would match `pub enum FileOp` inside the
+        // unrelated, longer declaration `pub enum FileOpError` (`FileOp` is a
+        // prefix of `FileOpError`). Require the character right after `decl`
+        // to not continue an identifier, skipping past any such false match.
+        let mut search_from = 0usize;
+        let start = loop {
+            let found = search_from + stripped[search_from..].find(&decl)?;
+            let after = found + decl.len();
+            let is_boundary = stripped[after..]
+                .chars()
+                .next()
+                .is_none_or(|ch| ch != '_' && !ch.is_alphanumeric());
+            if is_boundary {
+                break found;
+            }
+            search_from = found + decl.len();
+        };
 
         let body_open = start + stripped[start..].find('{')?;
         let mut depth = 0usize;
@@ -4364,12 +4536,45 @@ mod fingerprint_tests {
         hash
     }
 
-    /// The message-set fingerprint: FNV-1a over both message enums' surfaces,
+    /// Every enum reachable from a [`ClientMessage`]/[`DaemonMessage`] field —
+    /// directly (e.g. `DirEntriesReply::error: Option<DirBrowseError>`) or
+    /// transitively through a struct field (e.g. `WorktreeEntry::kind:
+    /// EntryKind`) — that is NOT itself one of the two top-level message
+    /// enums. Each is a closed, `#[serde(rename_all = "snake_case")]`-style
+    /// (or `kind`-tagged) leaf enum whose variant names never appear in
+    /// `ClientMessage`'s or `DaemonMessage`'s own text, so adding a variant
+    /// to one is invisible unless its surface is extracted separately here.
+    ///
+    /// [`ClientMessage`]: super::ClientMessage
+    /// [`DaemonMessage`]: super::DaemonMessage
+    const REACHABLE_LEAF_ENUMS: &[&str] = &[
+        "DirBrowseError",
+        "CloneError",
+        "EntryKind",
+        "GitStatusCode",
+        "DiagnosticSeverity",
+        "LspServerState",
+        "BufferErrorReason",
+        "FileOpError",
+        "SymbolKind",
+        "FileDiffPayload",
+        "DiffLineKind",
+        "GitWriteOp",
+        "FileOp",
+    ];
+
+    /// The message-set fingerprint: FNV-1a over `ClientMessage`,
+    /// `DaemonMessage`, and every [`REACHABLE_LEAF_ENUMS`] surface, each
     /// separated so content cannot shift between them without a hash change.
     fn message_set_fingerprint(source: &str) -> Option<u64> {
-        let client = enum_surface(source, "ClientMessage")?;
-        let daemon = enum_surface(source, "DaemonMessage")?;
-        Some(fnv1a_64(format!("{client}|{daemon}").as_bytes()))
+        let mut combined = enum_surface(source, "ClientMessage")?;
+        combined.push('|');
+        combined.push_str(&enum_surface(source, "DaemonMessage")?);
+        for name in REACHABLE_LEAF_ENUMS {
+            combined.push('|');
+            combined.push_str(&enum_surface(source, name)?);
+        }
+        Some(fnv1a_64(combined.as_bytes()))
     }
 
     /// A sample enum shaped like the real message enums, for the trip-wire
@@ -4513,5 +4718,65 @@ pub enum Sample {
         );
         // A declaration with no body brace at all.
         assert_eq!(enum_surface("pub enum Broken", "Broken"), None);
+    }
+
+    #[test]
+    fn test_enum_surface_prefix_name_does_not_match_longer_enum() {
+        // `FileOp` is a textual prefix of `FileOpError` (`crates/protocol`
+        // has both, real precedent for this collision): a naive substring
+        // search for `pub enum FileOp` would match inside `pub enum
+        // FileOpError`'s declaration instead. Reproduced with a small
+        // synthetic source so the assertion does not depend on the real
+        // enums' current field lists.
+        let source = r#"
+pub enum FooError {
+    Bar,
+}
+
+pub enum Foo {
+    Baz,
+}
+"#;
+        let foo = enum_surface(source, "Foo").expect("extract Foo");
+        assert!(foo.contains("Baz"), "surface was {foo:?}");
+        assert!(!foo.contains("Bar"), "surface was {foo:?}");
+
+        let foo_error = enum_surface(source, "FooError").expect("extract FooError");
+        assert!(foo_error.contains("Bar"), "surface was {foo_error:?}");
+    }
+
+    #[test]
+    fn test_message_set_fingerprint_leaf_enum_variant_addition_changes_fingerprint() {
+        // CloneError is referenced in DaemonMessage only as a field type
+        // (`Option<CloneError>`) -- its own variant names never appear in
+        // DaemonMessage's text. Before widening `message_set_fingerprint` to
+        // cover REACHABLE_LEAF_ENUMS, adding a variant here left the
+        // fingerprint unchanged (the exact latent hole issue #844 reports).
+        // `Other,` (with this exact indentation) appears exactly once in the
+        // crate source, as CloneError's last variant.
+        assert_eq!(
+            PROTOCOL_SOURCE.matches("    Other,\n}").count(),
+            1,
+            "test anchor must be unique in the crate source"
+        );
+        let grown =
+            PROTOCOL_SOURCE.replacen("    Other,\n}", "    Other,\n    Hypothetical,\n}", 1);
+        assert_ne!(
+            message_set_fingerprint(PROTOCOL_SOURCE),
+            message_set_fingerprint(&grown),
+            "a variant added to a wire-reachable leaf enum must change the fingerprint"
+        );
+    }
+
+    #[test]
+    fn test_message_set_fingerprint_unreachable_enum_addition_keeps_fingerprint() {
+        // Adding a whole new enum that is not reachable from ClientMessage's
+        // or DaemonMessage's fields (and not in REACHABLE_LEAF_ENUMS) is
+        // wire-invisible by construction and must not move the fingerprint.
+        let with_new_enum = format!("{PROTOCOL_SOURCE}\npub enum TotallyUnrelated {{ A, B }}\n");
+        assert_eq!(
+            message_set_fingerprint(PROTOCOL_SOURCE),
+            message_set_fingerprint(&with_new_enum)
+        );
     }
 }

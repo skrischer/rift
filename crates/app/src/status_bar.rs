@@ -21,7 +21,7 @@ use gpui::{
     ParentElement as _, SharedString, Styled as _,
 };
 use gpui_component::{h_flex, ActiveTheme as _};
-use rift_protocol::{AheadBehind, Diagnostic, DiagnosticSeverity, LspServerState};
+use rift_protocol::{AheadBehind, Diagnostic, DiagnosticSeverity, LspServerState, MemoryPressure};
 use rift_terminal::{PaneActivity, SessionView, StatusWindow};
 
 /// Fixed height of the composite status line, in pixels (the design's 28px).
@@ -40,9 +40,9 @@ const NO_BRANCH_LABEL: &str = "detached HEAD";
 /// `DaemonMessage::HostMetrics` push (`docs/spec-host-telemetry.md`). `protocol`
 /// carries the full sample inline on the enum variant rather than as a separate
 /// reusable type (unlike `LspServerState`), so this narrows it to the fields the
-/// composite status line's MEM/CPU segment actually reads; a later phase widens
-/// it as the pressure warning (Phase 44) and per-pane attribution (Phase 45)
-/// need more of the daemon's coherent sample (`swap_*`, `load`, `cpu_count`).
+/// composite status line's MEM/CPU segment and [`pressure_level`]
+/// (`docs/spec-memory-pressure.md`) read; per-pane attribution (Phase 45) may
+/// widen it further.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HostMetrics {
     /// Aggregate CPU load, 0.0-100.0.
@@ -52,6 +52,159 @@ pub struct HostMetrics {
     /// `MemAvailable` from `/proc/meminfo`, in bytes — the basis for "how much
     /// RAM is really free" (`docs/spec-host-telemetry.md`).
     pub mem_available: u64,
+    /// Total configured swap, in bytes — the denominator for the swap-used
+    /// ratio [`pressure_level`] reads (`docs/spec-memory-pressure.md`).
+    pub swap_total: u64,
+    /// Swap currently in use, in bytes.
+    pub swap_used: u64,
+    /// Linux PSI memory-stall averages, where the kernel exposes
+    /// `/proc/pressure/memory` (`None` on hosts without `CONFIG_PSI`, e.g. the
+    /// stock `microsoft-standard-WSL2` kernel) — an optional escalation signal
+    /// for [`pressure_level`].
+    pub psi: Option<MemoryPressure>,
+}
+
+/// The recolour states for the composite status line's MEM/CPU segment,
+/// computed by [`pressure_level`] from the pushed [`HostMetrics`] sample
+/// (`docs/spec-memory-pressure.md`). Declared `Normal < Warning < Critical` so
+/// `PressureLevel::max` picks "the worse of the two" when combining the
+/// independent mem-available / swap-used / PSI triggers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum PressureLevel {
+    #[default]
+    Normal,
+    Warning,
+    Critical,
+}
+
+/// Warning enters when the `MemAvailable` ratio falls below this fraction of
+/// total RAM (the "Standard" threshold band,
+/// `docs/spec-memory-pressure.md`).
+const WARNING_MEM_AVAILABLE_ENTER: f64 = 0.20;
+/// Warning exits back to `Normal` once the `MemAvailable` ratio recovers above
+/// this fraction — separate from the enter threshold so the segment does not
+/// flap at the boundary (hysteresis).
+const WARNING_MEM_AVAILABLE_EXIT: f64 = 0.25;
+/// Critical enters when the `MemAvailable` ratio falls below this fraction.
+const CRITICAL_MEM_AVAILABLE_ENTER: f64 = 0.10;
+/// Critical exits back toward `Warning` once the `MemAvailable` ratio
+/// recovers above this fraction (hysteresis).
+const CRITICAL_MEM_AVAILABLE_EXIT: f64 = 0.15;
+/// Warning triggers once the swap-used ratio exceeds this fraction of total
+/// swap. Unlike the mem-available axis, the spec gives a single boundary here
+/// (no separate exit value), so this axis is a plain threshold check.
+const WARNING_SWAP_USED: f64 = 0.50;
+/// Critical triggers once the swap-used ratio exceeds this fraction.
+const CRITICAL_SWAP_USED: f64 = 0.80;
+/// PSI `some_avg10` (percent of wall-clock time at least one task stalled on
+/// memory, over the trailing 10s) above this cutoff escalates a `Normal`
+/// baseline to `Warning`.
+const PSI_SOME_AVG10_WARNING_CUTOFF: f64 = 5.0;
+
+/// Compute the client-side memory-pressure level from a pushed [`HostMetrics`]
+/// sample, given the previously computed level (for hysteresis,
+/// `docs/spec-memory-pressure.md`). Memory-only trigger — `cpu`/load never
+/// factor in. The portable baseline (`MemAvailable` ratio + swap-used ratio)
+/// always drives the level so every host, including the PSI-less stock WSL2
+/// kernel, gets a working signal; PSI, where present, only ever escalates the
+/// baseline upward, never lowers it.
+pub fn pressure_level(sample: HostMetrics, previous: PressureLevel) -> PressureLevel {
+    let mem_available_ratio = if sample.mem_total == 0 {
+        1.0
+    } else {
+        sample.mem_available as f64 / sample.mem_total as f64
+    };
+    let swap_used_ratio = if sample.swap_total == 0 {
+        0.0
+    } else {
+        sample.swap_used as f64 / sample.swap_total as f64
+    };
+
+    let mem_level = mem_available_level(mem_available_ratio, previous);
+    let swap_level = if swap_used_ratio > CRITICAL_SWAP_USED {
+        PressureLevel::Critical
+    } else if swap_used_ratio > WARNING_SWAP_USED {
+        PressureLevel::Warning
+    } else {
+        PressureLevel::Normal
+    };
+    let baseline = mem_level.max(swap_level);
+
+    escalate_with_psi(baseline, sample.psi)
+}
+
+/// The `MemAvailable`-ratio axis of [`pressure_level`], with enter/exit
+/// hysteresis: `previous` decides which boundary applies so the level holds
+/// steady inside the enter/exit gap instead of flapping. Descending out of
+/// `Critical` lands on `Warning` unless the ratio also clears the `Warning`
+/// exit threshold, matching a gradual recovery rather than a jump straight to
+/// `Normal`.
+fn mem_available_level(ratio: f64, previous: PressureLevel) -> PressureLevel {
+    match previous {
+        PressureLevel::Critical => {
+            if ratio <= CRITICAL_MEM_AVAILABLE_EXIT {
+                PressureLevel::Critical
+            } else if ratio <= WARNING_MEM_AVAILABLE_EXIT {
+                PressureLevel::Warning
+            } else {
+                PressureLevel::Normal
+            }
+        }
+        PressureLevel::Warning => {
+            if ratio < CRITICAL_MEM_AVAILABLE_ENTER {
+                PressureLevel::Critical
+            } else if ratio > WARNING_MEM_AVAILABLE_EXIT {
+                PressureLevel::Normal
+            } else {
+                PressureLevel::Warning
+            }
+        }
+        PressureLevel::Normal => {
+            if ratio < CRITICAL_MEM_AVAILABLE_ENTER {
+                PressureLevel::Critical
+            } else if ratio < WARNING_MEM_AVAILABLE_ENTER {
+                PressureLevel::Warning
+            } else {
+                PressureLevel::Normal
+            }
+        }
+    }
+}
+
+/// PSI escalation over `baseline` (`docs/spec-memory-pressure.md`): a present
+/// stall only ever raises the level, never lowers it. Absent PSI (`None`,
+/// e.g. stock WSL2) leaves `baseline` untouched.
+fn escalate_with_psi(baseline: PressureLevel, psi: Option<MemoryPressure>) -> PressureLevel {
+    let Some(psi) = psi else {
+        return baseline;
+    };
+    let mut level = baseline;
+    if psi.some_avg10 > PSI_SOME_AVG10_WARNING_CUTOFF {
+        level = level.max(PressureLevel::Warning);
+    }
+    if psi.full_avg10 > 0.0 {
+        level = level.max(PressureLevel::Critical);
+    }
+    level
+}
+
+/// The upward-transition memory-pressure toast message
+/// (`docs/spec-memory-pressure.md`), e.g. `"Host memory low - 8% available"`:
+/// the `MemAvailable` ratio as an integer percentage, guarded against
+/// `mem_total == 0` the same way [`metrics_text`] is. The caller
+/// (`workspace.rs`'s host-metrics fold loop) picks the `NotificationType`
+/// (`Warning`/`Error`) from the new [`PressureLevel`]; this only names the
+/// condition.
+pub fn pressure_toast_message(mem_total: u64, mem_available: u64) -> String {
+    let available_pct = if mem_total == 0 {
+        0.0
+    } else {
+        mem_available as f64 / mem_total as f64 * 100.0
+    };
+    format!(
+        "Host memory low - {}% available",
+        available_pct.round() as i64
+    )
 }
 
 /// The full set of values the composite status line renders, borrowed from the
@@ -81,6 +234,11 @@ pub struct StatusLineModel<'a> {
     /// first sample arrives — hides the MEM/CPU segment entirely, mirroring
     /// the LSP dot before a server is known (`docs/spec-host-telemetry.md`).
     pub host_metrics: Option<&'a HostMetrics>,
+    /// The memory-pressure level computed from `host_metrics`
+    /// (`docs/spec-memory-pressure.md`), which recolours the MEM/CPU segment
+    /// text — `Normal` -> `theme.muted_foreground`, `Warning` -> `theme.warning`,
+    /// `Critical` -> `theme.danger`. Unused while `host_metrics` is `None`.
+    pub pressure_level: PressureLevel,
     /// The active editor tab's zero-based cursor `(line, column)`, or `None`
     /// when no tab is open.
     pub cursor: Option<(u32, u32)>,
@@ -275,11 +433,17 @@ pub fn render(
     });
 
     // Host resource segment (`docs/spec-host-telemetry.md`): hidden until the
-    // first `HostMetrics` sample arrives, neutral-colored — threshold/pressure
-    // coloring is Phase 44.
+    // first `HostMetrics` sample arrives; text color follows the client-side
+    // `pressure_level` (`docs/spec-memory-pressure.md`) — neutral / warning /
+    // critical, the same semantic tokens the diagnostic counts and LSP dot use.
+    let pressure_color = match model.pressure_level {
+        PressureLevel::Normal => theme.muted_foreground,
+        PressureLevel::Warning => theme.warning,
+        PressureLevel::Critical => theme.danger,
+    };
     let metrics = model.host_metrics.map(|m| {
         div()
-            .text_color(theme.muted_foreground)
+            .text_color(pressure_color)
             .child(SharedString::from(metrics_text(
                 m.cpu,
                 m.mem_total,
@@ -573,5 +737,188 @@ mod tests {
     #[test]
     fn test_metrics_text_guards_against_zero_mem_total() {
         assert_eq!(metrics_text(10.0, 0, 0), "MEM 0% \u{b7} CPU 10%");
+    }
+
+    // --- pressure_toast_message (docs/spec-memory-pressure.md) ---------------
+
+    #[test]
+    fn test_pressure_toast_message_names_available_percentage() {
+        assert_eq!(
+            pressure_toast_message(16_000_000_000, 1_280_000_000),
+            "Host memory low - 8% available"
+        );
+    }
+
+    #[test]
+    fn test_pressure_toast_message_guards_against_zero_mem_total() {
+        assert_eq!(
+            pressure_toast_message(0, 0),
+            "Host memory low - 0% available"
+        );
+    }
+
+    // --- pressure_level (docs/spec-memory-pressure.md) -----------------------
+
+    /// Builds a sample with a 16 GB host and a 4 GB swap, at the given
+    /// `mem_available` / `swap_used` byte counts, no PSI.
+    fn sample(mem_available: u64, swap_used: u64) -> HostMetrics {
+        HostMetrics {
+            cpu: 0.0,
+            mem_total: 16_000_000_000,
+            mem_available,
+            swap_total: 4_000_000_000,
+            swap_used,
+            psi: None,
+        }
+    }
+
+    fn sample_with_psi(mem_available: u64, psi: MemoryPressure) -> HostMetrics {
+        HostMetrics {
+            psi: Some(psi),
+            ..sample(mem_available, 0)
+        }
+    }
+
+    fn no_stall() -> MemoryPressure {
+        MemoryPressure {
+            some_avg10: 0.0,
+            some_avg60: 0.0,
+            some_avg300: 0.0,
+            full_avg10: 0.0,
+            full_avg60: 0.0,
+            full_avg300: 0.0,
+        }
+    }
+
+    #[test]
+    fn test_pressure_level_mem_available_bands_from_normal_baseline() {
+        // 30% available: comfortably normal.
+        assert_eq!(
+            pressure_level(sample(4_800_000_000, 0), PressureLevel::Normal),
+            PressureLevel::Normal
+        );
+        // 15% available: inside the warning band (<20%, not yet <10%).
+        assert_eq!(
+            pressure_level(sample(2_400_000_000, 0), PressureLevel::Normal),
+            PressureLevel::Warning
+        );
+        // 5% available: inside the critical band (<10%).
+        assert_eq!(
+            pressure_level(sample(800_000_000, 0), PressureLevel::Normal),
+            PressureLevel::Critical
+        );
+    }
+
+    #[test]
+    fn test_pressure_level_swap_used_bands_trigger_independent_of_mem_available() {
+        // Ample mem-available (80%), but swap 60% used -> warning.
+        assert_eq!(
+            pressure_level(sample(12_800_000_000, 2_400_000_000), PressureLevel::Normal),
+            PressureLevel::Warning
+        );
+        // Ample mem-available (80%), but swap 90% used -> critical.
+        assert_eq!(
+            pressure_level(sample(12_800_000_000, 3_600_000_000), PressureLevel::Normal),
+            PressureLevel::Critical
+        );
+    }
+
+    #[test]
+    fn test_pressure_level_warning_hysteresis_holds_inside_enter_exit_gap() {
+        // 22% available sits inside the warning enter (<20%) / exit (>25%)
+        // gap: from a Normal previous it never entered warning...
+        assert_eq!(
+            pressure_level(sample(3_520_000_000, 0), PressureLevel::Normal),
+            PressureLevel::Normal
+        );
+        // ...but from a Warning previous it holds at warning rather than
+        // dropping back to normal, since 22% has not cleared the 25% exit.
+        assert_eq!(
+            pressure_level(sample(3_520_000_000, 0), PressureLevel::Warning),
+            PressureLevel::Warning
+        );
+        // Once available clears the 25% exit threshold, it returns to normal.
+        assert_eq!(
+            pressure_level(sample(4_100_000_000, 0), PressureLevel::Warning),
+            PressureLevel::Normal
+        );
+    }
+
+    #[test]
+    fn test_pressure_level_critical_hysteresis_holds_inside_enter_exit_gap() {
+        // 12% available sits inside the critical enter (<10%) / exit (>15%)
+        // gap: holds at critical from a Critical previous...
+        assert_eq!(
+            pressure_level(sample(1_920_000_000, 0), PressureLevel::Critical),
+            PressureLevel::Critical
+        );
+        // ...but from a Warning previous, 12% never re-entered critical.
+        assert_eq!(
+            pressure_level(sample(1_920_000_000, 0), PressureLevel::Warning),
+            PressureLevel::Warning
+        );
+        // Past the 15% critical exit but still under the 25% warning exit:
+        // descends to warning, not straight to normal.
+        assert_eq!(
+            pressure_level(sample(2_560_000_000, 0), PressureLevel::Critical),
+            PressureLevel::Warning
+        );
+        // Past both exits: descends all the way to normal.
+        assert_eq!(
+            pressure_level(sample(4_100_000_000, 0), PressureLevel::Critical),
+            PressureLevel::Normal
+        );
+    }
+
+    #[test]
+    fn test_pressure_level_psi_present_escalates_normal_baseline() {
+        // Ample mem-available (80%) so the baseline alone is Normal.
+        let base_mem_available = 12_800_000_000;
+        // some_avg10 above the 5% cutoff escalates Normal -> Warning.
+        let stalling = MemoryPressure {
+            some_avg10: 6.0,
+            ..no_stall()
+        };
+        assert_eq!(
+            pressure_level(
+                sample_with_psi(base_mem_available, stalling),
+                PressureLevel::Normal
+            ),
+            PressureLevel::Warning
+        );
+        // Any full_avg10 > 0 escalates all the way to Critical.
+        let fully_stalled = MemoryPressure {
+            full_avg10: 0.1,
+            ..no_stall()
+        };
+        assert_eq!(
+            pressure_level(
+                sample_with_psi(base_mem_available, fully_stalled),
+                PressureLevel::Normal
+            ),
+            PressureLevel::Critical
+        );
+    }
+
+    #[test]
+    fn test_pressure_level_psi_absent_leaves_baseline_intact() {
+        // Warning-band mem-available (15%), no PSI: baseline stands alone.
+        assert_eq!(
+            pressure_level(sample(2_400_000_000, 0), PressureLevel::Normal),
+            PressureLevel::Warning
+        );
+    }
+
+    #[test]
+    fn test_pressure_level_psi_never_lowers_a_worse_baseline() {
+        // Critical baseline (5% available) with a quiet PSI reading: PSI only
+        // ever raises the level, so it must not pull critical back down.
+        assert_eq!(
+            pressure_level(
+                sample_with_psi(800_000_000, no_stall()),
+                PressureLevel::Normal
+            ),
+            PressureLevel::Critical
+        );
     }
 }
