@@ -344,3 +344,47 @@ under the milestone. This spec owns the design; the issues own progress.
   `spawn_pane_metrics_bridge`: a pure `should_forward(last, next)` helper
   dedups consecutive same-`enabled` sends before they reach the protocol,
   restoring a balanced stream without touching the popover/status_bar code.
+- 2026-08-01 (#880, daemon issue landed): `LAYOUT_QUERY` gained `#{pane_pid}` right
+  before the trailing `window_name`; `parse_layout_line`'s `splitn(13, '\t')` became
+  `splitn(14, '\t')`, `ParsedPaneLine` gained a `pane_pid: u32` field, and `parse_layout`
+  now also returns this session's `pane_id -> pane_pid` map alongside the windows — all
+  daemon-internal, the wire `PaneLayout` is unchanged. `terminal_task` gained a
+  `PanePids` sender parameter (the same `try_send`/full-replace discipline as the
+  existing `RootResolved` channel) so `Attach::process` surfaces a fresh map to
+  `serve_connection` on every layout query reply. A new daemon-global `PaneMetricsBus`
+  holds a `watch<Option<Arc<ProcessSnapshot>>>` plus the process-global opt-in counter;
+  `pane_metrics_sampler` (mirroring `host_metrics_sampler`'s shape) refreshes
+  `sysinfo`'s process table under `spawn_blocking` once per tick ONLY while the counter
+  is above zero, then publishes one immutable `ProcessSnapshot` (`parent_pid ->
+  children` index + per-pid `{ rss, cpu }`) built by `ProcessSnapshot::from_system`.
+  `ProcessSnapshot::subtree_usage` DFS-sums a pane pid's own usage plus every
+  descendant's from that one snapshot; an unknown/dead pid yields a zeroed (not
+  absent/error) result. `serve_connection` replaced the #879 `SetPaneMetricsEnabled`
+  placeholder with the real inc/dec of the shared counter (plus disconnect-cleanup
+  decrement) and, while opted in, rolls up its own session's panes
+  (`build_pane_metrics`, labelled solely from `pane_current_command` cached off its own
+  `LayoutSnapshot`/`LayoutUpdate` stream — never a content read or agent match) and
+  pushes its own `DaemonMessage::PaneMetrics` straight to its own socket on every shared
+  snapshot tick, plus once immediately on opt-in from whatever is already cached (no
+  daemon-global broadcast, no cross-connection replay, matching the constraint). No
+  priming double-refresh on activation: `sysinfo` reports `cpu_usage() == 0` only for a
+  process the persistent sampler `System` has never sampled before, not merely because
+  the gate was idle, so any pane whose process predates the reactivation reports a
+  correct CPU figure immediately; only a genuinely new process settles a tick later
+  (RSS unaffected either way). `Core::dispatch`'s and `handle_client_message`'s
+  `SetPaneMetricsEnabled` no-op arms (both never receive it in production, matching the
+  `CloneRepo` convention) had their comments updated to drop the now-stale forward
+  reference to this issue. No new dependency.
+- 2026-08-01 (#880 review fix): review on the #880 PR caught that the opt-in counter's
+  decrement ran only in the fall-through after `serve_connection`'s `'serve` loop — every
+  `?` early-return inside that loop (a read/write error, a malformed frame via
+  `decoder.next_frame()?`, etc.) skipped it, leaking a `+1` on an abrupt disconnect and
+  making `pane_metrics_sampler` refresh forever for a client no longer there. Replaced
+  the bare `pane_metrics_enabled: bool` with a `PaneMetricsOptIn` RAII guard (owns the
+  shared `Arc<AtomicUsize>` plus its own `counted: bool`): `set(enabled)` keeps the exact
+  same idempotent inc/dec-on-actual-transition semantics, and `Drop` decrements
+  unconditionally whenever still counted — covering the loop's `?` returns and a panic,
+  not only the clean fall-through. Added a direct unit test of the guard (construct,
+  opt in, return early via `?`, assert the counter is back at zero) plus an integration
+  test that drives a malformed frame through the real `serve_connection` loop while
+  opted in and asserts the same.

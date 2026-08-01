@@ -18,10 +18,10 @@ use rift_explorer::{Change, Entry, GitStatus, Snapshot, Watcher};
 use rift_lsp::{DocumentChange, DocumentSelector};
 use rift_protocol::{
     encode_frame, BufferErrorReason, ClientMessage, DaemonMessage, Diagnostic, EntryKind,
-    FrameDecoder, LoadAverage, LspServerState, MemoryPressure, NavRequestId, WorktreeEntry,
-    PROTOCOL_VERSION,
+    FrameDecoder, LoadAverage, LspServerState, MemoryPressure, NavRequestId, PaneMetric,
+    WorktreeEntry, PROTOCOL_VERSION,
 };
-use sysinfo::System;
+use sysinfo::{ProcessesToUpdate, System};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
@@ -206,6 +206,13 @@ const TERMINAL_OUTBOUND_CAPACITY: usize = 256;
 /// most one value in flight per attach, so this only needs to absorb a rapid
 /// re-attach without blocking the tmux read loop — see `terminal::RootResolved`.
 const ROOT_RESOLVED_CAPACITY: usize = 4;
+
+/// Per-connection pane-pid-map channel bound
+/// (`docs/spec-pane-attribution.md`, #880): a fresh map replaces the
+/// previous one wholesale (see `terminal::PanePids`), so a couple of slots
+/// comfortably absorbs a burst of layout churn without blocking the tmux
+/// read loop.
+const PANE_PIDS_CAPACITY: usize = 4;
 
 /// How long [`ContextMap::release`]'s last-reference path waits for the torn-
 /// down context's dispatch loop to join, while holding the registry-wide
@@ -1047,6 +1054,79 @@ struct HostMetricsHandles {
     latest: watch::Receiver<Option<DaemonMessage>>,
 }
 
+/// A connection's private handle onto the daemon-global shared process
+/// snapshot ([`PaneMetricsBus`], `docs/spec-pane-attribution.md`) —
+/// threaded into [`serve_connection`] alongside `host_metrics`, but gated
+/// differently: `enabled` is the SAME process-global opt-in counter for every
+/// connection, and THIS connection increments/decrements it itself as its own
+/// `ClientMessage::SetPaneMetricsEnabled` toggles (never a raw connection
+/// count, unlike [`HostMetricsBus::connections`]). `snapshot` observes the
+/// latest shared [`ProcessSnapshot`], read only while this connection has
+/// opted in. Unlike [`HostMetricsHandles`] there is no `broadcast`
+/// subscription: the per-pane roll-up is computed and pushed by
+/// `serve_connection` itself, straight to its own socket, never replayed from
+/// a shared bus (that would leak another connection's session panes).
+struct PaneMetricsHandles {
+    snapshot: watch::Receiver<Option<Arc<ProcessSnapshot>>>,
+    enabled: Arc<AtomicUsize>,
+}
+
+/// This connection's own membership in the process-global pane-metrics
+/// opt-in counter (`docs/spec-pane-attribution.md`, #880), owned as an RAII
+/// guard rather than a bare bool so the decrement fires on EVERY exit path —
+/// not just the fall-through after `serve_connection`'s `'serve` loop. That
+/// loop's body is full of `?` early-returns (`read?`, `decoder.next_frame()?`,
+/// every `write_all`/`flush().await?`, `write_pane_metrics(...).await?`) that
+/// can fire while this connection is opted in, e.g. on an abrupt disconnect
+/// (broken pipe on a write, or a read error rather than a clean EOF); without
+/// `Drop` those returns skip the manual cleanup and leak the shared counter,
+/// which keeps [`pane_metrics_sampler`] refreshing forever for a client that
+/// is no longer there (review finding on #958). `set` is idempotent exactly
+/// like the bool it replaces: a redundant `{ enabled: true }` while already
+/// counted, or `{ enabled: false }` without ever having opted in, is a no-op.
+struct PaneMetricsOptIn {
+    enabled: Arc<AtomicUsize>,
+    counted: bool,
+}
+
+impl PaneMetricsOptIn {
+    fn new(enabled: Arc<AtomicUsize>) -> Self {
+        Self {
+            enabled,
+            counted: false,
+        }
+    }
+
+    /// This connection's current opt-in state.
+    fn is_enabled(&self) -> bool {
+        self.counted
+    }
+
+    /// Applies a false->true or true->false transition, incrementing or
+    /// decrementing the shared counter exactly once per actual transition.
+    fn set(&mut self, enabled: bool) {
+        if enabled && !self.counted {
+            self.counted = true;
+            self.enabled.fetch_add(1, Ordering::Relaxed);
+        } else if !enabled && self.counted {
+            self.counted = false;
+            self.enabled.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for PaneMetricsOptIn {
+    fn drop(&mut self) {
+        // Mirrors the false branch of `set` above: only decrement if this
+        // connection actually incremented the counter and never explicitly
+        // opted back out, so a normal `{ enabled: false }` followed by
+        // disconnect never double-decrements.
+        if self.counted {
+            self.enabled.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Returns once the reader reaches EOF, the dispatch loop is gone, or the
 /// event bus closes.
 #[allow(clippy::too_many_arguments)]
@@ -1061,6 +1141,7 @@ async fn serve_connection<R, W>(
     root: Option<PathBuf>,
     context_map: Option<Arc<ContextMap>>,
     mut host_metrics: HostMetricsHandles,
+    mut pane_metrics: PaneMetricsHandles,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -1112,14 +1193,35 @@ where
     // `terminal_done` (below) guards both this and `terminal_out_rx` since
     // their senders are dropped together when the terminal task ends.
     let (root_resolved_tx, mut root_resolved_rx) = mpsc::channel(ROOT_RESOLVED_CAPACITY);
+    // This connection's session-wide `pane_id -> pane_pid` map
+    // (`docs/spec-pane-attribution.md`, #880) — see `terminal::PanePids`.
+    // Dropped/refreshed alongside `root_resolved_tx`/`terminal_out_tx` when
+    // the terminal task ends, same `terminal_done` guard below.
+    let (pane_pids_tx, mut pane_pids_rx) = mpsc::channel(PANE_PIDS_CAPACITY);
     let terminal = tokio::spawn(terminal::terminal_task(
         terminal_in_rx,
         terminal_out_tx,
         tmux_server,
         root,
         root_resolved_tx,
+        pane_pids_tx,
     ));
     let mut terminal_done = false;
+    // This connection's own session pane data for the per-pane resource
+    // breakdown (`docs/spec-pane-attribution.md`, #880), kept current while
+    // this connection is opted in: `session_pane_pids` from the `pane_pids_rx`
+    // branch below, `session_commands` (the agnostic `pane_current_command`
+    // label per pane, #880's "strictly agent-agnostic" constraint) peeled off
+    // this connection's own `LayoutSnapshot`/`LayoutUpdate` stream — no
+    // separate query, the data already flows through `terminal_out_rx`.
+    // `pane_metrics_opt_in` mirrors this connection's own opt-in state so
+    // `SetPaneMetricsEnabled` toggles the shared gate exactly once per actual
+    // transition; being an RAII guard ([`PaneMetricsOptIn`]), its `Drop`
+    // decrements the counter on every exit from this function, including the
+    // `'serve` loop's `?` early-returns, not only the clean fall-through.
+    let mut session_pane_pids: HashMap<u32, u32> = HashMap::new();
+    let mut session_commands: HashMap<u32, String> = HashMap::new();
+    let mut pane_metrics_opt_in = PaneMetricsOptIn::new(Arc::clone(&pane_metrics.enabled));
     // The root this connection has itself acquired via a resolved `Attach`
     // (as opposed to `root`/its context above, which the CALLER acquired and
     // releases). `None` until the first `Attach` resolves a root.
@@ -1365,14 +1467,44 @@ where
                             }
                         }
                         // The per-pane metrics opt-in
-                        // (`docs/spec-pane-attribution.md`, #879) is this
+                        // (`docs/spec-pane-attribution.md`, #880): this
                         // connection's on/off toggle for per-pane sampling.
-                        // Wire foundation only: the shared process-snapshot
-                        // gating, the per-connection subtree roll-up, and the
-                        // resulting `PaneMetrics` push all land in a
-                        // follow-on issue.
-                        // real handling: #880
-                        ClientMessage::SetPaneMetricsEnabled { .. } => {}
+                        // `pane_metrics_opt_in` (a [`PaneMetricsOptIn`] guard)
+                        // owns the SAME process-global counter every
+                        // connection shares (`PaneMetricsBus`): incremented
+                        // exactly once per actual false->true transition and
+                        // decremented once per true->false (including this
+                        // connection's own disconnect cleanup, via `Drop` —
+                        // see the guard's doc comment), so it stays exact
+                        // even if a client sends a redundant repeat. On
+                        // turning on, push once
+                        // immediately from whatever is already cached (this
+                        // connection's own session layout plus the shared
+                        // snapshot) instead of waiting for the next shared
+                        // tick, so an already-warm breakdown does not sit on
+                        // "sampling…" for a full tick. Uses
+                        // `borrow_and_update` (not `borrow`) so this cached
+                        // value is marked seen: a freshly cloned `watch`
+                        // handle's version starts at the channel's very
+                        // first send, so without this the `changed()` branch
+                        // below would immediately re-fire on the SAME
+                        // already-pushed value on its very next poll.
+                        ClientMessage::SetPaneMetricsEnabled { enabled } => {
+                            let was_enabled = pane_metrics_opt_in.is_enabled();
+                            pane_metrics_opt_in.set(enabled);
+                            if enabled && !was_enabled {
+                                let cached = pane_metrics.snapshot.borrow_and_update().clone();
+                                if let Some(snapshot) = cached {
+                                    write_pane_metrics(
+                                        &mut writer,
+                                        &snapshot,
+                                        &session_pane_pids,
+                                        &session_commands,
+                                    )
+                                    .await?;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1459,6 +1591,22 @@ where
                     // a layout change, or terminal-path-down): write it to the
                     // socket alongside the shared worktree/git stream.
                     Some(msg) => {
+                        // A layout message already carries every pane's
+                        // agnostic `current_command` (`docs/spec-pane-
+                        // attribution.md`, #880): cache it here (pane_id ->
+                        // command) rather than issuing a separate query, so
+                        // the per-pane breakdown's row label is always this
+                        // connection's own latest layout, never agent
+                        // detection or a content read.
+                        if let DaemonMessage::LayoutSnapshot { windows, .. }
+                        | DaemonMessage::LayoutUpdate { windows, .. } = &msg
+                        {
+                            session_commands = windows
+                                .iter()
+                                .flat_map(|w| w.panes.iter())
+                                .map(|p| (p.pane_id, p.current_command.clone()))
+                                .collect();
+                        }
                         let frame = encode_frame(&msg)?;
                         writer.write_all(&frame).await?;
                         writer.flush().await?;
@@ -1466,6 +1614,42 @@ where
                     // The terminal task ended; stop polling its channel so this
                     // branch cannot busy-loop. The worktree path keeps serving.
                     None => terminal_done = true,
+                }
+            }
+            // This connection's session-wide `pane_id -> pane_pid` map
+            // (`docs/spec-pane-attribution.md`, #880), refreshed on every
+            // layout query reply — see `terminal::PanePids`. Guarded and
+            // superseded exactly like `terminal_out_rx` above (both
+            // channels' senders close together when the terminal task ends).
+            pane_pids = pane_pids_rx.recv(), if !terminal_done => {
+                match pane_pids {
+                    Some(map) => session_pane_pids = map,
+                    None => terminal_done = true,
+                }
+            }
+            // The daemon-global shared process snapshot
+            // (`docs/spec-pane-attribution.md`, [`PaneMetricsBus`]) ticked:
+            // roll up THIS connection's own session panes from it and push
+            // its own `PaneMetrics` — never the Phase-43 broadcast bus, never
+            // a cross-connection replay. Guarded on `pane_metrics_opt_in` so
+            // a connection that has not opted in never even polls this
+            // watch (and a connection with nothing else opted in daemon-wide
+            // never wakes at all, since the shared sampler itself is gated).
+            changed = pane_metrics.snapshot.changed(), if pane_metrics_opt_in.is_enabled() => {
+                if changed.is_err() {
+                    // The sampler task is gone (process shutting down);
+                    // nothing more will ever arrive on this watch.
+                    break 'serve;
+                }
+                let snapshot = pane_metrics.snapshot.borrow_and_update().clone();
+                if let Some(snapshot) = snapshot {
+                    write_pane_metrics(
+                        &mut writer,
+                        &snapshot,
+                        &session_pane_pids,
+                        &session_commands,
+                    )
+                    .await?;
                 }
             }
             // The Attach seam (#737): the terminal task resolved the attached
@@ -1549,6 +1733,15 @@ where
     for should_interrupt in &clone_interrupts {
         should_interrupt.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+
+    // This connection's own opt-in cleanup (`docs/spec-pane-attribution.md`,
+    // #880) needs no explicit statement here: `pane_metrics_opt_in`'s `Drop`
+    // decrements the SAME process-global counter `SetPaneMetricsEnabled
+    // { false }` would have, whether this point is reached by falling
+    // through the loop or `pane_metrics_opt_in` is instead dropped earlier by
+    // a `?` return out of the `'serve` loop above — otherwise the shared
+    // sampler would keep refreshing forever for a client that is no longer
+    // there to receive the pushes.
 
     // End this connection's tmux attach. The task then detaches the control
     // child (the tmux session persists) and exits.
@@ -1638,6 +1831,24 @@ async fn write_messages<W: AsyncWrite + Unpin>(
         let frame = encode_frame(msg)?;
         writer.write_all(&frame).await?;
     }
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Build and write this connection's own `PaneMetrics` push
+/// (`docs/spec-pane-attribution.md`, #880): rolls up `snapshot` for each of
+/// `pane_pids`'s panes ([`build_pane_metrics`]) and writes the result
+/// straight to this connection's socket — never the Phase-43 broadcast bus,
+/// never a cross-connection replay.
+async fn write_pane_metrics<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    snapshot: &ProcessSnapshot,
+    pane_pids: &HashMap<u32, u32>,
+    commands: &HashMap<u32, String>,
+) -> anyhow::Result<()> {
+    let entries = build_pane_metrics(snapshot, pane_pids, commands);
+    let frame = encode_frame(&DaemonMessage::PaneMetrics { entries })?;
+    writer.write_all(&frame).await?;
     writer.flush().await?;
     Ok(())
 }
@@ -2100,6 +2311,220 @@ fn build_host_metrics_message(system: &System, psi: Option<MemoryPressure>) -> D
     }
 }
 
+/// Sampling cadence for the daemon-global shared process snapshot
+/// (`docs/spec-pane-attribution.md`, [`PaneMetricsBus`]) — a separate
+/// constant from [`HOST_METRICS_INTERVAL`] (even though both currently share
+/// the same value) so tuning one cadence can never accidentally move the
+/// other. `sysinfo`'s per-process CPU percentage needs two refreshes spaced
+/// at least `sysinfo::MINIMUM_CPU_UPDATE_INTERVAL` apart (200 ms on Linux),
+/// well under this.
+const PANE_METRICS_INTERVAL: Duration = Duration::from_secs(2);
+
+/// One process's resource usage as of the shared snapshot's tick
+/// (`docs/spec-pane-attribution.md`): resident memory in bytes and CPU usage
+/// (0.0-100.0 times the core count, `sysinfo`'s convention, matching
+/// [`DaemonMessage::HostMetrics::cpu`]'s scale).
+#[derive(Debug, Clone, Copy, Default)]
+struct ProcessUsage {
+    rss: u64,
+    cpu: f32,
+}
+
+/// The daemon-global shared process snapshot (`docs/spec-pane-attribution.md`):
+/// every live process's own usage plus a `parent_pid -> children` index, both
+/// built ONCE per tick from a single `sysinfo` process refresh
+/// ([`ProcessSnapshot::from_system`]), so a per-pane subtree roll-up
+/// ([`ProcessSnapshot::subtree_usage`]) is a plain DFS over this index rather
+/// than a fresh `/proc` walk per pane — O(processes) + O(subtree) per
+/// connection, never O(panes x /proc walks).
+#[derive(Debug, Clone, Default)]
+struct ProcessSnapshot {
+    usage: HashMap<u32, ProcessUsage>,
+    children: HashMap<u32, Vec<u32>>,
+}
+
+impl ProcessSnapshot {
+    /// Build a snapshot from `system`'s CURRENT process table. Callers
+    /// refresh `system` (`refresh_processes`) immediately before calling
+    /// this — kept as a pure builder, separate from [`pane_metrics_sampler`]'s
+    /// own `/proc`-reading side effects, mirroring [`build_host_metrics_message`].
+    fn from_system(system: &System) -> Self {
+        let mut usage = HashMap::new();
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (pid, process) in system.processes() {
+            let pid = pid.as_u32();
+            usage.insert(
+                pid,
+                ProcessUsage {
+                    rss: process.memory(),
+                    cpu: process.cpu_usage(),
+                },
+            );
+            if let Some(parent) = process.parent() {
+                children.entry(parent.as_u32()).or_default().push(pid);
+            }
+        }
+        Self { usage, children }
+    }
+
+    /// Sum `root_pid`'s own usage plus every descendant's, via a DFS over the
+    /// `children` index built once per tick (`docs/spec-pane-attribution.md`).
+    /// An unknown or dead `root_pid` (absent from `usage`, e.g. a pane whose
+    /// foreground process already exited) contributes nothing and still
+    /// yields a zeroed [`ProcessUsage`] rather than an error or `None` — a
+    /// dead pane is attributed zero resource use, not treated as a failure.
+    /// `visited` guards a pathological cycle in `children` (never expected
+    /// from a real `/proc` parent-pid tree, but keeps this pure function safe
+    /// regardless of its input).
+    fn subtree_usage(&self, root_pid: u32) -> ProcessUsage {
+        let mut total = ProcessUsage::default();
+        let mut visited = HashSet::new();
+        let mut stack = vec![root_pid];
+        while let Some(pid) = stack.pop() {
+            if !visited.insert(pid) {
+                continue;
+            }
+            if let Some(usage) = self.usage.get(&pid) {
+                total.rss += usage.rss;
+                total.cpu += usage.cpu;
+            }
+            if let Some(children) = self.children.get(&pid) {
+                stack.extend(children.iter().copied());
+            }
+        }
+        total
+    }
+}
+
+/// Build this connection's own `PaneMetrics` entries
+/// (`docs/spec-pane-attribution.md`, #880): for each of `pane_pids` (this
+/// connection's session, `pane_id -> pane_pid`) roll up `snapshot`'s subtree
+/// at that pid and label the row from `commands` (`pane_id ->
+/// pane_current_command`, kept from this connection's own layout stream —
+/// strictly agnostic, never an agent name or content read). A `pane_id` with
+/// no entry in `commands` (raced by a layout change) labels as an empty
+/// string, the same tolerance [`PaneLayout::current_command`] itself has.
+fn build_pane_metrics(
+    snapshot: &ProcessSnapshot,
+    pane_pids: &HashMap<u32, u32>,
+    commands: &HashMap<u32, String>,
+) -> Vec<PaneMetric> {
+    pane_pids
+        .iter()
+        .map(|(&pane_id, &pane_pid)| {
+            let usage = snapshot.subtree_usage(pane_pid);
+            PaneMetric {
+                pane_id,
+                rss: usage.rss,
+                cpu: usage.cpu,
+                command: commands.get(&pane_id).cloned().unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
+/// The daemon-global, opt-in-gated shared process snapshot bus
+/// (`docs/spec-pane-attribution.md`). Unlike [`HostMetricsBus`] — gated on
+/// the raw count of connected clients — `enabled` counts only the
+/// connections that have explicitly opted in via
+/// `ClientMessage::SetPaneMetricsEnabled { enabled: true }`
+/// (`serve_connection` increments on `true`, decrements on `false` /
+/// disconnect): with zero opted in, [`pane_metrics_sampler`] does NO
+/// process-table refresh at all, so a connected-but-idle client (no
+/// breakdown popover open) costs nothing. Holds only the latest immutable
+/// [`ProcessSnapshot`] on a `watch` — no `broadcast` bus, because the
+/// per-pane roll-up + push is per-connection, never a daemon-global message
+/// (that would leak one connection's session panes onto another's stream).
+#[derive(Clone)]
+struct PaneMetricsBus {
+    latest_tx: watch::Sender<Option<Arc<ProcessSnapshot>>>,
+    latest_rx: watch::Receiver<Option<Arc<ProcessSnapshot>>>,
+    enabled: Arc<AtomicUsize>,
+}
+
+impl PaneMetricsBus {
+    /// A fresh bus with no cached snapshot and zero opted-in connections (the
+    /// sampler refreshes nothing until a caller raises `enabled` above zero).
+    fn new() -> Self {
+        let (latest_tx, latest_rx) = watch::channel(None);
+        Self {
+            latest_tx,
+            latest_rx,
+            enabled: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// This connection's private handle: a clone of the replay watch plus the
+    /// shared opt-in counter, threaded into [`serve_connection`].
+    fn handles(&self) -> PaneMetricsHandles {
+        PaneMetricsHandles {
+            snapshot: self.latest_rx.clone(),
+            enabled: Arc::clone(&self.enabled),
+        }
+    }
+}
+
+/// The daemon-global shared process-snapshot sampler
+/// (`docs/spec-pane-attribution.md`). Mirrors [`host_metrics_sampler`]'s
+/// shape (one persistent `sysinfo::System`, refreshed under `spawn_blocking`
+/// every tick) with one difference: the gate is [`PaneMetricsBus::enabled`],
+/// the COUNT of connections currently opted in via
+/// `ClientMessage::SetPaneMetricsEnabled`, not the raw connection count — an
+/// idle daemon, or one whose clients have no breakdown popover open, does
+/// zero process-table work.
+///
+/// No separate priming refresh before the loop starts (unlike
+/// [`host_metrics_sampler`]'s `System::new_all()`): `sysinfo` reports
+/// `cpu_usage() == 0` only for a process THIS `System` has never sampled
+/// before, regardless of how long since its last refresh — so a pane whose
+/// process predates this activation (the common case, since this sampler's
+/// `System` persists across every opt-in/opt-out transition for the whole
+/// daemon lifetime) reports a correct CPU figure on the very first refresh
+/// after reactivation. Only a genuinely new process (never sampled by this
+/// `System` before) reads `cpu = 0` on its first sampled tick and settles on
+/// the next one — RSS is immediate regardless, so the primary RSS ranking is
+/// correct from the first published snapshot either way
+/// (`docs/spec-pane-attribution.md`, Risks table).
+async fn pane_metrics_sampler(bus: PaneMetricsBus) {
+    let mut system = System::new();
+    let mut interval = tokio::time::interval(PANE_METRICS_INTERVAL);
+
+    loop {
+        interval.tick().await;
+        if !pane_metrics_gate_open(&bus.enabled) {
+            continue;
+        }
+
+        let refreshed = tokio::task::spawn_blocking(move || {
+            system.refresh_processes(ProcessesToUpdate::All);
+            let snapshot = ProcessSnapshot::from_system(&system);
+            (system, snapshot)
+        })
+        .await;
+
+        let (refreshed_system, snapshot) = match refreshed {
+            Ok(pair) => pair,
+            Err(err) => {
+                error!(%err, "pane metrics: refresh panicked; sampler stops");
+                return;
+            }
+        };
+        system = refreshed_system;
+
+        let _ = bus.latest_tx.send(Some(Arc::new(snapshot)));
+    }
+}
+
+/// Whether [`PaneMetricsBus::enabled`] is above zero — the shared
+/// process-table refresh gate (`docs/spec-pane-attribution.md`). Extracted as
+/// a pure predicate so the "counter at zero -> no refresh" contract is unit
+/// tested without spawning [`pane_metrics_sampler`] or waiting on its tick
+/// interval, the same reason `effective_attach_root` (`terminal.rs`) is its
+/// own pure function rather than inlined.
+fn pane_metrics_gate_open(enabled: &AtomicUsize) -> bool {
+    enabled.load(Ordering::Relaxed) > 0
+}
+
 /// Read and parse Linux PSI memory-stall averages from `path`
 /// (`docs/spec-memory-pressure.md`), normally `/proc/pressure/memory`.
 /// Path-injectable so it is fixture-testable without a real `/proc`. Returns
@@ -2197,6 +2622,15 @@ where
     host_metrics_bus.connections.store(1, Ordering::Relaxed);
     let host_metrics_task = tokio::spawn(host_metrics_sampler(host_metrics_bus.clone()));
 
+    // Per-pane resource attribution (`docs/spec-pane-attribution.md`) is
+    // opt-in-gated, NOT seeded like `host_metrics_bus` above: `serve`'s one
+    // connection may never send `SetPaneMetricsEnabled { true }`, so the
+    // shared sampler must start at zero and only refresh once this
+    // connection's own opt-in raises it — an idle daemon, or a client whose
+    // breakdown popover is never opened, must cost zero process-table work.
+    let pane_metrics_bus = PaneMetricsBus::new();
+    let pane_metrics_task = tokio::spawn(pane_metrics_sampler(pane_metrics_bus.clone()));
+
     let result = match worktree_root {
         Some(root) => {
             // Acquires the one root's context up front, exactly like the
@@ -2236,6 +2670,7 @@ where
                 Some(root),
                 Some(context_map.clone()),
                 host_metrics_bus.handles(),
+                pane_metrics_bus.handles(),
             )
             .await;
             // `serve_connection` dropped its `inbound` clone on return, making
@@ -2269,6 +2704,7 @@ where
                 None,
                 Some(context_map.clone()),
                 host_metrics_bus.handles(),
+                pane_metrics_bus.handles(),
             )
             .await;
             // `serve_connection` dropped its `inbound` clone on return, so the
@@ -2282,6 +2718,7 @@ where
     // interval task per `serve` call (production runs `serve` once per
     // process — stdio mode — but tests call it many times).
     host_metrics_task.abort();
+    pane_metrics_task.abort();
     result
 }
 
@@ -2393,6 +2830,15 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
     let host_metrics_bus = HostMetricsBus::new();
     tokio::spawn(host_metrics_sampler(host_metrics_bus.clone()));
 
+    // The daemon-global shared process snapshot
+    // (`docs/spec-pane-attribution.md`): one `PaneMetricsBus` for the whole
+    // process, spawned detached the same way. Unlike `host_metrics_bus`
+    // above, `enabled` is NOT touched by the accept loop below — it is
+    // driven solely by each connection's own `SetPaneMetricsEnabled` opt-in
+    // (see `serve_connection`), never by the raw count of connections.
+    let pane_metrics_bus = PaneMetricsBus::new();
+    tokio::spawn(pane_metrics_sampler(pane_metrics_bus.clone()));
+
     let connection_root = worktree_root.clone();
     let primary = match worktree_root {
         // Canonicalized for the SAME reason as `serve`'s keep-warm acquire
@@ -2474,6 +2920,10 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
         // never zero while at least one `serve_connection` is running.
         host_metrics_bus.connections.fetch_add(1, Ordering::Relaxed);
         let host_metrics_connections = Arc::clone(&host_metrics_bus.connections);
+        // Unlike `host_metrics` above, `pane_metrics`'s own opt-in counter is
+        // NOT touched here — `serve_connection` drives it itself from this
+        // connection's `SetPaneMetricsEnabled` messages (see the field's doc).
+        let pane_metrics = pane_metrics_bus.handles();
         tokio::spawn(async move {
             if let Err(e) = serve_connection(
                 reader,
@@ -2486,6 +2936,7 @@ pub async fn serve_uds(socket_path: &Path, worktree_root: Option<PathBuf>) -> an
                 root,
                 Some(context_map),
                 host_metrics,
+                pane_metrics,
             )
             .await
             {
@@ -2816,9 +3267,10 @@ impl Core {
             // arm below is a defensive no-op until then.
             //
             // The per-pane metrics opt-in (`docs/spec-pane-attribution.md`,
-            // #879) is likewise answered per connection by
-            // `serve_connection` (real handling: #880); its arm below is a
-            // defensive no-op should it ever reach this loop.
+            // #880) is likewise answered per connection by
+            // `serve_connection` (the counter inc/dec and the per-connection
+            // roll-up + push); its arm below is a defensive no-op should it
+            // ever reach this loop.
             ClientMessage::Hello { .. }
             | ClientMessage::Attach { .. }
             | ClientMessage::Input { .. }
@@ -3002,6 +3454,28 @@ mod tests {
         )
     }
 
+    /// A [`PaneMetricsHandles`] for a test's direct `serve_connection` call,
+    /// paired with the `watch::Sender` that must stay alive for the duration
+    /// of the test — dropping it closes `snapshot`. Unlike
+    /// [`test_host_metrics_handles`] this is safe for an unrelated test to
+    /// drop immediately: the `snapshot.changed()` branch is only ever polled
+    /// while `pane_metrics_opt_in` reads enabled, and a test that never
+    /// sends `SetPaneMetricsEnabled { enabled: true }` never opts it in, so
+    /// a closed watch is simply never observed.
+    fn test_pane_metrics_handles() -> (
+        watch::Sender<Option<Arc<ProcessSnapshot>>>,
+        PaneMetricsHandles,
+    ) {
+        let (tx, rx) = watch::channel(None);
+        (
+            tx,
+            PaneMetricsHandles {
+                snapshot: rx,
+                enabled: Arc::new(AtomicUsize::new(0)),
+            },
+        )
+    }
+
     /// Read one framed `DaemonMessage` from `reader`, reassembling across reads.
     ///
     /// The decoder is caller-owned and must live for the whole connection: one
@@ -3084,6 +3558,7 @@ mod tests {
         let (mut client_reader, mut client_writer) = tokio::io::split(client);
         let (server_reader, server_writer) = tokio::io::split(server);
         let (_host_metrics_tx, host_metrics) = test_host_metrics_handles();
+        let (_pane_metrics_tx, pane_metrics) = test_pane_metrics_handles();
         let conn = tokio::spawn(async move {
             serve_connection(
                 server_reader,
@@ -3096,6 +3571,7 @@ mod tests {
                 None,
                 None,
                 host_metrics,
+                pane_metrics,
             )
             .await
         });
@@ -3145,6 +3621,7 @@ mod tests {
         let (mut healthy_reader, mut healthy_writer) = tokio::io::split(healthy);
         let (healthy_srv_reader, healthy_srv_writer) = tokio::io::split(healthy_srv);
         let (_healthy_host_metrics_tx, healthy_host_metrics) = test_host_metrics_handles();
+        let (_healthy_pane_metrics_tx, healthy_pane_metrics) = test_pane_metrics_handles();
         let healthy_conn = tokio::spawn({
             let inbound = handles.inbound.clone();
             let events = handles.subscribe();
@@ -3161,6 +3638,7 @@ mod tests {
                     None,
                     None,
                     healthy_host_metrics,
+                    healthy_pane_metrics,
                 )
                 .await
             }
@@ -3185,6 +3663,7 @@ mod tests {
         let (mut bad_reader, mut bad_writer) = tokio::io::split(bad);
         let (bad_srv_reader, bad_srv_writer) = tokio::io::split(bad_srv);
         let (_bad_host_metrics_tx, bad_host_metrics) = test_host_metrics_handles();
+        let (_bad_pane_metrics_tx, bad_pane_metrics) = test_pane_metrics_handles();
         let bad_conn = tokio::spawn({
             let inbound = handles.inbound.clone();
             let events = handles.subscribe();
@@ -3201,6 +3680,7 @@ mod tests {
                     None,
                     None,
                     bad_host_metrics,
+                    bad_pane_metrics,
                 )
                 .await
             }
@@ -3364,6 +3844,368 @@ mod tests {
         }
     }
 
+    /// `docs/spec-pane-attribution.md`: a pane pid's subtree roll-up sums its
+    /// OWN usage plus every descendant's, transitively — not just its direct
+    /// children — from a synthetic `parent_pid -> children` index (no real
+    /// `/proc`, no sampler task).
+    #[test]
+    fn test_subtree_usage_pane_with_descendants_sums_rss_and_cpu() {
+        // 100 (the pane's own process) has children 101 and 102; 101 has its
+        // own child 103 — a two-level subtree, so a naive direct-children-only
+        // sum would miss 103.
+        let snapshot = ProcessSnapshot {
+            usage: HashMap::from([
+                (
+                    100,
+                    ProcessUsage {
+                        rss: 1_000,
+                        cpu: 1.0,
+                    },
+                ),
+                (
+                    101,
+                    ProcessUsage {
+                        rss: 2_000,
+                        cpu: 2.0,
+                    },
+                ),
+                (
+                    102,
+                    ProcessUsage {
+                        rss: 3_000,
+                        cpu: 3.0,
+                    },
+                ),
+                (
+                    103,
+                    ProcessUsage {
+                        rss: 4_000,
+                        cpu: 4.0,
+                    },
+                ),
+            ]),
+            children: HashMap::from([(100, vec![101, 102]), (101, vec![103])]),
+        };
+
+        let total = snapshot.subtree_usage(100);
+
+        assert_eq!(total.rss, 10_000);
+        assert_eq!(total.cpu, 10.0);
+    }
+
+    /// `docs/spec-pane-attribution.md`: an unknown or already-dead
+    /// `pane_pid` (absent from the snapshot's `usage` map) yields a zeroed
+    /// roll-up, never an error or a panic — a pane whose foreground process
+    /// has exited is attributed zero resource use.
+    #[test]
+    fn test_subtree_usage_unknown_pid_returns_zero() {
+        let snapshot = ProcessSnapshot::default();
+
+        let total = snapshot.subtree_usage(99_999);
+
+        assert_eq!(total.rss, 0);
+        assert_eq!(total.cpu, 0.0);
+    }
+
+    /// `docs/spec-pane-attribution.md`: each `PaneMetric` row's label comes
+    /// solely from the pane's own `pane_current_command` (the agnostic map
+    /// `serve_connection` keeps from its own layout stream) — never an agent
+    /// name or any other process detail.
+    #[test]
+    fn test_build_pane_metrics_uses_pane_current_command_as_label() {
+        let snapshot = ProcessSnapshot {
+            usage: HashMap::from([(100, ProcessUsage { rss: 500, cpu: 5.0 })]),
+            children: HashMap::new(),
+        };
+        let pane_pids = HashMap::from([(1, 100)]);
+        let commands = HashMap::from([(1, "nvim".to_owned())]);
+
+        let mut entries = build_pane_metrics(&snapshot, &pane_pids, &commands);
+
+        assert_eq!(entries.len(), 1);
+        let entry = entries.remove(0);
+        assert_eq!(entry.pane_id, 1);
+        assert_eq!(entry.rss, 500);
+        assert_eq!(entry.cpu, 5.0);
+        assert_eq!(
+            entry.command, "nvim",
+            "the label must come from pane_current_command, never agent detection"
+        );
+    }
+
+    /// `docs/spec-pane-attribution.md`: a pane whose `pane_pid` is dead or
+    /// unknown to the shared snapshot still yields an entry (never dropped
+    /// silently), just zeroed — matching [`ProcessSnapshot::subtree_usage`]'s
+    /// own tolerance.
+    #[test]
+    fn test_build_pane_metrics_dead_pane_pid_yields_zero_entry() {
+        let snapshot = ProcessSnapshot::default();
+        let pane_pids = HashMap::from([(7, 424_242)]);
+        let commands = HashMap::from([(7, "bash".to_owned())]);
+
+        let mut entries = build_pane_metrics(&snapshot, &pane_pids, &commands);
+
+        assert_eq!(entries.len(), 1);
+        let entry = entries.remove(0);
+        assert_eq!(entry.rss, 0);
+        assert_eq!(entry.cpu, 0.0);
+        assert_eq!(entry.command, "bash");
+    }
+
+    /// `docs/spec-pane-attribution.md`: the shared process-table refresh gate
+    /// reads closed while the opt-in counter is zero.
+    #[test]
+    fn test_pane_metrics_gate_open_zero_counter_returns_false() {
+        let enabled = AtomicUsize::new(0);
+        assert!(!pane_metrics_gate_open(&enabled));
+    }
+
+    /// `docs/spec-pane-attribution.md`: the gate reads open as soon as at
+    /// least one connection has opted in.
+    #[test]
+    fn test_pane_metrics_gate_open_positive_counter_returns_true() {
+        let enabled = AtomicUsize::new(1);
+        assert!(pane_metrics_gate_open(&enabled));
+    }
+
+    /// `docs/spec-pane-attribution.md`, #880: `SetPaneMetricsEnabled { true }`
+    /// increments the SAME process-global counter every connection shares and
+    /// pushes once immediately from whatever is already cached (here an
+    /// empty snapshot with no session panes yet, so an empty `PaneMetrics`)
+    /// rather than waiting for the next shared-snapshot tick; ending the
+    /// connection while still opted in decrements the counter back to zero
+    /// (the cleanup path, exercised here since no explicit `{ false }` is
+    /// ever sent).
+    #[tokio::test]
+    async fn test_serve_connection_pane_metrics_opt_in_increments_counter_and_pushes_cached_snapshot(
+    ) {
+        let (daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
+        let dispatch = tokio::spawn(daemon.run());
+        let (_host_metrics_tx, host_metrics) = test_host_metrics_handles();
+
+        // Mirrors `PaneMetricsBus::handles()` exactly: the snapshot is
+        // published (advancing the channel's version) BEFORE this
+        // connection's own handle is cloned off the template receiver — the
+        // template itself is never read, so it stays at its initial version
+        // forever, same as `PaneMetricsBus.latest_rx`. A test that instead
+        // constructed the channel pre-seeded with the value would not
+        // reproduce the double-push this test guards against.
+        let (latest_tx, latest_rx) = watch::channel(None);
+        latest_tx
+            .send(Some(Arc::new(ProcessSnapshot::default())))
+            .expect("watch has a receiver");
+        let enabled = Arc::new(AtomicUsize::new(0));
+        let pane_metrics = PaneMetricsHandles {
+            snapshot: latest_rx.clone(),
+            enabled: Arc::clone(&enabled),
+        };
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+        let (server_reader, server_writer) = tokio::io::split(server);
+        let conn = tokio::spawn(async move {
+            serve_connection(
+                server_reader,
+                server_writer,
+                handles.inbound.clone(),
+                handles.subscribe(),
+                handles.state.clone(),
+                None,
+                None,
+                None,
+                None,
+                host_metrics,
+                pane_metrics,
+            )
+            .await
+        });
+
+        client_writer
+            .write_all(&hello_frame())
+            .await
+            .expect("send Hello");
+        client_writer
+            .write_all(
+                &encode_frame(&ClientMessage::SetPaneMetricsEnabled { enabled: true })
+                    .expect("encode opt-in"),
+            )
+            .await
+            .expect("send opt-in");
+        client_writer.flush().await.expect("flush");
+
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(
+            read_daemon_message(&mut client_reader, &mut decoder).await,
+            DaemonMessage::Welcome {
+                version: PROTOCOL_VERSION,
+            }
+        );
+        assert_eq!(
+            read_daemon_message(&mut client_reader, &mut decoder).await,
+            DaemonMessage::PaneMetrics { entries: vec![] },
+            "opting in with a cached snapshot but no known session panes yet \
+             must push an empty (not absent) breakdown immediately"
+        );
+        assert_eq!(
+            enabled.load(Ordering::Relaxed),
+            1,
+            "the shared opt-in counter must be incremented exactly once"
+        );
+        // The opt-in arm marks the cached snapshot seen via
+        // `borrow_and_update` precisely so the `changed()` branch does not
+        // immediately re-fire on the SAME unchanged value; assert no second
+        // push arrives before the shared snapshot actually changes again.
+        let extra = tokio::time::timeout(
+            Duration::from_millis(200),
+            read_daemon_message(&mut client_reader, &mut decoder),
+        )
+        .await;
+        assert!(
+            extra.is_err(),
+            "must not push a second PaneMetrics frame for the same unchanged cached snapshot"
+        );
+
+        drop(client_writer);
+        drop(client_reader);
+        let _ = tokio::time::timeout(Duration::from_secs(5), conn)
+            .await
+            .expect("serve_connection returns after disconnect");
+        assert_eq!(
+            enabled.load(Ordering::Relaxed),
+            0,
+            "disconnecting while still opted in must decrement the shared counter back to zero"
+        );
+
+        let _ = latest_tx.send(None);
+        dispatch.abort();
+    }
+
+    /// Review finding on #958 (`docs/spec-pane-attribution.md`, #880): the
+    /// `'serve` loop in `serve_connection` is full of `?` early-returns (a
+    /// malformed frame from `decoder.next_frame()?`, a broken-pipe write,
+    /// etc.) that can fire while a connection is opted in, well before the
+    /// clean fall-through after the loop. `PaneMetricsOptIn` must still
+    /// decrement on that path via `Drop` alone, with no cleanup code
+    /// reachable after an early return — this is a direct unit test of the
+    /// guard type, isolated from the async connection machinery entirely.
+    #[test]
+    fn test_pane_metrics_opt_in_drop_after_error_path_return_decrements_counter() {
+        let enabled = Arc::new(AtomicUsize::new(0));
+
+        // Mirrors a connection opting in, then hitting a `?` early-return
+        // out of `serve_connection` (rather than reaching the clean
+        // fall-through): the guard goes out of scope without ever calling
+        // `set(false)` or running any explicit cleanup statement.
+        fn opt_in_then_fail(enabled: &Arc<AtomicUsize>) -> Result<(), ()> {
+            let mut opt_in = PaneMetricsOptIn::new(Arc::clone(enabled));
+            opt_in.set(true);
+            assert_eq!(enabled.load(Ordering::Relaxed), 1);
+            Err(())?;
+            unreachable!("the `?` above always returns early");
+        }
+
+        let _ = opt_in_then_fail(&enabled);
+        assert_eq!(
+            enabled.load(Ordering::Relaxed),
+            0,
+            "Drop must decrement the counter on an early-return path, not just the clean one"
+        );
+    }
+
+    /// Companion to
+    /// `test_serve_connection_pane_metrics_opt_in_increments_counter_and_pushes_cached_snapshot`
+    /// above (which covers the clean-EOF decrement): this covers the review
+    /// finding on #958 end to end through the real connection loop — a
+    /// malformed frame makes `decoder.next_frame::<ClientMessage>()?` (the
+    /// `'serve` loop, `docs/spec-pane-attribution.md`, #880) return an error
+    /// WHILE this connection is opted in, well before the loop's clean
+    /// fall-through. `serve_connection` must still return with the shared
+    /// counter back at zero — proving the decrement is not only reachable
+    /// from the bottom of the function.
+    #[tokio::test]
+    async fn test_serve_connection_pane_metrics_opt_in_decrements_counter_on_malformed_frame_error()
+    {
+        let (daemon, handles) = channels(SERVE_EVENT_CAPACITY, SERVE_INBOUND_CAPACITY);
+        let dispatch = tokio::spawn(daemon.run());
+        let (_host_metrics_tx, host_metrics) = test_host_metrics_handles();
+        let (_pane_metrics_tx, pane_metrics) = test_pane_metrics_handles();
+        let enabled = Arc::clone(&pane_metrics.enabled);
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+        let (server_reader, server_writer) = tokio::io::split(server);
+        let conn = tokio::spawn(async move {
+            serve_connection(
+                server_reader,
+                server_writer,
+                handles.inbound.clone(),
+                handles.subscribe(),
+                handles.state.clone(),
+                None,
+                None,
+                None,
+                None,
+                host_metrics,
+                pane_metrics,
+            )
+            .await
+        });
+
+        client_writer
+            .write_all(&hello_frame())
+            .await
+            .expect("send Hello");
+        client_writer
+            .write_all(
+                &encode_frame(&ClientMessage::SetPaneMetricsEnabled { enabled: true })
+                    .expect("encode opt-in"),
+            )
+            .await
+            .expect("send opt-in");
+        // A hand-built frame whose payload is not valid JSON at all (as
+        // opposed to a version mismatch or a well-formed-but-wrong message),
+        // so `decoder.next_frame::<ClientMessage>()?` fails exactly the way
+        // a corrupted stream would, deterministically and without touching
+        // the socket at the transport level.
+        let malformed_payload = b"not json";
+        let malformed_len = u32::try_from(malformed_payload.len())
+            .expect("payload length fits u32")
+            .to_be_bytes();
+        client_writer
+            .write_all(&malformed_len)
+            .await
+            .expect("send malformed frame length prefix");
+        client_writer
+            .write_all(malformed_payload)
+            .await
+            .expect("send malformed frame payload");
+        client_writer.flush().await.expect("flush");
+
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(
+            read_daemon_message(&mut client_reader, &mut decoder).await,
+            DaemonMessage::Welcome {
+                version: PROTOCOL_VERSION,
+            }
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(5), conn)
+            .await
+            .expect("serve_connection returns after the malformed frame")
+            .expect("connection task joins");
+        assert!(
+            result.is_err(),
+            "a malformed frame must surface as an error return, not a clean close"
+        );
+        assert_eq!(
+            enabled.load(Ordering::Relaxed),
+            0,
+            "an error return while opted in must still decrement the shared counter back to zero"
+        );
+
+        dispatch.abort();
+    }
+
     /// `docs/spec-memory-pressure.md`: passing a PSI sample through the
     /// builder carries it straight onto the wire, unmodified.
     #[test]
@@ -3480,6 +4322,7 @@ mod tests {
             events: host_metrics_events,
             latest: host_metrics_latest,
         };
+        let (_pane_metrics_tx, pane_metrics) = test_pane_metrics_handles();
 
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (mut client_reader, mut client_writer) = tokio::io::split(client);
@@ -3496,6 +4339,7 @@ mod tests {
                 None,
                 None,
                 host_metrics,
+                pane_metrics,
             )
             .await
         });
@@ -3843,6 +4687,7 @@ mod tests {
         let (mut client_reader, mut client_writer) = tokio::io::split(client);
         let (server_reader, server_writer) = tokio::io::split(server);
         let (_host_metrics_tx, host_metrics) = test_host_metrics_handles();
+        let (_pane_metrics_tx, pane_metrics) = test_pane_metrics_handles();
         let conn = tokio::spawn(async move {
             let _ = serve_connection(
                 server_reader,
@@ -3855,6 +4700,7 @@ mod tests {
                 None,
                 None,
                 host_metrics,
+                pane_metrics,
             )
             .await;
         });
@@ -3896,6 +4742,7 @@ mod tests {
         let (mut client_reader, mut client_writer) = tokio::io::split(client);
         let (server_reader, server_writer) = tokio::io::split(server);
         let (_host_metrics_tx, host_metrics) = test_host_metrics_handles();
+        let (_pane_metrics_tx, pane_metrics) = test_pane_metrics_handles();
         let conn = tokio::spawn(async move {
             let _ = serve_connection(
                 server_reader,
@@ -3908,6 +4755,7 @@ mod tests {
                 None,
                 None,
                 host_metrics,
+                pane_metrics,
             )
             .await;
         });
@@ -3990,6 +4838,7 @@ mod tests {
         let (mut client_reader, mut client_writer) = tokio::io::split(client);
         let (server_reader, server_writer) = tokio::io::split(server);
         let (_host_metrics_tx, host_metrics) = test_host_metrics_handles();
+        let (_pane_metrics_tx, pane_metrics) = test_pane_metrics_handles();
         let conn = tokio::spawn(async move {
             let _ = serve_connection(
                 server_reader,
@@ -4002,6 +4851,7 @@ mod tests {
                 None,
                 None,
                 host_metrics,
+                pane_metrics,
             )
             .await;
         });
@@ -4096,12 +4946,14 @@ mod tests {
         // it, so the task parks on a send with nobody reading.
         let (out_tx, out_rx) = mpsc::channel(1);
         let (root_resolved_tx, _root_resolved_rx) = mpsc::channel(4);
+        let (pane_pids_tx, _pane_pids_rx) = mpsc::channel(4);
         let handle = tokio::spawn(terminal::terminal_task(
             in_rx,
             out_tx,
             Some(server.0.clone()),
             None,
             root_resolved_tx,
+            pane_pids_tx,
         ));
 
         in_tx
@@ -4147,6 +4999,7 @@ mod tests {
 
         let tmux_name = server.0.clone();
         let (_host_metrics_tx, host_metrics) = test_host_metrics_handles();
+        let (_pane_metrics_tx, pane_metrics) = test_pane_metrics_handles();
         let conn = tokio::spawn(async move {
             serve_connection(
                 server_reader,
@@ -4159,6 +5012,7 @@ mod tests {
                 None,
                 None,
                 host_metrics,
+                pane_metrics,
             )
             .await
         });
@@ -4283,6 +5137,7 @@ mod tests {
 
         let tmux_name = server.0.clone();
         let (_host_metrics_tx, host_metrics) = test_host_metrics_handles();
+        let (_pane_metrics_tx, pane_metrics) = test_pane_metrics_handles();
         let conn = tokio::spawn(async move {
             serve_connection(
                 server_reader,
@@ -4295,6 +5150,7 @@ mod tests {
                 None,
                 Some(context_map),
                 host_metrics,
+                pane_metrics,
             )
             .await
         });
@@ -5166,6 +6022,7 @@ mod tests {
         // `_conn_a` is bound and `host_metrics.events.recv()`
         // observes `Closed` on the connection's very first `select!` poll.
         let (_host_metrics_tx_a, host_metrics_a) = test_host_metrics_handles();
+        let (_pane_metrics_tx_a, pane_metrics_a) = test_pane_metrics_handles();
         let _conn_a = {
             let (inbound, events, state, nav) = (
                 handles.inbound.clone(),
@@ -5185,6 +6042,7 @@ mod tests {
                     None,
                     None,
                     host_metrics_a,
+                    pane_metrics_a,
                 )
                 .await
             })
@@ -5199,6 +6057,7 @@ mod tests {
         // `_conn_b` is bound and `host_metrics.events.recv()`
         // observes `Closed` on the connection's very first `select!` poll.
         let (_host_metrics_tx_b, host_metrics_b) = test_host_metrics_handles();
+        let (_pane_metrics_tx_b, pane_metrics_b) = test_pane_metrics_handles();
         let _conn_b = {
             let (inbound, events, state, nav) = (
                 handles.inbound.clone(),
@@ -5218,6 +6077,7 @@ mod tests {
                     None,
                     None,
                     host_metrics_b,
+                    pane_metrics_b,
                 )
                 .await
             })
@@ -5313,6 +6173,7 @@ mod tests {
         // `_conn` is bound and `host_metrics.events.recv()`
         // observes `Closed` on the connection's very first `select!` poll.
         let (_host_metrics_tx_a, host_metrics_a) = test_host_metrics_handles();
+        let (_pane_metrics_tx_a, pane_metrics_a) = test_pane_metrics_handles();
         let _conn = {
             let (inbound, events, state) = (
                 handles.inbound.clone(),
@@ -5331,6 +6192,7 @@ mod tests {
                     None,
                     None,
                     host_metrics_a,
+                    pane_metrics_a,
                 )
                 .await
             })
@@ -5400,6 +6262,7 @@ mod tests {
         // `_conn_a` is bound and `host_metrics.events.recv()`
         // observes `Closed` on the connection's very first `select!` poll.
         let (_host_metrics_tx_a, host_metrics_a) = test_host_metrics_handles();
+        let (_pane_metrics_tx_a, pane_metrics_a) = test_pane_metrics_handles();
         let _conn_a = {
             let (inbound, events, state, nav) = (
                 handles.inbound.clone(),
@@ -5419,6 +6282,7 @@ mod tests {
                     None,
                     None,
                     host_metrics_a,
+                    pane_metrics_a,
                 )
                 .await
             })
@@ -5433,6 +6297,7 @@ mod tests {
         // `_conn_b` is bound and `host_metrics.events.recv()`
         // observes `Closed` on the connection's very first `select!` poll.
         let (_host_metrics_tx_b, host_metrics_b) = test_host_metrics_handles();
+        let (_pane_metrics_tx_b, pane_metrics_b) = test_pane_metrics_handles();
         let _conn_b = {
             let (inbound, events, state, nav) = (
                 handles.inbound.clone(),
@@ -5452,6 +6317,7 @@ mod tests {
                     None,
                     None,
                     host_metrics_b,
+                    pane_metrics_b,
                 )
                 .await
             })
