@@ -201,6 +201,25 @@ struct SessionKillConfirm {
     focus_handle: FocusHandle,
 }
 
+/// An in-progress inline kill confirmation for a pane header's close (X)
+/// control (#907, `docs/spec-dogfooding-fixes.md`), armed only when the
+/// pane's foreground process is not the shell (`is_shell == false`, the same
+/// agent-agnostic signal the header's type glyph uses, #510) — a plain shell
+/// pane closes immediately with no prompt (see
+/// [`SessionView::render_pane_header`]). Two-step by design, mirroring
+/// [`SessionKillConfirm`]: the close click only arms this state
+/// ([`SessionView::start_pane_kill_confirm`]) — nothing reaches tmux until
+/// the confirm control commits ([`SessionView::confirm_pane_kill`]); Escape
+/// or the cancel control aborts with no command sent
+/// ([`SessionView::cancel_pane_kill`]). `pane_id` is tmux's pane id (`%N`),
+/// the same id `render_pane_header` is keyed by. `focus_handle` is moved onto
+/// the confirm row on arming (mirrors #686's drive-by fix for the session
+/// confirm) so the row's own `on_key_down` actually receives Escape.
+struct PaneKillConfirm {
+    pane_id: String,
+    focus_handle: FocusHandle,
+}
+
 /// Which way a chip's context-menu reorder action ([`SessionView::move_session`])
 /// swaps it in the visible session order (#744, "Move left"/"Move right"
 /// replacing #686's drag-to-reorder — see [`SessionView::move_session`] for
@@ -289,6 +308,12 @@ fn new_window_at_command(dir: &str) -> String {
 /// state — the pane header's zoom control.
 fn zoom_pane_command(pane: &str) -> String {
     format!("resize-pane -Z -t {}", pane)
+}
+
+/// tmux `kill-pane -t <pane>` command for the pane header's close (X)
+/// control (#907, `docs/spec-dogfooding-fixes.md`).
+fn kill_pane_command(pane: &str) -> String {
+    format!("kill-pane -t {}", pane)
 }
 
 /// Rewrite a home-anchored absolute path to a `~`-relative one for display
@@ -506,6 +531,12 @@ pub struct SessionView {
     /// a compact confirm affordance ("Kill?" + confirm/cancel) in place of
     /// its normal row. Two-step by design — see [`SessionKillConfirm`].
     confirming_kill: Option<SessionKillConfirm>,
+    /// A pane header's in-progress inline kill confirmation (#907), armed
+    /// from the header's close (X) control when the pane's foreground
+    /// process is not the shell; when active, that header renders a compact
+    /// confirm affordance in place of its normal split/split/zoom/close
+    /// actions. Two-step by design — see [`PaneKillConfirm`].
+    confirming_pane_kill: Option<PaneKillConfirm>,
     /// Requests an on-demand session-list refresh (forwarded to
     /// `TerminalHandle`'s `session_list_request_rx`); between requests the
     /// daemon's churn-driven pushes keep the strip live.
@@ -743,6 +774,7 @@ impl SessionView {
             sessions: Vec::new(),
             renaming_session: None,
             confirming_kill: None,
+            confirming_pane_kill: None,
             session_list_request_tx,
             session_switch_tx,
             session_order_tx,
@@ -1569,6 +1601,60 @@ impl SessionView {
         }
     }
 
+    /// Arm the kill confirmation for pane `pane_id`, dispatched by the pane
+    /// header's close (X) control when the pane's foreground process is not
+    /// the shell (#907, `docs/spec-dogfooding-fixes.md`): two-step by design,
+    /// so a stray click can never kill a running process outright. No
+    /// command is sent here — only [`Self::confirm_pane_kill`] sends one.
+    /// Moves keyboard focus onto a fresh handle for the confirm row,
+    /// mirroring [`Self::start_session_kill_confirm`]'s #686 drive-by fix, so
+    /// the row's own `on_key_down` Escape handler (see
+    /// [`Self::render_pane_header`]) actually fires.
+    fn start_pane_kill_confirm(
+        &mut self,
+        pane_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window, cx);
+        self.confirming_pane_kill = Some(PaneKillConfirm {
+            pane_id,
+            focus_handle,
+        });
+        cx.notify();
+    }
+
+    /// Commit an armed pane kill confirmation: send `kill-pane -t <pane_id>`
+    /// over the existing raw tmux-command seam (mirrors
+    /// [`Self::confirm_session_kill`]). The pane drops live via the next
+    /// layout snapshot; no separate teardown is needed here. A second
+    /// confirm after the kill already committed (or was cancelled) must not
+    /// re-send.
+    fn confirm_pane_kill(&mut self, cx: &mut Context<Self>) {
+        let Some(confirm) = self.confirming_pane_kill.take() else {
+            return;
+        };
+        if let Err(e) = self
+            .tmux_command_tx
+            .try_send(kill_pane_command(&confirm.pane_id))
+        {
+            debug!(error = %e, "failed to send pane kill command");
+        }
+        self.needs_focus = true;
+        cx.notify();
+    }
+
+    /// Cancel an armed pane kill confirmation without emitting a command
+    /// (Escape or the cancel control).
+    fn cancel_pane_kill(&mut self, cx: &mut Context<Self>) {
+        if self.confirming_pane_kill.is_some() {
+            self.confirming_pane_kill = None;
+            self.needs_focus = true;
+            cx.notify();
+        }
+    }
+
     fn render_layout(
         &self,
         node: &LayoutNode,
@@ -2056,11 +2142,14 @@ impl SessionView {
     /// #510), the `pane_current_command` title (mono), a home-relative cwd
     /// (muted mono), a "running" pill while the pane is busy — hidden when free
     /// (attention is unreachable for a visible pane under the #428 gating) — and
-    /// split-h / split-v / zoom controls that each emit a tmux command over the
-    /// shared command seam. The bg lifts for the active pane; a click anywhere
-    /// on the header focuses the pane (`select-pane`), replacing the removed
-    /// sidebar's mouse pane-select. Every control only emits a command; the next
-    /// snapshot redraws the result.
+    /// split-h / split-v / zoom / close controls that each emit a tmux command
+    /// over the shared command seam. The close (X, #907) control kills the
+    /// pane immediately when its foreground process is the shell; otherwise it
+    /// arms the inline [`PaneKillConfirm`] in place of the action row (mirrors
+    /// the session strip's kill-confirm, #685). The bg lifts for the active
+    /// pane; a click anywhere on the header focuses the pane (`select-pane`),
+    /// replacing the removed sidebar's mouse pane-select. Every control only
+    /// emits a command; the next snapshot redraws the result.
     fn render_pane_header(&self, pane_id: &str, cx: &mut Context<Self>) -> AnyElement {
         let Some(entry) = self.panes.get(pane_id) else {
             return div().into_any_element();
@@ -2083,6 +2172,7 @@ impl SessionView {
         let muted = cx.theme().muted_foreground;
         let border = cx.theme().border;
         let success = cx.theme().success;
+        let danger = cx.theme().danger;
 
         let header_bg = if is_active { active_bg } else { tab_bar };
         // `pane_current_command` is normally populated; fall back to the pane id
@@ -2133,34 +2223,97 @@ impl SessionView {
                     )
             }));
 
-        let actions = h_flex()
-            .flex_none()
-            .items_center()
-            .gap(px(2.0))
-            .child(self.header_action(
-                IconName::PanelRight,
-                split_command(true, pane_id),
-                muted,
-                fg,
-                active_bg,
-                cx,
-            ))
-            .child(self.header_action(
-                IconName::PanelBottom,
-                split_command(false, pane_id),
-                muted,
-                fg,
-                active_bg,
-                cx,
-            ))
-            .child(self.header_action(
-                IconName::Maximize,
-                zoom_pane_command(pane_id),
-                muted,
-                fg,
-                active_bg,
-                cx,
-            ));
+        // A pane kill confirm armed for THIS pane (#907) replaces the normal
+        // action row with the inline "Kill?" affordance, mirroring the
+        // session strip's kill-confirm row (see [`Self::render_session_strip`]).
+        let pane_kill_confirm = self
+            .confirming_pane_kill
+            .as_ref()
+            .filter(|confirm| confirm.pane_id == pane_id)
+            .map(|confirm| confirm.focus_handle.clone());
+
+        let actions = if let Some(focus_handle) = pane_kill_confirm {
+            let confirm_entity = cx.entity().clone();
+            let cancel_entity = confirm_entity.clone();
+            let key_cancel_entity = confirm_entity.clone();
+            let confirm_id = SharedString::from(format!("pane-kill-confirm-{pane_id}"));
+            let cancel_id = SharedString::from(format!("pane-kill-cancel-{pane_id}"));
+            h_flex()
+                .flex_none()
+                .items_center()
+                .gap(px(4.0))
+                // Moved onto this row when the confirm was armed
+                // (`Self::start_pane_kill_confirm`, mirrors #686's session
+                // drive-by fix) so `on_key_down` below actually receives
+                // Escape — without this, keyboard focus stayed on the
+                // terminal pane and Escape never reached this handler.
+                .track_focus(&focus_handle)
+                .on_key_down(move |event: &KeyDownEvent, _window, cx| {
+                    if event.keystroke.key.as_str() == "escape" {
+                        key_cancel_entity.update(cx, |view, cx| {
+                            view.cancel_pane_kill(cx);
+                        });
+                        cx.stop_propagation();
+                    }
+                })
+                .child(div().text_color(danger).child("Kill?"))
+                .child(
+                    Button::new(confirm_id)
+                        .xsmall()
+                        .danger()
+                        .icon(IconName::Check)
+                        .tooltip("Kill pane")
+                        .on_click(move |_event, _window, cx| {
+                            confirm_entity.update(cx, |view, cx| {
+                                view.confirm_pane_kill(cx);
+                            });
+                        }),
+                )
+                .child(
+                    Button::new(cancel_id)
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close)
+                        .tooltip("Cancel")
+                        .on_click(move |_event, _window, cx| {
+                            cancel_entity.update(cx, |view, cx| {
+                                view.cancel_pane_kill(cx);
+                            });
+                        }),
+                )
+                .into_any_element()
+        } else {
+            h_flex()
+                .flex_none()
+                .items_center()
+                .gap(px(2.0))
+                .child(self.header_action(
+                    IconName::PanelRight,
+                    split_command(true, pane_id),
+                    muted,
+                    fg,
+                    active_bg,
+                    cx,
+                ))
+                .child(self.header_action(
+                    IconName::PanelBottom,
+                    split_command(false, pane_id),
+                    muted,
+                    fg,
+                    active_bg,
+                    cx,
+                ))
+                .child(self.header_action(
+                    IconName::Maximize,
+                    zoom_pane_command(pane_id),
+                    muted,
+                    fg,
+                    active_bg,
+                    cx,
+                ))
+                .child(self.close_pane_action(pane_id, is_shell, muted, fg, active_bg, cx))
+                .into_any_element()
+        };
 
         h_flex()
             .flex_none()
@@ -2221,6 +2374,50 @@ impl SessionView {
                 }),
             )
     }
+
+    /// The pane header's close (X) control (#907,
+    /// `docs/spec-dogfooding-fixes.md`). A shell foreground process
+    /// (`is_shell == true`, tmux's own agent-agnostic signal, #510) has
+    /// nothing in-flight to lose, so a click kills the pane immediately,
+    /// mirroring the other header actions ([`Self::header_action`]); any
+    /// other foreground process arms the inline [`PaneKillConfirm`]
+    /// ([`Self::start_pane_kill_confirm`]) instead of sending a command
+    /// directly, so a stray click can never kill a running process outright.
+    fn close_pane_action(
+        &self,
+        pane_id: &str,
+        is_shell: bool,
+        muted: Hsla,
+        hover_fg: Hsla,
+        hover_bg: Hsla,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let target = pane_id.to_string();
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(22.0))
+            .rounded(px(4.0))
+            .text_color(muted)
+            .hover(|s| s.bg(hover_bg).text_color(hover_fg))
+            .child(Icon::new(IconName::Close).size_3())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
+                    if is_shell {
+                        let command = kill_pane_command(&target);
+                        if let Err(e) = this.tmux_command_tx.try_send(command.clone()) {
+                            debug!(error = %e, command = %command, "failed to send kill-pane command");
+                        }
+                    } else {
+                        this.start_pane_kill_confirm(target.clone(), window, cx);
+                    }
+                    cx.stop_propagation();
+                }),
+            )
+    }
 }
 
 impl Focusable for SessionView {
@@ -2236,16 +2433,17 @@ impl Focusable for SessionView {
 
 impl Render for SessionView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Skip pane auto-focus while an inline rename or an armed kill
-        // confirm (#686 drive-by fix) owns focus, so a snapshot arriving
-        // mid-edit does not steal the keystroke stream from it — the kill
-        // confirm has no input of its own to notice the theft, so without
-        // this guard a stray steal-back would silently break its Escape
-        // handler again.
+        // Skip pane auto-focus while an inline rename or an armed session/
+        // pane kill confirm (#686 drive-by fix; pane kill confirm added by
+        // #907) owns focus, so a snapshot arriving mid-edit does not steal
+        // the keystroke stream from it — the kill confirm has no input of
+        // its own to notice the theft, so without this guard a stray
+        // steal-back would silently break its Escape handler again.
         if self.needs_focus
             && self.renaming_window.is_none()
             && self.renaming_session.is_none()
             && self.confirming_kill.is_none()
+            && self.confirming_pane_kill.is_none()
         {
             let entity_to_focus = self
                 .active_pane_id
@@ -2674,7 +2872,7 @@ impl Render for SessionView {
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_activity, grid_size_for, home_relative, kill_session_command,
+        aggregate_activity, grid_size_for, home_relative, kill_pane_command, kill_session_command,
         max_vertical_pane_count, new_window_at_command, quote_tmux_name, reconnect_banner_message,
         rename_session_command, resize_direction, select_pane_command, split_command,
         tab_state_slot, zoom_pane_command, MoveDirection, PaneActivity, SessionListItem,
@@ -2864,6 +3062,11 @@ mod tests {
     #[test]
     fn test_zoom_pane_command_targets_pane() {
         assert_eq!(zoom_pane_command("%7"), "resize-pane -Z -t %7");
+    }
+
+    #[test]
+    fn test_kill_pane_command_targets_pane() {
+        assert_eq!(kill_pane_command("%7"), "kill-pane -t %7");
     }
 
     #[test]
@@ -3833,6 +4036,102 @@ mod tests {
             assert!(
                 session.read(cx).confirming_kill.is_none(),
                 "cancel clears the in-progress kill confirm"
+            );
+            assert!(
+                handle.tmux_command_rx.try_recv().is_err(),
+                "cancel sends no command"
+            );
+            assert!(session.read(cx).needs_focus, "focus restored after cancel");
+        })
+        .unwrap();
+    }
+
+    /// The pane header's close control (#907) only ARMS the two-step confirm
+    /// for a non-shell foreground process — nothing is sent to tmux yet, and
+    /// arming moves keyboard focus onto the confirm's own handle (mirrors
+    /// #686's session drive-by fix) so its `on_key_down` Escape handler
+    /// actually fires.
+    #[gpui::test]
+    fn test_start_pane_kill_confirm_arms_without_sending(cx: &mut TestAppContext) {
+        let (window, session, handle) = windowed_session_and_handle(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            session.update(cx, |view, cx| {
+                view.start_pane_kill_confirm("%3".to_string(), window, cx);
+            });
+
+            let confirm = session
+                .read(cx)
+                .confirming_pane_kill
+                .as_ref()
+                .expect("close arms the inline confirm")
+                .focus_handle
+                .clone();
+            assert!(
+                confirm.is_focused(window),
+                "arming moves focus onto the confirm row so Escape reaches it"
+            );
+            assert!(
+                handle.tmux_command_rx.try_recv().is_err(),
+                "arming the confirm sends no command"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Confirming an armed pane kill sends exactly one `kill-pane -t <id>`,
+    /// clears the confirm state, and restores pane focus (mirrors
+    /// `confirm_session_kill`). A second confirm after the commit must not
+    /// re-send.
+    #[gpui::test]
+    fn test_confirm_pane_kill_sends_one_kill_command_and_restores_focus(cx: &mut TestAppContext) {
+        let (window, session, handle) = windowed_session_and_handle(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            session.update(cx, |view, cx| {
+                view.start_pane_kill_confirm("%3".to_string(), window, cx);
+                view.needs_focus = false;
+            });
+
+            session.update(cx, |view, cx| view.confirm_pane_kill(cx));
+
+            assert_eq!(
+                handle.tmux_command_rx.try_recv().expect("command sent"),
+                "kill-pane -t %3"
+            );
+            assert!(
+                session.read(cx).confirming_pane_kill.is_none(),
+                "confirm cleared after commit"
+            );
+            assert!(session.read(cx).needs_focus, "focus restored after confirm");
+
+            session.update(cx, |view, cx| view.confirm_pane_kill(cx));
+            assert!(
+                handle.tmux_command_rx.try_recv().is_err(),
+                "a second confirm after the commit sends nothing"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Cancel (mirrors Escape, which dispatches the same handler) sends no
+    /// command, clears the armed confirm, and restores pane focus.
+    #[gpui::test]
+    fn test_cancel_pane_kill_sends_nothing_and_restores_focus(cx: &mut TestAppContext) {
+        let (window, session, handle) = windowed_session_and_handle(cx);
+
+        cx.update_window(window, |_, window, cx| {
+            session.update(cx, |view, cx| {
+                view.start_pane_kill_confirm("%3".to_string(), window, cx);
+                view.needs_focus = false;
+            });
+            assert!(session.read(cx).confirming_pane_kill.is_some());
+
+            session.update(cx, |view, cx| view.cancel_pane_kill(cx));
+
+            assert!(
+                session.read(cx).confirming_pane_kill.is_none(),
+                "cancel clears the in-progress pane kill confirm"
             );
             assert!(
                 handle.tmux_command_rx.try_recv().is_err(),
