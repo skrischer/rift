@@ -296,3 +296,15 @@ under the milestone. This spec owns the design; the issues own progress.
   (`psi: None`, `psi: _`) to keep `cargo test --workspace --exclude rift-app`
   green; no PSI read/parse logic was added there — that stays the daemon
   issue's scope.
+- 2026-08-01 (#875, daemon step): `read_memory_pressure(path: &Path)` and its
+  `parse_memory_pressure`/`parse_psi_averages` helpers hand-parse the two
+  `some`/`full` lines with `str::lines` + `strip_prefix` + `split_once('=')` —
+  no regex, no new dependency. Any parse gap (missing line, missing `avgN`
+  token, non-numeric value) short-circuits to `None` via `?`, matching the
+  spec's "never error, degrade to the portable baseline" risk mitigation.
+  `host_metrics_sampler` resolves `Path::new(DEFAULT_PSI_PATH).exists()` once
+  before the tick loop (a new `DEFAULT_PSI_PATH` constant next to
+  `HOST_METRICS_INTERVAL`) and re-reads only the file's contents each tick
+  inside the existing `spawn_blocking`, exactly as the spec's daemon scope
+  describes. `build_host_metrics_message` takes the PSI sample as a plain
+  parameter and passes it straight through, staying a pure builder.
