@@ -3154,6 +3154,14 @@ async fn consume_daemon_messages(
             msg @ DaemonMessage::HostMetrics { .. } => {
                 let _ = editor.host_metrics_tx.send(msg);
             }
+            // --- per-pane metrics -> breakdown popover (wire foundation only) ---
+            // `PaneMetrics` (`docs/spec-pane-attribution.md`, #879) is
+            // per-connection, push-only, and sent only while this connection
+            // has opted in via `SetPaneMetricsEnabled`. Wiring it into
+            // `WorkspaceView` and the MEM/CPU-indicator popover lands in a
+            // follow-on issue.
+            // real handling: #881
+            DaemonMessage::PaneMetrics { .. } => {}
             // --- diff reply -> diff view (every mode) ---
             // The reply to a `RequestDiff`: forward to the diff view, which
             // routes it by path against the currently open selection (#338).

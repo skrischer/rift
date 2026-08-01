@@ -50,7 +50,12 @@ binary, never by tolerating it (`docs/spec-connection-robustness.md`).
   a healthy concurrent connection's stream (relevant for the shared stable+dev
   daemon).
 
-History: version 14 adds the optional Linux PSI memory-stall payload
+History: version 15 adds the per-pane metrics push (`pane_metrics`) — a
+per-connection breakdown of the attached session's panes by rolled-up `/proc`
+resident memory and CPU, keyed by `pane_id` and labelled by the agnostic
+`pane_current_command` — plus its client→daemon opt-in
+(`set_pane_metrics_enabled`), the sampling on/off toggle a connection uses to
+drive on-demand per-pane sampling (`docs/spec-pane-attribution.md`); version 14 adds the optional Linux PSI memory-stall payload
 (`psi`) to `host_metrics` (`docs/spec-memory-pressure.md`); version 13 adds the host-metrics push (`host_metrics`) — a
 daemon-global CPU/memory/swap/load sample, push-only and `welcome`-replayed
 like `lsp_status` (`docs/spec-host-telemetry.md`); version 12 adds
@@ -322,6 +327,49 @@ stalled on memory reclaim over the last 10s/60s/300s; `full_avg10` /
 stalled simultaneously (a stronger signal than `some`). The kernel's own file
 also carries a trailing `total=<microseconds>` counter per line, which this
 payload omits — only the ready-to-use `avgN` percentages are carried.
+
+## Pane metrics (`docs/spec-pane-attribution.md`)
+
+```json
+// client → daemon: turn per-pane sampling on/off for this connection
+{ "type": "set_pane_metrics_enabled", "enabled": true }
+
+// daemon → client: this connection's attached-session breakdown
+{ "type": "pane_metrics", "entries": [
+  { "pane_id": 1, "rss": 123456789, "cpu": 12.5, "command": "cargo" },
+  { "pane_id": 2, "rss": 4096, "cpu": 0.0, "command": "bash" }
+] }
+```
+
+`pane_metrics` answers "which pane is the cause" when the host is under
+memory/CPU pressure: for each pane of the **attached session**, the daemon
+walks the `/proc` process subtree rooted at the pane's process (tmux
+`#{pane_pid}`) and sums the descendants' resident memory and CPU. `pane_id`
+matches the layout's pane id (the same key the client already has from
+`layout_snapshot`/`layout_update`) — the underlying host pid never reaches the
+wire. `rss` is the subtree's resident bytes; `cpu` is the subtree's CPU usage
+on `HostMetrics.cpu`'s scale (`0.0`-`100.0` times the core count); `command` is
+the pane's agnostic `pane_current_command` label, **never** an agent name.
+`command` is re-shipped on every push (not looked up from a separately cached
+layout) so each push is a self-contained, sample-coherent snapshot that still
+renders correctly if a pane has since vanished from the layout.
+
+Unlike `host_metrics`, `pane_metrics` is **per-connection, not
+daemon-global**: each `serve_connection` computes and writes its own attached
+session's entries to its own socket, never the shared broadcast bus — two
+connections attached to different tmux sessions on the same host never see
+each other's panes. It is push-only and sent only while this connection has
+opted in.
+
+`set_pane_metrics_enabled` is the opt-in that drives on-demand sampling — the
+telemetry channel otherwise has no client→daemon request path. A connection
+sends `{ "enabled": true }` while its breakdown popover is open and `{
+"enabled": false }` on close or disconnect. The daemon gates its shared
+process-table refresh on the count of connections currently opted in across
+the whole daemon: at zero, it does no per-pane sampling work at all; the first
+opt-in primes the process table (per-process CPU needs two samples to settle,
+so the first frame's `cpu` may read near zero, while `rss` is correct
+immediately).
 
 ### Live-buffer feed (`spec-editor.md`, cut C)
 
