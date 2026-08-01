@@ -20,11 +20,11 @@ viewport indicator and drag-to-scroll. Roadmap Phase 55.
 - A denser, structure-bearing miniature painted by the existing hand-drawn `canvas` + `paint_quad` path (`editor.rs:3247-3272`, `paint_minimap` `:3557`): per line, a block whose horizontal extent reflects **leading indentation + line length** (the indentation silhouette is what makes a minimap recognizable), shaded from the theme palette (`cx.theme().highlight_theme`, reachable per `editor.rs:2504`), with diagnostics overlaid as today.
 - Drag-to-scroll: extend the existing minimap mouse-down (`editor.rs:3266` → `minimap_jump` `:2056`) into a drag, mirroring the terminal border-drag idiom (`crates/terminal/src/session_view.rs:2623-2668`) — a full-window occluding overlay capturing `on_mouse_move`/`on_mouse_up`, mapping pointer-Y → line ratio → scroll target each move.
 - Reuse the viewport slab (`minimap_slab_fracs` `:3520`, painted `:3619`) as the viewport indicator.
-- Keep the sample cache model: recompute the miniature representation once per text change (`recompute_minimap_samples` `:953`), not per frame; bound the work to the downsample cap (`MINIMAP_SAMPLES = 1024`, `:357`).
+- Keep the sample cache model: recompute the miniature representation once per text change (`recompute_minimap_samples` `:953`), not per frame; bound the work to the downsample cap (`MINIMAP_SAMPLES = 1024`, `:357`). **The cache must carry indentation through the bucket**: today `sample_line_lengths` (`:3495`) collapses many source lines into one bucket taking the *max* length, which discards per-line indentation; the extended cache stores a per-bucket box (e.g. min leading-indent + max length) so the indentation silhouette survives bucketing on large files rather than degrading back to length bars.
 
 ### Out of scope
 
-- Forking or extending the longbridge gpui-component pin (git dep, rev `9ad30e6…`, not our fork — `Cargo.toml:75`). The pin exposes **no scroll-offset setter and no per-token/span accessor**; a token-glyph-accurate miniature and a caret-free drag both require extending that dependency. Whether to make that commitment is the gate decision; the deferred richer path is recorded, not built here unless the gate elects it.
+- Forking or extending the longbridge gpui-component pin (git dep, rev `9ad30e6…`, not our fork — `Cargo.toml:75`). The pin appears to expose **no scroll-offset setter and no per-token/span accessor** (inferred from the app's use sites — the pin source is not vendored in the checkout, so path B's first step is to CONFIRM the API is genuinely absent against the rev; if such an API already exists, a caret-free drag / token color is cheap and B is not really a fork). A token-glyph-accurate miniature and a caret-free drag otherwise require extending that dependency. Whether to make that commitment is the gate decision; the deferred richer path is recorded, not built here unless the gate elects it.
 - A glyph-scaled miniature (rendering shrunk actual characters) — out regardless of the gate; the realistic target is per-line shaded blocks, not scaled text.
 - Token-semantic coloring beyond what the theme palette + diagnostics already give the app, unless the gate elects the pin extension (the InputState exposes no per-span token accessor to the app; only `tree-sitter-rust` is compiled, so an app-side pass would be Rust-only and duplicate the widget's own highlighting).
 - Any change to the editor text model, LSP, or protocol — client-side rendering only.
@@ -63,7 +63,7 @@ viewport indicator and drag-to-scroll. Roadmap Phase 55.
 ## Verification
 
 - [ ] `just ci` equivalent green for `app` (fmt + clippy `-D warnings` + tests); the crate compiles warm-target clean.
-- [ ] Unit test: the miniature representation derives from a document with known indentation/length into the expected per-line block extents; the cache recomputes only on text change.
+- [ ] Unit test: the miniature representation derives from a document with known indentation/length into the expected per-bucket block boxes (indent offset + extent; per-line for small files, per-bucket min-indent/max-len for files past the downsample cap); the cache recomputes only on text change.
 - [ ] QA: the strip reads as a code silhouette (indentation structure visible), not flat length bars; diagnostics still mark their lines.
 - [ ] QA: dragging the miniature scrolls the document continuously; the viewport slab tracks the visible region. (Path A: note the caret follows; Path B: the caret does not move.)
 - [ ] QA: a large file (near the 2 MB cap) opens and scrolls without per-frame jank (recompute is off the render path).
@@ -75,7 +75,7 @@ viewport indicator and drag-to-scroll. Roadmap Phase 55.
 | `set_cursor_position` drag moves the caret (path A wart) | Accepted and documented for path A; path B (pin scroll setter) removes it. Surfaced at the gate so the choice is deliberate |
 | A gpui-component fork (path B) becomes a maintenance burden / diverges from upstream | Prefer upstreaming the accessor; pin-note discipline already governs the rev (`Cargo.toml:63-75`); scope the pin change to the minimum (a scroll-offset getter/setter, optional token accessor) |
 | Recomputing the miniature janks large files | Keep the once-per-change cache; move a heavy pass to `spawn_blocking`; bound by `MINIMAP_SAMPLES` |
-| The miniature is barely better than today's bars | The indentation silhouette + denser sampling is the visible upgrade even in path A; token color (path B) is the further step |
+| The miniature is barely better than today's bars | The indentation offset (a block starts at its leading indent, not left-aligned length-only) is the recognizable-minimap signal and the real path-A upgrade — the sample cap stays 1024, so density is unchanged; drag-to-scroll is the second upgrade; token color (path B) is the further step |
 
 ## Decision log
 
