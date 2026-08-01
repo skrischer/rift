@@ -91,13 +91,18 @@ use crate::worktree::WorktreeModel;
 /// Once shipped this must not change — it is the persisted panel identifier.
 pub const FILE_TREE_PANEL_NAME: &str = "explorer";
 
-/// Fixed row height for every tree entry, from the "Explorer — Redesign"
-/// artboard's row density (`docs/spec-explorer-redesign.md`) — the 4px
-/// [`ROW_BLOCK_PADDING_Y`] top and bottom plus the row's line height,
-/// replacing the shipped 22px. The virtual list needs a height per item; a
-/// uniform row keeps the size vector trivial to build and the scroll math
-/// exact.
-const ROW_HEIGHT: Pixels = px(28.0);
+/// Fixed row height for every tree entry. Tightened from the "Explorer —
+/// Redesign" artboard's 28px (`docs/spec-explorer-redesign.md`) to a denser
+/// default matching typical IDE explorers (`docs/spec-dogfooding-fixes.md`,
+/// #908) — the ambient `text_sm` row label read too large / too sparse. The
+/// virtual list needs a height per item; a uniform row keeps the size vector
+/// trivial to build and the scroll math exact.
+const ROW_HEIGHT: Pixels = px(24.0);
+
+/// Row label font size, replacing the ambient `text_sm` (14px) every tree row
+/// used — a tighter, IDE-typical size paired with the denser [`ROW_HEIGHT`]
+/// (`docs/spec-dogfooding-fixes.md`, #908).
+const ROW_TEXT_SIZE: Pixels = px(12.0);
 
 /// Vertical padding inside every row (top and bottom), from the artboard's
 /// row density.
@@ -117,6 +122,11 @@ const ROW_SLOT_GAP: Pixels = px(6.0);
 /// of the artboard's own rhythm.
 const HEADER_HEIGHT: Pixels = px(38.0);
 
+/// Font size of the `EXPLORER` header label. Nudged down from 11px to stay
+/// proportionally below the tightened [`ROOT_ROW_TEXT_SIZE`] and
+/// [`ROW_TEXT_SIZE`] (`docs/spec-dogfooding-fixes.md`, #908).
+const HEADER_TEXT_SIZE: Pixels = px(10.0);
+
 /// Left padding inside the header band, from the artboard's measured header
 /// inset (asymmetric with [`HEADER_PADDING_RIGHT`] — the artboard gives the
 /// `EXPLORER` label more room than the action cluster).
@@ -134,6 +144,11 @@ const HEADER_ACTION_GAP: Pixels = px(12.0);
 /// artboard's measured root-row inset — wider than a tree row's padding
 /// since the root row carries no reserved icon slot.
 const ROOT_ROW_PADDING_X: Pixels = px(12.0);
+
+/// Font size of the workspace-root (`RIFT`) row label. Nudged down from 12px
+/// to stay proportionally below the tightened [`ROW_TEXT_SIZE`], above
+/// [`HEADER_TEXT_SIZE`] (`docs/spec-dogfooding-fixes.md`, #908).
+const ROOT_ROW_TEXT_SIZE: Pixels = px(11.0);
 
 /// Base horizontal indent at depth 0, before any per-level indent is added —
 /// the artboard's indent lanes start at 8px, not flush against the row edge.
@@ -2277,7 +2292,7 @@ impl FileTree {
             .border_color(cx.theme().border)
             .child(
                 div()
-                    .text_size(px(11.0))
+                    .text_size(HEADER_TEXT_SIZE)
                     .font_weight(FontWeight::BOLD)
                     .text_color(cx.theme().muted_foreground)
                     .child("EXPLORER"),
@@ -2401,7 +2416,7 @@ impl FileTree {
             .h(ROW_HEIGHT)
             .px(ROOT_ROW_PADDING_X)
             .bg(cx.theme().background)
-            .text_size(px(12.0))
+            .text_size(ROOT_ROW_TEXT_SIZE)
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().list_hover))
             .child(
@@ -2654,7 +2669,7 @@ impl FileTree {
             .pr(px(8.0))
             .gap(ROW_SLOT_GAP)
             .rounded(ROW_RADIUS)
-            .text_sm()
+            .text_size(ROW_TEXT_SIZE)
             .cursor_pointer()
             // Every row carries the 2px left-border slot (the selected row
             // colors it `primary`), so selecting a row never shifts its
@@ -2827,7 +2842,7 @@ impl FileTree {
             .pr(px(8.0))
             .gap(ROW_SLOT_GAP)
             .rounded(ROW_RADIUS)
-            .text_sm()
+            .text_size(ROW_TEXT_SIZE)
             .children(Self::render_indent_guides(row.depth, cx))
             .child(icon_slot)
             .child(
@@ -2877,7 +2892,7 @@ impl FileTree {
             .pr(px(8.0))
             .gap(ROW_SLOT_GAP)
             .rounded(ROW_RADIUS)
-            .text_sm()
+            .text_size(ROW_TEXT_SIZE)
             .children(Self::render_indent_guides(depth, cx))
             .child(icon_slot)
             .child(
@@ -3344,7 +3359,13 @@ mod tests {
         // A grep-friendly lock on the redesigned density: layout pixels, not
         // theme tokens, replacing the shipped 22px row / 14px-per-level
         // indent / no-base indent / no-radius rows.
-        assert_eq!(ROW_HEIGHT, px(28.0));
+        //
+        // `ROW_HEIGHT`/`ROW_TEXT_SIZE` were tightened again for a denser
+        // default matching typical IDE explorers
+        // (`docs/spec-dogfooding-fixes.md`, #908), replacing the 28px row /
+        // ambient 14px `text_sm` label this test used to lock.
+        assert_eq!(ROW_HEIGHT, px(24.0));
+        assert_eq!(ROW_TEXT_SIZE, px(12.0));
         assert_eq!(ROW_BLOCK_PADDING_Y, px(4.0));
         assert_eq!(ROW_RADIUS, px(5.0));
         assert_eq!(ROW_SLOT_GAP, px(6.0));
@@ -3375,6 +3396,12 @@ mod tests {
         // chevron-less redesign (`docs/spec-explorer-polish.md`, #710), so
         // it no longer applies the gap.
         assert_eq!(ROW_SLOT_GAP, px(6.0));
+        // Header/root label sizes, nudged down to stay proportionally below
+        // the tightened `ROW_TEXT_SIZE` (`docs/spec-dogfooding-fixes.md`,
+        // #908): header (10) < root (11) < row (12), the same ascending
+        // order the shipped 11/12/14 triple had.
+        assert_eq!(HEADER_TEXT_SIZE, px(10.0));
+        assert_eq!(ROOT_ROW_TEXT_SIZE, px(11.0));
     }
 
     #[test]
