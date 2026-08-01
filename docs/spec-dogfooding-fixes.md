@@ -230,3 +230,22 @@ includes:
   `!ks.modifiers.alt`, so it is unit-testable without a GPUI window. The downstream
   sink (`SessionView::apply_font_zoom`) was already correct and untouched; Ctrl+`+`/
   Ctrl+`=`/Ctrl+`-` (no Alt) still zoom.
+- 2026-08-01: **Pane resize seam cursor + corner (2-axis) resize** resolved (#906).
+  Category 1 (completing the existing border-drag affordance — `resize_handle`
+  already dragged the seam, the cursor never changed to say so). `resize_handle`
+  now sets `CursorStyle::ResizeLeftRight`/`ResizeUpDown` matching its axis. For the
+  corner: `render_layout`'s per-seam loop now calls a new `render_seam`, which checks
+  whether the leading or trailing neighbor at that seam is itself a `LayoutNode::Split`
+  on the opposite axis (a new `layout::opposite_axis_children` helper) — i.e. whether
+  the seam also crosses that neighbor's own internal boundary/boundaries (leading
+  preferred, matching the seam's existing "leading child" resize-target convention;
+  trailing as fallback so a plain-pane/split-neighbor split, e.g. split right then
+  split the new right pane down, is covered too). When it does, the seam renders as a
+  mirror of the neighbor's own row/column proportions (same `flex_basis(relative(p))`
+  math as the neighbor's real row/column wrappers, so segment boundaries land at the
+  same pixels) with a small `nwse`-cursor corner hitzone between segments. `BorderDrag`
+  gained a `start: Point<Pixels>` (previously single-axis `Pixels`) and an optional
+  `corner: Option<CornerDrag>` so a corner drag emits two independent incremental
+  `resize-pane` commands (one per axis) from the same mouse-down origin, reusing the
+  existing per-axis delta/`resize_direction` plumbing rather than a new absolute-size
+  mechanism.

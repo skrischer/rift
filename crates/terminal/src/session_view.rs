@@ -230,13 +230,27 @@ enum MoveDirection {
     Right,
 }
 
-/// An in-progress border drag. `start` is the mouse position along the drag
-/// axis at mouse-down; `emitted_cells` is the whole-cell offset already sent to
-/// tmux, so each move only emits the incremental `resize-pane`.
+/// An in-progress border drag. `start` is the full mouse position at
+/// mouse-down (both axes are kept so a corner drag, below, can read its own
+/// perpendicular axis from the same origin); `emitted_cells` is the
+/// whole-cell offset already sent to tmux for the primary (`horizontal`)
+/// axis, so each move only emits the incremental `resize-pane`.
 struct BorderDrag {
     target_pane: String,
     horizontal: bool,
-    start: Pixels,
+    start: Point<Pixels>,
+    emitted_cells: i32,
+    /// Set for a corner (2-axis) hitzone (#906,
+    /// `docs/spec-dogfooding-fixes.md`): the perpendicular axis's own target
+    /// pane and incremental cell count, driven from the same `start` point.
+    /// `None` for a plain single-axis seam drag.
+    corner: Option<CornerDrag>,
+}
+
+/// The perpendicular axis of a corner (2-axis) drag, tracked alongside
+/// [`BorderDrag`]'s primary axis. See [`SessionView::corner_handle`].
+struct CornerDrag {
+    target_pane: String,
     emitted_cells: i32,
 }
 
@@ -1698,10 +1712,13 @@ impl SessionView {
                         // The seam before this border resizes the leading child;
                         // target a representative pane inside it.
                         let target = layout::first_pane_id(child).map(str::to_string);
-                        container = container.child(self.resize_handle(
+                        let trailing = &children[i + 1].1;
+                        container = container.child(self.render_seam(
                             horizontal,
                             border_color,
                             target,
+                            child,
+                            trailing,
                             cx,
                         ));
                     }
@@ -1711,15 +1728,18 @@ impl SessionView {
         }
     }
 
-    /// A draggable seam between two split children. The 7px hit area wraps a
-    /// centered 1px line; mouse-down records the drag so the root element's move
-    /// handler can emit incremental `resize-pane` commands. The cursor stays the
-    /// default arrow (no resize cursor).
+    /// The seam between two adjacent split children (#906,
+    /// `docs/spec-dogfooding-fixes.md`). Plain single-axis case: a full-strip
+    /// hit area. When either neighbor is itself split on the opposite axis,
+    /// the seam also crosses that neighbor's own internal boundary/boundaries
+    /// — [`Self::render_seam`] segments the strip and interleaves a corner
+    /// (2-axis) hitzone at each one.
     fn resize_handle(
         &self,
         horizontal: bool,
         border_color: Hsla,
         target: Option<String>,
+        cross_proportion: Option<f32>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let line = if horizontal {
@@ -1729,26 +1749,35 @@ impl SessionView {
         };
         let mut handle = div().flex().items_center().justify_center().flex_none();
         handle = if horizontal {
-            handle.w(px(7.0)).h_full()
+            handle.w(px(7.0))
         } else {
-            handle.h(px(7.0)).w_full()
+            handle.h(px(7.0))
+        };
+        handle = match cross_proportion {
+            Some(proportion) => handle.flex_1().flex_basis(relative(proportion)),
+            None if horizontal => handle.h_full(),
+            None => handle.w_full(),
         };
         handle = handle.child(line);
+        // An axis-appropriate resize cursor: ew-resize for a vertical seam
+        // (side-by-side panes), ns-resize for a horizontal one (stacked
+        // panes) — previously the cursor stayed the default arrow.
+        handle = handle.cursor(if horizontal {
+            CursorStyle::ResizeLeftRight
+        } else {
+            CursorStyle::ResizeUpDown
+        });
 
         if let Some(target) = target {
             handle = handle.on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
-                    let start = if horizontal {
-                        event.position.x
-                    } else {
-                        event.position.y
-                    };
                     this.border_drag = Some(BorderDrag {
                         target_pane: target.clone(),
                         horizontal,
-                        start,
+                        start: event.position,
                         emitted_cells: 0,
+                        corner: None,
                     });
                     cx.stop_propagation();
                     cx.notify();
@@ -1757,6 +1786,105 @@ impl SessionView {
         }
 
         handle.into_any_element()
+    }
+
+    /// Render the seam between two adjacent split children, adding a corner
+    /// (2-axis) hitzone wherever it crosses a neighbor's own internal
+    /// boundary (#906, `docs/spec-dogfooding-fixes.md`). Prefers the leading
+    /// neighbor (matching `target`'s own "leading child" convention),
+    /// falling back to the trailing one so a plain-pane/split-neighbor split
+    /// (e.g. split right, then split the new right pane down) is covered
+    /// too. A neighbor with more than one internal boundary gets one corner
+    /// per boundary; boundaries beyond a non-qualifying side stay reachable
+    /// through that neighbor's own recursively-rendered seam.
+    fn render_seam(
+        &self,
+        horizontal: bool,
+        border_color: Hsla,
+        target: Option<String>,
+        leading: &LayoutNode,
+        trailing: &LayoutNode,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(segments) = layout::opposite_axis_children(leading, horizontal)
+            .or_else(|| layout::opposite_axis_children(trailing, horizontal))
+        else {
+            return self.resize_handle(horizontal, border_color, target, None, cx);
+        };
+
+        let mut seam = if horizontal { v_flex() } else { h_flex() };
+        seam = seam.flex_none();
+        seam = if horizontal {
+            seam.w(px(7.0)).h_full()
+        } else {
+            seam.h(px(7.0)).w_full()
+        };
+
+        let last = segments.len().saturating_sub(1);
+        for (k, (proportion, node)) in segments.iter().enumerate() {
+            seam = seam.child(self.resize_handle(
+                horizontal,
+                border_color,
+                target.clone(),
+                Some(*proportion),
+                cx,
+            ));
+            if k < last {
+                let corner_target = layout::first_pane_id(node).map(str::to_string);
+                seam = seam.child(self.corner_handle(
+                    horizontal,
+                    border_color,
+                    target.clone(),
+                    corner_target,
+                    cx,
+                ));
+            }
+        }
+        seam.into_any_element()
+    }
+
+    /// A corner (2-axis) resize hitzone at a boundary where a seam crosses a
+    /// neighbor's own internal split (see [`Self::render_seam`]). Shows a
+    /// diagonal cursor; dragging it resizes `primary` (this seam's own axis)
+    /// and `secondary` (the neighbor's perpendicular axis) together, reusing
+    /// [`BorderDrag`]'s incremental `resize-pane` plumbing for each axis
+    /// independently via [`CornerDrag`].
+    fn corner_handle(
+        &self,
+        horizontal: bool,
+        border_color: Hsla,
+        primary: Option<String>,
+        secondary: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut corner = div()
+            .flex_none()
+            .w(px(7.0))
+            .h(px(7.0))
+            .bg(border_color)
+            .cursor(CursorStyle::ResizeUpLeftDownRight);
+
+        if let (Some(primary), Some(secondary)) = (primary, secondary) {
+            corner = corner.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                    this.border_drag = Some(BorderDrag {
+                        target_pane: primary.clone(),
+                        horizontal,
+                        start: event.position,
+                        emitted_cells: 0,
+                        corner: Some(CornerDrag {
+                            target_pane: secondary.clone(),
+                            emitted_cells: 0,
+                        }),
+                    });
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            );
+        }
+
+        corner.into_any_element()
     }
 
     /// The always-visible session strip (#683, `docs/spec-session-management.md`),
@@ -2836,12 +2964,12 @@ impl Render for SessionView {
                             let Some(drag) = this.border_drag.as_mut() else {
                                 return;
                             };
-                            let (pos, extent) = if drag.horizontal {
-                                (event.position.x, cell_width)
+                            let (pos, start, extent) = if drag.horizontal {
+                                (event.position.x, drag.start.x, cell_width)
                             } else {
-                                (event.position.y, cell_height)
+                                (event.position.y, drag.start.y, cell_height)
                             };
-                            let total = ((pos - drag.start) / extent).round() as i32;
+                            let total = ((pos - start) / extent).round() as i32;
                             let delta = total - drag.emitted_cells;
                             if delta != 0 {
                                 let dir = resize_direction(drag.horizontal, delta > 0);
@@ -2852,6 +2980,28 @@ impl Render for SessionView {
                                     delta.unsigned_abs()
                                 ));
                                 drag.emitted_cells = total;
+                            }
+                            // A corner (2-axis) drag also resizes the
+                            // perpendicular axis from the same origin point
+                            // (#906, `docs/spec-dogfooding-fixes.md`).
+                            if let Some(corner) = drag.corner.as_mut() {
+                                let (pos, start, extent) = if drag.horizontal {
+                                    (event.position.y, drag.start.y, cell_height)
+                                } else {
+                                    (event.position.x, drag.start.x, cell_width)
+                                };
+                                let total = ((pos - start) / extent).round() as i32;
+                                let delta = total - corner.emitted_cells;
+                                if delta != 0 {
+                                    let dir = resize_direction(!drag.horizontal, delta > 0);
+                                    let _ = this.tmux_command_tx.try_send(format!(
+                                        "resize-pane -t {} -{} {}",
+                                        corner.target_pane,
+                                        dir,
+                                        delta.unsigned_abs()
+                                    ));
+                                    corner.emitted_cells = total;
+                                }
                             }
                         },
                     ))

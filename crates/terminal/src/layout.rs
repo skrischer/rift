@@ -55,6 +55,24 @@ pub fn first_pane_id(node: &LayoutNode) -> Option<&str> {
     }
 }
 
+/// The children of `node` if it is a [`LayoutNode::Split`] on the axis
+/// opposite `horizontal` — i.e. a split whose seam crosses `node`'s own
+/// internal boundary/boundaries. Used to find a corner (2-axis) resize
+/// hitzone at the point where a seam meets a neighbor's own split (#906,
+/// `docs/spec-dogfooding-fixes.md`).
+pub fn opposite_axis_children(
+    node: &LayoutNode,
+    horizontal: bool,
+) -> Option<&Vec<(f32, LayoutNode)>> {
+    match node {
+        LayoutNode::Split {
+            horizontal: node_horizontal,
+            children,
+        } if *node_horizontal != horizontal => Some(children),
+        _ => None,
+    }
+}
+
 fn partition_by_left(panes: &[TmuxPaneState]) -> Option<Vec<Vec<TmuxPaneState>>> {
     let mut sorted: Vec<_> = panes.to_vec();
     sorted.sort_by_key(|p| p.left);
@@ -259,5 +277,38 @@ mod tests {
             pane("%2", 0, 21, 130, 19),
         ];
         assert_eq!(first_pane_id(&build_layout(&panes)), Some("%0"));
+    }
+
+    #[test]
+    fn test_opposite_axis_children_matching_split_returns_its_children() {
+        let node = LayoutNode::Split {
+            horizontal: false,
+            children: vec![
+                (0.5, LayoutNode::Pane("%0".into())),
+                (0.5, LayoutNode::Pane("%1".into())),
+            ],
+        };
+        let children = opposite_axis_children(&node, true).expect("opposite axis split");
+        assert_eq!(children.len(), 2);
+    }
+
+    #[test]
+    fn test_opposite_axis_children_same_axis_split_is_none() {
+        let node = LayoutNode::Split {
+            horizontal: true,
+            children: vec![
+                (0.5, LayoutNode::Pane("%0".into())),
+                (0.5, LayoutNode::Pane("%1".into())),
+            ],
+        };
+        assert_eq!(opposite_axis_children(&node, true), None);
+    }
+
+    #[test]
+    fn test_opposite_axis_children_plain_pane_is_none() {
+        assert_eq!(
+            opposite_axis_children(&LayoutNode::Pane("%0".into()), true),
+            None
+        );
     }
 }
