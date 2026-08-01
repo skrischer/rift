@@ -15,7 +15,7 @@ pub use frame::{encode_frame, FrameDecoder, FrameError, MAX_FRAME_LEN};
 /// is wire-compatible in one direction. The message set is pinned by the
 /// fingerprint test beside `PROTOCOL_FINGERPRINT` below, so a message-set
 /// change without a bump cannot pass CI.
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Pinned fingerprint of the protocol message set, checked by the
 /// `fingerprint_tests` module: an FNV-1a hash over the serde-visible surface
@@ -25,7 +25,7 @@ pub const PROTOCOL_VERSION: u32 = 13;
 /// [`PROTOCOL_VERSION`] above and re-pin this value (the failing test prints
 /// the new fingerprint).
 #[cfg(test)]
-const PROTOCOL_FINGERPRINT: u64 = 0x0548_0061_525c_804d;
+const PROTOCOL_FINGERPRINT: u64 = 0xaa93_6d0f_44a0_c16a;
 
 /// Messages the client sends to the daemon.
 ///
@@ -338,6 +338,20 @@ pub enum ClientMessage {
     /// same as [`ClientMessage::CreateFile`].
     DeletePath {
         path: String,
+    },
+    /// Turn per-pane resource sampling on/off for this connection
+    /// (`docs/spec-pane-attribution.md`). The telemetry channel has no other
+    /// client→daemon request path (`HostMetrics` is unconditional and
+    /// daemon-global), so this is the opt-in a connection uses to drive
+    /// on-demand per-pane sampling: `true` while its breakdown popover is
+    /// open, `false` on close or disconnect. The daemon gates a
+    /// process-global shared snapshot refresh on the count of connections
+    /// currently opted in (zero -> no process work) and, per opted-in
+    /// connection, rolls up and pushes its own session's
+    /// [`DaemonMessage::PaneMetrics`] — never a daemon-global broadcast, so
+    /// one connection's toggle cannot affect another's stream.
+    SetPaneMetricsEnabled {
+        enabled: bool,
     },
     Hello {
         version: u32,
@@ -721,6 +735,13 @@ pub enum DaemonMessage {
     /// from the daemon's cached latest sample, so a (re)attaching client sees
     /// current host state without waiting for the next tick — the same
     /// precedent as [`LspStatus`](DaemonMessage::LspStatus).
+    ///
+    /// `psi` (`docs/spec-memory-pressure.md`) is the optional Linux PSI
+    /// memory-stall payload, read from `/proc/pressure/memory` where the
+    /// kernel exposes it (`None` where it doesn't, e.g. the stock
+    /// `microsoft-standard-WSL2` kernel, which ships no `CONFIG_PSI`) —
+    /// intra-version optionality, not a version skew tolerance: a same-version
+    /// PSI-less host simply omits the key.
     HostMetrics {
         cpu: f32,
         mem_total: u64,
@@ -729,6 +750,23 @@ pub enum DaemonMessage {
         swap_used: u64,
         load: LoadAverage,
         cpu_count: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        psi: Option<MemoryPressure>,
+    },
+    /// A per-pane resource attribution breakdown for the attached session
+    /// (`docs/spec-pane-attribution.md`): for each pane the daemon rolls up
+    /// the `/proc` process subtree rooted at the pane's process and reports
+    /// its resident memory and CPU. Unlike [`HostMetrics`](DaemonMessage::HostMetrics)
+    /// this is **per-connection, not daemon-global** — each `serve_connection`
+    /// computes and pushes its own session's list, never the shared broadcast
+    /// bus, so one connection's panes are never leaked onto another's stream
+    /// (relevant when two connections attach different tmux sessions on the
+    /// same host). Push-only, and sent only while this connection has opted
+    /// in via [`ClientMessage::SetPaneMetricsEnabled`] (the on-demand sampling
+    /// model — an idle daemon with no breakdown open does zero process
+    /// refresh work).
+    PaneMetrics {
+        entries: Vec<PaneMetric>,
     },
     Welcome {
         version: u32,
@@ -965,6 +1003,49 @@ pub struct LoadAverage {
     pub one: f64,
     pub five: f64,
     pub fifteen: f64,
+}
+
+/// Linux PSI (Pressure Stall Information) memory-stall averages, read from
+/// `/proc/pressure/memory` and carried by
+/// [`DaemonMessage::HostMetrics`]'s optional `psi` field
+/// (`docs/spec-memory-pressure.md`). Each field is the kernel's
+/// percent-of-wall-clock-time-stalled figure over the named window: `some_*`
+/// is the share of time at least one task was stalled on memory, `full_*` the
+/// share of time *all* runnable tasks were stalled simultaneously (a stronger
+/// signal). The kernel's file also carries a trailing `total=<microseconds>`
+/// counter per line, which this payload deliberately omits — only the
+/// ready-to-use `avgN` percentages are carried. `Copy` so the app-local
+/// `status_bar::HostMetrics` that embeds it (behind `Option`) stays `Copy`.
+/// No `Eq`: the fields are `f64`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MemoryPressure {
+    pub some_avg10: f64,
+    pub some_avg60: f64,
+    pub some_avg300: f64,
+    pub full_avg10: f64,
+    pub full_avg60: f64,
+    pub full_avg300: f64,
+}
+
+/// One pane's resource attribution row, carried by
+/// [`DaemonMessage::PaneMetrics`] (`docs/spec-pane-attribution.md`). `pane_id`
+/// matches the layout's pane id ([`PaneLayout::pane_id`]) — the client keys on
+/// it exactly as it does for output/resize; the daemon never ships the
+/// underlying host pid. `rss` is the pane's `/proc` process-subtree resident
+/// memory in bytes (the pane's process and every descendant, summed); `cpu`
+/// is the subtree's CPU usage (0.0-100.0 times the core count, `sysinfo`'s
+/// convention, matching [`DaemonMessage::HostMetrics::cpu`]'s scale). `command`
+/// is the pane's agnostic `pane_current_command` label, re-shipped on every
+/// push (not looked up from a separately cached layout) so a
+/// [`DaemonMessage::PaneMetrics`] push is a **self-contained, sample-coherent**
+/// snapshot that still renders correctly if a pane has since vanished from
+/// the layout. No `Eq`: `cpu` is `f32`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PaneMetric {
+    pub pane_id: u32,
+    pub rss: u64,
+    pub cpu: f32,
+    pub command: String,
 }
 
 /// One diagnostic a language server reports for a file: a source span plus the
@@ -2152,7 +2233,7 @@ mod tests {
     }
 
     #[test]
-    fn test_host_metrics_roundtrip_preserves_full_payload() {
+    fn test_host_metrics_roundtrip_without_psi_preserves_full_payload() {
         let msg = DaemonMessage::HostMetrics {
             cpu: 42.5,
             mem_total: 16_000_000_000,
@@ -2165,6 +2246,7 @@ mod tests {
                 fifteen: 0.9,
             },
             cpu_count: 8,
+            psi: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize HostMetrics");
         assert!(json.contains(r#""type":"host_metrics""#));
@@ -2177,6 +2259,48 @@ mod tests {
         assert!(json.contains(r#""five":1.1"#));
         assert!(json.contains(r#""fifteen":0.9"#));
         assert!(json.contains(r#""cpu_count":8"#));
+        assert!(
+            !json.contains("\"psi\""),
+            "psi must be omitted when absent (e.g. a WSL2 host with no CONFIG_PSI): {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize HostMetrics"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_host_metrics_roundtrip_with_psi_preserves_full_payload() {
+        let msg = DaemonMessage::HostMetrics {
+            cpu: 42.5,
+            mem_total: 16_000_000_000,
+            mem_available: 4_000_000_000,
+            swap_total: 2_000_000_000,
+            swap_used: 100_000_000,
+            load: LoadAverage {
+                one: 1.5,
+                five: 1.1,
+                fifteen: 0.9,
+            },
+            cpu_count: 8,
+            psi: Some(MemoryPressure {
+                some_avg10: 12.5,
+                some_avg60: 8.25,
+                some_avg300: 3.1,
+                full_avg10: 4.0,
+                full_avg60: 2.5,
+                full_avg300: 1.0,
+            }),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize HostMetrics");
+        assert!(json.contains(r#""type":"host_metrics""#));
+        assert!(json.contains(r#""psi":{"#));
+        assert!(json.contains(r#""some_avg10":12.5"#));
+        assert!(json.contains(r#""some_avg60":8.25"#));
+        assert!(json.contains(r#""some_avg300":3.1"#));
+        assert!(json.contains(r#""full_avg10":4.0"#));
+        assert!(json.contains(r#""full_avg60":2.5"#));
+        assert!(json.contains(r#""full_avg300":1.0"#));
         assert_eq!(
             serde_json::from_str::<DaemonMessage>(&json).expect("deserialize HostMetrics"),
             msg
@@ -2188,12 +2312,119 @@ mod tests {
         for json in [
             r#"{"type":"host_metrics","mem_total":1,"mem_available":1,"swap_total":0,"swap_used":0,"load":{"one":0.0,"five":0.0,"fifteen":0.0},"cpu_count":1}"#,
             r#"{"type":"host_metrics","cpu":1.0,"mem_total":1,"mem_available":1,"swap_total":0,"swap_used":0,"cpu_count":1}"#,
+            r#"{"type":"host_metrics","cpu":1.0,"mem_total":1,"mem_available":1,"swap_total":0,"swap_used":0,"load":{"one":0.0,"five":0.0,"fifteen":0.0},"cpu_count":1,"psi":{"some_avg10":0.0}}"#,
         ] {
             assert!(
                 serde_json::from_str::<DaemonMessage>(json).is_err(),
                 "malformed HostMetrics must not deserialize: {json}"
             );
         }
+    }
+
+    #[test]
+    fn test_pane_metrics_roundtrip_preserves_entries() {
+        let msg = DaemonMessage::PaneMetrics {
+            entries: vec![
+                PaneMetric {
+                    pane_id: 1,
+                    rss: 123_456_789,
+                    cpu: 12.5,
+                    command: "cargo".to_owned(),
+                },
+                PaneMetric {
+                    pane_id: 2,
+                    rss: 0,
+                    cpu: 0.0,
+                    command: String::new(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&msg).expect("serialize PaneMetrics");
+        assert!(json.contains(r#""type":"pane_metrics""#));
+        assert!(json.contains(r#""pane_id":1"#));
+        assert!(json.contains(r#""rss":123456789"#));
+        assert!(json.contains(r#""cpu":12.5"#));
+        assert!(json.contains(r#""command":"cargo""#));
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize PaneMetrics"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_pane_metrics_empty_entries_roundtrips() {
+        let msg = DaemonMessage::PaneMetrics { entries: vec![] };
+        let json = serde_json::to_string(&msg).expect("serialize empty PaneMetrics");
+        assert_eq!(json, r#"{"type":"pane_metrics","entries":[]}"#);
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize empty PaneMetrics"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_pane_metrics_malformed_entry_is_rejected() {
+        for json in [
+            // Missing `command` on the entry.
+            r#"{"type":"pane_metrics","entries":[{"pane_id":1,"rss":1,"cpu":1.0}]}"#,
+            // Missing the top-level `entries` field entirely.
+            r#"{"type":"pane_metrics"}"#,
+            // `pane_id` as a string instead of a u32.
+            r#"{"type":"pane_metrics","entries":[{"pane_id":"1","rss":1,"cpu":1.0,"command":""}]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<DaemonMessage>(json).is_err(),
+                "malformed PaneMetrics must not deserialize: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pane_metric_roundtrip_preserves_all_fields() {
+        let metric = PaneMetric {
+            pane_id: 7,
+            rss: 42,
+            cpu: 3.5,
+            command: "bash".to_owned(),
+        };
+        let json = serde_json::to_string(&metric).expect("serialize PaneMetric");
+        assert_eq!(json, r#"{"pane_id":7,"rss":42,"cpu":3.5,"command":"bash"}"#);
+        assert_eq!(
+            serde_json::from_str::<PaneMetric>(&json).expect("deserialize PaneMetric"),
+            metric
+        );
+    }
+
+    #[test]
+    fn test_memory_pressure_roundtrip_preserves_all_fields() {
+        let psi = MemoryPressure {
+            some_avg10: 12.5,
+            some_avg60: 8.25,
+            some_avg300: 3.1,
+            full_avg10: 4.0,
+            full_avg60: 2.5,
+            full_avg300: 1.0,
+        };
+        let json = serde_json::to_string(&psi).expect("serialize MemoryPressure");
+        assert!(json.contains(r#""some_avg10":12.5"#));
+        assert!(json.contains(r#""some_avg60":8.25"#));
+        assert!(json.contains(r#""some_avg300":3.1"#));
+        assert!(json.contains(r#""full_avg10":4.0"#));
+        assert!(json.contains(r#""full_avg60":2.5"#));
+        assert!(json.contains(r#""full_avg300":1.0"#));
+        assert_eq!(
+            serde_json::from_str::<MemoryPressure>(&json).expect("deserialize MemoryPressure"),
+            psi
+        );
+    }
+
+    #[test]
+    fn test_memory_pressure_missing_field_is_rejected() {
+        let json = r#"{"some_avg10":0.0,"some_avg60":0.0,"some_avg300":0.0,"full_avg10":0.0,"full_avg60":0.0}"#;
+        assert!(
+            serde_json::from_str::<MemoryPressure>(json).is_err(),
+            "malformed MemoryPressure must not deserialize: {json}"
+        );
     }
 
     #[test]
@@ -3624,6 +3855,30 @@ mod tests {
         assert!(
             err.is_err(),
             "delete_path without a path must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_set_pane_metrics_enabled_roundtrip_true_and_false() {
+        for enabled in [true, false] {
+            let msg = ClientMessage::SetPaneMetricsEnabled { enabled };
+            let json = serde_json::to_string(&msg).expect("serialize SetPaneMetricsEnabled");
+            assert_eq!(
+                json,
+                format!(r#"{{"type":"set_pane_metrics_enabled","enabled":{enabled}}}"#)
+            );
+            let parsed: ClientMessage =
+                serde_json::from_str(&json).expect("deserialize SetPaneMetricsEnabled");
+            assert_eq!(parsed, msg);
+        }
+    }
+
+    #[test]
+    fn test_set_pane_metrics_enabled_missing_field_is_rejected() {
+        let err = serde_json::from_str::<ClientMessage>(r#"{"type":"set_pane_metrics_enabled"}"#);
+        assert!(
+            err.is_err(),
+            "set_pane_metrics_enabled without enabled must not deserialize"
         );
     }
 

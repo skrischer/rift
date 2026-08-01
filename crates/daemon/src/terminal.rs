@@ -760,6 +760,10 @@ impl Attach {
             // terminal message: the daemon-side clone execution lands in a
             // follow-on issue (#828) — silently dropped here in the
             // meantime, same convention.
+            // `SetPaneMetricsEnabled` (the per-pane metrics opt-in,
+            // `docs/spec-pane-attribution.md`, #879) is likewise not a
+            // terminal message — real handling: #880 — silently dropped
+            // here, same convention.
             ClientMessage::Input { .. }
             | ClientMessage::Attach { .. }
             | ClientMessage::OpenFile { .. }
@@ -782,6 +786,7 @@ impl Attach {
             | ClientMessage::DeletePath { .. }
             | ClientMessage::QueryDirEntries { .. }
             | ClientMessage::CloneRepo { .. }
+            | ClientMessage::SetPaneMetricsEnabled { .. }
             | ClientMessage::Hello { .. } => {}
         }
         Ok(())

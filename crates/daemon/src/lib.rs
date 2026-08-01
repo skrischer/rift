@@ -1357,6 +1357,15 @@ where
                                 }
                             }
                         }
+                        // The per-pane metrics opt-in
+                        // (`docs/spec-pane-attribution.md`, #879) is this
+                        // connection's on/off toggle for per-pane sampling.
+                        // Wire foundation only: the shared process-snapshot
+                        // gating, the per-connection subtree roll-up, and the
+                        // resulting `PaneMetrics` push all land in a
+                        // follow-on issue.
+                        // real handling: #880
+                        ClientMessage::SetPaneMetricsEnabled { .. } => {}
                     }
                 }
             }
@@ -2065,6 +2074,10 @@ fn build_host_metrics_message(system: &System) -> DaemonMessage {
             fifteen: load.fifteen,
         },
         cpu_count: system.cpus().len() as u32,
+        // PSI is read and wired in by a later step (`docs/spec-memory-pressure.md`);
+        // this protocol-only bump keeps every existing builder call site
+        // compiling with the portable baseline unaffected.
+        psi: None,
     }
 }
 
@@ -2717,6 +2730,11 @@ impl Core {
             // connection, as a detached task (`docs/spec-clone-repo.md`); the
             // daemon-side execution lands in a follow-on issue (#828) — its
             // arm below is a defensive no-op until then.
+            //
+            // The per-pane metrics opt-in (`docs/spec-pane-attribution.md`,
+            // #879) is likewise answered per connection by
+            // `serve_connection` (real handling: #880); its arm below is a
+            // defensive no-op should it ever reach this loop.
             ClientMessage::Hello { .. }
             | ClientMessage::Attach { .. }
             | ClientMessage::Input { .. }
@@ -2742,7 +2760,8 @@ impl Core {
             | ClientMessage::RenamePath { .. }
             | ClientMessage::DeletePath { .. }
             | ClientMessage::QueryDirEntries { .. }
-            | ClientMessage::CloneRepo { .. } => {}
+            | ClientMessage::CloneRepo { .. }
+            | ClientMessage::SetPaneMetricsEnabled { .. } => {}
         }
     }
 
@@ -3237,6 +3256,7 @@ mod tests {
                 swap_used: _,
                 load,
                 cpu_count,
+                psi: _,
             } => {
                 assert!(mem_total > 0, "a real host always reports total memory");
                 assert!(
@@ -3277,6 +3297,7 @@ mod tests {
                 fifteen: 0.3,
             },
             cpu_count: 8,
+            psi: None,
         };
         let (_host_metrics_tx, host_metrics_events) =
             broadcast::channel(HOST_METRICS_EVENT_CAPACITY);
