@@ -19,8 +19,7 @@ use rift_lsp::{DocumentChange, DocumentSelector};
 use rift_protocol::{
     encode_frame, BufferErrorReason, ClientMessage, DaemonMessage, Diagnostic, EntryKind,
     FrameDecoder, LoadAverage, LspServerState, MemoryPressure, NavRequestId, PaneMetric,
-    WorktreeEntry,
-    PROTOCOL_VERSION,
+    WorktreeEntry, PROTOCOL_VERSION,
 };
 use sysinfo::{ProcessesToUpdate, System};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
