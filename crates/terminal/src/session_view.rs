@@ -7,6 +7,7 @@ use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::{h_flex, v_flex, ActiveTheme, Icon, IconName, Sizable};
 use termy_terminal_ui::TmuxSnapshot;
@@ -18,8 +19,7 @@ use crate::pane_view::{measure_cell_size, PaneActivity, PaneView};
 use crate::quote_tmux_arg;
 use crate::{
     CaptureRequest, CaptureResult, ConnectionStatus, KeyTableQueryResult, PaneInput, PaneOutput,
-    SelectWindow, SessionListItem, SessionOrderUpdate, SessionSwitchRequest, SubscriptionUpdate,
-    TermSize,
+    SelectWindow, SessionListItem, SessionOrderUpdate, SessionSwitchRequest, TermSize,
 };
 
 const DEFAULT_FONT_SIZE: f32 = 14.0;
@@ -60,7 +60,6 @@ pub struct TerminalHandle {
     pub size_changed_rx: flume::Receiver<TermSize>,
     pub snapshot_tx: flume::Sender<SessionSnapshot>,
     pub tmux_command_rx: flume::Receiver<String>,
-    pub subscription_tx: flume::Sender<SubscriptionUpdate>,
     pub capture_request_rx: flume::Receiver<CaptureRequest>,
     pub capture_result_tx: flume::Sender<CaptureResult>,
     pub connection_status_tx: flume::Sender<ConnectionStatus>,
@@ -79,23 +78,17 @@ pub struct TerminalHandle {
     pub session_list_tx: flume::Sender<Vec<SessionListItem>>,
     /// An explicit session-list refresh request (`open_session_switcher`) —
     /// forwarded onto the protocol as `ClientMessage::QuerySessionList`.
-    /// Unused on the legacy tmux path (`RIFT_TERMINAL_LEGACY`): the receiver
-    /// drops there and a request is a harmless no-op, so the strip stays on
-    /// its single-row fallback (the legacy path is slated for removal, #285).
     pub session_list_request_rx: flume::Receiver<()>,
     /// A cockpit switch from the session strip — forwarded onto the
     /// protocol as `ClientMessage::Attach { session }` followed by a viewport
-    /// re-assert (see [`SessionSwitchRequest`]). Same legacy-path caveat as
-    /// `session_list_request_rx`.
+    /// re-assert (see [`SessionSwitchRequest`]).
     pub session_switch_rx: flume::Receiver<SessionSwitchRequest>,
     /// A session-order mutation from the strip — a "Move left"/"Move right"
     /// context-menu commit (#744, replacing #686's drag-to-reorder) or a
     /// rename's slot-preserving key rename (`docs/spec-session-management.md`).
     /// Routed to `rift-app`'s `session_order` store, which persists it and
     /// re-sorts + re-pushes the current list on `session_list_tx`'s target
-    /// channel. Unused on the legacy tmux path (the strip's move/rename
-    /// affordances still emit, but nothing is listening — harmless, the same
-    /// caveat as `session_list_request_rx`).
+    /// channel.
     pub session_order_rx: flume::Receiver<SessionOrderUpdate>,
     /// The reconnect banner's Cancel (#476,
     /// `docs/spec-connection-robustness.md`): consumed by the SSH-level
@@ -230,13 +223,27 @@ enum MoveDirection {
     Right,
 }
 
-/// An in-progress border drag. `start` is the mouse position along the drag
-/// axis at mouse-down; `emitted_cells` is the whole-cell offset already sent to
-/// tmux, so each move only emits the incremental `resize-pane`.
+/// An in-progress border drag. `start` is the full mouse position at
+/// mouse-down (both axes are kept so a corner drag, below, can read its own
+/// perpendicular axis from the same origin); `emitted_cells` is the
+/// whole-cell offset already sent to tmux for the primary (`horizontal`)
+/// axis, so each move only emits the incremental `resize-pane`.
 struct BorderDrag {
     target_pane: String,
     horizontal: bool,
-    start: Pixels,
+    start: Point<Pixels>,
+    emitted_cells: i32,
+    /// Set for a corner (2-axis) hitzone (#906,
+    /// `docs/spec-dogfooding-fixes.md`): the perpendicular axis's own target
+    /// pane and incremental cell count, driven from the same `start` point.
+    /// `None` for a plain single-axis seam drag.
+    corner: Option<CornerDrag>,
+}
+
+/// The perpendicular axis of a corner (2-axis) drag, tracked alongside
+/// [`BorderDrag`]'s primary axis. See [`SessionView::corner_handle`].
+struct CornerDrag {
+    target_pane: String,
     emitted_cells: i32,
 }
 
@@ -522,6 +529,13 @@ pub struct SessionView {
     /// stream) owns that. Rendered as the always-visible title-bar chip strip
     /// (#683), which replaced the phase-19 click-to-open popover.
     sessions: Vec<SessionListItem>,
+    /// Tracks the session strip's horizontal scroll offset (#905): shared
+    /// between the scrolling chip row (`.track_scroll`) and the overlay
+    /// [`gpui_component::scroll::Scrollbar`] in
+    /// [`Self::render_session_strip`] so the thumb reflects and drives the
+    /// same scroll position, mirroring `SessionPicker`'s vertical
+    /// `scroll_handle` (issue #804).
+    session_strip_scroll: ScrollHandle,
     /// The strip's in-progress inline session rename (#684), dispatched from
     /// a chip's right-click menu; when active, that chip renders the edit
     /// input in place of its name.
@@ -562,7 +576,6 @@ impl SessionView {
         let (size_changed_tx, size_changed_rx) = flume::unbounded();
         let (snapshot_tx, snapshot_rx) = flume::unbounded::<SessionSnapshot>();
         let (tmux_command_tx, tmux_command_rx) = flume::unbounded::<String>();
-        let (subscription_tx, subscription_rx) = flume::unbounded::<SubscriptionUpdate>();
         let (capture_request_tx, capture_request_rx) = flume::unbounded::<CaptureRequest>();
         let (capture_result_tx, capture_result_rx) = flume::unbounded::<CaptureResult>();
         let (connection_status_tx, connection_status_rx) = flume::unbounded::<ConnectionStatus>();
@@ -607,25 +620,6 @@ impl SessionView {
                 let result = cx.update(|cx| {
                     this.update(cx, |view, cx| {
                         view.apply_snapshot(snapshot, cx);
-                    })
-                });
-                if result.is_err() {
-                    break;
-                }
-            })
-            .detach();
-        }
-
-        {
-            // Phase 2d: format-subscription updates stream pane/window state
-            // changes (cd, command, rename) end-to-end into the view layer.
-            cx.spawn(async move |this, cx| loop {
-                let Ok(update) = subscription_rx.recv_async().await else {
-                    break;
-                };
-                let result = cx.update(|cx| {
-                    this.update(cx, |view, cx| {
-                        view.apply_subscription(update, cx);
                     })
                 });
                 if result.is_err() {
@@ -772,6 +766,7 @@ impl SessionView {
             prefix_options: PrefixOptions::default(),
             key_table_request_tx,
             sessions: Vec::new(),
+            session_strip_scroll: ScrollHandle::default(),
             renaming_session: None,
             confirming_kill: None,
             confirming_pane_kill: None,
@@ -785,8 +780,6 @@ impl SessionView {
         // to trigger `open_session_switcher`'s on-demand refresh, so an
         // initial request must be fired here or the strip stays empty until
         // the daemon's next churn-driven `%sessions-changed` push (#744).
-        // Inert on the legacy tmux path, same caveat as
-        // `session_list_request_rx` above.
         let _ = view.session_list_request_tx.try_send(());
 
         let handle = TerminalHandle {
@@ -795,7 +788,6 @@ impl SessionView {
             size_changed_rx,
             snapshot_tx,
             tmux_command_rx,
-            subscription_tx,
             capture_request_rx,
             capture_result_tx,
             connection_status_tx,
@@ -1352,49 +1344,6 @@ impl SessionView {
         }
     }
 
-    fn apply_subscription(&mut self, update: SubscriptionUpdate, cx: &mut Context<Self>) {
-        match update.name.as_str() {
-            // `rift_pane_path` (`#{pane_current_path}`, scope `%*`): live CWD per
-            // pane. Drives the statusbar within ~1s of `cd`; the snapshot only
-            // seeds initial state at pane creation.
-            "rift_pane_path" => {
-                if let Some(entry) = self.panes.get(&update.pane) {
-                    entry.entity.update(cx, |pv, cx| {
-                        pv.set_working_directory(update.value);
-                        cx.notify();
-                    });
-                    cx.notify();
-                }
-            }
-            // `rift_pane_command` (`#{pane_current_command}`, scope `%*`): the
-            // foreground command per pane. Same live-driver pattern as the CWD;
-            // the snapshot only seeds it at pane creation.
-            "rift_pane_command" => {
-                if let Some(entry) = self.panes.get(&update.pane) {
-                    entry.entity.update(cx, |pv, cx| {
-                        pv.set_current_command(update.value);
-                        cx.notify();
-                    });
-                    cx.notify();
-                }
-            }
-            // `rift_window_name` (`#{window_name}`, scope `@*`): live window
-            // title per window. Updates the tab label within ~1s of
-            // `rename-window`; the snapshot seeds it otherwise.
-            "rift_window_name" => {
-                if let Some(win) = self.windows.iter_mut().find(|w| w.id == update.window) {
-                    if win.name != update.value {
-                        win.name = update.value;
-                        cx.notify();
-                    }
-                }
-            }
-            other => {
-                debug!(name = %other, "unhandled tmux subscription");
-            }
-        }
-    }
-
     /// Begin an inline rename of `window_id`: seed a text input with the current
     /// window name, focus it, and subscribe for submit/blur. Enter emits
     /// `rename-window`; blur cancels. The snapshot remains the source of truth
@@ -1698,10 +1647,13 @@ impl SessionView {
                         // The seam before this border resizes the leading child;
                         // target a representative pane inside it.
                         let target = layout::first_pane_id(child).map(str::to_string);
-                        container = container.child(self.resize_handle(
+                        let trailing = &children[i + 1].1;
+                        container = container.child(self.render_seam(
                             horizontal,
                             border_color,
                             target,
+                            child,
+                            trailing,
                             cx,
                         ));
                     }
@@ -1711,15 +1663,18 @@ impl SessionView {
         }
     }
 
-    /// A draggable seam between two split children. The 7px hit area wraps a
-    /// centered 1px line; mouse-down records the drag so the root element's move
-    /// handler can emit incremental `resize-pane` commands. The cursor stays the
-    /// default arrow (no resize cursor).
+    /// The seam between two adjacent split children (#906,
+    /// `docs/spec-dogfooding-fixes.md`). Plain single-axis case: a full-strip
+    /// hit area. When either neighbor is itself split on the opposite axis,
+    /// the seam also crosses that neighbor's own internal boundary/boundaries
+    /// — [`Self::render_seam`] segments the strip and interleaves a corner
+    /// (2-axis) hitzone at each one.
     fn resize_handle(
         &self,
         horizontal: bool,
         border_color: Hsla,
         target: Option<String>,
+        cross_proportion: Option<f32>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let line = if horizontal {
@@ -1729,26 +1684,35 @@ impl SessionView {
         };
         let mut handle = div().flex().items_center().justify_center().flex_none();
         handle = if horizontal {
-            handle.w(px(7.0)).h_full()
+            handle.w(px(7.0))
         } else {
-            handle.h(px(7.0)).w_full()
+            handle.h(px(7.0))
+        };
+        handle = match cross_proportion {
+            Some(proportion) => handle.flex_1().flex_basis(relative(proportion)),
+            None if horizontal => handle.h_full(),
+            None => handle.w_full(),
         };
         handle = handle.child(line);
+        // An axis-appropriate resize cursor: ew-resize for a vertical seam
+        // (side-by-side panes), ns-resize for a horizontal one (stacked
+        // panes) — previously the cursor stayed the default arrow.
+        handle = handle.cursor(if horizontal {
+            CursorStyle::ResizeLeftRight
+        } else {
+            CursorStyle::ResizeUpDown
+        });
 
         if let Some(target) = target {
             handle = handle.on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
-                    let start = if horizontal {
-                        event.position.x
-                    } else {
-                        event.position.y
-                    };
                     this.border_drag = Some(BorderDrag {
                         target_pane: target.clone(),
                         horizontal,
-                        start,
+                        start: event.position,
                         emitted_cells: 0,
+                        corner: None,
                     });
                     cx.stop_propagation();
                     cx.notify();
@@ -1757,6 +1721,105 @@ impl SessionView {
         }
 
         handle.into_any_element()
+    }
+
+    /// Render the seam between two adjacent split children, adding a corner
+    /// (2-axis) hitzone wherever it crosses a neighbor's own internal
+    /// boundary (#906, `docs/spec-dogfooding-fixes.md`). Prefers the leading
+    /// neighbor (matching `target`'s own "leading child" convention),
+    /// falling back to the trailing one so a plain-pane/split-neighbor split
+    /// (e.g. split right, then split the new right pane down) is covered
+    /// too. A neighbor with more than one internal boundary gets one corner
+    /// per boundary; boundaries beyond a non-qualifying side stay reachable
+    /// through that neighbor's own recursively-rendered seam.
+    fn render_seam(
+        &self,
+        horizontal: bool,
+        border_color: Hsla,
+        target: Option<String>,
+        leading: &LayoutNode,
+        trailing: &LayoutNode,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(segments) = layout::opposite_axis_children(leading, horizontal)
+            .or_else(|| layout::opposite_axis_children(trailing, horizontal))
+        else {
+            return self.resize_handle(horizontal, border_color, target, None, cx);
+        };
+
+        let mut seam = if horizontal { v_flex() } else { h_flex() };
+        seam = seam.flex_none();
+        seam = if horizontal {
+            seam.w(px(7.0)).h_full()
+        } else {
+            seam.h(px(7.0)).w_full()
+        };
+
+        let last = segments.len().saturating_sub(1);
+        for (k, (proportion, node)) in segments.iter().enumerate() {
+            seam = seam.child(self.resize_handle(
+                horizontal,
+                border_color,
+                target.clone(),
+                Some(*proportion),
+                cx,
+            ));
+            if k < last {
+                let corner_target = layout::first_pane_id(node).map(str::to_string);
+                seam = seam.child(self.corner_handle(
+                    horizontal,
+                    border_color,
+                    target.clone(),
+                    corner_target,
+                    cx,
+                ));
+            }
+        }
+        seam.into_any_element()
+    }
+
+    /// A corner (2-axis) resize hitzone at a boundary where a seam crosses a
+    /// neighbor's own internal split (see [`Self::render_seam`]). Shows a
+    /// diagonal cursor; dragging it resizes `primary` (this seam's own axis)
+    /// and `secondary` (the neighbor's perpendicular axis) together, reusing
+    /// [`BorderDrag`]'s incremental `resize-pane` plumbing for each axis
+    /// independently via [`CornerDrag`].
+    fn corner_handle(
+        &self,
+        horizontal: bool,
+        border_color: Hsla,
+        primary: Option<String>,
+        secondary: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut corner = div()
+            .flex_none()
+            .w(px(7.0))
+            .h(px(7.0))
+            .bg(border_color)
+            .cursor(CursorStyle::ResizeUpLeftDownRight);
+
+        if let (Some(primary), Some(secondary)) = (primary, secondary) {
+            corner = corner.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                    this.border_drag = Some(BorderDrag {
+                        target_pane: primary.clone(),
+                        horizontal,
+                        start: event.position,
+                        emitted_cells: 0,
+                        corner: Some(CornerDrag {
+                            target_pane: secondary.clone(),
+                            emitted_cells: 0,
+                        }),
+                    });
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            );
+        }
+
+        corner.into_any_element()
     }
 
     /// The always-visible session strip (#683, `docs/spec-session-management.md`),
@@ -1819,6 +1882,7 @@ impl SessionView {
         let danger = cx.theme().danger;
 
         let mut strip = h_flex()
+            .id("session-strip-chips")
             .items_center()
             .gap(px(4.0))
             .text_size(px(13.0))
@@ -2074,9 +2138,46 @@ impl SessionView {
                     view.open_new_session_prompt(cx);
                 });
             })
-            .child("+ New session...");
+            .child("+ New session...")
+            // Sits outside the scrollable chip region below so it stays
+            // reachable regardless of session count (#905) — it never
+            // shrinks and is never scrolled past.
+            .flex_none();
 
-        strip.child(new_session)
+        // Constrain the strip (#905): `flex_1` + `min_w_0` let this region
+        // shrink to whatever space the title bar's left group has left after
+        // the brand (`title_bar::render`'s left `h_flex` carries the matching
+        // `flex_1`/`min_w_0`), instead of forcing its own unbounded content
+        // width onto the row and pushing "+ New session" and the title bar's
+        // right-side connection/settings/window controls off-screen. Once
+        // shrunk below the chips' combined width, the chip row itself
+        // (`strip`, already `.id`'d above) becomes the horizontally
+        // scrollable region — overflowed chips are reachable via scroll/drag,
+        // with an overlay `Scrollbar` (`ScrollbarShow::Hover`, mirroring
+        // `SessionPicker`'s vertical one, #804) as the discoverable affordance
+        // rather than a silent wheel-only scroll.
+        h_flex()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        strip
+                            .min_w_0()
+                            .overflow_x_scroll()
+                            .track_scroll(&self.session_strip_scroll),
+                    )
+                    .child(
+                        Scrollbar::horizontal(&self.session_strip_scroll)
+                            .scrollbar_show(ScrollbarShow::Hover),
+                    ),
+            )
+            .child(new_session)
     }
 
     /// The reconnect banner's Cancel action: ask the SSH-level reconnect
@@ -2836,12 +2937,12 @@ impl Render for SessionView {
                             let Some(drag) = this.border_drag.as_mut() else {
                                 return;
                             };
-                            let (pos, extent) = if drag.horizontal {
-                                (event.position.x, cell_width)
+                            let (pos, start, extent) = if drag.horizontal {
+                                (event.position.x, drag.start.x, cell_width)
                             } else {
-                                (event.position.y, cell_height)
+                                (event.position.y, drag.start.y, cell_height)
                             };
-                            let total = ((pos - drag.start) / extent).round() as i32;
+                            let total = ((pos - start) / extent).round() as i32;
                             let delta = total - drag.emitted_cells;
                             if delta != 0 {
                                 let dir = resize_direction(drag.horizontal, delta > 0);
@@ -2852,6 +2953,28 @@ impl Render for SessionView {
                                     delta.unsigned_abs()
                                 ));
                                 drag.emitted_cells = total;
+                            }
+                            // A corner (2-axis) drag also resizes the
+                            // perpendicular axis from the same origin point
+                            // (#906, `docs/spec-dogfooding-fixes.md`).
+                            if let Some(corner) = drag.corner.as_mut() {
+                                let (pos, start, extent) = if drag.horizontal {
+                                    (event.position.y, drag.start.y, cell_height)
+                                } else {
+                                    (event.position.x, drag.start.x, cell_width)
+                                };
+                                let total = ((pos - start) / extent).round() as i32;
+                                let delta = total - corner.emitted_cells;
+                                if delta != 0 {
+                                    let dir = resize_direction(!drag.horizontal, delta > 0);
+                                    let _ = this.tmux_command_tx.try_send(format!(
+                                        "resize-pane -t {} -{} {}",
+                                        corner.target_pane,
+                                        dir,
+                                        delta.unsigned_abs()
+                                    ));
+                                    corner.emitted_cells = total;
+                                }
                             }
                         },
                     ))
@@ -3338,14 +3461,16 @@ mod tests {
         }
     }
 
-    /// Regression (`docs/spec-pane-activity-v2.md`): the legacy tmux path
-    /// (`RIFT_TERMINAL_LEGACY`) sends an empty `pane_is_shell` map (`main.rs`).
-    /// `apply_snapshot` must resolve a pane absent from that map to `None`,
-    /// not a collapsed `Some(false)` — otherwise every legacy pane would read
+    /// Regression (`docs/spec-pane-activity-v2.md`): a pane absent from the
+    /// `pane_is_shell` map (as every pane was, on the direct-tmux fallback
+    /// removed in #285) must resolve to `None` in `apply_snapshot`, not a
+    /// collapsed `Some(false)` — otherwise such a pane would read
     /// forced-busy instead of falling back to the client structural
     /// classifier (alt-screen / OSC-133), which reads free here.
     #[gpui::test]
-    fn test_apply_snapshot_legacy_empty_map_reads_pane_free_not_busy(cx: &mut TestAppContext) {
+    fn test_apply_snapshot_empty_pane_is_shell_map_reads_pane_free_not_busy(
+        cx: &mut TestAppContext,
+    ) {
         cx.update(|cx| {
             let (session, _handle) = session_and_handle(cx);
 
@@ -3357,8 +3482,8 @@ mod tests {
             assert_eq!(
                 activity,
                 PaneActivity::Free,
-                "pane absent from an empty legacy pane_is_shell map must fall \
-                 back to the structural classifier, not read forced-busy"
+                "pane absent from an empty pane_is_shell map must fall back \
+                 to the structural classifier, not read forced-busy"
             );
         });
     }

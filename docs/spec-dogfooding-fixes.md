@@ -206,6 +206,15 @@ includes:
   highlight to invisibility, caught by a CI test failure
   (`test_editor_surface_background_is_a_subtle_step_lighter_than_base`) before merge.
   `secondary` differs from `accent`, so the highlight stays visible.
+- 2026-08-01: **Explorer row font too large / not adjustable** resolved (#908). Category 2
+  (defect in an existing path — no explorer-specific font-size setting exists yet; the
+  terminal "Font size" slider does not reach the tree, and that global control is the
+  seeded roadmap Phase 54, out of scope here). `ROW_HEIGHT` 28px -> 24px and the ambient
+  `text_sm` (14px) row label replaced by a new named `ROW_TEXT_SIZE` constant at 12px, a
+  denser default matching typical IDE explorers. Root row (`ROOT_ROW_TEXT_SIZE`) and
+  header (`HEADER_TEXT_SIZE`) nudged down in step, 12px -> 11px and 11px -> 10px, keeping
+  the same ascending header < root < row order the shipped 11/12/14 triple had. Both
+  density-lock tests in `crates/app/src/file_tree.rs` updated to the new values.
 - 2026-08-01: **Pane header close (X) button** resolved (#907). Category 1 (completing
   the existing pane-header action row — split-right/split-down/zoom already emit tmux
   commands over the shared seam, close had not caught up). The lightweight confirm did
@@ -230,3 +239,37 @@ includes:
   `!ks.modifiers.alt`, so it is unit-testable without a GPUI window. The downstream
   sink (`SessionView::apply_font_zoom`) was already correct and untouched; Ctrl+`+`/
   Ctrl+`=`/Ctrl+`-` (no Alt) still zoom.
+- 2026-08-01: **Pane resize seam cursor + corner (2-axis) resize** resolved (#906).
+  Category 1 (completing the existing border-drag affordance — `resize_handle`
+  already dragged the seam, the cursor never changed to say so). `resize_handle`
+  now sets `CursorStyle::ResizeLeftRight`/`ResizeUpDown` matching its axis. For the
+  corner: `render_layout`'s per-seam loop now calls a new `render_seam`, which checks
+  whether the leading or trailing neighbor at that seam is itself a `LayoutNode::Split`
+  on the opposite axis (a new `layout::opposite_axis_children` helper) — i.e. whether
+  the seam also crosses that neighbor's own internal boundary/boundaries (leading
+  preferred, matching the seam's existing "leading child" resize-target convention;
+  trailing as fallback so a plain-pane/split-neighbor split, e.g. split right then
+  split the new right pane down, is covered too). When it does, the seam renders as a
+  mirror of the neighbor's own row/column proportions (same `flex_basis(relative(p))`
+  math as the neighbor's real row/column wrappers, so segment boundaries land at the
+  same pixels) with a small `nwse`-cursor corner hitzone between segments. `BorderDrag`
+  gained a `start: Point<Pixels>` (previously single-axis `Pixels`) and an optional
+  `corner: Option<CornerDrag>` so a corner drag emits two independent incremental
+  `resize-pane` commands (one per axis) from the same mouse-down origin, reusing the
+  existing per-axis delta/`resize_direction` plumbing rather than a new absolute-size
+  mechanism.
+- 2026-08-01: **Session strip overflow pushing window controls off-screen** resolved
+  (#905). Category 2 (defect in an existing path). `render_session_strip` built a plain
+  `h_flex()` with no width constraint, and the title bar's left group
+  (`title_bar::render`) hosted it with no `min_w_0`/`max_w` either, so with enough
+  sessions the strip's unbounded content width pushed "+ New session" and the title
+  bar's right-side connection/settings/window controls off-screen. Fix: `flex_1` +
+  `min_w_0` on the left group (`title_bar.rs`) and again on the strip's own top-level
+  container let it shrink to whatever space remains after the brand, instead of
+  forcing its content width onto the row; the chip row itself becomes the
+  horizontally scrollable region past that point (`overflow_x_scroll` +
+  `track_scroll`, with an overlay `Scrollbar::horizontal` at `ScrollbarShow::Hover` as
+  the discoverable affordance, mirroring `SessionPicker`'s vertical scrollbar, #804).
+  "+ New session" sits outside the scrollable region as a `flex_none` sibling so it
+  stays reachable regardless of session count, never shrinking and never scrolled
+  past.
