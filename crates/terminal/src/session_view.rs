@@ -7,6 +7,7 @@ use gpui::*;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::{h_flex, v_flex, ActiveTheme, Icon, IconName, Sizable};
 use termy_terminal_ui::TmuxSnapshot;
@@ -18,8 +19,7 @@ use crate::pane_view::{measure_cell_size, PaneActivity, PaneView};
 use crate::quote_tmux_arg;
 use crate::{
     CaptureRequest, CaptureResult, ConnectionStatus, KeyTableQueryResult, PaneInput, PaneOutput,
-    SelectWindow, SessionListItem, SessionOrderUpdate, SessionSwitchRequest, SubscriptionUpdate,
-    TermSize,
+    SelectWindow, SessionListItem, SessionOrderUpdate, SessionSwitchRequest, TermSize,
 };
 
 const DEFAULT_FONT_SIZE: f32 = 14.0;
@@ -60,7 +60,6 @@ pub struct TerminalHandle {
     pub size_changed_rx: flume::Receiver<TermSize>,
     pub snapshot_tx: flume::Sender<SessionSnapshot>,
     pub tmux_command_rx: flume::Receiver<String>,
-    pub subscription_tx: flume::Sender<SubscriptionUpdate>,
     pub capture_request_rx: flume::Receiver<CaptureRequest>,
     pub capture_result_tx: flume::Sender<CaptureResult>,
     pub connection_status_tx: flume::Sender<ConnectionStatus>,
@@ -79,23 +78,17 @@ pub struct TerminalHandle {
     pub session_list_tx: flume::Sender<Vec<SessionListItem>>,
     /// An explicit session-list refresh request (`open_session_switcher`) —
     /// forwarded onto the protocol as `ClientMessage::QuerySessionList`.
-    /// Unused on the legacy tmux path (`RIFT_TERMINAL_LEGACY`): the receiver
-    /// drops there and a request is a harmless no-op, so the strip stays on
-    /// its single-row fallback (the legacy path is slated for removal, #285).
     pub session_list_request_rx: flume::Receiver<()>,
     /// A cockpit switch from the session strip — forwarded onto the
     /// protocol as `ClientMessage::Attach { session }` followed by a viewport
-    /// re-assert (see [`SessionSwitchRequest`]). Same legacy-path caveat as
-    /// `session_list_request_rx`.
+    /// re-assert (see [`SessionSwitchRequest`]).
     pub session_switch_rx: flume::Receiver<SessionSwitchRequest>,
     /// A session-order mutation from the strip — a "Move left"/"Move right"
     /// context-menu commit (#744, replacing #686's drag-to-reorder) or a
     /// rename's slot-preserving key rename (`docs/spec-session-management.md`).
     /// Routed to `rift-app`'s `session_order` store, which persists it and
     /// re-sorts + re-pushes the current list on `session_list_tx`'s target
-    /// channel. Unused on the legacy tmux path (the strip's move/rename
-    /// affordances still emit, but nothing is listening — harmless, the same
-    /// caveat as `session_list_request_rx`).
+    /// channel.
     pub session_order_rx: flume::Receiver<SessionOrderUpdate>,
     /// The reconnect banner's Cancel (#476,
     /// `docs/spec-connection-robustness.md`): consumed by the SSH-level
@@ -536,6 +529,13 @@ pub struct SessionView {
     /// stream) owns that. Rendered as the always-visible title-bar chip strip
     /// (#683), which replaced the phase-19 click-to-open popover.
     sessions: Vec<SessionListItem>,
+    /// Tracks the session strip's horizontal scroll offset (#905): shared
+    /// between the scrolling chip row (`.track_scroll`) and the overlay
+    /// [`gpui_component::scroll::Scrollbar`] in
+    /// [`Self::render_session_strip`] so the thumb reflects and drives the
+    /// same scroll position, mirroring `SessionPicker`'s vertical
+    /// `scroll_handle` (issue #804).
+    session_strip_scroll: ScrollHandle,
     /// The strip's in-progress inline session rename (#684), dispatched from
     /// a chip's right-click menu; when active, that chip renders the edit
     /// input in place of its name.
@@ -576,7 +576,6 @@ impl SessionView {
         let (size_changed_tx, size_changed_rx) = flume::unbounded();
         let (snapshot_tx, snapshot_rx) = flume::unbounded::<SessionSnapshot>();
         let (tmux_command_tx, tmux_command_rx) = flume::unbounded::<String>();
-        let (subscription_tx, subscription_rx) = flume::unbounded::<SubscriptionUpdate>();
         let (capture_request_tx, capture_request_rx) = flume::unbounded::<CaptureRequest>();
         let (capture_result_tx, capture_result_rx) = flume::unbounded::<CaptureResult>();
         let (connection_status_tx, connection_status_rx) = flume::unbounded::<ConnectionStatus>();
@@ -621,25 +620,6 @@ impl SessionView {
                 let result = cx.update(|cx| {
                     this.update(cx, |view, cx| {
                         view.apply_snapshot(snapshot, cx);
-                    })
-                });
-                if result.is_err() {
-                    break;
-                }
-            })
-            .detach();
-        }
-
-        {
-            // Phase 2d: format-subscription updates stream pane/window state
-            // changes (cd, command, rename) end-to-end into the view layer.
-            cx.spawn(async move |this, cx| loop {
-                let Ok(update) = subscription_rx.recv_async().await else {
-                    break;
-                };
-                let result = cx.update(|cx| {
-                    this.update(cx, |view, cx| {
-                        view.apply_subscription(update, cx);
                     })
                 });
                 if result.is_err() {
@@ -786,6 +766,7 @@ impl SessionView {
             prefix_options: PrefixOptions::default(),
             key_table_request_tx,
             sessions: Vec::new(),
+            session_strip_scroll: ScrollHandle::default(),
             renaming_session: None,
             confirming_kill: None,
             confirming_pane_kill: None,
@@ -799,8 +780,6 @@ impl SessionView {
         // to trigger `open_session_switcher`'s on-demand refresh, so an
         // initial request must be fired here or the strip stays empty until
         // the daemon's next churn-driven `%sessions-changed` push (#744).
-        // Inert on the legacy tmux path, same caveat as
-        // `session_list_request_rx` above.
         let _ = view.session_list_request_tx.try_send(());
 
         let handle = TerminalHandle {
@@ -809,7 +788,6 @@ impl SessionView {
             size_changed_rx,
             snapshot_tx,
             tmux_command_rx,
-            subscription_tx,
             capture_request_rx,
             capture_result_tx,
             connection_status_tx,
@@ -1366,49 +1344,6 @@ impl SessionView {
         }
     }
 
-    fn apply_subscription(&mut self, update: SubscriptionUpdate, cx: &mut Context<Self>) {
-        match update.name.as_str() {
-            // `rift_pane_path` (`#{pane_current_path}`, scope `%*`): live CWD per
-            // pane. Drives the statusbar within ~1s of `cd`; the snapshot only
-            // seeds initial state at pane creation.
-            "rift_pane_path" => {
-                if let Some(entry) = self.panes.get(&update.pane) {
-                    entry.entity.update(cx, |pv, cx| {
-                        pv.set_working_directory(update.value);
-                        cx.notify();
-                    });
-                    cx.notify();
-                }
-            }
-            // `rift_pane_command` (`#{pane_current_command}`, scope `%*`): the
-            // foreground command per pane. Same live-driver pattern as the CWD;
-            // the snapshot only seeds it at pane creation.
-            "rift_pane_command" => {
-                if let Some(entry) = self.panes.get(&update.pane) {
-                    entry.entity.update(cx, |pv, cx| {
-                        pv.set_current_command(update.value);
-                        cx.notify();
-                    });
-                    cx.notify();
-                }
-            }
-            // `rift_window_name` (`#{window_name}`, scope `@*`): live window
-            // title per window. Updates the tab label within ~1s of
-            // `rename-window`; the snapshot seeds it otherwise.
-            "rift_window_name" => {
-                if let Some(win) = self.windows.iter_mut().find(|w| w.id == update.window) {
-                    if win.name != update.value {
-                        win.name = update.value;
-                        cx.notify();
-                    }
-                }
-            }
-            other => {
-                debug!(name = %other, "unhandled tmux subscription");
-            }
-        }
-    }
-
     /// Begin an inline rename of `window_id`: seed a text input with the current
     /// window name, focus it, and subscribe for submit/blur. Enter emits
     /// `rename-window`; blur cancels. The snapshot remains the source of truth
@@ -1947,6 +1882,7 @@ impl SessionView {
         let danger = cx.theme().danger;
 
         let mut strip = h_flex()
+            .id("session-strip-chips")
             .items_center()
             .gap(px(4.0))
             .text_size(px(13.0))
@@ -2202,9 +2138,46 @@ impl SessionView {
                     view.open_new_session_prompt(cx);
                 });
             })
-            .child("+ New session...");
+            .child("+ New session...")
+            // Sits outside the scrollable chip region below so it stays
+            // reachable regardless of session count (#905) — it never
+            // shrinks and is never scrolled past.
+            .flex_none();
 
-        strip.child(new_session)
+        // Constrain the strip (#905): `flex_1` + `min_w_0` let this region
+        // shrink to whatever space the title bar's left group has left after
+        // the brand (`title_bar::render`'s left `h_flex` carries the matching
+        // `flex_1`/`min_w_0`), instead of forcing its own unbounded content
+        // width onto the row and pushing "+ New session" and the title bar's
+        // right-side connection/settings/window controls off-screen. Once
+        // shrunk below the chips' combined width, the chip row itself
+        // (`strip`, already `.id`'d above) becomes the horizontally
+        // scrollable region — overflowed chips are reachable via scroll/drag,
+        // with an overlay `Scrollbar` (`ScrollbarShow::Hover`, mirroring
+        // `SessionPicker`'s vertical one, #804) as the discoverable affordance
+        // rather than a silent wheel-only scroll.
+        h_flex()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        strip
+                            .min_w_0()
+                            .overflow_x_scroll()
+                            .track_scroll(&self.session_strip_scroll),
+                    )
+                    .child(
+                        Scrollbar::horizontal(&self.session_strip_scroll)
+                            .scrollbar_show(ScrollbarShow::Hover),
+                    ),
+            )
+            .child(new_session)
     }
 
     /// The reconnect banner's Cancel action: ask the SSH-level reconnect
@@ -3488,14 +3461,16 @@ mod tests {
         }
     }
 
-    /// Regression (`docs/spec-pane-activity-v2.md`): the legacy tmux path
-    /// (`RIFT_TERMINAL_LEGACY`) sends an empty `pane_is_shell` map (`main.rs`).
-    /// `apply_snapshot` must resolve a pane absent from that map to `None`,
-    /// not a collapsed `Some(false)` — otherwise every legacy pane would read
+    /// Regression (`docs/spec-pane-activity-v2.md`): a pane absent from the
+    /// `pane_is_shell` map (as every pane was, on the direct-tmux fallback
+    /// removed in #285) must resolve to `None` in `apply_snapshot`, not a
+    /// collapsed `Some(false)` — otherwise such a pane would read
     /// forced-busy instead of falling back to the client structural
     /// classifier (alt-screen / OSC-133), which reads free here.
     #[gpui::test]
-    fn test_apply_snapshot_legacy_empty_map_reads_pane_free_not_busy(cx: &mut TestAppContext) {
+    fn test_apply_snapshot_empty_pane_is_shell_map_reads_pane_free_not_busy(
+        cx: &mut TestAppContext,
+    ) {
         cx.update(|cx| {
             let (session, _handle) = session_and_handle(cx);
 
@@ -3507,8 +3482,8 @@ mod tests {
             assert_eq!(
                 activity,
                 PaneActivity::Free,
-                "pane absent from an empty legacy pane_is_shell map must fall \
-                 back to the structural classifier, not read forced-busy"
+                "pane absent from an empty pane_is_shell map must fall back \
+                 to the structural classifier, not read forced-busy"
             );
         });
     }
