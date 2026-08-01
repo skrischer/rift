@@ -283,13 +283,17 @@ pub struct StartRename;
 /// directory (artboard **State D**, `docs/spec-explorer-file-ops.md`, #676):
 /// a directory targets itself, a file targets its parent — see
 /// [`FileTree::create_target_dir`]. Dispatched by the row context menu's
-/// "New File…" item; pointer-only, not bound to a key.
+/// "New File…" item, or by the empty-root background context menu
+/// (`FileTree::render_empty_root_placeholder`, #904); pointer-only, not
+/// bound to a key.
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = rift, no_json)]
 pub struct NewFile;
 
 /// Same as [`NewFile`] but creates a directory. Dispatched by the row
-/// context menu's "New Folder…" item; pointer-only, not bound to a key.
+/// context menu's "New Folder…" item, or by the empty-root background
+/// context menu (`FileTree::render_empty_root_placeholder`, #904);
+/// pointer-only, not bound to a key.
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = rift, no_json)]
 pub struct NewFolder;
@@ -2323,6 +2327,34 @@ impl FileTree {
             .into_any_element()
     }
 
+    /// The [`EmptyState::EmptyRoot`] placeholder (#904): the same quiet,
+    /// centered chrome as [`Self::render_placeholder`], but wrapped in a
+    /// background context menu (`ContextMenuExt`) offering *New File…*/
+    /// *New Folder…* — with zero rows rendered here, right-clicking
+    /// anywhere in the pane is unambiguously "background", and create is
+    /// otherwise unreachable on an empty root (no row exists to carry the
+    /// per-row menu). Deliberately not applied to the whole
+    /// `Render::render` container or the shared `render_placeholder`
+    /// helper (also used by the `Loading`/"No matches" states, where a
+    /// create surface would be premature or redundant): any container that
+    /// also holds row elements would have this hitbox additionally
+    /// hover-matched underneath a row's own hitbox
+    /// (`HitboxBehavior::Normal` does not block ancestors), firing *both*
+    /// menus on every row right-click. [`FileTree::create_target_dir`]
+    /// already targets the worktree root with nothing selected (or a
+    /// selection the now-empty model can't resolve), so no explicit
+    /// selection-clearing is needed here.
+    fn render_empty_root_placeholder(cx: &Context<Self>) -> AnyElement {
+        div()
+            .size_full()
+            .context_menu(|menu: PopupMenu, _window, _cx| {
+                menu.menu("New File...", Box::new(NewFile))
+                    .menu("New Folder...", Box::new(NewFolder))
+            })
+            .child(Self::render_placeholder("Empty folder", cx))
+            .into_any_element()
+    }
+
     /// The [`EmptyState::NoRoot`] placeholder (issue #891): the same quiet,
     /// centered chrome as [`Self::render_placeholder`], plus a primary "Set
     /// project root" action. Emits [`FileTreeEvent::SetRootRequested`]; the
@@ -2979,7 +3011,7 @@ impl Render for FileTree {
         let content = if let Some(state) = self.empty_state() {
             match state {
                 EmptyState::Loading => Self::render_placeholder("Loading\u{2026}", cx),
-                EmptyState::EmptyRoot => Self::render_placeholder("Empty folder", cx),
+                EmptyState::EmptyRoot => Self::render_empty_root_placeholder(cx),
                 EmptyState::NoRoot => self.render_no_root_placeholder(cx),
             }
         } else if self.filter_active && !self.filter_query.is_empty() && self.row_cache.is_empty() {

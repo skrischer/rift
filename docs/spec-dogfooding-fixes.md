@@ -254,3 +254,19 @@ includes:
   "+ New session" sits outside the scrollable region as a `flex_none` sibling so it
   stays reachable regardless of session count, never shrinking and never scrolled
   past.
+- 2026-08-01: **Explorer has no context menu / create action on empty background**
+  resolved (#904). Category 2 (defect in an existing path). `.context_menu(...)` was
+  attached only inside `render_row`, so right-clicking empty background space showed
+  nothing, and on an empty root — no rows at all — `NewFile`/`NewFolder` (pointer-only,
+  no keybinding) were unreachable. Fix scoped to the `EmptyState::EmptyRoot` render
+  path (`FileTree::render_empty_root_placeholder`), not the whole `Render::render`
+  container the issue's investigation pointed at: `gpui-component`'s `ContextMenuExt`
+  registers its right-click listener via `window.on_mouse_event` gated only on
+  `hitbox.is_hovered(window)` (a pure spatial check, no propagation-stopping) — a
+  `.context_menu()` on any ancestor that also contains rows would still fire (its
+  hitbox spans the whole area, including every row) on *every* row right-click,
+  alongside the row's own menu, opening both at once. The empty-root placeholder has
+  zero rows to collide with, so it is the only container safe to wrap directly.
+  `FileTree::create_target_dir` already resolves to the worktree root whenever
+  `self.selected` is `None` or the model can no longer find it (guaranteed on an empty
+  model), so no extra selection-clearing was needed to target the root.
