@@ -15,7 +15,7 @@ pub use frame::{encode_frame, FrameDecoder, FrameError, MAX_FRAME_LEN};
 /// is wire-compatible in one direction. The message set is pinned by the
 /// fingerprint test beside `PROTOCOL_FINGERPRINT` below, so a message-set
 /// change without a bump cannot pass CI.
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Pinned fingerprint of the protocol message set, checked by the
 /// `fingerprint_tests` module: an FNV-1a hash over the serde-visible surface
@@ -25,7 +25,7 @@ pub const PROTOCOL_VERSION: u32 = 14;
 /// [`PROTOCOL_VERSION`] above and re-pin this value (the failing test prints
 /// the new fingerprint).
 #[cfg(test)]
-const PROTOCOL_FINGERPRINT: u64 = 0xb0fc_723e_ca5b_7294;
+const PROTOCOL_FINGERPRINT: u64 = 0xaa93_6d0f_44a0_c16a;
 
 /// Messages the client sends to the daemon.
 ///
@@ -338,6 +338,20 @@ pub enum ClientMessage {
     /// same as [`ClientMessage::CreateFile`].
     DeletePath {
         path: String,
+    },
+    /// Turn per-pane resource sampling on/off for this connection
+    /// (`docs/spec-pane-attribution.md`). The telemetry channel has no other
+    /// client→daemon request path (`HostMetrics` is unconditional and
+    /// daemon-global), so this is the opt-in a connection uses to drive
+    /// on-demand per-pane sampling: `true` while its breakdown popover is
+    /// open, `false` on close or disconnect. The daemon gates a
+    /// process-global shared snapshot refresh on the count of connections
+    /// currently opted in (zero -> no process work) and, per opted-in
+    /// connection, rolls up and pushes its own session's
+    /// [`DaemonMessage::PaneMetrics`] — never a daemon-global broadcast, so
+    /// one connection's toggle cannot affect another's stream.
+    SetPaneMetricsEnabled {
+        enabled: bool,
     },
     Hello {
         version: u32,
@@ -739,6 +753,21 @@ pub enum DaemonMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         psi: Option<MemoryPressure>,
     },
+    /// A per-pane resource attribution breakdown for the attached session
+    /// (`docs/spec-pane-attribution.md`): for each pane the daemon rolls up
+    /// the `/proc` process subtree rooted at the pane's process and reports
+    /// its resident memory and CPU. Unlike [`HostMetrics`](DaemonMessage::HostMetrics)
+    /// this is **per-connection, not daemon-global** — each `serve_connection`
+    /// computes and pushes its own session's list, never the shared broadcast
+    /// bus, so one connection's panes are never leaked onto another's stream
+    /// (relevant when two connections attach different tmux sessions on the
+    /// same host). Push-only, and sent only while this connection has opted
+    /// in via [`ClientMessage::SetPaneMetricsEnabled`] (the on-demand sampling
+    /// model — an idle daemon with no breakdown open does zero process
+    /// refresh work).
+    PaneMetrics {
+        entries: Vec<PaneMetric>,
+    },
     Welcome {
         version: u32,
     },
@@ -996,6 +1025,27 @@ pub struct MemoryPressure {
     pub full_avg10: f64,
     pub full_avg60: f64,
     pub full_avg300: f64,
+}
+
+/// One pane's resource attribution row, carried by
+/// [`DaemonMessage::PaneMetrics`] (`docs/spec-pane-attribution.md`). `pane_id`
+/// matches the layout's pane id ([`PaneLayout::pane_id`]) — the client keys on
+/// it exactly as it does for output/resize; the daemon never ships the
+/// underlying host pid. `rss` is the pane's `/proc` process-subtree resident
+/// memory in bytes (the pane's process and every descendant, summed); `cpu`
+/// is the subtree's CPU usage (0.0-100.0 times the core count, `sysinfo`'s
+/// convention, matching [`DaemonMessage::HostMetrics::cpu`]'s scale). `command`
+/// is the pane's agnostic `pane_current_command` label, re-shipped on every
+/// push (not looked up from a separately cached layout) so a
+/// [`DaemonMessage::PaneMetrics`] push is a **self-contained, sample-coherent**
+/// snapshot that still renders correctly if a pane has since vanished from
+/// the layout. No `Eq`: `cpu` is `f32`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PaneMetric {
+    pub pane_id: u32,
+    pub rss: u64,
+    pub cpu: f32,
+    pub command: String,
 }
 
 /// One diagnostic a language server reports for a file: a source span plus the
@@ -2269,6 +2319,80 @@ mod tests {
                 "malformed HostMetrics must not deserialize: {json}"
             );
         }
+    }
+
+    #[test]
+    fn test_pane_metrics_roundtrip_preserves_entries() {
+        let msg = DaemonMessage::PaneMetrics {
+            entries: vec![
+                PaneMetric {
+                    pane_id: 1,
+                    rss: 123_456_789,
+                    cpu: 12.5,
+                    command: "cargo".to_owned(),
+                },
+                PaneMetric {
+                    pane_id: 2,
+                    rss: 0,
+                    cpu: 0.0,
+                    command: String::new(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&msg).expect("serialize PaneMetrics");
+        assert!(json.contains(r#""type":"pane_metrics""#));
+        assert!(json.contains(r#""pane_id":1"#));
+        assert!(json.contains(r#""rss":123456789"#));
+        assert!(json.contains(r#""cpu":12.5"#));
+        assert!(json.contains(r#""command":"cargo""#));
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize PaneMetrics"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_pane_metrics_empty_entries_roundtrips() {
+        let msg = DaemonMessage::PaneMetrics { entries: vec![] };
+        let json = serde_json::to_string(&msg).expect("serialize empty PaneMetrics");
+        assert_eq!(json, r#"{"type":"pane_metrics","entries":[]}"#);
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize empty PaneMetrics"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_pane_metrics_malformed_entry_is_rejected() {
+        for json in [
+            // Missing `command` on the entry.
+            r#"{"type":"pane_metrics","entries":[{"pane_id":1,"rss":1,"cpu":1.0}]}"#,
+            // Missing the top-level `entries` field entirely.
+            r#"{"type":"pane_metrics"}"#,
+            // `pane_id` as a string instead of a u32.
+            r#"{"type":"pane_metrics","entries":[{"pane_id":"1","rss":1,"cpu":1.0,"command":""}]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<DaemonMessage>(json).is_err(),
+                "malformed PaneMetrics must not deserialize: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pane_metric_roundtrip_preserves_all_fields() {
+        let metric = PaneMetric {
+            pane_id: 7,
+            rss: 42,
+            cpu: 3.5,
+            command: "bash".to_owned(),
+        };
+        let json = serde_json::to_string(&metric).expect("serialize PaneMetric");
+        assert_eq!(json, r#"{"pane_id":7,"rss":42,"cpu":3.5,"command":"bash"}"#);
+        assert_eq!(
+            serde_json::from_str::<PaneMetric>(&json).expect("deserialize PaneMetric"),
+            metric
+        );
     }
 
     #[test]
@@ -3731,6 +3855,30 @@ mod tests {
         assert!(
             err.is_err(),
             "delete_path without a path must not deserialize"
+        );
+    }
+
+    #[test]
+    fn test_set_pane_metrics_enabled_roundtrip_true_and_false() {
+        for enabled in [true, false] {
+            let msg = ClientMessage::SetPaneMetricsEnabled { enabled };
+            let json = serde_json::to_string(&msg).expect("serialize SetPaneMetricsEnabled");
+            assert_eq!(
+                json,
+                format!(r#"{{"type":"set_pane_metrics_enabled","enabled":{enabled}}}"#)
+            );
+            let parsed: ClientMessage =
+                serde_json::from_str(&json).expect("deserialize SetPaneMetricsEnabled");
+            assert_eq!(parsed, msg);
+        }
+    }
+
+    #[test]
+    fn test_set_pane_metrics_enabled_missing_field_is_rejected() {
+        let err = serde_json::from_str::<ClientMessage>(r#"{"type":"set_pane_metrics_enabled"}"#);
+        assert!(
+            err.is_err(),
+            "set_pane_metrics_enabled without enabled must not deserialize"
         );
     }
 

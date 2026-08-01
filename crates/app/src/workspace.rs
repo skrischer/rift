@@ -545,6 +545,13 @@ pub struct WorkspaceView {
     /// the LSP dot before a server is known). Read inline in
     /// [`WorkspaceView::render`].
     host_metrics: Option<status_bar::HostMetrics>,
+    /// The client-side memory-pressure level computed from `host_metrics`
+    /// (`docs/spec-memory-pressure.md`), which recolours the MEM/CPU segment.
+    /// Starts `Normal` (no sample yet, so the segment is hidden regardless);
+    /// the first / welcome-replayed sample seeds it silently in the
+    /// host-metrics fold loop below — the toast on a *subsequent* rising edge
+    /// is a later phase (#877).
+    pressure_level: status_bar::PressureLevel,
     /// The diff view (`docs/spec-source-control.md`, #338): renders the
     /// `FileDiff` streamed for the source-control panel's selection. Kept as
     /// its own field for the same reason as `problems_panel` above; the
@@ -1037,8 +1044,11 @@ impl WorkspaceView {
         // push replaces the latest sample wholesale (replayed behind Welcome
         // so a reattach sees current state), then a notify repaints the
         // status bar. `None` before the first sample, which hides the
-        // segment (mirroring the LSP fold above). Routed through this view's
-        // weak handle so a closed window ends the loop gracefully.
+        // segment (mirroring the LSP fold above). The same sample also drives
+        // `pressure_level` (`docs/spec-memory-pressure.md`): the first /
+        // welcome-replayed sample seeds it silently (the toast on a
+        // subsequent rising edge is #877, not this loop). Routed through this
+        // view's weak handle so a closed window ends the loop gracefully.
         {
             cx.spawn(async move |this, cx| loop {
                 let Ok(msg) = host_metrics_rx.recv_async().await else {
@@ -1049,16 +1059,24 @@ impl WorkspaceView {
                         cpu,
                         mem_total,
                         mem_available,
+                        swap_total,
+                        swap_used,
+                        psi,
                         ..
                     } = msg
                     else {
                         return;
                     };
-                    view.host_metrics = Some(status_bar::HostMetrics {
+                    let sample = status_bar::HostMetrics {
                         cpu,
                         mem_total,
                         mem_available,
-                    });
+                        swap_total,
+                        swap_used,
+                        psi,
+                    };
+                    view.pressure_level = status_bar::pressure_level(sample, view.pressure_level);
+                    view.host_metrics = Some(sample);
                     cx.notify();
                 });
                 if result.is_err() {
@@ -1492,6 +1510,7 @@ impl WorkspaceView {
             results_opened_dock: false,
             lsp: BTreeMap::new(),
             host_metrics: None,
+            pressure_level: status_bar::PressureLevel::Normal,
             diff_view,
             open_file_tx,
             dock_area,
@@ -2670,6 +2689,7 @@ impl Render for WorkspaceView {
                     diagnostics: model.all_diagnostics(),
                     lsp: &self.lsp,
                     host_metrics: self.host_metrics.as_ref(),
+                    pressure_level: self.pressure_level,
                     cursor,
                     clock: &clock,
                 },

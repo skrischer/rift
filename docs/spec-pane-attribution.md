@@ -294,3 +294,18 @@ under the milestone. This spec owns the design; the issues own progress.
   refresh is gated on a process-global opt-in counter so an idle daemon does zero
   process work. The protocol issue therefore ships both the `PaneMetrics` push and the
   opt-in `ClientMessage` under one version bump. Human prerequisites: none.
+- 2026-08-01 (#879, protocol issue landed): `DaemonMessage::PaneMetrics { entries:
+  Vec<PaneMetric> }` and `ClientMessage::SetPaneMetricsEnabled { enabled: bool }` added;
+  `PROTOCOL_VERSION` 14 -> 15, fingerprint re-pinned; `docs/protocol.md` documents both.
+  Adding the two variants made three pre-existing exhaustive matches
+  non-exhaustive — the per-connection dispatch and the shared-loop `Core::dispatch` in
+  `crates/daemon/src/lib.rs`, and `handle_client_message` in
+  `crates/daemon/src/terminal.rs` — each got a minimal defensive no-op arm for
+  `SetPaneMetricsEnabled` (comment: `real handling: #880`), matching the existing
+  `CloneRepo`-arrives-before-its-follow-on-issue convention already in those matches.
+  `crates/app/src/main.rs`'s `consume_daemon_messages` got an explicit no-op arm for
+  `PaneMetrics` (`real handling: #881`) even though its catch-all `other => debug!(...)`
+  arm would have compiled without one, for symmetry with the daemon-side placeholders and
+  to make the deferral to #881 discoverable at the call site. Both placeholders are wire
+  foundation only, superseded when #880 (daemon: pane pid, shared snapshot, roll-up,
+  push) and #881 (app: ingest + popover) land.
