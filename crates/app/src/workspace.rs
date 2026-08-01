@@ -74,6 +74,7 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dialog::{AlertDialog, DialogButtonProps};
 use gpui_component::dock::{Dock, DockArea, DockItem, DockPlacement, PanelView};
+use gpui_component::notification::NotificationType;
 use gpui_component::{ActiveTheme as _, IconName, Root, Sizable as _, WindowExt as _};
 use rift_protocol::{
     ClientMessage, CloneError, DaemonMessage, DirBrowseError, DirEntry, EntryKind, LspServerState,
@@ -549,8 +550,8 @@ pub struct WorkspaceView {
     /// (`docs/spec-memory-pressure.md`), which recolours the MEM/CPU segment.
     /// Starts `Normal` (no sample yet, so the segment is hidden regardless);
     /// the first / welcome-replayed sample seeds it silently in the
-    /// host-metrics fold loop below — the toast on a *subsequent* rising edge
-    /// is a later phase (#877).
+    /// host-metrics fold loop below, and a *subsequent* rising edge fires a
+    /// single toast (`should_fire_pressure_toast`, #877).
     pressure_level: status_bar::PressureLevel,
     /// The diff view (`docs/spec-source-control.md`, #338): renders the
     /// `FileDiff` streamed for the source-control panel's selection. Kept as
@@ -1046,15 +1047,21 @@ impl WorkspaceView {
         // status bar. `None` before the first sample, which hides the
         // segment (mirroring the LSP fold above). The same sample also drives
         // `pressure_level` (`docs/spec-memory-pressure.md`): the first /
-        // welcome-replayed sample seeds it silently (the toast on a
-        // subsequent rising edge is #877, not this loop). Routed through this
-        // view's weak handle so a closed window ends the loop gracefully.
+        // welcome-replayed sample seeds it silently — `view.host_metrics` is
+        // still `None` at that point, which is the seed marker
+        // `should_fire_pressure_toast` reads — and a *subsequent* upward
+        // transition fires a single toast via `window.push_notification`.
+        // `cx.spawn_in` + `update_in` (matching the diff/nav loops above,
+        // rather than the plain `cx.spawn` the LSP fold just above still
+        // uses) holds the `Window` handle the toast needs. Routed through
+        // this view's weak handle so a closed window ends the loop
+        // gracefully.
         {
-            cx.spawn(async move |this, cx| loop {
+            cx.spawn_in(window, async move |this, cx| loop {
                 let Ok(msg) = host_metrics_rx.recv_async().await else {
                     break;
                 };
-                let result = this.update(cx, |view, cx| {
+                let result = this.update_in(cx, |view, window, cx| {
                     let DaemonMessage::HostMetrics {
                         cpu,
                         mem_total,
@@ -1075,8 +1082,22 @@ impl WorkspaceView {
                         swap_used,
                         psi,
                     };
-                    view.pressure_level = status_bar::pressure_level(sample, view.pressure_level);
+                    let seeding = view.host_metrics.is_none();
+                    let previous_level = view.pressure_level;
+                    let new_level = status_bar::pressure_level(sample, previous_level);
+                    view.pressure_level = new_level;
                     view.host_metrics = Some(sample);
+                    if should_fire_pressure_toast(seeding, previous_level, new_level) {
+                        let notification_type = if new_level == status_bar::PressureLevel::Critical
+                        {
+                            NotificationType::Error
+                        } else {
+                            NotificationType::Warning
+                        };
+                        let message: SharedString =
+                            status_bar::pressure_toast_message(mem_total, mem_available).into();
+                        window.push_notification((notification_type, message), cx);
+                    }
                     cx.notify();
                 });
                 if result.is_err() {
@@ -2479,6 +2500,24 @@ fn worktree_root_switched(previous: Option<&str>, new: Option<&str>) -> bool {
     previous.is_some() && previous != new
 }
 
+/// Whether the host-metrics fold loop should fire a memory-pressure toast for
+/// this tick (`docs/spec-memory-pressure.md`): edge-triggered on an upward
+/// `PressureLevel` transition only (`Normal`/`Warning`/`Critical` order via
+/// `PressureLevel`'s derived `Ord`) — never on a hold at the same level, never
+/// on a downward transition, and never on `seeding` (the first / welcome-
+/// replayed sample, which establishes `previous`/`new` without having been
+/// observed live — a reconnect under sustained pressure must not toast). A
+/// later rise re-arms naturally once the level has fallen, since that fall
+/// itself never fires (only a subsequent increase over the new, lower
+/// `previous` does).
+fn should_fire_pressure_toast(
+    seeding: bool,
+    previous: status_bar::PressureLevel,
+    new: status_bar::PressureLevel,
+) -> bool {
+    !seeding && new > previous
+}
+
 /// Fold one worktree-family daemon message into the file tree's model. Only the
 /// structure-path messages are routed here; any other variant is ignored (the
 /// tokio side forwards only this family on `worktree_rx`). An `UpdateWorktree`
@@ -3166,6 +3205,46 @@ mod tests {
         // ever completes — nothing was open yet, so this must not be treated
         // as a switch.
         assert!(!worktree_root_switched(None, Some("/proj/a")));
+    }
+
+    // --- memory-pressure toast edge-trigger (#877, docs/spec-memory-pressure.md)
+    // Headless: `should_fire_pressure_toast` is plain data logic over
+    // `PressureLevel`, no GPUI test harness needed.
+
+    #[test]
+    fn test_should_fire_pressure_toast_fires_on_every_listed_upward_transition() {
+        use status_bar::PressureLevel::{Critical, Normal, Warning};
+        assert!(should_fire_pressure_toast(false, Normal, Warning));
+        assert!(should_fire_pressure_toast(false, Warning, Critical));
+        assert!(should_fire_pressure_toast(false, Normal, Critical));
+    }
+
+    #[test]
+    fn test_should_fire_pressure_toast_does_not_repeat_while_the_level_holds() {
+        use status_bar::PressureLevel::{Critical, Normal, Warning};
+        assert!(!should_fire_pressure_toast(false, Normal, Normal));
+        assert!(!should_fire_pressure_toast(false, Warning, Warning));
+        assert!(!should_fire_pressure_toast(false, Critical, Critical));
+    }
+
+    #[test]
+    fn test_should_fire_pressure_toast_does_not_fire_on_a_downward_transition() {
+        use status_bar::PressureLevel::{Critical, Normal, Warning};
+        assert!(!should_fire_pressure_toast(false, Critical, Warning));
+        assert!(!should_fire_pressure_toast(false, Warning, Normal));
+        assert!(!should_fire_pressure_toast(false, Critical, Normal));
+    }
+
+    #[test]
+    fn test_should_fire_pressure_toast_never_fires_on_the_seeding_sample() {
+        // A reconnect while the host is already under pressure seeds
+        // `previous` at `Normal` (the field's default) and `new` at
+        // `Warning`/`Critical` in the same tick — an upward-looking pair that
+        // must still stay silent because `seeding` is `true`.
+        use status_bar::PressureLevel::{Critical, Normal, Warning};
+        assert!(!should_fire_pressure_toast(true, Normal, Warning));
+        assert!(!should_fire_pressure_toast(true, Normal, Critical));
+        assert!(!should_fire_pressure_toast(true, Normal, Normal));
     }
 
     #[test]
