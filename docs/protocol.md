@@ -50,7 +50,8 @@ binary, never by tolerating it (`docs/spec-connection-robustness.md`).
   a healthy concurrent connection's stream (relevant for the shared stable+dev
   daemon).
 
-History: version 13 adds the host-metrics push (`host_metrics`) — a
+History: version 14 adds the optional Linux PSI memory-stall payload
+(`psi`) to `host_metrics` (`docs/spec-memory-pressure.md`); version 13 adds the host-metrics push (`host_metrics`) — a
 daemon-global CPU/memory/swap/load sample, push-only and `welcome`-replayed
 like `lsp_status` (`docs/spec-host-telemetry.md`); version 12 adds
 `CloneError::GitUnavailable` for a missing host `git` binary, surfaced as a
@@ -285,10 +286,10 @@ the server exits) or a (re)start attempt fails. Push-only, and replayed once
 per known server behind `welcome` so a (re)attaching client sees current
 health immediately.
 
-## Host metrics (`docs/spec-host-telemetry.md`)
+## Host metrics (`docs/spec-host-telemetry.md`, `docs/spec-memory-pressure.md`)
 
 ```json
-{ "type": "host_metrics", "cpu": 42.5, "mem_total": 16000000000, "mem_available": 4000000000, "swap_total": 2000000000, "swap_used": 100000000, "load": { "one": 1.5, "five": 1.1, "fifteen": 0.9 }, "cpu_count": 8 }
+{ "type": "host_metrics", "cpu": 42.5, "mem_total": 16000000000, "mem_available": 4000000000, "swap_total": 2000000000, "swap_used": 100000000, "load": { "one": 1.5, "five": 1.1, "fifteen": 0.9 }, "cpu_count": 8, "psi": { "some_avg10": 12.5, "some_avg60": 8.25, "some_avg300": 3.1, "full_avg10": 4.0, "full_avg60": 2.5, "full_avg300": 1.0 } }
 ```
 
 `host_metrics` is a **host-global** signal, not per-context: unlike every
@@ -306,6 +307,21 @@ RAM is really free"; `load` is the 1/5/15-minute load average
 and replayed once behind `welcome` from the daemon's cached latest sample —
 the same precedent as `lsp_status` — so a (re)attaching client sees current
 host state without waiting for the next tick.
+
+`psi` is an **optional** Linux PSI (Pressure Stall Information) payload, read
+from `/proc/pressure/memory` where the kernel exposes it
+(`#[serde(default, skip_serializing_if = "Option::is_none")]` — omitted from
+the JSON entirely when absent, and tolerated as missing on deserialize). It is
+`null`/absent on hosts whose kernel ships no `CONFIG_PSI` — notably the stock
+`microsoft-standard-WSL2` kernel — in which case the client falls back to the
+portable `mem_available`/`swap_*` baseline alone. Where present, each field is
+the kernel's percent-stalled average over the named window: `some_avg10` /
+`some_avg60` / `some_avg300` is the share of time at least one task was
+stalled on memory reclaim over the last 10s/60s/300s; `full_avg10` /
+`full_avg60` / `full_avg300` is the share of time *every* runnable task was
+stalled simultaneously (a stronger signal than `some`). The kernel's own file
+also carries a trailing `total=<microseconds>` counter per line, which this
+payload omits — only the ready-to-use `avgN` percentages are carried.
 
 ### Live-buffer feed (`spec-editor.md`, cut C)
 

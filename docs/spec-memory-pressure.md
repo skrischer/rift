@@ -288,3 +288,11 @@ under the milestone. This spec owns the design; the issues own progress.
   the `MemoryPressure: Copy` derive and `total=` tolerance, the silent seed-on-
   (re)connect toast rule, the explicit no-foundation-change note, and the PSI
   escalation shape pinned in Prior decisions.
+- 2026-08-01 (#874, protocol step): adding the required `psi` field to
+  `DaemonMessage::HostMetrics` breaks the handful of existing struct-literal
+  construction/destructure sites outside `protocol` (`crates/daemon/src/lib.rs`'s
+  builder and its two tests), since a Rust struct field — unlike its serde
+  default — has no construction-time default. Fixed those sites mechanically
+  (`psi: None`, `psi: _`) to keep `cargo test --workspace --exclude rift-app`
+  green; no PSI read/parse logic was added there — that stays the daemon
+  issue's scope.
