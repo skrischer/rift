@@ -15,7 +15,7 @@ pub use frame::{encode_frame, FrameDecoder, FrameError, MAX_FRAME_LEN};
 /// is wire-compatible in one direction. The message set is pinned by the
 /// fingerprint test beside `PROTOCOL_FINGERPRINT` below, so a message-set
 /// change without a bump cannot pass CI.
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// Pinned fingerprint of the protocol message set, checked by the
 /// `fingerprint_tests` module: an FNV-1a hash over the serde-visible surface
@@ -25,7 +25,7 @@ pub const PROTOCOL_VERSION: u32 = 13;
 /// [`PROTOCOL_VERSION`] above and re-pin this value (the failing test prints
 /// the new fingerprint).
 #[cfg(test)]
-const PROTOCOL_FINGERPRINT: u64 = 0x0548_0061_525c_804d;
+const PROTOCOL_FINGERPRINT: u64 = 0xb0fc_723e_ca5b_7294;
 
 /// Messages the client sends to the daemon.
 ///
@@ -721,6 +721,13 @@ pub enum DaemonMessage {
     /// from the daemon's cached latest sample, so a (re)attaching client sees
     /// current host state without waiting for the next tick — the same
     /// precedent as [`LspStatus`](DaemonMessage::LspStatus).
+    ///
+    /// `psi` (`docs/spec-memory-pressure.md`) is the optional Linux PSI
+    /// memory-stall payload, read from `/proc/pressure/memory` where the
+    /// kernel exposes it (`None` where it doesn't, e.g. the stock
+    /// `microsoft-standard-WSL2` kernel, which ships no `CONFIG_PSI`) —
+    /// intra-version optionality, not a version skew tolerance: a same-version
+    /// PSI-less host simply omits the key.
     HostMetrics {
         cpu: f32,
         mem_total: u64,
@@ -729,6 +736,8 @@ pub enum DaemonMessage {
         swap_used: u64,
         load: LoadAverage,
         cpu_count: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        psi: Option<MemoryPressure>,
     },
     Welcome {
         version: u32,
@@ -965,6 +974,28 @@ pub struct LoadAverage {
     pub one: f64,
     pub five: f64,
     pub fifteen: f64,
+}
+
+/// Linux PSI (Pressure Stall Information) memory-stall averages, read from
+/// `/proc/pressure/memory` and carried by
+/// [`DaemonMessage::HostMetrics`]'s optional `psi` field
+/// (`docs/spec-memory-pressure.md`). Each field is the kernel's
+/// percent-of-wall-clock-time-stalled figure over the named window: `some_*`
+/// is the share of time at least one task was stalled on memory, `full_*` the
+/// share of time *all* runnable tasks were stalled simultaneously (a stronger
+/// signal). The kernel's file also carries a trailing `total=<microseconds>`
+/// counter per line, which this payload deliberately omits — only the
+/// ready-to-use `avgN` percentages are carried. `Copy` so the app-local
+/// `status_bar::HostMetrics` that embeds it (behind `Option`) stays `Copy`.
+/// No `Eq`: the fields are `f64`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MemoryPressure {
+    pub some_avg10: f64,
+    pub some_avg60: f64,
+    pub some_avg300: f64,
+    pub full_avg10: f64,
+    pub full_avg60: f64,
+    pub full_avg300: f64,
 }
 
 /// One diagnostic a language server reports for a file: a source span plus the
@@ -2152,7 +2183,7 @@ mod tests {
     }
 
     #[test]
-    fn test_host_metrics_roundtrip_preserves_full_payload() {
+    fn test_host_metrics_roundtrip_without_psi_preserves_full_payload() {
         let msg = DaemonMessage::HostMetrics {
             cpu: 42.5,
             mem_total: 16_000_000_000,
@@ -2165,6 +2196,7 @@ mod tests {
                 fifteen: 0.9,
             },
             cpu_count: 8,
+            psi: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize HostMetrics");
         assert!(json.contains(r#""type":"host_metrics""#));
@@ -2177,6 +2209,48 @@ mod tests {
         assert!(json.contains(r#""five":1.1"#));
         assert!(json.contains(r#""fifteen":0.9"#));
         assert!(json.contains(r#""cpu_count":8"#));
+        assert!(
+            !json.contains("\"psi\""),
+            "psi must be omitted when absent (e.g. a WSL2 host with no CONFIG_PSI): {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<DaemonMessage>(&json).expect("deserialize HostMetrics"),
+            msg
+        );
+    }
+
+    #[test]
+    fn test_host_metrics_roundtrip_with_psi_preserves_full_payload() {
+        let msg = DaemonMessage::HostMetrics {
+            cpu: 42.5,
+            mem_total: 16_000_000_000,
+            mem_available: 4_000_000_000,
+            swap_total: 2_000_000_000,
+            swap_used: 100_000_000,
+            load: LoadAverage {
+                one: 1.5,
+                five: 1.1,
+                fifteen: 0.9,
+            },
+            cpu_count: 8,
+            psi: Some(MemoryPressure {
+                some_avg10: 12.5,
+                some_avg60: 8.25,
+                some_avg300: 3.1,
+                full_avg10: 4.0,
+                full_avg60: 2.5,
+                full_avg300: 1.0,
+            }),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize HostMetrics");
+        assert!(json.contains(r#""type":"host_metrics""#));
+        assert!(json.contains(r#""psi":{"#));
+        assert!(json.contains(r#""some_avg10":12.5"#));
+        assert!(json.contains(r#""some_avg60":8.25"#));
+        assert!(json.contains(r#""some_avg300":3.1"#));
+        assert!(json.contains(r#""full_avg10":4.0"#));
+        assert!(json.contains(r#""full_avg60":2.5"#));
+        assert!(json.contains(r#""full_avg300":1.0"#));
         assert_eq!(
             serde_json::from_str::<DaemonMessage>(&json).expect("deserialize HostMetrics"),
             msg
@@ -2188,12 +2262,45 @@ mod tests {
         for json in [
             r#"{"type":"host_metrics","mem_total":1,"mem_available":1,"swap_total":0,"swap_used":0,"load":{"one":0.0,"five":0.0,"fifteen":0.0},"cpu_count":1}"#,
             r#"{"type":"host_metrics","cpu":1.0,"mem_total":1,"mem_available":1,"swap_total":0,"swap_used":0,"cpu_count":1}"#,
+            r#"{"type":"host_metrics","cpu":1.0,"mem_total":1,"mem_available":1,"swap_total":0,"swap_used":0,"load":{"one":0.0,"five":0.0,"fifteen":0.0},"cpu_count":1,"psi":{"some_avg10":0.0}}"#,
         ] {
             assert!(
                 serde_json::from_str::<DaemonMessage>(json).is_err(),
                 "malformed HostMetrics must not deserialize: {json}"
             );
         }
+    }
+
+    #[test]
+    fn test_memory_pressure_roundtrip_preserves_all_fields() {
+        let psi = MemoryPressure {
+            some_avg10: 12.5,
+            some_avg60: 8.25,
+            some_avg300: 3.1,
+            full_avg10: 4.0,
+            full_avg60: 2.5,
+            full_avg300: 1.0,
+        };
+        let json = serde_json::to_string(&psi).expect("serialize MemoryPressure");
+        assert!(json.contains(r#""some_avg10":12.5"#));
+        assert!(json.contains(r#""some_avg60":8.25"#));
+        assert!(json.contains(r#""some_avg300":3.1"#));
+        assert!(json.contains(r#""full_avg10":4.0"#));
+        assert!(json.contains(r#""full_avg60":2.5"#));
+        assert!(json.contains(r#""full_avg300":1.0"#));
+        assert_eq!(
+            serde_json::from_str::<MemoryPressure>(&json).expect("deserialize MemoryPressure"),
+            psi
+        );
+    }
+
+    #[test]
+    fn test_memory_pressure_missing_field_is_rejected() {
+        let json = r#"{"some_avg10":0.0,"some_avg60":0.0,"some_avg300":0.0,"full_avg10":0.0,"full_avg60":0.0}"#;
+        assert!(
+            serde_json::from_str::<MemoryPressure>(json).is_err(),
+            "malformed MemoryPressure must not deserialize: {json}"
+        );
     }
 
     #[test]
