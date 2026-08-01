@@ -58,11 +58,15 @@ const RESUME_POLL: Duration = Duration::from_millis(100);
 /// `pane_current_path` and `window_name` may contain spaces — with tabs each stays
 /// a single field (a literal tab inside a quoted tmux argument is preserved, and
 /// tmux octal-escapes it in the reply, which the control-mode [`Client`] decodes
-/// back; tmux-reference pitfall 8). `window_name` is last so a name containing
-/// tabs stays in the final field (see [`parse_layout_line`]). The `#{...}` formats
-/// are single-quoted because the control parser treats an unquoted `#` as a
-/// comment (tmux-reference pitfall 9).
-const LAYOUT_QUERY: &str = "list-panes -s -F '#{window_id}\t#{window_index}\t#{window_active}\t#{pane_id}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_current_command}\t#{pane_current_path}\t#{==:#{pane_current_command},#{b:default-shell}}\t#{window_name}'";
+/// back; tmux-reference pitfall 8). `#{pane_pid}` (`docs/spec-pane-attribution.md`,
+/// #880) is inserted right before the trailing `window_name` field: it is
+/// daemon-internal only (see [`ParsedPaneLine::pane_pid`], never added to the
+/// wire [`PaneLayout`]) and, like every other fixed-width field, sits before
+/// the one free-form field that may itself contain a tab. `window_name` stays
+/// last so a name containing tabs stays in the final field (see
+/// [`parse_layout_line`]). The `#{...}` formats are single-quoted because the
+/// control parser treats an unquoted `#` as a comment (tmux-reference pitfall 9).
+const LAYOUT_QUERY: &str = "list-panes -s -F '#{window_id}\t#{window_index}\t#{window_active}\t#{pane_id}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_current_command}\t#{pane_current_path}\t#{==:#{pane_current_command},#{b:default-shell}}\t#{pane_pid}\t#{window_name}'";
 
 /// One query that rebuilds the whole session list (`docs/spec-session-switch.md`),
 /// one line per session on the server. Same conventions as [`LAYOUT_QUERY`]:
@@ -119,6 +123,21 @@ const ROOT_QUERY: &str = "display-message -p '#{@root}\t#{session_path}'";
 /// drains it) is silently tolerated for the same reason.
 pub(crate) type RootResolved = mpsc::Sender<Option<PathBuf>>;
 
+/// This connection's session-wide `pane_id -> pane_pid` map
+/// (`docs/spec-pane-attribution.md`, #880), refreshed on every
+/// [`LAYOUT_QUERY`] reply and sent to `lib.rs`'s `serve_connection`, which
+/// uses it — together with the daemon-global shared process snapshot — to
+/// roll up and push this connection's own [`DaemonMessage::PaneMetrics`].
+/// Internal to the daemon, NOT a protocol message: `pane_pid` never reaches
+/// the wire (see [`ParsedPaneLine::pane_pid`]). Sent with `try_send`, same
+/// discipline as [`RootResolved`]: the map is a full-replace snapshot of the
+/// CURRENT session (mirroring [`DaemonMessage::LayoutUpdate`]'s own replace
+/// semantics), so a superseded value under backpressure is fine to drop —
+/// the next layout query's reply supersedes it anyway. A full channel or a
+/// gone receiver (a test that never drains it) is silently tolerated for the
+/// same reason.
+pub(crate) type PanePids = mpsc::Sender<HashMap<u32, u32>>;
+
 /// Signals that the connection's outbound channel closed — the client is gone.
 struct Closed;
 
@@ -139,13 +158,15 @@ enum Flow {
 /// it (`Attach::spawn`), so every later window and split inherits the project
 /// root instead of `$HOME`. `None` in the rootless test call sites. `root_resolved`
 /// carries the per-attach resolved session root back to `serve_connection` — see
-/// [`RootResolved`].
+/// [`RootResolved`]. `pane_pids` carries this session's `pane_id -> pane_pid`
+/// map the same way — see [`PanePids`].
 pub(crate) async fn terminal_task(
     mut inbound: mpsc::Receiver<ClientMessage>,
     outbound: mpsc::Sender<DaemonMessage>,
     server_socket: Option<String>,
     root: Option<PathBuf>,
     root_resolved: RootResolved,
+    pane_pids: PanePids,
 ) {
     let mut attach: Option<Attach> = None;
     let mut buf = vec![0u8; TERM_READ_BUFFER];
@@ -190,6 +211,7 @@ pub(crate) async fn terminal_task(
                         server_socket.as_deref(),
                         picked_root.as_deref(),
                         &outbound,
+                        pane_pids.clone(),
                     )
                     .await;
                 }
@@ -277,8 +299,9 @@ async fn open_attach(
     server_socket: Option<&str>,
     root: Option<&Path>,
     outbound: &mpsc::Sender<DaemonMessage>,
+    pane_pids: PanePids,
 ) -> Option<Attach> {
-    match Attach::spawn(session.clone(), server_socket, root).await {
+    match Attach::spawn(session.clone(), server_socket, root, pane_pids).await {
         Ok(attach) => Some(attach),
         Err(err) => {
             error!(%session, %err, "tmux attach failed");
@@ -545,6 +568,10 @@ struct Attach {
     /// matches is dropped, which is fine since a fresher query is already
     /// in flight.
     key_table_query: Option<KeyTableQuery>,
+    /// This connection's channel for surfacing the session's `pane_id ->
+    /// pane_pid` map (`docs/spec-pane-attribution.md`, #880) — see
+    /// [`PanePids`]. Sent every time a [`LAYOUT_QUERY`] reply lands.
+    pane_pids: PanePids,
 }
 
 /// One in-flight attach-time content seed for a single pane
@@ -592,6 +619,7 @@ impl Attach {
         session: String,
         server_socket: Option<&str>,
         root: Option<&Path>,
+        pane_pids: PanePids,
     ) -> anyhow::Result<Self> {
         let mut command = tmux_command();
         command
@@ -625,6 +653,7 @@ impl Attach {
             captures: HashMap::new(),
             seed_captures: Vec::new(),
             key_table_query: None,
+            pane_pids,
         };
         // Enable tmux's per-pane flow control for this attach (tmux→daemon leg).
         attach
@@ -761,9 +790,10 @@ impl Attach {
             // follow-on issue (#828) — silently dropped here in the
             // meantime, same convention.
             // `SetPaneMetricsEnabled` (the per-pane metrics opt-in,
-            // `docs/spec-pane-attribution.md`, #879) is likewise not a
-            // terminal message — real handling: #880 — silently dropped
-            // here, same convention.
+            // `docs/spec-pane-attribution.md`, #880) is likewise not a
+            // terminal message: it is answered per connection by
+            // `serve_connection` (the counter inc/dec and the roll-up +
+            // push), so it never reaches the terminal task either.
             ClientMessage::Input { .. }
             | ClientMessage::Attach { .. }
             | ClientMessage::OpenFile { .. }
@@ -863,7 +893,12 @@ impl Attach {
                     if id.is_some() && id == self.layout_query {
                         self.layout_query = None;
                         if !error {
-                            let windows = parse_layout(&output);
+                            let (windows, pane_pids) = parse_layout(&output);
+                            // Best-effort, same discipline as `root_resolved`
+                            // (`docs/spec-pane-attribution.md`, #880): a
+                            // superseded map under backpressure is fine to
+                            // drop, the next layout reply supersedes it.
+                            let _ = self.pane_pids.try_send(pane_pids);
                             let is_snapshot = !self.snapshot_sent;
                             // Seed each pane's current visible screen right after
                             // the attach-time snapshot
@@ -1285,13 +1320,18 @@ fn parse_pane_arg(args: &str) -> Option<u32> {
 }
 
 /// Group [`LAYOUT_QUERY`] reply lines into per-window layouts, preserving the
-/// order windows first appear and the order of panes within each.
-fn parse_layout(lines: &[String]) -> Vec<WindowLayout> {
+/// order windows first appear and the order of panes within each, alongside
+/// this session's `pane_id -> pane_pid` map (`docs/spec-pane-attribution.md`,
+/// #880) — `pane_pid` is daemon-internal (see [`ParsedPaneLine::pane_pid`])
+/// and never lands on the wire [`WindowLayout`]/[`PaneLayout`].
+fn parse_layout(lines: &[String]) -> (Vec<WindowLayout>, HashMap<u32, u32>) {
     let mut windows: Vec<WindowLayout> = Vec::new();
+    let mut pane_pids = HashMap::new();
     for line in lines {
         let Some(parsed) = parse_layout_line(line) else {
             continue;
         };
+        pane_pids.insert(parsed.pane.pane_id, parsed.pane_pid);
         match windows.iter_mut().find(|w| w.window_id == parsed.window_id) {
             Some(window) => window.panes.push(parsed.pane),
             None => windows.push(WindowLayout {
@@ -1303,7 +1343,7 @@ fn parse_layout(lines: &[String]) -> Vec<WindowLayout> {
             }),
         }
     }
-    windows
+    (windows, pane_pids)
 }
 
 /// One parsed [`LAYOUT_QUERY`] line: the pane plus its window's identity.
@@ -1313,14 +1353,19 @@ struct ParsedPaneLine {
     window_active: bool,
     window_name: String,
     pane: PaneLayout,
+    /// tmux `#{pane_pid}` (`docs/spec-pane-attribution.md`, #880): the host
+    /// process id rooting this pane's `/proc` subtree. Daemon-internal only —
+    /// deliberately NOT part of the wire [`PaneLayout`] (see [`parse_layout`]).
+    pane_pid: u32,
 }
 
 /// Parse one tab-separated `@<win> <win_index> <win_active> %<pane>
 /// <pane_active> <left> <top> <width> <height> <command> <path> <is_shell>
-/// <name>` line (see [`LAYOUT_QUERY`] for why tabs); `splitn(13, '\t')` keeps a
-/// window name containing tabs intact in the final field.
+/// <pane_pid> <name>` line (see [`LAYOUT_QUERY`] for why tabs);
+/// `splitn(14, '\t')` keeps a window name containing tabs intact in the
+/// final field.
 fn parse_layout_line(line: &str) -> Option<ParsedPaneLine> {
-    let mut fields = line.splitn(13, '\t');
+    let mut fields = line.splitn(14, '\t');
     let window_id = fields.next()?.strip_prefix('@')?.parse().ok()?;
     let window_index = fields.next()?.parse().ok()?;
     let window_active = fields.next()? == "1";
@@ -1333,6 +1378,7 @@ fn parse_layout_line(line: &str) -> Option<ParsedPaneLine> {
     let current_command = fields.next()?.to_owned();
     let current_path = fields.next()?.to_owned();
     let is_shell = fields.next()? == "1";
+    let pane_pid = fields.next()?.parse().ok()?;
     let window_name = fields.next().unwrap_or("").to_owned();
     Some(ParsedPaneLine {
         window_id,
@@ -1350,6 +1396,7 @@ fn parse_layout_line(line: &str) -> Option<ParsedPaneLine> {
             current_command,
             is_shell,
         },
+        pane_pid,
     })
 }
 
@@ -1612,9 +1659,10 @@ mod tests {
 
     #[test]
     fn test_parse_layout_line_full_fields() {
-        let parsed =
-            parse_layout_line("@0\t3\t1\t%1\t1\t51\t0\t49\t30\tnvim\t/home/dev/proj\t0\tbash")
-                .expect("parse");
+        let parsed = parse_layout_line(
+            "@0\t3\t1\t%1\t1\t51\t0\t49\t30\tnvim\t/home/dev/proj\t0\t4242\tbash",
+        )
+        .expect("parse");
         assert_eq!(parsed.window_id, 0);
         assert_eq!(
             parsed.window_index, 3,
@@ -1622,6 +1670,10 @@ mod tests {
         );
         assert!(parsed.window_active);
         assert_eq!(parsed.window_name, "bash");
+        assert_eq!(
+            parsed.pane_pid, 4242,
+            "pane_pid (#{{pane_pid}}, #880) is the field just before window_name"
+        );
         assert_eq!(
             parsed.pane,
             PaneLayout {
@@ -1643,7 +1695,7 @@ mod tests {
         // Both the cwd and the window name may contain spaces; the tab
         // separator keeps each a single field.
         let parsed = parse_layout_line(
-            "@2\t5\t0\t%5\t0\t0\t0\t80\t24\tbash\t/home/dev/my repo\t1\tmy project",
+            "@2\t5\t0\t%5\t0\t0\t0\t80\t24\tbash\t/home/dev/my repo\t1\t100\tmy project",
         )
         .expect("parse");
         assert_eq!(parsed.window_index, 5);
@@ -1658,8 +1710,8 @@ mod tests {
     fn test_parse_layout_line_is_shell_true_for_shell_idle_pane() {
         // tmux's own `#{==:...}` comparison reports `1` when the pane's
         // foreground command is its default shell.
-        let parsed =
-            parse_layout_line("@0\t0\t1\t%1\t1\t0\t0\t80\t24\tbash\t/tmp\t1\tbash").expect("parse");
+        let parsed = parse_layout_line("@0\t0\t1\t%1\t1\t0\t0\t80\t24\tbash\t/tmp\t1\t100\tbash")
+            .expect("parse");
         assert!(parsed.pane.is_shell);
     }
 
@@ -1667,7 +1719,7 @@ mod tests {
     fn test_parse_layout_line_is_shell_false_for_running_process() {
         // Any foreground command other than the default shell compares
         // unequal — no client-side command taxonomy involved (#510).
-        let parsed = parse_layout_line("@0\t0\t1\t%1\t1\t0\t0\t80\t24\tcargo\t/tmp\t0\tbash")
+        let parsed = parse_layout_line("@0\t0\t1\t%1\t1\t0\t0\t80\t24\tcargo\t/tmp\t0\t100\tbash")
             .expect("parse");
         assert!(!parsed.pane.is_shell);
     }
@@ -1677,7 +1729,7 @@ mod tests {
         // tmux emits an empty field (two adjacent tabs) when a format
         // variable has no value; that must parse, not skip the pane.
         let parsed =
-            parse_layout_line("@0\t0\t1\t%1\t1\t0\t0\t80\t24\t\t\t0\tbash").expect("parse");
+            parse_layout_line("@0\t0\t1\t%1\t1\t0\t0\t80\t24\t\t\t0\t100\tbash").expect("parse");
         assert_eq!(parsed.pane.current_command, "");
         assert_eq!(parsed.pane.current_path, "");
         assert!(!parsed.pane.is_shell);
@@ -1687,17 +1739,23 @@ mod tests {
     #[test]
     fn test_parse_layout_line_malformed_returns_none() {
         assert_eq!(
-            parse_layout_line("0\t0\t1\t%1\t1\t0\t0\t80\t24\tbash\t/tmp\tbash").map(|_| ()),
+            parse_layout_line("0\t0\t1\t%1\t1\t0\t0\t80\t24\tbash\t/tmp\t0\t100\tbash").map(|_| ()),
             None
         ); // window id no @
         assert_eq!(
-            parse_layout_line("@0\tabc\t1\t%1\t1\t0\t0\t80\t24\tbash\t/tmp\tbash").map(|_| ()),
+            parse_layout_line("@0\tabc\t1\t%1\t1\t0\t0\t80\t24\tbash\t/tmp\t0\t100\tbash")
+                .map(|_| ()),
             None
         ); // window index non-numeric (#495)
         assert_eq!(
-            parse_layout_line("@0\t0\t1\t1\t0\t0\t80\t24\tbash\t/tmp\tbash").map(|_| ()),
+            parse_layout_line("@0\t0\t1\t1\t0\t0\t80\t24\tbash\t/tmp\t0\t100\tbash").map(|_| ()),
             None
         ); // pane id no %
+        assert_eq!(
+            parse_layout_line("@0\t0\t1\t%1\t1\t0\t0\t80\t24\tbash\t/tmp\t0\tnotapid\tbash")
+                .map(|_| ()),
+            None
+        ); // pane_pid non-numeric (#880)
         assert_eq!(
             parse_layout_line("@0\t0\t1\t%1\t1\t0\t0\t80").map(|_| ()),
             None
@@ -1711,14 +1769,14 @@ mod tests {
     #[test]
     fn test_parse_layout_groups_panes_by_window_in_order() {
         let lines = vec![
-            "@0\t0\t1\t%0\t0\t0\t0\t50\t30\tbash\t/tmp\t1\teditor".to_owned(),
-            "@0\t0\t1\t%1\t1\t51\t0\t49\t30\tbash\t/tmp\t1\teditor".to_owned(),
+            "@0\t0\t1\t%0\t0\t0\t0\t50\t30\tbash\t/tmp\t1\t100\teditor".to_owned(),
+            "@0\t0\t1\t%1\t1\t51\t0\t49\t30\tbash\t/tmp\t1\t101\teditor".to_owned(),
             // window_index 2, not 1: simulates the gap tmux leaves after
             // closing window 1 (`renumber-windows` off, the default) — the
             // real index must survive, not collapse to array position (#495).
-            "@1\t2\t0\t%2\t1\t0\t0\t100\t30\tbash\t/tmp\t1\tlogs".to_owned(),
+            "@1\t2\t0\t%2\t1\t0\t0\t100\t30\tbash\t/tmp\t1\t102\tlogs".to_owned(),
         ];
-        let windows = parse_layout(&lines);
+        let (windows, pane_pids) = parse_layout(&lines);
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].window_id, 0);
         assert_eq!(windows[0].window_index, 0);
@@ -1737,17 +1795,23 @@ mod tests {
         assert_eq!(windows[1].name, "logs");
         assert!(!windows[1].active);
         assert_eq!(windows[1].panes.len(), 1);
+        assert_eq!(
+            pane_pids,
+            HashMap::from([(0, 100), (1, 101), (2, 102)]),
+            "the pane_id -> pane_pid map (#880) covers every parsed pane"
+        );
     }
 
     #[test]
     fn test_parse_layout_skips_malformed_lines() {
         let lines = vec![
             "garbage line".to_owned(),
-            "@0\t0\t1\t%0\t1\t0\t0\t80\t24\tbash\t/tmp\t1\tbash".to_owned(),
+            "@0\t0\t1\t%0\t1\t0\t0\t80\t24\tbash\t/tmp\t1\t100\tbash".to_owned(),
         ];
-        let windows = parse_layout(&lines);
+        let (windows, pane_pids) = parse_layout(&lines);
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].panes.len(), 1);
+        assert_eq!(pane_pids, HashMap::from([(0, 100)]));
     }
 
     #[test]
@@ -1911,6 +1975,10 @@ mod tests {
         // `test_attach_sends_resolved_root_on_the_internal_channel` constructs
         // `terminal_task` directly to observe it instead.
         let (root_resolved_tx, _root_resolved_rx) = mpsc::channel(4);
+        // Likewise the pane-pid receiver (#880) is not observed by these
+        // fixtures; `test_parse_layout_*` covers the map's construction and
+        // `lib.rs`'s pane-metrics tests cover its consumption.
+        let (pane_pids_tx, _pane_pids_rx) = mpsc::channel(4);
         let socket = server.name.clone();
         let handle = tokio::spawn(terminal_task(
             in_rx,
@@ -1918,6 +1986,7 @@ mod tests {
             Some(socket),
             root,
             root_resolved_tx,
+            pane_pids_tx,
         ));
         (in_tx, out_rx, handle)
     }
@@ -2088,12 +2157,14 @@ mod tests {
         let (in_tx, in_rx) = mpsc::channel(64);
         let (out_tx, mut out_rx) = mpsc::channel(256);
         let (root_resolved_tx, mut root_resolved_rx) = mpsc::channel(4);
+        let (pane_pids_tx, _pane_pids_rx) = mpsc::channel(4);
         let task = tokio::spawn(terminal_task(
             in_rx,
             out_tx,
             Some(server.name.clone()),
             Some(root.clone()),
             root_resolved_tx,
+            pane_pids_tx,
         ));
 
         in_tx
