@@ -219,3 +219,14 @@ includes:
   glyph): a shell foreground sends `kill-pane` immediately (nothing in-flight to lose,
   matching split/zoom's no-confirm precedent); any other foreground process arms the
   confirm instead, so a stray click can never kill a running process outright.
+- 2026-08-01: **AltGr+Plus/Minus triggering font zoom** resolved (#903). Category 2
+  (defect in an existing path). The font-zoom guard in
+  `crates/terminal/src/pane_view.rs`'s `on_key_down` checked only
+  `ks.modifiers.control`, so AltGr — reported as Ctrl+Alt on Windows/Linux
+  (`keyboard.rs`'s `encode_keystroke_impl`) — matched the `"+"`/`"="`/`"-"` zoom arm
+  and `return`ed before the terminal's AltGr passthrough could send the composed
+  character (e.g. German AltGr+` -> `~`, physically the `+`/`~` key). Fix: extracted
+  the guard into a pure `font_zoom_delta(&Keystroke) -> i32` that also requires
+  `!ks.modifiers.alt`, so it is unit-testable without a GPUI window. The downstream
+  sink (`SessionView::apply_font_zoom`) was already correct and untouched; Ctrl+`+`/
+  Ctrl+`=`/Ctrl+`-` (no Alt) still zoom.

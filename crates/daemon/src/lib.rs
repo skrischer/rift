@@ -2065,6 +2065,10 @@ fn build_host_metrics_message(system: &System) -> DaemonMessage {
             fifteen: load.fifteen,
         },
         cpu_count: system.cpus().len() as u32,
+        // PSI is read and wired in by a later step (`docs/spec-memory-pressure.md`);
+        // this protocol-only bump keeps every existing builder call site
+        // compiling with the portable baseline unaffected.
+        psi: None,
     }
 }
 
@@ -3237,6 +3241,7 @@ mod tests {
                 swap_used: _,
                 load,
                 cpu_count,
+                psi: _,
             } => {
                 assert!(mem_total > 0, "a real host always reports total memory");
                 assert!(
@@ -3277,6 +3282,7 @@ mod tests {
                 fifteen: 0.3,
             },
             cpu_count: 8,
+            psi: None,
         };
         let (_host_metrics_tx, host_metrics_events) =
             broadcast::channel(HOST_METRICS_EVENT_CAPACITY);
