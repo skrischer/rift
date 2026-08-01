@@ -84,6 +84,28 @@ fn classify_busy(is_shell: Option<bool>, alt_screen: bool, osc_executing: bool) 
     }
 }
 
+/// Whole-client font-zoom delta for a keystroke, or `0` when the keystroke is
+/// not a zoom shortcut. Ctrl++ (key `"+"`, or `"="` on QWERTY where
+/// Ctrl+Shift+= yields `"+"`) zooms in; Ctrl+- zooms out.
+///
+/// Excludes Alt: on Windows/Linux, AltGr is reported as Ctrl+Alt
+/// (`keyboard.rs`'s `encode_keystroke_impl`), so an AltGr-composed character
+/// on the `+`/`-` key (e.g. German AltGr+` -> `~`, physically the `+`/`~` key)
+/// must reach the terminal's AltGr passthrough instead of being intercepted
+/// here as a zoom shortcut (#903).
+///
+/// GPUI-free so it is unit-testable in isolation.
+fn font_zoom_delta(ks: &Keystroke) -> i32 {
+    if !ks.modifiers.control || ks.modifiers.alt {
+        return 0;
+    }
+    match ks.key.as_str() {
+        "+" | "=" => 1,
+        "-" => -1,
+        _ => 0,
+    }
+}
+
 /// Mutable per-pane activity signals folded into a [`PaneActivity`]. Kept free
 /// of GPUI so the state machine is unit-testable in isolation. Busy/free is a
 /// pure function of the structural inputs (see [`classify_busy`]); this tracker
@@ -1724,19 +1746,13 @@ impl Render for PaneView {
                     return;
                 }
 
-                // Whole-client font zoom. Ctrl++ (key "+", or "=" on QWERTY where
-                // Ctrl+Shift+= yields "+") zooms in; Ctrl+- zooms out. The delta
-                // goes to `SessionView`, the source of truth for font size.
-                if ks.modifiers.control {
-                    let delta = match ks.key.as_str() {
-                        "+" | "=" => 1,
-                        "-" => -1,
-                        _ => 0,
-                    };
-                    if delta != 0 {
-                        let _ = this.font_zoom_tx.try_send(delta);
-                        return;
-                    }
+                // Whole-client font zoom (see `font_zoom_delta` for the
+                // shortcut and the AltGr exclusion). The delta goes to
+                // `SessionView`, the source of truth for font size.
+                let delta = font_zoom_delta(ks);
+                if delta != 0 {
+                    let _ = this.font_zoom_tx.try_send(delta);
+                    return;
                 }
 
                 // tmux key-table mirroring: after the rift-native early
@@ -2214,6 +2230,50 @@ mod tests {
                 assert!(classify_busy(Some(false), alt, osc), "alt={alt} osc={osc}");
             }
         }
+    }
+
+    fn keystroke(key: &str, control: bool, alt: bool) -> Keystroke {
+        Keystroke {
+            modifiers: Modifiers {
+                control,
+                alt,
+                ..Modifiers::none()
+            },
+            key: key.into(),
+            key_char: None,
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_font_zoom_delta_ctrl_plus_or_equals_zooms_in() {
+        assert_eq!(font_zoom_delta(&keystroke("+", true, false)), 1);
+        assert_eq!(font_zoom_delta(&keystroke("=", true, false)), 1);
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_font_zoom_delta_ctrl_minus_zooms_out() {
+        assert_eq!(font_zoom_delta(&keystroke("-", true, false)), -1);
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_font_zoom_delta_altgr_reported_as_ctrl_alt_does_not_zoom() {
+        // AltGr on Windows/Linux is reported as Ctrl+Alt (keyboard.rs). The
+        // guard must not treat that combination as a zoom shortcut, so the
+        // composed character (e.g. German AltGr+~ on the +/- key) falls
+        // through to the terminal's AltGr passthrough instead (#903).
+        assert_eq!(font_zoom_delta(&keystroke("+", true, true)), 0);
+        assert_eq!(font_zoom_delta(&keystroke("=", true, true)), 0);
+        assert_eq!(font_zoom_delta(&keystroke("-", true, true)), 0);
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_font_zoom_delta_no_control_does_not_zoom() {
+        assert_eq!(font_zoom_delta(&keystroke("+", false, false)), 0);
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_font_zoom_delta_unrelated_key_does_not_zoom() {
+        assert_eq!(font_zoom_delta(&keystroke("a", true, false)), 0);
     }
 
     #[::core::prelude::v1::test]
