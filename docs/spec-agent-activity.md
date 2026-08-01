@@ -19,11 +19,8 @@ Roadmap Phase 53.
 ### In scope
 
 - Extend `PaneActivity` (`pane_view.rs:57`) to carry a working-vs-idle refinement of `Busy` (a new variant or a sub-flag), and thread it through the aggregate + render path: `activity_rank` / `aggregate_activity` (`session_view.rs:369-394`), `tab_state_slot` (`:410`), the tab render (`:2340`), and the status-line `window_chip` (`status_bar.rs:328`).
-- The working/idle signal source **per the gate decision** — one of:
-  - **(a) per-pane `/proc` CPU roll-up** (the Phase-45 method): working = the `pane_pid` process-subtree CPU is above a threshold, idle = near-zero. Requires Phase 45 (milestone #66) implemented first (it is spec-only today — no `#{pane_pid}` query, no per-process sampler, no `PaneMetrics` message exist).
-  - **(b) PTY output-idle timing** (Phase-45-independent, client-only): a per-pane `last_output: Instant` updated at the PTY read-loop advance (`pane_view.rs:347`); working = output within a threshold window, idle = quiet beyond it. No daemon/protocol change.
-  - **(c) both, layered:** `/proc` CPU as the authority, output cadence as a low-latency accelerator/fallback (the "structural authority + client accelerator" pattern of `spec-pane-activity-v2.md:293`).
-- The threshold(s) and hysteresis for whichever signal(s) the gate elects, tuned to avoid flicker.
+- The working/idle signal source is **per-pane `/proc` CPU roll-up** (gate-resolved, the Phase-45 method): working = the `pane_pid` process-subtree CPU is above a threshold, idle = near-zero. This reuses Phase 45's per-pane metric (milestone #66), which must be implemented first (it is spec-only today — no `#{pane_pid}` query, no per-process sampler, no `PaneMetrics` message exist). The output-idle proxy and the layered variant were declined at the gate.
+- The CPU threshold and hysteresis, tuned to avoid flicker at the boundary.
 
 ### Out of scope
 
@@ -58,7 +55,7 @@ Roadmap Phase 53.
 | Working/idle is a refinement *within* the existing structural `Busy`, not a rework of it | Phase-18-v2's `is_shell` gate correctly answers "a command is running"; this only splits the non-shell Busy case; a shell pane is unaffected | 2026-08-01 |
 | Strictly `/proc` CPU and/or byte-arrival cadence; never capture-pane hashing or agent detection | Constitution `:69`; Arbor's content-hashing approach is explicitly rejected | 2026-08-01 |
 | The indicator carries a working/idle *classification*, not per-pane CPU numbers | Per-pane metric display is Phase 45's popover; this is an at-a-glance state | 2026-08-01 |
-| **OPEN — resolved at the spec-acceptance gate:** the working/idle signal source — (a) per-pane `/proc` CPU (needs Phase 45 implemented; highest fidelity, blocks on milestone #66); (b) PTY output-idle timing (buildable now, client-only, but re-admits the interaction-dependent byte-flow v2 removed); or (c) both layered (best accuracy, most work, still gated on 45 for the CPU half) | The roadmap commits Phase 53 to "Depends on 45" and the `/proc` method, but Phase 45 is spec-only — so the choice is accuracy-and-alignment (a/c, blocked on 45) vs. ship-now-lower-fidelity (b, a conscious partial reversal of v2). This also sets Phase 53's `Depends on milestone` edge | 2026-08-01 |
+| The working/idle signal source is **(a) per-pane `/proc` CPU** — working = the `pane_pid` process-subtree CPU is above a threshold, idle = near-zero — reusing the Phase-45 method. NOT the output-idle proxy (b) and NOT the layered (c) | Accepted at the gate. Highest fidelity (measures "computing" directly), constitution-cleanest, and avoids re-admitting the interaction-dependent byte-flow Phase-18-v2 deliberately removed. The accepted cost: Phase 53's CPU issues are blocked on delivering Phase 45 (milestone #66, spec-only today) and inherit the ~2 s cadence + spin-vs-work ambiguity | 2026-08-01 |
 
 ## Tracking
 
@@ -87,3 +84,4 @@ Roadmap Phase 53.
 ## Decision log
 
 - 2026-08-01: Scoped from `pane_view.rs` / `session_view.rs` / `daemon` + the Phase-45 and Phase-18-v2 specs (Explore agent). `is_shell` and OSC-133 both stay "running" for an agent's whole lifetime, so a new orthogonal signal is required. Phase 45 (the `/proc` `pane_pid` method) is 100% spec / 0% code, so a CPU path blocks on delivering it; the output-idle path is buildable now but re-admits the byte-flow signal Phase-18-v2 deliberately removed. The single open item — the signal source (a `/proc` CPU vs b output-idle vs c both), which also sets the `Depends on milestone: #66` edge — carried to the gate.
+- 2026-08-01: Spec-acceptance gate (PR #942) — accepted. Review returned APPROVE (verified the agent-agnostic crux for all three options — no content inspection / agent-name match / output parsing in any; confirmed `is_shell` + OSC-133 both stay "running" for an agent's whole lifetime, Phase 45 is 100% spec / 0% code, and the byte-flow machinery was genuinely deleted by v2) with only informational nits. Gate decision: **(a) per-pane `/proc` CPU** — highest fidelity, avoids re-admitting the byte-flow v2 removed; the accepted cost is a hard dependency on Phase 45 (milestone #66), so the CPU-classification issues carry `Depends on milestone: #66` and wait until Phase 45 ships (the shared `PaneActivity` model + render-thread issue can proceed independently).
