@@ -15,7 +15,7 @@ pub use keytable::{
     Binding, DispatchDecision, KeyTable, PrefixOptions,
 };
 pub use line_id::LineIdTracker;
-pub use pane_view::{PaneActivity, PaneView};
+pub use pane_view::{PaneActivity, PaneView, WorkState};
 pub use session_view::{
     SessionSnapshot, SessionView, SessionViewEvent, StatusWindow, TerminalHandle, MAX_FONT_SIZE,
     MIN_FONT_SIZE,
