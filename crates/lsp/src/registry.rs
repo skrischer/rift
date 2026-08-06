@@ -75,8 +75,14 @@ pub enum ServerLifecycle {
     /// The server is alive and has completed its `initialize` handshake.
     Running,
     /// The server's main loop ended (exit, crash, or transport failure), or a
-    /// (re)start attempt failed outright (missing binary, spawn/init error).
+    /// (re)start attempt failed for a reason other than a missing binary
+    /// (spawn error besides "not found", or an `initialize` failure).
     Crashed,
+    /// A (re)start attempt failed because the binary is absent from `$PATH`
+    /// (`io::ErrorKind::NotFound`) — distinct from [`ServerLifecycle::Crashed`]
+    /// so a language nobody has installed reads as informational, not an
+    /// alarming failure (`docs/spec-lsp-servers.md` — graceful degradation).
+    NotInstalled,
 }
 
 /// The lazy, per-language server registry.
@@ -248,10 +254,11 @@ impl Registry {
                 self.lifecycle.push((spec.binary, ServerLifecycle::Running));
                 Some(id)
             }
-            Err(LspError::Spawn { .. }) => {
+            Err(LspError::Spawn { ref source, .. }) if is_missing_binary(source) => {
                 self.log_missing_once(spec.binary);
                 self.bump_backoff(spec.binary);
-                self.lifecycle.push((spec.binary, ServerLifecycle::Crashed));
+                self.lifecycle
+                    .push((spec.binary, ServerLifecycle::NotInstalled));
                 None
             }
             Err(error) => {
@@ -420,6 +427,15 @@ impl Registry {
     }
 }
 
+/// Whether a spawn `io::Error` means the binary is absent from `$PATH`. This
+/// is the one case [`ensure_started`](Registry::ensure_started) maps to
+/// [`ServerLifecycle::NotInstalled`] rather than [`ServerLifecycle::Crashed`]
+/// — any other spawn failure (permissions, exec format, …) is a genuine
+/// failure of a binary that IS present, so it keeps the `Crashed` state.
+fn is_missing_binary(source: &std::io::Error) -> bool {
+    source.kind() == std::io::ErrorKind::NotFound
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,6 +475,18 @@ mod tests {
         // `InvalidUri` before the missing-binary path is ever reached.
         let root = std::env::current_dir().expect("cwd is readable in tests");
         Registry::with_selector(DocumentSelector::with_table(table), root, tx)
+    }
+
+    #[test]
+    fn test_is_missing_binary_not_found_true() {
+        let error = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(is_missing_binary(&error));
+    }
+
+    #[test]
+    fn test_is_missing_binary_other_kind_false() {
+        let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(!is_missing_binary(&error));
     }
 
     #[tokio::test]
@@ -578,7 +606,7 @@ mod tests {
     // --- lifecycle events (issue #520) ---
 
     #[tokio::test]
-    async fn test_observe_failed_start_pushes_starting_then_crashed() {
+    async fn test_observe_failed_start_pushes_starting_then_not_installed() {
         let mut reg = registry(MISSING);
         reg.observe(Path::new("a.rs")).await;
         let events = reg.take_lifecycle_events();
@@ -586,7 +614,7 @@ mod tests {
             events,
             vec![
                 (MISSING[0].binary, ServerLifecycle::Starting),
-                (MISSING[0].binary, ServerLifecycle::Crashed),
+                (MISSING[0].binary, ServerLifecycle::NotInstalled),
             ]
         );
     }
@@ -604,7 +632,7 @@ mod tests {
     async fn test_observe_reused_live_server_pushes_no_lifecycle_event() {
         // `MISSING` never actually starts, so this exercises the backoff-skip
         // path instead: re-observing inside the backoff window must not push
-        // a fresh `Starting`/`Crashed` pair — only the first attempt does.
+        // a fresh `Starting`/`NotInstalled` pair — only the first attempt does.
         let mut reg = registry(MISSING);
         reg.observe(Path::new("a.rs")).await;
         reg.take_lifecycle_events();
@@ -627,7 +655,7 @@ mod tests {
                     .filter(|(name, _)| *name == spec.binary)
                     .count(),
                 2,
-                "each binary gets its own Starting + Crashed pair"
+                "each binary gets its own Starting + NotInstalled pair"
             );
         }
     }

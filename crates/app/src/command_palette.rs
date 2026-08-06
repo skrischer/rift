@@ -249,6 +249,7 @@ mod tests {
         assert_eq!(
             matched_names("toggle"),
             vec![
+                "Toggle Markdown Preview",
                 "Toggle Explorer",
                 "Toggle Outline",
                 "Toggle Problems",
