@@ -171,6 +171,20 @@
 //!
 //! [`arm_loading`]: EditorView::arm_loading
 //!
+//! # Markdown preview (#918)
+//!
+//! A Markdown tab ([`is_markdown_path`]: `.md` / `.markdown`) carries its own
+//! [`EditorTab::markdown_preview`] flag, toggled by the breadcrumb button (only
+//! shown for a Markdown tab) or the [`ToggleMarkdownPreview`] command-palette
+//! action. In preview mode the render path swaps the code-editor widget for
+//! the tab's buffer text rendered read-only through
+//! `gpui_component::text::markdown` — the same renderer the hover popover's
+//! doc body uses. The preview is re-derived from `tab.input.read(cx).value()`
+//! on every render, so it live-updates on the existing per-tab
+//! [`EditorView::observe_input`] notify (any edit, local or a reloaded
+//! external write) without a new subscription. Read-only: nothing in preview
+//! mode writes back to the buffer, and toggling to source leaves it intact.
+//!
 //! # Timeout, not a hang
 //!
 //! A daemon refusal (binary / non-UTF-8, path escape) produces *no reply* — the
@@ -189,10 +203,10 @@ use flume::Sender;
 use gpui::{
     canvas, div, fill, px, App, AppContext as _, Bounds, ClickEvent, Context, Entity, EventEmitter,
     FocusHandle, Focusable, Hsla, InteractiveElement as _, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels, Point, Render, SharedString, Size,
-    Styled as _, Subscription, Window,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point, Render,
+    SharedString, Size, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
 };
-use gpui_component::button::Button;
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dialog::{AlertDialog, Dialog, DialogButtonProps};
 use gpui_component::dock::{Panel, PanelControl, PanelEvent};
 use gpui_component::highlighter::{
@@ -203,7 +217,9 @@ use gpui_component::menu::PopupMenu;
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::text::markdown;
 use gpui_component::ActiveTheme as _;
+use gpui_component::Rope;
 use gpui_component::RopeExt as _;
+use gpui_component::Sizable as _;
 use gpui_component::WindowExt as _;
 use gpui_component::{Icon, IconName};
 use rift_protocol::{
@@ -270,6 +286,14 @@ pub struct GoToLine;
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = rift, no_json)]
 pub struct CloseResultsPanel;
+
+/// Toggle the active tab's Markdown source/preview mode
+/// (`docs/spec-markdown-preview.md`). Dispatched from the breadcrumb toggle
+/// button and the command palette. A no-op when the active tab is not a
+/// Markdown tab (`is_markdown_path`).
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct ToggleMarkdownPreview;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -344,16 +368,20 @@ const HOVER_DEFINITION_HINT: &str = "F12";
 /// `FindReferences` binding advertised by the command registry.
 const HOVER_REFERENCES_HINT: &str = "Shift+F12";
 
-/// Width of the minimap marks strip on the editor's right edge. Widened from
-/// the original "~14px" (`docs/spec-editor-chrome.md`) — that width left
-/// barely any room for line-length marks to vary, making the strip unreadable
-/// (#600). Still a marks strip, not a pixel-perfect code render.
+/// Width of the minimap miniature strip on the editor's right edge. Widened
+/// from the original "~14px" (`docs/spec-editor-chrome.md`) — that width left
+/// barely any room for indentation-silhouette blocks to vary, making the
+/// strip unreadable (#600). Still a downsampled miniature, not a
+/// pixel-perfect code render.
 const MINIMAP_WIDTH: Pixels = px(32.0);
 
-/// Maximum number of line-length sample rows painted in the minimap. Caps the
-/// per-render work so a very large buffer stays cheap — the strip is only a few
-/// hundred pixels tall, so more samples than this add no visible detail
-/// (`docs/spec-editor-chrome.md`: marks are downsampled, not a pixel render).
+/// Maximum number of bucket rows painted in the minimap, and the threshold
+/// above which [`EditorView::recompute_minimap_samples`] moves its scan onto
+/// GPUI's background executor rather than the render thread. Caps the
+/// per-render work so a very large buffer stays cheap — the strip is only a
+/// few hundred pixels tall, so more buckets than this add no visible detail
+/// (`docs/spec-editor-minimap.md`: buckets are downsampled, not a pixel
+/// render).
 const MINIMAP_SAMPLES: usize = 1024;
 
 /// Height in pixels of a diagnostic mark painted over the minimap strip.
@@ -364,7 +392,8 @@ const MINIMAP_DIAG_MARK_HEIGHT: f32 = 3.0;
 /// even when the buffer is far taller than the viewport.
 const MINIMAP_SLAB_MIN_HEIGHT: f32 = 6.0;
 
-/// Horizontal inset in pixels of the line-length marks from the strip's edges.
+/// Horizontal inset in pixels of the indentation-silhouette blocks from the
+/// strip's edges.
 const MINIMAP_MARK_INSET: f32 = 3.0;
 
 // ── Internal state types ──────────────────────────────────────────────────────
@@ -441,28 +470,50 @@ struct InlineCard {
     detail: Option<SharedString>,
 }
 
-/// Owned render data for the minimap marks strip on the editor's right edge
-/// (`docs/spec-editor-chrome.md`). Gathered under the `InputState` read borrow
-/// in [`EditorView::render`] and moved into the strip's `canvas` paint closure,
-/// so the borrow is released before painting. Deliberately NOT a pixel-perfect
-/// code render: line-length marks are downsampled to at most [`MINIMAP_SAMPLES`]
-/// rows, diagnostics and the viewport slab are positioned by line ratio, and the
-/// whole strip repaints only when the editor is damaged (a GPUI notify).
+/// A minimap bucket's indentation-silhouette box: the shallowest leading
+/// indent and the longest line extent (both in characters, the same metric
+/// `RopeExt::line_len` already used) among the source lines the bucket
+/// covers. Painted as a block that starts at `indent` and reaches `len`, so a
+/// block's *position* — not just its width — carries the indentation
+/// signal that makes the strip read as code structure rather than
+/// left-aligned length bars (`docs/spec-editor-minimap.md`). Blank lines
+/// (`len == 0`) are excluded from `indent` — otherwise a single blank line
+/// sharing a bucket with indented code would collapse the bucket's indent
+/// floor to zero — but still let a longer sibling line set `len`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct MinimapBucket {
+    /// Shallowest leading-indent width (characters) across the bucket's
+    /// non-blank lines. `0` when the bucket has no non-blank line.
+    indent: u32,
+    /// Longest line length (characters) across the bucket's lines. `0` for an
+    /// all-blank bucket.
+    len: u32,
+}
+
+/// Owned render data for the minimap miniature on the editor's right edge
+/// (`docs/spec-editor-minimap.md`). Gathered under the `InputState` read
+/// borrow in [`EditorView::render`] and moved into the strip's `canvas` paint
+/// closure, so the borrow is released before painting. Deliberately NOT a
+/// pixel-perfect code render: per-line indentation/length boxes are
+/// downsampled to at most [`MINIMAP_SAMPLES`] buckets, diagnostics and the
+/// viewport slab are positioned by line ratio, and the whole strip repaints
+/// only when the editor is damaged (a GPUI notify).
 struct MinimapPaint {
-    /// Per-sample maximum line length (characters). Length `min(total, samples)`;
-    /// empty for an empty buffer. Painted as horizontal marks scaled across the
-    /// strip height, width proportional to the sample's share of the longest
-    /// line. A cheap ref-count clone of the tab's cached [`EditorTab::minimap_samples`]
-    /// — derived once per text change, not rescanned per render.
-    samples: Rc<[u32]>,
+    /// Per-bucket indentation-silhouette box. Length `min(total, samples)`;
+    /// empty for an empty buffer. Painted as a block offset by `indent` and
+    /// extending to `len`, both scaled across the strip width against the
+    /// widest bucket. A cheap ref-count clone of the tab's cached
+    /// [`EditorTab::minimap_samples`] — derived once per text change, not
+    /// rescanned per render.
+    samples: Rc<[MinimapBucket]>,
     /// Diagnostic marks: `(line-ratio 0..1, severity color)`, painted full-width
-    /// over the length marks so problems stand out at a glance.
+    /// over the indentation blocks so problems stand out at a glance.
     diag_marks: Vec<(f32, Hsla)>,
     /// The viewport slab as `(top, bottom)` fractions of the strip height; the
     /// slab is skipped when `bottom <= top` (no laid-out viewport yet).
     slab_top: f32,
     slab_bottom: f32,
-    /// Color of the line-length marks (subtle) and of the viewport slab.
+    /// Color of the indentation-silhouette blocks (subtle) and of the viewport slab.
     mark_color: Hsla,
     slab_color: Hsla,
 }
@@ -513,6 +564,12 @@ struct EditorTab {
     /// Whether this tab is read-only (out-of-root target, #195/#301). No
     /// edit, no save path, unwatched snapshot.
     read_only: bool,
+    /// Whether a Markdown tab (`is_markdown_path`) is showing rendered
+    /// preview instead of the source editor (`docs/spec-markdown-preview.md`).
+    /// Per-tab, toggled by the breadcrumb button or [`ToggleMarkdownPreview`];
+    /// meaningless (and never set) for a non-Markdown tab. Read-only: preview
+    /// never mutates the buffer, and toggling back to source leaves it intact.
+    markdown_preview: bool,
     /// The on-disk `mtime` observed when this tab's conflict surfaced —
     /// the worktree snapshot's `mtime` or a `SaveConflict` reply's
     /// `disk_mtime`. "Keep mine" (#433) adopts it as the forced save's
@@ -593,18 +650,27 @@ struct EditorTab {
     /// re-syncs the widget's suppressed diagnostic set.
     cursor_line: u32,
 
-    /// This tab's cached minimap line-length marks — the widest character count
-    /// per downsampled block of source lines, capped at [`MINIMAP_SAMPLES`].
-    /// Derived once per load and per buffer `Change` (never per render), so a
-    /// large focused buffer is not rescanned on every cursor blink or scroll —
-    /// the marks change only when the text does (`docs/spec-editor-chrome.md`:
-    /// derive marks once, redraw on damage only). `Rc<[u32]>` so `render` hands
-    /// a cheap ref-count clone to the strip's paint closure, not a data copy.
-    /// Character count (`Rope::line_len`) deliberately substitutes for
-    /// gpui-component's shaped `LineLayout` cache, which is `pub(crate)` and thus
-    /// inaccessible from this crate; it still honors the strip's "not a
-    /// pixel-perfect code render" intent.
-    minimap_samples: Rc<[u32]>,
+    /// This tab's cached minimap indentation-silhouette buckets — one
+    /// [`MinimapBucket`] per downsampled block of source lines, capped at
+    /// [`MINIMAP_SAMPLES`]. Derived once per load and per buffer `Change`
+    /// (never per render), so a large focused buffer is not rescanned on
+    /// every cursor blink or scroll — the buckets change only when the text
+    /// does (`docs/spec-editor-minimap.md`: derive once, redraw on damage
+    /// only). `Rc<[MinimapBucket]>` so `render` hands a cheap ref-count clone
+    /// to the strip's paint closure, not a data copy. Character count
+    /// (`RopeExt::line_len`) deliberately substitutes for gpui-component's
+    /// shaped `LineLayout` cache, which is `pub(crate)` and thus inaccessible
+    /// from this crate; it still honors the strip's "not a pixel-perfect code
+    /// render" intent.
+    minimap_samples: Rc<[MinimapBucket]>,
+    /// Monotonic counter bumped at the top of every
+    /// [`EditorView::recompute_minimap_samples`] call (sync or background).
+    /// Fences the large-file background recompute path: its result is only
+    /// applied if this still matches the value captured when it was
+    /// dispatched, so a fast follow-up edit's fresher (possibly synchronous)
+    /// recompute is never clobbered by a slower, now-stale background pass
+    /// finishing late.
+    minimap_generation: u64,
 }
 
 // ── Main view ─────────────────────────────────────────────────────────────────
@@ -658,6 +724,16 @@ pub struct EditorView {
     /// harmless because the strip's geometry barely moves between frames.
     minimap_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 
+    /// Whether the minimap strip is currently being dragged (#937,
+    /// `docs/spec-editor-minimap.md`). Set on the strip's own mouse-down
+    /// alongside the initial click-to-jump; while set, `render` adds a
+    /// full-window occluding overlay that captures further mouse-move/
+    /// mouse-up so the drag does not fight the editor's own mouse handling
+    /// (text selection, hover-debounce) underneath — mirrors the terminal's
+    /// border-drag idiom (`crates/terminal/src/session_view.rs`
+    /// `BorderDrag`/`:2922-2989`). Cleared on mouse-up.
+    minimap_drag: bool,
+
     /// Whether the right-dock results panel is currently showing this editor's
     /// nav results (`docs/spec-editor-chrome.md` §3, #529). Set when a response
     /// is emitted to the panel; cleared when the editor closes it (Escape) or
@@ -693,6 +769,7 @@ impl EditorView {
             nav_id: 0,
             content_bounds: Rc::new(Cell::new(None)),
             minimap_bounds: Rc::new(Cell::new(None)),
+            minimap_drag: false,
             results_visible: false,
         }
     }
@@ -733,6 +810,7 @@ impl EditorView {
             dirty: false,
             base_mtime: None,
             read_only,
+            markdown_preview: false,
             conflict_disk_mtime: None,
             generation: 0,
             save_generation: 0,
@@ -751,6 +829,7 @@ impl EditorView {
             diagnostics: Vec::new(),
             cursor_line: 0,
             minimap_samples: Rc::from([]),
+            minimap_generation: 0,
         });
         self.arm_loading(index, true, window, cx);
         index
@@ -937,30 +1016,77 @@ impl EditorView {
                     tab.dirty = true;
                     cx.notify();
                 }
-                // Re-derive the minimap marks now the text changed — never per
-                // render, so a blink or scroll does not rescan the buffer.
+                // Re-derive the minimap buckets now the text changed — never
+                // per render, so a blink or scroll does not rescan the buffer.
                 this.recompute_minimap_samples(index, cx);
                 this.arm_buffer_feed(index, cx);
             }
         })
     }
 
-    /// Re-derive the tab at `index`'s cached minimap line-length marks from its
-    /// current buffer. Called on load and on every buffer `Change`, never per
-    /// render, so a large focused buffer is not rescanned on every cursor blink
-    /// or scroll frame (`docs/spec-editor-chrome.md`: derive marks once, redraw
-    /// on damage only).
+    /// Re-derive the tab at `index`'s cached minimap indentation-silhouette
+    /// buckets from its current buffer. Called on load and on every buffer
+    /// `Change`, never per render, so a large focused buffer is not rescanned
+    /// on every cursor blink or scroll frame (`docs/spec-editor-minimap.md`:
+    /// derive once, redraw on damage only).
+    ///
+    /// A buffer at or under the downsample cap ([`MINIMAP_SAMPLES`]) scans a
+    /// bounded, cheap number of lines and is computed synchronously so the
+    /// strip is correct on the very same frame. A buffer past the cap — tens
+    /// of thousands of lines at the 2 MB buffer cap
+    /// (`daemon/src/buffer.rs:123`) — moves the scan onto GPUI's background
+    /// executor rather than the render/main thread: this app hosts no
+    /// long-lived tokio runtime a `tokio::spawn_blocking` could run on (see
+    /// `spawn_session_order_actor`'s doc in `main.rs`), so `cx.background_spawn`
+    /// is the in-repo equivalent for CPU-bound work off the render path, and a
+    /// near-cap file opens or scrolls without per-frame jank.
     fn recompute_minimap_samples(&mut self, index: usize, cx: &Context<Self>) {
-        let Some(tab) = self.tabs.get(index) else {
+        let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
-        let samples: Rc<[u32]> = {
-            let input_state = tab.input.read(cx);
-            let text = input_state.text();
-            let total = text.lines_len();
-            sample_line_lengths(total, |row| text.line_len(row) as u32, MINIMAP_SAMPLES).into()
-        };
-        self.tabs[index].minimap_samples = samples;
+        tab.minimap_generation = tab.minimap_generation.wrapping_add(1);
+        let generation = tab.minimap_generation;
+        let path = tab.path.clone();
+        // `Rope::clone` is a cheap structural-sharing clone (an Arc-based
+        // tree), not a deep copy — the crossing this owned handle needs to
+        // reach the background executor's `'static` bound, not a
+        // borrow-checker workaround.
+        let text = tab.input.read(cx).text().clone();
+        let total = text.lines_len();
+
+        if total <= MINIMAP_SAMPLES {
+            let buckets =
+                compute_minimap_buckets(total, |row| line_shape(&text, row), MINIMAP_SAMPLES);
+            self.tabs[index].minimap_samples = buckets.into();
+            return;
+        }
+
+        let computed = cx.background_spawn(async move {
+            compute_minimap_buckets(total, |row| line_shape(&text, row), MINIMAP_SAMPLES)
+        });
+        cx.spawn(async move |this, cx| {
+            let buckets = computed.await;
+            cx.update(|cx| {
+                let _ = this.update(cx, |this, cx| {
+                    // Re-resolve by path, not the captured `index`: a
+                    // `close_tab` while the background pass was in flight can
+                    // shift indices, so trusting the stale position risks
+                    // acting on the wrong tab.
+                    let Some(index) = this.tab_index_for_path(&path) else {
+                        return;
+                    };
+                    let Some(tab) = this.tabs.get_mut(index) else {
+                        return;
+                    };
+                    if tab.minimap_generation != generation {
+                        return;
+                    }
+                    tab.minimap_samples = buckets.into();
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
     }
 
     /// Observe an `InputState` so the editor re-renders on cursor moves and
@@ -1235,8 +1361,8 @@ impl EditorView {
         self.tabs[index].dirty = false;
         self.tabs[index].save_state = SaveState::Idle;
         self.tabs[index].load_state = TabLoadState::Loaded;
-        // Derive the minimap marks for the freshly loaded content up front, so
-        // the strip is correct on the first frame rather than a frame late.
+        // Derive the minimap buckets for the freshly loaded content up front,
+        // so the strip is correct on the first frame rather than a frame late.
         self.recompute_minimap_samples(index, cx);
 
         if let Some(range) = self.tabs[index].pending_jump.take() {
@@ -2043,16 +2169,28 @@ impl EditorView {
         cx.notify();
     }
 
-    /// Jump the active tab to the minimap-clicked line (`docs/spec-editor-chrome.md`:
-    /// "click-to-jump"). `click_y` is the window-space vertical position of the
-    /// click; the strip's captured bounds turn it into a 0..1 ratio, then a
-    /// target line. The jump lands the caret at that line's start via
-    /// `InputState::set_cursor_position`, which scrolls it into view — the only
-    /// public scroll seam this gpui-component pin exposes (there is no
-    /// scroll-offset setter), so a minimap click both scrolls to and selects the
-    /// clicked line, matching the ctrl+click / nav jumps that already move the
-    /// caret. The position is clamped to a valid line, and the rope layer clamps
-    /// the column, so an out-of-range click still lands somewhere sane.
+    /// Jump the active tab to the minimap-clicked (or -dragged) line
+    /// (`docs/spec-editor-minimap.md`: "click-to-jump" / "drag-to-scroll").
+    /// `pointer_y` is the window-space vertical position of the pointer; the
+    /// strip's captured bounds turn it into a 0..1 ratio ([`minimap_pointer_ratio`]),
+    /// then a target line ([`minimap_click_line`]). The jump lands the caret at
+    /// that line's start via `InputState::set_cursor_position`, which scrolls it
+    /// into view — the only public scroll seam this gpui-component pin exposes
+    /// (there is no scroll-offset setter), so both a minimap click and a
+    /// minimap drag scroll by moving the caret to the pointer's line, matching
+    /// the ctrl+click / nav jumps that already move the caret. The position is
+    /// clamped to a valid line, and the rope layer clamps the column, so an
+    /// out-of-range pointer position still lands somewhere sane.
+    ///
+    /// Called once on the strip's mouse-down (click-to-jump) and again on
+    /// every mouse-move while [`EditorView::minimap_drag`] is set (drag-to-scroll,
+    /// #937) — a drag is nothing but this same jump repeated continuously.
+    /// **Known v1 limitation** (`docs/spec-editor-minimap.md`): because the only
+    /// scroll seam is `set_cursor_position`, the caret visibly follows the
+    /// pointer as a drag scrolls, rather than the document scrolling under a
+    /// stationary caret. Accepted at the gate; a caret-free drag would need a
+    /// scroll-offset setter the pin does not expose, deferred to a possible
+    /// pin-extension follow-up.
     fn minimap_jump(&mut self, click_y: Pixels, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.active else {
             return;
@@ -2064,7 +2202,8 @@ impl EditorView {
         if strip_height <= 0.0 {
             return;
         }
-        let ratio = (f32::from(click_y) - f32::from(bounds.origin.y)) / strip_height;
+        let ratio =
+            minimap_pointer_ratio(f32::from(click_y), f32::from(bounds.origin.y), strip_height);
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
@@ -2257,6 +2396,25 @@ impl EditorView {
     /// in sync. Idempotent.
     pub fn mark_results_closed(&mut self) {
         self.results_visible = false;
+    }
+
+    /// Toggle the active tab's Markdown source/preview mode
+    /// (`docs/spec-markdown-preview.md`). A no-op when no tab is active or the
+    /// active tab is not Markdown — the preview is per-tab and meaningless
+    /// elsewhere. Never touches the buffer: only which of the two views the
+    /// tab currently renders.
+    fn toggle_markdown_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.active else {
+            return;
+        };
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        if !is_markdown_path(&tab.path) {
+            return;
+        }
+        tab.markdown_preview = !tab.markdown_preview;
+        cx.notify();
     }
 
     /// Move keyboard focus to the active tab's buffer (or the editor's fallback
@@ -2594,6 +2752,12 @@ impl Render for EditorView {
                 .into_any_element();
         }
 
+        // Markdown preview (`docs/spec-markdown-preview.md`): the toggle
+        // affordance shows only for a Markdown tab; the preview itself only
+        // renders while that tab's own `markdown_preview` flag is set.
+        let is_markdown_tab = is_markdown_path(&tab.path);
+        let markdown_preview_active = is_markdown_tab && tab.markdown_preview;
+
         // One-line save-outcome banner. The conflict case surfaces as its own
         // modal dialog (#532, opened imperatively wherever the active tab's
         // conflict is armed — see `open_conflict_dialog`) instead of inline
@@ -2897,21 +3061,21 @@ impl Render for EditorView {
             }
         }
 
-        // ── Minimap marks strip (docs/spec-editor-chrome.md) ──
+        // ── Minimap miniature strip (docs/spec-editor-minimap.md) ──
         //
         // Owned render data for the strip on the editor's right edge: the
-        // downsampled line-length marks (a cheap ref-count clone of the tab's
-        // cached `minimap_samples` — derived on text change, never rescanned
-        // here), plus the diagnostic marks and viewport slab, whose ratios are
-        // O(diagnostics) / O(1) to gather under this tab's `InputState` read
-        // borrow. Moved into the strip's `canvas` paint closure below, so the
-        // borrow is released before painting. Explicitly NOT a pixel-perfect
-        // code render: marks are capped at `MINIMAP_SAMPLES`, positioned by
-        // ratio, redrawn only on damage.
+        // downsampled indentation-silhouette buckets (a cheap ref-count clone
+        // of the tab's cached `minimap_samples` — derived on text change,
+        // never rescanned here), plus the diagnostic marks and viewport slab,
+        // whose ratios are O(diagnostics) / O(1) to gather under this tab's
+        // `InputState` read borrow. Moved into the strip's `canvas` paint
+        // closure below, so the borrow is released before painting.
+        // Explicitly NOT a pixel-perfect code render: buckets are capped at
+        // `MINIMAP_SAMPLES`, positioned by ratio, redrawn only on damage.
         // Bolder/higher-contrast than the original muted-foreground-at-.55 (#600):
         // `foreground` reads clearly against the strip's `secondary` background at
         // the widened size, while the slab keeps `accent` but a touch more opaque
-        // so it stays visually distinct from the length/diagnostic marks under it.
+        // so it stays visually distinct from the blocks/diagnostic marks under it.
         let mut minimap_mark_color = cx.theme().foreground;
         minimap_mark_color.a = 0.65;
         let mut minimap_slab_color = cx.theme().accent;
@@ -2944,18 +3108,11 @@ impl Render for EditorView {
             }
         };
 
-        let breadcrumb_bar = div()
+        let breadcrumb_segments = div()
             .flex()
-            .flex_shrink_0()
             .items_center()
             .gap(px(6.0))
-            .h(BREADCRUMB_HEIGHT)
-            .px(px(10.0))
-            .bg(crumb_bg)
-            .border_b_1()
-            .border_color(crumb_border)
-            .font_family(mono_font)
-            .text_size(mono_size)
+            .min_w_0()
             .overflow_hidden()
             .children(breadcrumb_children(
                 &path_segments,
@@ -2963,6 +3120,46 @@ impl Render for EditorView {
                 crumb_path_color,
                 crumb_symbol_color,
             ));
+
+        let mut breadcrumb_bar = div()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .justify_between()
+            .h(BREADCRUMB_HEIGHT)
+            .px(px(10.0))
+            .bg(crumb_bg)
+            .border_b_1()
+            .border_color(crumb_border)
+            .font_family(mono_font)
+            .text_size(mono_size)
+            .child(breadcrumb_segments);
+
+        // Source/preview toggle (`docs/spec-markdown-preview.md`): shown only
+        // for a Markdown tab, right-aligned in the breadcrumb bar.
+        if is_markdown_tab {
+            let (icon, tooltip) = if markdown_preview_active {
+                (IconName::EyeOff, "Show source")
+            } else {
+                (IconName::Eye, "Show preview")
+            };
+            breadcrumb_bar = breadcrumb_bar.child(
+                Button::new("markdown-preview-toggle")
+                    .icon(icon)
+                    .label(if markdown_preview_active {
+                        "Source"
+                    } else {
+                        "Preview"
+                    })
+                    .xsmall()
+                    .ghost()
+                    .tab_stop(false)
+                    .tooltip(tooltip)
+                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.toggle_markdown_preview(cx);
+                    })),
+            );
+        }
 
         let read_only = tab.read_only;
 
@@ -3073,6 +3270,9 @@ impl Render for EditorView {
                 if !this.close_results_panel(cx) {
                     cx.propagate();
                 }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleMarkdownPreview, _window, cx| {
+                this.toggle_markdown_preview(cx);
             }))
             .on_mouse_down(
                 MouseButton::Left,
@@ -3237,13 +3437,16 @@ impl Render for EditorView {
             editor_area = editor_area.child(popover);
         }
 
-        // Minimap marks strip on the editor's right edge, beside the widget's
-        // scrollbar (`docs/spec-editor-chrome.md`). A single `canvas` paints the
-        // downsampled line-length marks, the diagnostic marks, and the viewport
-        // slab in one pass — no second text render — and records its bounds for
-        // click-to-jump. The click handler jumps the view to the clicked line;
+        // Minimap miniature strip on the editor's right edge, beside the widget's
+        // scrollbar (`docs/spec-editor-minimap.md`). A single `canvas` paints the
+        // downsampled indentation-silhouette blocks, the diagnostic marks, and the
+        // viewport slab in one pass — no second text render — and records its
+        // bounds for click-to-jump and drag. The mouse-down both jumps to the
+        // clicked line and arms `minimap_drag` (#937, drag-to-scroll);
         // `stop_propagation` keeps a strip click from reaching the outer
-        // ctrl+click-to-definition handler.
+        // ctrl+click-to-definition handler. While `minimap_drag` is set, the
+        // full-window occluding overlay appended below `editor_row` captures the
+        // continuing drag.
         let minimap_bounds = self.minimap_bounds.clone();
         let minimap_strip = div()
             .id("editor-minimap")
@@ -3266,20 +3469,75 @@ impl Render for EditorView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.minimap_drag = true;
                     this.minimap_jump(event.position.y, window, cx);
                     cx.stop_propagation();
                 }),
             );
 
-        let editor_row = div()
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .flex_row()
-            .child(editor_area)
-            .child(minimap_strip);
+        // Markdown preview area: the buffer's current text, rendered
+        // read-only through the vendored `gpui_component::text::markdown`
+        // renderer (the same one the hover popover's doc body uses above).
+        // Re-derived on every render, so it live-updates on any buffer
+        // change — the same [`Self::observe_input`] notify that already
+        // repaints the source editor on every keystroke or programmatic
+        // edit (`docs/spec-markdown-preview.md`). When the preview is not
+        // active, the row is the source editor beside the minimap strip.
+        let editor_row = if markdown_preview_active {
+            let content = tab.input.read(cx).value().to_string();
+            div()
+                .id("markdown-preview")
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .overflow_y_scroll()
+                .bg(surface_bg)
+                .text_color(surface_fg)
+                .p(px(12.0))
+                .child(markdown(content))
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_row()
+                .child(editor_area)
+                .child(minimap_strip)
+                .into_any_element()
+        };
+        root = root.child(editor_row);
 
-        root.child(editor_row).into_any_element()
+        // While dragging the minimap (`minimap_drag`, #937), a full-window
+        // occluding overlay captures every mouse-move/mouse-up so the drag does
+        // not fight the editor's own mouse handling (text selection, the
+        // hover-debounce `on_mouse_move` on the outer `root`) underneath —
+        // mirrors the terminal's border-drag idiom
+        // (`crates/terminal/src/session_view.rs:2922-2989`). Each move re-runs
+        // `minimap_jump`, the same click-to-jump mapping, so the drag is a
+        // continuous jump; mouse-up clears `minimap_drag`.
+        if self.minimap_drag {
+            root = root.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .occlude()
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                        this.minimap_jump(event.position.y, window, cx);
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                            this.minimap_drag = false;
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+
+        root.into_any_element()
     }
 }
 
@@ -3427,6 +3685,13 @@ fn language_for_path(path: &str) -> String {
         .unwrap_or_else(|| "text".to_owned())
 }
 
+/// Whether `path` is a Markdown file (`.md` / `.markdown`, case-insensitive) —
+/// gates the source/preview toggle affordance
+/// (`docs/spec-markdown-preview.md`).
+fn is_markdown_path(path: &str) -> bool {
+    matches!(language_for_path(path).as_str(), "md" | "markdown")
+}
+
 /// Whether the zero-based `(line, character)` cursor position falls within
 /// `range` (inclusive of both endpoints — a cursor resting on a symbol's
 /// closing brace still counts as enclosed).
@@ -3484,33 +3749,59 @@ fn primary_diagnostic_on_line(diagnostics: &[Diagnostic], line: u32) -> Option<&
         .max_by_key(|d| severity_rank(d.severity))
 }
 
-// ── Minimap helpers (docs/spec-editor-chrome.md) ────────────────────────────────
+// ── Minimap helpers (docs/spec-editor-minimap.md) ───────────────────────────────
 
-/// Downsample the buffer's per-line lengths into at most `samples` marks for the
-/// minimap strip. Each returned entry is the widest line length over the block
-/// of source lines it covers, so a dense region reads as a longer mark than a
-/// sparse one. Returns `min(total_lines, samples)` entries (empty for an empty
-/// buffer), keeping the per-render cost bounded regardless of file size — the
-/// strip is only a few hundred pixels tall, so more marks add no visible detail.
-fn sample_line_lengths(
+/// Downsample the buffer's per-line indentation-silhouette shape into at most
+/// `samples` bucket boxes for the minimap strip. `line_shape(row)` returns
+/// `(leading_indent, line_len)` in characters for `row`. Each bucket takes
+/// the shallowest indent and the longest length across the source lines it
+/// covers — the min-indent keeps a bucket's left edge from collapsing to
+/// whichever line happens to be deepest, the max-length keeps the "widest
+/// line wins" reading the strip already had. Returns `min(total_lines,
+/// samples)` entries (empty for an empty buffer), keeping the per-render cost
+/// bounded regardless of file size — the strip is only a few hundred pixels
+/// tall, so more buckets than this add no visible detail.
+fn compute_minimap_buckets(
     total_lines: usize,
-    line_len: impl Fn(usize) -> u32,
+    line_shape: impl Fn(usize) -> (u32, u32),
     samples: usize,
-) -> Vec<u32> {
+) -> Vec<MinimapBucket> {
     if total_lines == 0 || samples == 0 {
         return Vec::new();
     }
     let n = total_lines.min(samples);
-    let mut out = vec![0u32; n];
+    let mut out = vec![MinimapBucket::default(); n];
+    let mut has_indent = vec![false; n];
     for row in 0..total_lines {
         // `row < total_lines` and `n <= total_lines`, so `bucket < n`.
         let bucket = row * n / total_lines;
-        let len = line_len(row);
-        if len > out[bucket] {
-            out[bucket] = len;
+        let (indent, len) = line_shape(row);
+        if len > out[bucket].len {
+            out[bucket].len = len;
+        }
+        // Blank lines (`len == 0`) carry no indentation signal — excluded so
+        // one blank line sharing a bucket with indented code cannot pull the
+        // bucket's indent floor down to zero.
+        if len > 0 && (!has_indent[bucket] || indent < out[bucket].indent) {
+            out[bucket].indent = indent;
+            has_indent[bucket] = true;
         }
     }
     out
+}
+
+/// A source line's `(leading_indent, line_len)` in characters, read from a
+/// live buffer via `RopeExt`. `line_len` is the same metric the strip already
+/// used; `indent` counts only leading spaces/tabs, clamped to `line_len` so a
+/// pathological line can never report more indent than it has characters.
+fn line_shape(text: &Rope, row: usize) -> (u32, u32) {
+    let len = text.line_len(row) as u32;
+    let indent = text
+        .slice_line(row)
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .count() as u32;
+    (indent.min(len), len)
 }
 
 /// The viewport slab's `(top, bottom)` position as fractions of the minimap
@@ -3525,6 +3816,17 @@ fn minimap_slab_fracs(visible_start: usize, visible_end: usize, total_lines: usi
     let top = (visible_start as f32 / total).clamp(0.0, 1.0);
     let bottom = (visible_end as f32 / total).clamp(0.0, 1.0);
     (top, bottom.max(top))
+}
+
+/// The 0..1 ratio down the minimap strip a pointer at window-space `pointer_y`
+/// maps to, given the strip's captured top edge (`bounds_top`) and height
+/// (`strip_height`), both window-space pixels from `EditorView::minimap_bounds`.
+/// Deliberately unclamped: a drag that leaves the strip above or below still
+/// produces a ratio outside `0..1`, and [`minimap_click_line`] is what clamps
+/// it to a valid line — so dragging past either edge lands on the first/last
+/// line rather than needing a second clamp here.
+fn minimap_pointer_ratio(pointer_y: f32, bounds_top: f32, strip_height: f32) -> f32 {
+    (pointer_y - bounds_top) / strip_height
 }
 
 /// The buffer line a minimap click at `click_ratio` (0..1 down the strip) maps
@@ -3549,11 +3851,11 @@ fn go_to_line_target(requested: usize, total_lines: usize) -> usize {
         .min(total_lines.saturating_sub(1))
 }
 
-/// Paint the minimap strip into `bounds`: the downsampled line-length marks, the
-/// diagnostic marks (full-width, by line ratio, over the length marks), and the
-/// viewport slab — in one pass, no second text render. Also records `bounds` for
-/// the next mouse-down's click-to-jump. All positions are derived by ratio, so
-/// the strip is correct at any height without re-shaping any text.
+/// Paint the minimap strip into `bounds`: the downsampled indentation-silhouette
+/// blocks, the diagnostic marks (full-width, by line ratio, over the blocks),
+/// and the viewport slab — in one pass, no second text render. Also records
+/// `bounds` for the next mouse-down's click-to-jump. All positions are derived
+/// by ratio, so the strip is correct at any height without re-shaping any text.
 fn paint_minimap(
     bounds: Bounds<Pixels>,
     data: &MinimapPaint,
@@ -3570,23 +3872,28 @@ fn paint_minimap(
         return;
     }
 
-    // Line-length marks: one bar per sample, scaled across the full height, its
-    // width proportional to the sample's share of the longest line.
+    // Indentation-silhouette blocks: one per bucket, scaled across the full
+    // height. Each block starts at its bucket's indent and reaches its
+    // bucket's length, both scaled against the widest bucket on the same
+    // axis — so a block's *offset*, not just its width, carries the
+    // indentation signal (`docs/spec-editor-minimap.md`).
     let sample_count = data.samples.len();
     if sample_count > 0 {
-        let max_len = data.samples.iter().copied().max().unwrap_or(0).max(1) as f32;
+        let max_len = data.samples.iter().map(|b| b.len).max().unwrap_or(0).max(1) as f32;
         let inset = MINIMAP_MARK_INSET.min(width / 4.0);
         let available = (width - inset * 2.0).max(1.0);
         let row_height = (height / sample_count as f32).max(1.0);
-        for (i, &len) in data.samples.iter().enumerate() {
-            if len == 0 {
+        for (i, bucket) in data.samples.iter().enumerate() {
+            if bucket.len == 0 {
                 continue;
             }
-            let mark_width = (available * (len as f32 / max_len)).max(1.0);
+            let indent_px = available * (bucket.indent as f32 / max_len);
+            let end_px = available * (bucket.len as f32 / max_len);
+            let mark_width = (end_px - indent_px).max(1.0);
             let y = origin_y + height * i as f32 / sample_count as f32;
             let mark = Bounds {
                 origin: Point {
-                    x: px(origin_x + inset),
+                    x: px(origin_x + inset + indent_px),
                     y: px(y),
                 },
                 size: Size {
@@ -3808,6 +4115,24 @@ mod tests {
     fn test_language_for_path_lowercases_extension() {
         assert_eq!(language_for_path("MAIN.RS"), "rs");
         assert_eq!(language_for_path("Config.TOML"), "toml");
+    }
+
+    // --- Markdown preview (docs/spec-markdown-preview.md, #918) ---
+
+    #[test]
+    fn test_is_markdown_path_matches_md_and_markdown_extensions() {
+        assert!(is_markdown_path("docs/readme.md"));
+        assert!(is_markdown_path("docs/readme.markdown"));
+        assert!(is_markdown_path("docs/README.MD"));
+        assert!(is_markdown_path("NOTES.Markdown"));
+    }
+
+    #[test]
+    fn test_is_markdown_path_rejects_non_markdown_and_extensionless_paths() {
+        assert!(!is_markdown_path("src/main.rs"));
+        assert!(!is_markdown_path("Cargo.toml"));
+        assert!(!is_markdown_path("Makefile"));
+        assert!(!is_markdown_path(""));
     }
 
     // --- buffer-error reason labels (#617) ---
@@ -4202,27 +4527,69 @@ mod tests {
         assert!(!close_needs_confirm(false));
     }
 
-    // --- minimap marks strip (docs/spec-editor-chrome.md) ---
+    // --- minimap indentation-silhouette miniature (docs/spec-editor-minimap.md) ---
 
     #[test]
-    fn test_sample_line_lengths_is_one_to_one_when_under_the_cap() {
-        let lengths = [3u32, 0, 10, 5];
-        let out = sample_line_lengths(lengths.len(), |row| lengths[row], 100);
-        assert_eq!(out, vec![3, 0, 10, 5]);
+    fn test_compute_minimap_buckets_is_one_to_one_when_under_the_cap() {
+        // (indent, len) per line; one bucket per line since 4 <= samples.
+        let shapes = [(0u32, 3u32), (0, 0), (4, 10), (2, 5)];
+        let out = compute_minimap_buckets(shapes.len(), |row| shapes[row], 100);
+        assert_eq!(
+            out,
+            vec![
+                MinimapBucket { indent: 0, len: 3 },
+                MinimapBucket { indent: 0, len: 0 },
+                MinimapBucket { indent: 4, len: 10 },
+                MinimapBucket { indent: 2, len: 5 },
+            ]
+        );
     }
 
     #[test]
-    fn test_sample_line_lengths_takes_the_max_per_bucket_when_downsampled() {
+    fn test_compute_minimap_buckets_takes_min_indent_and_max_len_per_bucket() {
         // Four lines into two buckets: rows 0..1 -> bucket 0, rows 2..3 -> 1.
-        let lengths = [3u32, 10, 4, 7];
-        let out = sample_line_lengths(lengths.len(), |row| lengths[row], 2);
-        assert_eq!(out, vec![10, 7]);
+        let shapes = [(4u32, 8u32), (2, 6), (0, 20), (6, 7)];
+        let out = compute_minimap_buckets(shapes.len(), |row| shapes[row], 2);
+        assert_eq!(
+            out,
+            vec![
+                MinimapBucket { indent: 2, len: 8 },
+                MinimapBucket { indent: 0, len: 20 },
+            ]
+        );
     }
 
     #[test]
-    fn test_sample_line_lengths_is_empty_for_an_empty_buffer() {
-        assert!(sample_line_lengths(0, |_| 0, 100).is_empty());
-        assert!(sample_line_lengths(5, |_| 1, 0).is_empty());
+    fn test_compute_minimap_buckets_excludes_blank_lines_from_the_indent_floor() {
+        // A blank line (indent 0, len 0) sharing a bucket with a deeply
+        // indented line must not pull the bucket's indent down to zero.
+        let shapes = [(8u32, 12u32), (0, 0)];
+        let out = compute_minimap_buckets(shapes.len(), |row| shapes[row], 1);
+        assert_eq!(out, vec![MinimapBucket { indent: 8, len: 12 }]);
+    }
+
+    #[test]
+    fn test_compute_minimap_buckets_all_blank_bucket_defaults_to_zero() {
+        let shapes = [(0u32, 0u32), (0, 0)];
+        let out = compute_minimap_buckets(shapes.len(), |row| shapes[row], 1);
+        assert_eq!(out, vec![MinimapBucket { indent: 0, len: 0 }]);
+    }
+
+    #[test]
+    fn test_compute_minimap_buckets_is_empty_for_an_empty_buffer() {
+        assert!(compute_minimap_buckets(0, |_| (0, 0), 100).is_empty());
+        assert!(compute_minimap_buckets(5, |_| (0, 1), 0).is_empty());
+    }
+
+    #[test]
+    fn test_line_shape_counts_leading_spaces_and_tabs() {
+        let text = Rope::from("    fn main() {}\n\tif x {\nno_indent\n   \n");
+        assert_eq!(line_shape(&text, 0), (4, 16));
+        assert_eq!(line_shape(&text, 1), (1, 7));
+        assert_eq!(line_shape(&text, 2), (0, 9));
+        // A whitespace-only line has no non-whitespace content: indent is
+        // clamped to the line's own length, not counted past it.
+        assert_eq!(line_shape(&text, 3), (3, 3));
     }
 
     #[test]
@@ -4249,6 +4616,32 @@ mod tests {
         assert_eq!(minimap_click_line(1.0, 100), 99);
         assert_eq!(minimap_click_line(1.5, 100), 99);
         assert_eq!(minimap_click_line(0.5, 0), 0);
+    }
+
+    // --- minimap drag-to-scroll pointer-Y -> ratio mapping (#937) ---
+
+    #[test]
+    fn test_minimap_pointer_ratio_maps_pointer_position_to_strip_fraction() {
+        // Pointer at the strip's top edge, midpoint, and bottom edge.
+        assert!((minimap_pointer_ratio(100.0, 100.0, 200.0) - 0.0).abs() < f32::EPSILON);
+        assert!((minimap_pointer_ratio(200.0, 100.0, 200.0) - 0.5).abs() < f32::EPSILON);
+        assert!((minimap_pointer_ratio(300.0, 100.0, 200.0) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_minimap_pointer_ratio_pointer_outside_strip_is_not_clamped() {
+        // A drag that leaves the strip above or below produces a ratio outside
+        // 0..1 — `minimap_click_line` is what clamps it, not this function.
+        assert!((minimap_pointer_ratio(50.0, 100.0, 200.0) - -0.25).abs() < f32::EPSILON);
+        assert!((minimap_pointer_ratio(400.0, 100.0, 200.0) - 1.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_minimap_pointer_ratio_composes_with_click_line_for_a_drag_step() {
+        // End-to-end pointer-Y -> document line, the mapping a drag move reuses
+        // continuously from click-to-jump (`minimap_jump`).
+        let ratio = minimap_pointer_ratio(250.0, 100.0, 200.0);
+        assert_eq!(minimap_click_line(ratio, 100), 75);
     }
 
     // --- go-to-line target clamp (#620) ---
@@ -4645,6 +5038,66 @@ mod tests {
             });
 
             assert!(!window.has_active_dialog(cx));
+        })
+        .unwrap();
+    }
+
+    // --- Markdown preview toggle (docs/spec-markdown-preview.md, #918) ---
+
+    /// Acceptance: toggling a Markdown tab's preview leaves any other tab's
+    /// mode untouched (per-tab state, `docs/spec-markdown-preview.md`), and a
+    /// non-Markdown active tab's toggle is a no-op.
+    #[gpui::test]
+    fn test_toggle_markdown_preview_is_per_tab_and_a_no_op_for_non_markdown(
+        cx: &mut TestAppContext,
+    ) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let md = editor.push_tab("docs/readme.md".into(), false, window, cx);
+                let rs = editor.push_tab("src/main.rs".into(), false, window, cx);
+                editor.tabs[md].load_state = TabLoadState::Loaded;
+                editor.tabs[rs].load_state = TabLoadState::Loaded;
+
+                editor.active = Some(rs);
+                editor.toggle_markdown_preview(cx);
+                assert!(
+                    !editor.tabs[rs].markdown_preview,
+                    "a non-Markdown active tab's toggle is a no-op"
+                );
+
+                editor.active = Some(md);
+                editor.toggle_markdown_preview(cx);
+                assert!(
+                    editor.tabs[md].markdown_preview,
+                    "a Markdown tab toggles into preview"
+                );
+                assert!(
+                    !editor.tabs[rs].markdown_preview,
+                    "toggling one tab must not affect another"
+                );
+
+                editor.toggle_markdown_preview(cx);
+                assert!(
+                    !editor.tabs[md].markdown_preview,
+                    "toggling again restores source"
+                );
+            });
+        })
+        .unwrap();
+    }
+
+    /// Acceptance: no active tab is a no-op (no panic, no state change).
+    #[gpui::test]
+    fn test_toggle_markdown_preview_is_a_no_op_with_no_active_tab(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        cx.update_window(window.into(), |_, _window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.toggle_markdown_preview(cx);
+                assert!(editor.tabs.is_empty());
+            });
         })
         .unwrap();
     }

@@ -21,7 +21,7 @@ use rift_protocol::{
     FrameDecoder, LoadAverage, LspServerState, MemoryPressure, NavRequestId, PaneMetric,
     WorktreeEntry, PROTOCOL_VERSION,
 };
-use sysinfo::{ProcessesToUpdate, System};
+use sysinfo::{Disk, Disks, ProcessesToUpdate, System};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
@@ -281,6 +281,13 @@ const HOST_METRICS_EVENT_CAPACITY: usize = 4;
 /// stock `microsoft-standard-WSL2` kernel); [`host_metrics_sampler`] gates on
 /// its existence once at startup rather than on every tick.
 const DEFAULT_PSI_PATH: &str = "/proc/pressure/memory";
+
+/// Default `/proc/meminfo` path (`docs/spec-telemetry-detail.md`): source of
+/// `Cached`/`Buffers`, which `sysinfo` does not expose. Unlike
+/// [`DEFAULT_PSI_PATH`], `Cached`/`Buffers` are always present on Linux, so
+/// [`host_metrics_sampler`] reads it unconditionally every tick rather than
+/// gating on its existence.
+const DEFAULT_MEMINFO_PATH: &str = "/proc/meminfo";
 
 /// Queue depth for worktree events flowing from the blocking worker into the
 /// dispatch loop. Bounds how far the worker may run ahead while the loop is busy.
@@ -2213,11 +2220,12 @@ impl HostMetricsBus {
 
 /// The daemon-global `/proc` sampler task (`docs/spec-host-telemetry.md`).
 ///
-/// Holds one persistent [`sysinfo::System`], primed with an initial refresh,
-/// then refreshed every [`HOST_METRICS_INTERVAL`] under `spawn_blocking` (a
-/// `/proc` read) and pushed onto `bus.events` / `bus.latest_tx` — but only
-/// while `bus.connections` reads above zero; with zero connections the tick
-/// is a no-op, so an idle daemon polls `/proc` for nothing. Runs until its
+/// Holds one persistent [`sysinfo::System`] and one persistent
+/// [`sysinfo::Disks`], both primed with an initial refresh, then refreshed
+/// every [`HOST_METRICS_INTERVAL`] under `spawn_blocking` (a `/proc` read)
+/// and pushed onto `bus.events` / `bus.latest_tx` — but only while
+/// `bus.connections` reads above zero; with zero connections the tick is a
+/// no-op, so an idle daemon polls `/proc` for nothing. Runs until its
 /// spawning task is dropped/aborted: [`serve_uds`] spawns it detached for the
 /// daemon process's whole lifetime (matching [`keep_warm_supervisor`]'s own
 /// spawn-and-forget); [`serve`] aborts its `JoinHandle` when the one
@@ -2237,12 +2245,29 @@ async fn host_metrics_sampler(bus: HostMetricsBus) {
         }
     };
 
+    // `docs/spec-telemetry-detail.md`: the disk list rarely changes, but
+    // `Disks::new_with_refreshed_list` also does the initial `statvfs` reads,
+    // so priming it here (rather than starting from an empty `Disks::new()`)
+    // means the very first emitted sample already carries real figures.
+    let mut disks = match tokio::task::spawn_blocking(Disks::new_with_refreshed_list).await {
+        Ok(disks) => disks,
+        Err(err) => {
+            error!(%err, "host metrics: disk priming panicked; sampler not started");
+            return;
+        }
+    };
+
     // PSI availability (`CONFIG_PSI`) is a boot-time kernel property, not a
     // per-tick condition (`docs/spec-memory-pressure.md`), so the file's
     // existence is resolved once here and cached for the sampler's lifetime;
     // only its CONTENTS are re-read each tick.
     let psi_path = Path::new(DEFAULT_PSI_PATH);
     let psi_available = psi_path.exists();
+
+    // `Cached`/`Buffers` (`docs/spec-telemetry-detail.md`) are always present
+    // on Linux, unlike PSI, so no existence gate is needed here — only the
+    // path is fixed once.
+    let meminfo_path = Path::new(DEFAULT_MEMINFO_PATH);
 
     let mut interval = tokio::time::interval(HOST_METRICS_INTERVAL);
     // The first `tick()` fires immediately; consume it here so the loop
@@ -2258,24 +2283,44 @@ async fn host_metrics_sampler(bus: HostMetricsBus) {
         let refreshed = tokio::task::spawn_blocking(move || {
             system.refresh_cpu_usage();
             system.refresh_memory();
+            disks.refresh_list();
             let psi = if psi_available {
                 read_memory_pressure(psi_path)
             } else {
                 None
             };
-            let message = build_host_metrics_message(&system, psi);
-            (system, message)
+            let (mem_cached, mem_buffers) = read_meminfo(meminfo_path);
+            // `docs/spec-telemetry-detail.md`: the daemon's own filesystem,
+            // resolved fresh each tick (a cheap `getcwd`) rather than cached
+            // at startup — the daemon never `chdir`s today, but re-reading it
+            // costs nothing and stays correct if that ever changes.
+            let daemon_dir = std::env::current_dir().ok();
+            let (disk_total, disk_available) = daemon_dir
+                .as_deref()
+                .and_then(|dir| select_daemon_disk(&disks, dir))
+                .map(|disk| (disk.total_space(), disk.available_space()))
+                .unwrap_or((0, 0));
+            let message = build_host_metrics_message(
+                &system,
+                psi,
+                mem_cached,
+                mem_buffers,
+                disk_total,
+                disk_available,
+            );
+            (system, disks, message)
         })
         .await;
 
-        let (refreshed_system, message) = match refreshed {
-            Ok(pair) => pair,
+        let (refreshed_system, refreshed_disks, message) = match refreshed {
+            Ok(triple) => triple,
             Err(err) => {
                 error!(%err, "host metrics: refresh panicked; sampler stops");
                 return;
             }
         };
         system = refreshed_system;
+        disks = refreshed_disks;
 
         let _ = bus.latest_tx.send(Some(message.clone()));
         let _ = bus.events.send(message);
@@ -2287,18 +2332,29 @@ async fn host_metrics_sampler(bus: HostMetricsBus) {
 /// (`refresh_cpu_usage` + `refresh_memory`) immediately before calling this —
 /// kept as a pure builder, separate from [`host_metrics_sampler`]'s own
 /// `/proc`-reading side effects, so it is testable without spawning a task or
-/// waiting on the sampling interval. `System::load_average()` is a Unix
-/// concept read fresh from `/proc/loadavg` on every call (an associated
-/// function, not tied to `system`'s own refresh cycle). `psi` is the caller's
-/// already-read Linux PSI sample (`docs/spec-memory-pressure.md`) — `None`
-/// where the kernel exposes no `/proc/pressure/memory` — passed straight
-/// through onto the wire so this stays a pure builder.
-fn build_host_metrics_message(system: &System, psi: Option<MemoryPressure>) -> DaemonMessage {
+/// waiting on the sampling interval. `System::load_average()` and
+/// `System::uptime()` are Unix concepts read fresh from `/proc` on every call
+/// (associated functions, not tied to `system`'s own refresh cycle). `psi`,
+/// `mem_cached`/`mem_buffers` (`docs/spec-telemetry-detail.md`, from a
+/// `/proc/meminfo` read `sysinfo` cannot do), and `disk_total`/
+/// `disk_available` (from `sysinfo`'s `disk` feature) are all the caller's
+/// already-read values, passed straight through onto the wire so this stays a
+/// pure builder.
+fn build_host_metrics_message(
+    system: &System,
+    psi: Option<MemoryPressure>,
+    mem_cached: u64,
+    mem_buffers: u64,
+    disk_total: u64,
+    disk_available: u64,
+) -> DaemonMessage {
     let load = System::load_average();
     DaemonMessage::HostMetrics {
         cpu: system.global_cpu_usage(),
         mem_total: system.total_memory(),
         mem_available: system.available_memory(),
+        mem_cached,
+        mem_buffers,
         swap_total: system.total_swap(),
         swap_used: system.used_swap(),
         load: LoadAverage {
@@ -2307,6 +2363,9 @@ fn build_host_metrics_message(system: &System, psi: Option<MemoryPressure>) -> D
             fifteen: load.fifteen,
         },
         cpu_count: system.cpus().len() as u32,
+        uptime_secs: System::uptime(),
+        disk_total,
+        disk_available,
         psi,
     }
 }
@@ -2588,6 +2647,62 @@ fn parse_psi_averages(rest: &str) -> Option<(f64, f64, f64)> {
         }
     }
     Some((avg10?, avg60?, avg300?))
+}
+
+/// Read and parse `Cached`/`Buffers` (bytes) from `path`, normally
+/// `/proc/meminfo` (`docs/spec-telemetry-detail.md`) — the two memory-
+/// breakdown fields `sysinfo` does not expose. Path-injectable so it is
+/// fixture-testable without a real `/proc`. Unlike [`read_memory_pressure`],
+/// `Cached`/`Buffers` are always present on Linux, so a read failure (an
+/// absent or unreadable file) degrades to `(0, 0)` rather than the caller
+/// gating on existence first.
+fn read_meminfo(path: &Path) -> (u64, u64) {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => parse_meminfo(&contents),
+        Err(_) => (0, 0),
+    }
+}
+
+/// Parse the `Cached:`/`Buffers:` lines out of `/proc/meminfo`'s
+/// `Key:<spaces><value> kB` format, returning `(cached_bytes, buffers_bytes)`.
+/// The kernel reports both fields in kB; this converts to bytes. A missing or
+/// unparseable line yields 0 for that field alone — the parser never panics,
+/// even on a malformed or truncated file.
+fn parse_meminfo(contents: &str) -> (u64, u64) {
+    let mut cached_kb = None;
+    let mut buffers_kb = None;
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("Cached:") {
+            cached_kb = parse_meminfo_kb(rest);
+        } else if let Some(rest) = line.strip_prefix("Buffers:") {
+            buffers_kb = parse_meminfo_kb(rest);
+        }
+    }
+    (
+        cached_kb.unwrap_or(0) * 1024,
+        buffers_kb.unwrap_or(0) * 1024,
+    )
+}
+
+/// Parse the numeric kB value out of a `/proc/meminfo` value remainder (e.g.
+/// `"     123456 kB"`), ignoring the trailing unit. `None` if the first
+/// whitespace-separated token is absent or fails to parse as `u64`.
+fn parse_meminfo_kb(rest: &str) -> Option<u64> {
+    rest.split_whitespace().next()?.parse::<u64>().ok()
+}
+
+/// Select, from `disks`, the disk whose `mount_point` is the longest path
+/// prefix of `daemon_dir` — the filesystem the daemon's own working directory
+/// actually lives on (`docs/spec-telemetry-detail.md`: the daemon-global
+/// filesystem, not any per-connection project root). `None` if `disks` is
+/// empty or no mount point is an ancestor of `daemon_dir`, which should not
+/// happen on a real host, where `/` is always listed and always matches.
+fn select_daemon_disk<'a>(disks: &'a Disks, daemon_dir: &Path) -> Option<&'a Disk> {
+    disks
+        .list()
+        .iter()
+        .filter(|disk| daemon_dir.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().as_os_str().len())
 }
 
 /// Run a daemon over a single byte-stream transport until either side closes.
@@ -3799,29 +3914,37 @@ mod tests {
         let _ = tokio::fs::remove_file(&sock).await;
     }
 
-    /// `docs/spec-host-telemetry.md`: a real `sysinfo::System` refresh
-    /// produces a plausible host sample — `mem_total` positive, `cpu` a
-    /// percentage, `cpu_count` at least one core, and every load-average
-    /// field present. Pure and fast (no sampler task, no waiting on
-    /// `HOST_METRICS_INTERVAL`): exercises `build_host_metrics_message`
-    /// directly, the same builder `host_metrics_sampler` calls each tick.
-    /// Passes `None` for the PSI argument (`docs/spec-memory-pressure.md`):
-    /// the builder must pass it straight through onto the wire unmodified.
+    /// `docs/spec-host-telemetry.md` + `docs/spec-telemetry-detail.md`: a
+    /// real `sysinfo::System` refresh produces a plausible host sample —
+    /// `mem_total` positive, `cpu` a percentage, `cpu_count` at least one
+    /// core, every load-average field present, and `uptime_secs` (read
+    /// internally via `System::uptime()`) plausible. Pure and fast (no
+    /// sampler task, no waiting on `HOST_METRICS_INTERVAL`): exercises
+    /// `build_host_metrics_message` directly, the same builder
+    /// `host_metrics_sampler` calls each tick. Passes `None` for the PSI
+    /// argument (`docs/spec-memory-pressure.md`) and sentinel values for
+    /// `mem_cached`/`mem_buffers`/`disk_total`/`disk_available`: the builder
+    /// must pass all of them straight through onto the wire unmodified.
     #[test]
     fn test_build_host_metrics_message_produces_plausible_sample() {
         let mut system = System::new_all();
         system.refresh_cpu_usage();
         system.refresh_memory();
 
-        match build_host_metrics_message(&system, None) {
+        match build_host_metrics_message(&system, None, 111, 222, 333, 444) {
             DaemonMessage::HostMetrics {
                 cpu,
                 mem_total,
                 mem_available,
+                mem_cached,
+                mem_buffers,
                 swap_total: _,
                 swap_used: _,
                 load,
                 cpu_count,
+                uptime_secs,
+                disk_total,
+                disk_available,
                 psi,
             } => {
                 assert!(mem_total > 0, "a real host always reports total memory");
@@ -3835,6 +3958,14 @@ mod tests {
                 );
                 assert!(cpu_count >= 1, "a real host reports at least one core");
                 assert!(load.one >= 0.0 && load.five >= 0.0 && load.fifteen >= 0.0);
+                assert!(uptime_secs > 0, "a real host has been up for some time");
+                assert_eq!(mem_cached, 111, "mem_cached must pass through unmodified");
+                assert_eq!(mem_buffers, 222, "mem_buffers must pass through unmodified");
+                assert_eq!(disk_total, 333, "disk_total must pass through unmodified");
+                assert_eq!(
+                    disk_available, 444,
+                    "disk_available must pass through unmodified"
+                );
                 assert!(
                     psi.is_none(),
                     "None in must mean None out of a pure builder"
@@ -4222,7 +4353,7 @@ mod tests {
             full_avg300: 6.0,
         };
 
-        match build_host_metrics_message(&system, Some(psi)) {
+        match build_host_metrics_message(&system, Some(psi), 0, 0, 0, 0) {
             DaemonMessage::HostMetrics { psi: Some(got), .. } => {
                 assert_eq!(got, psi);
             }
@@ -4287,6 +4418,90 @@ mod tests {
         assert!(read_memory_pressure(&path).is_none());
     }
 
+    /// `docs/spec-telemetry-detail.md`: a `/proc/meminfo`-shaped fixture
+    /// parses `Cached` and `Buffers`, converting kB to bytes.
+    #[test]
+    fn test_read_meminfo_valid_fixture_yields_cached_and_buffers() {
+        let tmp = TempDir::new("meminfo-valid");
+        let path = tmp.path.join("meminfo");
+        write_file(
+            &path,
+            "MemTotal:       16384000 kB\n\
+             MemFree:         1234567 kB\n\
+             MemAvailable:    9000000 kB\n\
+             Buffers:          123456 kB\n\
+             Cached:          2345678 kB\n\
+             SwapCached:            0 kB\n",
+        );
+
+        let (cached, buffers) = read_meminfo(&path);
+
+        assert_eq!(cached, 2_345_678 * 1024);
+        assert_eq!(buffers, 123_456 * 1024);
+    }
+
+    /// `docs/spec-telemetry-detail.md`: a missing `Buffers` (or `Cached`)
+    /// line yields 0 for that field alone, never panicking; an absent path
+    /// yields `(0, 0)` rather than an error, since the fields are always
+    /// optional enhancements over the portable baseline.
+    #[test]
+    fn test_read_meminfo_missing_field_or_absent_path_yields_zero() {
+        let tmp = TempDir::new("meminfo-malformed");
+
+        let missing_buffers_path = tmp.path.join("missing-buffers");
+        write_file(
+            &missing_buffers_path,
+            "MemTotal:       16384000 kB\nCached:          2345678 kB\n",
+        );
+        let (cached, buffers) = read_meminfo(&missing_buffers_path);
+        assert_eq!(cached, 2_345_678 * 1024);
+        assert_eq!(buffers, 0, "a missing Buffers line must yield 0, not panic");
+
+        let empty_path = tmp.path.join("empty");
+        write_file(&empty_path, "");
+        assert_eq!(read_meminfo(&empty_path), (0, 0));
+
+        let garbage_path = tmp.path.join("garbage");
+        write_file(&garbage_path, "not the meminfo format at all\n");
+        assert_eq!(read_meminfo(&garbage_path), (0, 0));
+
+        let absent_path = tmp.path.join("does-not-exist");
+        assert_eq!(read_meminfo(&absent_path), (0, 0));
+    }
+
+    /// `docs/spec-telemetry-detail.md`: an empty disk list matches no
+    /// `daemon_dir`, so [`select_daemon_disk`] returns `None` rather than
+    /// panicking or picking an arbitrary entry.
+    #[test]
+    fn test_select_daemon_disk_empty_disks_returns_none() {
+        let disks = Disks::new();
+
+        assert!(select_daemon_disk(&disks, Path::new("/tmp")).is_none());
+    }
+
+    /// `docs/spec-telemetry-detail.md`: against the real host's mount list,
+    /// the daemon's own working directory always resolves to some disk (`/`
+    /// is always listed on Linux) with a plausible positive `total_space`,
+    /// and the selected mount point is genuinely a prefix of the queried
+    /// directory (the "longest mount-point prefix wins" contract).
+    #[test]
+    fn test_select_daemon_disk_real_disks_picks_prefix_match() {
+        let disks = Disks::new_with_refreshed_list();
+        let daemon_dir = std::env::current_dir().expect("test process has a working directory");
+
+        let disk = select_daemon_disk(&disks, &daemon_dir)
+            .expect("a real host always has at least `/` mounted");
+
+        assert!(
+            daemon_dir.starts_with(disk.mount_point()),
+            "the selected mount point must be a prefix of the queried directory"
+        );
+        assert!(
+            disk.total_space() > 0,
+            "a real mounted filesystem reports nonzero total space"
+        );
+    }
+
     /// `docs/spec-host-telemetry.md`: on `Hello`, a connection replays the
     /// daemon-global bus's CACHED latest sample right behind the handshake
     /// (and the — here absent — worktree snapshot), so a (re)attaching client
@@ -4302,6 +4517,8 @@ mod tests {
             cpu: 12.5,
             mem_total: 16_000_000_000,
             mem_available: 8_000_000_000,
+            mem_cached: 3_000_000_000,
+            mem_buffers: 200_000_000,
             swap_total: 2_000_000_000,
             swap_used: 0,
             load: LoadAverage {
@@ -4310,6 +4527,9 @@ mod tests {
                 fifteen: 0.3,
             },
             cpu_count: 8,
+            uptime_secs: 3_600,
+            disk_total: 500_000_000_000,
+            disk_available: 200_000_000_000,
             psi: None,
         };
         let (_host_metrics_tx, host_metrics_events) =
