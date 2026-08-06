@@ -37,6 +37,8 @@ pub enum SshError {
     HostKeyMismatch { host: String, line: usize },
     #[error("known_hosts error: {0}")]
     KnownHosts(String),
+    #[error("WSL error: {0}")]
+    Wsl(String),
 }
 
 impl SshError {
@@ -46,8 +48,9 @@ impl SshError {
     /// Transport-shaped deaths (dropped connection, dead channel, remote I/O,
     /// timeouts) are worth retrying — the outage may heal. Deterministic
     /// auth/config failures (bad key, refused auth, host-key/known_hosts
-    /// problems) are not: retrying cannot fix them, and hiding them behind a
-    /// retry banner would mask real misconfiguration.
+    /// problems, an unreachable WSL distro or a missing `wsl.exe`) are not:
+    /// retrying cannot fix them, and hiding them behind a retry banner would
+    /// mask real misconfiguration.
     pub fn is_retryable(&self) -> bool {
         !matches!(
             self,
@@ -56,6 +59,7 @@ impl SshError {
                 | SshError::KeyEncrypted
                 | SshError::HostKeyMismatch { .. }
                 | SshError::KnownHosts(_)
+                | SshError::Wsl(_)
         )
     }
 }
@@ -104,6 +108,13 @@ mod tests {
         }
         .is_retryable());
         assert!(!SshError::KnownHosts("unreadable known_hosts".into()).is_retryable());
+    }
+
+    #[test]
+    fn test_is_retryable_wsl_unavailable_returns_false() {
+        // A stopped/mistyped distro or a missing `wsl.exe` cannot be healed
+        // by retrying (issue #923, `docs/spec-wsl-transport.md`).
+        assert!(!SshError::Wsl("distro 'Ubuntu' is not reachable".into()).is_retryable());
     }
 
     #[test]
