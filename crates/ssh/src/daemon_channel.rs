@@ -16,12 +16,16 @@ use tracing::warn;
 
 use crate::error::SshError;
 
-/// Raw byte transport over a single SSH exec channel.
+/// Raw byte transport over the daemon's underlying process/channel — an SSH
+/// exec channel ([`DaemonChannel::new`]) or a WSL `wsl.exe` child's piped
+/// stdio ([`DaemonChannel::from_parts`], fed by
+/// [`crate::wsl::WslConnection::open_daemon_channel`]'s own actor).
 ///
-/// Owns a channel actor that forwards the remote daemon's stdout
-/// (`ChannelMsg::Data`) to a reader queue and writes outbound bytes to the
-/// channel. No PTY, no resize. Remote stderr (`ChannelMsg::ExtendedData`) is
-/// kept out of the frame stream — it would corrupt the protocol framing.
+/// Owns (SSH) or is handed (WSL) an actor that forwards the daemon's raw
+/// output bytes to a reader queue and writes outbound bytes to the
+/// transport. No PTY, no resize. Remote stderr (SSH's `ChannelMsg::ExtendedData`,
+/// the WSL child's stderr) is kept out of the frame stream — it would corrupt
+/// the protocol framing.
 pub struct DaemonChannel {
     data_rx: flume::Receiver<Vec<u8>>,
     write_tx: flume::Sender<Vec<u8>>,
@@ -37,10 +41,15 @@ impl DaemonChannel {
         Self { data_rx, write_tx }
     }
 
-    /// Wire a channel directly to in-memory queues, bypassing SSH — the test
-    /// seam for exercising [`DaemonClient`] against a stubbed daemon side.
-    #[cfg(test)]
-    fn from_parts(data_rx: flume::Receiver<Vec<u8>>, write_tx: flume::Sender<Vec<u8>>) -> Self {
+    /// Wire raw byte queues directly into a [`DaemonChannel`] — the
+    /// transport-agnostic constructor. Used by
+    /// [`crate::wsl::WslConnection::open_daemon_channel`], whose own actor
+    /// drives a `wsl.exe` child's piped stdio (no SSH `Channel` to wrap), and
+    /// by tests exercising [`DaemonClient`] against a stubbed daemon side.
+    pub(crate) fn from_parts(
+        data_rx: flume::Receiver<Vec<u8>>,
+        write_tx: flume::Sender<Vec<u8>>,
+    ) -> Self {
         Self { data_rx, write_tx }
     }
 

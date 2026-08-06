@@ -2299,6 +2299,10 @@ fn build_host_metrics_message(system: &System, psi: Option<MemoryPressure>) -> D
         cpu: system.global_cpu_usage(),
         mem_total: system.total_memory(),
         mem_available: system.available_memory(),
+        // TODO(#928): populate from a small `/proc/meminfo` read (`Cached`/
+        // `Buffers`, which `sysinfo` does not expose).
+        mem_cached: 0,
+        mem_buffers: 0,
         swap_total: system.total_swap(),
         swap_used: system.used_swap(),
         load: LoadAverage {
@@ -2307,6 +2311,12 @@ fn build_host_metrics_message(system: &System, psi: Option<MemoryPressure>) -> D
             fifteen: load.fifteen,
         },
         cpu_count: system.cpus().len() as u32,
+        // TODO(#928): populate from `sysinfo::System::uptime()`.
+        uptime_secs: 0,
+        // TODO(#928): populate from `sysinfo`'s `disk` feature (the daemon's
+        // own filesystem).
+        disk_total: 0,
+        disk_available: 0,
         psi,
     }
 }
@@ -3818,10 +3828,15 @@ mod tests {
                 cpu,
                 mem_total,
                 mem_available,
+                mem_cached: _,
+                mem_buffers: _,
                 swap_total: _,
                 swap_used: _,
                 load,
                 cpu_count,
+                uptime_secs: _,
+                disk_total: _,
+                disk_available: _,
                 psi,
             } => {
                 assert!(mem_total > 0, "a real host always reports total memory");
@@ -4302,6 +4317,8 @@ mod tests {
             cpu: 12.5,
             mem_total: 16_000_000_000,
             mem_available: 8_000_000_000,
+            mem_cached: 3_000_000_000,
+            mem_buffers: 200_000_000,
             swap_total: 2_000_000_000,
             swap_used: 0,
             load: LoadAverage {
@@ -4310,6 +4327,9 @@ mod tests {
                 fifteen: 0.3,
             },
             cpu_count: 8,
+            uptime_secs: 3_600,
+            disk_total: 500_000_000_000,
+            disk_available: 200_000_000_000,
             psi: None,
         };
         let (_host_metrics_tx, host_metrics_events) =
