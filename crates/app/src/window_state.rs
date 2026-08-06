@@ -138,7 +138,11 @@ pub struct WindowState {
     /// workspace. A present entry naming an area this build does not
     /// recognize (an older/future schema) is dropped rather than failing
     /// the whole parse, via [`deserialize_tolerant_areas`] — see "State
-    /// drift on area set changes" in the spec's Risks.
+    /// drift on area set changes" in the spec's Risks. The one exception is
+    /// the removed pre-Phase-56 `"explorer_editor"` fused tag
+    /// (`docs/spec-explorer-editor-split.md`, issue #940): it expands into
+    /// *both* `Area::Explorer` and `Area::Editor` instead of dropping, so an
+    /// upgrading user keeps both panels rather than losing them.
     #[serde(
         default = "default_visible_areas",
         deserialize_with = "deserialize_tolerant_areas"
@@ -148,7 +152,12 @@ pub struct WindowState {
     /// #820 wires the setter that ever sets this away from `None`) — `None`
     /// means no area is soloed, the field's default. Same drop-not-fail
     /// tolerance as `visible_areas` for an unrecognized value, via
-    /// [`deserialize_tolerant_solo_area`].
+    /// [`deserialize_tolerant_solo_area`]. The legacy `"explorer_editor"`
+    /// token also degrades to `None` here (issue #940) — a single solo slot
+    /// cannot hold two areas, and un-soloing is what actually lets the
+    /// (now-expanded) `visible_areas` set render both Explorer and Editor,
+    /// since a set solo target hides every other area regardless of its own
+    /// membership in `visible_areas` (`workspace::Visibility::is_visible`).
     #[serde(default, deserialize_with = "deserialize_tolerant_solo_area")]
     pub solo_area: Option<Area>,
 }
@@ -164,33 +173,59 @@ fn default_visible_areas() -> Vec<Area> {
 
 /// Deserialize a present `visible_areas` array tolerantly (issue #822,
 /// spec risk "State drift on area set changes"): each element is parsed as
-/// an [`Area`] independently, and one that fails to match a known variant
-/// (a persisted name a future/older build removed or renamed) is dropped
-/// rather than failing the whole field. Plain `Vec<Area>` deserialization
-/// would instead fail the entire array on one bad element, which — since
-/// container-level `#[serde(default)]` only fills *missing* fields, not a
-/// *present*-but-invalid one — would propagate up and reset the whole
-/// [`WindowState`] to default, losing bounds/theme/recents along with it.
+/// an [`Area`] independently via [`expand_area_value`], and one that fails
+/// to match a known variant (a persisted name a future/older build removed
+/// or renamed) is dropped rather than failing the whole field. Plain
+/// `Vec<Area>` deserialization would instead fail the entire array on one
+/// bad element, which — since container-level `#[serde(default)]` only
+/// fills *missing* fields, not a *present*-but-invalid one — would
+/// propagate up and reset the whole [`WindowState`] to default, losing
+/// bounds/theme/recents along with it.
 fn deserialize_tolerant_areas<'de, D>(deserializer: D) -> Result<Vec<Area>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let raw = Vec::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(raw
+    Ok(raw.into_iter().flat_map(expand_area_value).collect())
+}
+
+/// Parse one raw `visible_areas` element into zero, one, or two [`Area`]s
+/// (`docs/spec-explorer-editor-split.md`, issue #940). The removed
+/// pre-Phase-56 `"explorer_editor"` fused tag expands into *both*
+/// `Area::Explorer` and `Area::Editor` — the two areas it used to represent
+/// before the split — instead of being dropped, so an upgrading user keeps
+/// both panels open rather than losing them to the generic
+/// unrecognized-variant drop below. Any other value this build does not
+/// recognize (a genuinely future/removed area) still yields zero areas via
+/// `serde_json::from_value`'s `Err`, exactly like before this migration.
+fn expand_area_value(value: serde_json::Value) -> Vec<Area> {
+    if value.as_str() == Some("explorer_editor") {
+        return vec![Area::Explorer, Area::Editor];
+    }
+    serde_json::from_value::<Area>(value)
+        .ok()
         .into_iter()
-        .filter_map(|value| serde_json::from_value::<Area>(value).ok())
-        .collect())
+        .collect()
 }
 
 /// Same tolerance as [`deserialize_tolerant_areas`] for the single optional
 /// `solo_area` slot: a present-but-unrecognized value degrades to `None`
-/// (no solo) instead of failing the parse.
+/// (no solo) instead of failing the parse. The legacy `"explorer_editor"`
+/// token (issue #940) degrades to `None` the same way, deliberately: a
+/// single solo slot cannot hold two areas, and un-soloing is what lets the
+/// (separately expanded) `visible_areas` set actually render both Explorer
+/// and Editor, rather than a single-area solo hiding one of them.
 fn deserialize_tolerant_solo_area<'de, D>(deserializer: D) -> Result<Option<Area>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(raw.and_then(|value| serde_json::from_value::<Area>(value).ok()))
+    Ok(raw.and_then(|value| {
+        if value.as_str() == Some("explorer_editor") {
+            return None;
+        }
+        serde_json::from_value::<Area>(value).ok()
+    }))
 }
 
 impl Default for WindowState {
@@ -930,15 +965,19 @@ mod tests {
         );
     }
 
-    /// `docs/spec-explorer-editor-split.md` (issue #939): `Area::ExplorerEditor`
-    /// was split into `Area::Explorer` + `Area::Editor`, so a pre-Phase-56
-    /// persisted `"explorer_editor"` token is, today, just another
-    /// unrecognized `Area` variant to the tolerant deserializer above — it is
-    /// dropped, not fatal, exactly like `some_future_area`. This pins that
-    /// safe, non-crashing degrade; expanding it into *both* `Explorer` and
-    /// `Editor` instead of dropping it is issue #940.
+    /// `docs/spec-explorer-editor-split.md` (issue #940): a pre-Phase-56
+    /// persisted `"explorer_editor"` token, the fused area that
+    /// `Area::Explorer` and `Area::Editor` replaced, must expand to both new
+    /// areas on load instead of being dropped like a genuinely unrecognized
+    /// variant (that drop-not-fatal case stays pinned by
+    /// `test_unknown_area_variant_in_visible_areas_is_dropped_not_fatal`
+    /// above), so an upgrading user keeps both panels rather than starting
+    /// with neither. The solo slot cannot hold two areas at once, so a
+    /// legacy solo target un-solos instead — the (separately expanded)
+    /// `visible_areas` set is what actually renders both panels; a solo
+    /// target hides every area but itself.
     #[test]
-    fn test_legacy_explorer_editor_variant_in_visible_areas_is_dropped_not_fatal() {
+    fn test_legacy_explorer_editor_variant_in_visible_areas_expands_to_both_areas() {
         let json = r#"{
             "visible_areas": ["explorer_editor", "terminal", "git"],
             "solo_area": "explorer_editor"
@@ -948,13 +987,27 @@ mod tests {
 
         assert_eq!(
             parsed.visible_areas,
-            vec![Area::Terminal, Area::Git],
-            "the removed explorer_editor token is dropped like any unrecognized variant"
+            vec![Area::Explorer, Area::Editor, Area::Terminal, Area::Git],
+            "the removed explorer_editor token expands to both new areas, in place, \
+             alongside the other recognized entries"
         );
         assert_eq!(
             parsed.solo_area, None,
-            "a legacy explorer_editor solo target degrades to no solo"
+            "a legacy explorer_editor solo target un-solos rather than picking one area, \
+             so the expanded visible_areas set renders both panels"
         );
+    }
+
+    /// A truly unrelated future/unknown solo target (not the legacy
+    /// `"explorer_editor"` token) still degrades to no solo, same as
+    /// before this migration — the special-cased expand in
+    /// `deserialize_tolerant_solo_area` must not swallow other values too.
+    #[test]
+    fn test_unknown_solo_area_variant_degrades_to_no_solo() {
+        let json = r#"{"solo_area": "some_future_area"}"#;
+        let parsed: WindowState = serde_json::from_str(json).expect("parse despite unknown solo");
+
+        assert_eq!(parsed.solo_area, None);
     }
 
     /// Issue #873 (`docs/spec-host-scoped-root-recents.md`): an old state
