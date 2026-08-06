@@ -30,11 +30,35 @@ pub const MAX_RECENTS: usize = 8;
 /// whole list (issue #873, `docs/spec-host-scoped-root-recents.md`).
 pub const MAX_RECENT_ROOTS: usize = 8;
 
+/// The connection-kind discriminator (issue #924, `docs/spec-wsl-transport.md`):
+/// SSH (host/user/port/key) or WSL (distro name only). Threaded through
+/// [`RecentConnection`] and the app's connect-time types (`SshConfig`,
+/// `ConnectRequest`) so a WSL target is stored, deduped, and reconnected
+/// distinctly from an SSH target. `#[default]` is `Ssh` so an older recents
+/// entry written before this field existed (field absent in JSON) tolerantly
+/// loads as an SSH target rather than failing the parse (the same
+/// `#[serde(default)]` contract `remote_exec_wrapper`/`recent_roots` already
+/// rely on, #477).
+///
+/// The connect-card kind toggle / distro chooser UI is out of scope here
+/// (issue #926) — this is the data plumbing only, so every connect flow in
+/// this codebase still produces `Ssh` entries; the enum and the WSL identity
+/// keying below are exercised directly by unit tests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnectionKind {
+    #[default]
+    Ssh,
+    Wsl,
+}
+
 /// One entry in the RECENT list: everything the Connection screen's connect
 /// card needs to prefill and reconnect with one click.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RecentConnection {
+    /// SSH vs WSL (issue #924); see [`ConnectionKind`]. Additive over the
+    /// pre-#924 schema, tolerant-loading absent as `Ssh`.
+    pub kind: ConnectionKind,
     pub host: String,
     pub user: String,
     pub port: u16,
@@ -42,6 +66,10 @@ pub struct RecentConnection {
     /// `PathBuf`: the store is plain JSON text, and the card round-trips it
     /// through a text input either way).
     pub key: String,
+    /// The WSL distro name (issue #924); only meaningful when `kind` is
+    /// [`ConnectionKind::Wsl`], empty for an SSH entry. Additive over the
+    /// pre-#924 schema, tolerant-loading absent as `""`.
+    pub distro: String,
     pub session: String,
     /// The connect card's Remote exec wrapper field value at connect time
     /// (issue #790, `docs/spec-remote-exec-wrapper-ui.md`), e.g.
@@ -68,10 +96,12 @@ pub struct RecentConnection {
 impl Default for RecentConnection {
     fn default() -> Self {
         Self {
+            kind: ConnectionKind::default(),
             host: String::new(),
             user: String::new(),
             port: 22,
             key: String::new(),
+            distro: String::new(),
             session: String::new(),
             remote_exec_wrapper: String::new(),
             last_connected_unix_secs: 0,
@@ -80,18 +110,46 @@ impl Default for RecentConnection {
     }
 }
 
-/// The host/user/port/key/wrapper identity a recents entry is keyed on, as a
-/// comparable tuple — the shared shape [`same_target`] (two entries) and
-/// [`matches_target`] (an entry vs. a live [`RecentTarget`]) both compare, so
-/// the five fields are named in exactly one place.
-fn identity(entry: &RecentConnection) -> (&str, &str, u16, &str, &str) {
-    (
-        entry.host.as_str(),
-        entry.user.as_str(),
-        entry.port,
-        entry.key.as_str(),
-        entry.remote_exec_wrapper.as_str(),
-    )
+/// The identity a recents entry is keyed on for dedupe/move-to-front
+/// purposes (issue #924, `docs/spec-wsl-transport.md`) — one variant per
+/// [`ConnectionKind`], so an SSH target and a WSL target can never compare
+/// equal even if their string fields happened to coincide: the enum
+/// discriminant differs. [`same_target`] (two entries) and [`matches_target`]
+/// (an entry vs. a live [`RecentTarget`]) both build this, so the identity
+/// fields are named in exactly one place per kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Identity<'a> {
+    /// SSH is keyed on the host/user/port/key/wrapper 5-tuple (issue #790).
+    Ssh(&'a str, &'a str, u16, &'a str, &'a str),
+    /// WSL is keyed on the distro name alone — two WSL targets on the same
+    /// distro are the same target regardless of any other field.
+    Wsl(&'a str),
+}
+
+fn identity(entry: &RecentConnection) -> Identity<'_> {
+    match entry.kind {
+        ConnectionKind::Ssh => Identity::Ssh(
+            entry.host.as_str(),
+            entry.user.as_str(),
+            entry.port,
+            entry.key.as_str(),
+            entry.remote_exec_wrapper.as_str(),
+        ),
+        ConnectionKind::Wsl => Identity::Wsl(entry.distro.as_str()),
+    }
+}
+
+fn identity_of_target(target: &RecentTarget) -> Identity<'_> {
+    match target.kind {
+        ConnectionKind::Ssh => Identity::Ssh(
+            target.host.as_str(),
+            target.user.as_str(),
+            target.port,
+            target.key.as_str(),
+            target.remote_exec_wrapper.as_str(),
+        ),
+        ConnectionKind::Wsl => Identity::Wsl(target.distro.as_str()),
+    }
 }
 
 /// Whether two entries are the same connection target for the recents list's
@@ -101,24 +159,18 @@ fn identity(entry: &RecentConnection) -> (&str, &str, u16, &str, &str) {
 /// growing the list per session tried against the same host. The wrapper
 /// (issue #790) joins the key: a container recent (host + wrapper) and a
 /// bare-host recent to the same host are distinct functional targets, so both
-/// stay re-runnable rather than one clobbering the other's wrapper.
+/// stay re-runnable rather than one clobbering the other's wrapper. A WSL
+/// entry never matches an SSH entry (issue #924): [`identity`] keys each kind
+/// on a distinct [`Identity`] variant.
 fn same_target(a: &RecentConnection, b: &RecentConnection) -> bool {
     identity(a) == identity(b)
 }
 
-/// Whether `entry` is the connection `target` identifies — the same five
-/// fields [`same_target`] compares, against a live [`RecentTarget`] instead
-/// of a second stored entry (issue #873, `docs/spec-host-scoped-root-
-/// recents.md`).
+/// Whether `entry` is the connection `target` identifies — the same identity
+/// [`same_target`] compares, against a live [`RecentTarget`] instead of a
+/// second stored entry (issue #873, `docs/spec-host-scoped-root-recents.md`).
 fn matches_target(entry: &RecentConnection, target: &RecentTarget) -> bool {
-    identity(entry)
-        == (
-            target.host.as_str(),
-            target.user.as_str(),
-            target.port,
-            target.key.as_str(),
-            target.remote_exec_wrapper.as_str(),
-        )
+    identity(entry) == identity_of_target(target)
 }
 
 /// The host/user/port/key/wrapper identity for a recents entry (issue #707,
@@ -132,10 +184,18 @@ fn matches_target(entry: &RecentConnection, target: &RecentTarget) -> bool {
 /// `workspace::WorkspaceView::new`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecentTarget {
+    /// SSH vs WSL (issue #924); see [`ConnectionKind`]. Every connect flow
+    /// in this codebase still produces `Ssh` today (the kind toggle is
+    /// issue #926) — carried here so the identity/record plumbing is
+    /// already kind-aware.
+    pub kind: ConnectionKind,
     pub host: String,
     pub user: String,
     pub port: u16,
     pub key: String,
+    /// The WSL distro name (issue #924); only meaningful when `kind` is
+    /// [`ConnectionKind::Wsl`].
+    pub distro: String,
     /// The connect-time Remote exec wrapper field value (issue #790), empty
     /// for a normal host connection — persisted onto the recorded
     /// [`RecentConnection`] so a container recent stays re-runnable.
@@ -150,10 +210,12 @@ impl RecentTarget {
     pub fn record(&self, path: &Path, session: &str) {
         let now = now_unix_secs();
         let entry = RecentConnection {
+            kind: self.kind,
             host: self.host.clone(),
             user: self.user.clone(),
             port: self.port,
             key: self.key.clone(),
+            distro: self.distro.clone(),
             session: session.to_string(),
             remote_exec_wrapper: self.remote_exec_wrapper.clone(),
             last_connected_unix_secs: now,
@@ -199,10 +261,12 @@ pub fn merge_recent_root(path: &Path, target: &RecentTarget, root: &str) -> Resu
         }
         None => {
             let entry = RecentConnection {
+                kind: target.kind,
                 host: target.host.clone(),
                 user: target.user.clone(),
                 port: target.port,
                 key: target.key.clone(),
+                distro: target.distro.clone(),
                 remote_exec_wrapper: target.remote_exec_wrapper.clone(),
                 recent_roots: vec![root.to_string()],
                 ..RecentConnection::default()
@@ -375,10 +439,12 @@ mod tests {
 
     fn sample(host: &str) -> RecentConnection {
         RecentConnection {
+            kind: ConnectionKind::Ssh,
             host: host.to_string(),
             user: "developer".to_string(),
             port: 22,
             key: "/home/developer/.ssh/id_ed25519".to_string(),
+            distro: String::new(),
             session: "rift".to_string(),
             remote_exec_wrapper: String::new(),
             last_connected_unix_secs: 0,
@@ -386,12 +452,26 @@ mod tests {
         }
     }
 
+    /// A WSL-kind entry (issue #924) — mirrors [`sample`] but keyed by
+    /// `distro` instead of the SSH fields, which are left blank exactly as a
+    /// WSL entry the (future, #926) card would produce.
+    fn sample_wsl(distro: &str) -> RecentConnection {
+        RecentConnection {
+            kind: ConnectionKind::Wsl,
+            distro: distro.to_string(),
+            session: "rift".to_string(),
+            ..RecentConnection::default()
+        }
+    }
+
     fn sample_target(host: &str) -> RecentTarget {
         RecentTarget {
+            kind: ConnectionKind::Ssh,
             host: host.to_string(),
             user: "developer".to_string(),
             port: 22,
             key: "/home/developer/.ssh/id_ed25519".to_string(),
+            distro: String::new(),
             remote_exec_wrapper: String::new(),
         }
     }
@@ -663,6 +743,124 @@ mod tests {
             recents[MAX_RECENTS - 1].host,
             format!("host-{}", 3),
             "oldest entries beyond the cap are dropped"
+        );
+    }
+
+    // --- connection kind (#924) ---------------------------------------------
+
+    #[test]
+    fn test_save_then_load_round_trips_wsl_kind() {
+        let scratch = Scratch::new("roundtrip_wsl");
+        let path = scratch.path("recents.json");
+        let recents = vec![sample_wsl("Ubuntu")];
+
+        save(&path, &recents).expect("save");
+
+        let loaded = load(&path);
+        assert_eq!(loaded, recents);
+        assert_eq!(loaded[0].kind, ConnectionKind::Wsl);
+        assert_eq!(loaded[0].distro, "Ubuntu");
+    }
+
+    #[test]
+    fn test_load_field_absent_kind_and_distro_defaults_to_ssh() {
+        let scratch = Scratch::new("kind_absent");
+        let path = scratch.path("recents.json");
+        // Hand-written JSON without `kind`/`distro`, simulating an entry
+        // written before this change (issue #924's tolerant-load contract,
+        // mirroring #790's `remote_exec_wrapper` precedent, #477).
+        let json = r#"[{
+            "host": "100.64.0.1",
+            "user": "developer",
+            "port": 22,
+            "key": "/home/developer/.ssh/id_ed25519",
+            "session": "rift",
+            "remote_exec_wrapper": "",
+            "last_connected_unix_secs": 1000
+        }]"#;
+        fs::write(&path, json).expect("write field-absent json");
+
+        let recents = load(&path);
+
+        assert_eq!(recents.len(), 1);
+        assert_eq!(recents[0].kind, ConnectionKind::Ssh);
+        assert_eq!(recents[0].distro, "");
+    }
+
+    #[test]
+    fn test_load_malformed_kind_returns_empty_without_panic() {
+        let scratch = Scratch::new("kind_malformed");
+        let path = scratch.path("recents.json");
+        // An unrecognized `kind` value falls back to the whole-file tolerant
+        // load ([`load`]'s existing malformed-JSON contract), not a panic.
+        let json = r#"[{"kind": "Docker", "host": "100.64.0.1"}]"#;
+        fs::write(&path, json).expect("write malformed kind json");
+
+        assert_eq!(load(&path), Vec::new());
+    }
+
+    #[test]
+    fn test_identity_two_wsl_targets_on_same_distro_dedup() {
+        let scratch = Scratch::new("wsl_dedup");
+        let path = scratch.path("recents.json");
+
+        record(&path, sample_wsl("Ubuntu"), 1_000).expect("first record");
+        let recents = record(&path, sample_wsl("Ubuntu"), 2_000).expect("second record");
+
+        assert_eq!(
+            recents.len(),
+            1,
+            "two WSL targets on the same distro are the same recents entry"
+        );
+        assert_eq!(recents[0].last_connected_unix_secs, 2_000);
+    }
+
+    #[test]
+    fn test_identity_wsl_targets_on_different_distros_are_distinct() {
+        let scratch = Scratch::new("wsl_distinct");
+        let path = scratch.path("recents.json");
+
+        record(&path, sample_wsl("Ubuntu"), 1_000).expect("first record");
+        let recents = record(&path, sample_wsl("Debian"), 2_000).expect("second record");
+
+        assert_eq!(recents.len(), 2, "different distros are distinct targets");
+    }
+
+    #[test]
+    fn test_identity_ssh_and_wsl_never_collide() {
+        // An SSH entry and a WSL entry that happen to share every string
+        // field value (both blank) must never be treated as the same
+        // target — the kind discriminant alone must decide.
+        let ssh = RecentConnection {
+            kind: ConnectionKind::Ssh,
+            ..RecentConnection::default()
+        };
+        let wsl = RecentConnection {
+            kind: ConnectionKind::Wsl,
+            ..RecentConnection::default()
+        };
+
+        assert!(
+            !same_target(&ssh, &wsl),
+            "an SSH and a WSL entry must never collide, even with identical blank fields"
+        );
+    }
+
+    #[test]
+    fn test_record_ssh_and_wsl_to_same_host_string_stay_distinct() {
+        let scratch = Scratch::new("ssh_wsl_distinct");
+        let path = scratch.path("recents.json");
+        let ssh = sample("Ubuntu");
+        let mut wsl = sample_wsl("Ubuntu");
+        wsl.host = "Ubuntu".to_string();
+
+        record(&path, ssh, 1_000).expect("record ssh");
+        let recents = record(&path, wsl, 2_000).expect("record wsl");
+
+        assert_eq!(
+            recents.len(),
+            2,
+            "an SSH host and a WSL distro sharing the same string are distinct recents"
         );
     }
 
