@@ -203,8 +203,8 @@ use flume::Sender;
 use gpui::{
     canvas, div, fill, px, App, AppContext as _, Bounds, ClickEvent, Context, Entity, EventEmitter,
     FocusHandle, Focusable, Hsla, InteractiveElement as _, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels, Point, Render, SharedString, Size,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point, Render,
+    SharedString, Size, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dialog::{AlertDialog, Dialog, DialogButtonProps};
@@ -724,6 +724,16 @@ pub struct EditorView {
     /// harmless because the strip's geometry barely moves between frames.
     minimap_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 
+    /// Whether the minimap strip is currently being dragged (#937,
+    /// `docs/spec-editor-minimap.md`). Set on the strip's own mouse-down
+    /// alongside the initial click-to-jump; while set, `render` adds a
+    /// full-window occluding overlay that captures further mouse-move/
+    /// mouse-up so the drag does not fight the editor's own mouse handling
+    /// (text selection, hover-debounce) underneath — mirrors the terminal's
+    /// border-drag idiom (`crates/terminal/src/session_view.rs`
+    /// `BorderDrag`/`:2922-2989`). Cleared on mouse-up.
+    minimap_drag: bool,
+
     /// Whether the right-dock results panel is currently showing this editor's
     /// nav results (`docs/spec-editor-chrome.md` §3, #529). Set when a response
     /// is emitted to the panel; cleared when the editor closes it (Escape) or
@@ -759,6 +769,7 @@ impl EditorView {
             nav_id: 0,
             content_bounds: Rc::new(Cell::new(None)),
             minimap_bounds: Rc::new(Cell::new(None)),
+            minimap_drag: false,
             results_visible: false,
         }
     }
@@ -2158,16 +2169,28 @@ impl EditorView {
         cx.notify();
     }
 
-    /// Jump the active tab to the minimap-clicked line (`docs/spec-editor-chrome.md`:
-    /// "click-to-jump"). `click_y` is the window-space vertical position of the
-    /// click; the strip's captured bounds turn it into a 0..1 ratio, then a
-    /// target line. The jump lands the caret at that line's start via
-    /// `InputState::set_cursor_position`, which scrolls it into view — the only
-    /// public scroll seam this gpui-component pin exposes (there is no
-    /// scroll-offset setter), so a minimap click both scrolls to and selects the
-    /// clicked line, matching the ctrl+click / nav jumps that already move the
-    /// caret. The position is clamped to a valid line, and the rope layer clamps
-    /// the column, so an out-of-range click still lands somewhere sane.
+    /// Jump the active tab to the minimap-clicked (or -dragged) line
+    /// (`docs/spec-editor-minimap.md`: "click-to-jump" / "drag-to-scroll").
+    /// `pointer_y` is the window-space vertical position of the pointer; the
+    /// strip's captured bounds turn it into a 0..1 ratio ([`minimap_pointer_ratio`]),
+    /// then a target line ([`minimap_click_line`]). The jump lands the caret at
+    /// that line's start via `InputState::set_cursor_position`, which scrolls it
+    /// into view — the only public scroll seam this gpui-component pin exposes
+    /// (there is no scroll-offset setter), so both a minimap click and a
+    /// minimap drag scroll by moving the caret to the pointer's line, matching
+    /// the ctrl+click / nav jumps that already move the caret. The position is
+    /// clamped to a valid line, and the rope layer clamps the column, so an
+    /// out-of-range pointer position still lands somewhere sane.
+    ///
+    /// Called once on the strip's mouse-down (click-to-jump) and again on
+    /// every mouse-move while [`EditorView::minimap_drag`] is set (drag-to-scroll,
+    /// #937) — a drag is nothing but this same jump repeated continuously.
+    /// **Known v1 limitation** (`docs/spec-editor-minimap.md`): because the only
+    /// scroll seam is `set_cursor_position`, the caret visibly follows the
+    /// pointer as a drag scrolls, rather than the document scrolling under a
+    /// stationary caret. Accepted at the gate; a caret-free drag would need a
+    /// scroll-offset setter the pin does not expose, deferred to a possible
+    /// pin-extension follow-up.
     fn minimap_jump(&mut self, click_y: Pixels, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.active else {
             return;
@@ -2179,7 +2202,8 @@ impl EditorView {
         if strip_height <= 0.0 {
             return;
         }
-        let ratio = (f32::from(click_y) - f32::from(bounds.origin.y)) / strip_height;
+        let ratio =
+            minimap_pointer_ratio(f32::from(click_y), f32::from(bounds.origin.y), strip_height);
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
@@ -3417,10 +3441,12 @@ impl Render for EditorView {
         // scrollbar (`docs/spec-editor-minimap.md`). A single `canvas` paints the
         // downsampled indentation-silhouette blocks, the diagnostic marks, and the
         // viewport slab in one pass — no second text render — and records its
-        // bounds for click-to-jump. The click handler jumps the view to the
-        // clicked line; `stop_propagation` keeps a strip click from reaching the
-        // outer ctrl+click-to-definition handler. Drag-to-scroll is out of scope
-        // for this step (#937) — click-to-jump stays the only interaction.
+        // bounds for click-to-jump and drag. The mouse-down both jumps to the
+        // clicked line and arms `minimap_drag` (#937, drag-to-scroll);
+        // `stop_propagation` keeps a strip click from reaching the outer
+        // ctrl+click-to-definition handler. While `minimap_drag` is set, the
+        // full-window occluding overlay appended below `editor_row` captures the
+        // continuing drag.
         let minimap_bounds = self.minimap_bounds.clone();
         let minimap_strip = div()
             .id("editor-minimap")
@@ -3443,6 +3469,7 @@ impl Render for EditorView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.minimap_drag = true;
                     this.minimap_jump(event.position.y, window, cx);
                     cx.stop_propagation();
                 }),
@@ -3454,7 +3481,8 @@ impl Render for EditorView {
         // Re-derived on every render, so it live-updates on any buffer
         // change — the same [`Self::observe_input`] notify that already
         // repaints the source editor on every keystroke or programmatic
-        // edit (`docs/spec-markdown-preview.md`).
+        // edit (`docs/spec-markdown-preview.md`). When the preview is not
+        // active, the row is the source editor beside the minimap strip.
         let editor_row = if markdown_preview_active {
             let content = tab.input.read(cx).value().to_string();
             div()
@@ -3478,8 +3506,38 @@ impl Render for EditorView {
                 .child(minimap_strip)
                 .into_any_element()
         };
+        root = root.child(editor_row);
 
-        root.child(editor_row).into_any_element()
+        // While dragging the minimap (`minimap_drag`, #937), a full-window
+        // occluding overlay captures every mouse-move/mouse-up so the drag does
+        // not fight the editor's own mouse handling (text selection, the
+        // hover-debounce `on_mouse_move` on the outer `root`) underneath —
+        // mirrors the terminal's border-drag idiom
+        // (`crates/terminal/src/session_view.rs:2922-2989`). Each move re-runs
+        // `minimap_jump`, the same click-to-jump mapping, so the drag is a
+        // continuous jump; mouse-up clears `minimap_drag`.
+        if self.minimap_drag {
+            root = root.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .occlude()
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                        this.minimap_jump(event.position.y, window, cx);
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                            this.minimap_drag = false;
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+
+        root.into_any_element()
     }
 }
 
@@ -3758,6 +3816,17 @@ fn minimap_slab_fracs(visible_start: usize, visible_end: usize, total_lines: usi
     let top = (visible_start as f32 / total).clamp(0.0, 1.0);
     let bottom = (visible_end as f32 / total).clamp(0.0, 1.0);
     (top, bottom.max(top))
+}
+
+/// The 0..1 ratio down the minimap strip a pointer at window-space `pointer_y`
+/// maps to, given the strip's captured top edge (`bounds_top`) and height
+/// (`strip_height`), both window-space pixels from `EditorView::minimap_bounds`.
+/// Deliberately unclamped: a drag that leaves the strip above or below still
+/// produces a ratio outside `0..1`, and [`minimap_click_line`] is what clamps
+/// it to a valid line — so dragging past either edge lands on the first/last
+/// line rather than needing a second clamp here.
+fn minimap_pointer_ratio(pointer_y: f32, bounds_top: f32, strip_height: f32) -> f32 {
+    (pointer_y - bounds_top) / strip_height
 }
 
 /// The buffer line a minimap click at `click_ratio` (0..1 down the strip) maps
@@ -4547,6 +4616,32 @@ mod tests {
         assert_eq!(minimap_click_line(1.0, 100), 99);
         assert_eq!(minimap_click_line(1.5, 100), 99);
         assert_eq!(minimap_click_line(0.5, 0), 0);
+    }
+
+    // --- minimap drag-to-scroll pointer-Y -> ratio mapping (#937) ---
+
+    #[test]
+    fn test_minimap_pointer_ratio_maps_pointer_position_to_strip_fraction() {
+        // Pointer at the strip's top edge, midpoint, and bottom edge.
+        assert!((minimap_pointer_ratio(100.0, 100.0, 200.0) - 0.0).abs() < f32::EPSILON);
+        assert!((minimap_pointer_ratio(200.0, 100.0, 200.0) - 0.5).abs() < f32::EPSILON);
+        assert!((minimap_pointer_ratio(300.0, 100.0, 200.0) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_minimap_pointer_ratio_pointer_outside_strip_is_not_clamped() {
+        // A drag that leaves the strip above or below produces a ratio outside
+        // 0..1 — `minimap_click_line` is what clamps it, not this function.
+        assert!((minimap_pointer_ratio(50.0, 100.0, 200.0) - -0.25).abs() < f32::EPSILON);
+        assert!((minimap_pointer_ratio(400.0, 100.0, 200.0) - 1.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_minimap_pointer_ratio_composes_with_click_line_for_a_drag_step() {
+        // End-to-end pointer-Y -> document line, the mapping a drag move reuses
+        // continuously from click-to-jump (`minimap_jump`).
+        let ratio = minimap_pointer_ratio(250.0, 100.0, 200.0);
+        assert_eq!(minimap_click_line(ratio, 100), 75);
     }
 
     // --- go-to-line target clamp (#620) ---

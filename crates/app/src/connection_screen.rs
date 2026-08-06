@@ -38,7 +38,7 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{h_flex, v_flex, ActiveTheme, Icon, IconName};
 
-use crate::recents::{self, RecentConnection};
+use crate::recents::{self, ConnectionKind, RecentConnection};
 use crate::title_bar;
 
 /// Connect card width (design contract: "card ~470px").
@@ -195,10 +195,17 @@ pub enum SessionIntent {
 /// prints `Some("<redacted>")` instead of the plaintext value.
 #[derive(Clone, PartialEq)]
 pub struct ConnectRequest {
+    /// SSH vs WSL (issue #924, `docs/spec-wsl-transport.md`); see
+    /// [`ConnectionKind`]. The connect-card kind toggle is out of scope here
+    /// (issue #926) — every request this screen builds today is `Ssh`.
+    pub kind: ConnectionKind,
     pub host: String,
     pub user: String,
     pub port: u16,
     pub key: PathBuf,
+    /// The WSL distro name (issue #924); only meaningful when `kind` is
+    /// [`ConnectionKind::Wsl`], empty for an SSH request.
+    pub distro: String,
     /// The Remote exec wrapper field's value at connect (issue #789,
     /// `docs/spec-remote-exec-wrapper-ui.md`), e.g. `docker exec -i devenv`;
     /// `None` for an empty/whitespace field (byte-for-byte passthrough, a
@@ -214,10 +221,12 @@ pub struct ConnectRequest {
 impl std::fmt::Debug for ConnectRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectRequest")
+            .field("kind", &self.kind)
             .field("host", &self.host)
             .field("user", &self.user)
             .field("port", &self.port)
             .field("key", &self.key)
+            .field("distro", &self.distro)
             .field("remote_exec_wrapper", &self.remote_exec_wrapper)
             .field("session_intent", &self.session_intent)
             .field(
@@ -478,10 +487,14 @@ impl ConnectionScreen {
             remote_exec_wrapper_from_field(&self.remote_exec_wrapper_input.read(cx).value());
 
         Ok(ConnectRequest {
+            // The kind toggle is issue #926 — this card only ever builds SSH
+            // requests today.
+            kind: ConnectionKind::Ssh,
             host,
             user,
             port,
             key: PathBuf::from(key_text),
+            distro: String::new(),
             remote_exec_wrapper,
             session_intent: SessionIntent::Pick,
             passphrase,
@@ -538,10 +551,15 @@ impl ConnectionScreen {
         let remote_exec_wrapper =
             remote_exec_wrapper_from_field(&self.remote_exec_wrapper_input.read(cx).value());
         cx.emit(ConnectionScreenEvent::Connect(ConnectRequest {
+            // Carried over from the recent as-is (issue #924) — no UI reads
+            // or edits it yet (that's issue #926), but a recents entry is
+            // never silently downgraded to `Ssh` on reconnect.
+            kind: recent.kind,
             host: recent.host,
             user: recent.user,
             port: recent.port,
             key: PathBuf::from(recent.key),
+            distro: recent.distro,
             remote_exec_wrapper,
             session_intent: session_intent_from_recent(&recent.session),
             passphrase: None,
@@ -1127,10 +1145,12 @@ mod tests {
 
     fn sample_request(passphrase: Option<&str>) -> ConnectRequest {
         ConnectRequest {
+            kind: ConnectionKind::Ssh,
             host: "100.64.0.1".to_string(),
             user: "developer".to_string(),
             port: 22,
             key: PathBuf::from("/home/developer/.ssh/id_ed25519"),
+            distro: String::new(),
             remote_exec_wrapper: None,
             session_intent: SessionIntent::Pick,
             passphrase: passphrase.map(str::to_string),

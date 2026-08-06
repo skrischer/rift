@@ -676,6 +676,7 @@ fn translate_lifecycle(state: ServerLifecycle) -> LspServerState {
         ServerLifecycle::Starting => LspServerState::Starting,
         ServerLifecycle::Running => LspServerState::Running,
         ServerLifecycle::Crashed => LspServerState::Crashed,
+        ServerLifecycle::NotInstalled => LspServerState::NotInstalled,
     }
 }
 
@@ -913,6 +914,10 @@ mod tests {
             translate_lifecycle(ServerLifecycle::Crashed),
             LspServerState::Crashed
         );
+        assert_eq!(
+            translate_lifecycle(ServerLifecycle::NotInstalled),
+            LspServerState::NotInstalled
+        );
     }
 
     /// A table whose binary cannot exist on `$PATH`, so `observe` always
@@ -926,7 +931,7 @@ mod tests {
     }];
 
     #[tokio::test]
-    async fn test_apply_changes_forwards_starting_then_crashed_for_missing_binary() {
+    async fn test_apply_changes_forwards_starting_then_not_installed_for_missing_binary() {
         let (_doc_tx, doc_rx) = mpsc::channel(8);
         let (_buffer_tx, buffer_rx) = mpsc::channel(8);
         let (diag_tx, _diag_rx) = mpsc::channel(8);
@@ -962,7 +967,7 @@ mod tests {
             status_rx.try_recv(),
             Ok(LspStatusEvent {
                 server: binary.to_string(),
-                state: LspServerState::Crashed,
+                state: LspServerState::NotInstalled,
             })
         );
         assert!(status_rx.try_recv().is_err(), "no further events");

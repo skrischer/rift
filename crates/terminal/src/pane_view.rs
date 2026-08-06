@@ -1,4 +1,6 @@
+use std::cell::Cell;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -241,16 +243,19 @@ struct SearchPrompt {
     _subscription: Subscription,
 }
 
-/// A read-only mirror of [`PaneView`]'s composite scroll position (the live
-/// `Term`'s `display_offset` plus the pre-attach history block's
-/// `history_scroll`), reshaped into the pixel-offset/content-size vocabulary
-/// [`ScrollbarHandle`] expects so the vendored `gpui_component` [`Scrollbar`]
-/// can render the thumb and drive its own autohide timing
-/// (`docs/spec-terminal-scrollbar.md`). `set_offset` is deliberately a no-op:
-/// drag-to-scroll is a separate step (#916), and until it lands the composite
-/// scroll state in [`PaneView`] stays the sole authority over position — this
-/// handle never becomes a second scroll owner.
-#[derive(Clone, Copy)]
+/// A mirror of [`PaneView`]'s composite scroll position (the live `Term`'s
+/// `display_offset` plus the pre-attach history block's `history_scroll`),
+/// reshaped into the pixel-offset/content-size vocabulary [`ScrollbarHandle`]
+/// expects so the vendored `gpui_component` [`Scrollbar`] can render the
+/// thumb, drive its own autohide timing, and drag the thumb
+/// (`docs/spec-terminal-scrollbar.md`). [`PaneView`]'s composite scroll state
+/// stays the sole authority over position: the vendored widget calls
+/// `set_offset` from inside its own mouse-event handlers, with no
+/// `Context<PaneView>` to act through, so `set_offset` only stashes the
+/// dragged-to row in `drag_target` — a slot shared with [`PaneView`] via
+/// `Rc` — for [`PaneView::apply_pending_drag`] to reconcile into the real
+/// scroll state at the start of the next render.
+#[derive(Clone)]
 struct CompositeScrollHandle {
     /// Rows scrolled up from the live bottom: `display_offset + history_scroll`.
     rows_from_bottom: usize,
@@ -263,6 +268,9 @@ struct CompositeScrollHandle {
     /// Pixel height of one grid row, converting the row-based composite
     /// position into the pixel space [`ScrollbarHandle`] expects.
     row_height: Pixels,
+    /// Where `set_offset` stashes the dragged-to composite row
+    /// (`rows_from_bottom`), consumed by [`PaneView::apply_pending_drag`].
+    drag_target: Rc<Cell<Option<usize>>>,
 }
 
 impl CompositeScrollHandle {
@@ -279,7 +287,24 @@ impl ScrollbarHandle for CompositeScrollHandle {
         point(px(0.0), -(self.row_height * self.distance_from_top()))
     }
 
-    fn set_offset(&self, _offset: Point<Pixels>) {}
+    /// The inverse of [`Self::offset`]: a drag or track-click pixel offset
+    /// maps back to a composite row (`total_rows - distance_from_top`,
+    /// clamped to `0..=total_rows` so dragging past either end clamps
+    /// cleanly instead of over/underflowing) and is stashed in
+    /// `drag_target`.
+    fn set_offset(&self, offset: Point<Pixels>) {
+        if self.row_height <= px(0.0) {
+            return;
+        }
+        let distance_from_top = (-offset.y / self.row_height).round();
+        let distance_from_top = if distance_from_top <= 0.0 {
+            0
+        } else {
+            (distance_from_top as usize).min(self.total_rows)
+        };
+        self.drag_target
+            .set(Some(self.total_rows - distance_from_top));
+    }
 
     fn content_size(&self) -> Size<Pixels> {
         size(
@@ -310,6 +335,12 @@ pub struct PaneView {
     /// `cols` at capture time; the block is sized to this width and goes stale
     /// when the grid width changes.
     history_capture_cols: usize,
+    /// Pending drag-to-scroll target row (composite `rows_from_bottom`),
+    /// set by the scrollbar thumb's `set_offset`
+    /// (`CompositeScrollHandle::drag_target`, shared via `Rc` since that
+    /// call site has no `Context<PaneView>` to notify through) and consumed
+    /// by [`Self::apply_pending_drag`] at the start of the next render.
+    scroll_drag: Rc<Cell<Option<usize>>>,
     focus_handle: FocusHandle,
     cell_size: Size<Pixels>,
     grid_size: TermSize,
@@ -494,6 +525,7 @@ impl PaneView {
             history_pending: false,
             history_pending_scroll: 0,
             history_capture_cols: 0,
+            scroll_drag: Rc::new(Cell::new(None)),
             focus_handle: cx.focus_handle(),
             cell_size: size(px(0.0), px(0.0)),
             grid_size,
@@ -822,6 +854,25 @@ impl PaneView {
         // ops so a stale frame is never reused across a scroll.
         self.paint_cache.clear();
         cx.notify();
+    }
+
+    /// Reconcile a drag-to-scroll target left in `scroll_drag` by the
+    /// scrollbar thumb's `set_offset` (`CompositeScrollHandle::drag_target`)
+    /// into the real composite scroll state, via the same incremental path
+    /// (`Self::handle_scroll`) wheel scrolling uses — so drag and wheel
+    /// share one source of truth for clamping and history-block fetching.
+    /// Called at the start of every render, before the composite position is
+    /// read for this frame's paint.
+    fn apply_pending_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.scroll_drag.take() else {
+            return;
+        };
+        let current = {
+            let term = self.terminal.lock().expect("term lock poisoned");
+            term.grid().display_offset() + self.history_scroll
+        };
+        let delta = target as i32 - current as i32;
+        self.handle_scroll(delta, cx);
     }
 
     /// Ask the SSH thread for the pre-attach history: everything above the lines
@@ -1200,6 +1251,7 @@ impl PaneView {
             total_rows: history_size + block_rows,
             viewport_rows,
             row_height: self.cell_size.height,
+            drag_target: self.scroll_drag.clone(),
         };
         Some(Scrollbar::vertical(&handle).scrollbar_show(ScrollbarShow::Hover))
     }
@@ -1564,6 +1616,11 @@ fn map_damage(term: &mut Term<Listener>) -> TerminalGridPaintDamage {
 
 impl Render for PaneView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Reconcile any drag-to-scroll gesture from the last frame before this
+        // frame's composite position is read, so a drag's own frame already
+        // paints the dragged-to content instead of lagging one frame behind.
+        self.apply_pending_drag(cx);
+
         let font_size = self.font_size;
         let cell_size = measure_cell_size(window, font_size);
         self.cell_size = cell_size;
@@ -2141,6 +2198,20 @@ mod tests {
         TerminalPalette::from_theme(&gpui_component::ThemeColor::default())
     }
 
+    fn composite_scroll_handle(
+        rows_from_bottom: usize,
+        total_rows: usize,
+        viewport_rows: usize,
+    ) -> CompositeScrollHandle {
+        CompositeScrollHandle {
+            rows_from_bottom,
+            total_rows,
+            viewport_rows,
+            row_height: px(20.0),
+            drag_target: Rc::new(Cell::new(None)),
+        }
+    }
+
     #[::core::prelude::v1::test]
     fn test_parse_capture_empty_payload_yields_no_rows() {
         let palette = test_palette();
@@ -2208,12 +2279,7 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn test_composite_scroll_handle_offset_at_live_bottom_is_max_negative() {
-        let handle = CompositeScrollHandle {
-            rows_from_bottom: 0,
-            total_rows: 10,
-            viewport_rows: 24,
-            row_height: px(20.0),
-        };
+        let handle = composite_scroll_handle(0, 10, 24);
 
         assert_eq!(handle.offset(), point(px(0.0), px(-200.0)));
         assert_eq!(handle.content_size(), size(px(0.0), px(680.0)));
@@ -2221,12 +2287,7 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn test_composite_scroll_handle_offset_at_scrollback_top_is_zero() {
-        let handle = CompositeScrollHandle {
-            rows_from_bottom: 10,
-            total_rows: 10,
-            viewport_rows: 24,
-            row_height: px(20.0),
-        };
+        let handle = composite_scroll_handle(10, 10, 24);
 
         assert_eq!(handle.offset(), point(px(0.0), px(0.0)));
     }
@@ -2236,31 +2297,85 @@ mod tests {
         // `history_scroll` can transiently exceed `total_rows` right after a
         // resize invalidates the pre-attach block; the offset must clamp to
         // the top rather than underflow.
-        let handle = CompositeScrollHandle {
-            rows_from_bottom: 50,
-            total_rows: 10,
-            viewport_rows: 24,
-            row_height: px(20.0),
-        };
+        let handle = composite_scroll_handle(50, 10, 24);
 
         assert_eq!(handle.offset(), point(px(0.0), px(0.0)));
     }
 
     #[::core::prelude::v1::test]
-    fn test_composite_scroll_handle_set_offset_is_noop() {
-        // Drag-to-scroll lands in #916; until then the composite scroll state
-        // in `PaneView` stays the sole authority over position.
+    fn test_composite_scroll_handle_set_offset_at_top_targets_deepest_history() {
+        // Dragging the thumb to the very top of the track (offset 0) should
+        // target the oldest end of the composite range.
+        let handle = composite_scroll_handle(3, 10, 24);
+
+        handle.set_offset(point(px(0.0), px(0.0)));
+
+        assert_eq!(handle.drag_target.get(), Some(10));
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_composite_scroll_handle_set_offset_at_bottom_targets_live_view() {
+        // Dragging the thumb to the very bottom of the track should target
+        // the live bottom (`rows_from_bottom == 0`), not scroll back at all.
+        let handle = composite_scroll_handle(3, 10, 24);
+
+        handle.set_offset(point(px(0.0), px(-200.0)));
+
+        assert_eq!(handle.drag_target.get(), Some(0));
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_composite_scroll_handle_set_offset_round_trips_with_offset_at_mid() {
+        // The inverse mapping must undo the forward mapping (`Self::offset`,
+        // from #915) at a representative mid-range position: feeding a row's
+        // own `offset()` back into `set_offset` must recover that same row.
+        for rows_from_bottom in [1usize, 4, 9] {
+            let handle = composite_scroll_handle(rows_from_bottom, 10, 24);
+            let offset = handle.offset();
+
+            handle.set_offset(offset);
+
+            assert_eq!(handle.drag_target.get(), Some(rows_from_bottom));
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_composite_scroll_handle_set_offset_clamps_past_top() {
+        // A positive (above-top) offset must never panic or produce a target
+        // beyond `total_rows` — dragging past the end clamps cleanly.
+        let handle = composite_scroll_handle(3, 10, 24);
+
+        handle.set_offset(point(px(0.0), px(999.0)));
+
+        assert_eq!(handle.drag_target.get(), Some(10));
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_composite_scroll_handle_set_offset_clamps_past_bottom() {
+        // An offset more negative than the live-bottom extreme must clamp to
+        // `rows_from_bottom == 0` rather than underflow.
+        let handle = composite_scroll_handle(3, 10, 24);
+
+        handle.set_offset(point(px(0.0), px(-999.0)));
+
+        assert_eq!(handle.drag_target.get(), Some(0));
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_composite_scroll_handle_set_offset_zero_row_height_is_noop() {
+        // Guards the division in `set_offset` against a not-yet-measured
+        // (zero) cell height instead of producing NaN/infinite targets.
         let handle = CompositeScrollHandle {
             rows_from_bottom: 3,
             total_rows: 10,
             viewport_rows: 24,
-            row_height: px(20.0),
+            row_height: px(0.0),
+            drag_target: Rc::new(Cell::new(None)),
         };
-        let before = handle.offset();
 
         handle.set_offset(point(px(0.0), px(-999.0)));
 
-        assert_eq!(handle.offset(), before);
+        assert_eq!(handle.drag_target.get(), None);
     }
 
     #[::core::prelude::v1::test]
