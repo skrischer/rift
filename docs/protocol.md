@@ -50,7 +50,10 @@ binary, never by tolerating it (`docs/spec-connection-robustness.md`).
   a healthy concurrent connection's stream (relevant for the shared stable+dev
   daemon).
 
-History: version 15 adds the per-pane metrics push (`pane_metrics`) — a
+History: version 16 adds the `NotInstalled` `LspServerState` variant — a
+language server whose binary is absent from the remote `$PATH` is reported as
+informationally "not installed" rather than folded into `Crashed`
+(`docs/spec-lsp-servers.md`); version 15 adds the per-pane metrics push (`pane_metrics`) — a
 per-connection breakdown of the attached session's panes by rolled-up `/proc`
 resident memory and CPU, keyed by `pane_id` and labelled by the agnostic
 `pane_current_command` — plus its client→daemon opt-in
@@ -282,14 +285,17 @@ always present (`0` on a clean worktree), never optional.
 e.g. `"rust-analyzer"`), NOT the per-spawn server id `diagnostics` keys by: a
 restart mints a fresh internal id, but the status-line health dot asks "is my
 rust-analyzer OK", which is name-scoped. `state` is one of `starting` /
-`running` / `crashed` — there is no `stopped`, since a server the daemon has
-observed is never deliberately stopped while a client is attached. Emitted by
-the daemon's LSP registry around its observe cycle: `starting` when a
-(re)start is triggered, `running` once the `initialize` handshake completes,
-`crashed` once a dead instance is pruned (detected on the next observe after
-the server exits) or a (re)start attempt fails. Push-only, and replayed once
-per known server behind `welcome` so a (re)attaching client sees current
-health immediately.
+`running` / `crashed` / `not_installed` — there is no `stopped`, since a
+server the daemon has observed is never deliberately stopped while a client
+is attached. Emitted by the daemon's LSP registry around its observe cycle:
+`starting` when a (re)start is triggered, `running` once the `initialize`
+handshake completes, `crashed` once a dead instance is pruned (detected on
+the next observe after the server exits) or a (re)start attempt fails.
+`not_installed` is the informational counterpart to `crashed` — the
+server's binary is absent from the remote `$PATH` — so a language nobody
+has installed reads as "not installed" rather than an alarming crash
+(`docs/spec-lsp-servers.md`). Push-only, and replayed once per known server
+behind `welcome` so a (re)attaching client sees current health immediately.
 
 ## Host metrics (`docs/spec-host-telemetry.md`, `docs/archive/spec-memory-pressure.md`)
 
