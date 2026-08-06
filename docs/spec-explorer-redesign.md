@@ -208,7 +208,7 @@ from are already vendored via `gpui-component`.
 
 Consulted the "Explorer overhaul — prior-art index (Phases 27–31)" in
 `prior-art.md`, the shipped Phase-11 tree (`spec-explorer-panel.md`), and the
-shipped Phase-25 parity pass (`spec-explorer-parity.md`).
+shipped Phase-25 parity pass (`archive/spec-explorer-parity.md`).
 
 - **Paper "Explorer — Redesign" artboard (file `rift`)** — the binding visual
   contract. It clones the shipped Cockpit explorer panel verbatim (surfaces,
