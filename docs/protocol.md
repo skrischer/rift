@@ -50,7 +50,10 @@ binary, never by tolerating it (`docs/spec-connection-robustness.md`).
   a healthy concurrent connection's stream (relevant for the shared stable+dev
   daemon).
 
-History: version 16 adds the `NotInstalled` `LspServerState` variant — a
+History: version 17 adds the memory breakdown (`mem_cached`/`mem_buffers`),
+`uptime_secs`, and the daemon-filesystem disk fields (`disk_total`/
+`disk_available`) to `host_metrics` (`docs/spec-telemetry-detail.md`); version
+16 adds the `NotInstalled` `LspServerState` variant — a
 language server whose binary is absent from the remote `$PATH` is reported as
 informationally "not installed" rather than folded into `Crashed`
 (`docs/spec-lsp-servers.md`); version 15 adds the per-pane metrics push (`pane_metrics`) — a
@@ -297,10 +300,10 @@ has installed reads as "not installed" rather than an alarming crash
 (`docs/spec-lsp-servers.md`). Push-only, and replayed once per known server
 behind `welcome` so a (re)attaching client sees current health immediately.
 
-## Host metrics (`docs/spec-host-telemetry.md`, `docs/archive/spec-memory-pressure.md`)
+## Host metrics (`docs/spec-host-telemetry.md`, `docs/archive/spec-memory-pressure.md`, `docs/spec-telemetry-detail.md`)
 
 ```json
-{ "type": "host_metrics", "cpu": 42.5, "mem_total": 16000000000, "mem_available": 4000000000, "swap_total": 2000000000, "swap_used": 100000000, "load": { "one": 1.5, "five": 1.1, "fifteen": 0.9 }, "cpu_count": 8, "psi": { "some_avg10": 12.5, "some_avg60": 8.25, "some_avg300": 3.1, "full_avg10": 4.0, "full_avg60": 2.5, "full_avg300": 1.0 } }
+{ "type": "host_metrics", "cpu": 42.5, "mem_total": 16000000000, "mem_available": 4000000000, "mem_cached": 3000000000, "mem_buffers": 500000000, "swap_total": 2000000000, "swap_used": 100000000, "load": { "one": 1.5, "five": 1.1, "fifteen": 0.9 }, "cpu_count": 8, "uptime_secs": 123456, "disk_total": 500000000000, "disk_available": 200000000000, "psi": { "some_avg10": 12.5, "some_avg60": 8.25, "some_avg300": 3.1, "full_avg10": 4.0, "full_avg60": 2.5, "full_avg300": 1.0 } }
 ```
 
 `host_metrics` is a **host-global** signal, not per-context: unlike every
@@ -318,6 +321,20 @@ RAM is really free"; `load` is the 1/5/15-minute load average
 and replayed once behind `welcome` from the daemon's cached latest sample —
 the same precedent as `lsp_status` — so a (re)attaching client sees current
 host state without waiting for the next tick.
+
+`mem_cached`/`mem_buffers` are bytes read from `/proc/meminfo`'s `Cached`/
+`Buffers` fields — `sysinfo` exposes total/free/available/used but not these,
+hence a small dedicated daemon-side read (`docs/spec-telemetry-detail.md`).
+`uptime_secs` is the host's uptime in seconds (`sysinfo::System::uptime()`).
+`disk_total`/`disk_available` are bytes for the **daemon's own filesystem**
+(the mount whose `mount_point` is the longest prefix of the daemon's working
+directory, read via `sysinfo`'s `disk` feature) — daemon-global like every
+other field on this message, not the per-connection attached-session root.
+All five are plain required fields (no `Option`, no `#[serde(default)]`),
+matching the precedent set by `repo_state`'s `lines_added`/`lines_removed`:
+under this protocol's strict version-equality policy a same-version peer
+always sends every field, so there is no wire back-compat to preserve for an
+additive, always-available reading.
 
 `psi` is an **optional** Linux PSI (Pressure Stall Information) payload, read
 from `/proc/pressure/memory` where the kernel exposes it

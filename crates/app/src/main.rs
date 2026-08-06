@@ -36,10 +36,20 @@ use rift_terminal::{
 use tracing::{debug, error, info, warn};
 
 struct SshConfig {
+    /// SSH vs WSL (issue #924, `docs/spec-wsl-transport.md`); see
+    /// [`rift_app::recents::ConnectionKind`]. Threaded through from
+    /// [`ConnectRequest`] and carried alongside the SSH fields, which stay
+    /// populated (possibly blank) for a WSL config today — wiring the
+    /// connect pipeline itself to branch on this is out of scope here
+    /// (issues #923/#925/#926 land the WSL transport and its UI).
+    kind: recents::ConnectionKind,
     host: String,
     port: u16,
     user: String,
     key: PathBuf,
+    /// The WSL distro name (issue #924); only meaningful when `kind` is
+    /// [`rift_app::recents::ConnectionKind::Wsl`].
+    distro: String,
     /// The Connection screen's Remote exec wrapper field value (issue #789,
     /// `docs/spec-remote-exec-wrapper-ui.md`), e.g. `docker exec -i devenv` —
     /// threaded onto [`rift_ssh::SshConnection::with_remote_exec_wrapper`] in
@@ -952,10 +962,12 @@ impl Shell {
         // The recents identity (issue #707), captured before `request`'s
         // fields move into `SshConfig` below.
         let recent_target = RecentTarget {
+            kind: request.kind,
             host: request.host.clone(),
             user: request.user.clone(),
             port: request.port,
             key: request.key.display().to_string(),
+            distro: request.distro.clone(),
             remote_exec_wrapper: request.remote_exec_wrapper.clone().unwrap_or_default(),
         };
 
@@ -965,10 +977,12 @@ impl Shell {
         // ..." caption (#706).
         let ssh_label = format!("{}@{}", request.user, request.host);
         let ssh = SshConfig {
+            kind: request.kind,
             host: request.host,
             user: request.user,
             port: request.port,
             key: request.key,
+            distro: request.distro,
             remote_exec_wrapper: request.remote_exec_wrapper,
             passphrase: request.passphrase,
         };
@@ -1116,11 +1130,13 @@ impl Shell {
 
             let key_exists = ssh.key.exists();
             debug!(
+                kind = ?ssh.kind,
                 host = %ssh.host,
                 port = ssh.port,
                 user = %ssh.user,
                 key = %ssh.key.display(),
                 key_exists,
+                distro = %ssh.distro,
                 "connecting via SSH"
             );
 
