@@ -2070,6 +2070,43 @@ fn drain_render_backlog(ch: &PtyChannels, editor: &EditorChannels, watches: &Eng
     }
 }
 
+/// The transport [`run_ssh_session`] connects through for a given
+/// [`SshConfig`], and the parameters that connection is built from — the
+/// SSH/WSL routing decision (issue #926, `docs/spec-wsl-transport.md`),
+/// pulled out as a pure, borrowing function so it is unit-tested without a
+/// live connection (mirrors why neither [`rift_ssh::SshConnection::connect`]
+/// nor [`rift_ssh::WslConnection::connect`] carry a unit test themselves —
+/// see `crates/ssh/src/transport.rs`'s module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConnectTarget<'a> {
+    Ssh {
+        host: &'a str,
+        port: u16,
+        user: &'a str,
+        key: &'a Path,
+    },
+    Wsl {
+        distro: &'a str,
+    },
+}
+
+/// [`ConnectTarget`] for `ssh.kind` — SSH carries the host/port/user/key
+/// fields, WSL carries only the distro name, mirroring the connect card's own
+/// field swap (`connection_screen::ConnectionScreen`).
+fn connect_target(ssh: &SshConfig) -> ConnectTarget<'_> {
+    match ssh.kind {
+        recents::ConnectionKind::Ssh => ConnectTarget::Ssh {
+            host: &ssh.host,
+            port: ssh.port,
+            user: &ssh.user,
+            key: &ssh.key,
+        },
+        recents::ConnectionKind::Wsl => ConnectTarget::Wsl {
+            distro: &ssh.distro,
+        },
+    }
+}
+
 async fn run_ssh_session(
     ssh: &SshConfig,
     ch: PtyChannels,
@@ -2077,19 +2114,28 @@ async fn run_ssh_session(
     connected: &AtomicBool,
     watches: &EngineWatches,
 ) -> Result<()> {
-    use rift_ssh::{Connection, SshConnection};
+    use rift_ssh::{Connection, SshConnection, WslConnection};
 
-    let ssh_conn = SshConnection::connect(
-        &ssh.host,
-        ssh.port,
-        &ssh.user,
-        &ssh.key,
-        ssh.passphrase.as_deref(),
-    )
-    .await
-    .context("SSH connection failed")?
-    .with_remote_exec_wrapper(ssh.remote_exec_wrapper.clone());
-    let mut conn = Connection::Ssh(ssh_conn);
+    let mut conn = match connect_target(ssh) {
+        ConnectTarget::Ssh {
+            host,
+            port,
+            user,
+            key,
+        } => {
+            let ssh_conn = SshConnection::connect(host, port, user, key, ssh.passphrase.as_deref())
+                .await
+                .context("SSH connection failed")?
+                .with_remote_exec_wrapper(ssh.remote_exec_wrapper.clone());
+            Connection::Ssh(ssh_conn)
+        }
+        ConnectTarget::Wsl { distro } => {
+            let wsl_conn = WslConnection::connect(distro)
+                .await
+                .context("WSL connection failed")?;
+            Connection::Wsl(wsl_conn)
+        }
+    };
 
     // Provision the daemon ahead of the terminal: detect the platform, upload the
     // versioned binary when absent, then attach — spawning it detached if none is
@@ -2845,8 +2891,13 @@ async fn provision_daemon(
         }
     };
 
-    let remote_dir =
-        env::var("RIFT_DAEMON_REMOTE_DIR").unwrap_or_else(|_| "$HOME/.rift/bin".to_string());
+    // `RIFT_DAEMON_REMOTE_DIR` wins verbatim for either transport when set;
+    // otherwise the default differs by transport kind (issue #925/#926,
+    // `docs/spec-wsl-transport.md`) — a WSL target's default lands on the
+    // distro's own Linux filesystem instead of the SSH default's `bin`
+    // subdirectory, never a DrvFs path.
+    let configured_remote_dir = env::var("RIFT_DAEMON_REMOTE_DIR").ok();
+    let remote_dir = rift_ssh::resolve_remote_dir(conn.kind(), configured_remote_dir.as_deref());
 
     let outcome = match rift_ssh::ensure_daemon_deployed(
         conn,
@@ -3922,12 +3973,13 @@ fn layout_to_snapshot(
 #[cfg(test)]
 mod tests {
     use super::{
-        drain_render_backlog, is_retryable_session_error, layout_to_snapshot,
-        resolve_attach_session, resolve_auto_attach_target, resolve_preferred_session,
-        route_picker, session_is_unset, should_forward, CaptureRequest, EditorChannels,
-        EngineWatches, PaneInput, PickedSession, PickerChannels, PickerRoute, PtyChannels,
-        SessionListItem, SessionSwitchRequest, TermSize,
+        connect_target, drain_render_backlog, is_retryable_session_error, layout_to_snapshot,
+        recents, resolve_attach_session, resolve_auto_attach_target, resolve_preferred_session,
+        route_picker, session_is_unset, should_forward, CaptureRequest, ConnectTarget,
+        EditorChannels, EngineWatches, PaneInput, PickedSession, PickerChannels, PickerRoute,
+        PtyChannels, SessionListItem, SessionSwitchRequest, SshConfig, TermSize,
     };
+    use std::path::{Path, PathBuf};
 
     // The vendored `Popover`'s double `on_open_change(false)` per
     // trigger-button close (see `spawn_pane_metrics_bridge`'s doc comment)
@@ -4580,5 +4632,63 @@ mod tests {
             !icon.is_empty(),
             "embedded file-type icon SVG must not be empty"
         );
+    }
+
+    // --- connect_target (issue #926, SSH/WSL routing) ---------------------
+
+    fn sample_ssh_config() -> SshConfig {
+        SshConfig {
+            kind: recents::ConnectionKind::Ssh,
+            host: "100.64.0.1".to_string(),
+            user: "developer".to_string(),
+            port: 22,
+            key: PathBuf::from("/home/developer/.ssh/id_ed25519"),
+            distro: String::new(),
+            remote_exec_wrapper: None,
+            passphrase: None,
+        }
+    }
+
+    fn sample_wsl_config() -> SshConfig {
+        SshConfig {
+            kind: recents::ConnectionKind::Wsl,
+            host: String::new(),
+            user: String::new(),
+            port: 0,
+            key: PathBuf::new(),
+            distro: "Ubuntu".to_string(),
+            remote_exec_wrapper: None,
+            passphrase: None,
+        }
+    }
+
+    #[test]
+    fn test_connect_target_ssh_kind_routes_to_ssh_with_host_fields() {
+        let ssh = sample_ssh_config();
+
+        match connect_target(&ssh) {
+            ConnectTarget::Ssh {
+                host,
+                port,
+                user,
+                key,
+            } => {
+                assert_eq!(host, "100.64.0.1");
+                assert_eq!(port, 22);
+                assert_eq!(user, "developer");
+                assert_eq!(key, Path::new("/home/developer/.ssh/id_ed25519"));
+            }
+            ConnectTarget::Wsl { .. } => panic!("Ssh kind must route to ConnectTarget::Ssh"),
+        }
+    }
+
+    #[test]
+    fn test_connect_target_wsl_kind_routes_to_wsl_with_distro() {
+        let ssh = sample_wsl_config();
+
+        match connect_target(&ssh) {
+            ConnectTarget::Wsl { distro } => assert_eq!(distro, "Ubuntu"),
+            ConnectTarget::Ssh { .. } => panic!("Wsl kind must route to ConnectTarget::Wsl"),
+        }
     }
 }
