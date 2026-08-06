@@ -15,7 +15,7 @@ pub use frame::{encode_frame, FrameDecoder, FrameError, MAX_FRAME_LEN};
 /// is wire-compatible in one direction. The message set is pinned by the
 /// fingerprint test beside `PROTOCOL_FINGERPRINT` below, so a message-set
 /// change without a bump cannot pass CI.
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// Pinned fingerprint of the protocol message set, checked by the
 /// `fingerprint_tests` module: an FNV-1a hash over the serde-visible surface
@@ -27,7 +27,7 @@ pub const PROTOCOL_VERSION: u32 = 15;
 /// message set changes deliberately, bump [`PROTOCOL_VERSION`] above and
 /// re-pin this value (the failing test prints the new fingerprint).
 #[cfg(test)]
-const PROTOCOL_FINGERPRINT: u64 = 0x6591_c829_77d9_5ee8;
+const PROTOCOL_FINGERPRINT: u64 = 0x7906_e662_8a97_ee25;
 
 /// Messages the client sends to the daemon.
 ///
@@ -1083,7 +1083,8 @@ pub enum DiagnosticSeverity {
 /// A language server's lifecycle state, carried by
 /// [`DaemonMessage::LspStatus`]. No `Stopped` variant: a server the daemon
 /// has observed is never deliberately stopped while a client is attached —
-/// only started, running, or crashed (and possibly restarted).
+/// only started, running, crashed (and possibly restarted), or never
+/// spawnable in the first place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LspServerState {
@@ -1095,6 +1096,11 @@ pub enum LspServerState {
     /// The server's main loop ended (exit, crash, or a transport failure)
     /// and it has not been restarted yet.
     Crashed,
+    /// The server's binary is absent from the remote `$PATH`: an
+    /// informational state, distinct from [`LspServerState::Crashed`], so a
+    /// language nobody has installed does not read as an alarming failure
+    /// (`docs/spec-lsp-servers.md` — graceful degradation).
+    NotInstalled,
 }
 
 /// Why the daemon refused a buffer-channel read or write, carried by
@@ -2195,6 +2201,7 @@ mod tests {
             LspServerState::Starting,
             LspServerState::Running,
             LspServerState::Crashed,
+            LspServerState::NotInstalled,
         ] {
             let msg = DaemonMessage::LspStatus {
                 server: "rust-analyzer".to_owned(),
@@ -2206,6 +2213,23 @@ mod tests {
             assert_eq!(
                 serde_json::from_str::<DaemonMessage>(&json).expect("deserialize LspStatus"),
                 msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_lsp_server_state_variants_roundtrip_snake_case() {
+        for (state, tag) in [
+            (LspServerState::Starting, "starting"),
+            (LspServerState::Running, "running"),
+            (LspServerState::Crashed, "crashed"),
+            (LspServerState::NotInstalled, "not_installed"),
+        ] {
+            let json = serde_json::to_string(&state).expect("serialize LspServerState");
+            assert_eq!(json, format!(r#""{tag}""#));
+            assert_eq!(
+                serde_json::from_str::<LspServerState>(&json).expect("deserialize LspServerState"),
+                state
             );
         }
     }
