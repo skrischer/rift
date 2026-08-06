@@ -45,13 +45,41 @@ pub struct ServerSpec {
 ///
 /// Data, not code: rust-analyzer is the proving server (`docs/spec-daemon-lsp.md`,
 /// the #173 spike). Further languages are added as rows here, requiring no
-/// change to the registry or lifecycle logic.
-pub const BUILTIN_SERVERS: &[ServerSpec] = &[ServerSpec {
-    language: "rust",
-    binary: "rust-analyzer",
-    args: &[],
-    extensions: &["rs"],
-}];
+/// change to the registry or lifecycle logic. One row per server binary with an
+/// `extensions` list; the wire `languageId` is differentiated separately by
+/// [`language_id_for`](crate::document::language_id_for) (`docs/spec-lsp-servers.md`).
+pub const BUILTIN_SERVERS: &[ServerSpec] = &[
+    ServerSpec {
+        language: "rust",
+        binary: "rust-analyzer",
+        args: &[],
+        extensions: &["rs"],
+    },
+    ServerSpec {
+        language: "python",
+        binary: "pyright-langserver",
+        args: &["--stdio"],
+        extensions: &["py", "pyi"],
+    },
+    ServerSpec {
+        language: "typescript",
+        binary: "typescript-language-server",
+        args: &["--stdio"],
+        extensions: &["ts", "tsx", "js", "jsx", "mjs", "cjs"],
+    },
+    ServerSpec {
+        language: "go",
+        binary: "gopls",
+        args: &[],
+        extensions: &["go"],
+    },
+    ServerSpec {
+        language: "cpp",
+        binary: "clangd",
+        args: &[],
+        extensions: &["c", "h", "cc", "cpp", "cxx", "hpp", "hh"],
+    },
+];
 
 /// Maps a filesystem path to the servers that should diagnose it.
 ///
@@ -110,6 +138,56 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].language, "rust");
         assert_eq!(matches[0].binary, "rust-analyzer");
+    }
+
+    #[test]
+    fn test_matching_python_extensions_yield_pyright() {
+        let selector = DocumentSelector::builtin();
+        for path in ["main.py", "types.pyi"] {
+            let matches: Vec<_> = selector.matching(Path::new(path)).collect();
+            assert_eq!(matches.len(), 1, "path {path}");
+            assert_eq!(matches[0].language, "python");
+            assert_eq!(matches[0].binary, "pyright-langserver");
+            assert_eq!(matches[0].args, &["--stdio"]);
+        }
+    }
+
+    #[test]
+    fn test_matching_typescript_javascript_extensions_yield_tsserver() {
+        let selector = DocumentSelector::builtin();
+        for path in [
+            "app.ts", "app.tsx", "app.js", "app.jsx", "app.mjs", "app.cjs",
+        ] {
+            let matches: Vec<_> = selector.matching(Path::new(path)).collect();
+            assert_eq!(matches.len(), 1, "path {path}");
+            assert_eq!(matches[0].language, "typescript");
+            assert_eq!(matches[0].binary, "typescript-language-server");
+            assert_eq!(matches[0].args, &["--stdio"]);
+        }
+    }
+
+    #[test]
+    fn test_matching_go_extension_yields_gopls() {
+        let selector = DocumentSelector::builtin();
+        let matches: Vec<_> = selector.matching(Path::new("main.go")).collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].language, "go");
+        assert_eq!(matches[0].binary, "gopls");
+        assert!(matches[0].args.is_empty());
+    }
+
+    #[test]
+    fn test_matching_c_cpp_extensions_yield_clangd() {
+        let selector = DocumentSelector::builtin();
+        for path in [
+            "main.c", "main.h", "main.cc", "main.cpp", "main.cxx", "main.hpp", "main.hh",
+        ] {
+            let matches: Vec<_> = selector.matching(Path::new(path)).collect();
+            assert_eq!(matches.len(), 1, "path {path}");
+            assert_eq!(matches[0].language, "cpp");
+            assert_eq!(matches[0].binary, "clangd");
+            assert!(matches[0].args.is_empty());
+        }
     }
 
     #[test]
