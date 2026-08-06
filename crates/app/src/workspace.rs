@@ -567,6 +567,12 @@ pub struct WorkspaceView {
     /// host-metrics fold loop below, and a *subsequent* rising edge fires a
     /// single toast (`should_fire_pressure_toast`, #877).
     pressure_level: status_bar::PressureLevel,
+    /// The client-side memory-history ring buffer (`docs/spec-telemetry-detail.md`):
+    /// a bounded sample series of `host_metrics`'s mem%-used, pushed by the
+    /// same host-metrics fold loop that sets `host_metrics`/`pressure_level`.
+    /// Pure client state — nothing on the wire. Feeds the host-detail hover
+    /// card's inline sparkline.
+    mem_history: status_bar::MemoryHistory,
     /// The attached session's latest per-pane breakdown for the composite
     /// status line's popover (`docs/spec-pane-attribution.md`, #881), folded
     /// from the daemon's per-connection `PaneMetrics` push. Empty before the
@@ -1079,6 +1085,9 @@ impl WorkspaceView {
         // still `None` at that point, which is the seed marker
         // `should_fire_pressure_toast` reads — and a *subsequent* upward
         // transition fires a single toast via `window.push_notification`.
+        // The same sample's mem%-used also pushes onto `mem_history`
+        // (`docs/spec-telemetry-detail.md`), the bounded ring buffer behind
+        // the host-detail hover card's inline sparkline.
         // `cx.spawn_in` + `update_in` (matching the diff/nav loops above,
         // rather than the plain `cx.spawn` the LSP fold just above still
         // uses) holds the `Window` handle the toast needs. Routed through
@@ -1094,8 +1103,13 @@ impl WorkspaceView {
                         cpu,
                         mem_total,
                         mem_available,
+                        mem_cached,
+                        mem_buffers,
                         swap_total,
                         swap_used,
+                        load,
+                        cpu_count,
+                        uptime_secs,
                         psi,
                         ..
                     } = msg
@@ -1106,8 +1120,13 @@ impl WorkspaceView {
                         cpu,
                         mem_total,
                         mem_available,
+                        mem_cached,
+                        mem_buffers,
                         swap_total,
                         swap_used,
+                        load,
+                        cpu_count,
+                        uptime_secs,
                         psi,
                     };
                     let seeding = view.host_metrics.is_none();
@@ -1115,6 +1134,8 @@ impl WorkspaceView {
                     let new_level = status_bar::pressure_level(sample, previous_level);
                     view.pressure_level = new_level;
                     view.host_metrics = Some(sample);
+                    view.mem_history
+                        .push(status_bar::mem_used_pct(mem_total, mem_available) as f32);
                     if should_fire_pressure_toast(seeding, previous_level, new_level) {
                         let notification_type = if new_level == status_bar::PressureLevel::Critical
                         {
@@ -1588,6 +1609,7 @@ impl WorkspaceView {
             lsp: BTreeMap::new(),
             host_metrics: None,
             pressure_level: status_bar::PressureLevel::Normal,
+            mem_history: status_bar::MemoryHistory::default(),
             pane_metrics: Vec::new(),
             pane_metrics_enabled_tx,
             diff_view,
@@ -2787,6 +2809,7 @@ impl Render for WorkspaceView {
                     lsp: &self.lsp,
                     host_metrics: self.host_metrics.as_ref(),
                     pressure_level: self.pressure_level,
+                    mem_history: self.mem_history.as_slice(),
                     pane_metrics: &self.pane_metrics,
                     pane_metrics_enabled_tx: self.pane_metrics_enabled_tx.clone(),
                     cursor,
