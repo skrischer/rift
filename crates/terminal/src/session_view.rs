@@ -397,25 +397,32 @@ fn grid_size_for(area: Size<Pixels>, cell: Size<Pixels>, reserved_height: Pixels
 }
 
 /// Precedence rank of a [`PaneActivity`] for the per-window aggregate:
-/// attention > busy > free.
+/// attention > busy (working) > busy (idle) > free. Working outranks idle so
+/// a window with at least one actively-working pane reads working at a
+/// glance, even alongside other panes idling; both are refinements of busy
+/// and rank below attention (`docs/spec-agent-activity.md`).
 fn activity_rank(activity: PaneActivity) -> u8 {
     match activity {
         PaneActivity::Free => 0,
-        PaneActivity::Busy => 1,
-        PaneActivity::Attention => 2,
+        PaneActivity::BusyIdle => 1,
+        PaneActivity::Busy => 2,
+        PaneActivity::Attention => 3,
     }
 }
 
 /// Fold a window's per-pane activities into `(dominant, active_count)`: the
 /// dominant state by precedence (attention > busy > free) and the number of
-/// panes that are busy or attention. GPUI-free so the precedence and count are
-/// unit-testable in isolation, mirroring the per-pane `ActivityTracker`
-/// (`docs/spec-pane-activity-v2.md`).
+/// panes that are busy (either working or idle refinement) or attention.
+/// GPUI-free so the precedence and count are unit-testable in isolation,
+/// mirroring the per-pane `ActivityTracker` (`docs/spec-pane-activity-v2.md`).
 fn aggregate_activity(activities: impl Iterator<Item = PaneActivity>) -> (PaneActivity, usize) {
     let mut dominant = PaneActivity::Free;
     let mut active_count = 0;
     for activity in activities {
-        if matches!(activity, PaneActivity::Busy | PaneActivity::Attention) {
+        if matches!(
+            activity,
+            PaneActivity::Busy | PaneActivity::BusyIdle | PaneActivity::Attention
+        ) {
             active_count += 1;
         }
         if activity_rank(activity) > activity_rank(dominant) {
@@ -427,15 +434,19 @@ fn aggregate_activity(activities: impl Iterator<Item = PaneActivity>) -> (PaneAc
 
 /// Which shape a window tab's fixed state slot renders for a dominant
 /// [`PaneActivity`]. Busy and attention are deliberately distinct shapes and
-/// sizes (a small success dot vs a danger "!"-badge) so a glance tells them
-/// apart (`docs/spec-cockpit-chrome.md`); `Idle` draws nothing but the slot
-/// reserves its width so the lane stays aligned across tabs. GPUI-free so the
-/// mapping is unit-testable without an app context; the render layer supplies
-/// the theme colors.
+/// sizes (a small dot vs a danger "!"-badge) so a glance tells them apart
+/// (`docs/spec-cockpit-chrome.md`); `Idle` draws nothing but the slot reserves
+/// its width so the lane stays aligned across tabs. `Busy` (working) and
+/// `BusyIdle` (idle-awaiting-input) share the same dot shape, distinguished
+/// only by color (success vs warning) — both mean "a command is running",
+/// just with the working/idle refinement layered in
+/// (`docs/spec-agent-activity.md`). GPUI-free so the mapping is unit-testable
+/// without an app context; the render layer supplies the theme colors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TabStateSlot {
     Idle,
     Busy,
+    BusyIdle,
     Attention,
 }
 
@@ -443,8 +454,33 @@ fn tab_state_slot(activity: PaneActivity) -> TabStateSlot {
     match activity {
         PaneActivity::Free => TabStateSlot::Idle,
         PaneActivity::Busy => TabStateSlot::Busy,
+        PaneActivity::BusyIdle => TabStateSlot::BusyIdle,
         PaneActivity::Attention => TabStateSlot::Attention,
     }
+}
+
+/// The tab bar's busy-dot indicator: a `color`-tinted dot plus, once more
+/// than one pane is busy, the active count — shared by `TabStateSlot::Busy`
+/// (success) and `TabStateSlot::BusyIdle` (warning), so the two working/idle
+/// refinements render the identical shape and differ only by color
+/// (`docs/spec-agent-activity.md`).
+fn busy_slot_dot(color: Hsla, muted: Hsla, active_count: usize) -> AnyElement {
+    let mut busy = h_flex()
+        .gap(px(3.0))
+        .items_center()
+        .child(div().size(px(7.0)).rounded_full().bg(color));
+    // Count only when more than one pane is busy — a lone busy pane needs no
+    // "1".
+    if active_count > 1 {
+        busy = busy.child(
+            div()
+                .font_family("JetBrainsMono Nerd Font Mono")
+                .text_size(px(11.0))
+                .text_color(muted)
+                .child(SharedString::from(active_count.to_string())),
+        );
+    }
+    busy.into_any_element()
 }
 
 /// The tab type glyph for a window whose active pane is (or is not) at its
@@ -2261,9 +2297,11 @@ impl SessionView {
             .working_directory()
             .map(home_relative)
             .unwrap_or_default();
-        // The pill tracks the pane's own busy state; attention never surfaces on
-        // a visible pane (its window is active, so the tracker suppresses it).
-        let running = matches!(pane.activity(), PaneActivity::Busy);
+        // The pill tracks the pane's own busy state (either working/idle
+        // refinement — a command is running either way); attention never
+        // surfaces on a visible pane (its window is active, so the tracker
+        // suppresses it).
+        let running = pane.activity().is_busy();
         let is_shell = entry.is_shell;
         let is_active = self.active_pane_id.as_deref() == Some(pane_id);
 
@@ -2603,11 +2641,13 @@ impl Render for SessionView {
 
         let selected_index = self.windows.iter().position(|w| w.is_active).unwrap_or(0);
         // Tab affordances reuse the theme tokens (zero hardcoded hex): the index
-        // caption and type glyph idle muted, the busy dot is success-tinted, the
+        // caption and type glyph idle muted, the busy dot is success-tinted
+        // (warning-tinted for the idle-awaiting-input refinement), the
         // attention badge is danger with a white "!", the close x reddens on
         // hover, and the new-window glyph brightens.
         let muted = cx.theme().muted_foreground;
         let success = cx.theme().success;
+        let warning = cx.theme().warning;
         let danger = cx.theme().danger;
         let danger_foreground = cx.theme().danger_foreground;
         let close_idle = cx.theme().muted_foreground;
@@ -2688,24 +2728,8 @@ impl Render for SessionView {
                     let group_name = SharedString::from(format!("window-tab-{}", w.id));
                     let state = match tab_state_slot(dominant) {
                         TabStateSlot::Idle => div().into_any_element(),
-                        TabStateSlot::Busy => {
-                            let mut busy = h_flex()
-                                .gap(px(3.0))
-                                .items_center()
-                                .child(div().size(px(7.0)).rounded_full().bg(success));
-                            // Count only when more than one pane is busy — a lone
-                            // busy pane needs no "1".
-                            if active_count > 1 {
-                                busy = busy.child(
-                                    div()
-                                        .font_family("JetBrainsMono Nerd Font Mono")
-                                        .text_size(px(11.0))
-                                        .text_color(muted)
-                                        .child(SharedString::from(active_count.to_string())),
-                                );
-                            }
-                            busy.into_any_element()
-                        }
+                        TabStateSlot::Busy => busy_slot_dot(success, muted, active_count),
+                        TabStateSlot::BusyIdle => busy_slot_dot(warning, muted, active_count),
                         TabStateSlot::Attention => h_flex()
                             .size(px(16.0))
                             .flex_none()
@@ -3372,6 +3396,29 @@ mod tests {
     }
 
     #[test]
+    fn test_aggregate_activity_busy_idle_ranks_between_free_and_busy() {
+        // BusyIdle alone reports itself and counts as active (a command is
+        // still running, just idle-awaiting-input).
+        assert_eq!(
+            aggregate_activity([PaneActivity::BusyIdle].into_iter()),
+            (PaneActivity::BusyIdle, 1)
+        );
+        // BusyIdle dominates free.
+        let (dominant, count) =
+            aggregate_activity([PaneActivity::Free, PaneActivity::BusyIdle].into_iter());
+        assert_eq!(dominant, PaneActivity::BusyIdle);
+        assert_eq!(count, 1);
+        // A working pane still dominates an idle one, and attention dominates
+        // both.
+        let (dominant, _) =
+            aggregate_activity([PaneActivity::BusyIdle, PaneActivity::Busy].into_iter());
+        assert_eq!(dominant, PaneActivity::Busy);
+        let (dominant, _) =
+            aggregate_activity([PaneActivity::BusyIdle, PaneActivity::Attention].into_iter());
+        assert_eq!(dominant, PaneActivity::Attention);
+    }
+
+    #[test]
     fn test_tab_state_slot_free_is_idle() {
         assert_eq!(tab_state_slot(PaneActivity::Free), TabStateSlot::Idle);
     }
@@ -3384,6 +3431,19 @@ mod tests {
         assert_eq!(attention, TabStateSlot::Attention);
         // Distinct shapes so the dot and the "!"-badge never read alike.
         assert_ne!(busy, attention);
+    }
+
+    #[test]
+    fn test_tab_state_slot_busy_idle_maps_to_its_own_slot() {
+        assert_eq!(
+            tab_state_slot(PaneActivity::BusyIdle),
+            TabStateSlot::BusyIdle
+        );
+        // Distinct from plain busy so the render layer can color them apart.
+        assert_ne!(
+            tab_state_slot(PaneActivity::BusyIdle),
+            tab_state_slot(PaneActivity::Busy)
+        );
     }
 
     #[test]

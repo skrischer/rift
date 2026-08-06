@@ -56,16 +56,47 @@ impl EventListener for Listener {
 /// Per-pane activity classification derived agent-agnostically from structural
 /// process state (the tmux foreground-process flag, the client alternate-screen
 /// mode, the OSC-133 phase) plus the terminal bell. Precedence:
-/// attention > busy > free (`docs/spec-pane-activity-v2.md`).
+/// attention > busy (working/idle) > free (`docs/spec-pane-activity-v2.md`,
+/// `docs/spec-agent-activity.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneActivity {
     /// At a shell prompt or otherwise not running a command.
     Free,
-    /// A foreground command is running — stays busy across the command's silent
-    /// phases (a running agent reads busy whether working or thinking).
+    /// A foreground command is running and, per [`WorkState`], is actively
+    /// working — the default until a work-state signal says otherwise (a
+    /// running agent reads busy whether working or thinking).
     Busy,
+    /// A foreground command is running but [`WorkState`] classifies it as
+    /// idle-awaiting-input — a refinement *within* busy, never a substitute
+    /// for the structural `is_shell` gate: a plain shell pane never reaches
+    /// this state (`docs/spec-agent-activity.md`). Nothing produces this
+    /// variant yet: it is the seam the future per-pane CPU classifier drives
+    /// via [`PaneView::set_work_state`].
+    BusyIdle,
     /// The pane rang the terminal bell and the user has not acknowledged it.
     Attention,
+}
+
+impl PaneActivity {
+    /// Whether a foreground command is running, regardless of the
+    /// working/idle refinement — for callers that only care that the pane is
+    /// busy, not which refinement.
+    pub fn is_busy(&self) -> bool {
+        matches!(self, PaneActivity::Busy | PaneActivity::BusyIdle)
+    }
+}
+
+/// The working-vs-idle refinement of [`PaneActivity::Busy`]: whether a running
+/// foreground process (an agent) is actively working or idle awaiting input.
+/// Derived from agent-agnostic host signals only — never agent detection or
+/// output parsing (`docs/spec-agent-activity.md`). `Working` is the default:
+/// until a signal source is wired in (the per-pane CPU classifier, #953), a
+/// busy pane always reads [`PaneActivity::Busy`] — today's behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkState {
+    #[default]
+    Working,
+    Idle,
 }
 
 /// Whether a pane is busy (a foreground command is running), from its structural
@@ -129,6 +160,12 @@ struct ActivityTracker {
     /// a bell in the window the user is looking at never raises attention
     /// (`docs/spec-pane-activity-v2.md`).
     window_active: bool,
+    /// The working-vs-idle refinement applied while busy, pushed down via
+    /// [`Self::set_work_state`] — the seam the future CPU classifier (#953)
+    /// drives. Defaults to [`WorkState::Working`], so a busy pane reads
+    /// [`PaneActivity::Busy`] until a signal source says otherwise
+    /// (`docs/spec-agent-activity.md`).
+    work_state: WorkState,
 }
 
 impl ActivityTracker {
@@ -137,6 +174,13 @@ impl ActivityTracker {
     /// applies).
     fn set_foreground_shell(&mut self, is_shell: Option<bool>) {
         self.is_shell = is_shell;
+    }
+
+    /// Record the pane's working-vs-idle refinement, applied only while the
+    /// pane is otherwise busy — a free (shell) pane is unaffected regardless
+    /// of this value (`docs/spec-agent-activity.md`).
+    fn set_work_state(&mut self, work_state: WorkState) {
+        self.work_state = work_state;
     }
 
     /// Raise unacknowledged attention (the pane rang the terminal bell).
@@ -175,12 +219,16 @@ impl ActivityTracker {
 
     /// The pane's busy/free state ignoring any unacknowledged bell — the state
     /// the active window surfaces, so a bell arriving there never flashes
-    /// attention (`docs/spec-pane-activity-v2.md`).
+    /// attention (`docs/spec-pane-activity-v2.md`). The working/idle
+    /// refinement only applies while busy: a free (shell) pane is unaffected
+    /// by `work_state` (`docs/spec-agent-activity.md`).
     fn underlying(&self, alt_screen: bool, osc_executing: bool) -> PaneActivity {
-        if classify_busy(self.is_shell, alt_screen, osc_executing) {
-            PaneActivity::Busy
-        } else {
-            PaneActivity::Free
+        if !classify_busy(self.is_shell, alt_screen, osc_executing) {
+            return PaneActivity::Free;
+        }
+        match self.work_state {
+            WorkState::Working => PaneActivity::Busy,
+            WorkState::Idle => PaneActivity::BusyIdle,
         }
     }
 }
@@ -1102,6 +1150,15 @@ impl PaneView {
     /// (`docs/spec-pane-activity-v2.md`).
     pub fn set_foreground_shell(&mut self, is_shell: Option<bool>) {
         self.activity.set_foreground_shell(is_shell);
+    }
+
+    /// Record this pane's working-vs-idle refinement of [`PaneActivity::Busy`]
+    /// (`docs/spec-agent-activity.md`). This is the seam a future per-pane
+    /// signal source (the `/proc` CPU classifier, #953) drives; nothing calls
+    /// it yet, so every pane defaults to [`WorkState::Working`] and reads
+    /// today's plain `Busy` — behavior-preserving until that signal lands.
+    pub fn set_work_state(&mut self, work_state: WorkState) {
+        self.activity.set_work_state(work_state);
     }
 
     fn pixel_to_grid(&self, pos: Point<Pixels>) -> (usize, usize) {
@@ -2744,6 +2801,46 @@ mod tests {
         // Leaving the window afterwards must not resurface the suppressed bell.
         tracker.set_window_active(false);
         assert_eq!(tracker.state(false, false), PaneActivity::Free);
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_activity_default_work_state_reads_plain_busy() {
+        // Behavior-preserving default: no work-state signal wired in yet, so a
+        // busy pane reads today's plain `Busy` (`docs/spec-agent-activity.md`).
+        let mut tracker = ActivityTracker::default();
+        tracker.set_foreground_shell(Some(false));
+        assert_eq!(tracker.state(false, false), PaneActivity::Busy);
+        assert!(tracker.state(false, false).is_busy());
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_activity_work_state_idle_refines_busy_to_busy_idle() {
+        let mut tracker = ActivityTracker::default();
+        tracker.set_foreground_shell(Some(false));
+        tracker.set_work_state(WorkState::Idle);
+        assert_eq!(tracker.state(false, false), PaneActivity::BusyIdle);
+        assert!(tracker.state(false, false).is_busy());
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_activity_work_state_idle_on_shell_pane_stays_free() {
+        // The working/idle refinement only applies while the structural gate
+        // reads busy; a shell pane is unaffected regardless of `work_state`.
+        let mut tracker = ActivityTracker::default();
+        tracker.set_foreground_shell(Some(true));
+        tracker.set_work_state(WorkState::Idle);
+        assert_eq!(tracker.state(false, false), PaneActivity::Free);
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_activity_bell_overrides_busy_idle_as_attention() {
+        // Attention still takes precedence over the working/idle refinement.
+        let mut tracker = ActivityTracker::default();
+        tracker.set_foreground_shell(Some(false));
+        tracker.set_work_state(WorkState::Idle);
+        tracker.on_bell();
+        assert_eq!(tracker.state(false, false), PaneActivity::Attention);
+        assert_eq!(tracker.underlying(false, false), PaneActivity::BusyIdle);
     }
 
     #[::core::prelude::v1::test]

@@ -54,7 +54,8 @@ const NO_BRANCH_LABEL: &str = "detached HEAD";
 /// carries the full sample inline on the enum variant rather than as a separate
 /// reusable type (unlike `LspServerState`), so this narrows it to the fields the
 /// composite status line's MEM/CPU segment, [`pressure_level`]
-/// (`docs/spec-memory-pressure.md`), and the host-detail hover card
+/// (`docs/spec-memory-pressure.md`), the host-detail hover card
+/// (`docs/spec-telemetry-detail.md`), and the DISK segment
 /// (`docs/spec-telemetry-detail.md`) read.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HostMetrics {
@@ -80,6 +81,13 @@ pub struct HostMetrics {
     pub cpu_count: u32,
     /// Host uptime, in seconds (`docs/spec-telemetry-detail.md`).
     pub uptime_secs: u64,
+    /// Total capacity of the daemon's own filesystem, in bytes
+    /// (`docs/spec-telemetry-detail.md`) — the basis for the DISK status
+    /// segment's used-percentage.
+    pub disk_total: u64,
+    /// Free space on the daemon's own filesystem, in bytes
+    /// (`docs/spec-telemetry-detail.md`).
+    pub disk_available: u64,
     /// Linux PSI memory-stall averages, where the kernel exposes
     /// `/proc/pressure/memory` (`None` on hosts without `CONFIG_PSI`, e.g. the
     /// stock `microsoft-standard-WSL2` kernel) — an optional escalation signal
@@ -432,6 +440,30 @@ fn metrics_text(cpu: f32, mem_total: u64, mem_available: u64) -> String {
         "MEM {}% \u{b7} CPU {}%",
         mem_pct.round() as i64,
         (cpu as f64).round() as i64
+    )
+}
+
+/// The daemon filesystem's disk-used ratio as a percentage (0.0-100.0 when
+/// `disk_total` > 0), guarded against a zero `disk_total` the same way
+/// [`mem_used_pct`] is. Saturates so a degenerate sample (`disk_available >
+/// disk_total`) never underflows. Shared by the status-line DISK segment.
+pub fn disk_used_pct(disk_total: u64, disk_available: u64) -> f64 {
+    if disk_total == 0 {
+        0.0
+    } else {
+        disk_total.saturating_sub(disk_available) as f64 / disk_total as f64 * 100.0
+    }
+}
+
+/// The `DISK <n>%` (used) status-line segment text
+/// (`docs/spec-telemetry-detail.md`): integer-rounded, no threshold recolor
+/// this phase (neutral-coloured — Phase 44 owns pressure). Whether to render
+/// at all (hidden before the first sample) is the caller's concern via
+/// `StatusLineModel.host_metrics: Option<...>`, mirroring [`metrics_text`].
+fn disk_text(disk_total: u64, disk_available: u64) -> String {
+    format!(
+        "DISK {}%",
+        disk_used_pct(disk_total, disk_available).round() as i64
     )
 }
 
@@ -845,6 +877,18 @@ pub fn render(
             .content(move |_state, _window, cx| host_detail_content(&sample, &mem_history, cx))
     });
 
+    // Disk-headroom segment (`docs/spec-telemetry-detail.md`): beside the
+    // MEM/CPU segment, reading the daemon-global `disk_total`/
+    // `disk_available` fields. Hidden until the first sample arrives
+    // (mirroring `metrics` above); neutral-coloured — no threshold recolor
+    // this phase (Phase 44 owns pressure).
+    let disk = model.host_metrics.map(|m| {
+        let text = disk_text(m.disk_total, m.disk_available);
+        div()
+            .text_color(theme.muted_foreground)
+            .child(SharedString::from(text))
+    });
+
     let clock = div()
         .text_color(theme.muted_foreground)
         .child(SharedString::from(model.clock.to_owned()));
@@ -858,6 +902,7 @@ pub fn render(
         .children((!model.lsp.is_empty()).then_some(lsp))
         .children(cursor)
         .children(metrics)
+        .children(disk)
         .child(clock);
 
     h_flex()
@@ -879,15 +924,12 @@ pub fn render(
 
 /// One window as a clickable `index:name` chip. The active window sits on a
 /// surface chip (`list_active`); a busy/attention window carries a leading dot
-/// (success / danger). Click dispatches `select-window` through `session_view`
-/// (the existing tmux command channel) — never a parallel path.
+/// (success working / warning idle-awaiting-input / danger attention). Click
+/// dispatches `select-window` through `session_view` (the existing tmux
+/// command channel) — never a parallel path.
 fn window_chip(w: &StatusWindow, session_view: &Entity<SessionView>, cx: &App) -> impl IntoElement {
     let theme = cx.theme();
-    let activity_color = match w.activity {
-        PaneActivity::Busy => Some(theme.success),
-        PaneActivity::Attention => Some(theme.danger),
-        PaneActivity::Free => None,
-    };
+    let activity_color = activity_dot_color(w.activity, theme.success, theme.warning, theme.danger);
     let label = format!("{}:{}", w.index, w.name);
     let entity = session_view.clone();
     let window_id = w.id.clone();
@@ -915,6 +957,25 @@ fn window_chip(w: &StatusWindow, session_view: &Entity<SessionView>, cx: &App) -
         .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
             entity.update(cx, |view, cx| view.select_window(&window_id, cx));
         })
+}
+
+/// The window chip's leading-dot color for a folded [`PaneActivity`]: success
+/// while actively working, warning while idle-awaiting-input (the busy
+/// refinement `docs/spec-agent-activity.md` adds), danger on attention, and
+/// no dot while free. GPUI-free (the theme colors are passed in) so the
+/// mapping is unit-testable without an app context.
+fn activity_dot_color(
+    activity: PaneActivity,
+    success: gpui::Hsla,
+    warning: gpui::Hsla,
+    danger: gpui::Hsla,
+) -> Option<gpui::Hsla> {
+    match activity {
+        PaneActivity::Busy => Some(success),
+        PaneActivity::BusyIdle => Some(warning),
+        PaneActivity::Attention => Some(danger),
+        PaneActivity::Free => None,
+    }
 }
 
 /// A colored dot + count, for one diagnostic severity (`●e` / `⚠w` in the
@@ -1044,6 +1105,39 @@ mod tests {
                 .insert(server.to_owned(), items);
         }
         map
+    }
+
+    #[gpui::test]
+    fn test_activity_dot_color_maps_each_activity_to_its_theme_color(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Reads the live gpui-component theme tokens (never a raw color
+        // constructor, `docs/spec-settings-theme.md`) so the mapping is
+        // checked against the colors `window_chip` actually renders with.
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            let theme = cx.theme();
+            let success = theme.success;
+            let warning = theme.warning;
+            let danger = theme.danger;
+
+            assert_eq!(
+                activity_dot_color(PaneActivity::Busy, success, warning, danger),
+                Some(success)
+            );
+            assert_eq!(
+                activity_dot_color(PaneActivity::BusyIdle, success, warning, danger),
+                Some(warning)
+            );
+            assert_eq!(
+                activity_dot_color(PaneActivity::Attention, success, warning, danger),
+                Some(danger)
+            );
+            assert_eq!(
+                activity_dot_color(PaneActivity::Free, success, warning, danger),
+                None
+            );
+        });
     }
 
     #[test]
@@ -1207,6 +1301,8 @@ mod tests {
             },
             cpu_count: 4,
             uptime_secs: 0,
+            disk_total: 0,
+            disk_available: 0,
             psi: None,
         }
     }
@@ -1445,6 +1541,34 @@ mod tests {
     #[test]
     fn test_mem_used_pct_guards_against_zero_mem_total() {
         assert_eq!(mem_used_pct(0, 0), 0.0);
+    }
+
+    // --- disk-headroom segment (docs/spec-telemetry-detail.md) ---------------
+
+    #[test]
+    fn test_disk_used_pct_computes_used_ratio() {
+        assert_eq!(disk_used_pct(500_000_000_000, 200_000_000_000), 60.0);
+    }
+
+    #[test]
+    fn test_disk_used_pct_guards_against_zero_disk_total() {
+        assert_eq!(disk_used_pct(0, 0), 0.0);
+    }
+
+    #[test]
+    fn test_disk_used_pct_saturates_on_a_degenerate_sample() {
+        // disk_available > disk_total should never happen, but must not underflow.
+        assert_eq!(disk_used_pct(1_000, 2_000), 0.0);
+    }
+
+    #[test]
+    fn test_disk_text_formats_used_percentage_rounded() {
+        assert_eq!(disk_text(500_000_000_000, 200_000_000_000), "DISK 60%");
+    }
+
+    #[test]
+    fn test_disk_text_guards_against_zero_disk_total() {
+        assert_eq!(disk_text(0, 0), "DISK 0%");
     }
 
     // --- MemoryHistory ring buffer (docs/spec-telemetry-detail.md) -----------
