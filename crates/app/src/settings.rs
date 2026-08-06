@@ -4,12 +4,17 @@
 //! dialog overlay, the same pattern `command_palette` uses. **Appearance** is
 //! the one populated page (issue #608): a Theme group of selectable cards —
 //! one per theme registered in the `ThemeRegistry`, previewed from that
-//! theme's own tokens — and a Font & size group (UI font, editor/terminal
-//! mono font, whole-client font size). Every control is a view over live app
-//! state ([`crate::set_theme_persisted`], [`crate::set_ui_font_persisted`],
-//! [`crate::set_mono_font_persisted`], and `SessionView`'s font-zoom state —
-//! the same state the command palette and `Ctrl+=`/`Ctrl+-` already mutate),
-//! persisted via the window-state store, never a config file
+//! theme's own tokens — and a Font & size group (UI font, editor/panes mono
+//! font, global UI font size, terminal size). Every control is a view over
+//! live app state ([`crate::set_theme_persisted`], [`crate::set_ui_font_persisted`],
+//! [`crate::set_mono_font_persisted`], [`crate::set_ui_font_size_persisted`]
+//! (issue #920, resizes the editor and dock panels via the theme's
+//! `font_size`/`mono_font_size`; the explorer's row text is pinned to fixed
+//! `Pixels` by #908 and does not cascade — see the "UI font size" item's
+//! description), and `SessionView`'s font-zoom state — the
+//! terminal PTY grid only, unaffected by the UI font size, the same state the
+//! command palette and `Ctrl+=`/`Ctrl+-` already mutate), persisted via the
+//! window-state store, never a config file
 //! (`docs/spec-dogfooding-channels.md`'s standing "no new config layer"
 //! decision). The remaining sections (Connection, Keybindings, Editor,
 //! Terminal, General, About) are shell structure only, populated in later
@@ -247,7 +252,30 @@ fn appearance_page(
                 )
                 .description("Monospace for the editor, status bar, and other dock panels (not the terminal PTY grid)."),
                 SettingItem::new(
-                    "Font size",
+                    "UI font size",
+                    SettingField::number_input(
+                        NumberFieldOptions {
+                            min: f64::from(crate::MIN_UI_FONT_SIZE),
+                            max: f64::from(crate::MAX_UI_FONT_SIZE),
+                            step: 1.0,
+                        },
+                        |cx: &App| f64::from(f32::from(cx.theme().font_size)),
+                        |val: f64, cx: &mut App| {
+                            crate::set_ui_font_size_persisted(val as f32, None, cx)
+                        },
+                    ),
+                )
+                // NOTE (issue #920 escalation): the explorer's row/header text
+                // sizes were pinned to fixed `Pixels` by #908
+                // (`docs/spec-dogfooding-fixes.md`, landed after this issue's
+                // spec), so they do not actually cascade from the theme base
+                // `font_size` this control sets — unlike `text_sm`/`text_xs`
+                // readers elsewhere. The description below is scoped to what
+                // this PR verifiably resizes; making the explorer scale too is
+                // flagged as a follow-up rather than silently claimed here.
+                .description("Resizes the editor and dock panels. Does not affect the explorer rows or the terminal grid."),
+                SettingItem::new(
+                    "Terminal size",
                     SettingField::number_input(
                         NumberFieldOptions {
                             min: f64::from(MIN_FONT_SIZE),
@@ -262,7 +290,7 @@ fn appearance_page(
                         },
                     ),
                 )
-                .description("Base size for editor and terminal (Ctrl+=/Ctrl+- also adjust this)."),
+                .description("Size of the terminal PTY grid only (Ctrl+=/Ctrl+- also adjust this)."),
             ]),
         ])
 }

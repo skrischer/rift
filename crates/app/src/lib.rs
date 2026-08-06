@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use gpui::{App, SharedString, Window};
+use gpui::{px, App, SharedString, Window};
 use gpui_component::{Theme, ThemeConfig, ThemeMode, ThemeRegistry};
 use tracing::{error, warn};
 
@@ -87,7 +87,10 @@ pub fn apply_theme(cx: &mut App) {
 /// (`set_theme_mode`) survives a restart too. A persisted font-family override
 /// (issue #608) is applied last, and only when non-empty — an empty field
 /// means "no override", so the resolved theme's own font stands, exactly like
-/// a fresh store predating these two fields.
+/// a fresh store predating these two fields. The global UI font size (issue
+/// #920) is always applied — unlike the font-family overrides it has no
+/// "unset" sentinel, and a fresh store's default already matches the
+/// resolved theme's own base size, so applying it is a no-op there.
 pub fn apply_persisted_theme(state: &window_state::WindowState, cx: &mut App) {
     if register_themes(cx) {
         set_theme(&state.theme_name, None, cx);
@@ -98,6 +101,7 @@ pub fn apply_persisted_theme(state: &window_state::WindowState, cx: &mut App) {
         if !state.mono_font_family.is_empty() {
             set_mono_font(&state.mono_font_family, None, cx);
         }
+        set_ui_font_size(state.ui_font_size_px, None, cx);
     }
 }
 
@@ -322,6 +326,55 @@ pub fn set_mono_font_persisted(name: &str, window: Option<&mut Window>, cx: &mut
     persist_best_effort(|path| window_state::save_mono_font_family(path, name));
 }
 
+// ── UI font-size setter (issue #920) ─────────────────────────────────────────
+//
+// A single "UI font size" control (`crate::settings`) resizes the editor,
+// dock panels, and explorer live: it sets the theme's base `font_size` —
+// which `gpui-component`'s `Root` reapplies as `window.set_rem_size` on every
+// render, cascading to every `text_sm`/`text_xs` reader (the explorer rows
+// and chrome) — and `mono_font_size` (the editor and dock panels), scaled
+// together via `scaled_mono_font_size`. This is entirely separate from the
+// terminal PTY grid's own size, `rift_terminal::SessionView::font_size`
+// (`settings.rs`'s "Terminal size" control), which nothing here touches.
+
+/// Lower bound of the global UI font-size control — its own range, not
+/// borrowed from the terminal grid's `rift_terminal::MIN_FONT_SIZE` (spec:
+/// "the UI font-size setter defines its own min/max bounds").
+pub const MIN_UI_FONT_SIZE: f32 = 12.0;
+/// Upper bound of the global UI font-size control (see [`MIN_UI_FONT_SIZE`]).
+pub const MAX_UI_FONT_SIZE: f32 = 24.0;
+
+/// The `mono_font_size` a given base `font_size` scales to, preserving the
+/// ratio `gpui-component`'s `Theme::default` ships out of the box (13px mono
+/// over a 16px base) — so the editor and dock panels stay proportionally
+/// smaller than the base chrome text at every UI font size, not only the
+/// default. Pure, so it is unit-testable without an `App`.
+fn scaled_mono_font_size(font_size_px: f32) -> f32 {
+    font_size_px * 13.0 / 16.0
+}
+
+/// Switch the global UI font size live: the theme's base `font_size` and
+/// `mono_font_size`, scaled together via [`scaled_mono_font_size`].
+/// `size_px` is clamped to [`MIN_UI_FONT_SIZE`, `MAX_UI_FONT_SIZE`]. Mirrors
+/// [`set_ui_font`]'s window-refresh fallback (issue #493): a `SettingField`
+/// setter only ever hands its closure `cx: &mut App`, never a `Window`.
+pub fn set_ui_font_size(size_px: f32, window: Option<&mut Window>, cx: &mut App) {
+    let clamped = size_px.clamp(MIN_UI_FONT_SIZE, MAX_UI_FONT_SIZE);
+    let theme = Theme::global_mut(cx);
+    theme.font_size = px(clamped);
+    theme.mono_font_size = px(scaled_mono_font_size(clamped));
+    match window {
+        Some(window) => window.refresh(),
+        None => cx.refresh_windows(),
+    }
+}
+
+/// [`set_ui_font_size`], then persists the choice so it survives a restart.
+pub fn set_ui_font_size_persisted(size_px: f32, window: Option<&mut Window>, cx: &mut App) {
+    set_ui_font_size(size_px, window, cx);
+    persist_best_effort(|path| window_state::save_ui_font_size(path, size_px));
+}
+
 // ── Command-palette theme actions ────────────────────────────────────────────
 //
 // Dispatchable, parameterless actions (issue #367, `docs/spec-theme-settings.md`):
@@ -369,8 +422,9 @@ mod tests {
     use crate::window_state::{self, WindowState};
     use crate::{
         apply_persisted_theme, apply_theme, persist_theme_mode_to, persist_theme_to, resolve_theme,
-        set_mono_font, set_theme, set_theme_mode, set_ui_font, toggle_theme_mode,
-        CATPPUCCIN_MOCHA_THEME_NAME, DEFAULT_LIGHT_THEME_NAME, DEFAULT_THEME_NAME,
+        scaled_mono_font_size, set_mono_font, set_theme, set_theme_mode, set_ui_font,
+        set_ui_font_size, toggle_theme_mode, CATPPUCCIN_MOCHA_THEME_NAME, DEFAULT_LIGHT_THEME_NAME,
+        DEFAULT_THEME_NAME, MAX_UI_FONT_SIZE, MIN_UI_FONT_SIZE,
     };
 
     fn theme_config(name: &str, mode: ThemeMode) -> ThemeConfig {
@@ -794,6 +848,122 @@ mod tests {
 
             assert_eq!(cx.theme().font_family, font_before_restore);
             assert_ne!(cx.theme().font_family.as_ref(), "");
+        });
+    }
+
+    // --- UI font-size setter (issue #920) -----------------------------------
+
+    #[test]
+    fn test_scaled_mono_font_size_preserves_the_default_ratio() {
+        assert_eq!(scaled_mono_font_size(16.0), 13.0);
+    }
+
+    #[test]
+    fn test_scaled_mono_font_size_scales_proportionally_with_the_base() {
+        assert_eq!(scaled_mono_font_size(32.0), 26.0);
+    }
+
+    #[gpui::test]
+    fn test_set_ui_font_size_updates_the_live_theme_font_size_and_mono_size(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            apply_theme(cx);
+
+            set_ui_font_size(20.0, None, cx);
+
+            assert_eq!(f32::from(cx.theme().font_size), 20.0);
+            assert_eq!(
+                f32::from(cx.theme().mono_font_size),
+                scaled_mono_font_size(20.0)
+            );
+        });
+    }
+
+    /// A value outside `[MIN_UI_FONT_SIZE, MAX_UI_FONT_SIZE]` clamps rather
+    /// than applying verbatim or panicking — mirrors `rift_terminal`'s own
+    /// `SessionView::set_font_size` clamp behavior.
+    #[gpui::test]
+    fn test_set_ui_font_size_clamps_out_of_range_values(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            apply_theme(cx);
+
+            set_ui_font_size(MIN_UI_FONT_SIZE - 5.0, None, cx);
+            assert_eq!(f32::from(cx.theme().font_size), MIN_UI_FONT_SIZE);
+
+            set_ui_font_size(MAX_UI_FONT_SIZE + 5.0, None, cx);
+            assert_eq!(f32::from(cx.theme().font_size), MAX_UI_FONT_SIZE);
+        });
+    }
+
+    /// Same class of regression `test_set_ui_font_without_a_window_still_refreshes_open_windows`
+    /// guards against (issue #493): `set_ui_font_size` mutates `Theme::global`
+    /// directly rather than through `Theme::change`, so it needs its own
+    /// window-refresh fallback rather than inheriting one.
+    #[gpui::test]
+    fn test_set_ui_font_size_without_a_window_still_refreshes_open_windows(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            apply_theme(cx);
+        });
+
+        let render_count = Rc::new(std::cell::Cell::new(0usize));
+        let view_render_count = render_count.clone();
+        let _window = cx.add_window(move |_, _| CountingView {
+            render_count: view_render_count,
+        });
+        assert_eq!(render_count.get(), 1, "window draws once on creation");
+
+        cx.update(|cx| {
+            set_ui_font_size(20.0, None, cx);
+        });
+
+        assert_eq!(
+            render_count.get(),
+            2,
+            "refresh_windows should schedule a redraw even without a Window handle"
+        );
+    }
+
+    /// A persisted UI font size is re-applied on restore, over whatever the
+    /// resolved theme's own base size would otherwise be.
+    #[gpui::test]
+    fn test_apply_persisted_theme_applies_a_persisted_ui_font_size(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            let state = WindowState {
+                ui_font_size_px: 22.0,
+                ..WindowState::default()
+            };
+
+            apply_persisted_theme(&state, cx);
+
+            assert_eq!(f32::from(cx.theme().font_size), 22.0);
+            assert_eq!(
+                f32::from(cx.theme().mono_font_size),
+                scaled_mono_font_size(22.0)
+            );
+        });
+    }
+
+    /// A fresh store's default UI font size matches the resolved theme's own
+    /// out-of-the-box base size (16px) and mono size (13px), so restoring it
+    /// is a no-op visually.
+    #[gpui::test]
+    fn test_apply_persisted_theme_default_ui_font_size_matches_theme_default(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+
+            apply_persisted_theme(&WindowState::default(), cx);
+
+            assert_eq!(f32::from(cx.theme().font_size), 16.0);
+            assert_eq!(f32::from(cx.theme().mono_font_size), 13.0);
         });
     }
 
