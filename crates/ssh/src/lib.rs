@@ -13,11 +13,11 @@ pub use backoff::ReconnectBackoff;
 pub use connection::{key_requires_passphrase, SshConnection};
 pub use daemon_channel::{DaemonChannel, DaemonClient, Handshake};
 pub use deploy::{
-    ensure_daemon_deployed, needs_upload, remote_binary_name, target_triple_from_uname,
-    DeployOutcome,
+    ensure_daemon_deployed, needs_upload, remote_binary_name, resolve_remote_dir,
+    target_triple_from_uname, DeployOutcome,
 };
 pub use error::SshError;
 pub use launch::{connect_or_spawn_daemon, stop_daemon};
 pub use pty::{PtyStream, PtySyncReader, PtySyncWriter, PtyWriter};
-pub use transport::Connection;
+pub use transport::{Connection, ConnectionKind};
 pub use wsl::WslConnection;

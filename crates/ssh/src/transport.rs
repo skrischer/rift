@@ -35,7 +35,28 @@ pub enum Connection {
     Wsl(WslConnection),
 }
 
+/// The concrete transport kind backing a [`Connection`] — a cheap,
+/// synchronous, freely-constructible discriminant carrying no connection
+/// state. [`SshConnection`] and [`WslConnection`] only exist behind a live
+/// `connect()` (a real SSH handshake / `wsl.exe` probe), so callers that need
+/// to branch on SSH-vs-WSL in a unit test — e.g. the deploy path's
+/// transport-specific `remote_dir` default (`crate::deploy`) — match on this
+/// instead of constructing a whole [`Connection`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionKind {
+    Ssh,
+    Wsl,
+}
+
 impl Connection {
+    /// The transport kind backing this connection. See [`ConnectionKind`].
+    pub fn kind(&self) -> ConnectionKind {
+        match self {
+            Connection::Ssh(_) => ConnectionKind::Ssh,
+            Connection::Wsl(_) => ConnectionKind::Wsl,
+        }
+    }
+
     /// Whether the underlying transport has closed. See
     /// [`SshConnection::is_closed`] / [`WslConnection::is_closed`].
     pub fn is_closed(&self) -> bool {
