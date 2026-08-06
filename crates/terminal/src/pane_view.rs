@@ -13,6 +13,7 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dialog::AlertDialog;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::notification::Notification;
+use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarShow};
 use gpui_component::ActiveTheme;
 use gpui_component::WindowExt;
 use gpui_component::{Disableable, Icon, IconName, Sizable};
@@ -238,6 +239,54 @@ struct SearchPrompt {
     input: Entity<InputState>,
     state: SearchState,
     _subscription: Subscription,
+}
+
+/// A read-only mirror of [`PaneView`]'s composite scroll position (the live
+/// `Term`'s `display_offset` plus the pre-attach history block's
+/// `history_scroll`), reshaped into the pixel-offset/content-size vocabulary
+/// [`ScrollbarHandle`] expects so the vendored `gpui_component` [`Scrollbar`]
+/// can render the thumb and drive its own autohide timing
+/// (`docs/spec-terminal-scrollbar.md`). `set_offset` is deliberately a no-op:
+/// drag-to-scroll is a separate step (#916), and until it lands the composite
+/// scroll state in [`PaneView`] stays the sole authority over position — this
+/// handle never becomes a second scroll owner.
+#[derive(Clone, Copy)]
+struct CompositeScrollHandle {
+    /// Rows scrolled up from the live bottom: `display_offset + history_scroll`.
+    rows_from_bottom: usize,
+    /// Total scrollable rows above the live bottom: `history_size` plus the
+    /// pre-attach block's row count once captured (`0` beforehand, so the
+    /// total — and thus the thumb geometry — is provisional until then).
+    total_rows: usize,
+    /// The pane's visible row count.
+    viewport_rows: usize,
+    /// Pixel height of one grid row, converting the row-based composite
+    /// position into the pixel space [`ScrollbarHandle`] expects.
+    row_height: Pixels,
+}
+
+impl CompositeScrollHandle {
+    /// Rows between the top of the composite range and the current viewport.
+    /// `0` at the very top (deepest scrollback); `total_rows` at the live
+    /// bottom.
+    fn distance_from_top(&self) -> usize {
+        self.total_rows.saturating_sub(self.rows_from_bottom)
+    }
+}
+
+impl ScrollbarHandle for CompositeScrollHandle {
+    fn offset(&self) -> Point<Pixels> {
+        point(px(0.0), -(self.row_height * self.distance_from_top()))
+    }
+
+    fn set_offset(&self, _offset: Point<Pixels>) {}
+
+    fn content_size(&self) -> Size<Pixels> {
+        size(
+            px(0.0),
+            self.row_height * (self.total_rows + self.viewport_rows),
+        )
+    }
 }
 
 pub struct PaneView {
@@ -1128,6 +1177,33 @@ impl PaneView {
         true
     }
 
+    /// The vertical scrollback scrollbar overlay: a [`CompositeScrollHandle`]
+    /// mirror of the composite scroll position driving the vendored
+    /// [`Scrollbar`] (`docs/spec-terminal-scrollbar.md`). `None` in
+    /// alt-screen mode (`alt_screen`), where there is no scrollback to
+    /// traverse; the vendored widget also hides itself whenever the
+    /// composite range does not exceed the viewport, so a pane with no
+    /// scrollback yet stays scrollbar-free even before that check.
+    fn render_scrollbar(
+        &self,
+        history_size: usize,
+        display_offset: usize,
+        viewport_rows: usize,
+        alt_screen: bool,
+    ) -> Option<Scrollbar> {
+        if alt_screen {
+            return None;
+        }
+        let block_rows = self.history_block.as_ref().map_or(0, Vec::len);
+        let handle = CompositeScrollHandle {
+            rows_from_bottom: display_offset + self.history_scroll,
+            total_rows: history_size + block_rows,
+            viewport_rows,
+            row_height: self.cell_size.height,
+        };
+        Some(Scrollbar::vertical(&handle).scrollbar_show(ScrollbarShow::Hover))
+    }
+
     /// The floating scrollback-search bar: query input, match counter,
     /// prev/next navigation, and a close button. Rendered as the last child
     /// on top of the grid (later children paint over earlier ones), so it
@@ -1581,6 +1657,8 @@ impl Render for PaneView {
         }
 
         let display_offset = term.grid().display_offset();
+        let history_size = term.grid().history_size();
+        let alt_screen = mode.contains(TermMode::ALT_SCREEN);
 
         // When scrolled into the pre-attach block, its bottom `history_rows` rows
         // occupy the top of the viewport and the live `Term` (pinned fully
@@ -2035,7 +2113,13 @@ impl Render for PaneView {
                 }
             }))
             .child(bounds_observer)
-            .child(grid);
+            .child(grid)
+            .children(self.render_scrollbar(
+                history_size,
+                display_offset,
+                new_size.rows,
+                alt_screen,
+            ));
 
         if self.search.is_some() {
             terminal_area.child(self.render_search_bar(cx))
@@ -2120,6 +2204,63 @@ mod tests {
         assert!(cells
             .iter()
             .all(|cell| !cell.search_match && !cell.search_current));
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_composite_scroll_handle_offset_at_live_bottom_is_max_negative() {
+        let handle = CompositeScrollHandle {
+            rows_from_bottom: 0,
+            total_rows: 10,
+            viewport_rows: 24,
+            row_height: px(20.0),
+        };
+
+        assert_eq!(handle.offset(), point(px(0.0), px(-200.0)));
+        assert_eq!(handle.content_size(), size(px(0.0), px(680.0)));
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_composite_scroll_handle_offset_at_scrollback_top_is_zero() {
+        let handle = CompositeScrollHandle {
+            rows_from_bottom: 10,
+            total_rows: 10,
+            viewport_rows: 24,
+            row_height: px(20.0),
+        };
+
+        assert_eq!(handle.offset(), point(px(0.0), px(0.0)));
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_composite_scroll_handle_offset_clamps_when_rows_from_bottom_exceeds_total() {
+        // `history_scroll` can transiently exceed `total_rows` right after a
+        // resize invalidates the pre-attach block; the offset must clamp to
+        // the top rather than underflow.
+        let handle = CompositeScrollHandle {
+            rows_from_bottom: 50,
+            total_rows: 10,
+            viewport_rows: 24,
+            row_height: px(20.0),
+        };
+
+        assert_eq!(handle.offset(), point(px(0.0), px(0.0)));
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_composite_scroll_handle_set_offset_is_noop() {
+        // Drag-to-scroll lands in #916; until then the composite scroll state
+        // in `PaneView` stays the sole authority over position.
+        let handle = CompositeScrollHandle {
+            rows_from_bottom: 3,
+            total_rows: 10,
+            viewport_rows: 24,
+            row_height: px(20.0),
+        };
+        let before = handle.offset();
+
+        handle.set_offset(point(px(0.0), px(-999.0)));
+
+        assert_eq!(handle.offset(), before);
     }
 
     #[::core::prelude::v1::test]
