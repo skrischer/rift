@@ -2061,9 +2061,9 @@ async fn run_ssh_session(
     connected: &AtomicBool,
     watches: &EngineWatches,
 ) -> Result<()> {
-    use rift_ssh::SshConnection;
+    use rift_ssh::{Connection, SshConnection};
 
-    let mut conn = SshConnection::connect(
+    let ssh_conn = SshConnection::connect(
         &ssh.host,
         ssh.port,
         &ssh.user,
@@ -2073,6 +2073,7 @@ async fn run_ssh_session(
     .await
     .context("SSH connection failed")?
     .with_remote_exec_wrapper(ssh.remote_exec_wrapper.clone());
+    let mut conn = Connection::Ssh(ssh_conn);
 
     // Provision the daemon ahead of the terminal: detect the platform, upload the
     // versioned binary when absent, then attach — spawning it detached if none is
@@ -2147,7 +2148,7 @@ async fn run_ssh_session(
 /// leave the fresh child on the attach-default grid — so this function
 /// receives the handles instead of creating them.
 async fn run_daemon_terminal(
-    conn: &mut rift_ssh::SshConnection,
+    conn: &mut rift_ssh::Connection,
     client: rift_ssh::DaemonClient,
     endpoint: DaemonEndpoint,
     watches: &EngineWatches,
@@ -2626,7 +2627,7 @@ enum ReconnectFailure {
 /// client is currently on and re-asserts the freshest grid even when both
 /// changed since the stream died.
 async fn reconnect_daemon(
-    conn: &mut rift_ssh::SshConnection,
+    conn: &mut rift_ssh::Connection,
     endpoint: &DaemonEndpoint,
     session_rx: &tokio::sync::watch::Receiver<String>,
     viewport_rx: &tokio::sync::watch::Receiver<Option<TermSize>>,
@@ -2694,7 +2695,7 @@ async fn reconnect_daemon(
 /// without it the terminal would stay reflowed to the 80x24 attach default
 /// (same re-assert the session-switch bridge does).
 async fn try_daemon_reconnect(
-    conn: &mut rift_ssh::SshConnection,
+    conn: &mut rift_ssh::Connection,
     endpoint: &DaemonEndpoint,
     session: &str,
     viewport: Option<TermSize>,
@@ -2751,7 +2752,7 @@ const DAEMON_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// [`reconnect_daemon`] cannot respawn within that window is a structural
 /// failure (SSH transport dead, binary gone), which the SSH-level reconnect
 /// loop (#476) owns. A dead SSH transport short-circuits the window via
-/// `SshConnection::is_closed`, so an SSH drop reaches the SSH-level loop (and
+/// `Connection::is_closed`, so an SSH drop reaches the SSH-level loop (and
 /// its banner) within the keepalive detection bound (#438), not after it.
 const DAEMON_RECONNECT_MAX_ATTEMPTS: u32 = 10;
 
@@ -2799,7 +2800,7 @@ struct DaemonEndpoint {
 /// session visibly. The socket and log sit beside the versioned binary
 /// (`<binary>.sock` / `<binary>.log`), inheriting its path.
 async fn provision_daemon(
-    conn: &mut rift_ssh::SshConnection,
+    conn: &mut rift_ssh::Connection,
 ) -> Result<Option<(rift_ssh::DaemonClient, DaemonEndpoint)>> {
     use rift_ssh::Handshake;
 
