@@ -18,18 +18,21 @@ use std::collections::BTreeMap;
 
 use flume::Sender;
 use gpui::{
-    div, px, Anchor, App, Entity, FontWeight, InteractiveElement as _, IntoElement, MouseButton,
-    ParentElement as _, SharedString, Styled as _,
+    canvas, div, px, Anchor, App, Bounds, Entity, FontWeight, Hsla, InteractiveElement as _,
+    IntoElement, MouseButton, ParentElement as _, PathBuilder, Pixels, SharedString, Styled as _,
+    Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
+    hover_card::HoverCard,
+    plot::origin_point,
     popover::Popover,
-    v_flex, ActiveTheme as _, Sizable as _,
+    v_flex, ActiveTheme as _, Sizable as _, Theme,
 };
 use rift_protocol::{
-    AheadBehind, ClientMessage, Diagnostic, DiagnosticSeverity, LspServerState, MemoryPressure,
-    PaneMetric,
+    AheadBehind, ClientMessage, Diagnostic, DiagnosticSeverity, LoadAverage, LspServerState,
+    MemoryPressure, PaneMetric,
 };
 use rift_terminal::{PaneActivity, SessionView, StatusWindow};
 use tracing::debug;
@@ -50,9 +53,9 @@ const NO_BRANCH_LABEL: &str = "detached HEAD";
 /// `DaemonMessage::HostMetrics` push (`docs/spec-host-telemetry.md`). `protocol`
 /// carries the full sample inline on the enum variant rather than as a separate
 /// reusable type (unlike `LspServerState`), so this narrows it to the fields the
-/// composite status line's MEM/CPU segment and [`pressure_level`]
-/// (`docs/spec-memory-pressure.md`) read; per-pane attribution (Phase 45) may
-/// widen it further.
+/// composite status line's MEM/CPU segment, [`pressure_level`]
+/// (`docs/spec-memory-pressure.md`), and the host-detail hover card
+/// (`docs/spec-telemetry-detail.md`) read.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HostMetrics {
     /// Aggregate CPU load, 0.0-100.0.
@@ -62,16 +65,74 @@ pub struct HostMetrics {
     /// `MemAvailable` from `/proc/meminfo`, in bytes — the basis for "how much
     /// RAM is really free" (`docs/spec-host-telemetry.md`).
     pub mem_available: u64,
+    /// `Cached` from `/proc/meminfo`, in bytes (`docs/spec-telemetry-detail.md`).
+    pub mem_cached: u64,
+    /// `Buffers` from `/proc/meminfo`, in bytes (`docs/spec-telemetry-detail.md`).
+    pub mem_buffers: u64,
     /// Total configured swap, in bytes — the denominator for the swap-used
     /// ratio [`pressure_level`] reads (`docs/spec-memory-pressure.md`).
     pub swap_total: u64,
     /// Swap currently in use, in bytes.
     pub swap_used: u64,
+    /// Host load average over 1/5/15 minutes (`docs/spec-telemetry-detail.md`).
+    pub load: LoadAverage,
+    /// Number of logical CPU cores (`docs/spec-telemetry-detail.md`).
+    pub cpu_count: u32,
+    /// Host uptime, in seconds (`docs/spec-telemetry-detail.md`).
+    pub uptime_secs: u64,
     /// Linux PSI memory-stall averages, where the kernel exposes
     /// `/proc/pressure/memory` (`None` on hosts without `CONFIG_PSI`, e.g. the
     /// stock `microsoft-standard-WSL2` kernel) — an optional escalation signal
     /// for [`pressure_level`].
     pub psi: Option<MemoryPressure>,
+}
+
+/// Retention window for the inline memory-history sparkline
+/// (`docs/spec-telemetry-detail.md`): ~150 samples at the daemon's 2s
+/// `HostMetrics` cadence is ~5 minutes — enough to show a trend toward the
+/// limit without unbounded growth over a long session.
+pub const MEMORY_HISTORY_CAPACITY: usize = 150;
+
+/// A bounded, client-side ring buffer of recent memory-used percentages
+/// (`docs/spec-telemetry-detail.md`): pure derived state folded from the
+/// existing `HostMetrics` push in the workspace's fold loop, never sent on
+/// the wire. The oldest sample drops once `capacity` is reached, so a long
+/// session's history stays flat rather than growing unbounded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryHistory {
+    samples: Vec<f32>,
+    capacity: usize,
+}
+
+impl MemoryHistory {
+    /// A new, empty history bounded to `capacity` samples (at least 1).
+    pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            samples: Vec::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Push a new mem%-used sample, evicting the oldest sample first once
+    /// already at capacity.
+    pub fn push(&mut self, mem_pct: f32) {
+        if self.samples.len() >= self.capacity {
+            self.samples.remove(0);
+        }
+        self.samples.push(mem_pct);
+    }
+
+    /// The buffered samples, oldest first.
+    pub fn as_slice(&self) -> &[f32] {
+        &self.samples
+    }
+}
+
+impl Default for MemoryHistory {
+    fn default() -> Self {
+        Self::new(MEMORY_HISTORY_CAPACITY)
+    }
 }
 
 /// The recolour states for the composite status line's MEM/CPU segment,
@@ -249,6 +310,12 @@ pub struct StatusLineModel<'a> {
     /// text — `Normal` -> `theme.muted_foreground`, `Warning` -> `theme.warning`,
     /// `Critical` -> `theme.danger`. Unused while `host_metrics` is `None`.
     pub pressure_level: PressureLevel,
+    /// The client-side memory-history ring buffer's current samples (oldest
+    /// first), rendered as the host-detail hover card's inline sparkline
+    /// (`docs/spec-telemetry-detail.md`). Empty before the first sample;
+    /// `host_metrics` gates whether the segment (and so the hover card)
+    /// renders at all.
+    pub mem_history: &'a [f32],
     /// The attached session's latest per-pane breakdown, folded from the
     /// daemon's per-connection `PaneMetrics` push
     /// (`docs/spec-pane-attribution.md`, #881) — empty before the first push
@@ -332,24 +399,139 @@ pub fn format_clock(hour: u32, minute: u32) -> String {
     format!("{hour:02}:{minute:02}")
 }
 
-/// The `MEM <n>% \u{b7} CPU <n>%` host-resource segment text
-/// (`docs/spec-host-telemetry.md`): both percentages integer-rounded, a
-/// middot separator, literal `MEM`/`CPU` labels. RAM% is
-/// `(mem_total - mem_available) / mem_total`; `mem_total == 0` (a degenerate
-/// sample) is guarded to `0%` rather than dividing by zero. Whether to render
-/// at all (hidden before the first sample) is the caller's concern via
-/// `StatusLineModel.host_metrics: Option<...>`, mirroring `cursor_text`.
-fn metrics_text(cpu: f32, mem_total: u64, mem_available: u64) -> String {
-    let mem_pct = if mem_total == 0 {
+/// The host's memory currently in use, in bytes: `mem_total - mem_available`
+/// (`docs/spec-telemetry-detail.md`), saturating so a degenerate sample
+/// (`mem_available > mem_total`) never underflows. The basis for both the
+/// MEM% status-line segment ([`metrics_text`]) and the hover card's memory
+/// breakdown ([`host_detail_content`]).
+pub fn mem_used_bytes(mem_total: u64, mem_available: u64) -> u64 {
+    mem_total.saturating_sub(mem_available)
+}
+
+/// The host's memory-used ratio as a percentage (0.0-100.0 when
+/// `mem_total` > 0), guarded against a zero `mem_total` the same way
+/// [`metrics_text`] is. Shared by the status-line MEM% text and the
+/// memory-history ring buffer's per-sample push
+/// (`docs/spec-telemetry-detail.md`).
+pub fn mem_used_pct(mem_total: u64, mem_available: u64) -> f64 {
+    if mem_total == 0 {
         0.0
     } else {
-        (mem_total.saturating_sub(mem_available)) as f64 / mem_total as f64 * 100.0
-    };
+        mem_used_bytes(mem_total, mem_available) as f64 / mem_total as f64 * 100.0
+    }
+}
+
+/// The `MEM <n>% \u{b7} CPU <n>%` host-resource segment text
+/// (`docs/spec-host-telemetry.md`): both percentages integer-rounded, a
+/// middot separator, literal `MEM`/`CPU` labels. Whether to render at all
+/// (hidden before the first sample) is the caller's concern via
+/// `StatusLineModel.host_metrics: Option<...>`, mirroring `cursor_text`.
+fn metrics_text(cpu: f32, mem_total: u64, mem_available: u64) -> String {
+    let mem_pct = mem_used_pct(mem_total, mem_available);
     format!(
         "MEM {}% \u{b7} CPU {}%",
         mem_pct.round() as i64,
         (cpu as f64).round() as i64
     )
+}
+
+/// Map a memory-history ring buffer (oldest to newest, mem%-used values
+/// expected in 0.0-100.0) onto `(x, y)` pixel offsets for the inline
+/// sparkline (`docs/spec-telemetry-detail.md`): x spreads evenly across
+/// `width`; y uses a fixed 0-100 scale — not autoscaled to the visible
+/// window's min/max, so a flat line at, say, 50% always sits at mid-height —
+/// and GPUI's top-left screen origin, so a *higher* percentage draws
+/// *nearer the top*. A single sample maps to one point at `x = 0`; an empty
+/// history yields no points.
+pub fn sparkline_points(history: &[f32], width: f32, height: f32) -> Vec<(f32, f32)> {
+    if history.is_empty() {
+        return Vec::new();
+    }
+    let last_index = history.len() - 1;
+    history
+        .iter()
+        .enumerate()
+        .map(|(i, &value)| {
+            let x = if last_index == 0 {
+                0.0
+            } else {
+                width * i as f32 / last_index as f32
+            };
+            let pct = value.clamp(0.0, 100.0);
+            let y = height - height * pct / 100.0;
+            (x, y)
+        })
+        .collect()
+}
+
+/// Fixed size of the inline memory-history sparkline canvas
+/// (`docs/spec-telemetry-detail.md`).
+const SPARKLINE_WIDTH: f32 = 96.0;
+const SPARKLINE_HEIGHT: f32 = 24.0;
+
+/// Paint the inline memory-history sparkline as a stroked polyline
+/// (`docs/spec-telemetry-detail.md`), mapped by [`sparkline_points`] within
+/// the canvas element's own `bounds`. A no-op for an empty or single-sample
+/// history — nothing to connect yet.
+fn paint_sparkline(bounds: Bounds<Pixels>, history: &[f32], color: Hsla, window: &mut Window) {
+    let width = bounds.size.width.as_f32();
+    let height = bounds.size.height.as_f32();
+    let mut points = sparkline_points(history, width, height).into_iter();
+    let Some((x0, y0)) = points.next() else {
+        return;
+    };
+    let mut builder = PathBuilder::stroke(px(1.5));
+    builder.move_to(origin_point(px(x0), px(y0), bounds.origin));
+    for (x, y) in points {
+        builder.line_to(origin_point(px(x), px(y), bounds.origin));
+    }
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, color);
+    }
+}
+
+/// Bytes as gigabytes with one decimal place, e.g. `15.6 GB`
+/// (`docs/spec-telemetry-detail.md`'s memory-breakdown rows): binary GiB
+/// scale (1024^3) — close enough for a detail card, not a precise byte count.
+fn format_bytes_gb(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+/// The host uptime as a compact `<d>d <h>h <m>m` label, dropping leading
+/// zero components (e.g. `3h 15m`, or `15m` under an hour) — the `uptime`
+/// command's day/hour/minute granularity, without its seconds.
+fn format_uptime(uptime_secs: u64) -> String {
+    let minutes = uptime_secs / 60;
+    let days = minutes / (24 * 60);
+    let hours = (minutes / 60) % 24;
+    let mins = minutes % 60;
+    if days > 0 {
+        format!("{days}d {hours}h {mins}m")
+    } else if hours > 0 {
+        format!("{hours}h {mins}m")
+    } else {
+        format!("{mins}m")
+    }
+}
+
+/// The `1 / 5 / 15` load-average label, two decimal places each — matching
+/// `uptime`'s conventional load-average precision.
+fn format_load(load: LoadAverage) -> String {
+    format!("{:.2} / {:.2} / {:.2}", load.one, load.five, load.fifteen)
+}
+
+/// One label/value row in the host-detail hover card, label muted, value
+/// on the foreground token.
+fn detail_row(theme: &Theme, label: &'static str, value: String) -> impl IntoElement {
+    h_flex()
+        .justify_between()
+        .gap(px(12.0))
+        .child(div().text_color(theme.muted_foreground).child(label))
+        .child(
+            div()
+                .text_color(theme.foreground)
+                .child(SharedString::from(value)),
+        )
 }
 
 /// One ranked row in the pane-metrics breakdown popover
@@ -433,6 +615,71 @@ fn pane_metrics_popover_content(rows: &[PaneMetricRow], cx: &App) -> impl IntoEl
         }
     }
     list
+}
+
+/// The host-detail hover card's content (`docs/spec-telemetry-detail.md`):
+/// the memory breakdown (total/used/available/cached/buffers), swap, load
+/// 1/5/15, uptime, and core count, plus the inline memory-history
+/// sparkline. Independent of [`pane_metrics_popover_content`]'s per-pane
+/// breakdown — this is host-global detail, not per-pane attribution.
+/// Theme tokens only.
+fn host_detail_content(sample: &HostMetrics, mem_history: &[f32], cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let used = mem_used_bytes(sample.mem_total, sample.mem_available);
+    let stroke = theme.chart_1;
+    let points = mem_history.to_vec();
+
+    v_flex()
+        .gap(px(6.0))
+        .min_w(px(220.0))
+        .child(detail_row(
+            theme,
+            "Memory total",
+            format_bytes_gb(sample.mem_total),
+        ))
+        .child(detail_row(theme, "Used", format_bytes_gb(used)))
+        .child(detail_row(
+            theme,
+            "Available",
+            format_bytes_gb(sample.mem_available),
+        ))
+        .child(detail_row(
+            theme,
+            "Cached",
+            format_bytes_gb(sample.mem_cached),
+        ))
+        .child(detail_row(
+            theme,
+            "Buffers",
+            format_bytes_gb(sample.mem_buffers),
+        ))
+        .child(detail_row(
+            theme,
+            "Swap",
+            format!(
+                "{} / {}",
+                format_bytes_gb(sample.swap_used),
+                format_bytes_gb(sample.swap_total)
+            ),
+        ))
+        .child(detail_row(theme, "Load (1/5/15)", format_load(sample.load)))
+        .child(detail_row(
+            theme,
+            "Uptime",
+            format_uptime(sample.uptime_secs),
+        ))
+        .child(detail_row(theme, "Cores", sample.cpu_count.to_string()))
+        .child(
+            div().w(px(SPARKLINE_WIDTH)).h(px(SPARKLINE_HEIGHT)).child(
+                canvas(
+                    move |_bounds, _window, _cx| points,
+                    move |bounds, points, window, _cx| {
+                        paint_sparkline(bounds, &points, stroke, window);
+                    },
+                )
+                .size_full(),
+            ),
+        )
 }
 
 /// Build the composite status line element. Theme tokens only: the bar sits on
@@ -527,7 +774,12 @@ pub fn render(
                     div()
                         .text_color(theme.muted_foreground)
                         .child(SharedString::from(server.clone())),
-                ),
+                )
+                .children(lsp_state_note(*state).map(|note| {
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(format!("({note})")))
+                })),
         );
     }
 
@@ -553,11 +805,20 @@ pub fn render(
     // so the daemon samples only while this popover is open; `pane_metrics`
     // (folded from the daemon's per-connection pushes) drives the content,
     // rebuilt fresh on every render per `Popover::content`'s own contract.
+    //
+    // Host-detail hover card (`docs/spec-telemetry-detail.md`): an
+    // independent surface from the click-driven popover above — hovering
+    // the segment (rather than clicking it) shows the memory breakdown,
+    // swap, load, uptime, cores, and the inline memory-history sparkline.
+    // It wraps the popover as its trigger so both interactions share the
+    // one `MEM % \u{b7} CPU %` segment: `HoverCard` only listens for hover on
+    // its own wrapper div, so the inner popover's click handling still
+    // reaches its button untouched.
     let metrics = model.host_metrics.map(|m| {
         let text = metrics_text(m.cpu, m.mem_total, m.mem_available);
         let rows = pane_metric_rows(model.pane_metrics);
         let enabled_tx = model.pane_metrics_enabled_tx.clone();
-        Popover::new("status-pane-metrics")
+        let pane_metrics_popover = Popover::new("status-pane-metrics")
             .anchor(Anchor::BottomRight)
             .trigger(
                 Button::new("status-pane-metrics-trigger")
@@ -574,7 +835,14 @@ pub fn render(
                     debug!(error = %e, enabled, "failed to send pane-metrics enabled toggle");
                 }
             })
-            .content(move |_state, _window, cx| pane_metrics_popover_content(&rows, cx))
+            .content(move |_state, _window, cx| pane_metrics_popover_content(&rows, cx));
+
+        let sample = *m;
+        let mem_history = model.mem_history.to_vec();
+        HoverCard::new("status-host-detail")
+            .anchor(Anchor::BottomRight)
+            .trigger(pane_metrics_popover)
+            .content(move |_state, _window, cx| host_detail_content(&sample, &mem_history, cx))
     });
 
     let clock = div()
@@ -665,14 +933,29 @@ fn dot(color: gpui::Hsla) -> impl IntoElement {
 }
 
 /// The health-dot color for one language-server state: running = success,
-/// starting = warning, crashed = danger.
+/// starting = warning, crashed = danger. `NotInstalled` is deliberately
+/// `muted_foreground`, not `danger` — it is informational ("nobody put this
+/// server on the host"), not an alarming failure (`docs/spec-lsp-servers.md`
+/// — graceful degradation).
 fn lsp_state_color(state: LspServerState, cx: &App) -> gpui::Hsla {
     match state {
         LspServerState::Running => cx.theme().success,
         LspServerState::Starting => cx.theme().warning,
         LspServerState::Crashed => cx.theme().danger,
-        // Compile stub: full informational rendering lands in #913.
         LspServerState::NotInstalled => cx.theme().muted_foreground,
+    }
+}
+
+/// A short explanatory note shown next to a language server's name in the
+/// health line. Only `NotInstalled` carries one: the color dot alone tells
+/// you *something's* off, but "not on $PATH" is what tells a user with
+/// several languages configured that this one simply isn't installed on the
+/// remote host, not that it crashed. `Running`/`Starting`/`Crashed` are
+/// already distinguished by `lsp_state_color` and need no extra text.
+fn lsp_state_note(state: LspServerState) -> Option<&'static str> {
+    match state {
+        LspServerState::NotInstalled => Some("not on $PATH"),
+        LspServerState::Running | LspServerState::Starting | LspServerState::Crashed => None,
     }
 }
 
@@ -806,6 +1089,25 @@ mod tests {
     }
 
     #[test]
+    fn test_lsp_state_note_not_installed_explains_missing_path_entry() {
+        assert_eq!(
+            lsp_state_note(LspServerState::NotInstalled),
+            Some("not on $PATH")
+        );
+    }
+
+    #[test]
+    fn test_lsp_state_note_running_starting_crashed_have_no_note() {
+        for state in [
+            LspServerState::Running,
+            LspServerState::Starting,
+            LspServerState::Crashed,
+        ] {
+            assert_eq!(lsp_state_note(state), None);
+        }
+    }
+
+    #[test]
     fn test_line_totals_text_hidden_on_clean_worktree() {
         assert_eq!(line_totals_text(0, 0), None);
     }
@@ -894,8 +1196,17 @@ mod tests {
             cpu: 0.0,
             mem_total: 16_000_000_000,
             mem_available,
+            mem_cached: 0,
+            mem_buffers: 0,
             swap_total: 4_000_000_000,
             swap_used,
+            load: LoadAverage {
+                one: 0.0,
+                five: 0.0,
+                fifteen: 0.0,
+            },
+            cpu_count: 4,
+            uptime_secs: 0,
             psi: None,
         }
     }
@@ -1108,5 +1419,135 @@ mod tests {
     #[test]
     fn test_pane_metric_rows_empty_input_yields_no_rows() {
         assert!(pane_metric_rows(&[]).is_empty());
+    }
+
+    // --- mem_used_bytes / mem_used_pct (docs/spec-telemetry-detail.md) -------
+
+    #[test]
+    fn test_mem_used_bytes_subtracts_available_from_total() {
+        assert_eq!(
+            mem_used_bytes(16_000_000_000, 4_000_000_000),
+            12_000_000_000
+        );
+    }
+
+    #[test]
+    fn test_mem_used_bytes_saturates_on_a_degenerate_sample() {
+        // mem_available > mem_total should never happen, but must not underflow.
+        assert_eq!(mem_used_bytes(1_000, 2_000), 0);
+    }
+
+    #[test]
+    fn test_mem_used_pct_computes_used_ratio() {
+        assert_eq!(mem_used_pct(16_000_000_000, 8_000_000_000), 50.0);
+    }
+
+    #[test]
+    fn test_mem_used_pct_guards_against_zero_mem_total() {
+        assert_eq!(mem_used_pct(0, 0), 0.0);
+    }
+
+    // --- MemoryHistory ring buffer (docs/spec-telemetry-detail.md) -----------
+
+    #[test]
+    fn test_memory_history_push_accumulates_samples_oldest_first() {
+        let mut history = MemoryHistory::new(5);
+        history.push(10.0);
+        history.push(20.0);
+        history.push(30.0);
+        assert_eq!(history.as_slice(), &[10.0, 20.0, 30.0]);
+    }
+
+    #[test]
+    fn test_memory_history_push_evicts_oldest_once_at_capacity() {
+        let mut history = MemoryHistory::new(3);
+        for sample in [1.0, 2.0, 3.0, 4.0, 5.0] {
+            history.push(sample);
+        }
+        assert_eq!(history.as_slice(), &[3.0, 4.0, 5.0]);
+        assert_eq!(history.as_slice().len(), 3, "bounded to the capacity");
+    }
+
+    #[test]
+    fn test_memory_history_new_clamps_zero_capacity_to_one() {
+        let mut history = MemoryHistory::new(0);
+        history.push(1.0);
+        history.push(2.0);
+        assert_eq!(history.as_slice(), &[2.0]);
+    }
+
+    #[test]
+    fn test_memory_history_default_uses_the_documented_capacity() {
+        let mut history = MemoryHistory::default();
+        for i in 0..(MEMORY_HISTORY_CAPACITY + 10) {
+            history.push(i as f32);
+        }
+        assert_eq!(history.as_slice().len(), MEMORY_HISTORY_CAPACITY);
+    }
+
+    // --- sparkline_points (docs/spec-telemetry-detail.md) --------------------
+
+    #[test]
+    fn test_sparkline_points_empty_history_yields_no_points() {
+        assert!(sparkline_points(&[], 100.0, 20.0).is_empty());
+    }
+
+    #[test]
+    fn test_sparkline_points_single_sample_maps_to_origin_x() {
+        let points = sparkline_points(&[50.0], 100.0, 20.0);
+        assert_eq!(points, vec![(0.0, 10.0)]);
+    }
+
+    #[test]
+    fn test_sparkline_points_spreads_x_evenly_and_inverts_y_for_percentage() {
+        let points = sparkline_points(&[0.0, 100.0], 100.0, 20.0);
+        // 0% sits at the bottom (y = height); 100% sits at the top (y = 0);
+        // x is spread from 0 to width across the two samples.
+        assert_eq!(points, vec![(0.0, 20.0), (100.0, 0.0)]);
+    }
+
+    #[test]
+    fn test_sparkline_points_clamps_out_of_range_values() {
+        let points = sparkline_points(&[-10.0, 150.0], 10.0, 10.0);
+        assert_eq!(points, vec![(0.0, 10.0), (10.0, 0.0)]);
+    }
+
+    // --- format_bytes_gb / format_uptime / format_load ------------------------
+
+    #[test]
+    fn test_format_bytes_gb_renders_one_decimal() {
+        assert_eq!(format_bytes_gb(16_000_000_000), "14.9 GB");
+    }
+
+    #[test]
+    fn test_format_bytes_gb_zero_bytes() {
+        assert_eq!(format_bytes_gb(0), "0.0 GB");
+    }
+
+    #[test]
+    fn test_format_uptime_under_an_hour_shows_minutes_only() {
+        assert_eq!(format_uptime(15 * 60), "15m");
+    }
+
+    #[test]
+    fn test_format_uptime_under_a_day_shows_hours_and_minutes() {
+        assert_eq!(format_uptime(3 * 3600 + 15 * 60), "3h 15m");
+    }
+
+    #[test]
+    fn test_format_uptime_over_a_day_shows_days_hours_and_minutes() {
+        assert_eq!(format_uptime(2 * 86400 + 3 * 3600 + 15 * 60), "2d 3h 15m");
+    }
+
+    #[test]
+    fn test_format_load_formats_two_decimals() {
+        assert_eq!(
+            format_load(LoadAverage {
+                one: 1.5,
+                five: 1.1234,
+                fifteen: 0.9
+            }),
+            "1.50 / 1.12 / 0.90"
+        );
     }
 }
