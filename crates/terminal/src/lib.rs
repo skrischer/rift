@@ -3,6 +3,7 @@ pub mod error;
 pub mod keyboard;
 pub mod keytable;
 pub mod layout;
+pub mod line_id;
 pub mod pane_view;
 pub mod prefix;
 mod search;
@@ -13,6 +14,7 @@ pub use keytable::{
     classify_command, keystroke_to_tmux_key, normalize_tmux_key, parse_list_keys, parse_options,
     Binding, DispatchDecision, KeyTable, PrefixOptions,
 };
+pub use line_id::LineIdTracker;
 pub use pane_view::{PaneActivity, PaneView, WorkState};
 pub use session_view::{
     SessionSnapshot, SessionView, SessionViewEvent, StatusWindow, TerminalHandle, MAX_FONT_SIZE,

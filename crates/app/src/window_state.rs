@@ -557,7 +557,7 @@ mod tests {
             ui_font_family: "Inter".to_string(),
             mono_font_family: "JetBrains Mono".to_string(),
             ui_font_size_px: 18.0,
-            visible_areas: vec![Area::ExplorerEditor, Area::Git],
+            visible_areas: vec![Area::Explorer, Area::Git],
             solo_area: Some(Area::Git),
         }
     }
@@ -927,6 +927,33 @@ mod tests {
         assert_eq!(
             parsed.theme_name, "Catppuccin Mocha",
             "unrelated fields are unaffected by the tolerant array"
+        );
+    }
+
+    /// `docs/spec-explorer-editor-split.md` (issue #939): `Area::ExplorerEditor`
+    /// was split into `Area::Explorer` + `Area::Editor`, so a pre-Phase-56
+    /// persisted `"explorer_editor"` token is, today, just another
+    /// unrecognized `Area` variant to the tolerant deserializer above — it is
+    /// dropped, not fatal, exactly like `some_future_area`. This pins that
+    /// safe, non-crashing degrade; expanding it into *both* `Explorer` and
+    /// `Editor` instead of dropping it is issue #940.
+    #[test]
+    fn test_legacy_explorer_editor_variant_in_visible_areas_is_dropped_not_fatal() {
+        let json = r#"{
+            "visible_areas": ["explorer_editor", "terminal", "git"],
+            "solo_area": "explorer_editor"
+        }"#;
+        let parsed: WindowState =
+            serde_json::from_str(json).expect("parse despite the removed explorer_editor variant");
+
+        assert_eq!(
+            parsed.visible_areas,
+            vec![Area::Terminal, Area::Git],
+            "the removed explorer_editor token is dropped like any unrecognized variant"
+        );
+        assert_eq!(
+            parsed.solo_area, None,
+            "a legacy explorer_editor solo target degrades to no solo"
         );
     }
 

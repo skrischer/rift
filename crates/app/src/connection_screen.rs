@@ -29,16 +29,24 @@
 //! owns the connect pipeline and the recents read/write, mirroring how
 //! `rift_terminal::SessionView` only emits terminal input and never touches
 //! the SSH connection itself.
+//!
+//! Issue #926 (`docs/spec-wsl-transport.md`) adds the header's SSH/WSL kind
+//! toggle: choosing WSL swaps the host/user/port/key/passphrase/wrapper
+//! fields for a single free-text distro field (no `wsl.exe -l -q` dropdown —
+//! that enumeration is a Windows-only subprocess call this GPUI-view-only
+//! screen does not make; an unreachable/mistyped distro still surfaces a
+//! clear, non-retryable error from `main.rs`'s connect pipeline). `main.rs`
+//! routes the resulting [`ConnectRequest`]'s `kind` to `rift_ssh::Connection::Wsl`.
 
 use std::path::{Path, PathBuf};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::{h_flex, v_flex, ActiveTheme, Icon, IconName};
+use gpui_component::{h_flex, v_flex, ActiveTheme, Icon, IconName, Selectable as _, Sizable as _};
 
-use crate::recents::{self, RecentConnection};
+use crate::recents::{self, ConnectionKind, RecentConnection};
 use crate::title_bar;
 
 /// Connect card width (design contract: "card ~470px").
@@ -195,10 +203,17 @@ pub enum SessionIntent {
 /// prints `Some("<redacted>")` instead of the plaintext value.
 #[derive(Clone, PartialEq)]
 pub struct ConnectRequest {
+    /// SSH vs WSL (issue #924, `docs/spec-wsl-transport.md`); see
+    /// [`ConnectionKind`]. Set by the connect card's kind toggle (issue #926)
+    /// — `Ssh` unless the WSL side is selected.
+    pub kind: ConnectionKind,
     pub host: String,
     pub user: String,
     pub port: u16,
     pub key: PathBuf,
+    /// The WSL distro name (issue #924); only meaningful when `kind` is
+    /// [`ConnectionKind::Wsl`], empty for an SSH request.
+    pub distro: String,
     /// The Remote exec wrapper field's value at connect (issue #789,
     /// `docs/spec-remote-exec-wrapper-ui.md`), e.g. `docker exec -i devenv`;
     /// `None` for an empty/whitespace field (byte-for-byte passthrough, a
@@ -214,10 +229,12 @@ pub struct ConnectRequest {
 impl std::fmt::Debug for ConnectRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectRequest")
+            .field("kind", &self.kind)
             .field("host", &self.host)
             .field("user", &self.user)
             .field("port", &self.port)
             .field("key", &self.key)
+            .field("distro", &self.distro)
             .field("remote_exec_wrapper", &self.remote_exec_wrapper)
             .field("session_intent", &self.session_intent)
             .field(
@@ -287,12 +304,29 @@ fn remote_exec_wrapper_from_field(value: &str) -> Option<String> {
     }
 }
 
+/// The WSL distro field's connect-time value (issue #926): trimmed and
+/// required non-empty, mirroring the SSH branch's own required-field checks
+/// (`Self::build_ssh_request`) — pulled out as a pure function so this one
+/// bit of new validation logic is unit-tested without a live `InputState`.
+fn validate_distro_field(value: &str) -> Result<String, ConnectError> {
+    let distro = value.trim().to_string();
+    if distro.is_empty() {
+        return Err(ConnectError::General("WSL distro is required.".to_string()));
+    }
+    Ok(distro)
+}
+
 /// The Connection screen view: the connect card's inputs (the passphrase
 /// row renders only while `key_encrypted`), the RECENT list it was
 /// constructed with, and the two error slots a previous connect attempt (or
 /// this screen's own field validation) may have set — never both at once
 /// (`docs/spec-connection-robustness.md`).
 pub struct ConnectionScreen {
+    /// SSH vs WSL (issue #926, `docs/spec-wsl-transport.md`); set by the
+    /// header kind toggle, `Ssh` on a fresh card. Gates which field group
+    /// [`Render::render`] shows and which branch [`Self::build_request`]
+    /// validates.
+    kind: ConnectionKind,
     host_input: Entity<InputState>,
     user_input: Entity<InputState>,
     port_input: Entity<InputState>,
@@ -301,6 +335,12 @@ pub struct ConnectionScreen {
     /// `docs/spec-remote-exec-wrapper-ui.md`); optional, free text.
     remote_exec_wrapper_input: Entity<InputState>,
     passphrase_input: Entity<InputState>,
+    /// The WSL distro field (issue #926): a free-text distro name rather than
+    /// a dropdown enumerated via `wsl.exe -l -q` — that enumeration is a
+    /// Windows-only subprocess call this GPUI-view-only screen does not make
+    /// (see the module docs); an unreachable/mistyped distro still surfaces a
+    /// clear, non-retryable connect error (`rift_ssh::WslConnection::connect`).
+    distro_input: Entity<InputState>,
     recents: Vec<RecentConnection>,
     /// The card's bottom banner (host/user/port/key validation, or a general
     /// connect failure).
@@ -340,6 +380,7 @@ impl ConnectionScreen {
                 .placeholder("docker exec -i <container>")
         });
         let passphrase_input = cx.new(|cx| InputState::new(window, cx).masked(true));
+        let distro_input = cx.new(|cx| InputState::new(window, cx).placeholder("Ubuntu-22.04"));
 
         // Enter in any field submits the card, matching the design contract
         // ("one click connects" applies equally to Enter).
@@ -350,6 +391,7 @@ impl ConnectionScreen {
             &key_input,
             &remote_exec_wrapper_input,
             &passphrase_input,
+            &distro_input,
         ] {
             cx.subscribe_in(
                 input,
@@ -386,16 +428,31 @@ impl ConnectionScreen {
         let key_encrypted = force_encrypted || key_needs_passphrase(&defaults.key);
 
         Self {
+            kind: ConnectionKind::Ssh,
             host_input,
             user_input,
             port_input,
             key_input,
             remote_exec_wrapper_input,
             passphrase_input,
+            distro_input,
             recents,
             error,
             passphrase_error,
             key_encrypted,
+        }
+    }
+
+    /// Switch the card's connection kind (the header toggle), clearing any
+    /// stale error state left over from the previous kind's field set —
+    /// swapping fields with a validation error still showing would point at
+    /// a field that is no longer visible.
+    fn set_kind(&mut self, kind: ConnectionKind, cx: &mut Context<Self>) {
+        if self.kind != kind {
+            self.kind = kind;
+            self.error = None;
+            self.passphrase_error = None;
+            cx.notify();
         }
     }
 
@@ -434,16 +491,47 @@ impl ConnectionScreen {
         }
     }
 
-    /// Read the inputs and validate them into a [`ConnectRequest`]. Host and
-    /// User must be non-empty; Port must parse as a `u16`; the SSH key path
-    /// must be non-empty. The session is no longer a card field (issues
-    /// #706/#707/#705/#808, `docs/spec-post-connect-picker.md`,
-    /// `docs/spec-retire-fixed-session.md`): the plain "Connect \u{2192}"
-    /// button always resolves [`SessionIntent::Pick`]. When the key is
-    /// detected as encrypted, the passphrase field must be
+    /// Read the inputs and validate them into a [`ConnectRequest`], dispatched
+    /// on the header kind toggle (issue #926): [`Self::build_ssh_request`] for
+    /// the SSH field group, [`Self::build_wsl_request`] for the distro field.
+    fn build_request(&self, cx: &App) -> Result<ConnectRequest, ConnectError> {
+        match self.kind {
+            ConnectionKind::Ssh => self.build_ssh_request(cx),
+            ConnectionKind::Wsl => self.build_wsl_request(cx),
+        }
+    }
+
+    /// The WSL branch of [`Self::build_request`]: only the distro field is
+    /// read (the SSH fields are hidden and irrelevant to this kind), and it
+    /// must be non-empty. `host`/`user`/`key` carry the same empty defaults
+    /// [`RecentConnection::default`] uses for a WSL entry; `port` mirrors that
+    /// default too rather than reading the (hidden, possibly stale) Port
+    /// field.
+    fn build_wsl_request(&self, cx: &App) -> Result<ConnectRequest, ConnectError> {
+        let distro = validate_distro_field(&self.distro_input.read(cx).value())?;
+        Ok(ConnectRequest {
+            kind: ConnectionKind::Wsl,
+            host: String::new(),
+            user: String::new(),
+            port: 0,
+            key: PathBuf::new(),
+            distro,
+            remote_exec_wrapper: None,
+            session_intent: SessionIntent::Pick,
+            passphrase: None,
+        })
+    }
+
+    /// The SSH branch of [`Self::build_request`] (the pre-#926 validation,
+    /// unchanged): Host and User must be non-empty; Port must parse as a
+    /// `u16`; the SSH key path must be non-empty. The session is no longer a
+    /// card field (issues #706/#707/#705/#808,
+    /// `docs/spec-post-connect-picker.md`, `docs/spec-retire-fixed-session.md`):
+    /// the plain "Connect \u{2192}" button always resolves [`SessionIntent::Pick`].
+    /// When the key is detected as encrypted, the passphrase field must be
     /// non-empty too (#478) — surfaced via [`ConnectError::Passphrase`] so it
     /// renders at that field rather than the bottom banner.
-    fn build_request(&self, cx: &App) -> Result<ConnectRequest, ConnectError> {
+    fn build_ssh_request(&self, cx: &App) -> Result<ConnectRequest, ConnectError> {
         let host = self.host_input.read(cx).value().trim().to_string();
         if host.is_empty() {
             return Err(ConnectError::General("Host is required.".to_string()));
@@ -478,10 +566,12 @@ impl ConnectionScreen {
             remote_exec_wrapper_from_field(&self.remote_exec_wrapper_input.read(cx).value());
 
         Ok(ConnectRequest {
+            kind: ConnectionKind::Ssh,
             host,
             user,
             port,
             key: PathBuf::from(key_text),
+            distro: String::new(),
             remote_exec_wrapper,
             session_intent: SessionIntent::Pick,
             passphrase,
@@ -507,6 +597,7 @@ impl ConnectionScreen {
         let Some(recent) = self.recents.get(index).cloned() else {
             return;
         };
+        self.kind = recent.kind;
         self.host_input.update(cx, |input, cx| {
             input.set_value(recent.host.clone(), window, cx)
         });
@@ -519,6 +610,9 @@ impl ConnectionScreen {
         self.key_input.update(cx, |input, cx| {
             input.set_value(recent.key.clone(), window, cx)
         });
+        self.distro_input.update(cx, |input, cx| {
+            input.set_value(recent.distro.clone(), window, cx)
+        });
         self.passphrase_input
             .update(cx, |input, cx| input.set_value(String::new(), window, cx));
         self.remote_exec_wrapper_input.update(cx, |input, cx| {
@@ -526,7 +620,7 @@ impl ConnectionScreen {
         });
         self.refresh_key_encrypted(cx);
 
-        if self.key_encrypted {
+        if recent.kind == ConnectionKind::Ssh && self.key_encrypted {
             self.error = None;
             self.passphrase_error = Some("Enter the passphrase for this SSH key.".to_string());
             cx.notify();
@@ -538,10 +632,12 @@ impl ConnectionScreen {
         let remote_exec_wrapper =
             remote_exec_wrapper_from_field(&self.remote_exec_wrapper_input.read(cx).value());
         cx.emit(ConnectionScreenEvent::Connect(ConnectRequest {
+            kind: recent.kind,
             host: recent.host,
             user: recent.user,
             port: recent.port,
             key: PathBuf::from(recent.key),
+            distro: recent.distro,
             remote_exec_wrapper,
             session_intent: session_intent_from_recent(&recent.session),
             passphrase: None,
@@ -559,8 +655,12 @@ impl Focusable for ConnectionScreen {
     }
 }
 
-/// The connect card's header row: title plus an "SSH" pill.
-fn render_header(cx: &mut Context<ConnectionScreen>) -> impl IntoElement {
+/// The connect card's header row: title plus the SSH/WSL kind toggle (issue
+/// #926, `docs/spec-wsl-transport.md`) — SSH is the default selection; the
+/// WSL option is offered on every target (the WSL transport is a Windows-only
+/// runtime concern, not a compile-time one, so a non-Windows build still
+/// compiles and clippy-checks this path — `rift_ssh::wsl` module docs).
+fn render_header(cx: &mut Context<ConnectionScreen>, kind: ConnectionKind) -> impl IntoElement {
     h_flex()
         .w_full()
         .items_center()
@@ -572,17 +672,38 @@ fn render_header(cx: &mut Context<ConnectionScreen>) -> impl IntoElement {
                 .text_color(cx.theme().foreground)
                 .child("Connect to host"),
         )
+        .child(render_kind_toggle(cx, kind))
+}
+
+/// The SSH/WSL segmented toggle (issue #926): the same [`ButtonGroup`]
+/// two-button pattern `diff_view`'s Split|Unified toggle uses, selected state
+/// driven by [`ConnectionScreen::kind`].
+fn render_kind_toggle(
+    cx: &mut Context<ConnectionScreen>,
+    kind: ConnectionKind,
+) -> impl IntoElement {
+    ButtonGroup::new("connect-kind-toggle")
+        .compact()
+        .outline()
+        .xsmall()
         .child(
-            div()
-                .px(px(8.0))
-                .py(px(2.0))
-                .rounded(px(4.0))
-                .border_1()
-                .border_color(cx.theme().border)
-                .text_size(px(11.0))
-                .text_color(cx.theme().muted_foreground)
-                .child("SSH"),
+            Button::new("connect-kind-ssh")
+                .label("SSH")
+                .selected(kind == ConnectionKind::Ssh),
         )
+        .child(
+            Button::new("connect-kind-wsl")
+                .label("WSL")
+                .selected(kind == ConnectionKind::Wsl),
+        )
+        .on_click(cx.listener(|this, clicks: &Vec<usize>, _window, cx| {
+            let kind = if clicks.contains(&1) {
+                ConnectionKind::Wsl
+            } else {
+                ConnectionKind::Ssh
+            };
+            this.set_kind(kind, cx);
+        }))
 }
 
 /// One labeled input row: a small muted label above a mono-valued, leading-
@@ -686,6 +807,25 @@ fn render_logo(cx: &mut Context<ConnectionScreen>) -> impl IntoElement {
         )
 }
 
+/// A RECENT row's title (mono) and caption text, pulled out as a pure
+/// function (no `cx`) so the WSL-kind branch (issue #926) is unit-tested: an
+/// SSH entry has no `distro`, so the title stays `host` and the caption keeps
+/// its "user · session" shape; a WSL entry has no `host`/`user`, so the title
+/// falls back to `distro` and the caption drops the empty user, keeping a WSL
+/// recent from rendering as a blank-looking row.
+fn recent_row_summary(recent: &RecentConnection) -> (String, String) {
+    match recent.kind {
+        ConnectionKind::Ssh => (
+            recent.host.clone(),
+            format!("{} \u{b7} session {}", recent.user, recent.session),
+        ),
+        ConnectionKind::Wsl => (
+            recent.distro.clone(),
+            format!("WSL \u{b7} session {}", recent.session),
+        ),
+    }
+}
+
 /// One RECENT row: a host icon tile, host (mono) + "user · session <name>"
 /// caption, an optional muted wrapper indicator (issue #790 — only rendered
 /// when the entry's `remote_exec_wrapper` is non-empty, so a container
@@ -704,8 +844,9 @@ fn render_recent_row(
     let tile_bg = cx.theme().muted;
     let mono = cx.theme().mono_font_family.clone();
 
-    let host = SharedString::from(recent.host.clone());
-    let caption = SharedString::from(format!("{} \u{b7} session {}", recent.user, recent.session));
+    let (host, caption) = recent_row_summary(recent);
+    let host = SharedString::from(host);
+    let caption = SharedString::from(caption);
     let wrapper = SharedString::from(recent.remote_exec_wrapper.clone());
     let has_wrapper = !recent.remote_exec_wrapper.is_empty();
     let when = SharedString::from(recents::relative_time(
@@ -819,11 +960,15 @@ fn render_recents_section(
 
 impl Render for ConnectionScreen {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let kind = self.kind;
         let error_banner = self
             .error
             .clone()
             .map(|error| render_error_banner(cx, &error));
-        let passphrase_row = self.key_encrypted.then(|| {
+        // The passphrase row only applies to SSH's encrypted-key flow (#478);
+        // gating on `kind` too keeps a stale `key_encrypted` (from before a
+        // WSL switch) from rendering it under the distro field.
+        let passphrase_row = (kind == ConnectionKind::Ssh && self.key_encrypted).then(|| {
             render_passphrase_field(cx, &self.passphrase_input, self.passphrase_error.as_deref())
         });
         let recents_section = render_recents_section(cx, &self.recents);
@@ -836,49 +981,62 @@ impl Render for ConnectionScreen {
             .border_1()
             .border_color(cx.theme().border)
             .rounded(px(12.0))
-            .child(render_header(cx))
-            .child(render_field(
+            .child(render_header(cx, kind));
+
+        // The kind toggle swaps the host/user/port/key/passphrase/wrapper
+        // fields for a single distro field (issue #926, the spec's "choosing
+        // WSL replaces the ... fields with a distro chooser").
+        let card = match kind {
+            ConnectionKind::Ssh => card
+                .child(render_field(
+                    cx,
+                    "Host",
+                    &self.host_input,
+                    IconName::HardDrive,
+                ))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .gap(px(12.0))
+                        .child(div().flex_1().child(render_field(
+                            cx,
+                            "User",
+                            &self.user_input,
+                            IconName::User,
+                        )))
+                        .child(div().w(px(96.0)).child(render_field(
+                            cx,
+                            "Port",
+                            &self.port_input,
+                            IconName::Network,
+                        ))),
+                )
+                .child(render_field(cx, "SSH key", &self.key_input, IconName::File))
+                .child(render_field(
+                    cx,
+                    "Remote exec wrapper",
+                    &self.remote_exec_wrapper_input,
+                    IconName::SquareTerminal,
+                ))
+                .children(passphrase_row),
+            ConnectionKind::Wsl => card.child(render_field(
                 cx,
-                "Host",
-                &self.host_input,
+                "WSL distro",
+                &self.distro_input,
                 IconName::HardDrive,
-            ))
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap(px(12.0))
-                    .child(div().flex_1().child(render_field(
-                        cx,
-                        "User",
-                        &self.user_input,
-                        IconName::User,
-                    )))
-                    .child(div().w(px(96.0)).child(render_field(
-                        cx,
-                        "Port",
-                        &self.port_input,
-                        IconName::Network,
-                    ))),
-            )
-            .child(render_field(cx, "SSH key", &self.key_input, IconName::File))
-            .child(render_field(
-                cx,
-                "Remote exec wrapper",
-                &self.remote_exec_wrapper_input,
-                IconName::SquareTerminal,
-            ))
-            .children(passphrase_row)
-            .children(error_banner)
-            .child(
-                Button::new("connect-button")
-                    .primary()
-                    .label("Connect \u{2192}")
-                    .w_full()
-                    .h(px(CONNECT_BUTTON_HEIGHT))
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.try_connect(cx);
-                    })),
-            );
+            )),
+        };
+
+        let card = card.children(error_banner).child(
+            Button::new("connect-button")
+                .primary()
+                .label("Connect \u{2192}")
+                .w_full()
+                .h(px(CONNECT_BUTTON_HEIGHT))
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.try_connect(cx);
+                })),
+        );
 
         // The custom title bar (#511, `docs/spec-cockpit-chrome.md`): the
         // Connection screen's "not connected" group — no settings gear here,
@@ -1123,14 +1281,42 @@ mod tests {
         assert_eq!(remote_exec_wrapper_from_field(&field_value), None);
     }
 
+    // ── validate_distro_field (issue #926, WSL distro chooser) ─────────────
+
+    #[::core::prelude::v1::test]
+    fn test_validate_distro_field_non_empty_trims_and_returns_ok() {
+        assert_eq!(
+            validate_distro_field("  Ubuntu-22.04  "),
+            Ok("Ubuntu-22.04".to_string())
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_validate_distro_field_empty_returns_general_error() {
+        assert_eq!(
+            validate_distro_field(""),
+            Err(ConnectError::General("WSL distro is required.".to_string()))
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_validate_distro_field_whitespace_only_returns_general_error() {
+        assert_eq!(
+            validate_distro_field("   "),
+            Err(ConnectError::General("WSL distro is required.".to_string()))
+        );
+    }
+
     // ── ConnectRequest (Debug redaction) ──────────────────────────────────
 
     fn sample_request(passphrase: Option<&str>) -> ConnectRequest {
         ConnectRequest {
+            kind: ConnectionKind::Ssh,
             host: "100.64.0.1".to_string(),
             user: "developer".to_string(),
             port: 22,
             key: PathBuf::from("/home/developer/.ssh/id_ed25519"),
+            distro: String::new(),
             remote_exec_wrapper: None,
             session_intent: SessionIntent::Pick,
             passphrase: passphrase.map(str::to_string),
@@ -1175,5 +1361,38 @@ mod tests {
     #[::core::prelude::v1::test]
     fn test_session_intent_from_recent_empty_returns_pick() {
         assert_eq!(session_intent_from_recent(""), SessionIntent::Pick);
+    }
+
+    // ── recent_row_summary (issue #926, SSH/WSL RECENT row display) ────────
+
+    #[::core::prelude::v1::test]
+    fn test_recent_row_summary_ssh_kind_shows_host_and_user_caption() {
+        let recent = RecentConnection {
+            kind: ConnectionKind::Ssh,
+            host: "100.64.0.1".to_string(),
+            user: "developer".to_string(),
+            session: "rift".to_string(),
+            ..RecentConnection::default()
+        };
+
+        let (host, caption) = recent_row_summary(&recent);
+
+        assert_eq!(host, "100.64.0.1");
+        assert_eq!(caption, "developer \u{b7} session rift");
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_recent_row_summary_wsl_kind_shows_distro_and_no_blank_user() {
+        let recent = RecentConnection {
+            kind: ConnectionKind::Wsl,
+            distro: "Ubuntu-22.04".to_string(),
+            session: "rift".to_string(),
+            ..RecentConnection::default()
+        };
+
+        let (host, caption) = recent_row_summary(&recent);
+
+        assert_eq!(host, "Ubuntu-22.04");
+        assert_eq!(caption, "WSL \u{b7} session rift");
     }
 }
