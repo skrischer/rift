@@ -1,8 +1,8 @@
 # Spec: Explorer design parity
 
-> Status: READY
+> Status: COMPLETED
 > Created: 2026-07-08
-> Completed: —
+> Completed: 2026-07-08
 
 Bring the file explorer to full parity with the Paper "Cockpit — IDE" artboard:
 an in-panel header band with a live action row, the git-status **letter lane**

@@ -1,8 +1,8 @@
 # Spec: Settings shell + theme unification
 
-> Status: READY
+> Status: COMPLETED
 > Created: 2026-07-08
-> Completed: —
+> Completed: 2026-07-08
 
 Bring settings and theming to the Paper "Settings" artboard: a full
 sidebar-nav settings shell (replacing today's cramped modal), a terminal
