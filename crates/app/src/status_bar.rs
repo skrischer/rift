@@ -779,28 +779,37 @@ mod tests {
         map
     }
 
-    #[test]
-    fn test_activity_dot_color_maps_each_activity_to_its_theme_color() {
-        let success = gpui::hsla(0.3, 1.0, 0.5, 1.0);
-        let warning = gpui::hsla(0.1, 1.0, 0.5, 1.0);
-        let danger = gpui::hsla(0.0, 1.0, 0.5, 1.0);
+    #[gpui::test]
+    fn test_activity_dot_color_maps_each_activity_to_its_theme_color(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Reads the live gpui-component theme tokens (never a raw color
+        // constructor, `docs/spec-settings-theme.md`) so the mapping is
+        // checked against the colors `window_chip` actually renders with.
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            let theme = cx.theme();
+            let success = theme.success;
+            let warning = theme.warning;
+            let danger = theme.danger;
 
-        assert_eq!(
-            activity_dot_color(PaneActivity::Busy, success, warning, danger),
-            Some(success)
-        );
-        assert_eq!(
-            activity_dot_color(PaneActivity::BusyIdle, success, warning, danger),
-            Some(warning)
-        );
-        assert_eq!(
-            activity_dot_color(PaneActivity::Attention, success, warning, danger),
-            Some(danger)
-        );
-        assert_eq!(
-            activity_dot_color(PaneActivity::Free, success, warning, danger),
-            None
-        );
+            assert_eq!(
+                activity_dot_color(PaneActivity::Busy, success, warning, danger),
+                Some(success)
+            );
+            assert_eq!(
+                activity_dot_color(PaneActivity::BusyIdle, success, warning, danger),
+                Some(warning)
+            );
+            assert_eq!(
+                activity_dot_color(PaneActivity::Attention, success, warning, danger),
+                Some(danger)
+            );
+            assert_eq!(
+                activity_dot_color(PaneActivity::Free, success, warning, danger),
+                None
+            );
+        });
     }
 
     #[test]
