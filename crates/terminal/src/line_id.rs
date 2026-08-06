@@ -23,14 +23,32 @@
 //! case), `cursor_line` is flat too. Verified empirically against a real
 //! `Term`: in that steady state the two getters carry **no further growth
 //! signal at all**, even though alacritty keeps evicting/birthing a line per
-//! scrolled row. The adopted adjustment (full rationale in the spec decision
-//! log): once saturated and the primary signal reports zero growth, fall
-//! back to counting `\n` bytes (a C0 control byte, never a UTF-8
-//! continuation/CSI parameter byte — structural, not content
-//! interpretation, mirroring the existing `\n`-count in
-//! `parse_capture_to_rows`) in the batch that produced this update. Exact
-//! for newline-terminated output; only *undercounts* (never leaks — the
-//! hard cap in step 3 of [`LineIdTracker::update`] still applies every call)
+//! scrolled row.
+//!
+//! The initial version of this module only applied a `\n`-count fallback
+//! when the *whole* batch produced zero window growth, on the assumption
+//! that a batch that grows the window at all must be precise. That
+//! assumption is wrong: a single batch that *crosses* the cap partway
+//! through both grows `history_size()` (so it takes the precise,
+//! window-based path) **and** keeps scrolling past the cap in the same
+//! `advance()` call, silently rotating away rows with no further getter
+//! signal. Those extra births were never minted, so `next_id`
+//! permanently under-counted, the step-3 hard cap never advanced
+//! `oldest_id` to compensate, and `id_for_row` went on returning a stale id
+//! for a row alacritty had already evicted — a real, non-recovering
+//! row→id desync, reachable any time one coalesced `%output` batch (a build
+//! log, a large `cat`) exceeds the scrollback room remaining at the moment
+//! it lands. **The fix:** compute both signals unconditionally whenever a
+//! batch ends saturated — `window_growth` (the precise, capped delta) and a
+//! structural `\n`-byte count (a C0 control byte, never a UTF-8
+//! continuation/CSI parameter byte, mirroring the existing `\n`-count in
+//! `parse_capture_to_rows`) — and take their maximum. Neither signal ever
+//! *overcounts* the true birth count (`window_growth` only undercounts past
+//! the cap; the `\n` count only undercounts wrap-only rows with no trailing
+//! LF), so the maximum is the best available lower bound and is exact for
+//! the overwhelmingly common case of newline-terminated output, including
+//! batches that straddle the cap. It still undercounts (never leaks — the
+//! hard cap in step 3 of [`LineIdTracker::update`] applies every call) only
 //! for an auto-wrapped, non-newline-terminated line completing while
 //! already saturated.
 //!
@@ -128,20 +146,38 @@ impl LineIdTracker {
         let target_window = history_size as u64 + cursor_line as u64 + 1;
         let current_window = self.next_id - self.oldest_id;
 
-        let growth = if target_window > current_window {
-            // Precise path: history_size/cursor_line diffs exactly account
-            // for every newly-produced row (plain newlines, wraps, and the
-            // common screen-clear-then-retype case all take this path).
-            target_window - current_window
-        } else if history_size >= self.history_cap {
-            // Saturated: see "The saturation wall" in the module docs.
-            bytes_fed.iter().filter(|byte| **byte == b'\n').count() as u64
+        // Precise path: while there is still room below the cap,
+        // history_size/cursor_line diffs exactly account for every
+        // newly-produced row (plain newlines, wraps, and the common
+        // screen-clear-then-retype case all take this path). This alone is
+        // NOT a safe upper bound once a single batch also *crosses* the cap
+        // (see "The saturation wall" in the module docs): history_size()
+        // stops growing partway through the batch, silently rotating away
+        // any further scrolls, so `window_growth` alone undercounts by
+        // exactly the number of rows lost after saturation was reached.
+        let window_growth = target_window.saturating_sub(current_window);
+
+        let growth = if history_size >= self.history_cap {
+            // Saturated by the end of this batch - either it was already
+            // flat (the pre-existing single-line-at-a-time case, where
+            // `window_growth` is 0) or it crossed the cap mid-batch (where
+            // `window_growth` undercounts). `\n` (a C0 control byte, never
+            // a UTF-8 continuation or CSI parameter byte - structural, not
+            // content interpretation, mirroring the existing `\n`-count in
+            // `parse_capture_to_rows`) completes exactly one row per
+            // occurrence regardless of saturation, so it is an independent,
+            // exact lower bound for newline-driven output. Neither signal
+            // ever overcounts the true birth count, so the combined,
+            // correct growth is their maximum - this is what fixes the
+            // permanent row-id desync a saturation-crossing batch used to
+            // cause (next_id under-advanced, so the step-3 cap below never
+            // caught up and stale ids got reused for new content).
+            let newline_count = bytes_fed.iter().filter(|byte| **byte == b'\n').count() as u64;
+            window_growth.max(newline_count)
         } else {
-            // A benign fluctuation (cursor moved up, or a clear reset the
-            // cursor without growing history enough to compensate): the
-            // rows those ids refer to still exist, so nothing is evicted or
-            // re-minted; content written there reuses the existing id.
-            0
+            // Below the cap, `window_growth` is exact on its own: no batch
+            // this call could possibly have overflowed silently.
+            window_growth
         };
         self.next_id += growth;
 
@@ -191,6 +227,7 @@ mod tests {
     use super::LineIdTracker;
     use alacritty_terminal::event::{Event, EventListener};
     use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::index::Line;
     use alacritty_terminal::term::{Config, Term};
     use alacritty_terminal::vte::ansi::Processor;
 
@@ -250,6 +287,18 @@ mod tests {
         }
 
         (tracker, term)
+    }
+
+    /// Reads back the text of the row at `absolute_row` (same addressing as
+    /// [`LineIdTracker::id_for_row`]), trimmed of trailing blank cells - the
+    /// content-encoded oracle the saturation-crossing test uses to verify
+    /// `id_for_row` against ground truth instead of hand-derived numbers.
+    fn row_text(term: &Term<NullListener>, absolute_row: usize) -> String {
+        let history_size = term.grid().history_size() as i32;
+        let line = Line(absolute_row as i32 - history_size);
+        let row = &term.grid()[line];
+        let text: String = row.into_iter().map(|cell| cell.c).collect();
+        text.trim_end().to_string()
     }
 
     #[::core::prelude::v1::test]
@@ -384,6 +433,138 @@ mod tests {
         assert!(
             tracker.newest_id().unwrap_or(0) > window_cap,
             "ids kept advancing past saturation instead of freezing"
+        );
+    }
+
+    /// The bug this test was written to catch: a *single* batch that both
+    /// grows history_size() toward the cap AND keeps scrolling past it in
+    /// the same `advance()` call. The window-delta signal alone accounts
+    /// for only the room-filling portion; the rest must come from the
+    /// `\n`-count fallback combined into the *same* call, not picked
+    /// instead of it. Verified against a real `Term`, using each line's own
+    /// embedded birth index as ground truth rather than hand-derived ids.
+    #[::core::prelude::v1::test]
+    fn test_saturation_crossing_batch_counts_every_birth_and_reconverges() {
+        let rows = 3;
+        let cols = 20;
+        let cap = 20;
+        let window_cap = cap as u64 + rows as u64;
+
+        // Below the cap, so growth here is precise by construction; gives a
+        // known birth-id offset for the S-labeled lines that follow,
+        // sidestepping the fresh-tracker's-first-call degenerate case.
+        let baseline: Vec<u8> = (0..5)
+            .flat_map(|n| format!("B{n}\r\n").into_bytes())
+            .collect();
+        let (baseline_tracker, _) = drive(rows, cols, cap, &[&baseline]);
+        // The baseline's newest id is a pending, not-yet-written row (the
+        // cursor's current position) - the straddle batch's first line
+        // (`S0`) is written into that SAME row, not a fresh one, so it is
+        // the birth id for "S0" (not "S0"'s id plus one).
+        let birth_offset = baseline_tracker.newest_id().expect("baseline minted ids");
+
+        // ONE batch, 40 newlines: only 17 lines of room remain after the
+        // baseline (cap 20 - history 3), so this straddles the cap
+        // partway through the same `advance()` call.
+        let straddle_count = 40u64;
+        let straddle: Vec<u8> = (0..straddle_count)
+            .flat_map(|n| format!("S{n}\r\n").into_bytes())
+            .collect();
+        let (tracker, term) = drive(rows, cols, cap, &[&baseline, &straddle]);
+
+        assert_eq!(
+            term.grid().history_size(),
+            cap,
+            "history saturated mid-batch"
+        );
+        // All 40 births must be counted, not just the ones that grew
+        // history_size() before it hit the wall - the newest id is the
+        // pending row after "S39" (birth_offset + one id per newline).
+        assert_eq!(tracker.newest_id(), Some(birth_offset + straddle_count));
+        assert_eq!(
+            tracker.live_len(),
+            window_cap,
+            "window fills exactly to the bound, no leak"
+        );
+
+        // Content-encoded oracle: every retained, written row's own embedded
+        // birth index must match what id_for_row reports for it - not
+        // merely a count, but a per-row correctness check that catches
+        // silent reuse/aliasing. The single newest row (id `birth_offset +
+        // straddle_count`) is the pending row after "S39" - not yet written
+        // to, so it carries no label and is skipped.
+        let mut checked = 0;
+        for row in 0..window_cap as usize {
+            let label = row_text(&term, row);
+            let Some(n) = label.strip_prefix('S').and_then(|s| s.parse::<u64>().ok()) else {
+                continue;
+            };
+            assert_eq!(
+                tracker.id_for_row(row),
+                Some(birth_offset + n),
+                "row {row} (\"{label}\") must resolve to its true birth id"
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked,
+            window_cap as usize - 1,
+            "every retained row except the single pending (unwritten) one is S-labeled"
+        );
+
+        // Re-convergence: a still-live row must keep the SAME id as more
+        // ordinary lines push it further through the (still-saturated)
+        // window - row -> id stability across continued scroll, not just a
+        // one-time snapshot right after the straddle.
+        let id_before = tracker.id_for_row(10);
+        let label_before = row_text(&term, 10);
+
+        let more: Vec<u8> = (40..43u64)
+            .flat_map(|n| format!("S{n}\r\n").into_bytes())
+            .collect();
+        let (tracker2, term2) = drive(rows, cols, cap, &[&baseline, &straddle, &more]);
+        assert_eq!(
+            tracker2.live_len(),
+            window_cap,
+            "still bounded after reconverging"
+        );
+        // 3 more saturated lines shift every live row back by exactly 3.
+        assert_eq!(
+            tracker2.id_for_row(7),
+            id_before,
+            "the same content keeps its id as it scrolls further"
+        );
+        assert_eq!(row_text(&term2, 7), label_before);
+    }
+
+    /// Formula-level companion to the real-`Term` straddling test above:
+    /// pins the exact arithmetic for a single `update()` call that both
+    /// consumes remaining room and scrolls past the cap, independent of
+    /// alacritty's own wrap/scroll-region behavior.
+    #[::core::prelude::v1::test]
+    fn test_update_mixed_growth_and_saturation_counts_every_birth_in_one_call() {
+        let history_cap = 10;
+        let screen_lines = 5;
+        let mut tracker = LineIdTracker::new(history_cap);
+
+        // Baseline below the cap: window size 8, 7 lines of room left.
+        tracker.update(3, screen_lines, 4, b"");
+        assert_eq!(tracker.live_len(), 8);
+
+        // 12 newlines fed in one call; only 7 fit before history_size()
+        // saturates at the cap, so the window-delta alone would report 7.
+        let batch = b"1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n";
+        tracker.update(history_cap, screen_lines, 4, batch);
+
+        assert_eq!(
+            tracker.live_len(),
+            history_cap as u64 + screen_lines as u64,
+            "window fills exactly to the bound, no leak"
+        );
+        assert_eq!(
+            tracker.newest_id(),
+            Some(8 + 12 - 1),
+            "all 12 births counted, not just the 7 that grew history_size()"
         );
     }
 
