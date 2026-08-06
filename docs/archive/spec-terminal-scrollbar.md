@@ -1,5 +1,6 @@
 # Spec: Terminal scrollback scrollbar
 
+> Status: COMPLETED (2026-08-06)
 > Created: 2026-07-28
 
 A visible vertical scrollbar overlay on a terminal pane that shows the viewport's

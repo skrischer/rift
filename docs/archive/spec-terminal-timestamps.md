@@ -1,5 +1,6 @@
 # Spec: Terminal output timestamps (on-demand)
 
+> Status: COMPLETED (2026-08-06)
 > Created: 2026-07-30
 
 Stamp PTY-byte arrival time per scrollback line at the pane and surface it
