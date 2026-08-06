@@ -17,7 +17,7 @@ use tracing::debug;
 use crate::connection::exec::shell_single_quote;
 use crate::daemon_channel::DaemonChannel;
 use crate::error::SshError;
-use crate::SshConnection;
+use crate::Connection;
 
 /// Marker the probe prints when a daemon is already listening.
 const MARKER_RUNNING: &str = "RIFT_DAEMON_RUNNING";
@@ -124,7 +124,7 @@ fn stop_command(socket_path: &str) -> String {
 /// Best-effort by construction: [`stop_command`] itself always exits zero, so
 /// an `Err` here means the exec channel failed outright (e.g. a dropped SSH
 /// connection), not that the daemon was already stopped or never running.
-pub async fn stop_daemon(conn: &mut SshConnection, socket_path: &str) -> Result<(), SshError> {
+pub async fn stop_daemon(conn: &mut Connection, socket_path: &str) -> Result<(), SshError> {
     conn.exec_capture(&stop_command(socket_path)).await?;
     Ok(())
 }
@@ -141,7 +141,7 @@ pub async fn stop_daemon(conn: &mut SshConnection, socket_path: &str) -> Result<
 /// stdio. A fresh spawn always starts the daemon root-less; it derives its
 /// watched root from the session it attaches.
 pub async fn connect_or_spawn_daemon(
-    conn: &mut SshConnection,
+    conn: &mut Connection,
     binary_path: &str,
     socket_path: &str,
     log_path: &str,

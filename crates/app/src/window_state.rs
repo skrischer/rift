@@ -122,6 +122,14 @@ pub struct WindowState {
     /// the raw terminal PTY grid, which stays pinned to a Nerd Font variant
     /// for its icon glyphs (`rift_terminal`'s `session_view`/`pane_view`).
     pub mono_font_family: String,
+    /// The global UI font size (`docs/spec-ui-font-size.md`, issue #920):
+    /// drives the active theme's base `font_size` (which cascades to
+    /// `text_sm`/`text_xs`, and to every fixed-`px` surface via
+    /// gpui-component's `Root::set_rem_size`) and `mono_font_size` (editor and
+    /// dock panels), scaled together (`crate::scaled_mono_font_size`). Distinct
+    /// from the terminal PTY grid's own [`WindowState::font_size_px`], which
+    /// this never touches.
+    pub ui_font_size_px: f32,
     /// Which workspace areas are visible right now
     /// (`docs/spec-workspace-visibility-rail.md`, issue #822), mirroring the
     /// other additive fields' shape: a field missing from the on-disk
@@ -200,6 +208,7 @@ impl Default for WindowState {
             diff_view_mode: DiffViewMode::default(),
             ui_font_family: String::new(),
             mono_font_family: String::new(),
+            ui_font_size_px: crate::DEFAULT_UI_FONT_SIZE_PX,
             visible_areas: default_visible_areas(),
             solo_area: None,
         }
@@ -257,6 +266,17 @@ pub fn save_ui_font_family(path: &Path, font_family: &str) -> Result<(), StoreEr
 pub fn save_mono_font_family(path: &Path, font_family: &str) -> Result<(), StoreError> {
     let mut state = load(path);
     state.mono_font_family = font_family.to_string();
+    save(path, &state)
+}
+
+/// Persist the global UI font size into the store at `path`: a
+/// read-modify-write that updates only `ui_font_size_px`, leaving bounds/
+/// theme/fonts/diff-view-mode already on disk untouched — mirrors
+/// [`save_mono_font_family`]'s shape (issue #920). Distinct from
+/// [`save_geometry`]'s `font_size_px`, the terminal PTY grid's own size.
+pub fn save_ui_font_size(path: &Path, size_px: f32) -> Result<(), StoreError> {
+    let mut state = load(path);
+    state.ui_font_size_px = size_px;
     save(path, &state)
 }
 
@@ -536,6 +556,7 @@ mod tests {
             diff_view_mode: DiffViewMode::Split,
             ui_font_family: "Inter".to_string(),
             mono_font_family: "JetBrains Mono".to_string(),
+            ui_font_size_px: 18.0,
             visible_areas: vec![Area::ExplorerEditor, Area::Git],
             solo_area: Some(Area::Git),
         }
@@ -570,6 +591,7 @@ mod tests {
         assert_eq!(parsed.diff_view_mode, DiffViewMode::Unified);
         assert_eq!(parsed.ui_font_family, "");
         assert_eq!(parsed.mono_font_family, "");
+        assert_eq!(parsed.ui_font_size_px, crate::DEFAULT_UI_FONT_SIZE_PX);
         assert_eq!(
             parsed.visible_areas,
             default_visible_areas(),
@@ -638,6 +660,7 @@ mod tests {
             "a field this JSON predates falls back too"
         );
         assert_eq!(parsed.mono_font_family, "");
+        assert_eq!(parsed.ui_font_size_px, crate::DEFAULT_UI_FONT_SIZE_PX);
     }
 
     #[test]
@@ -1022,6 +1045,39 @@ mod tests {
 
         let loaded = load(&path);
         assert_eq!(loaded.mono_font_family, "JetBrains Mono");
+        assert_eq!(loaded.theme_name, crate::DEFAULT_THEME_NAME);
+        assert_eq!(loaded.bounds, Rect::default());
+    }
+
+    // --- UI font-size persistence (#920) ------------------------------------
+
+    #[test]
+    fn test_save_ui_font_size_updates_only_that_field_and_preserves_the_rest() {
+        let scratch = Scratch::new("save_ui_font_size");
+        let path = scratch.path("state.json");
+        let initial = sample_state();
+        save(&path, &initial).expect("initial save");
+
+        save_ui_font_size(&path, 20.0).expect("save_ui_font_size");
+
+        let loaded = load(&path);
+        assert_eq!(loaded.ui_font_size_px, 20.0);
+        assert_eq!(loaded.ui_font_family, initial.ui_font_family);
+        assert_eq!(loaded.mono_font_family, initial.mono_font_family);
+        assert_eq!(loaded.theme_name, initial.theme_name);
+        assert_eq!(loaded.bounds, initial.bounds);
+        assert_eq!(loaded.font_size_px, initial.font_size_px);
+    }
+
+    #[test]
+    fn test_save_ui_font_size_on_missing_file_starts_from_defaults() {
+        let scratch = Scratch::new("save_ui_font_size_missing");
+        let path = scratch.path("does-not-exist.json");
+
+        save_ui_font_size(&path, 22.0).expect("save_ui_font_size");
+
+        let loaded = load(&path);
+        assert_eq!(loaded.ui_font_size_px, 22.0);
         assert_eq!(loaded.theme_name, crate::DEFAULT_THEME_NAME);
         assert_eq!(loaded.bounds, Rect::default());
     }
