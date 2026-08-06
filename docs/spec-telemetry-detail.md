@@ -133,7 +133,7 @@ push, and only the memory breakdown + uptime + disk need new daemon reads.
 - **rift's own Phase-43 core** ([archive/spec-host-telemetry.md](archive/spec-host-telemetry.md))
   — the `HostMetrics` push (already carrying `load` + `cpu_count`), the sampler, and
   the status-line segment the detail / sparkline / disk surfaces extend.
-- **rift's own Phase-45 per-connection transport** ([spec-pane-attribution.md](spec-pane-attribution.md))
+- **rift's own Phase-45 per-connection transport** ([spec-pane-attribution.md](archive/spec-pane-attribution.md))
   — the pattern the `@root` disk push follows if the gate picks the session filesystem
   (each `serve_connection` computes + sends its own, not on the daemon-global bus); the
   breakdown popover the detail view may extend.
