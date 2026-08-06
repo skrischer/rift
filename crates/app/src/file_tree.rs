@@ -99,10 +99,14 @@ pub const FILE_TREE_PANEL_NAME: &str = "explorer";
 /// trivial to build and the scroll math exact.
 const ROW_HEIGHT: Pixels = px(24.0);
 
-/// Row label font size, replacing the ambient `text_sm` (14px) every tree row
-/// used — a tighter, IDE-typical size paired with the denser [`ROW_HEIGHT`]
-/// (`docs/spec-dogfooding-fixes.md`, #908).
-const ROW_TEXT_SIZE: Pixels = px(12.0);
+/// Row label font size at the default global UI font size
+/// (`crate::DEFAULT_UI_FONT_SIZE_PX`), replacing the ambient `text_sm` (14px)
+/// every tree row used — a tighter, IDE-typical size paired with the denser
+/// [`ROW_HEIGHT`] (`docs/spec-dogfooding-fixes.md`, #908). Folded into the
+/// global "UI font size" control (issue #920, [`row_text_size`]): this exact
+/// value reproduces unchanged at the default UI font size, and scales
+/// proportionally with it otherwise.
+const ROW_TEXT_SIZE_AT_DEFAULT: f32 = 12.0;
 
 /// Vertical padding inside every row (top and bottom), from the artboard's
 /// row density.
@@ -122,10 +126,12 @@ const ROW_SLOT_GAP: Pixels = px(6.0);
 /// of the artboard's own rhythm.
 const HEADER_HEIGHT: Pixels = px(38.0);
 
-/// Font size of the `EXPLORER` header label. Nudged down from 11px to stay
-/// proportionally below the tightened [`ROOT_ROW_TEXT_SIZE`] and
-/// [`ROW_TEXT_SIZE`] (`docs/spec-dogfooding-fixes.md`, #908).
-const HEADER_TEXT_SIZE: Pixels = px(10.0);
+/// Font size of the `EXPLORER` header label at the default UI font size.
+/// Nudged down from 11px to stay proportionally below the tightened
+/// [`ROOT_ROW_TEXT_SIZE_AT_DEFAULT`] and [`ROW_TEXT_SIZE_AT_DEFAULT`]
+/// (`docs/spec-dogfooding-fixes.md`, #908). Scaled by [`header_text_size`]
+/// (issue #920), same default-parity contract as [`ROW_TEXT_SIZE_AT_DEFAULT`].
+const HEADER_TEXT_SIZE_AT_DEFAULT: f32 = 10.0;
 
 /// Left padding inside the header band, from the artboard's measured header
 /// inset (asymmetric with [`HEADER_PADDING_RIGHT`] — the artboard gives the
@@ -145,10 +151,37 @@ const HEADER_ACTION_GAP: Pixels = px(12.0);
 /// since the root row carries no reserved icon slot.
 const ROOT_ROW_PADDING_X: Pixels = px(12.0);
 
-/// Font size of the workspace-root (`RIFT`) row label. Nudged down from 12px
-/// to stay proportionally below the tightened [`ROW_TEXT_SIZE`], above
-/// [`HEADER_TEXT_SIZE`] (`docs/spec-dogfooding-fixes.md`, #908).
-const ROOT_ROW_TEXT_SIZE: Pixels = px(11.0);
+/// Font size of the workspace-root (`RIFT`) row label at the default UI font
+/// size. Nudged down from 12px to stay proportionally below the tightened
+/// [`ROW_TEXT_SIZE_AT_DEFAULT`], above [`HEADER_TEXT_SIZE_AT_DEFAULT`]
+/// (`docs/spec-dogfooding-fixes.md`, #908). Scaled by [`root_row_text_size`]
+/// (issue #920), same default-parity contract as [`ROW_TEXT_SIZE_AT_DEFAULT`].
+const ROOT_ROW_TEXT_SIZE_AT_DEFAULT: f32 = 11.0;
+
+/// Scale an explorer text size proportionally to the live theme's base
+/// `font_size` — the global "UI font size" control (issue #920,
+/// `crate::set_ui_font_size`) — so `base_at_default_px` (the exact value
+/// #908 shipped, measured at [`crate::DEFAULT_UI_FONT_SIZE_PX`]) reproduces
+/// unchanged at the default UI font size, and grows/shrinks with it exactly
+/// like the editor's `mono_font_size` (`crate::scaled_mono_font_size`).
+fn scaled_explorer_text_size(base_at_default_px: f32, cx: &App) -> Pixels {
+    px(base_at_default_px * f32::from(cx.theme().font_size) / crate::DEFAULT_UI_FONT_SIZE_PX)
+}
+
+/// [`ROW_TEXT_SIZE_AT_DEFAULT`], scaled to the live UI font size.
+fn row_text_size(cx: &App) -> Pixels {
+    scaled_explorer_text_size(ROW_TEXT_SIZE_AT_DEFAULT, cx)
+}
+
+/// [`HEADER_TEXT_SIZE_AT_DEFAULT`], scaled to the live UI font size.
+fn header_text_size(cx: &App) -> Pixels {
+    scaled_explorer_text_size(HEADER_TEXT_SIZE_AT_DEFAULT, cx)
+}
+
+/// [`ROOT_ROW_TEXT_SIZE_AT_DEFAULT`], scaled to the live UI font size.
+fn root_row_text_size(cx: &App) -> Pixels {
+    scaled_explorer_text_size(ROOT_ROW_TEXT_SIZE_AT_DEFAULT, cx)
+}
 
 /// Base horizontal indent at depth 0, before any per-level indent is added —
 /// the artboard's indent lanes start at 8px, not flush against the row edge.
@@ -2296,7 +2329,7 @@ impl FileTree {
             .border_color(cx.theme().border)
             .child(
                 div()
-                    .text_size(HEADER_TEXT_SIZE)
+                    .text_size(header_text_size(cx))
                     .font_weight(FontWeight::BOLD)
                     .text_color(cx.theme().muted_foreground)
                     .child("EXPLORER"),
@@ -2448,7 +2481,7 @@ impl FileTree {
             .h(ROW_HEIGHT)
             .px(ROOT_ROW_PADDING_X)
             .bg(cx.theme().background)
-            .text_size(ROOT_ROW_TEXT_SIZE)
+            .text_size(root_row_text_size(cx))
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().list_hover))
             .child(
@@ -2701,7 +2734,7 @@ impl FileTree {
             .pr(px(8.0))
             .gap(ROW_SLOT_GAP)
             .rounded(ROW_RADIUS)
-            .text_size(ROW_TEXT_SIZE)
+            .text_size(row_text_size(cx))
             .cursor_pointer()
             // Every row carries the 2px left-border slot (the selected row
             // colors it `primary`), so selecting a row never shifts its
@@ -2874,7 +2907,7 @@ impl FileTree {
             .pr(px(8.0))
             .gap(ROW_SLOT_GAP)
             .rounded(ROW_RADIUS)
-            .text_size(ROW_TEXT_SIZE)
+            .text_size(row_text_size(cx))
             .children(Self::render_indent_guides(row.depth, cx))
             .child(icon_slot)
             .child(
@@ -2924,7 +2957,7 @@ impl FileTree {
             .pr(px(8.0))
             .gap(ROW_SLOT_GAP)
             .rounded(ROW_RADIUS)
-            .text_size(ROW_TEXT_SIZE)
+            .text_size(row_text_size(cx))
             .children(Self::render_indent_guides(depth, cx))
             .child(icon_slot)
             .child(
@@ -3392,12 +3425,17 @@ mod tests {
         // theme tokens, replacing the shipped 22px row / 14px-per-level
         // indent / no-base indent / no-radius rows.
         //
-        // `ROW_HEIGHT`/`ROW_TEXT_SIZE` were tightened again for a denser
-        // default matching typical IDE explorers
+        // `ROW_HEIGHT`/`ROW_TEXT_SIZE_AT_DEFAULT` were tightened again for a
+        // denser default matching typical IDE explorers
         // (`docs/spec-dogfooding-fixes.md`, #908), replacing the 28px row /
-        // ambient 14px `text_sm` label this test used to lock.
+        // ambient 14px `text_sm` label this test used to lock. The text size
+        // is now the default-UI-font-size anchor for [`row_text_size`]'s
+        // scaling (issue #920) rather than a fixed `Pixels`; see
+        // `test_explorer_text_sizes_match_the_fixed_defaults_at_the_default_ui_font_size`
+        // and `test_explorer_text_sizes_scale_with_a_larger_ui_font_size` for
+        // the scaling behavior this constant now only anchors.
         assert_eq!(ROW_HEIGHT, px(24.0));
-        assert_eq!(ROW_TEXT_SIZE, px(12.0));
+        assert_eq!(ROW_TEXT_SIZE_AT_DEFAULT, 12.0);
         assert_eq!(ROW_BLOCK_PADDING_Y, px(4.0));
         assert_eq!(ROW_RADIUS, px(5.0));
         assert_eq!(ROW_SLOT_GAP, px(6.0));
@@ -3429,11 +3467,65 @@ mod tests {
         // it no longer applies the gap.
         assert_eq!(ROW_SLOT_GAP, px(6.0));
         // Header/root label sizes, nudged down to stay proportionally below
-        // the tightened `ROW_TEXT_SIZE` (`docs/spec-dogfooding-fixes.md`,
+        // the tightened `ROW_TEXT_SIZE_AT_DEFAULT` (`docs/spec-dogfooding-fixes.md`,
         // #908): header (10) < root (11) < row (12), the same ascending
-        // order the shipped 11/12/14 triple had.
-        assert_eq!(HEADER_TEXT_SIZE, px(10.0));
-        assert_eq!(ROOT_ROW_TEXT_SIZE, px(11.0));
+        // order the shipped 11/12/14 triple had. These are the default-UI-
+        // font-size anchors [`header_text_size`]/[`root_row_text_size`] scale
+        // from (issue #920).
+        assert_eq!(HEADER_TEXT_SIZE_AT_DEFAULT, 10.0);
+        assert_eq!(ROOT_ROW_TEXT_SIZE_AT_DEFAULT, 11.0);
+    }
+
+    // --- explorer text scales with the global UI font size (#920) ----------
+
+    /// At the default UI font size (`crate::DEFAULT_UI_FONT_SIZE_PX`), the
+    /// scaled sizes reproduce #908's exact fixed values — zero visual
+    /// regression for anyone who never touches the new "UI font size"
+    /// control.
+    #[gpui::test]
+    fn test_explorer_text_sizes_match_the_fixed_defaults_at_the_default_ui_font_size(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::apply_theme(cx);
+
+            assert_eq!(row_text_size(cx), px(ROW_TEXT_SIZE_AT_DEFAULT));
+            assert_eq!(header_text_size(cx), px(HEADER_TEXT_SIZE_AT_DEFAULT));
+            assert_eq!(root_row_text_size(cx), px(ROOT_ROW_TEXT_SIZE_AT_DEFAULT));
+        });
+    }
+
+    /// Raising the global UI font size (`crate::set_ui_font_size`) scales all
+    /// three explorer text sizes up proportionally — the acceptance criterion
+    /// this issue folds in (`docs/spec-ui-font-size.md`: "folds the
+    /// explorer-font-too-large papercut").
+    #[gpui::test]
+    fn test_explorer_text_sizes_scale_with_a_larger_ui_font_size(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::apply_theme(cx);
+
+            // The control's own upper bound (`crate::MAX_UI_FONT_SIZE`), a
+            // clean 1.5x the default (16px) so the expected scaled values are
+            // exact, not float-approximate.
+            crate::set_ui_font_size(crate::MAX_UI_FONT_SIZE, None, cx);
+            let ratio = crate::MAX_UI_FONT_SIZE / crate::DEFAULT_UI_FONT_SIZE_PX;
+
+            assert_eq!(row_text_size(cx), px(ROW_TEXT_SIZE_AT_DEFAULT * ratio));
+            assert_eq!(
+                header_text_size(cx),
+                px(HEADER_TEXT_SIZE_AT_DEFAULT * ratio)
+            );
+            assert_eq!(
+                root_row_text_size(cx),
+                px(ROOT_ROW_TEXT_SIZE_AT_DEFAULT * ratio)
+            );
+            assert!(
+                f32::from(row_text_size(cx)) > ROW_TEXT_SIZE_AT_DEFAULT,
+                "a larger UI font size must yield larger, not smaller or equal, rows"
+            );
+        });
     }
 
     #[test]
