@@ -24,7 +24,7 @@ use tracing::{debug, info};
 
 use crate::connection::exec::shell_single_quote;
 use crate::error::SshError;
-use crate::SshConnection;
+use crate::Connection;
 
 /// Map the `uname -sm` output (kernel name + machine, e.g. `"Linux x86_64"`) to
 /// the Rust target triple of the daemon binary built for that platform. Returns
@@ -170,7 +170,7 @@ pub struct DeployOutcome {
 /// `version` is the app's compiled-in daemon version; pass
 /// `env!("CARGO_PKG_VERSION")` at the call site.
 pub async fn ensure_daemon_deployed(
-    conn: &mut SshConnection,
+    conn: &mut Connection,
     local_binary: &[u8],
     remote_dir: &str,
     version: &str,
