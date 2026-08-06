@@ -13,7 +13,7 @@ pub use keytable::{
     classify_command, keystroke_to_tmux_key, normalize_tmux_key, parse_list_keys, parse_options,
     Binding, DispatchDecision, KeyTable, PrefixOptions,
 };
-pub use pane_view::{PaneActivity, PaneView};
+pub use pane_view::{PaneActivity, PaneView, WorkState};
 pub use session_view::{
     SessionSnapshot, SessionView, SessionViewEvent, StatusWindow, TerminalHandle, MAX_FONT_SIZE,
     MIN_FONT_SIZE,

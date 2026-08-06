@@ -611,15 +611,12 @@ pub fn render(
 
 /// One window as a clickable `index:name` chip. The active window sits on a
 /// surface chip (`list_active`); a busy/attention window carries a leading dot
-/// (success / danger). Click dispatches `select-window` through `session_view`
-/// (the existing tmux command channel) — never a parallel path.
+/// (success working / warning idle-awaiting-input / danger attention). Click
+/// dispatches `select-window` through `session_view` (the existing tmux
+/// command channel) — never a parallel path.
 fn window_chip(w: &StatusWindow, session_view: &Entity<SessionView>, cx: &App) -> impl IntoElement {
     let theme = cx.theme();
-    let activity_color = match w.activity {
-        PaneActivity::Busy => Some(theme.success),
-        PaneActivity::Attention => Some(theme.danger),
-        PaneActivity::Free => None,
-    };
+    let activity_color = activity_dot_color(w.activity, theme.success, theme.warning, theme.danger);
     let label = format!("{}:{}", w.index, w.name);
     let entity = session_view.clone();
     let window_id = w.id.clone();
@@ -647,6 +644,25 @@ fn window_chip(w: &StatusWindow, session_view: &Entity<SessionView>, cx: &App) -
         .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
             entity.update(cx, |view, cx| view.select_window(&window_id, cx));
         })
+}
+
+/// The window chip's leading-dot color for a folded [`PaneActivity`]: success
+/// while actively working, warning while idle-awaiting-input (the busy
+/// refinement `docs/spec-agent-activity.md` adds), danger on attention, and
+/// no dot while free. GPUI-free (the theme colors are passed in) so the
+/// mapping is unit-testable without an app context.
+fn activity_dot_color(
+    activity: PaneActivity,
+    success: gpui::Hsla,
+    warning: gpui::Hsla,
+    danger: gpui::Hsla,
+) -> Option<gpui::Hsla> {
+    match activity {
+        PaneActivity::Busy => Some(success),
+        PaneActivity::BusyIdle => Some(warning),
+        PaneActivity::Attention => Some(danger),
+        PaneActivity::Free => None,
+    }
 }
 
 /// A colored dot + count, for one diagnostic severity (`●e` / `⚠w` in the
@@ -761,6 +777,30 @@ mod tests {
                 .insert(server.to_owned(), items);
         }
         map
+    }
+
+    #[test]
+    fn test_activity_dot_color_maps_each_activity_to_its_theme_color() {
+        let success = gpui::hsla(0.3, 1.0, 0.5, 1.0);
+        let warning = gpui::hsla(0.1, 1.0, 0.5, 1.0);
+        let danger = gpui::hsla(0.0, 1.0, 0.5, 1.0);
+
+        assert_eq!(
+            activity_dot_color(PaneActivity::Busy, success, warning, danger),
+            Some(success)
+        );
+        assert_eq!(
+            activity_dot_color(PaneActivity::BusyIdle, success, warning, danger),
+            Some(warning)
+        );
+        assert_eq!(
+            activity_dot_color(PaneActivity::Attention, success, warning, danger),
+            Some(danger)
+        );
+        assert_eq!(
+            activity_dot_color(PaneActivity::Free, success, warning, danger),
+            None
+        );
     }
 
     #[test]
