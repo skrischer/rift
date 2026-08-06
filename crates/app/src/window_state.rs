@@ -42,12 +42,6 @@ const MIN_WINDOW_HEIGHT: f64 = 150.0;
 /// and wires this value through it.
 const DEFAULT_FONT_SIZE_PX: f32 = 14.0;
 
-/// Global UI font size rift starts at before any restore, mirroring
-/// `gpui-component`'s own `Theme::default` base `font_size` (16px) — a fresh
-/// store's restored size matches the out-of-the-box theme exactly, no visible
-/// jump on first launch (issue #920).
-const DEFAULT_UI_FONT_SIZE_PX: f32 = 16.0;
-
 /// The diff view's Split|Unified display preference
 /// (`docs/spec-source-control-write.md`, issue #547): which renderer the
 /// header's segmented toggle selects for the open file's diff. `Unified` is
@@ -214,7 +208,7 @@ impl Default for WindowState {
             diff_view_mode: DiffViewMode::default(),
             ui_font_family: String::new(),
             mono_font_family: String::new(),
-            ui_font_size_px: DEFAULT_UI_FONT_SIZE_PX,
+            ui_font_size_px: crate::DEFAULT_UI_FONT_SIZE_PX,
             visible_areas: default_visible_areas(),
             solo_area: None,
         }
@@ -597,7 +591,7 @@ mod tests {
         assert_eq!(parsed.diff_view_mode, DiffViewMode::Unified);
         assert_eq!(parsed.ui_font_family, "");
         assert_eq!(parsed.mono_font_family, "");
-        assert_eq!(parsed.ui_font_size_px, DEFAULT_UI_FONT_SIZE_PX);
+        assert_eq!(parsed.ui_font_size_px, crate::DEFAULT_UI_FONT_SIZE_PX);
         assert_eq!(
             parsed.visible_areas,
             default_visible_areas(),
@@ -666,7 +660,7 @@ mod tests {
             "a field this JSON predates falls back too"
         );
         assert_eq!(parsed.mono_font_family, "");
-        assert_eq!(parsed.ui_font_size_px, DEFAULT_UI_FONT_SIZE_PX);
+        assert_eq!(parsed.ui_font_size_px, crate::DEFAULT_UI_FONT_SIZE_PX);
     }
 
     #[test]

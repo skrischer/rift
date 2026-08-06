@@ -9,9 +9,10 @@
 //! live app state ([`crate::set_theme_persisted`], [`crate::set_ui_font_persisted`],
 //! [`crate::set_mono_font_persisted`], [`crate::set_ui_font_size_persisted`]
 //! (issue #920, resizes the editor and dock panels via the theme's
-//! `font_size`/`mono_font_size`; the explorer's row text is pinned to fixed
-//! `Pixels` by #908 and does not cascade — see the "UI font size" item's
-//! description), and `SessionView`'s font-zoom state — the
+//! `font_size`/`mono_font_size`, and the explorer rows via
+//! `crate::file_tree`'s scaled text-size helpers — folding the "explorer font
+//! too large" papercut, `docs/spec-dogfooding-fixes.md` #908), and
+//! `SessionView`'s font-zoom state — the
 //! terminal PTY grid only, unaffected by the UI font size, the same state the
 //! command palette and `Ctrl+=`/`Ctrl+-` already mutate), persisted via the
 //! window-state store, never a config file
@@ -265,15 +266,14 @@ fn appearance_page(
                         },
                     ),
                 )
-                // NOTE (issue #920 escalation): the explorer's row/header text
-                // sizes were pinned to fixed `Pixels` by #908
-                // (`docs/spec-dogfooding-fixes.md`, landed after this issue's
-                // spec), so they do not actually cascade from the theme base
-                // `font_size` this control sets — unlike `text_sm`/`text_xs`
-                // readers elsewhere. The description below is scoped to what
-                // this PR verifiably resizes; making the explorer scale too is
-                // flagged as a follow-up rather than silently claimed here.
-                .description("Resizes the editor and dock panels. Does not affect the explorer rows or the terminal grid."),
+                // The explorer's row/header/root-row text (#908,
+                // `docs/spec-dogfooding-fixes.md`) is scaled by
+                // `crate::file_tree`'s `row_text_size`/`header_text_size`/
+                // `root_row_text_size` rather than reading `text_sm`/`text_xs`
+                // directly, but resolves against this same theme `font_size`
+                // (issue #920) — so it scales here too, at the default UI font
+                // size reproducing #908's exact fixed values.
+                .description("Resizes the editor, dock panels, and explorer rows. Does not affect the terminal grid."),
                 SettingItem::new(
                     "Terminal size",
                     SettingField::number_input(

@@ -329,13 +329,16 @@ pub fn set_mono_font_persisted(name: &str, window: Option<&mut Window>, cx: &mut
 // ── UI font-size setter (issue #920) ─────────────────────────────────────────
 //
 // A single "UI font size" control (`crate::settings`) resizes the editor,
-// dock panels, and explorer live: it sets the theme's base `font_size` —
-// which `gpui-component`'s `Root` reapplies as `window.set_rem_size` on every
-// render, cascading to every `text_sm`/`text_xs` reader (the explorer rows
-// and chrome) — and `mono_font_size` (the editor and dock panels), scaled
-// together via `scaled_mono_font_size`. This is entirely separate from the
-// terminal PTY grid's own size, `rift_terminal::SessionView::font_size`
-// (`settings.rs`'s "Terminal size" control), which nothing here touches.
+// dock panels, explorer, and chrome live: it sets the theme's base
+// `font_size` — which `gpui-component`'s `Root` reapplies as
+// `window.set_rem_size` on every render, cascading to every `text_sm`/
+// `text_xs` reader (chrome), and which `crate::file_tree`'s
+// `row_text_size`/`header_text_size`/`root_row_text_size` read directly to
+// scale the explorer's own fixed-`Pixels` row/header/root-row text (#908) —
+// and `mono_font_size` (the editor and dock panels), scaled together via
+// `scaled_mono_font_size`. This is entirely separate from the terminal PTY
+// grid's own size, `rift_terminal::SessionView::font_size` (`settings.rs`'s
+// "Terminal size" control), which nothing here touches.
 
 /// Lower bound of the global UI font-size control — its own range, not
 /// borrowed from the terminal grid's `rift_terminal::MIN_FONT_SIZE` (spec:
@@ -344,13 +347,21 @@ pub const MIN_UI_FONT_SIZE: f32 = 12.0;
 /// Upper bound of the global UI font-size control (see [`MIN_UI_FONT_SIZE`]).
 pub const MAX_UI_FONT_SIZE: f32 = 24.0;
 
+/// The base UI font size `gpui-component`'s own `Theme::default` ships
+/// (`font_size: px(16.)`) — the single reference point every proportional
+/// scale in this crate is relative to: [`scaled_mono_font_size`] here, the
+/// `WindowState::default` seed (`window_state.rs`), and the explorer's
+/// row/header/root-row text sizes (`file_tree.rs`, issue #920). Crate-private:
+/// callers scale relative to it, they never need the raw number.
+pub(crate) const DEFAULT_UI_FONT_SIZE_PX: f32 = 16.0;
+
 /// The `mono_font_size` a given base `font_size` scales to, preserving the
 /// ratio `gpui-component`'s `Theme::default` ships out of the box (13px mono
-/// over a 16px base) — so the editor and dock panels stay proportionally
-/// smaller than the base chrome text at every UI font size, not only the
-/// default. Pure, so it is unit-testable without an `App`.
+/// over a [`DEFAULT_UI_FONT_SIZE_PX`] base) — so the editor and dock panels
+/// stay proportionally smaller than the base chrome text at every UI font
+/// size, not only the default. Pure, so it is unit-testable without an `App`.
 fn scaled_mono_font_size(font_size_px: f32) -> f32 {
-    font_size_px * 13.0 / 16.0
+    font_size_px * 13.0 / DEFAULT_UI_FONT_SIZE_PX
 }
 
 /// Switch the global UI font size live: the theme's base `font_size` and
