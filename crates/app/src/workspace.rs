@@ -1123,6 +1123,8 @@ impl WorkspaceView {
                         load,
                         cpu_count,
                         uptime_secs,
+                        disk_total,
+                        disk_available,
                         psi,
                         ..
                     } = msg
@@ -1140,6 +1142,8 @@ impl WorkspaceView {
                         load,
                         cpu_count,
                         uptime_secs,
+                        disk_total,
+                        disk_available,
                         psi,
                     };
                     let seeding = view.host_metrics.is_none();
