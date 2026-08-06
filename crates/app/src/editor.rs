@@ -4376,7 +4376,7 @@ mod tests {
     #[test]
     fn test_line_shape_counts_leading_spaces_and_tabs() {
         let text = Rope::from("    fn main() {}\n\tif x {\nno_indent\n   \n");
-        assert_eq!(line_shape(&text, 0), (4, 17));
+        assert_eq!(line_shape(&text, 0), (4, 16));
         assert_eq!(line_shape(&text, 1), (1, 7));
         assert_eq!(line_shape(&text, 2), (0, 9));
         // A whitespace-only line has no non-whitespace content: indent is
