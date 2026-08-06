@@ -7,7 +7,7 @@
 //! icon's active state now reads [`RailState`]'s `*_visible` fields — sourced
 //! by the caller from `WorkspaceView`'s own visibility set, not
 //! `dock.is_open`. The four area icons' `on_click` handlers
-//! (`on_toggle_explorer_editor`/`on_toggle_terminal`/`on_toggle_source_control`/
+//! (`on_toggle_explorer`/`on_toggle_terminal`/`on_toggle_source_control`/
 //! `on_toggle_problems`) are built by the caller and passed into [`render`]
 //! (`docs/spec-visibility-rail-focus.md`, issue #848): `WorkspaceView` binds
 //! them to itself via `cx.listener` (a weak reference into
@@ -62,9 +62,13 @@ const BUTTON_SIZE: Pixels = px(36.0);
 /// rift-owned visibility set (`docs/spec-workspace-visibility-rail.md`) and
 /// worktree models — never derived or cached here.
 pub struct RailState {
-    /// Whether the Explorer+Editor area is visible (`Area::ExplorerEditor`,
-    /// one rail icon for both the left-dock explorer and the center editor).
-    pub explorer_editor_visible: bool,
+    /// Whether the Explorer area (the left-dock file tree) is visible
+    /// (`Area::Explorer`). `docs/spec-explorer-editor-split.md` (issue #939)
+    /// split the former fused `Area::ExplorerEditor` into `Area::Explorer` +
+    /// `Area::Editor`; this rail still carries a single icon for the pair —
+    /// mapped to `Area::Explorer` alone for now — until issue #941 (blocked
+    /// on the icon asset) adds a second, dedicated Editor icon + field.
+    pub explorer_visible: bool,
     /// Whether the Terminal area is visible (`Area::Terminal`, issue #821):
     /// a fully symmetric peer like the other three — hiding it or soloing a
     /// different area removes it from the center `h_split` entirely, never
@@ -154,8 +158,8 @@ fn rail_button(
 
 /// `area`'s design hue while it renders plainly visible (not soloed) — the
 /// artboard's per-area color system (`docs/spec-workspace-visibility-rail.md`,
-/// issue #856): Explorer+Editor blue, Terminal amber, Diagnostics red, Git
-/// green. Explorer+Editor/Diagnostics/Git resolve to the base `blue`/`red`/
+/// issue #856): Explorer/Editor blue, Terminal amber, Diagnostics red, Git
+/// green. Explorer/Editor/Diagnostics/Git resolve to the base `blue`/`red`/
 /// `green` theme tokens, exact matches for the artboard's `#89B4FA`/
 /// `#F38BA8`/`#A6E3A1` under the shipped Catppuccin Mocha theme (`cx.theme()`
 /// is live, so a theme switch re-tints automatically — no hardcoded hex).
@@ -163,9 +167,11 @@ fn rail_button(
 /// `warning` instead: the same substitution `file_icons::TintRole::Warning`
 /// already uses for the identical artboard peach `#FAB387` reference on the
 /// `.rs` file-type glyph, kept consistent here rather than hardcoding the hex.
+/// `Explorer`/`Editor` share the one blue hue for now (issue #939 split the
+/// area, but the Editor has no rail icon of its own yet — issue #941).
 fn area_hue(area: Area, cx: &App) -> Hsla {
     match area {
-        Area::ExplorerEditor => cx.theme().blue,
+        Area::Explorer | Area::Editor => cx.theme().blue,
         Area::Terminal => cx.theme().warning,
         Area::Diagnostics => cx.theme().red,
         Area::Git => cx.theme().green,
@@ -254,7 +260,7 @@ fn area_button(
 /// `on_click`, it never builds a click handler itself for an area toggle.
 pub fn render(
     state: RailState,
-    on_toggle_explorer_editor: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_toggle_explorer: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_toggle_terminal: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_toggle_source_control: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_toggle_problems: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -264,10 +270,10 @@ pub fn render(
         "activity-rail-explorer",
         IconName::PanelLeft,
         "Explorer",
-        Area::ExplorerEditor,
-        state.explorer_editor_visible,
+        Area::Explorer,
+        state.explorer_visible,
         state.solo,
-        on_toggle_explorer_editor,
+        on_toggle_explorer,
         cx,
     );
 

@@ -176,8 +176,15 @@ pub struct FocusTerminal;
 #[action(namespace = rift, no_json)]
 pub struct ZoomActivePanel;
 
-/// Solo the Explorer+Editor area, dispatched by `FileTree`/`EditorView`'s
-/// `toolbar_buttons()` header button (issue #820) — see [`ZoomActivePanel`].
+/// Solo the (legacy, pre-split) Explorer+Editor area, dispatched identically
+/// by both `FileTree`'s and `EditorView`'s `toolbar_buttons()` header button
+/// (issue #820) — see [`ZoomActivePanel`]. Interim: since `Area::ExplorerEditor`
+/// no longer exists (`docs/spec-explorer-editor-split.md`, issue #939), the
+/// handler below solos `Area::Explorer` for both dispatch sites, so
+/// `EditorView`'s own solo button temporarily solos the Explorer (left dock)
+/// rather than itself — disclosed and left for issue #941, which replaces
+/// this single action with dedicated `SoloExplorer`/`SoloEditor` actions
+/// wired per panel.
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = rift, no_json)]
 pub struct SoloExplorerEditor;
@@ -351,24 +358,28 @@ pub struct WorkspaceChannels {
     pub pane_metrics_enabled_tx: Sender<ClientMessage>,
 }
 
-/// The four fixed workspace areas the activity rail carries one icon each for
-/// (`docs/spec-workspace-visibility-rail.md`), replacing gpui-component's own
-/// per-dock open/close as the source of truth for what renders.
-/// Explorer+Editor are one area: the left-dock file tree and the center
-/// editor half toggle together. The Terminal is a fully symmetric peer
-/// (issue #821, "Terminal: fully symmetric"): hiding it removes it from the
-/// center `h_split` entirely (the Editor expands to fill the freed half, or
-/// the center goes empty if both are hidden), and it never re-arranges or
-/// takes the Explorer+Editor's place — the rail only ever governs visibility
-/// and solo, never layout order. `Diagnostics`/`Git` are the existing
-/// bottom/right docks.
+/// The five fixed workspace areas the activity rail carries one icon each
+/// for (`docs/spec-workspace-visibility-rail.md`), replacing gpui-component's
+/// own per-dock open/close as the source of truth for what renders.
+/// `Explorer` (the left-dock file tree) and `Editor` (the center editor
+/// half) toggle independently (`docs/spec-explorer-editor-split.md`, issue
+/// #939 — reversing Phase 39's deliberate `ExplorerEditor` fusion). The
+/// Terminal is a fully symmetric peer (issue #821, "Terminal: fully
+/// symmetric"): hiding it removes it from the center `h_split` entirely (the
+/// Editor expands to fill the freed half, or the center goes empty if both
+/// are hidden), and it never re-arranges or takes the Editor's place — the
+/// rail only ever governs visibility and solo, never layout order.
+/// `Diagnostics`/`Git` are the existing bottom/right docks.
 ///
 /// `Serialize`/`Deserialize` (issue #822, `window_state.rs`) use
-/// `rename_all = "snake_case"` tags (`"explorer_editor"`, `"terminal"`, ...)
-/// so the persisted JSON stays readable; `window_state.rs` deserializes each
-/// entry independently and drops one that fails to match a known variant
-/// (a future/older schema's area) instead of failing the whole array — see
-/// `window_state::deserialize_tolerant_areas`.
+/// `rename_all = "snake_case"` tags (`"explorer"`, `"editor"`, `"terminal"`,
+/// ...) so the persisted JSON stays readable; `window_state.rs` deserializes
+/// each entry independently and drops one that fails to match a known
+/// variant (a future/older schema's area, including the now-removed
+/// `"explorer_editor"` fused tag) instead of failing the whole array — see
+/// `window_state::deserialize_tolerant_areas`. Expanding a legacy
+/// `"explorer_editor"` entry into both `Explorer` and `Editor` (rather than
+/// dropping it) is issue #940.
 // `pub`, not `pub(crate)`: `window_state::WindowState`'s `visible_areas`/
 // `solo_area` fields are `pub` (mirroring every other `WindowState` field,
 // e.g. `DiffViewMode`), and a public field cannot expose a less-visible
@@ -376,7 +387,8 @@ pub struct WorkspaceChannels {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Area {
-    ExplorerEditor,
+    Explorer,
+    Editor,
     Terminal,
     Diagnostics,
     Git,
@@ -386,8 +398,9 @@ impl Area {
     /// Every area, in the rail's left-to-right order — also
     /// `window_state::default_visible_areas`'s source of truth for
     /// `WindowState::default`'s all-visible seed (issue #822).
-    pub(crate) const ALL: [Area; 4] = [
-        Area::ExplorerEditor,
+    pub(crate) const ALL: [Area; 5] = [
+        Area::Explorer,
+        Area::Editor,
         Area::Terminal,
         Area::Diagnostics,
         Area::Git,
@@ -499,8 +512,8 @@ pub struct WorkspaceView {
     /// The terminal's dock panel wrapper (`docs/spec-ide-shell.md`, #324):
     /// kept as its own field (mirroring `file_tree`/`editor`) so
     /// [`Self::apply_center_visibility`] can rebuild the center `h_split`
-    /// around the same live entity on every Explorer+Editor or Terminal
-    /// toggle (issue #821), instead of only being reachable through the
+    /// around the same live entity on every Editor or Terminal toggle
+    /// (issue #821, issue #939), instead of only being reachable through the
     /// (rebuilt) `dock_area` tree. Never dropped or recreated across a
     /// hide/show — this is what keeps the wrapped `SessionView`'s tmux
     /// control-mode subscription alive with no reconnect while the Terminal
@@ -1230,7 +1243,8 @@ impl WorkspaceView {
             .unwrap_or_default();
         let visibility =
             Visibility::from_persisted(&persisted_state.visible_areas, persisted_state.solo_area);
-        let explorer_editor_visible = visibility.is_visible(Area::ExplorerEditor);
+        let explorer_visible = visibility.is_visible(Area::Explorer);
+        let editor_visible = visibility.is_visible(Area::Editor);
         let terminal_visible = visibility.is_visible(Area::Terminal);
         let diagnostics_visible = visibility.is_visible(Area::Diagnostics);
         let git_visible = visibility.is_visible(Area::Git);
@@ -1368,13 +1382,15 @@ impl WorkspaceView {
         .detach();
 
         let left_item = DockItem::tab(file_tree.clone(), &weak_dock_area, window, cx);
-        // The Explorer+Editor and Terminal areas (issue #822 seeding, issue
-        // #821 making the Terminal a fully symmetric peer too): the center
+        // The Editor and Terminal areas (issue #822 seeding, issue #821
+        // making the Terminal a fully symmetric peer too; issue #939 split
+        // the Editor's visibility off the Explorer's, `Area::Explorer`
+        // driving `set_left_dock`'s open flag below instead): the center
         // starts as the editor|terminal split only when both are visible,
         // either side alone when just one is, or an empty tab strip when the
         // loaded state left both hidden — mirroring
         // `Self::apply_center_visibility`'s own branches exactly.
-        let center_item = match (explorer_editor_visible, terminal_visible) {
+        let center_item = match (editor_visible, terminal_visible) {
             (true, true) => DockItem::h_split(
                 vec![
                     DockItem::tab(editor.clone(), &weak_dock_area, window, cx),
@@ -1413,7 +1429,7 @@ impl WorkspaceView {
             dock.set_left_dock(
                 left_item,
                 Some(px(LEFT_DOCK_WIDTH)),
-                explorer_editor_visible,
+                explorer_visible,
                 window,
                 cx,
             );
@@ -1757,10 +1773,10 @@ impl WorkspaceView {
     /// every area's `is_visible` returns at once. Calls each of the three
     /// underlying `apply_*_visibility` functions directly (not through
     /// [`Self::apply_area_visibility`]'s per-`Area` dispatch) since
-    /// `ExplorerEditor` and `Terminal` both map to the same
-    /// [`Self::apply_center_visibility`] (issue #821) — looping `Area::ALL`
-    /// through the dispatcher would rebuild the center twice per
-    /// reconciliation. Callers persist once themselves afterward.
+    /// `Explorer`, `Editor`, and `Terminal` all map to the same
+    /// [`Self::apply_center_visibility`] (issue #939, issue #821) — looping
+    /// `Area::ALL` through the dispatcher would rebuild the center three
+    /// times per reconciliation. Callers persist once themselves afterward.
     fn reconcile_visibility(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Captured before the `apply_*_visibility` calls below unrender
         // whichever area just lost visibility — re-homed afterward only if
@@ -1778,11 +1794,12 @@ impl WorkspaceView {
 
     /// Dispatch to the one `apply_*_visibility` matching `area` — the plain
     /// rail-click path (`Self::toggle_area`), which only ever changes one
-    /// area at a time. `ExplorerEditor` and `Terminal` (issue #821) both
-    /// route to [`Self::apply_center_visibility`], which reads both areas'
-    /// current visibility itself rather than trusting the single `visible`
-    /// passed in for whichever one of the pair triggered this — the center's
-    /// shape depends on both.
+    /// area at a time. `Explorer`, `Editor`, and `Terminal` (issue #939,
+    /// issue #821) all route to [`Self::apply_center_visibility`], which
+    /// reads all three areas' current visibility itself rather than trusting
+    /// the single `visible` passed in for whichever one triggered this — the
+    /// left dock's open state and the center's shape depend on all three
+    /// together.
     fn apply_area_visibility(
         &self,
         area: Area,
@@ -1791,7 +1808,9 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         match area {
-            Area::ExplorerEditor | Area::Terminal => self.apply_center_visibility(window, cx),
+            Area::Explorer | Area::Editor | Area::Terminal => {
+                self.apply_center_visibility(window, cx)
+            }
             Area::Diagnostics => self.apply_diagnostics_visibility(visible, window, cx),
             Area::Git => self.apply_git_visibility(visible, window, cx),
         }
@@ -1812,19 +1831,22 @@ impl WorkspaceView {
         }
     }
 
-    /// Reconcile the dock tree's center region with the Explorer+Editor
-    /// *and* Terminal areas' visibility together (issue #821 makes the
-    /// Terminal a fully symmetric peer, no longer an always-rendered floor —
-    /// see the spec's "Terminal: fully symmetric" decision): the
-    /// editor|terminal `h_split` when both are visible, either side alone —
-    /// filling the freed half — when exactly one is, or an empty tab strip
-    /// (a zero-panel `TabPanel`, mirroring `apply_diagnostics_visibility`'s
-    /// "hidden = zero tabs, not merely collapsed" contract) when both are
-    /// hidden, e.g. while a non-Terminal area is soloed. Also open/closes the
-    /// left dock with the Explorer+Editor flag (closed, a Left `Dock` skips
-    /// its whole subtree in gpui-component's own `Dock::render`, so this
-    /// alone makes the explorer "not rendered"). The rail never re-arranges
-    /// or demotes the terminal — it stays the prominent center peer
+    /// Reconcile the dock tree's center region with the Explorer, Editor,
+    /// and Terminal areas' visibility together (issue #939 splits the
+    /// Explorer's dock from the Editor's center half, reversing Phase 39's
+    /// `ExplorerEditor` fusion; issue #821 makes the Terminal a fully
+    /// symmetric peer, no longer an always-rendered floor — see the spec's
+    /// "Terminal: fully symmetric" decision): a 3-input decision — the left
+    /// dock opens/closes on the Explorer flag alone (closed, a Left `Dock`
+    /// skips its whole subtree in gpui-component's own `Dock::render`, so
+    /// this alone makes the explorer "not rendered"), while the center
+    /// region is the editor|terminal `h_split` when both the Editor and
+    /// Terminal are visible, either side alone — filling the freed half —
+    /// when exactly one is, or an empty tab strip (a zero-panel `TabPanel`,
+    /// mirroring `apply_diagnostics_visibility`'s "hidden = zero tabs, not
+    /// merely collapsed" contract) when both are hidden, e.g. while a
+    /// non-Editor/non-Terminal area is soloed. The rail never re-arranges or
+    /// demotes the terminal — it stays the prominent center peer
     /// side-by-side with the Editor whenever both show, never merged into a
     /// shared tab strip.
     ///
@@ -1836,16 +1858,17 @@ impl WorkspaceView {
     /// Explicitly notifies `session_view` afterward — issue #821 extending
     /// the #596 dock-toggle reflow observer (below, in `Self::new`) to
     /// visible-set/solo transitions. That observer only watches the
-    /// left/right/bottom `Dock` entities, which a pure Terminal/
-    /// Explorer+Editor visibility change never touches; without this, a
-    /// re-shown Terminal's render-coupled tmux grid resize
-    /// (`resize_client_to_area`, `rift-terminal`'s `grid_observer` prepaint)
-    /// might not re-fire, leaving tmux at the stale pre-hide grid.
+    /// left/right/bottom `Dock` entities, which a pure Explorer/Editor/
+    /// Terminal visibility change never touches; without this, a re-shown
+    /// Terminal's render-coupled tmux grid resize (`resize_client_to_area`,
+    /// `rift-terminal`'s `grid_observer` prepaint) might not re-fire, leaving
+    /// tmux at the stale pre-hide grid.
     fn apply_center_visibility(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let explorer_editor_visible = self.visibility.is_visible(Area::ExplorerEditor);
+        let explorer_visible = self.visibility.is_visible(Area::Explorer);
+        let editor_visible = self.visibility.is_visible(Area::Editor);
         let terminal_visible = self.visibility.is_visible(Area::Terminal);
         let weak_dock_area = self.dock_area.downgrade();
-        let center = match (explorer_editor_visible, terminal_visible) {
+        let center = match (editor_visible, terminal_visible) {
             (true, true) => DockItem::h_split(
                 vec![
                     DockItem::tab(self.editor.clone(), &weak_dock_area, window, cx),
@@ -1864,9 +1887,7 @@ impl WorkspaceView {
         self.dock_area.update(cx, |dock_area, cx| {
             dock_area.set_center(center, window, cx);
             if let Some(left_dock) = dock_area.left_dock().cloned() {
-                left_dock.update(cx, |dock, cx| {
-                    dock.set_open(explorer_editor_visible, window, cx)
-                });
+                left_dock.update(cx, |dock, cx| dock.set_open(explorer_visible, window, cx));
             }
         });
         self.session_view.update(cx, |_session, cx| cx.notify());
@@ -1969,8 +1990,8 @@ impl WorkspaceView {
     /// as a tab alongside the explorer (opening the dock too, since
     /// `DockArea::add_panel` does not do that for an already-existing dock)
     /// or removes it, per `outline_open`'s current state — independent of the
-    /// Explorer+Editor area toggle above (the outline panel is not one of the
-    /// rail's four areas).
+    /// Explorer area toggle above (the outline panel is not one of the
+    /// rail's areas).
     fn toggle_outline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let opening = !self.outline_open;
         let panel: Arc<dyn PanelView> = Arc::new(self.outline_panel.clone());
@@ -2072,11 +2093,13 @@ impl WorkspaceView {
         // `ProblemsPanel`/`DiffView` all also implement gpui-component's
         // `Panel`, which gives `Entity<T>` a second, differently-scoped
         // `focus_handle` (via its blanket `PanelView` impl) — plain method
-        // syntax is ambiguous between the two.
-        if Focusable::focus_handle(&self.file_tree, cx).contains_focused(window, cx)
-            || Focusable::focus_handle(&self.editor, cx).contains_focused(window, cx)
-        {
-            Some(Area::ExplorerEditor)
+        // syntax is ambiguous between the two. `Explorer`/`Editor` are split
+        // arms (issue #939): the file tree and the editor are two distinct
+        // areas now, each checked independently.
+        if Focusable::focus_handle(&self.file_tree, cx).contains_focused(window, cx) {
+            Some(Area::Explorer)
+        } else if Focusable::focus_handle(&self.editor, cx).contains_focused(window, cx) {
+            Some(Area::Editor)
         } else if self
             .session_view
             .focus_handle(cx)
@@ -2130,9 +2153,12 @@ impl WorkspaceView {
         }
         match Self::preferred_focus_area(&self.visibility) {
             Some(Area::Terminal) => self.focus_terminal(window, cx),
-            Some(Area::ExplorerEditor) => self.editor.update(cx, |editor, cx| {
+            Some(Area::Editor) => self.editor.update(cx, |editor, cx| {
                 editor.focus_active_input(window, cx);
             }),
+            Some(Area::Explorer) => {
+                Focusable::focus_handle(&self.file_tree, cx).focus(window, cx);
+            }
             Some(Area::Diagnostics) => {
                 Focusable::focus_handle(&self.problems_panel, cx).focus(window, cx);
             }
@@ -2144,16 +2170,19 @@ impl WorkspaceView {
     }
 
     /// Pick the area focus should re-home to, preferring **Terminal ->
-    /// Explorer+Editor -> Diagnostics -> Git** (`docs/vision.md`: the
+    /// Editor -> Explorer -> Diagnostics -> Git** (`docs/vision.md`: the
     /// terminal is rift's primary surface, restore focus there first when
-    /// visible) — pure state-machine logic over [`Visibility`], no GPUI
-    /// dependency, directly unit-testable. `None` means no area is visible
-    /// (the degenerate all-hidden state); callers fall back to the
+    /// visible; the Editor — where typing happens — outranks the Explorer,
+    /// issue #939 splitting the former single Explorer+Editor preference
+    /// slot into these two) — pure state-machine logic over [`Visibility`],
+    /// no GPUI dependency, directly unit-testable. `None` means no area is
+    /// visible (the degenerate all-hidden state); callers fall back to the
     /// workspace's own root focus anchor.
     fn preferred_focus_area(visibility: &Visibility) -> Option<Area> {
-        const PREFERENCE: [Area; 4] = [
+        const PREFERENCE: [Area; 5] = [
             Area::Terminal,
-            Area::ExplorerEditor,
+            Area::Editor,
+            Area::Explorer,
             Area::Diagnostics,
             Area::Git,
         ];
@@ -2722,12 +2751,16 @@ impl Render for WorkspaceView {
         // (`docs/spec-visibility-rail-focus.md`, issue #848) — the rail click
         // path is now focus-immune by construction. The `Toggle*` actions +
         // their `on_action` handlers below stay in place for the keyboard,
-        // command palette, and agent-driven dispatch.
+        // command palette, and agent-driven dispatch. The rail still shows
+        // one Explorer icon — a second Editor icon is issue #941 (blocked on
+        // the icon asset); this button toggles `Area::Explorer` alone now
+        // (issue #939), so the Editor half of the center stays always-on
+        // until #941 gives it its own control.
         let rail = {
             let model = self.file_tree.read(cx).model();
             activity_rail::render(
                 activity_rail::RailState {
-                    explorer_editor_visible: self.visibility.is_visible(Area::ExplorerEditor),
+                    explorer_visible: self.visibility.is_visible(Area::Explorer),
                     terminal_visible: self.visibility.is_visible(Area::Terminal),
                     git_visible: self.visibility.is_visible(Area::Git),
                     diagnostics_visible: self.visibility.is_visible(Area::Diagnostics),
@@ -2736,7 +2769,7 @@ impl Render for WorkspaceView {
                     worst_diagnostic: activity_rail::worst_severity(model.all_diagnostics()),
                 },
                 cx.listener(|this, _event: &ClickEvent, window, cx| {
-                    this.toggle_area(Area::ExplorerEditor, window, cx);
+                    this.toggle_area(Area::Explorer, window, cx);
                 }),
                 cx.listener(|this, _event: &ClickEvent, window, cx| {
                     this.toggle_area(Area::Terminal, window, cx);
@@ -2820,7 +2853,7 @@ impl Render for WorkspaceView {
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &ToggleExplorer, window, cx| {
-                this.toggle_area(Area::ExplorerEditor, window, cx);
+                this.toggle_area(Area::Explorer, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleOutline, window, cx| {
                 this.toggle_outline(window, cx);
@@ -2841,7 +2874,11 @@ impl Render for WorkspaceView {
                 this.zoom_active_panel(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SoloExplorerEditor, window, cx| {
-                this.toggle_solo_area(Area::ExplorerEditor, window, cx);
+                // Interim: solos `Area::Explorer` for both `FileTree`'s and
+                // `EditorView`'s identical dispatch of this action (see the
+                // struct's own doc comment) — issue #941 replaces this with
+                // per-panel `SoloExplorer`/`SoloEditor` actions.
+                this.toggle_solo_area(Area::Explorer, window, cx);
             }))
             .on_action(cx.listener(|this, _: &SoloTerminal, window, cx| {
                 this.toggle_solo_area(Area::Terminal, window, cx);
@@ -2947,7 +2984,12 @@ mod tests {
 
         visibility.toggle(Area::Git);
         assert!(!visibility.is_visible(Area::Git), "Git is now hidden");
-        for area in [Area::ExplorerEditor, Area::Terminal, Area::Diagnostics] {
+        for area in [
+            Area::Explorer,
+            Area::Editor,
+            Area::Terminal,
+            Area::Diagnostics,
+        ] {
             assert!(
                 visibility.is_visible(area),
                 "toggling Git leaves {area:?} visible"
@@ -2973,7 +3015,7 @@ mod tests {
             !visibility.is_visible(Area::Terminal),
             "Terminal is now hidden"
         );
-        for area in [Area::ExplorerEditor, Area::Diagnostics, Area::Git] {
+        for area in [Area::Explorer, Area::Editor, Area::Diagnostics, Area::Git] {
             assert!(
                 visibility.is_visible(area),
                 "toggling Terminal leaves {area:?} visible"
@@ -2998,7 +3040,7 @@ mod tests {
             visibility.is_visible(Area::Diagnostics),
             "the soloed area renders"
         );
-        for area in [Area::ExplorerEditor, Area::Terminal, Area::Git] {
+        for area in [Area::Explorer, Area::Editor, Area::Terminal, Area::Git] {
             assert!(
                 !visibility.is_visible(area),
                 "{area:?} is hidden while another area is soloed, even though it is \
@@ -3021,7 +3063,7 @@ mod tests {
             visibility.is_visible(Area::Diagnostics),
             "the target area renders"
         );
-        for area in [Area::ExplorerEditor, Area::Terminal, Area::Git] {
+        for area in [Area::Explorer, Area::Editor, Area::Terminal, Area::Git] {
             assert!(
                 !visibility.is_visible(area),
                 "{area:?}, including the Terminal, is hidden while Diagnostics is soloed"
@@ -3039,7 +3081,7 @@ mod tests {
         visibility.toggle_solo(Area::Terminal);
 
         assert!(visibility.is_visible(Area::Terminal));
-        for area in [Area::ExplorerEditor, Area::Diagnostics, Area::Git] {
+        for area in [Area::Explorer, Area::Editor, Area::Diagnostics, Area::Git] {
             assert!(!visibility.is_visible(area), "{area:?} is hidden");
         }
     }
@@ -3061,7 +3103,12 @@ mod tests {
             !visibility.is_visible(Area::Git),
             "exiting solo restores the pre-solo set, where Git was still hidden"
         );
-        for area in [Area::ExplorerEditor, Area::Terminal, Area::Diagnostics] {
+        for area in [
+            Area::Explorer,
+            Area::Editor,
+            Area::Terminal,
+            Area::Diagnostics,
+        ] {
             assert!(visibility.is_visible(area), "{area:?} is visible again");
         }
     }
@@ -3131,7 +3178,7 @@ mod tests {
             Visibility::from_persisted(&[Area::Terminal, Area::Git], Some(Area::Terminal));
 
         assert!(visibility.is_visible(Area::Terminal), "the solo target");
-        for area in [Area::ExplorerEditor, Area::Diagnostics, Area::Git] {
+        for area in [Area::Explorer, Area::Editor, Area::Diagnostics, Area::Git] {
             assert!(
                 !visibility.is_visible(area),
                 "{area:?} is hidden while Terminal is soloed"
@@ -3182,15 +3229,22 @@ mod tests {
         visibility.toggle(Area::Terminal);
         assert_eq!(
             WorkspaceView::preferred_focus_area(&visibility),
-            Some(Area::ExplorerEditor),
-            "Terminal hidden: Explorer+Editor is next"
+            Some(Area::Editor),
+            "Terminal hidden: Editor is next"
         );
 
-        visibility.toggle(Area::ExplorerEditor);
+        visibility.toggle(Area::Editor);
+        assert_eq!(
+            WorkspaceView::preferred_focus_area(&visibility),
+            Some(Area::Explorer),
+            "Terminal and Editor hidden: Explorer is next"
+        );
+
+        visibility.toggle(Area::Explorer);
         assert_eq!(
             WorkspaceView::preferred_focus_area(&visibility),
             Some(Area::Diagnostics),
-            "Terminal and Explorer+Editor hidden: Diagnostics is next"
+            "Terminal, Editor, and Explorer hidden: Diagnostics is next"
         );
 
         visibility.toggle(Area::Diagnostics);
@@ -3772,17 +3826,15 @@ mod tests {
     }
 
     /// Shell command action (`docs/spec-command-palette.md`, issue #358;
-    /// rewired by `docs/spec-workspace-visibility-rail.md`, issue #819): the
-    /// `ToggleExplorer` handler now flips `Area::ExplorerEditor`'s membership
-    /// in the rift-owned visibility set, closes the left dock (the same
-    /// `DockArea::toggle_dock` wiring `test_toggle_left_dock_flips_open_state`
-    /// exercises directly), and collapses the center split down to the
-    /// Terminal alone — restoring the editor|terminal split on the next
-    /// toggle.
+    /// rewired by `docs/spec-workspace-visibility-rail.md`, issue #819;
+    /// split off the Editor by `docs/spec-explorer-editor-split.md`, issue
+    /// #939): the `ToggleExplorer` handler flips `Area::Explorer`'s
+    /// membership in the rift-owned visibility set and closes the left dock
+    /// (the same `DockArea::toggle_dock` wiring
+    /// `test_toggle_left_dock_flips_open_state` exercises directly) — the
+    /// center split is untouched, since the Editor is now a separate area.
     #[gpui::test]
-    fn test_toggle_area_explorer_editor_hides_left_dock_and_collapses_center_to_terminal(
-        cx: &mut TestAppContext,
-    ) {
+    fn test_toggle_area_explorer_hides_only_the_left_dock(cx: &mut TestAppContext) {
         let mut workspace: Option<Entity<WorkspaceView>> = None;
         let window = cx.update(|cx| {
             gpui_component::init(cx);
@@ -3805,25 +3857,83 @@ mod tests {
                     "explorer dock starts open"
                 );
                 assert!(
-                    workspace
-                        .read(cx)
-                        .visibility
-                        .is_visible(Area::ExplorerEditor),
+                    workspace.read(cx).visibility.is_visible(Area::Explorer),
                     "the area starts visible"
                 );
 
                 workspace.update(cx, |view, cx| {
-                    view.toggle_area(Area::ExplorerEditor, window, cx);
+                    view.toggle_area(Area::Explorer, window, cx);
                 });
                 assert!(
                     !dock_area.read(cx).is_dock_open(DockPlacement::Left, cx),
                     "ToggleExplorer hides the explorer dock"
                 );
                 assert!(
-                    !workspace
-                        .read(cx)
-                        .visibility
-                        .is_visible(Area::ExplorerEditor),
+                    !workspace.read(cx).visibility.is_visible(Area::Explorer),
+                    "the area is now hidden in the rift-owned set"
+                );
+                match dock_area.read(cx).center() {
+                    DockItem::Split { axis, items, .. } => {
+                        assert_eq!(*axis, Axis::Horizontal);
+                        assert_eq!(
+                            items.len(),
+                            2,
+                            "the center editor|terminal split is untouched by an Explorer-only toggle"
+                        );
+                    }
+                    other => panic!("expected the center split to stay intact, got {other:?}"),
+                }
+
+                workspace.update(cx, |view, cx| {
+                    view.toggle_area(Area::Explorer, window, cx);
+                });
+                assert!(
+                    dock_area.read(cx).is_dock_open(DockPlacement::Left, cx),
+                    "toggling again restores the explorer dock"
+                );
+                assert!(
+                    workspace.read(cx).visibility.is_visible(Area::Explorer),
+                    "the area is visible again"
+                );
+            })
+            .unwrap();
+    }
+
+    /// `docs/spec-explorer-editor-split.md`, issue #939: toggling `Area::Editor`
+    /// collapses the center split down to the Terminal alone — the left
+    /// (Explorer) dock is untouched, unlike the fused pre-split toggle this
+    /// replaces — restoring the editor|terminal split on the next toggle.
+    #[gpui::test]
+    fn test_toggle_area_editor_collapses_center_to_terminal_and_restores_the_split(
+        cx: &mut TestAppContext,
+    ) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let session_view = cx.new(|cx| SessionView::new(cx).0);
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+
+        window
+            .update(cx, |_, window, cx| {
+                let dock_area = workspace.read(cx).dock_area.clone();
+                assert!(
+                    workspace.read(cx).visibility.is_visible(Area::Editor),
+                    "the area starts visible"
+                );
+
+                workspace.update(cx, |view, cx| {
+                    view.toggle_area(Area::Editor, window, cx);
+                });
+                assert!(
+                    !workspace.read(cx).visibility.is_visible(Area::Editor),
                     "the area is now hidden in the rift-owned set"
                 );
                 match dock_area.read(cx).center() {
@@ -3836,19 +3946,15 @@ mod tests {
                         panic!("expected the center to collapse to a single tab, got {other:?}")
                     }
                 }
+                // The left (Explorer) dock is untouched by an Editor-only
+                // toggle.
+                assert!(dock_area.read(cx).is_dock_open(DockPlacement::Left, cx));
 
                 workspace.update(cx, |view, cx| {
-                    view.toggle_area(Area::ExplorerEditor, window, cx);
+                    view.toggle_area(Area::Editor, window, cx);
                 });
                 assert!(
-                    dock_area.read(cx).is_dock_open(DockPlacement::Left, cx),
-                    "toggling again restores the explorer dock"
-                );
-                assert!(
-                    workspace
-                        .read(cx)
-                        .visibility
-                        .is_visible(Area::ExplorerEditor),
+                    workspace.read(cx).visibility.is_visible(Area::Editor),
                     "the area is visible again"
                 );
                 match dock_area.read(cx).center() {
@@ -3864,13 +3970,98 @@ mod tests {
             .unwrap();
     }
 
+    /// `docs/spec-explorer-editor-split.md`, issue #939: `apply_center_visibility`'s
+    /// 3-input decision (Explorer, Editor, Terminal) exhaustively — the left
+    /// dock's open state tracks Explorer alone, and the center's shape
+    /// depends only on Editor/Terminal, regardless of Explorer.
+    #[gpui::test]
+    fn test_apply_center_visibility_exhaustive_three_input_table(cx: &mut TestAppContext) {
+        let mut workspace: Option<Entity<WorkspaceView>> = None;
+        let window = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.open_window(Default::default(), |window, cx| {
+                let session_view = cx.new(|cx| SessionView::new(cx).0);
+                workspace = Some(cx.new(|cx| {
+                    WorkspaceView::new(session_view, test_channels(), None, None, None, window, cx)
+                }));
+                cx.new(|cx| Root::new(workspace.clone().unwrap(), window, cx))
+            })
+            .unwrap()
+        });
+        let workspace = workspace.expect("workspace constructed inside the window callback");
+
+        window
+            .update(cx, |_, window, cx| {
+                let dock_area = workspace.read(cx).dock_area.clone();
+                for explorer in [false, true] {
+                    for editor in [false, true] {
+                        for terminal in [false, true] {
+                            let mut areas = Vec::new();
+                            if explorer {
+                                areas.push(Area::Explorer);
+                            }
+                            if editor {
+                                areas.push(Area::Editor);
+                            }
+                            if terminal {
+                                areas.push(Area::Terminal);
+                            }
+                            workspace.update(cx, |view, cx| {
+                                view.visibility = Visibility::from_persisted(&areas, None);
+                                view.apply_center_visibility(window, cx);
+                            });
+
+                            assert_eq!(
+                                dock_area.read(cx).is_dock_open(DockPlacement::Left, cx),
+                                explorer,
+                                "left dock open state tracks Explorer alone \
+                                 (explorer={explorer}, editor={editor}, terminal={terminal})"
+                            );
+
+                            match (editor, terminal) {
+                                (true, true) => match dock_area.read(cx).center() {
+                                    DockItem::Split { axis, items, .. } => {
+                                        assert_eq!(*axis, Axis::Horizontal);
+                                        assert_eq!(items.len(), 2);
+                                    }
+                                    other => {
+                                        panic!("expected an editor|terminal split, got {other:?}")
+                                    }
+                                },
+                                (true, false) => match dock_area.read(cx).center() {
+                                    DockItem::Tabs { items, .. } => assert_eq!(
+                                        items[0].panel_name(cx),
+                                        crate::editor::EDITOR_PANEL_NAME
+                                    ),
+                                    other => panic!("expected the editor alone, got {other:?}"),
+                                },
+                                (false, true) => match dock_area.read(cx).center() {
+                                    DockItem::Tabs { items, .. } => assert_eq!(
+                                        items[0].panel_name(cx),
+                                        crate::terminal_panel::TERMINAL_PANEL_NAME
+                                    ),
+                                    other => panic!("expected the terminal alone, got {other:?}"),
+                                },
+                                (false, false) => match dock_area.read(cx).center() {
+                                    DockItem::Tabs { items, .. } => {
+                                        assert!(items.is_empty(), "expected an empty tab strip")
+                                    }
+                                    other => panic!("expected empty tabs, got {other:?}"),
+                                },
+                            }
+                        }
+                    }
+                }
+            })
+            .unwrap();
+    }
+
     /// Shell command action (`docs/spec-workspace-visibility-rail.md`, issue
     /// #821, "Terminal: fully symmetric"): `ToggleTerminal` flips
     /// `Area::Terminal`'s membership in the rift-owned visibility set and
     /// collapses the center split down to the Editor alone — the mirror
-    /// image of the Explorer+Editor toggle above, proving the Terminal is a
-    /// real render-level peer rather than the permanent floor #820 left it
-    /// as.
+    /// image of the Editor toggle above, proving the Terminal is a real
+    /// render-level peer rather than the permanent floor #820 left it as.
     #[gpui::test]
     fn test_toggle_area_terminal_collapses_center_to_editor_and_restores_the_split(
         cx: &mut TestAppContext,
@@ -4002,10 +4193,9 @@ mod tests {
     /// Issue #821: soloing a NON-Terminal area hides the Terminal too — the
     /// spec's "Terminal: fully symmetric" decision — which drives the
     /// center's `apply_center_visibility` all the way down to an empty tab
-    /// strip (zero panels) since both center-contributing areas
-    /// (Explorer+Editor and Terminal) are hidden at once. Zero panels, not a
-    /// leftover single tab, is what actually makes the Terminal "not
-    /// rendered" while soloed away.
+    /// strip (zero panels) since both center-contributing areas (Editor and
+    /// Terminal) are hidden at once. Zero panels, not a leftover single tab,
+    /// is what actually makes the Terminal "not rendered" while soloed away.
     #[gpui::test]
     fn test_toggle_solo_a_non_terminal_area_empties_the_center(cx: &mut TestAppContext) {
         let mut workspace: Option<Entity<WorkspaceView>> = None;
@@ -4117,7 +4307,7 @@ mod tests {
     /// trigger (clicking the Terminal rail toggle broke every other toggle,
     /// since focus is on the Terminal at click time far more often than on
     /// any other area) — moves focus to the next-preferred still-visible
-    /// area (Explorer+Editor) instead of stranding it on the now-unrendered
+    /// area (the Editor) instead of stranding it on the now-unrendered
     /// Terminal.
     #[gpui::test]
     fn test_toggle_area_rehomes_focus_only_when_the_focused_area_is_hidden(
@@ -4177,7 +4367,7 @@ mod tests {
                 assert!(
                     Focusable::focus_handle(&workspace.read(cx).editor, cx)
                         .contains_focused(window, cx),
-                    "focus re-homed to Explorer+Editor, the next-preferred still-visible area"
+                    "focus re-homed to the Editor, the next-preferred still-visible area"
                 );
             })
             .unwrap();
@@ -4247,7 +4437,7 @@ mod tests {
                 // Collapse the left dock first, to prove ToggleOutline opens
                 // it rather than merely adding an invisible tab.
                 workspace.update(cx, |view, cx| {
-                    view.toggle_area(Area::ExplorerEditor, window, cx);
+                    view.toggle_area(Area::Explorer, window, cx);
                 });
                 assert!(!dock_area.read(cx).is_dock_open(DockPlacement::Left, cx));
 
