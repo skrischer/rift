@@ -16,7 +16,6 @@
 
 use std::collections::BTreeMap;
 
-use flume::Sender;
 use gpui::{
     canvas, div, px, Anchor, App, Bounds, Entity, FontWeight, Hsla, InteractiveElement as _,
     IntoElement, MouseButton, ParentElement as _, PathBuilder, Pixels, SharedString, Styled as _,
@@ -31,11 +30,12 @@ use gpui_component::{
     v_flex, ActiveTheme as _, Sizable as _, Theme,
 };
 use rift_protocol::{
-    AheadBehind, ClientMessage, Diagnostic, DiagnosticSeverity, LoadAverage, LspServerState,
-    MemoryPressure, PaneMetric,
+    AheadBehind, Diagnostic, DiagnosticSeverity, LoadAverage, LspServerState, MemoryPressure,
+    PaneMetric,
 };
 use rift_terminal::{PaneActivity, SessionView, StatusWindow};
-use tracing::debug;
+
+use crate::workspace::WorkspaceView;
 
 /// Fixed height of the composite status line, in pixels (the design's 28px).
 const HEIGHT: f32 = 28.0;
@@ -330,12 +330,6 @@ pub struct StatusLineModel<'a> {
     /// arrives (the popover renders a brief "sampling" placeholder for that
     /// case, [`pane_metrics_popover_content`]).
     pub pane_metrics: &'a [PaneMetric],
-    /// The breakdown popover's open/close toggle sender: a clone is captured
-    /// by the popover's `on_open_change` callback in [`render`], which
-    /// forwards it onto the protocol as `ClientMessage::SetPaneMetricsEnabled`
-    /// — `true` on open (starts this connection's per-pane sampling on the
-    /// daemon), `false` on close (stops it).
-    pub pane_metrics_enabled_tx: Sender<ClientMessage>,
     /// The active editor tab's zero-based cursor `(line, column)`, or `None`
     /// when no tab is open.
     pub cursor: Option<(u32, u32)>,
@@ -722,6 +716,7 @@ fn host_detail_content(sample: &HostMetrics, mem_history: &[f32], cx: &App) -> i
 pub fn render(
     model: StatusLineModel,
     session_view: &Entity<SessionView>,
+    workspace: &Entity<WorkspaceView>,
     cx: &App,
 ) -> impl IntoElement {
     let theme = cx.theme();
@@ -833,10 +828,14 @@ pub fn render(
     // Per-pane breakdown popover (`docs/spec-pane-attribution.md`, #881):
     // clicking the segment toggles a `Popover` listing the attached
     // session's panes ranked by RSS/CPU. `on_open_change` forwards the new
-    // open state onto the protocol as `ClientMessage::SetPaneMetricsEnabled`
-    // so the daemon samples only while this popover is open; `pane_metrics`
-    // (folded from the daemon's per-connection pushes) drives the content,
-    // rebuilt fresh on every render per `Popover::content`'s own contract.
+    // open state into `WorkspaceView::set_pane_metrics_popover_open`, which
+    // merges it with the working/idle classifier's own opt-in want before
+    // forwarding `ClientMessage::SetPaneMetricsEnabled` onto the protocol
+    // (`docs/spec-agent-activity.md`'s decision log — closing this popover
+    // must not disable the daemon's per-pane sampling while the classifier
+    // still needs it); `pane_metrics` (folded from the daemon's
+    // per-connection pushes) drives the content, rebuilt fresh on every
+    // render per `Popover::content`'s own contract.
     //
     // Host-detail hover card (`docs/spec-telemetry-detail.md`): an
     // independent surface from the click-driven popover above — hovering
@@ -849,7 +848,7 @@ pub fn render(
     let metrics = model.host_metrics.map(|m| {
         let text = metrics_text(m.cpu, m.mem_total, m.mem_available);
         let rows = pane_metric_rows(model.pane_metrics);
-        let enabled_tx = model.pane_metrics_enabled_tx.clone();
+        let workspace_for_popover = workspace.clone();
         let pane_metrics_popover = Popover::new("status-pane-metrics")
             .anchor(Anchor::BottomRight)
             .trigger(
@@ -859,13 +858,10 @@ pub fn render(
                     .label(text)
                     .text_color(pressure_color),
             )
-            .on_open_change(move |open, _window, _cx| {
-                let enabled = *open;
-                if let Err(e) =
-                    enabled_tx.try_send(ClientMessage::SetPaneMetricsEnabled { enabled })
-                {
-                    debug!(error = %e, enabled, "failed to send pane-metrics enabled toggle");
-                }
+            .on_open_change(move |open, _window, cx| {
+                let open = *open;
+                workspace_for_popover
+                    .update(cx, |view, _cx| view.set_pane_metrics_popover_open(open));
             })
             .content(move |_state, _window, cx| pane_metrics_popover_content(&rows, cx));
 

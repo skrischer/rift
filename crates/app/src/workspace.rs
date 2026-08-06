@@ -60,7 +60,7 @@
 //! #351) — never the merely-active tab, so a stale response for a superseded
 //! request can never land on the wrong tab.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -84,6 +84,7 @@ use rift_terminal::{SessionView, SessionViewEvent};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use crate::activity_classifier::CpuWorkClassifier;
 use crate::activity_rail;
 use crate::command_palette::{CommandPalette, OpenCommandPalette};
 use crate::diff_view::DiffView;
@@ -348,13 +349,15 @@ pub struct WorkspaceChannels {
     /// [`WorkspaceView::apply_dir_entries_reply`] directly, since only one of
     /// the pre-/in-cockpit pickers is ever showing at a time.
     pub dir_browse_tx: Sender<ClientMessage>,
-    /// The per-pane breakdown popover's open/close toggle
-    /// (`docs/spec-pane-attribution.md`, #881): sent as a
-    /// `ClientMessage::SetPaneMetricsEnabled` directly from the popover's
-    /// `on_open_change` callback (`status_bar.rs`) — `true` while it is
-    /// open, `false` on close — so the daemon samples this connection's
-    /// panes only on demand. Push-only from here, mirroring `git_op_tx`: the
-    /// resulting breakdown arrives separately on `pane_metrics_rx` above.
+    /// The daemon's on-demand `PaneMetrics` opt-in, sent as
+    /// `ClientMessage::SetPaneMetricsEnabled` by
+    /// [`WorkspaceView::sync_pane_metrics_opt_in`] — never directly from a
+    /// UI callback: [`PaneMetricsOptIn`] merges the breakdown popover's
+    /// open/close want (`docs/spec-pane-attribution.md`, #881) with the
+    /// working/idle classifier's own want (`docs/spec-agent-activity.md`,
+    /// #953) with OR before a value ever reaches this channel. Push-only
+    /// from here, mirroring `git_op_tx`: the resulting breakdown arrives
+    /// separately on `pane_metrics_rx` above.
     pub pane_metrics_enabled_tx: Sender<ClientMessage>,
 }
 
@@ -589,14 +592,28 @@ pub struct WorkspaceView {
     /// The attached session's latest per-pane breakdown for the composite
     /// status line's popover (`docs/spec-pane-attribution.md`, #881), folded
     /// from the daemon's per-connection `PaneMetrics` push. Empty before the
-    /// first push arrives (sent only while the popover is open — there is no
-    /// Welcome replay for this per-connection, on-demand stream, unlike
-    /// `host_metrics`/`lsp` above). Read inline in [`WorkspaceView::render`].
+    /// first push arrives — the daemon's `PaneMetrics` stream is on-demand,
+    /// with no Welcome replay, unlike `host_metrics`/`lsp` above (see
+    /// [`Self::pane_metrics_opt_in`] for when it flows). Read inline in
+    /// [`WorkspaceView::render`].
     pane_metrics: Vec<PaneMetric>,
-    /// The per-pane breakdown popover's open/close toggle sender
-    /// (`docs/spec-pane-attribution.md`, #881) — cloned into the popover's
-    /// `on_open_change` callback each render (`status_bar::render`), which
-    /// forwards it onto the protocol as `ClientMessage::SetPaneMetricsEnabled`.
+    /// Per-pane working/idle classifier state (`docs/spec-agent-activity.md`,
+    /// #953), keyed by `PaneMetric::pane_id`: each `PaneMetrics` push feeds
+    /// that pane's own [`CpuWorkClassifier`] one CPU sample, and the result
+    /// drives `SessionView::set_pane_work_state` in
+    /// [`Self::apply_pane_metrics`]. Entries persist for panes that have
+    /// since closed or gone idle (never pruned) — bounded by the number of
+    /// distinct panes this session has ever had metrics for, small enough
+    /// not to matter for a single attached session.
+    pane_work_classifiers: HashMap<u32, CpuWorkClassifier>,
+    /// This session's own merged opt-in for the daemon's on-demand
+    /// `PaneMetrics` stream (`docs/spec-pane-attribution.md`), extended by
+    /// `docs/spec-agent-activity.md`'s decision log to a second independent
+    /// consumer — see [`PaneMetricsOptIn`].
+    pane_metrics_opt_in: PaneMetricsOptIn,
+    /// The channel [`PaneMetricsOptIn::recompute`]'s result is sent on, as a
+    /// `ClientMessage::SetPaneMetricsEnabled` — the tokio side
+    /// (`spawn_pane_metrics_bridge`) forwards it onto the protocol.
     pane_metrics_enabled_tx: Sender<ClientMessage>,
     /// The diff view (`docs/spec-source-control.md`, #338): renders the
     /// `FileDiff` streamed for the source-control panel's selection. Kept as
@@ -690,6 +707,111 @@ struct RootPickerSession {
     /// routing it into `picker`.
     pending_clone: Option<String>,
     _subscription: Subscription,
+}
+
+/// This session's own merged opt-in for the daemon's on-demand `PaneMetrics`
+/// stream: two independent consumers share ONE
+/// `ClientMessage::SetPaneMetricsEnabled` toggle — the breakdown popover
+/// (`docs/spec-pane-attribution.md`) and the working/idle classifier
+/// (`docs/spec-agent-activity.md`'s decision log, #953 —
+/// [`SessionView::has_busy_pane`]). [`Self::recompute`] ORs both wants and
+/// reports a value only on an actual flip, so closing the popover never
+/// disables the stream while the classifier still needs it and vice versa —
+/// while still keeping `docs/archive/spec-pane-attribution.md`'s "an idle
+/// daemon does zero process-table work" decision intact (both wants false ->
+/// nothing enabled). Pure (no `gpui`) so the merge is unit-tested directly.
+#[derive(Debug, Default)]
+struct PaneMetricsOptIn {
+    popover_open: bool,
+    classifier_needs_metrics: bool,
+    /// The last value actually returned by [`Self::recompute`], or `None`
+    /// before the first call.
+    last_sent: Option<bool>,
+}
+
+impl PaneMetricsOptIn {
+    /// Recompute `popover_open || classifier_needs_metrics` against the last
+    /// sent value (before the first call, treated as `false` — the daemon's
+    /// own default, so a session that never wants the stream never sends a
+    /// redundant initial `false`), returning `Some(enabled)` only when it
+    /// actually flips.
+    fn recompute(&mut self) -> Option<bool> {
+        let wants = self.popover_open || self.classifier_needs_metrics;
+        if self.last_sent.unwrap_or(false) == wants {
+            return None;
+        }
+        self.last_sent = Some(wants);
+        Some(wants)
+    }
+}
+
+#[cfg(test)]
+mod pane_metrics_opt_in_tests {
+    use super::PaneMetricsOptIn;
+
+    #[test]
+    fn test_recompute_first_call_reports_the_initial_want() {
+        let mut opt_in = PaneMetricsOptIn {
+            popover_open: true,
+            ..Default::default()
+        };
+        assert_eq!(opt_in.recompute(), Some(true));
+    }
+
+    #[test]
+    fn test_recompute_popover_close_does_not_disable_while_classifier_needs_it() {
+        let mut opt_in = PaneMetricsOptIn {
+            popover_open: true,
+            ..Default::default()
+        };
+        assert_eq!(opt_in.recompute(), Some(true));
+
+        opt_in.classifier_needs_metrics = true;
+        // Still `true` overall: no change to report.
+        assert_eq!(opt_in.recompute(), None);
+
+        opt_in.popover_open = false;
+        // The classifier still wants it: the OR stays `true`, nothing sent.
+        assert_eq!(opt_in.recompute(), None);
+    }
+
+    #[test]
+    fn test_recompute_classifier_settling_does_not_disable_while_popover_open() {
+        let mut opt_in = PaneMetricsOptIn {
+            classifier_needs_metrics: true,
+            ..Default::default()
+        };
+        assert_eq!(opt_in.recompute(), Some(true));
+
+        opt_in.popover_open = true;
+        assert_eq!(opt_in.recompute(), None);
+
+        opt_in.classifier_needs_metrics = false;
+        // The popover still wants it: stays enabled, nothing sent.
+        assert_eq!(opt_in.recompute(), None);
+    }
+
+    #[test]
+    fn test_recompute_disables_only_once_both_wants_clear() {
+        let mut opt_in = PaneMetricsOptIn {
+            popover_open: true,
+            ..Default::default()
+        };
+        assert_eq!(opt_in.recompute(), Some(true));
+
+        opt_in.classifier_needs_metrics = true;
+        opt_in.popover_open = false;
+        assert_eq!(opt_in.recompute(), None);
+
+        opt_in.classifier_needs_metrics = false;
+        assert_eq!(opt_in.recompute(), Some(false));
+    }
+
+    #[test]
+    fn test_recompute_no_change_returns_none() {
+        let mut opt_in = PaneMetricsOptIn::default();
+        assert_eq!(opt_in.recompute(), None, "starts false; no want set yet");
+    }
 }
 
 impl WorkspaceView {
@@ -1174,13 +1296,15 @@ impl WorkspaceView {
         }
 
         // Per-pane metrics stream -> composite status line breakdown popover
-        // (`docs/spec-pane-attribution.md`, #881): each `PaneMetrics` push
-        // replaces the latest breakdown wholesale, then a notify repaints
-        // the status bar — mirroring the host-metrics fold above. Unlike
-        // `host_metrics`/`lsp`, this stream is per-connection and sent only
-        // while the popover is open (no Welcome replay to seed a "current"
-        // value), so there is no seeding/pressure-toast logic here. Routed
-        // through this view's weak handle so a closed window ends the loop
+        // AND the working/idle classifier (`docs/spec-pane-attribution.md`,
+        // #881; `docs/spec-agent-activity.md`, #953): each `PaneMetrics` push
+        // is folded by `apply_pane_metrics`, which replaces the breakdown
+        // wholesale AND feeds each entry's CPU to that pane's classifier —
+        // mirroring the host-metrics fold above. Unlike `host_metrics`/`lsp`,
+        // this stream is per-connection and on-demand (no Welcome replay to
+        // seed a "current" value; see `PaneMetricsOptIn` for when it flows),
+        // so there is no seeding/pressure-toast logic here. Routed through
+        // this view's weak handle so a closed window ends the loop
         // gracefully.
         {
             cx.spawn(async move |this, cx| loop {
@@ -1191,7 +1315,7 @@ impl WorkspaceView {
                     let DaemonMessage::PaneMetrics { entries } = msg else {
                         return;
                     };
-                    view.pane_metrics = entries;
+                    view.apply_pane_metrics(entries, cx);
                     cx.notify();
                 });
                 if result.is_err() {
@@ -1597,8 +1721,24 @@ impl WorkspaceView {
         // view must repaint when either notifies. `cx.observe` fires on every
         // notify of the observed entity — the same signal that already redraws
         // the terminal's own tab bar and the editor.
-        cx.observe(&session_view, |_this, _session_view, cx| cx.notify())
-            .detach();
+        //
+        // Piggy-backed here rather than on a new subscription: the working/idle
+        // classifier's own `PaneMetrics` opt-in condition
+        // (`docs/spec-agent-activity.md`'s decision log, #953) is "the attached
+        // session has >=1 non-shell Busy pane" (`SessionView::has_busy_pane`),
+        // which can only change on exactly the events that already notify
+        // `session_view` (a layout snapshot, a pane's own OSC-133/bell
+        // transition). Recomputed on every notify — cheap (an O(panes) scan) —
+        // but `sync_pane_metrics_opt_in` only actually sends when the merged
+        // want flips, never on every recompute (`session_view` notifies far
+        // more often than that, e.g. on ordinary output repaint).
+        cx.observe(&session_view, |this, session_view, cx| {
+            let needs_metrics = session_view.read(cx).has_busy_pane(cx);
+            this.pane_metrics_opt_in.classifier_needs_metrics = needs_metrics;
+            this.sync_pane_metrics_opt_in();
+            cx.notify();
+        })
+        .detach();
         cx.observe(&editor, |_this, _editor, cx| cx.notify())
             .detach();
 
@@ -1631,6 +1771,8 @@ impl WorkspaceView {
             pressure_level: status_bar::PressureLevel::Normal,
             mem_history: status_bar::MemoryHistory::default(),
             pane_metrics: Vec::new(),
+            pane_work_classifiers: HashMap::new(),
+            pane_metrics_opt_in: PaneMetricsOptIn::default(),
             pane_metrics_enabled_tx,
             diff_view,
             open_file_tx,
@@ -1646,6 +1788,57 @@ impl WorkspaceView {
             root_picker_session: None,
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    /// The breakdown popover's own contribution to the merged `PaneMetrics`
+    /// opt-in (`PaneMetricsOptIn`, `docs/spec-pane-attribution.md` +
+    /// `docs/spec-agent-activity.md`'s decision log) — called from
+    /// `status_bar::render`'s popover `on_open_change` (`true` on open,
+    /// `false` on close) instead of sending `SetPaneMetricsEnabled` directly,
+    /// so a close never disables the stream while the working/idle
+    /// classifier still needs it.
+    pub(crate) fn set_pane_metrics_popover_open(&mut self, open: bool) {
+        self.pane_metrics_opt_in.popover_open = open;
+        self.sync_pane_metrics_opt_in();
+    }
+
+    /// Send `ClientMessage::SetPaneMetricsEnabled` only when
+    /// [`PaneMetricsOptIn::recompute`] reports the merged want actually
+    /// flipped. `try_send` mirrors every other push-only channel send in this
+    /// view (e.g. `save_file_tx`): the receiving `spawn_pane_metrics_bridge`
+    /// loop only ends when this view drops, so a full/closed channel here
+    /// means the daemon connection is already going away.
+    fn sync_pane_metrics_opt_in(&mut self) {
+        if let Some(enabled) = self.pane_metrics_opt_in.recompute() {
+            let _ = self
+                .pane_metrics_enabled_tx
+                .try_send(ClientMessage::SetPaneMetricsEnabled { enabled });
+        }
+    }
+
+    /// Fold one `PaneMetrics` push (`docs/spec-pane-attribution.md`) into the
+    /// breakdown popover's model AND the working/idle classifier
+    /// (`docs/spec-agent-activity.md`, #953): each entry's CPU feeds that
+    /// pane's own [`CpuWorkClassifier`] one sample, and the resulting
+    /// `WorkState` is pushed onto `SessionView` — gated there to the
+    /// non-shell Busy case only (`SessionView::set_pane_work_state`), so
+    /// classifying a shell pane's near-zero CPU is harmless even though it
+    /// runs for every entry (the daemon labels every session pane, not only
+    /// busy ones, `docs/spec-pane-attribution.md`). Classifier state for a
+    /// pane is never reset on its own — see [`Self::pane_work_classifiers`].
+    fn apply_pane_metrics(&mut self, entries: Vec<PaneMetric>, cx: &mut Context<Self>) {
+        for entry in &entries {
+            let work_state = self
+                .pane_work_classifiers
+                .entry(entry.pane_id)
+                .or_default()
+                .observe(entry.cpu);
+            let pane_id = format!("%{}", entry.pane_id);
+            self.session_view.update(cx, |session, cx| {
+                session.set_pane_work_state(&pane_id, work_state, cx);
+            });
+        }
+        self.pane_metrics = entries;
     }
 
     /// Arm (or re-arm) the debounced window-state save (#225): bumps the
@@ -2833,6 +3026,7 @@ impl Render for WorkspaceView {
         let status_bar = {
             let model = self.file_tree.read(cx).model();
             let (lines_added, lines_removed) = model.line_totals();
+            let workspace_entity = cx.entity();
             status_bar::render(
                 status_bar::StatusLineModel {
                     windows: &windows,
@@ -2848,11 +3042,11 @@ impl Render for WorkspaceView {
                     pressure_level: self.pressure_level,
                     mem_history: self.mem_history.as_slice(),
                     pane_metrics: &self.pane_metrics,
-                    pane_metrics_enabled_tx: self.pane_metrics_enabled_tx.clone(),
                     cursor,
                     clock: &clock,
                 },
                 &self.session_view,
+                &workspace_entity,
                 cx,
             )
             .into_any_element()
