@@ -7,6 +7,7 @@ mod known_hosts;
 mod launch;
 mod pty;
 mod transport;
+mod wsl;
 
 pub use backoff::ReconnectBackoff;
 pub use connection::{key_requires_passphrase, SshConnection};
@@ -19,3 +20,4 @@ pub use error::SshError;
 pub use launch::{connect_or_spawn_daemon, stop_daemon};
 pub use pty::{PtyStream, PtySyncReader, PtySyncWriter, PtyWriter};
 pub use transport::Connection;
+pub use wsl::WslConnection;
