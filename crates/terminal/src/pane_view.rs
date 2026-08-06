@@ -31,9 +31,10 @@ use crate::colors::TerminalPalette;
 use crate::error::TerminalError;
 use crate::keyboard;
 use crate::keytable::{self, KeyTable, PrefixOptions};
+use crate::line_timestamp::LineTimestamps;
 use crate::prefix::{PrefixAction, PrefixEngine};
 use crate::search::{MatchIndex, SearchState};
-use crate::{CaptureRequest, PaneInput, TermSize};
+use crate::{CaptureRequest, LineIdTracker, PaneInput, TermSize};
 
 pub fn statusbar_height() -> Pixels {
     px(28.0)
@@ -439,6 +440,18 @@ pub struct PaneView {
     /// Positions the platform IME candidate window via
     /// [`EntityInputHandler::bounds_for_range`].
     cursor_cell: (usize, usize),
+    /// Rift-owned monotonic scrollback line identity for the live `Term`
+    /// (`crate::line_id`), fed from the PTY read loop after every batch
+    /// chunk's `advance()`. Shared via `Arc<Mutex<_>>` with that background
+    /// task, mirroring `terminal`'s own sharing; reset on resize (like
+    /// `history_block`/`paint_cache`), since a resize's `history_size()`
+    /// delta is ambiguous (see the `line_id` module docs).
+    line_id: Arc<Mutex<LineIdTracker>>,
+    /// Bounded per-pane map from a live line's [`LineIdTracker`] id to the
+    /// wall-clock arrival time of the PTY batch that completed it
+    /// (`docs/spec-terminal-timestamps.md`). Consumed by the on-demand
+    /// timestamp reveal surface (#934) via [`Self::timestamp_for_line`].
+    line_timestamps: Arc<Mutex<LineTimestamps>>,
 }
 
 impl PaneView {
@@ -463,14 +476,21 @@ impl PaneView {
     ) -> Self {
         let grid_size = TermSize { cols: 80, rows: 24 };
         let config = Config::default();
+        // The only external input `LineIdTracker` needs (module docs,
+        // `crate::line_id`) — must match the `Term`'s own configured cap.
+        let history_cap = config.scrolling_history;
         let (term_event_tx, term_event_rx) = flume::unbounded();
         let listener = Listener {
             event_tx: term_event_tx,
         };
         let terminal = Arc::new(Mutex::new(Term::new(config, &grid_size, listener)));
+        let line_id = Arc::new(Mutex::new(LineIdTracker::new(history_cap)));
+        let line_timestamps = Arc::new(Mutex::new(LineTimestamps::new()));
 
         {
             let terminal = terminal.clone();
+            let line_id = line_id.clone();
+            let line_timestamps = line_timestamps.clone();
             cx.spawn(async move |this, cx| {
                 let mut osc = OscInterceptor::new();
                 let mut parser: Processor = Processor::new();
@@ -480,21 +500,54 @@ impl PaneView {
                         debug!("PTY stream closed");
                         break;
                     };
+                    // Captured here, at batch receive, not inside the
+                    // `smol::unblock` closure below: that closure runs on a
+                    // background thread pool that may schedule it late,
+                    // which would record when the thread happened to run
+                    // rather than when these bytes actually arrived
+                    // (`docs/spec-terminal-timestamps.md`).
+                    let arrival = Instant::now();
                     let mut chunks = vec![data];
                     while let Ok(more) = pty_rx.try_recv() {
                         chunks.push(more);
                     }
                     let term_ref = terminal.clone();
+                    let line_id_ref = line_id.clone();
+                    let line_timestamps_ref = line_timestamps.clone();
                     let mut p = parser;
                     let mut o = osc;
                     let parse_result = smol::unblock(move || {
                         let mut term = term_ref.lock().map_err(|_| TerminalError::LockPoisoned)?;
+                        let mut tracker = line_id_ref
+                            .lock()
+                            .map_err(|_| TerminalError::LockPoisoned)?;
+                        let mut timestamps = line_timestamps_ref
+                            .lock()
+                            .map_err(|_| TerminalError::LockPoisoned)?;
                         let mut events = Vec::new();
                         for chunk in &chunks {
                             let (filtered, chunk_events) = o.process(chunk);
                             events.extend(chunk_events);
                             if !filtered.is_empty() {
                                 p.advance(&mut *term, &filtered);
+                                let alt_screen = term.mode().contains(TermMode::ALT_SCREEN);
+                                let (history_size, screen_lines, cursor_line) = {
+                                    let grid = term.grid();
+                                    (
+                                        grid.history_size(),
+                                        grid.screen_lines(),
+                                        grid.cursor.point.line.0.max(0) as usize,
+                                    )
+                                };
+                                timestamps.stamp_chunk(
+                                    &mut tracker,
+                                    alt_screen,
+                                    history_size,
+                                    screen_lines,
+                                    cursor_line,
+                                    &filtered,
+                                    arrival,
+                                );
                             }
                         }
                         Ok::<_, TerminalError>((p, o, events))
@@ -599,6 +652,8 @@ impl PaneView {
             search: None,
             ime_marked_text: None,
             cursor_cell: (0, 0),
+            line_id,
+            line_timestamps,
         }
     }
 
@@ -837,6 +892,22 @@ impl PaneView {
                 let mut term = self.terminal.lock().expect("term lock poisoned");
                 term.resize(new_size);
             }
+            // A resize's `history_size()` delta is ambiguous between "row
+            // reclaimed into a growing viewport" and "row evicted"
+            // (`crate::line_id` module docs) - reset rather than feed it
+            // through `LineIdTracker::update`, mirroring the
+            // invalidate-on-resize pattern below for `history_block`/
+            // `paint_cache`. Ids restart from 0, so the timestamp map must
+            // be cleared too or stale entries would misattribute an old
+            // arrival time to unrelated new content.
+            self.line_id
+                .lock()
+                .expect("line id tracker lock poisoned")
+                .reset();
+            self.line_timestamps
+                .lock()
+                .expect("line timestamps lock poisoned")
+                .clear();
             self.paint_cache.clear();
             self.invalidate_history();
         }
@@ -850,6 +921,33 @@ impl PaneView {
         self.history_scroll = 0;
         self.history_pending = false;
         self.history_pending_scroll = 0;
+    }
+
+    /// The [`LineIdTracker`] id of the live row at `absolute_row` (same
+    /// addressing as `extract_row_cells`: 0 = the oldest row currently
+    /// retained), or `None` if the row is outside the tracker's live
+    /// window (pre-attach history, or not yet born). Exposed for the
+    /// on-demand timestamp reveal surface (#934,
+    /// `docs/spec-terminal-timestamps.md`), which inverts a hovered
+    /// viewport row to this addressing via the composite scroll mapping.
+    pub fn line_id_for_row(&self, absolute_row: usize) -> Option<u64> {
+        self.line_id
+            .lock()
+            .expect("line id tracker lock poisoned")
+            .id_for_row(absolute_row)
+    }
+
+    /// The wall-clock arrival time of the PTY batch that completed the live
+    /// scrollback line with the given [`LineIdTracker`] id, or `None` if
+    /// the line predates attach, was evicted, is still in progress, or was
+    /// produced while the alternate screen was active (never stamped —
+    /// `crate::line_timestamp` module docs). Exposed for the on-demand
+    /// timestamp reveal surface (#934).
+    pub fn timestamp_for_line(&self, line_id: u64) -> Option<Instant> {
+        self.line_timestamps
+            .lock()
+            .expect("line timestamps lock poisoned")
+            .get(line_id)
     }
 
     /// Composite scroll across the live `Term`'s own scrollback (post-attach) and

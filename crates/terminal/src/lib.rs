@@ -4,6 +4,7 @@ pub mod keyboard;
 pub mod keytable;
 pub mod layout;
 pub mod line_id;
+mod line_timestamp;
 pub mod pane_view;
 pub mod prefix;
 mod search;
