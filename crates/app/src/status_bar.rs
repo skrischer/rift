@@ -671,6 +671,8 @@ fn lsp_state_color(state: LspServerState, cx: &App) -> gpui::Hsla {
         LspServerState::Running => cx.theme().success,
         LspServerState::Starting => cx.theme().warning,
         LspServerState::Crashed => cx.theme().danger,
+        // Compile stub: full informational rendering lands in #913.
+        LspServerState::NotInstalled => cx.theme().muted_foreground,
     }
 }
 
