@@ -527,7 +527,12 @@ pub fn render(
                     div()
                         .text_color(theme.muted_foreground)
                         .child(SharedString::from(server.clone())),
-                ),
+                )
+                .children(lsp_state_note(*state).map(|note| {
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(format!("({note})")))
+                })),
         );
     }
 
@@ -665,14 +670,29 @@ fn dot(color: gpui::Hsla) -> impl IntoElement {
 }
 
 /// The health-dot color for one language-server state: running = success,
-/// starting = warning, crashed = danger.
+/// starting = warning, crashed = danger. `NotInstalled` is deliberately
+/// `muted_foreground`, not `danger` — it is informational ("nobody put this
+/// server on the host"), not an alarming failure (`docs/spec-lsp-servers.md`
+/// — graceful degradation).
 fn lsp_state_color(state: LspServerState, cx: &App) -> gpui::Hsla {
     match state {
         LspServerState::Running => cx.theme().success,
         LspServerState::Starting => cx.theme().warning,
         LspServerState::Crashed => cx.theme().danger,
-        // Compile stub: full informational rendering lands in #913.
         LspServerState::NotInstalled => cx.theme().muted_foreground,
+    }
+}
+
+/// A short explanatory note shown next to a language server's name in the
+/// health line. Only `NotInstalled` carries one: the color dot alone tells
+/// you *something's* off, but "not on $PATH" is what tells a user with
+/// several languages configured that this one simply isn't installed on the
+/// remote host, not that it crashed. `Running`/`Starting`/`Crashed` are
+/// already distinguished by `lsp_state_color` and need no extra text.
+fn lsp_state_note(state: LspServerState) -> Option<&'static str> {
+    match state {
+        LspServerState::NotInstalled => Some("not on $PATH"),
+        LspServerState::Running | LspServerState::Starting | LspServerState::Crashed => None,
     }
 }
 
@@ -803,6 +823,25 @@ mod tests {
             ],
         )]);
         assert_eq!(diagnostic_counts(&map), (0, 0));
+    }
+
+    #[test]
+    fn test_lsp_state_note_not_installed_explains_missing_path_entry() {
+        assert_eq!(
+            lsp_state_note(LspServerState::NotInstalled),
+            Some("not on $PATH")
+        );
+    }
+
+    #[test]
+    fn test_lsp_state_note_running_starting_crashed_have_no_note() {
+        for state in [
+            LspServerState::Running,
+            LspServerState::Starting,
+            LspServerState::Crashed,
+        ] {
+            assert_eq!(lsp_state_note(state), None);
+        }
     }
 
     #[test]
