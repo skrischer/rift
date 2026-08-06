@@ -24,6 +24,7 @@ use tracing::{debug, info};
 
 use crate::connection::exec::shell_single_quote;
 use crate::error::SshError;
+use crate::transport::ConnectionKind;
 use crate::Connection;
 
 /// Map the `uname -sm` output (kernel name + machine, e.g. `"Linux x86_64"`) to
@@ -150,6 +151,45 @@ fn join_home(home: &str, remote_dir: &str) -> Result<String, SshError> {
         return Err(SshError::UnsupportedHomePath(remote_dir.to_string()));
     }
     Ok(remote_dir.to_string())
+}
+
+/// Default `remote_dir` [`ensure_daemon_deployed`] resolves against, per
+/// transport kind, when the caller has no explicit override. Both values are
+/// `$HOME`-relative literals: [`ensure_daemon_deployed`] expands `$HOME`
+/// itself, by running a fixed, data-free command against whichever
+/// [`Connection`] it was actually called with (see [`join_home`]) — for a
+/// [`ConnectionKind::Wsl`] connection that command runs inside the distro
+/// (`wsl.exe -d <distro> -- printf '%s' "$HOME"`), landing on the distro's
+/// OWN home directory (e.g. `/home/user`), never a `/mnt/c` DrvFs path (AF_UNIX
+/// on DrvFs is unreliable — `docs/spec-wsl-transport.md`). The SSH default
+/// keeps its existing `bin` subdirectory unchanged; the WSL default matches
+/// the spec's example and needs no subdirectory of its own, since the distro
+/// filesystem is not shared with anything Windows-side the way a remote
+/// SSH host's `$HOME` might be.
+///
+/// The daemon's UDS socket and log file are not resolved separately — both
+/// are derived from the returned [`DeployOutcome::remote_path`] by appending
+/// a fixed suffix (`.sock` / `.log`) at the call site, so a correct
+/// `remote_dir` here is sufficient to keep the socket off DrvFs too.
+fn default_remote_dir(kind: ConnectionKind) -> &'static str {
+    match kind {
+        ConnectionKind::Ssh => "$HOME/.rift/bin",
+        ConnectionKind::Wsl => "$HOME/.rift",
+    }
+}
+
+/// Resolve the `remote_dir` argument callers pass to [`ensure_daemon_deployed`]:
+/// an explicit `configured` override (e.g. the app's `RIFT_DAEMON_REMOTE_DIR`
+/// env var, read by the caller — this crate does not read the environment
+/// itself) wins verbatim for either transport, exactly like the existing
+/// `env::var(..).unwrap_or_else(..)` call site; otherwise falls back to
+/// [`default_remote_dir`], which differs by [`ConnectionKind`] so a WSL
+/// target defaults onto the distro's own Linux filesystem instead of
+/// silently reusing the SSH default.
+pub fn resolve_remote_dir(kind: ConnectionKind, configured: Option<&str>) -> String {
+    configured
+        .map(str::to_string)
+        .unwrap_or_else(|| default_remote_dir(kind).to_string())
 }
 
 /// Outcome of [`ensure_daemon_deployed`]: the resolved remote binary path, plus
@@ -417,5 +457,43 @@ mod tests {
         // No trailing slash at all: `~other` with no path component.
         let err = join_home("/home/u", "~other").expect_err("must reject");
         assert!(matches!(err, SshError::UnsupportedHomePath(ref p) if p == "~other"));
+    }
+
+    #[test]
+    fn test_resolve_remote_dir_ssh_default_keeps_existing_bin_path() {
+        // Byte-identical to the pre-WSL default (`main.rs`'s hardcoded
+        // fallback) so the SSH path is unaffected by the WSL branch.
+        assert_eq!(
+            resolve_remote_dir(ConnectionKind::Ssh, None),
+            "$HOME/.rift/bin"
+        );
+    }
+
+    #[test]
+    fn test_resolve_remote_dir_wsl_default_is_home_relative_never_mnt_c() {
+        let dir = resolve_remote_dir(ConnectionKind::Wsl, None);
+        assert_eq!(dir, "$HOME/.rift");
+        assert!(dir.starts_with("$HOME"));
+        assert!(!dir.contains("/mnt/c"));
+    }
+
+    #[test]
+    fn test_resolve_remote_dir_configured_override_wins_for_either_kind() {
+        assert_eq!(
+            resolve_remote_dir(ConnectionKind::Ssh, Some("/opt/rift")),
+            "/opt/rift"
+        );
+        assert_eq!(
+            resolve_remote_dir(ConnectionKind::Wsl, Some("/opt/rift")),
+            "/opt/rift"
+        );
+    }
+
+    #[test]
+    fn test_resolve_remote_dir_ssh_and_wsl_defaults_differ() {
+        assert_ne!(
+            resolve_remote_dir(ConnectionKind::Ssh, None),
+            resolve_remote_dir(ConnectionKind::Wsl, None)
+        );
     }
 }
