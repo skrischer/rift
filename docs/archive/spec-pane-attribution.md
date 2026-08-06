@@ -1,6 +1,8 @@
 # Spec: Per-pane resource attribution
 
+> Status: COMPLETED
 > Created: 2026-07-11
+> Completed: 2026-08-06
 
 When the host is under memory/CPU pressure, the cockpit answers *which pane is the
 cause*: the daemon rolls up the `/proc` process subtree rooted at each tmux pane's

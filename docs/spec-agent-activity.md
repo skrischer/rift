@@ -41,7 +41,7 @@ Roadmap Phase 53.
 ## Prior art
 
 - [QA-seeded phases — prior-art index (Phases 48–56)](prior-art.md#qa-seeded-phases--prior-art-index-phases-4856) — the Phase 53 row: the shipped `is_shell` signal cannot see an agent's working→idle edge (permanently Busy); add the Phase-45 `pane_pid`→/proc CPU roll-up and/or a PTY output-idle timer as the missing edge signal. **AVOID Arbor's agent detection + capture-pane content hashing** (constitution). References rift's own Phase-18 pane-activity index + pattern #9; `penso/arbor` working/waiting indicators; per-pane `/proc` via `pane_pid`.
-- rift's own Phase-45 spec (`docs/spec-pane-attribution.md`) — the `pane_pid` → subtree CPU/RSS method a `/proc`-CPU path reuses.
+- rift's own Phase-45 spec (`docs/archive/spec-pane-attribution.md`) — the `pane_pid` → subtree CPU/RSS method a `/proc`-CPU path reuses.
 - rift's own Phase-18-v2 spec (`docs/spec-pane-activity-v2.md`) — the structural `Busy` model this refines, and the byte-flow signal it deliberately removed (which path (b) re-admits).
 
 ## Human prerequisites

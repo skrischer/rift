@@ -1,6 +1,8 @@
 # Spec: Memory-pressure warning
 
+> Status: COMPLETED
 > Created: 2026-07-11
+> Completed: 2026-08-06
 
 The cockpit proactively warns before the host wedges on memory: the Phase-43
 `MEM% · CPU%` indicator recolours (neutral → warning → critical) and a one-shot
