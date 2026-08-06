@@ -68,9 +68,8 @@ pub enum PaneActivity {
     /// A foreground command is running but [`WorkState`] classifies it as
     /// idle-awaiting-input — a refinement *within* busy, never a substitute
     /// for the structural `is_shell` gate: a plain shell pane never reaches
-    /// this state (`docs/spec-agent-activity.md`). Nothing produces this
-    /// variant yet: it is the seam the future per-pane CPU classifier drives
-    /// via [`PaneView::set_work_state`].
+    /// this state (`docs/spec-agent-activity.md`). Driven by the app-side
+    /// per-pane CPU classifier (#953) via [`PaneView::set_work_state`].
     BusyIdle,
     /// The pane rang the terminal bell and the user has not acknowledged it.
     Attention,
@@ -88,9 +87,10 @@ impl PaneActivity {
 /// The working-vs-idle refinement of [`PaneActivity::Busy`]: whether a running
 /// foreground process (an agent) is actively working or idle awaiting input.
 /// Derived from agent-agnostic host signals only — never agent detection or
-/// output parsing (`docs/spec-agent-activity.md`). `Working` is the default:
-/// until a signal source is wired in (the per-pane CPU classifier, #953), a
-/// busy pane always reads [`PaneActivity::Busy`] — today's behavior.
+/// output parsing (`docs/spec-agent-activity.md`). `Working` is the default —
+/// a pane the per-pane CPU classifier (#953) has not yet classified (or
+/// cannot, while the daemon's on-demand `PaneMetrics` stream is not opted in)
+/// reads [`PaneActivity::Busy`], matching pre-#953 behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WorkState {
     #[default]
@@ -160,10 +160,10 @@ struct ActivityTracker {
     /// (`docs/spec-pane-activity-v2.md`).
     window_active: bool,
     /// The working-vs-idle refinement applied while busy, pushed down via
-    /// [`Self::set_work_state`] — the seam the future CPU classifier (#953)
-    /// drives. Defaults to [`WorkState::Working`], so a busy pane reads
-    /// [`PaneActivity::Busy`] until a signal source says otherwise
-    /// (`docs/spec-agent-activity.md`).
+    /// [`Self::set_work_state`] — the seam the app-side per-pane CPU
+    /// classifier (#953) drives. Defaults to [`WorkState::Working`], so a
+    /// busy pane reads [`PaneActivity::Busy`] until a signal source says
+    /// otherwise (`docs/spec-agent-activity.md`).
     work_state: WorkState,
 }
 
@@ -1055,10 +1055,11 @@ impl PaneView {
     }
 
     /// Record this pane's working-vs-idle refinement of [`PaneActivity::Busy`]
-    /// (`docs/spec-agent-activity.md`). This is the seam a future per-pane
-    /// signal source (the `/proc` CPU classifier, #953) drives; nothing calls
-    /// it yet, so every pane defaults to [`WorkState::Working`] and reads
-    /// today's plain `Busy` — behavior-preserving until that signal lands.
+    /// (`docs/spec-agent-activity.md`). Driven by the app's per-pane `/proc`
+    /// CPU classifier (#953, `crates/app/src/activity_classifier.rs`) from
+    /// the daemon's on-demand `PaneMetrics` stream; a pane it has not yet
+    /// classified still defaults to [`WorkState::Working`] and reads plain
+    /// `Busy`.
     pub fn set_work_state(&mut self, work_state: WorkState) {
         self.activity.set_work_state(work_state);
     }

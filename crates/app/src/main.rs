@@ -3446,22 +3446,22 @@ fn should_forward(last: &mut Option<bool>, next: bool) -> bool {
     true
 }
 
-/// Forward the breakdown popover's open/close toggle onto the protocol as
-/// [`rift_protocol::ClientMessage::SetPaneMetricsEnabled`]
-/// (`docs/spec-pane-attribution.md`, #881) — the same shape as
-/// [`spawn_git_op_bridge`]. Push-only from here: the resulting breakdown
+/// Forward `WorkspaceView`'s merged per-pane-metrics opt-in
+/// (`PaneMetricsOptIn` in `workspace.rs`, OR'd from the breakdown popover's
+/// open/close want and the working/idle classifier's own want,
+/// `docs/spec-pane-attribution.md`'s #881 + `docs/spec-agent-activity.md`'s
+/// #953) onto the protocol as
+/// [`rift_protocol::ClientMessage::SetPaneMetricsEnabled`] — the same shape
+/// as [`spawn_git_op_bridge`]. Push-only from here: the resulting breakdown
 /// returns via [`consume_daemon_messages`] on `editor.pane_metrics_tx`, not
 /// as a routed reply to this message. Ends when the render-side channel
 /// closes.
 ///
-/// The vendored `Popover` fires `on_open_change(false)` twice for a single
-/// trigger-button close (content capture-phase dismiss, then the trigger's
-/// own bubble-phase toggle), so `status_bar.rs` sends an unbalanced
-/// `{true}, {false}, {false}` per toggle cycle. The daemon's opt-in is a
-/// counter (inc on `true` / dec on `false`), so this bridge dedups
-/// consecutive same-value sends ([`should_forward`]) before they reach the
-/// protocol, collapsing the pair into a single `{false}` and restoring a
-/// balanced stream.
+/// `WorkspaceView` already sends only on an actual flip of the merged want,
+/// but this bridge keeps its own defensive dedup ([`should_forward`]) as a
+/// backstop against a duplicate send reaching the protocol — the daemon's
+/// opt-in is a counter (inc on `true` / dec on `false`), so an unbalanced
+/// repeat would otherwise miscount it.
 fn spawn_pane_metrics_bridge(
     client_rx: DaemonClientWatch,
     pane_metrics_enabled_rx: flume::Receiver<rift_protocol::ClientMessage>,

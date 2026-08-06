@@ -15,7 +15,7 @@ use tracing::debug;
 
 use crate::keytable::{self, KeyTable, PrefixOptions};
 use crate::layout::{self, LayoutNode};
-use crate::pane_view::{measure_cell_size, PaneActivity, PaneView};
+use crate::pane_view::{measure_cell_size, PaneActivity, PaneView, WorkState};
 use crate::quote_tmux_arg;
 use crate::{
     CaptureRequest, CaptureResult, ConnectionStatus, KeyTableQueryResult, PaneInput, PaneOutput,
@@ -1267,6 +1267,47 @@ impl SessionView {
             .map(|w| layout::build_layout(&w.panes));
 
         cx.notify();
+    }
+
+    /// Whether the attached session has at least one pane whose structural
+    /// busy state (ignoring any unacknowledged bell) is a non-shell command
+    /// running (`PaneActivity::is_busy`) — the per-pane CPU working/idle
+    /// classifier's own opt-in condition for the daemon's on-demand
+    /// `PaneMetrics` stream (`docs/spec-agent-activity.md`, extending
+    /// `docs/spec-pane-attribution.md`'s on-demand `SetPaneMetricsEnabled`):
+    /// there is something to classify only while this is `true`. `false` for
+    /// an all-shell session, matching that a plain shell pane never needs the
+    /// working/idle refinement in the first place.
+    pub fn has_busy_pane(&self, cx: &App) -> bool {
+        self.panes
+            .values()
+            .any(|entry| entry.entity.read(cx).underlying_activity().is_busy())
+    }
+
+    /// Push pane `pane_id`'s working/idle refinement, classified from its
+    /// per-pane CPU by the app-side classifier (`docs/spec-agent-activity.md`,
+    /// #953), onto its `PaneView` — applied only while that pane is currently
+    /// non-shell Busy, so a sample for a pane that has since gone back to its
+    /// shell (or was never busy) is a harmless no-op (`PaneView`'s own
+    /// `ActivityTracker` already ignores `work_state` while free, but
+    /// checking here avoids notifying a pane this refinement will not affect).
+    /// A `pane_id` absent from this session (raced by a layout change, or a
+    /// stale sample from an already-closed pane) is also a silent no-op.
+    pub fn set_pane_work_state(
+        &mut self,
+        pane_id: &str,
+        work_state: WorkState,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self.panes.get(pane_id) else {
+            return;
+        };
+        entry.entity.update(cx, |pane, cx| {
+            if pane.underlying_activity().is_busy() {
+                pane.set_work_state(work_state);
+                cx.notify();
+            }
+        });
     }
 
     /// The folded activity of the window `window_id`: its dominant pane state
@@ -3024,7 +3065,7 @@ mod tests {
         rename_session_command, resize_direction, select_pane_command, split_command,
         tab_state_slot, zoom_pane_command, MoveDirection, PaneActivity, SessionListItem,
         SessionOrderUpdate, SessionSnapshot, SessionView, SessionViewEvent, TabStateSlot, TermSize,
-        TerminalHandle, DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE,
+        TerminalHandle, WorkState, DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE,
     };
     use crate::layout::LayoutNode;
     use gpui::{
@@ -3563,6 +3604,89 @@ mod tests {
 
             let activity = session.read(cx).panes["%0"].entity.read(cx).activity();
             assert_eq!(activity, PaneActivity::Busy);
+        });
+    }
+
+    /// `has_busy_pane` — the working/idle classifier's own opt-in condition
+    /// (`docs/spec-agent-activity.md`) — tracks the structural busy gate: a
+    /// session with only a shell pane reports `false`, one with a non-shell
+    /// command running reports `true`.
+    #[gpui::test]
+    fn test_has_busy_pane_true_only_while_a_non_shell_command_runs(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, _handle) = session_and_handle(cx);
+
+            let mut pane_is_shell = HashMap::new();
+            pane_is_shell.insert("%0".to_owned(), true);
+            session.update(cx, |view, cx| {
+                view.apply_snapshot(snapshot_with_pane_is_shell(pane_is_shell), cx)
+            });
+            assert!(!session.read(cx).has_busy_pane(cx));
+
+            let mut pane_is_shell = HashMap::new();
+            pane_is_shell.insert("%0".to_owned(), false);
+            session.update(cx, |view, cx| {
+                view.apply_snapshot(snapshot_with_pane_is_shell(pane_is_shell), cx)
+            });
+            assert!(session.read(cx).has_busy_pane(cx));
+        });
+    }
+
+    /// `set_pane_work_state` applied to a currently non-shell Busy pane flips
+    /// its refinement to `BusyIdle` (`docs/spec-agent-activity.md`).
+    #[gpui::test]
+    fn test_set_pane_work_state_busy_pane_flips_to_busy_idle(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, _handle) = session_and_handle(cx);
+
+            let mut pane_is_shell = HashMap::new();
+            pane_is_shell.insert("%0".to_owned(), false);
+            session.update(cx, |view, cx| {
+                view.apply_snapshot(snapshot_with_pane_is_shell(pane_is_shell), cx)
+            });
+
+            session.update(cx, |view, cx| {
+                view.set_pane_work_state("%0", WorkState::Idle, cx)
+            });
+
+            let activity = session.read(cx).panes["%0"].entity.read(cx).activity();
+            assert_eq!(activity, PaneActivity::BusyIdle);
+        });
+    }
+
+    /// `set_pane_work_state` applied to a free (shell) pane is a no-op — the
+    /// working/idle refinement never substitutes for the structural
+    /// `is_shell` gate (`docs/spec-agent-activity.md`).
+    #[gpui::test]
+    fn test_set_pane_work_state_free_pane_is_a_no_op(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, _handle) = session_and_handle(cx);
+
+            let mut pane_is_shell = HashMap::new();
+            pane_is_shell.insert("%0".to_owned(), true);
+            session.update(cx, |view, cx| {
+                view.apply_snapshot(snapshot_with_pane_is_shell(pane_is_shell), cx)
+            });
+
+            session.update(cx, |view, cx| {
+                view.set_pane_work_state("%0", WorkState::Idle, cx)
+            });
+
+            let activity = session.read(cx).panes["%0"].entity.read(cx).activity();
+            assert_eq!(activity, PaneActivity::Free);
+        });
+    }
+
+    /// `set_pane_work_state` for a pane id absent from the session (a raced
+    /// layout change, or a stale sample) is a silent no-op, not a panic.
+    #[gpui::test]
+    fn test_set_pane_work_state_unknown_pane_id_is_a_no_op(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let (session, _handle) = session_and_handle(cx);
+
+            session.update(cx, |view, cx| {
+                view.set_pane_work_state("%does-not-exist", WorkState::Idle, cx)
+            });
         });
     }
 
