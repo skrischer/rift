@@ -1,5 +1,6 @@
 # Spec: Real editor minimap
 
+> Status: COMPLETED (2026-08-06)
 > Created: 2026-08-01
 
 Replace the 32px line-length marks-strip with a scaled code miniature plus a

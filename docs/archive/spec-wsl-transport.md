@@ -1,5 +1,6 @@
 # Spec: WSL transport
 
+> Status: COMPLETED (2026-08-06)
 > Created: 2026-07-29
 
 A first-class WSL connection type alongside SSH — `wsl.exe -d <distro>` as a local

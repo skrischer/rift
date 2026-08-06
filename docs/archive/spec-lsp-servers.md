@@ -1,5 +1,6 @@
 # Spec: Multi-language LSP servers
 
+> Status: COMPLETED (2026-08-06)
 > Created: 2026-07-27
 
 Populate the daemon's built-in language-server registry beyond the single

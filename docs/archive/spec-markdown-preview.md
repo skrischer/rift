@@ -1,5 +1,6 @@
 # Spec: Markdown preview
 
+> Status: COMPLETED (2026-08-06)
 > Created: 2026-07-29
 
 A per-tab source/preview toggle for Markdown files: in preview mode the editor tab

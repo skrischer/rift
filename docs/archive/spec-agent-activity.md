@@ -1,5 +1,6 @@
 # Spec: Agent activity — working vs idle signal
 
+> Status: COMPLETED (2026-08-06)
 > Created: 2026-08-01
 
 Split today's single `Busy` pane state into working vs idle-awaiting-input for a

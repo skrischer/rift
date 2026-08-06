@@ -1,5 +1,6 @@
 # Spec: Telemetry detail + disk headroom
 
+> Status: COMPLETED (2026-08-06)
 > Created: 2026-07-11
 
 Rounds out the host-telemetry block with the "look closer" surfaces: a detail view

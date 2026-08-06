@@ -1,5 +1,6 @@
 # Spec: Global UI font size
 
+> Status: COMPLETED (2026-08-06)
 > Created: 2026-07-29
 
 A UI font-size control that resizes the editor, explorer, and chrome (not only the
