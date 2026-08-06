@@ -42,15 +42,27 @@
 //! batch ends saturated — `window_growth` (the precise, capped delta) and a
 //! structural `\n`-byte count (a C0 control byte, never a UTF-8
 //! continuation/CSI parameter byte, mirroring the existing `\n`-count in
-//! `parse_capture_to_rows`) — and take their maximum. Neither signal ever
-//! *overcounts* the true birth count (`window_growth` only undercounts past
-//! the cap; the `\n` count only undercounts wrap-only rows with no trailing
-//! LF), so the maximum is the best available lower bound and is exact for
-//! the overwhelmingly common case of newline-terminated output, including
-//! batches that straddle the cap. It still undercounts (never leaks — the
-//! hard cap in step 3 of [`LineIdTracker::update`] applies every call) only
-//! for an auto-wrapped, non-newline-terminated line completing while
-//! already saturated.
+//! `parse_capture_to_rows`) — and take their maximum. This closes the
+//! newline-burst desync above, but it does **not** make saturated growth
+//! exact in general: `window_growth` is *permanently* 0 once fully
+//! saturated (both getters flat, by definition of "saturated"), so growth
+//! there is *always* just the `\n` count. An auto-wrapped line adds one
+//! grid row per wrap with no `\n` byte of its own — regardless of whether
+//! the line itself ends with a trailing `\n` — so every such wrap is
+//! silently undercounted once saturated. This is a **known, accepted spike
+//! limitation** (see the spec decision log): post-saturation,
+//! `next_id`/`oldest_id` permanently fall behind the grid's true row count
+//! by the wrap count, for every wrapped line that arrives after saturation
+//! — a small, cumulative row→id (and therefore timestamp) drift
+//! proportional to post-saturation wrapped-line volume, pinned by
+//! [`tests::test_wrapped_line_at_saturation_drifts_by_wrap_count_known_limitation`].
+//! A robust fix would need to simulate the cursor against arbitrary escape
+//! sequences (colors, cursor moves, TUI redraws) to detect wraps without a
+//! trailing `\n` — i.e. reimplement a VTE — which is out of scope for this
+//! module and would be least reliable on exactly the escape-heavy agent
+//! output this tool targets. Pre-saturation growth, and any saturated
+//! batch containing only newline-terminated, non-wrapping lines, remain
+//! exact; #933 (the timestamp backend) must account for this drift.
 //!
 //! **Eviction vs. a harmless cursor move:** `history_size()` only ever
 //! *decreases* via an explicit scrollback purge (`ESC[3J`) or a full reset
@@ -172,6 +184,12 @@ impl LineIdTracker {
             // permanent row-id desync a saturation-crossing batch used to
             // cause (next_id under-advanced, so the step-3 cap below never
             // caught up and stale ids got reused for new content).
+            //
+            // KNOWN LIMITATION (see module docs): once fully saturated,
+            // `window_growth` is always 0, so growth here is *always* just
+            // the `\n` count - an auto-wrapped line still silently
+            // undercounts by its wrap-row count, whether or not it ends
+            // with a trailing `\n`. Accepted and handed to #933.
             let newline_count = bytes_fed.iter().filter(|byte| **byte == b'\n').count() as u64;
             window_growth.max(newline_count)
         } else {
@@ -565,6 +583,76 @@ mod tests {
             tracker.newest_id(),
             Some(8 + 12 - 1),
             "all 12 births counted, not just the 7 that grew history_size()"
+        );
+    }
+
+    /// KNOWN, ACCEPTED LIMITATION (spike finding, handed to #933 - see the
+    /// spec decision log). Once saturated, `window_growth` is always 0, so
+    /// `update`'s only growth signal is the `\n`-byte count - but an
+    /// auto-wrapped line adds one grid row per wrap with no `\n` byte of
+    /// its own, whether or not the line itself ends with a trailing `\n`.
+    /// Each such wrap is silently undercounted, permanently drifting
+    /// `next_id`/`oldest_id` (and therefore every still-live row's
+    /// reported id) behind the grid's true row count by the wrap count.
+    /// This test pins the exact magnitude with a newline-terminated
+    /// wrapped line (ruling out "it only affects lines with no trailing
+    /// LF" as a fix) so a future change cannot silently make the drift
+    /// worse, or claim it does not exist, without updating this assertion.
+    #[::core::prelude::v1::test]
+    fn test_wrapped_line_at_saturation_drifts_by_wrap_count_known_limitation() {
+        let rows = 5;
+        let cols = 10;
+        let cap = 20;
+
+        // Saturate with single-newline, single-row batches ("L0".."L29"),
+        // each exactly matching alacritty's growth 1:1 - no drift possible
+        // from this part, so it establishes a known-exact baseline.
+        let labeled: Vec<Vec<u8>> = (0..30).map(|n| format!("L{n}\r\n").into_bytes()).collect();
+        let mut batches: Vec<&[u8]> = labeled.iter().map(|s| s.as_slice()).collect();
+        let (baseline_tracker, baseline_term) = drive(rows, cols, cap, &batches);
+        assert_eq!(
+            baseline_term.grid().history_size(),
+            cap,
+            "saturated before the wrap batch"
+        );
+
+        let track_row = 10;
+        let id_before = baseline_tracker.id_for_row(track_row).expect("row is live");
+        let label_before = row_text(&baseline_term, track_row);
+
+        // ONE wrapped, newline-terminated line: 25 chars on a 10-column
+        // grid spans 3 rows (10 + 10 + 5). Two of those rows exist ONLY
+        // because of the auto-wrap, with no `\n` of their own; the
+        // trailing "\r\n" is the only `\n` byte in the whole batch, so
+        // true_growth (3: two wraps + the row the trailing LF opens) is
+        // undercounted by wrap_count (2, the two wrap-only rows).
+        let wrap_batch: Vec<u8> = ["A".repeat(25), "\r\n".to_string()].concat().into_bytes();
+        let true_growth = 3usize;
+        let wrap_count = true_growth - 1;
+        batches.push(&wrap_batch);
+        let (tracker, term) = drive(rows, cols, cap, &batches);
+
+        assert_eq!(term.grid().history_size(), cap, "still saturated");
+        // Ground truth: alacritty itself really did scroll `true_growth`
+        // rows (independent of this module's bookkeeping), so the tracked
+        // content is now `true_growth` rows further back.
+        assert_eq!(
+            row_text(&term, track_row - true_growth),
+            label_before,
+            "the grid itself shifted by the true growth, not by 1"
+        );
+
+        // The drift: querying the id at that TRUE new position no longer
+        // matches the id the content was originally assigned - it reports
+        // an id `wrap_count` lower, because next_id/oldest_id only
+        // advanced by the `\n` count (1), not the true growth (3).
+        let id_at_true_position = tracker
+            .id_for_row(track_row - true_growth)
+            .expect("still live");
+        assert_eq!(
+            id_before - id_at_true_position,
+            wrap_count as u64,
+            "post-saturation wrap undercounts drift the id by exactly the wrap count"
         );
     }
 
