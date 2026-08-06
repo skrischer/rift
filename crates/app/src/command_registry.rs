@@ -12,7 +12,9 @@
 
 use gpui::Action;
 
-use crate::editor::{FindReferences, GoToDefinition, GoToLine, Save, ShowHover};
+use crate::editor::{
+    FindReferences, GoToDefinition, GoToLine, Save, ShowHover, ToggleMarkdownPreview,
+};
 use crate::workspace::{
     FocusTerminal, NewSession, RefreshKeyTables, SwitchSession, ToggleExplorer, ToggleOutline,
     ToggleProblems, ToggleSourceControl, ToggleTerminal, ZoomActivePanel,
@@ -60,6 +62,9 @@ pub const COMMANDS: &[Command] = &[
         Box::new(FindReferences)
     }),
     Command::new("Go to Line", Some("Ctrl+G"), || Box::new(GoToLine)),
+    Command::new("Toggle Markdown Preview", None, || {
+        Box::new(ToggleMarkdownPreview)
+    }),
     Command::new("Toggle Explorer", None, || Box::new(ToggleExplorer)),
     Command::new("Toggle Outline", None, || Box::new(ToggleOutline)),
     Command::new("Toggle Problems", None, || Box::new(ToggleProblems)),
@@ -120,6 +125,7 @@ mod tests {
                 "Show Hover",
                 "Find References",
                 "Go to Line",
+                "Toggle Markdown Preview",
                 "Toggle Explorer",
                 "Toggle Outline",
                 "Toggle Problems",
@@ -165,6 +171,18 @@ mod tests {
         let go_to_line = find("Go to Line").expect("Go to Line is registered");
         assert!(go_to_line.action().partial_eq(&GoToLine));
         assert_eq!(go_to_line.keybinding_hint, Some("Ctrl+G"));
+    }
+
+    /// Markdown preview toggle (`docs/spec-markdown-preview.md`, #918):
+    /// registered under the display name the palette renders, dispatching
+    /// [`ToggleMarkdownPreview`], with no keybinding hint (palette- and
+    /// breadcrumb-button-only, like the other panel toggles).
+    #[test]
+    fn test_toggle_markdown_preview_is_registered_and_dispatches_the_expected_action() {
+        let toggle =
+            find("Toggle Markdown Preview").expect("Toggle Markdown Preview is registered");
+        assert!(toggle.action().partial_eq(&ToggleMarkdownPreview));
+        assert_eq!(toggle.keybinding_hint, None);
     }
 
     /// Theme commands (issue #367): registered under the display names the

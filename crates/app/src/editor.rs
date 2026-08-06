@@ -171,6 +171,20 @@
 //!
 //! [`arm_loading`]: EditorView::arm_loading
 //!
+//! # Markdown preview (#918)
+//!
+//! A Markdown tab ([`is_markdown_path`]: `.md` / `.markdown`) carries its own
+//! [`EditorTab::markdown_preview`] flag, toggled by the breadcrumb button (only
+//! shown for a Markdown tab) or the [`ToggleMarkdownPreview`] command-palette
+//! action. In preview mode the render path swaps the code-editor widget for
+//! the tab's buffer text rendered read-only through
+//! `gpui_component::text::markdown` — the same renderer the hover popover's
+//! doc body uses. The preview is re-derived from `tab.input.read(cx).value()`
+//! on every render, so it live-updates on the existing per-tab
+//! [`EditorView::observe_input`] notify (any edit, local or a reloaded
+//! external write) without a new subscription. Read-only: nothing in preview
+//! mode writes back to the buffer, and toggling to source leaves it intact.
+//!
 //! # Timeout, not a hang
 //!
 //! A daemon refusal (binary / non-UTF-8, path escape) produces *no reply* — the
@@ -190,9 +204,9 @@ use gpui::{
     canvas, div, fill, px, App, AppContext as _, Bounds, ClickEvent, Context, Entity, EventEmitter,
     FocusHandle, Focusable, Hsla, InteractiveElement as _, IntoElement, MouseButton,
     MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels, Point, Render, SharedString, Size,
-    Styled as _, Subscription, Window,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window,
 };
-use gpui_component::button::Button;
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dialog::{AlertDialog, Dialog, DialogButtonProps};
 use gpui_component::dock::{Panel, PanelControl, PanelEvent};
 use gpui_component::highlighter::{
@@ -205,6 +219,7 @@ use gpui_component::text::markdown;
 use gpui_component::ActiveTheme as _;
 use gpui_component::Rope;
 use gpui_component::RopeExt as _;
+use gpui_component::Sizable as _;
 use gpui_component::WindowExt as _;
 use gpui_component::{Icon, IconName};
 use rift_protocol::{
@@ -271,6 +286,14 @@ pub struct GoToLine;
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = rift, no_json)]
 pub struct CloseResultsPanel;
+
+/// Toggle the active tab's Markdown source/preview mode
+/// (`docs/spec-markdown-preview.md`). Dispatched from the breadcrumb toggle
+/// button and the command palette. A no-op when the active tab is not a
+/// Markdown tab (`is_markdown_path`).
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct ToggleMarkdownPreview;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -541,6 +564,12 @@ struct EditorTab {
     /// Whether this tab is read-only (out-of-root target, #195/#301). No
     /// edit, no save path, unwatched snapshot.
     read_only: bool,
+    /// Whether a Markdown tab (`is_markdown_path`) is showing rendered
+    /// preview instead of the source editor (`docs/spec-markdown-preview.md`).
+    /// Per-tab, toggled by the breadcrumb button or [`ToggleMarkdownPreview`];
+    /// meaningless (and never set) for a non-Markdown tab. Read-only: preview
+    /// never mutates the buffer, and toggling back to source leaves it intact.
+    markdown_preview: bool,
     /// The on-disk `mtime` observed when this tab's conflict surfaced —
     /// the worktree snapshot's `mtime` or a `SaveConflict` reply's
     /// `disk_mtime`. "Keep mine" (#433) adopts it as the forced save's
@@ -770,6 +799,7 @@ impl EditorView {
             dirty: false,
             base_mtime: None,
             read_only,
+            markdown_preview: false,
             conflict_disk_mtime: None,
             generation: 0,
             save_generation: 0,
@@ -2344,6 +2374,25 @@ impl EditorView {
         self.results_visible = false;
     }
 
+    /// Toggle the active tab's Markdown source/preview mode
+    /// (`docs/spec-markdown-preview.md`). A no-op when no tab is active or the
+    /// active tab is not Markdown — the preview is per-tab and meaningless
+    /// elsewhere. Never touches the buffer: only which of the two views the
+    /// tab currently renders.
+    fn toggle_markdown_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.active else {
+            return;
+        };
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        if !is_markdown_path(&tab.path) {
+            return;
+        }
+        tab.markdown_preview = !tab.markdown_preview;
+        cx.notify();
+    }
+
     /// Move keyboard focus to the active tab's buffer (or the editor's fallback
     /// handle while no tab is open). The workspace calls this after opening the
     /// results panel, whose `add_panel` steals focus, so a following `Escape`
@@ -2678,6 +2727,12 @@ impl Render for EditorView {
                 .child(message)
                 .into_any_element();
         }
+
+        // Markdown preview (`docs/spec-markdown-preview.md`): the toggle
+        // affordance shows only for a Markdown tab; the preview itself only
+        // renders while that tab's own `markdown_preview` flag is set.
+        let is_markdown_tab = is_markdown_path(&tab.path);
+        let markdown_preview_active = is_markdown_tab && tab.markdown_preview;
 
         // One-line save-outcome banner. The conflict case surfaces as its own
         // modal dialog (#532, opened imperatively wherever the active tab's
@@ -3029,18 +3084,11 @@ impl Render for EditorView {
             }
         };
 
-        let breadcrumb_bar = div()
+        let breadcrumb_segments = div()
             .flex()
-            .flex_shrink_0()
             .items_center()
             .gap(px(6.0))
-            .h(BREADCRUMB_HEIGHT)
-            .px(px(10.0))
-            .bg(crumb_bg)
-            .border_b_1()
-            .border_color(crumb_border)
-            .font_family(mono_font)
-            .text_size(mono_size)
+            .min_w_0()
             .overflow_hidden()
             .children(breadcrumb_children(
                 &path_segments,
@@ -3048,6 +3096,46 @@ impl Render for EditorView {
                 crumb_path_color,
                 crumb_symbol_color,
             ));
+
+        let mut breadcrumb_bar = div()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .justify_between()
+            .h(BREADCRUMB_HEIGHT)
+            .px(px(10.0))
+            .bg(crumb_bg)
+            .border_b_1()
+            .border_color(crumb_border)
+            .font_family(mono_font)
+            .text_size(mono_size)
+            .child(breadcrumb_segments);
+
+        // Source/preview toggle (`docs/spec-markdown-preview.md`): shown only
+        // for a Markdown tab, right-aligned in the breadcrumb bar.
+        if is_markdown_tab {
+            let (icon, tooltip) = if markdown_preview_active {
+                (IconName::EyeOff, "Show source")
+            } else {
+                (IconName::Eye, "Show preview")
+            };
+            breadcrumb_bar = breadcrumb_bar.child(
+                Button::new("markdown-preview-toggle")
+                    .icon(icon)
+                    .label(if markdown_preview_active {
+                        "Source"
+                    } else {
+                        "Preview"
+                    })
+                    .xsmall()
+                    .ghost()
+                    .tab_stop(false)
+                    .tooltip(tooltip)
+                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.toggle_markdown_preview(cx);
+                    })),
+            );
+        }
 
         let read_only = tab.read_only;
 
@@ -3158,6 +3246,9 @@ impl Render for EditorView {
                 if !this.close_results_panel(cx) {
                     cx.propagate();
                 }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleMarkdownPreview, _window, cx| {
+                this.toggle_markdown_preview(cx);
             }))
             .on_mouse_down(
                 MouseButton::Left,
@@ -3357,13 +3448,36 @@ impl Render for EditorView {
                 }),
             );
 
-        let editor_row = div()
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .flex_row()
-            .child(editor_area)
-            .child(minimap_strip);
+        // Markdown preview area: the buffer's current text, rendered
+        // read-only through the vendored `gpui_component::text::markdown`
+        // renderer (the same one the hover popover's doc body uses above).
+        // Re-derived on every render, so it live-updates on any buffer
+        // change — the same [`Self::observe_input`] notify that already
+        // repaints the source editor on every keystroke or programmatic
+        // edit (`docs/spec-markdown-preview.md`).
+        let editor_row = if markdown_preview_active {
+            let content = tab.input.read(cx).value().to_string();
+            div()
+                .id("markdown-preview")
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .overflow_y_scroll()
+                .bg(surface_bg)
+                .text_color(surface_fg)
+                .p(px(12.0))
+                .child(markdown(content))
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_row()
+                .child(editor_area)
+                .child(minimap_strip)
+                .into_any_element()
+        };
 
         root.child(editor_row).into_any_element()
     }
@@ -3511,6 +3625,13 @@ fn language_for_path(path: &str) -> String {
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.to_ascii_lowercase())
         .unwrap_or_else(|| "text".to_owned())
+}
+
+/// Whether `path` is a Markdown file (`.md` / `.markdown`, case-insensitive) —
+/// gates the source/preview toggle affordance
+/// (`docs/spec-markdown-preview.md`).
+fn is_markdown_path(path: &str) -> bool {
+    matches!(language_for_path(path).as_str(), "md" | "markdown")
 }
 
 /// Whether the zero-based `(line, character)` cursor position falls within
@@ -3925,6 +4046,24 @@ mod tests {
     fn test_language_for_path_lowercases_extension() {
         assert_eq!(language_for_path("MAIN.RS"), "rs");
         assert_eq!(language_for_path("Config.TOML"), "toml");
+    }
+
+    // --- Markdown preview (docs/spec-markdown-preview.md, #918) ---
+
+    #[test]
+    fn test_is_markdown_path_matches_md_and_markdown_extensions() {
+        assert!(is_markdown_path("docs/readme.md"));
+        assert!(is_markdown_path("docs/readme.markdown"));
+        assert!(is_markdown_path("docs/README.MD"));
+        assert!(is_markdown_path("NOTES.Markdown"));
+    }
+
+    #[test]
+    fn test_is_markdown_path_rejects_non_markdown_and_extensionless_paths() {
+        assert!(!is_markdown_path("src/main.rs"));
+        assert!(!is_markdown_path("Cargo.toml"));
+        assert!(!is_markdown_path("Makefile"));
+        assert!(!is_markdown_path(""));
     }
 
     // --- buffer-error reason labels (#617) ---
@@ -4804,6 +4943,66 @@ mod tests {
             });
 
             assert!(!window.has_active_dialog(cx));
+        })
+        .unwrap();
+    }
+
+    // --- Markdown preview toggle (docs/spec-markdown-preview.md, #918) ---
+
+    /// Acceptance: toggling a Markdown tab's preview leaves any other tab's
+    /// mode untouched (per-tab state, `docs/spec-markdown-preview.md`), and a
+    /// non-Markdown active tab's toggle is a no-op.
+    #[gpui::test]
+    fn test_toggle_markdown_preview_is_per_tab_and_a_no_op_for_non_markdown(
+        cx: &mut TestAppContext,
+    ) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let md = editor.push_tab("docs/readme.md".into(), false, window, cx);
+                let rs = editor.push_tab("src/main.rs".into(), false, window, cx);
+                editor.tabs[md].load_state = TabLoadState::Loaded;
+                editor.tabs[rs].load_state = TabLoadState::Loaded;
+
+                editor.active = Some(rs);
+                editor.toggle_markdown_preview(cx);
+                assert!(
+                    !editor.tabs[rs].markdown_preview,
+                    "a non-Markdown active tab's toggle is a no-op"
+                );
+
+                editor.active = Some(md);
+                editor.toggle_markdown_preview(cx);
+                assert!(
+                    editor.tabs[md].markdown_preview,
+                    "a Markdown tab toggles into preview"
+                );
+                assert!(
+                    !editor.tabs[rs].markdown_preview,
+                    "toggling one tab must not affect another"
+                );
+
+                editor.toggle_markdown_preview(cx);
+                assert!(
+                    !editor.tabs[md].markdown_preview,
+                    "toggling again restores source"
+                );
+            });
+        })
+        .unwrap();
+    }
+
+    /// Acceptance: no active tab is a no-op (no panic, no state change).
+    #[gpui::test]
+    fn test_toggle_markdown_preview_is_a_no_op_with_no_active_tab(cx: &mut TestAppContext) {
+        let (editor, window, _open_file_rx) = build_test_editor(cx);
+
+        cx.update_window(window.into(), |_, _window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.toggle_markdown_preview(cx);
+                assert!(editor.tabs.is_empty());
+            });
         })
         .unwrap();
     }
