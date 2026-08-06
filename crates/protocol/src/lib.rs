@@ -15,7 +15,7 @@ pub use frame::{encode_frame, FrameDecoder, FrameError, MAX_FRAME_LEN};
 /// is wire-compatible in one direction. The message set is pinned by the
 /// fingerprint test beside `PROTOCOL_FINGERPRINT` below, so a message-set
 /// change without a bump cannot pass CI.
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Pinned fingerprint of the protocol message set, checked by the
 /// `fingerprint_tests` module: an FNV-1a hash over the serde-visible surface
@@ -27,7 +27,7 @@ pub const PROTOCOL_VERSION: u32 = 16;
 /// message set changes deliberately, bump [`PROTOCOL_VERSION`] above and
 /// re-pin this value (the failing test prints the new fingerprint).
 #[cfg(test)]
-const PROTOCOL_FINGERPRINT: u64 = 0x7906_e662_8a97_ee25;
+const PROTOCOL_FINGERPRINT: u64 = 0x7998_891f_4057_8c5f;
 
 /// Messages the client sends to the daemon.
 ///
@@ -744,14 +744,29 @@ pub enum DaemonMessage {
     /// `microsoft-standard-WSL2` kernel, which ships no `CONFIG_PSI`) —
     /// intra-version optionality, not a version skew tolerance: a same-version
     /// PSI-less host simply omits the key.
+    ///
+    /// `mem_cached`/`mem_buffers` (`docs/spec-telemetry-detail.md`) are bytes
+    /// read from `/proc/meminfo`'s `Cached`/`Buffers` fields — `sysinfo`
+    /// exposes total/free/available/used but not these, hence the dedicated
+    /// daemon-side read. `uptime_secs` is the host's uptime in seconds
+    /// (`sysinfo::System::uptime`). `disk_total`/`disk_available` are bytes
+    /// for the **daemon's own filesystem** (the mount whose `mount_point` is
+    /// the longest prefix of the daemon's working directory), read via
+    /// `sysinfo`'s `disk` feature — daemon-global like every other field
+    /// here, not the per-connection attached-session root.
     HostMetrics {
         cpu: f32,
         mem_total: u64,
         mem_available: u64,
+        mem_cached: u64,
+        mem_buffers: u64,
         swap_total: u64,
         swap_used: u64,
         load: LoadAverage,
         cpu_count: u32,
+        uptime_secs: u64,
+        disk_total: u64,
+        disk_available: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         psi: Option<MemoryPressure>,
     },
@@ -2264,6 +2279,8 @@ mod tests {
             cpu: 42.5,
             mem_total: 16_000_000_000,
             mem_available: 4_000_000_000,
+            mem_cached: 3_000_000_000,
+            mem_buffers: 500_000_000,
             swap_total: 2_000_000_000,
             swap_used: 100_000_000,
             load: LoadAverage {
@@ -2272,6 +2289,9 @@ mod tests {
                 fifteen: 0.9,
             },
             cpu_count: 8,
+            uptime_secs: 123_456,
+            disk_total: 500_000_000_000,
+            disk_available: 200_000_000_000,
             psi: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize HostMetrics");
@@ -2279,12 +2299,17 @@ mod tests {
         assert!(json.contains(r#""cpu":42.5"#));
         assert!(json.contains(r#""mem_total":16000000000"#));
         assert!(json.contains(r#""mem_available":4000000000"#));
+        assert!(json.contains(r#""mem_cached":3000000000"#));
+        assert!(json.contains(r#""mem_buffers":500000000"#));
         assert!(json.contains(r#""swap_total":2000000000"#));
         assert!(json.contains(r#""swap_used":100000000"#));
         assert!(json.contains(r#""one":1.5"#));
         assert!(json.contains(r#""five":1.1"#));
         assert!(json.contains(r#""fifteen":0.9"#));
         assert!(json.contains(r#""cpu_count":8"#));
+        assert!(json.contains(r#""uptime_secs":123456"#));
+        assert!(json.contains(r#""disk_total":500000000000"#));
+        assert!(json.contains(r#""disk_available":200000000000"#));
         assert!(
             !json.contains("\"psi\""),
             "psi must be omitted when absent (e.g. a WSL2 host with no CONFIG_PSI): {json}"
@@ -2301,6 +2326,8 @@ mod tests {
             cpu: 42.5,
             mem_total: 16_000_000_000,
             mem_available: 4_000_000_000,
+            mem_cached: 3_000_000_000,
+            mem_buffers: 500_000_000,
             swap_total: 2_000_000_000,
             swap_used: 100_000_000,
             load: LoadAverage {
@@ -2309,6 +2336,9 @@ mod tests {
                 fifteen: 0.9,
             },
             cpu_count: 8,
+            uptime_secs: 123_456,
+            disk_total: 500_000_000_000,
+            disk_available: 200_000_000_000,
             psi: Some(MemoryPressure {
                 some_avg10: 12.5,
                 some_avg60: 8.25,
@@ -2336,15 +2366,32 @@ mod tests {
     #[test]
     fn test_host_metrics_missing_field_is_rejected() {
         for json in [
-            r#"{"type":"host_metrics","mem_total":1,"mem_available":1,"swap_total":0,"swap_used":0,"load":{"one":0.0,"five":0.0,"fifteen":0.0},"cpu_count":1}"#,
-            r#"{"type":"host_metrics","cpu":1.0,"mem_total":1,"mem_available":1,"swap_total":0,"swap_used":0,"cpu_count":1}"#,
-            r#"{"type":"host_metrics","cpu":1.0,"mem_total":1,"mem_available":1,"swap_total":0,"swap_used":0,"load":{"one":0.0,"five":0.0,"fifteen":0.0},"cpu_count":1,"psi":{"some_avg10":0.0}}"#,
+            r#"{"type":"host_metrics","mem_total":1,"mem_available":1,"mem_cached":0,"mem_buffers":0,"swap_total":0,"swap_used":0,"load":{"one":0.0,"five":0.0,"fifteen":0.0},"cpu_count":1,"uptime_secs":0,"disk_total":0,"disk_available":0}"#,
+            r#"{"type":"host_metrics","cpu":1.0,"mem_total":1,"mem_available":1,"mem_cached":0,"mem_buffers":0,"swap_total":0,"swap_used":0,"cpu_count":1,"uptime_secs":0,"disk_total":0,"disk_available":0}"#,
+            r#"{"type":"host_metrics","cpu":1.0,"mem_total":1,"mem_available":1,"mem_cached":0,"mem_buffers":0,"swap_total":0,"swap_used":0,"load":{"one":0.0,"five":0.0,"fifteen":0.0},"cpu_count":1,"uptime_secs":0,"disk_total":0,"disk_available":0,"psi":{"some_avg10":0.0}}"#,
         ] {
             assert!(
                 serde_json::from_str::<DaemonMessage>(json).is_err(),
                 "malformed HostMetrics must not deserialize: {json}"
             );
         }
+    }
+
+    /// A pre-version-17 wire payload — the exact shape `HostMetrics` had
+    /// before this phase's breakdown/uptime/disk fields were added, missing
+    /// `mem_cached`/`mem_buffers`/`uptime_secs`/`disk_total`/`disk_available`
+    /// entirely — must be rejected. The new fields are plain (non-`Option`,
+    /// no `#[serde(default)]`) required members, matching the precedent set
+    /// by `RepoState::lines_added`/`lines_removed`: under this protocol's
+    /// strict version-equality policy a same-version peer always sends every
+    /// field, so there is no wire back-compat to preserve for them.
+    #[test]
+    fn test_host_metrics_legacy_payload_without_new_fields_is_rejected() {
+        let legacy = r#"{"type":"host_metrics","cpu":1.0,"mem_total":1,"mem_available":1,"swap_total":0,"swap_used":0,"load":{"one":0.0,"five":0.0,"fifteen":0.0},"cpu_count":1}"#;
+        assert!(
+            serde_json::from_str::<DaemonMessage>(legacy).is_err(),
+            "a pre-version-17 legacy HostMetrics payload must not deserialize: {legacy}"
+        );
     }
 
     #[test]
