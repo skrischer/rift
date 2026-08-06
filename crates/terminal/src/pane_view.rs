@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -282,6 +282,18 @@ struct HoveredLink {
     target: String,
 }
 
+/// The on-demand per-line timestamp reveal surface's live state (#934,
+/// `docs/spec-terminal-timestamps.md`): the viewport row currently hovered
+/// (same addressing as [`PaneView::pixel_to_grid`]'s row, used to position
+/// the reveal) paired with that line's already-formatted arrival label.
+/// `None` (via `PaneView::hover_reveal`) whenever nothing is hovered or the
+/// hovered row has no timestamp — see
+/// [`PaneView::timestamp_for_viewport_row`].
+struct HoverReveal {
+    row: usize,
+    label: SharedString,
+}
+
 /// The scrollback search bar's live GPUI wiring: the query [`Input`] and its
 /// change/submit/blur subscription, paired with the pure match state.
 /// Mirrors [`crate::session_view`]'s `WindowRename`: blur cancels (closes
@@ -452,6 +464,17 @@ pub struct PaneView {
     /// (`docs/spec-terminal-timestamps.md`). Consumed by the on-demand
     /// timestamp reveal surface (#934) via [`Self::timestamp_for_line`].
     line_timestamps: Arc<Mutex<LineTimestamps>>,
+    /// `(Instant::now(), SystemTime::now())` captured once at construction —
+    /// [`LineTimestamps`] stores arrival as a monotonic [`Instant`], which
+    /// carries no wall-clock meaning on its own; this anchor pair is the only
+    /// way to translate one into a clock reading worth showing a person.
+    /// Consumed by [`Self::hover_timestamp_label`].
+    anchor_instant: Instant,
+    anchor_wall: SystemTime,
+    /// The on-demand per-line hover timestamp reveal's current state (#934),
+    /// refreshed on every `on_mouse_move`. `None` when nothing is hovered or
+    /// the hovered row has no timestamp.
+    hover_reveal: Option<HoverReveal>,
 }
 
 impl PaneView {
@@ -654,6 +677,9 @@ impl PaneView {
             cursor_cell: (0, 0),
             line_id,
             line_timestamps,
+            anchor_instant: Instant::now(),
+            anchor_wall: SystemTime::now(),
+            hover_reveal: None,
         }
     }
 
@@ -948,6 +974,62 @@ impl PaneView {
             .lock()
             .expect("line timestamps lock poisoned")
             .get(line_id)
+    }
+
+    /// How many rows of the pre-attach history block are currently painted
+    /// at the top of the viewport — the same computation `render` performs
+    /// (`history_rows`) to place that block above the live `Term`'s own
+    /// rows. Needed by the hover reveal to tell a pre-attach row (never
+    /// timestamped — it predates attach) apart from a live one.
+    fn history_rows_shown(&self) -> usize {
+        self.history_block
+            .as_ref()
+            .map_or(0, |block| self.history_scroll.min(block.len()))
+            .min(self.grid_size.rows)
+    }
+
+    /// The arrival time for the viewport row under the mouse (same row
+    /// addressing as [`Self::pixel_to_grid`], which already folds in
+    /// [`Self::history_rows_shown`]'s pre-attach overlay), or `None` if that
+    /// row has none: pre-attach history, the alternate screen (never
+    /// stamped — `crate::line_timestamp` module docs), or a live row with no
+    /// sealed timestamp yet (still in progress, evicted, or beyond the
+    /// tracked window). The on-demand hover reveal surface (#934,
+    /// `docs/spec-terminal-timestamps.md`).
+    fn timestamp_for_viewport_row(&self, row: usize) -> Option<Instant> {
+        let history_rows = self.history_rows_shown();
+        let live_row = row.checked_sub(history_rows)?;
+
+        let term = self.terminal.lock().expect("term lock poisoned");
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let grid = term.grid();
+        let display_offset = grid.display_offset();
+        let history_size = grid.history_size();
+        drop(term);
+
+        let absolute_row = live_row_to_absolute_row(live_row, display_offset, history_size)?;
+        let line_id = self.line_id_for_row(absolute_row)?;
+        self.timestamp_for_line(line_id)
+    }
+
+    /// Formats `arrival` (a [`LineTimestamps`] id's stamped [`Instant`]) as
+    /// an `HH:MM:SS` clock reading, via the `(Instant, SystemTime)` anchor
+    /// pair captured once at construction. `None` only if the underlying
+    /// system clock/duration arithmetic is out of range (never expected in
+    /// practice — a genuine invariant, not a normal path — so this stays a
+    /// checked `Option` rather than a panic).
+    ///
+    /// UTC time-of-day, not localized: the spec explicitly rules out a new
+    /// dependency for this feature, and Rust's standard library exposes no
+    /// timezone conversion (that is what pulls in a `chrono`/`time`
+    /// dependency elsewhere in this workspace) — a plain, deterministic
+    /// clock reading is the sensible default the spec asks for in place of
+    /// a configurable format.
+    fn hover_timestamp_label(&self, arrival: Instant) -> Option<SharedString> {
+        let wall = arrival_wall_clock(self.anchor_instant, self.anchor_wall, arrival)?;
+        format_clock(wall).map(SharedString::from)
     }
 
     /// Composite scroll across the live `Term`'s own scrollback (post-attach) and
@@ -1383,6 +1465,35 @@ impl PaneView {
         true
     }
 
+    /// The on-demand per-line hover timestamp reveal (#934, `docs/spec-
+    /// terminal-timestamps.md`): a small badge pinned to the right edge of
+    /// the pane, aligned with the hovered row, showing that line's arrival
+    /// time. `None` while nothing is hovered or the hovered row has none
+    /// (`Self::timestamp_for_viewport_row`). Reuses the same popover/border/
+    /// shadow styling as `render_search_bar`'s floating panel.
+    fn render_hover_timestamp(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let reveal = self.hover_reveal.as_ref()?;
+        Some(
+            div()
+                .id("terminal-hover-timestamp")
+                .occlude()
+                .absolute()
+                .top(self.cell_size.height * reveal.row)
+                .right_2()
+                .px_2()
+                .py_0p5()
+                .rounded(px(6.0))
+                .bg(cx.theme().popover)
+                .text_color(cx.theme().popover_foreground)
+                .border_1()
+                .border_color(cx.theme().border)
+                .shadow_md()
+                .text_size(px(12.0))
+                .child(reveal.label.clone())
+                .into_any_element(),
+        )
+    }
+
     /// The vertical scrollback scrollbar overlay: a [`CompositeScrollHandle`]
     /// mirror of the composite scroll position driving the vendored
     /// [`Scrollbar`] (`docs/spec-terminal-scrollbar.md`). `None` in
@@ -1632,6 +1743,61 @@ pub fn measure_cell_size(window: &mut Window, font_size: Pixels) -> Size<Pixels>
         .unwrap_or(px(8.4));
     let line_height = font_size * 1.4;
     size(cell_width, line_height)
+}
+
+/// Inverts the composite-scroll row->line mapping (`docs/spec-terminal-
+/// timestamps.md`, built inline for v1 — a shared helper is factored only
+/// once the Phase-49 scrollback scrollbar lands as a second consumer): given
+/// `live_row` (a row within the live `Term`'s own rendered rows, `0` at its
+/// `Line(0)` — the same addressing `extract_row_cells`'s `row` parameter
+/// uses when `render` calls it), returns the [`LineIdTracker`] id addressing
+/// (`0` = the oldest row the tracker still retains, i.e. `Line(-history_size)`
+/// — see `LineIdTracker::id_for_row`'s doc comment).
+///
+/// `extract_row_cells` reads `Line(live_row - display_offset)`; shifting
+/// that by `history_size` (`LineIdTracker`'s `0` is `history_size` rows
+/// before `Line(0)`) gives `live_row + history_size - display_offset`.
+/// `None` on underflow (`display_offset` exceeding `live_row + history_size`)
+/// — should not happen for a row `render` actually painted, since both
+/// getters come from the same grid snapshot, but this stays a checked
+/// no-panic path rather than an assumed invariant.
+fn live_row_to_absolute_row(
+    live_row: usize,
+    display_offset: usize,
+    history_size: usize,
+) -> Option<usize> {
+    (live_row + history_size).checked_sub(display_offset)
+}
+
+/// Translates a [`LineTimestamps`] arrival [`Instant`] to wall-clock time via
+/// the `(Instant, SystemTime)` anchor pair captured once at
+/// [`PaneView::new`]. `None` only on underlying duration-arithmetic overflow
+/// (never expected — the anchor is captured before the pane's PTY read loop
+/// starts, so every arrival is at or after it in practice).
+fn arrival_wall_clock(
+    anchor_instant: Instant,
+    anchor_wall: SystemTime,
+    arrival: Instant,
+) -> Option<SystemTime> {
+    match arrival.checked_duration_since(anchor_instant) {
+        Some(elapsed) => anchor_wall.checked_add(elapsed),
+        None => {
+            let earlier = anchor_instant.checked_duration_since(arrival)?;
+            anchor_wall.checked_sub(earlier)
+        }
+    }
+}
+
+/// Formats a [`SystemTime`] as a UTC `HH:MM:SS` clock reading via plain
+/// epoch-second arithmetic — see [`PaneView::hover_timestamp_label`] for why
+/// this stays UTC and dependency-free rather than a localized calendar.
+fn format_clock(wall: SystemTime) -> Option<String> {
+    let epoch_secs = wall.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let secs_of_day = epoch_secs % 86_400;
+    let hours = secs_of_day / 3600;
+    let minutes = (secs_of_day % 3600) / 60;
+    let seconds = secs_of_day % 60;
+    Some(format!("{hours:02}:{minutes:02}:{seconds:02}"))
 }
 
 fn extract_row_cells(
@@ -2190,6 +2356,25 @@ impl Render for PaneView {
                     this.hovered_link = None;
                     cx.notify();
                 }
+
+                // The on-demand per-line hover timestamp reveal (#934,
+                // `docs/spec-terminal-timestamps.md`): resolve the row
+                // under the mouse to its arrival label on every move, no
+                // modifier required (unlike the ctrl-gated link hover
+                // above). `timestamp_for_viewport_row` already returns
+                // `None` for pre-attach history, alt-screen, and
+                // still-in-progress rows, so this stays unobtrusive there.
+                let (_, row) = this.pixel_to_grid(event.position);
+                let new_reveal = this
+                    .timestamp_for_viewport_row(row)
+                    .and_then(|arrival| this.hover_timestamp_label(arrival))
+                    .map(|label| HoverReveal { row, label });
+                if this.hover_reveal.as_ref().map(|r| (r.row, &r.label))
+                    != new_reveal.as_ref().map(|r| (r.row, &r.label))
+                {
+                    this.hover_reveal = new_reveal;
+                    cx.notify();
+                }
             }))
             .on_mouse_up(
                 MouseButton::Left,
@@ -2331,7 +2516,8 @@ impl Render for PaneView {
                 display_offset,
                 new_size.rows,
                 alt_screen,
-            ));
+            ))
+            .children(self.render_hover_timestamp(cx));
 
         if self.search.is_some() {
             terminal_area.child(self.render_search_bar(cx))
@@ -2859,6 +3045,87 @@ mod tests {
 
         tracker.set_window_active(false);
         assert_eq!(tracker.state(false, false), PaneActivity::Free);
+    }
+
+    // -- #934: on-demand hover timestamp reveal --------------------------
+
+    #[::core::prelude::v1::test]
+    fn test_live_row_to_absolute_row_at_live_bottom_matches_history_size() {
+        // Not scrolled (display_offset 0): live_row 0 is the live Term's
+        // own Line(0), which `LineIdTracker` addresses as `history_size`
+        // (its doc comment: "history_size = the first on-screen row").
+        assert_eq!(live_row_to_absolute_row(0, 0, 42), Some(42));
+        assert_eq!(live_row_to_absolute_row(3, 0, 42), Some(45));
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_live_row_to_absolute_row_scrolled_to_oldest_history_is_zero() {
+        // Fully scrolled up (display_offset == history_size): live_row 0 is
+        // Line(-history_size), the oldest row the tracker retains - id 0.
+        assert_eq!(live_row_to_absolute_row(0, 100, 100), Some(0));
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_live_row_to_absolute_row_underflow_returns_none() {
+        // display_offset exceeding what `live_row + history_size` can cover
+        // is not a real grid state, but the checked path must not panic.
+        assert_eq!(live_row_to_absolute_row(0, 10, 5), None);
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_arrival_wall_clock_after_anchor_adds_elapsed() {
+        let anchor_instant = Instant::now();
+        let anchor_wall = UNIX_EPOCH + Duration::from_secs(1_000);
+        let arrival = anchor_instant + Duration::from_secs(30);
+        assert_eq!(
+            arrival_wall_clock(anchor_instant, anchor_wall, arrival),
+            Some(UNIX_EPOCH + Duration::from_secs(1_030))
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_arrival_wall_clock_before_anchor_subtracts_elapsed() {
+        // Defensive path: should not happen in practice (the anchor is
+        // captured before the PTY read loop starts), but must not panic.
+        let anchor_instant = Instant::now() + Duration::from_secs(30);
+        let anchor_wall = UNIX_EPOCH + Duration::from_secs(1_000);
+        let arrival = anchor_instant - Duration::from_secs(10);
+        assert_eq!(
+            arrival_wall_clock(anchor_instant, anchor_wall, arrival),
+            Some(UNIX_EPOCH + Duration::from_secs(990))
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_format_clock_formats_hh_mm_ss() {
+        // 1_000 seconds past the epoch is 00:16:40 UTC.
+        assert_eq!(
+            format_clock(UNIX_EPOCH + Duration::from_secs(1_000)).as_deref(),
+            Some("00:16:40")
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_format_clock_wraps_at_midnight() {
+        // 86_400 seconds past the epoch is exactly one day later - back to
+        // 00:00:00, not day-carrying into the hours field.
+        assert_eq!(
+            format_clock(UNIX_EPOCH + Duration::from_secs(86_400)).as_deref(),
+            Some("00:00:00")
+        );
+        assert_eq!(
+            format_clock(UNIX_EPOCH + Duration::from_secs(86_399)).as_deref(),
+            Some("23:59:59")
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn test_format_clock_before_epoch_returns_none() {
+        assert_eq!(
+            format_clock(UNIX_EPOCH - Duration::from_secs(1)),
+            None,
+            "a system clock before 1970 has no meaningful epoch-seconds reading"
+        );
     }
 }
 
