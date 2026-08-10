@@ -84,7 +84,7 @@ use rift_protocol::{
 
 use crate::file_icons::{self, Glyph};
 use crate::fuzzy_match::fuzzy_match;
-use crate::workspace::{solo_button, SoloExplorerEditor};
+use crate::workspace::{solo_button, SoloExplorer};
 use crate::worktree::WorktreeModel;
 
 /// Stable, distinct dock-panel identity for the file tree (`Panel::panel_name`).
@@ -3015,7 +3015,7 @@ impl Panel for FileTree {
         _cx: &mut Context<Self>,
     ) -> Option<Vec<Button>> {
         Some(vec![solo_button(|_, window, cx| {
-            window.dispatch_action(Box::new(SoloExplorerEditor), cx);
+            window.dispatch_action(Box::new(SoloExplorer), cx);
         })])
     }
 }

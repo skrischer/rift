@@ -29,7 +29,7 @@
 //! (issue #856) needs [`crate::workspace::Area`] itself, to pick each icon's
 //! design hue and to compare against the solo target — the one exception to
 //! this module otherwise never naming `WorkspaceView` types, mirroring how
-//! `file_tree.rs` already imports `workspace::{solo_button, SoloExplorerEditor}`
+//! `file_tree.rs` already imports `workspace::{solo_button, SoloExplorer}`
 //! for the same reason. [`RailState::solo`] carries the rift-owned solo
 //! target (`Option<Area>`) alongside the existing `*_visible` flags: an
 //! area's icon renders in its own hue while visible, the shared solo hue
@@ -63,12 +63,16 @@ const BUTTON_SIZE: Pixels = px(36.0);
 /// worktree models — never derived or cached here.
 pub struct RailState {
     /// Whether the Explorer area (the left-dock file tree) is visible
-    /// (`Area::Explorer`). `docs/spec-explorer-editor-split.md` (issue #939)
-    /// split the former fused `Area::ExplorerEditor` into `Area::Explorer` +
-    /// `Area::Editor`; this rail still carries a single icon for the pair —
-    /// mapped to `Area::Explorer` alone for now — until issue #941 (blocked
-    /// on the icon asset) adds a second, dedicated Editor icon + field.
+    /// (`Area::Explorer`). `docs/spec-explorer-editor-split.md` split the
+    /// former fused `Area::ExplorerEditor` into `Area::Explorer` +
+    /// `Area::Editor` (issue #939); the rail carries a dedicated icon per
+    /// area (issue #941), so this field drives the Explorer icon alone.
     pub explorer_visible: bool,
+    /// Whether the Editor area (the center editor half) is visible
+    /// (`Area::Editor`, issue #941): the peer of `explorer_visible` after the
+    /// split — drives the Editor icon independently, sharing the Explorer's
+    /// blue hue ([`area_hue`]) but its own filled-region panel glyph.
+    pub editor_visible: bool,
     /// Whether the Terminal area is visible (`Area::Terminal`, issue #821):
     /// a fully symmetric peer like the other three — hiding it or soloing a
     /// different area removes it from the center `h_split` entirely, never
@@ -248,19 +252,24 @@ fn area_button(
     }
 }
 
-/// Render the 48px activity rail: files / terminal / source-control /
+/// Render the 48px activity rail: files / editor / terminal / source-control /
 /// diagnostics toggles, a flexible spacer, then settings at the bottom — no
 /// search icon, since no search panel exists yet (the spec's "no dead
 /// controls" constraint). Theme tokens only: rail background/border match
 /// the title bar's sidebar surface, the active state matches the design's
 /// selected surface.
 ///
-/// The four `on_toggle_*` callbacks are the caller's entity-bound listeners
+/// The five `on_toggle_*` callbacks are the caller's entity-bound listeners
 /// (issue #848) — this function only wires them to the matching button's
 /// `on_click`, it never builds a click handler itself for an area toggle.
+/// Explorer and Editor (issue #941) carry the custom filled-region split-panel
+/// icons: both at the `PanelLeft` 30:70 proportion, Explorer filling the narrow
+/// sidebar region and Editor the wide main region, so each icon's fill names
+/// its own target.
 pub fn render(
     state: RailState,
     on_toggle_explorer: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_toggle_editor: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_toggle_terminal: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_toggle_source_control: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_toggle_problems: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -268,12 +277,23 @@ pub fn render(
 ) -> impl IntoElement {
     let explorer = area_button(
         "activity-rail-explorer",
-        IconName::PanelLeft,
+        Icon::empty().path("file_icons/panel-explorer.svg"),
         "Explorer",
         Area::Explorer,
         state.explorer_visible,
         state.solo,
         on_toggle_explorer,
+        cx,
+    );
+
+    let editor = area_button(
+        "activity-rail-editor",
+        Icon::empty().path("file_icons/panel-editor.svg"),
+        "Editor",
+        Area::Editor,
+        state.editor_visible,
+        state.solo,
+        on_toggle_editor,
         cx,
     );
 
@@ -337,6 +357,7 @@ pub fn render(
         .border_r_1()
         .border_color(cx.theme().sidebar_border)
         .child(explorer)
+        .child(editor)
         .child(terminal)
         .child(source_control)
         .child(problems)

@@ -228,7 +228,7 @@ use rift_protocol::{
 };
 
 use crate::results_panel::ResultsKind;
-use crate::workspace::{solo_button, SoloExplorerEditor};
+use crate::workspace::{solo_button, SoloEditor};
 
 /// Stable, distinct dock-panel identity for the editor (`Panel::panel_name`).
 /// Once shipped this must not change — it is the persisted panel identifier.
@@ -2648,7 +2648,7 @@ impl Panel for EditorView {
         _cx: &mut Context<Self>,
     ) -> Option<Vec<Button>> {
         Some(vec![solo_button(|_, window, cx| {
-            window.dispatch_action(Box::new(SoloExplorerEditor), cx);
+            window.dispatch_action(Box::new(SoloEditor), cx);
         })])
     }
 }
