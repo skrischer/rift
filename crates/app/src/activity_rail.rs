@@ -6,9 +6,10 @@
 //! per-dock open/close toggle to the rift-owned area-visibility set: each
 //! icon's active state now reads [`RailState`]'s `*_visible` fields — sourced
 //! by the caller from `WorkspaceView`'s own visibility set, not
-//! `dock.is_open`. The four area icons' `on_click` handlers
-//! (`on_toggle_explorer`/`on_toggle_terminal`/`on_toggle_source_control`/
-//! `on_toggle_problems`) are built by the caller and passed into [`render`]
+//! `dock.is_open`. The five area icons' `on_click` handlers
+//! (`on_toggle_explorer`/`on_toggle_editor`/`on_toggle_terminal`/
+//! `on_toggle_source_control`/`on_toggle_problems`) are built by the caller
+//! and passed into [`render`]
 //! (`docs/spec-visibility-rail-focus.md`, issue #848): `WorkspaceView` binds
 //! them to itself via `cx.listener` (a weak reference into
 //! `Entity<WorkspaceView>`, no retain cycle) so a click invokes
@@ -171,8 +172,10 @@ fn rail_button(
 /// `warning` instead: the same substitution `file_icons::TintRole::Warning`
 /// already uses for the identical artboard peach `#FAB387` reference on the
 /// `.rs` file-type glyph, kept consistent here rather than hardcoding the hex.
-/// `Explorer`/`Editor` share the one blue hue for now (issue #939 split the
-/// area, but the Editor has no rail icon of its own yet — issue #941).
+/// `Explorer`/`Editor` deliberately share the one blue hue: issue #939 split
+/// the area and issue #941 gave each its own rail icon (the filled-region
+/// panel glyphs), but they stay one hue since the icon shape — not color —
+/// names the target.
 fn area_hue(area: Area, cx: &App) -> Hsla {
     match area {
         Area::Explorer | Area::Editor => cx.theme().blue,
