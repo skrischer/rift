@@ -1,5 +1,6 @@
 # Spec: Independent Explorer/Editor visibility
 
+> Status: COMPLETED (2026-08-10)
 > Created: 2026-08-01
 
 Split the combined `Area::ExplorerEditor` rail item into two independently
