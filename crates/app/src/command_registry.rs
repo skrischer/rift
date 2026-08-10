@@ -16,8 +16,8 @@ use crate::editor::{
     FindReferences, GoToDefinition, GoToLine, Save, ShowHover, ToggleMarkdownPreview,
 };
 use crate::workspace::{
-    FocusTerminal, NewSession, RefreshKeyTables, SwitchSession, ToggleExplorer, ToggleOutline,
-    ToggleProblems, ToggleSourceControl, ToggleTerminal, ZoomActivePanel,
+    FocusTerminal, NewSession, RefreshKeyTables, SwitchSession, ToggleEditor, ToggleExplorer,
+    ToggleOutline, ToggleProblems, ToggleSourceControl, ToggleTerminal, ZoomActivePanel,
 };
 use crate::{
     SelectCatppuccinMochaTheme, SelectDefaultDarkTheme, SelectDefaultLightTheme, ToggleThemeMode,
@@ -66,6 +66,7 @@ pub const COMMANDS: &[Command] = &[
         Box::new(ToggleMarkdownPreview)
     }),
     Command::new("Toggle Explorer", None, || Box::new(ToggleExplorer)),
+    Command::new("Toggle Editor", None, || Box::new(ToggleEditor)),
     Command::new("Toggle Outline", None, || Box::new(ToggleOutline)),
     Command::new("Toggle Problems", None, || Box::new(ToggleProblems)),
     Command::new("Toggle Source Control", None, || {
@@ -127,6 +128,7 @@ mod tests {
                 "Go to Line",
                 "Toggle Markdown Preview",
                 "Toggle Explorer",
+                "Toggle Editor",
                 "Toggle Outline",
                 "Toggle Problems",
                 "Toggle Source Control",

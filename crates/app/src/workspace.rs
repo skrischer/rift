@@ -123,10 +123,20 @@ const WINDOW_STATE_SAVE_DEBOUNCE: Duration = Duration::from_millis(200);
 // beside the `dock_area` they target, and wired to it in
 // [`WorkspaceView::render`]'s `on_action` handlers.
 
-/// Toggle the explorer (left) dock hidden/shown.
+/// Toggle the explorer (left) dock hidden/shown — `Area::Explorer` alone
+/// (`docs/spec-explorer-editor-split.md`, issue #941).
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = rift, no_json)]
 pub struct ToggleExplorer;
+
+/// Toggle the Editor area (the center editor half) hidden/shown — `Area::
+/// Editor` alone (`docs/spec-explorer-editor-split.md`, issue #941). The peer
+/// of `ToggleExplorer` since the former fused `Area::ExplorerEditor` split
+/// (issue #939): hiding the Editor lets the Terminal fill the center, never
+/// touching the Explorer's left dock.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct ToggleEditor;
 
 /// Toggle the outline panel (left dock, alongside the explorer) shown/hidden
 /// (`docs/spec-editor-chrome.md`, issue #530). Unlike `ToggleExplorer` this
@@ -177,18 +187,22 @@ pub struct FocusTerminal;
 #[action(namespace = rift, no_json)]
 pub struct ZoomActivePanel;
 
-/// Solo the (legacy, pre-split) Explorer+Editor area, dispatched identically
-/// by both `FileTree`'s and `EditorView`'s `toolbar_buttons()` header button
-/// (issue #820) — see [`ZoomActivePanel`]. Interim: since `Area::ExplorerEditor`
-/// no longer exists (`docs/spec-explorer-editor-split.md`, issue #939), the
-/// handler below solos `Area::Explorer` for both dispatch sites, so
-/// `EditorView`'s own solo button temporarily solos the Explorer (left dock)
-/// rather than itself — disclosed and left for issue #941, which replaces
-/// this single action with dedicated `SoloExplorer`/`SoloEditor` actions
-/// wired per panel.
+/// Solo the Explorer area, dispatched by `FileTree`'s `toolbar_buttons()`
+/// header button (issue #820) — see [`ZoomActivePanel`]. Split from the former
+/// fused `SoloExplorerEditor` (`docs/spec-explorer-editor-split.md`, issue
+/// #941): `FileTree` now solos only its own left-dock Explorer.
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(namespace = rift, no_json)]
-pub struct SoloExplorerEditor;
+pub struct SoloExplorer;
+
+/// Solo the Editor area, dispatched by `EditorView`'s `toolbar_buttons()`
+/// header button (issue #820) — see [`ZoomActivePanel`]. Split from the former
+/// fused `SoloExplorerEditor` (`docs/spec-explorer-editor-split.md`, issue
+/// #941): `EditorView`'s solo button now solos the center Editor itself rather
+/// than the Explorer left dock.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = rift, no_json)]
+pub struct SoloEditor;
 
 /// Solo the Terminal area, dispatched by `TerminalPanel`'s `toolbar_buttons()`
 /// header button (issue #820) — see [`ZoomActivePanel`].
@@ -2970,16 +2984,16 @@ impl Render for WorkspaceView {
         // (`docs/spec-visibility-rail-focus.md`, issue #848) — the rail click
         // path is now focus-immune by construction. The `Toggle*` actions +
         // their `on_action` handlers below stay in place for the keyboard,
-        // command palette, and agent-driven dispatch. The rail still shows
-        // one Explorer icon — a second Editor icon is issue #941 (blocked on
-        // the icon asset); this button toggles `Area::Explorer` alone now
-        // (issue #939), so the Editor half of the center stays always-on
-        // until #941 gives it its own control.
+        // command palette, and agent-driven dispatch. The rail shows two
+        // independent icons for the split pair (issue #941): Explorer toggles
+        // `Area::Explorer` (left dock), Editor toggles `Area::Editor` (center
+        // editor half) — each with its own filled-region panel icon.
         let rail = {
             let model = self.file_tree.read(cx).model();
             activity_rail::render(
                 activity_rail::RailState {
                     explorer_visible: self.visibility.is_visible(Area::Explorer),
+                    editor_visible: self.visibility.is_visible(Area::Editor),
                     terminal_visible: self.visibility.is_visible(Area::Terminal),
                     git_visible: self.visibility.is_visible(Area::Git),
                     diagnostics_visible: self.visibility.is_visible(Area::Diagnostics),
@@ -2989,6 +3003,9 @@ impl Render for WorkspaceView {
                 },
                 cx.listener(|this, _event: &ClickEvent, window, cx| {
                     this.toggle_area(Area::Explorer, window, cx);
+                }),
+                cx.listener(|this, _event: &ClickEvent, window, cx| {
+                    this.toggle_area(Area::Editor, window, cx);
                 }),
                 cx.listener(|this, _event: &ClickEvent, window, cx| {
                     this.toggle_area(Area::Terminal, window, cx);
@@ -3076,6 +3093,9 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &ToggleExplorer, window, cx| {
                 this.toggle_area(Area::Explorer, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleEditor, window, cx| {
+                this.toggle_area(Area::Editor, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleOutline, window, cx| {
                 this.toggle_outline(window, cx);
             }))
@@ -3094,12 +3114,11 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &ZoomActivePanel, window, cx| {
                 this.zoom_active_panel(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &SoloExplorerEditor, window, cx| {
-                // Interim: solos `Area::Explorer` for both `FileTree`'s and
-                // `EditorView`'s identical dispatch of this action (see the
-                // struct's own doc comment) — issue #941 replaces this with
-                // per-panel `SoloExplorer`/`SoloEditor` actions.
+            .on_action(cx.listener(|this, _: &SoloExplorer, window, cx| {
                 this.toggle_solo_area(Area::Explorer, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SoloEditor, window, cx| {
+                this.toggle_solo_area(Area::Editor, window, cx);
             }))
             .on_action(cx.listener(|this, _: &SoloTerminal, window, cx| {
                 this.toggle_solo_area(Area::Terminal, window, cx);

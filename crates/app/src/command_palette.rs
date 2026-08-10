@@ -251,6 +251,7 @@ mod tests {
             vec![
                 "Toggle Markdown Preview",
                 "Toggle Explorer",
+                "Toggle Editor",
                 "Toggle Outline",
                 "Toggle Problems",
                 "Toggle Source Control",
